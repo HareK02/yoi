@@ -11,6 +11,7 @@ mod compaction;
 mod connected_compaction;
 mod handoff;
 mod memory_links;
+mod recovery;
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -1092,7 +1093,7 @@ async fn persisted_pre_binding_job_recovers_only_under_original_session_lifetime
 }
 
 #[tokio::test]
-async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_create() {
+async fn shutdown_reopen_resumes_same_job_and_frozen_input_without_duplicate_create() {
     let mut fixture = Fixture::new("proposed, corrected, partially performed, then interrupted");
     let state = fixture.host().catalog.state_root.clone();
     let worker = fixture._allocation.as_ref().unwrap().worker_id();
@@ -1129,12 +1130,27 @@ async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_c
         .items;
     assert_eq!(entries.len(), 1);
     let saved_entry = entries[0].id.clone();
-    let original_input = jobs.get(&id).unwrap().request.input;
+    let original = jobs.get(&id).unwrap();
+    let original_input = original.request.input.clone();
     fixture.append(
         "newer-than-snapshot",
         "NEW INPUT MUST NOT MIX INTO RESUMED SNAPSHOT",
     );
     jobs.shutdown().await.unwrap();
+    let stopped_store = crate::jobs::StandaloneJobs::open(
+        &fixture.connection.jobs_path,
+        fixture._temp.path().into(),
+    )
+    .unwrap();
+    let stopped = stopped_store.get(&id).unwrap();
+    assert_eq!(stopped.state, JobState::Failed);
+    assert_eq!(stopped.attempt.state, JobAttemptState::Failed);
+    assert_eq!(stopped.attempt.attempt_id, original.attempt.attempt_id);
+    assert_eq!(stopped.request, original.request);
+    assert!(!stopped.version_stopped);
+    assert!(!stopped.executions.is_empty());
+    assert!(stopped.executions_released());
+    stopped_store.shutdown().await.unwrap();
     fixture.connection.close().unwrap();
     let mut reopened = StandaloneSubjects::open_existing(&state)
         .unwrap()
@@ -1143,8 +1159,8 @@ async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_c
     let jobs = crate::jobs::StandaloneJobs::open(&reopened.jobs_path, fixture._temp.path().into())
         .unwrap();
     reopened.host.bind_jobs(jobs.clone()).unwrap();
-    assert_eq!(jobs.get(&id).unwrap().state, JobState::Unknown);
-    // Deny every original-source read while preparing and running the replacement.
+    assert_eq!(jobs.get(&id).unwrap(), stopped);
+    // Deny every original-source read while preparing and running the new attempt.
     let source_path = fixture
         .sessions
         .root_dir()
@@ -1154,28 +1170,35 @@ async fn shutdown_reopen_reconciles_partial_saved_operations_without_duplicate_c
         .path()
         .join("temporarily-unavailable-original");
     fs::rename(&source_path, &denied).unwrap();
-    let (_, replacement) = reopened.host.next_journal_job().unwrap().unwrap();
-    let replacement_input = jobs.get(&replacement).unwrap().request.input;
-    assert_eq!(replacement_input["capture"], original_input["capture"]);
+    let (_, resumed_id) = reopened.host.next_journal_job().unwrap().unwrap();
+    assert_eq!(resumed_id, id);
+    let resumed = jobs.get(&resumed_id).unwrap();
+    assert_eq!(resumed.request, original.request);
+    assert_eq!(resumed.input_digest, original.input_digest);
+    assert_eq!(resumed.intent_fingerprint, original.intent_fingerprint);
+    assert_eq!(resumed.domain_grant, original.domain_grant);
+    assert_eq!(resumed.executions, stopped.executions);
+    assert_eq!(resumed.state, JobState::Pending);
+    assert_eq!(resumed.attempt.state, JobAttemptState::Reserved);
+    assert_eq!(resumed.attempt.number, original.attempt.number + 1);
+    assert_ne!(resumed.attempt.attempt_id, original.attempt.attempt_id);
+    assert_eq!(resumed.input_disposition, JobInputDisposition::Available);
     assert!(
-        !replacement_input
+        !resumed
+            .request
+            .input
             .to_string()
             .contains("NEW INPUT MUST NOT MIX")
     );
-    assert_eq!(jobs.get(&id).unwrap().request.input, original_input);
-    assert_eq!(
-        jobs.get(&id).unwrap().input_disposition,
-        JobInputDisposition::Available
-    );
-    assert_ne!(
-        replacement, id,
-        "unknown external execution is not blindly replayed"
-    );
-    jobs.start_with_model_client(&replacement, JournalScript::default())
+    let history = jobs
+        .list_session_snapshots(&fixture.context.session_id, None, 100)
+        .unwrap();
+    assert_eq!(history.len(), 1, "recovery must not reserve a second Job");
+    jobs.start_with_model_client(&resumed_id, JournalScript::default())
         .await
         .unwrap();
     let completed =
-        tokio::time::timeout(std::time::Duration::from_secs(20), jobs.wait(&replacement))
+        tokio::time::timeout(std::time::Duration::from_secs(20), jobs.wait(&resumed_id))
             .await
             .unwrap()
             .unwrap();
@@ -1894,7 +1917,7 @@ async fn saved_body_jobs_process_over_a_hundred_entries_and_utf8_without_live_so
 }
 
 #[tokio::test]
-async fn descriptor_job_migrates_to_new_identity_preserving_input_and_successful_records() {
+async fn descriptor_job_version_cutover_retains_input_and_records_without_live_recapture() {
     let fixture = Fixture::new("original descriptor-only input");
     let (adapter, _, modern) = fixture.adapter();
     let jobs = fixture.host().jobs().unwrap();
@@ -1929,13 +1952,8 @@ async fn descriptor_job_migrates_to_new_identity_preserving_input_and_successful
     request.job_id = format!("legacy-descriptor:{}", uuid::Uuid::now_v7());
     request.input =
         serde_json::json!({"selected_ranges":old_grant.ranges,"origins":old_grant.origins});
-    let old = jobs
-        .request_granted(request, serde_json::to_value(&old_grant).unwrap())
-        .unwrap();
-    assert!(
-        fixture.host().journal_grant(&old).is_err(),
-        "descriptor jobs must not execute as snapshots"
-    );
+    let path = fixture._temp.path().join("descriptor-schema-five.sqlite3");
+    recovery::seed_schema_five_journal(&path, &request, &old_grant);
     let generation = fixture
         .host()
         .catalog
@@ -1944,8 +1962,8 @@ async fn descriptor_job_migrates_to_new_identity_preserving_input_and_successful
             &adapter.context,
             &old_grant.journal_id,
             JobAttemptBinding {
-                job_id: old.request.job_id.clone(),
-                attempt_id: old.attempt.attempt_id.clone(),
+                job_id: request.job_id.clone(),
+                attempt_id: job::attempt_id(&request.job_id, 1),
             },
             old_grant.ranges.clone(),
         )
@@ -1978,56 +1996,52 @@ async fn descriptor_job_migrates_to_new_identity_preserving_input_and_successful
             },
         )
         .unwrap();
-    fixture.append(
-        "new-not-selected",
-        "LATEST SOURCE MUST WAIT UNTIL OLD INPUT FINISHES",
+    // Normal recovery is not the migration runner. Seed the old running attempt,
+    // then use the production initializer before consulting any live Session.
+    let prior = rusqlite::Connection::open(&path).unwrap();
+    prior
+        .execute("UPDATE job_attempts SET state='dispatched'", [])
+        .unwrap();
+    drop(prior);
+    let migrated = crate::jobs::StandaloneJobs::open(&path, fixture._temp.path().into()).unwrap();
+    let old = migrated.get(&request.job_id).unwrap();
+    assert!(old.version_stopped);
+    assert_eq!(old.state, JobState::Failed);
+    assert_eq!(old.attempt.state, JobAttemptState::Failed);
+    assert_eq!(
+        old.attempt.failure.as_deref(),
+        Some("バージョン更新による実行打切り")
     );
-    fixture.host().admit_journal(&fixture.context).unwrap();
-    let (_, next) = fixture.host().next_journal_job().unwrap().unwrap();
-    assert_ne!(next, old.request.job_id);
-    let replacement = jobs.get(&next).unwrap();
-    let replacement_input = JournalInput::decode(&replacement.request.input).unwrap();
+    assert_eq!(old.request, request);
+    assert_eq!(old.input_disposition, JobInputDisposition::Available);
+    assert!(!old.executions_released());
+    assert!(fixture.host().journal_grant(&old).is_err());
+    fixture.append("new-not-selected", "LATEST SOURCE MUST NOT BE RECAPTURED");
+    let error = fixture
+        .host()
+        .recover_journal_job(&migrated, &old)
+        .unwrap_err();
     assert!(
-        !replacement
-            .request
-            .input
-            .to_string()
-            .contains("LATEST SOURCE MUST WAIT")
+        matches!(error, SubjektivHostError::Conflict { ref code, .. } if code == "journal_version_stopped")
     );
-    assert_eq!(replacement_input.selected_ranges, old_grant.ranges);
-    let retired = jobs.get(&old.request.job_id).unwrap();
-    assert_eq!(retired.input_disposition, JobInputDisposition::Invalidated);
-    assert_eq!(retired.input_digest, old.input_digest);
-    assert_eq!(retired.intent_fingerprint, old.intent_fingerprint);
-    assert!(retired.request.input.is_null());
+    assert!(migrated.retry(&request.job_id).is_err());
     assert!(
+        migrated
+            .resume_granted(&request.job_id, &old.attempt.attempt_id)
+            .is_err()
+    );
+    assert!(migrated.pending().unwrap().is_empty());
+    assert_eq!(migrated.get(&request.job_id).unwrap(), old);
+    assert_eq!(
         fixture
             .host()
             .catalog
             .store
-            .execute_journal(
-                &context,
-                JournalOperation {
-                    request_id: "legacy-delayed".into(),
-                    expected_state: saved.state_token,
-                    action: JournalAction::ConfirmUnchanged,
-                    covered_ranges: old_grant.ranges,
-                }
-            )
-            .is_err()
+            .active_journal_generation(&adapter.context, &adapter.grant.journal_id,)
+            .unwrap()
+            .unwrap(),
+        generation
     );
-    jobs.start_with_model_client(&next, JournalScript::default())
-        .await
-        .unwrap();
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(20), jobs.wait(&next))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(completed.state, JobState::Completed);
-    fixture
-        .host()
-        .complete_journal_job(&jobs, &completed)
-        .unwrap();
     let entries = fixture
         .host()
         .catalog
@@ -2036,6 +2050,16 @@ async fn descriptor_job_migrates_to_new_identity_preserving_input_and_successful
         .unwrap();
     assert_eq!(entries.items.len(), 1);
     assert_eq!(entries.items[0].id, saved.entry_id.unwrap());
+    drop(migrated);
+    let reopened = crate::jobs::StandaloneJobs::open(&path, fixture._temp.path().into()).unwrap();
+    assert_eq!(reopened.get(&request.job_id).unwrap(), old);
+    assert_eq!(
+        reopened
+            .list_session_snapshots(&fixture.context.session_id, None, 100)
+            .unwrap()
+            .len(),
+        1
+    );
     jobs.shutdown().await.unwrap();
 }
 
@@ -2373,23 +2397,31 @@ async fn close_cancels_retained_local_job_before_erase_can_acquire_exclusive_lea
             .is_ok();
     // Always tear down before asserting the observed violation, so a failed regression
     // cannot leak the blocked model future into another test.
-    let _ = retained.shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_secs(20), retained.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(model.request_dropped.load(Ordering::Acquire));
     fixture.connection.close().unwrap();
     assert!(fixture.connection.lease.is_none());
     assert!(fixture.host().jobs.lock().unwrap().is_none());
-    // Cancellation is not completion/erasure. Reopening retains the same unknown
-    // attempt's immutable body until the explicit erasure transaction retires it.
+    // Cancellation is not completion/erasure. The owned shutdown has confirmed cleanup,
+    // but reopening must preserve the failed attempt and its immutable body.
     let reopened = crate::jobs::StandaloneJobs::open(
         &fixture.connection.jobs_path,
         fixture._temp.path().into(),
     )
     .unwrap();
-    let unknown = reopened.get(&id).unwrap();
-    assert_eq!(unknown.attempt.state, crate::jobs::JobAttemptState::Unknown);
-    assert_eq!(unknown.input_disposition, JobInputDisposition::Available);
+    let failed = reopened.get(&id).unwrap();
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.attempt.state, JobAttemptState::Failed);
+    assert!(!failed.version_stopped);
+    assert_eq!(failed.attempt.number, 1);
+    assert!(!failed.executions.is_empty());
+    assert!(failed.executions_released());
+    assert_eq!(failed.input_disposition, JobInputDisposition::Available);
     assert!(
-        unknown
+        failed
             .request
             .input
             .to_string()

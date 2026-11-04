@@ -26,6 +26,7 @@
 
 use subjektiv::api::*;
 mod backend_job_profile;
+mod backend_job_recovery;
 mod chat;
 mod external_operation_audit;
 mod session_registration;
@@ -2130,6 +2131,7 @@ pub struct WorkspaceApi {
         Arc<Mutex<HashMap<RuntimeWorkerRef, Arc<Mutex<OrchestratorAttentionState>>>>>,
     notification_delivery_lifecycle: Arc<notification_delivery::NotificationDeliveryLifecycle>,
     backend_job_drain_requests: Arc<AtomicU64>,
+    backend_job_recovery: Arc<backend_job_recovery::RecoveryOwners>,
     journal_lifecycle: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     journal_dispatch_owner: Option<Arc<WorkspaceApi>>,
     plugin_runtime_owner: Option<Arc<WorkspaceApi>>,
@@ -2643,6 +2645,27 @@ impl WorkerRemovalService {
         reason: &str,
         parent_workspace_deletion_operation_id: Option<&str>,
     ) -> std::result::Result<worker::WorkspaceResponse, String> {
+        self.execute_target_removal_on_host_checked(
+            runtime,
+            target,
+            reason,
+            parent_workspace_deletion_operation_id,
+            None,
+        )
+        .await
+    }
+
+    /// Restarted Job cleanup may resume only its already-observed canonical
+    /// operation. Check under the same removal lock; never fall through to planning
+    /// a new removal when the retained operation disappeared or was superseded.
+    async fn execute_target_removal_on_host_checked(
+        &self,
+        runtime: &RuntimeRegistry,
+        target: &RuntimeWorkerRef,
+        reason: &str,
+        parent_workspace_deletion_operation_id: Option<&str>,
+        expected_removal: Option<(&str, &str)>,
+    ) -> std::result::Result<worker::WorkspaceResponse, String> {
         let remove_lock = {
             let mut locks = self
                 .worker_remove_locks
@@ -2670,6 +2693,20 @@ impl WorkerRemovalService {
             .store
             .recover_worker_removal_execution(&self.workspace_id, &target)
             .map_err(|_| "Worker removal recovery authority is unavailable".to_string())?;
+        if let Some((operation_id, fingerprint)) = expected_removal {
+            if !prepared.as_ref().is_some_and(|saved| {
+                saved.plan.workspace_id == self.workspace_id
+                    && saved.plan.worker == *target
+                    && saved.plan.operation_id == operation_id
+                    && saved.plan.input_fingerprint == fingerprint
+                    && saved.runtime_request.operation_id == operation_id
+                    && saved.runtime_request.input_fingerprint == fingerprint
+            }) {
+                return Err(
+                    "Retained Job cleanup removal operation changed or is unavailable".into(),
+                );
+            }
+        }
         if let Some(prepared) = prepared {
             if prepared.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded {
                 self.worker_projection
@@ -4730,6 +4767,7 @@ impl WorkspaceApi {
             notification_delivery_lifecycle: Arc::new(Default::default()),
             orchestrator_attention: Arc::new(Mutex::new(HashMap::new())),
             backend_job_drain_requests: Arc::new(AtomicU64::new(0)),
+            backend_job_recovery: Arc::default(),
             journal_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             journal_dispatch_owner: None,
             plugin_runtime_owner: None,
@@ -4845,7 +4883,16 @@ impl WorkspaceApi {
         &self,
         request: &BackendJobRequest,
     ) -> Result<BackendJobReservation> {
-        self.resolve_backend_job_profile(request)?;
+        // Existing intent replays may only observe the original admission and
+        // must not depend on today's Profile/default. A new dispatch still
+        // resolves current configuration before creating execution authority.
+        if self
+            .store
+            .get_backend_job(self.workspace_id(), &request.job_id)?
+            .is_none()
+        {
+            self.resolve_backend_job_profile(request)?;
+        }
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let reservation = {
             let gate = subjektiv_deletion::job_subject(request)
@@ -4864,7 +4911,9 @@ impl WorkspaceApi {
             self.store
                 .reserve_backend_job(&self.config.workspace_id, request, &now)?
         };
+        let owned_attempt = reservation.attempt.clone();
         let result = self.dispatch_backend_job_reservation(reservation);
+        self.own_backend_job_recovery(&owned_attempt);
         if result.is_err() {
             self.drain_reserved_backend_jobs();
         }
@@ -4872,8 +4921,7 @@ impl WorkspaceApi {
     }
 
     /// Explicit re-evaluation creates a new bounded attempt only after a
-    /// definitive failure. Unknown execution outcomes require manual attention
-    /// and cannot be replayed because the original tracked run may still execute.
+    /// definitive failure and independently confirmed execution/writer cleanup.
     /// Transport replay must call `dispatch_backend_job` with the original
     /// immutable request.
     pub fn retry_backend_job(&self, job_id: &str) -> Result<BackendJobReservation> {
@@ -4899,7 +4947,9 @@ impl WorkspaceApi {
             self.store
                 .reserve_backend_job_retry(&self.config.workspace_id, job_id, &now)?
         };
+        let owned_attempt = reservation.attempt.clone();
         let result = self.dispatch_backend_job_reservation(reservation);
+        self.own_backend_job_recovery(&owned_attempt);
         if result.is_err() {
             self.drain_reserved_backend_jobs();
         }
@@ -4910,6 +4960,12 @@ impl WorkspaceApi {
         &self,
         reservation: BackendJobReservation,
     ) -> Result<BackendJobReservation> {
+        let dispatch_gate = self
+            .backend_job_recovery
+            .dispatch_gate(&reservation.attempt.attempt_id);
+        let _dispatch_guard = dispatch_gate
+            .lock()
+            .map_err(|_| Error::Store("Backend Job dispatch owner poisoned".into()))?;
         // Reread even a terminal/stale reservation before deciding whether it can
         // dispatch or replay: an explicit erasure may have retired its saved input.
         let journal_gate = subjektiv_deletion::job_subject(&reservation.job.request)
@@ -4995,67 +5051,45 @@ impl WorkspaceApi {
             return Ok(reservation);
         }
         let request = &reservation.job.request;
-        let (profile, config_bundle) = match self.resolve_backend_job_profile(request) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                self.finish_backend_job_attempt(
-                    &request.job_id,
-                    &reservation.attempt.attempt_id,
-                    BackendJobAttemptState::Failed,
-                    "profile_requirements",
-                    &error.to_string(),
-                )?;
-                return Err(error);
-            }
-        };
+        let spawn_request =
+            match self.backend_job_spawn_request(&reservation.job, &reservation.attempt) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.finish_backend_job_attempt(
+                        &request.job_id,
+                        &reservation.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "profile_requirements",
+                        &error.to_string(),
+                    )?;
+                    return Err(error);
+                }
+            };
         let worker_input = request.worker_input(&reservation.attempt.attempt_id)?;
-        let control_operation = WorkerControlOperation {
-            operation_id: allocation_key(&reservation.attempt.attempt_id),
-            input_fingerprint: reservation.job.intent_fingerprint.clone(),
-        };
-        let spawned = match self.spawn_workspace_worker(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            WorkerSpawnRequest {
-                requested_worker_name: Some(format!("job:{}", request.purpose)),
-                singleton_key: None,
-                intent: WorkerSpawnIntent::BackendJob {
-                    job_id: request.job_id.clone(),
-                    attempt_id: reservation.attempt.attempt_id.clone(),
-                    purpose: request.purpose.clone(),
-                    input_digest: request.input_digest()?,
-                    subjektiv_consolidation: request.grants.subjektiv_consolidation.is_some(),
-                    subjektiv_journal: request.grants.subjektiv_journal.is_some(),
-                },
-                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                    expected_segments: 0,
-                },
-                profile,
-                ticket_assignment: None,
-                initial_submit: Vec::new(),
-                workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachment_requests: Vec::new(),
-                resolved_workdir_attachments: Vec::new(),
-                resolved_config_bundle: Some(config_bundle),
-                resolved_worker_observation_enabled: false,
-                resolved_worker_observation_grants: Vec::new(),
-                resolved_workspace_api: None,
-                resolved_memory_settings: None,
-                // Journal Jobs use their independent frozen Job Host grant, not the
-                // main-Subject/Memory attachment or its resident/extraction policy.
-                resolved_subjektiv_attached: request.grants.subjektiv_consolidation.is_some(),
-                resolved_control_operation: Some(control_operation),
-                resolved_execution_grant: None,
-            },
-        ) {
+        let spawned = match self.spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request) {
             Ok(spawned) => spawned,
             Err(error) => {
                 let detail = error.error.to_string();
-                self.finish_backend_job_attempt(
-                    &request.job_id,
-                    &reservation.attempt.attempt_id,
-                    BackendJobAttemptState::Failed,
-                    "dispatch_error",
+                if matches!(
+                    &error.error,
+                    Error::UnknownRuntime(_)
+                        | Error::InvalidInput(_)
+                        | Error::WorkspacePermissionDenied(_)
+                ) {
+                    self.finish_backend_job_attempt(
+                        &request.job_id,
+                        &reservation.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "dispatch_rejected",
+                        &detail,
+                    )?;
+                    return Err(error.error);
+                }
+                self.retain_backend_job_recovery(
+                    &reservation.attempt,
+                    "allocation_response_lost",
                     &detail,
+                    "Read the same allocation receipt; never allocate a replacement Worker",
                 )?;
                 return Err(error.error);
             }
@@ -5084,6 +5118,18 @@ impl WorkspaceApi {
         };
         let bound_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let runtime_run_id = crate::backend_job::runtime_run_id(&reservation.attempt.attempt_id);
+        // Only this initial allocation path can open Host admission. Recovery must
+        // never reconstruct an empty owner and use its drain as historical proof.
+        self.backend_job_recovery.initially_admit(
+            crate::backend_job_host_effects::JobHostOwner {
+                workspace_id: self.workspace_id().to_owned(),
+                job_id: request.job_id.clone(),
+                attempt_id: reservation.attempt.attempt_id.clone(),
+                input_digest: reservation.attempt.input_digest.clone(),
+                worker: worker.worker.clone(),
+                runtime_run_id: runtime_run_id.clone(),
+            },
+        )?;
         let newly_bound = self.worker_projection.publish_ordered(|| {
             self.store
                 .bind_backend_job_attempt_worker(
@@ -5123,71 +5169,15 @@ impl WorkspaceApi {
             &reservation.attempt.deadline_at,
         );
 
-        let submitted = match self.runtime.send_input(
-            &worker.worker,
-            WorkerInputRequest {
-                source: None,
-                kind: WorkerInputKind::User,
-                content: worker_input,
-                submission_request_id: Some(runtime_run_id.clone()),
-                segments: None,
-            },
-        ) {
-            Ok(submitted) => submitted,
-            Err(error) => {
-                let detail = error.message();
-                self.finish_backend_job_attempt(
-                    &request.job_id,
-                    &reservation.attempt.attempt_id,
-                    BackendJobAttemptState::Unknown,
-                    "input_outcome_unknown",
-                    &detail,
-                )?;
-                return Err(error.into_error());
-            }
-        };
-        if submitted.state != InternalWorkerOperationState::Accepted {
-            let detail = submitted
-                .diagnostics
-                .first()
-                .map(|diagnostic| diagnostic.message.as_str())
-                .unwrap_or("embedded Runtime rejected Backend Job input");
-            let (state, category) = match submitted.disposition {
-                WorkerInputDisposition::Unknown => {
-                    (BackendJobAttemptState::Unknown, "input_outcome_unknown")
-                }
-                WorkerInputDisposition::Accepted | WorkerInputDisposition::Rejected => {
-                    (BackendJobAttemptState::Failed, "input_rejected")
-                }
-            };
-            self.finish_backend_job_attempt(
+        let bound = self
+            .store
+            .get_backend_job_attempt(
+                self.workspace_id(),
                 &request.job_id,
                 &reservation.attempt.attempt_id,
-                state,
-                category,
-                detail,
-            )?;
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                code: format!("backend_job_{category}"),
-                message: detail.to_string(),
-            });
-        }
-        if submitted.runtime_run_id.as_deref() != Some(runtime_run_id.as_str()) {
-            self.finish_backend_job_attempt(
-                &request.job_id,
-                &reservation.attempt.attempt_id,
-                BackendJobAttemptState::Unknown,
-                "runtime_run_mismatch",
-                "embedded Runtime accepted Backend Job input without matching tracked run evidence",
-            )?;
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                code: "backend_job_runtime_run_mismatch".to_string(),
-                message: "embedded Runtime accepted Backend Job input without matching tracked run evidence"
-                    .to_string(),
-            });
-        }
+            )?
+            .ok_or_else(|| Error::Store("bound Backend Job attempt missing".into()))?;
+        self.submit_initial_backend_job_input(&reservation.job, &bound, worker_input)?;
         subjektiv_journal::attest_delivery(self, &reservation)?;
         let job = self
             .store
@@ -5293,6 +5283,7 @@ impl WorkspaceApi {
                             });
                     }
                 }
+                self.own_backend_job_recovery(attempt);
             }
             if attempts.len() < page_limit || !made_progress {
                 return;
@@ -5308,18 +5299,7 @@ impl WorkspaceApi {
         failure_category: &str,
         failure_detail: &str,
     ) -> Result<BackendJobAttemptRecord> {
-        if let Some(job) = self
-            .store
-            .get_backend_job(&self.config.workspace_id, job_id)?
-            && job.request.grants.subjektiv_journal.is_some()
-            && state != BackendJobAttemptState::Unknown
-            && let Some(attempt) =
-                self.store
-                    .get_backend_job_attempt(&self.config.workspace_id, job_id, attempt_id)?
-        {
-            subjektiv_journal::close(self, &job.request, &attempt)?;
-        }
-        let attempt = self.store.finish_backend_job_attempt(
+        self.store.finish_backend_job_attempt(
             &self.config.workspace_id,
             job_id,
             attempt_id,
@@ -5328,15 +5308,6 @@ impl WorkspaceApi {
             failure_detail,
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )?;
-        // A retained checkpoint can prove the Journal result even if teardown is
-        // blocked. Do not make outcome resolution depend on successful Session cleanup.
-        if attempt.state == BackendJobAttemptState::Unknown
-            && let Some(job) = self.store.get_backend_job(self.workspace_id(), job_id)?
-            && job.request.grants.subjektiv_journal.is_some()
-            && let Err(error) = subjektiv_journal::reconcile_unknown(self, &job, &attempt)
-        {
-            tracing::warn!(%error,%job_id,%attempt_id,"Journal Unknown outcome remains recoverable");
-        }
         let current = self
             .store
             .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)?
@@ -5345,71 +5316,33 @@ impl WorkspaceApi {
         Ok(current)
     }
 
-    /// Admit on the independent cleanup lane before claiming durable work. Rejection leaves
-    /// Pending/Failed recoverable, not an orphaned Executing claim. Runtime teardown is a
-    /// lifecycle fence, not model-processing evidence; unknown DB outcomes are not retried.
+    /// Cleanup has its own admitted lifetime, separate from the result callback lease.
+    /// Claim occurs only after lane admission; retained exact owners recover storage faults.
     fn schedule_backend_job_worker_cleanup(&self, attempt: &BackendJobAttemptRecord) -> bool {
         if !attempt.state.terminal()
             || attempt.worker.is_none()
             || !matches!(
                 attempt.worker_cleanup_state,
-                Some(BackendJobWorkerCleanupState::Pending | BackendJobWorkerCleanupState::Failed)
+                Some(
+                    BackendJobWorkerCleanupState::Pending
+                        | BackendJobWorkerCleanupState::Failed
+                        | BackendJobWorkerCleanupState::Executing
+                        | BackendJobWorkerCleanupState::Completed
+                )
             )
         {
             return false;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(job_id = %attempt.job_id, "Backend Job cleanup remains durable without a runtime");
-            return false;
-        };
-        let api = self.clone();
-        let job_id = attempt.job_id.clone();
-        let attempt_id = attempt.attempt_id.clone();
-        // Admit before claiming: overload must leave durable Pending/Failed
-        // ownership recoverable, never strand a Running claim without a job.
-        let admission = self.host_executors.cleanup().and_then(|executor| {
-            executor.dispatch(move || {
-            let cleanup = || -> Result<()> {
-                let (attempt, claimed) = api.store.claim_backend_job_worker_cleanup(
-                    &api.config.workspace_id, &job_id, &attempt_id,
-                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                )?;
-                if !claimed { return Ok(()); }
-                let waits_for_run_teardown = attempt.state == BackendJobAttemptState::Completed
-                    || attempt.failure_category.as_deref() == Some("invalid_result");
-                runtime.block_on(async {
-                    if waits_for_run_teardown {
-                        api.wait_for_backend_job_worker_run_teardown(&attempt).await?;
-                    }
-                    // Already on the Host owner; removal must not submit to and
-                    // wait on its own lane. All transaction helpers return before I/O.
-                    api.cleanup_backend_job_attempt_worker(attempt).await
-                })
-            };
-            if let Err(error) = cleanup() {
-                tracing::warn!(%error, %job_id, %attempt_id, "Backend Job Worker cleanup failed");
-            }
-        })
-        });
-        if let Err(error) = admission {
-            tracing::warn!(%error, "Backend Job cleanup was not admitted; its durable ownership is unchanged");
-            return false;
-        }
-        true
+        self.own_backend_job_cleanup(attempt)
     }
 
     async fn wait_for_backend_job_worker_run_teardown(
         &self,
         attempt: &BackendJobAttemptRecord,
     ) -> Result<()> {
-        let worker = attempt.worker.as_ref().ok_or_else(|| {
-            Error::Store("claimed Backend Job Worker cleanup lost its binding".to_string())
-        })?;
-        let Some(runtime_run_id) = attempt.runtime_run_id.as_deref() else {
-            // Attempts created before tracked Runtime submissions can only be
-            // recovered after a Backend restart, which has already ended their
-            // in-process result response and Run. Canonical stop/remove remains
-            // the safety boundary for those legacy leftovers.
+        // This wait only preserves response ordering. It is NEVER termination proof;
+        // canonical stop plus exact Controller/Host fences are required below.
+        let Some(worker) = attempt.worker.as_ref() else {
             return Ok(());
         };
         let journal_request = self
@@ -5418,56 +5351,40 @@ impl WorkspaceApi {
             .filter(|job| job.request.grants.subjektiv_journal.is_some())
             .map(|job| job.request);
         let deadline = chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
-            .map_err(|e| Error::Store(e.to_string()))?;
-        loop {
-            if let Some(request) = &journal_request {
-                // Preserve normal result-response teardown ordering, but an explicit
-                // erasure or the immutable Job deadline must not wait on a stuck Run.
-                // Actual stop and canonical Purge still happen below this wait.
-                if Utc::now() >= deadline || subjektiv_journal::session_erased(self, request)? {
-                    return Ok(());
-                }
+            .map_err(|error| Error::Store(error.to_string()))?;
+        while Utc::now() < deadline {
+            // Explicit erasure interrupts response ordering, not termination proof.
+            // The caller must still stop, join and fence this exact execution.
+            if let Some(request) = &journal_request
+                && subjektiv_journal::session_erased(self, request)?
+            {
+                break;
             }
             match self.runtime.worker(worker) {
                 Ok(detail)
-                    if detail.state.eq_ignore_ascii_case("stopped")
-                        || detail.execution_reconstructed
-                        || detail.worker_state.as_ref().is_some_and(|snapshot| {
-                            snapshot.state == protocol::WorkerState::Idle
-                                && snapshot.last_finished_submission_request_id.as_deref()
-                                    == Some(runtime_run_id)
-                        }) =>
+                    if detail.worker_state.as_ref().is_some_and(|state| {
+                        state.last_finished_submission_request_id == attempt.runtime_run_id
+                    }) =>
                 {
-                    return Ok(());
+                    break;
                 }
-                Ok(_) => {
-                    // In this process incarnation the result capability runs inside
-                    // this tracked Submit. The controller publishes the exact request
-                    // id only after the invocation returns. A Worker reconstructed
-                    // from durable state is handled above instead: opening the
-                    // Worker store exclusively proves its prior process and any
-                    // pre-marker Run are gone, even if execution restoration has
-                    // not yet produced a fresh live snapshot.
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Ok(detail)
+                    if detail.state.eq_ignore_ascii_case("stopped")
+                        || detail.execution_reconstructed =>
+                {
+                    break;
                 }
-                Err(RuntimeRegistryError::UnknownWorker { .. }) => return Ok(()),
-                Err(error) => {
-                    self.store.finish_backend_job_worker_cleanup(
-                        &self.config.workspace_id,
-                        &attempt.job_id,
-                        &attempt.attempt_id,
-                        BackendJobWorkerCleanupState::Failed,
-                        Some("backend_job_cleanup_run_state_unavailable"),
-                        Some(&error.message()),
-                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                    )?;
-                    return Err(error.into_error());
-                }
+                Err(_) => break,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
             }
         }
+        Ok(())
     }
 
     fn recover_backend_job_worker_cleanups(&self) -> Result<()> {
+        // The same Store list also returns Completed Journal cleanup with
+        // Available input. Its owner takes the retirement-only step before claim;
+        // neither a live Worker nor a new removal operation is required.
         let page_limit = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS);
         let mut attempts = self.store.recover_backend_job_worker_cleanups(
             &self.config.workspace_id,
@@ -5494,7 +5411,11 @@ impl WorkspaceApi {
     async fn cleanup_backend_job_attempt_worker(
         &self,
         attempt: BackendJobAttemptRecord,
+        retained_removal: Option<(String, String)>,
     ) -> Result<()> {
+        let history = self
+            .store
+            .list_backend_job_attempts(self.workspace_id(), &attempt.job_id)?;
         let job_id = attempt.job_id.as_str();
         let attempt_id = attempt.attempt_id.as_str();
         let worker = attempt.worker.clone().ok_or_else(|| {
@@ -5502,10 +5423,10 @@ impl WorkspaceApi {
         })?;
 
         let fail = |category: &str, detail: String| -> Result<()> {
-            self.store.finish_backend_job_worker_cleanup(
+            self.store.finish_backend_job_worker_cleanup_owned(
                 &self.config.workspace_id,
-                job_id,
-                attempt_id,
+                &history,
+                &attempt,
                 BackendJobWorkerCleanupState::Failed,
                 Some(category),
                 Some(&detail),
@@ -5518,11 +5439,12 @@ impl WorkspaceApi {
             })
         };
         let complete = || -> Result<()> {
-            let journal = self
+            self.require_backend_job_attempt_effects_ended(&attempt)?;
+            let journal_job = self
                 .store
                 .get_backend_job(self.workspace_id(), job_id)?
-                .is_some_and(|job| job.request.grants.subjektiv_journal.is_some());
-            if journal {
+                .filter(|job| job.request.grants.subjektiv_journal.is_some());
+            if journal_job.is_some() {
                 let removal = self
                     .config_store
                     .recover_worker_removal_execution(self.workspace_id(), &worker)
@@ -5539,95 +5461,37 @@ impl WorkspaceApi {
                     );
                 }
             }
-            self.store.finish_backend_job_worker_cleanup(
+            if let Some(job) = &journal_job {
+                if !subjektiv_journal::session_erased(self, &job.request)? {
+                    // Close the old generation before publishing cleanup completion.
+                    // A failed close remains owned and recoverable, never hidden by
+                    // an already-Completed cleanup marker.
+                    subjektiv_journal::close(self, &job.request, &attempt)?;
+                }
+            }
+            self.store.finish_backend_job_worker_cleanup_owned(
                 &self.config.workspace_id,
-                job_id,
-                attempt_id,
+                &history,
+                &attempt,
                 BackendJobWorkerCleanupState::Completed,
                 None,
                 None,
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
             )?;
-            if let Some(job) = self
-                .store
-                .get_backend_job(&self.config.workspace_id, job_id)?
-                && job.request.grants.subjektiv_journal.is_some()
-            {
-                // Cleanup completion is a durable stop/removal fence. Unknown is
-                // reconciled with retained domain receipts before closing its generation.
-                let current = self
-                    .store
-                    .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)?
-                    .ok_or_else(|| Error::Store("cleaned Journal attempt missing".into()))?;
-                if current.state == BackendJobAttemptState::Unknown {
-                    subjektiv_journal::reconcile_unknown(self, &job, &current)?;
-                } else if !subjektiv_journal::session_erased(self, &job.request)? {
-                    subjektiv_journal::close(self, &job.request, &current)?;
-                    if current.state == BackendJobAttemptState::Completed {
-                        subjektiv_journal::drain_after_completion(self, &job.request);
-                        if job.input_disposition
-                            == crate::backend_job::JobInputDisposition::Available
-                        {
-                            self.store.reclaim_backend_job_input(
-                                self.workspace_id(),
-                                job_id,
-                                &job.input_digest,
-                                crate::backend_job::JobInputRetirementReason::Completed,
-                            )?;
-                        }
-                    }
-                }
-            }
-            Ok(())
+            self.finish_backend_job_cleanup_retirement(job_id, attempt_id)
         };
 
-        let detail = match self.runtime.worker(&worker) {
-            Ok(detail) => detail,
-            Err(RuntimeRegistryError::UnknownWorker { .. }) => {
-                if self
-                    .store
-                    .get_worker_registry(&self.config.workspace_id, &worker)?
-                    .is_none()
-                {
-                    return complete();
-                }
-                // A canonical removal may have deleted the Runtime object before
-                // its catalog commit. Let the existing durable removal operation
-                // recover that midpoint; without such an operation this remains
-                // a diagnosable retryable failure rather than a direct DB delete.
-                let response = WorkerRemovalService::new(self)
-                    .execute_target_removal_on_host(
-                        self.runtime.as_ref(),
-                        &worker,
-                        &format!("Terminal Backend Job attempt {attempt_id}"),
-                        None,
-                    )
-                    .await
-                    .map_err(|message| Error::RuntimeOperationFailed {
-                        runtime_id: worker.runtime_id.clone(),
-                        code: "backend_job_cleanup_removal_failed".to_string(),
-                        message,
-                    });
-                return match response {
-                    Ok(response) if response.status == StatusCode::OK.as_u16() => complete(),
-                    Ok(response) => {
-                        fail("backend_job_cleanup_runtime_worker_missing", response.body)
-                    }
-                    Err(error) => fail("backend_job_cleanup_removal_failed", error.to_string()),
-                };
-            }
-            Err(error) => {
-                return fail("backend_job_cleanup_runtime_unavailable", error.message());
-            }
-        };
-        if !detail.state.eq_ignore_ascii_case("stopped") {
+        // Stop acceptance and the status projection are not scope termination receipts.
+        // Even a currently Stopped Worker needs retained exact execution-owner proof.
+        if self
+            .require_backend_job_attempt_effects_ended(&attempt)
+            .is_err()
+        {
             match self.runtime.stop_worker(
                 &worker,
                 WorkerLifecycleRequest {
                     stop_intent: None,
-                    reason: Some(format!(
-                        "Backend Job attempt {attempt_id} reached terminal state"
-                    )),
+                    reason: Some(format!("Backend Job attempt {attempt_id} cleanup")),
                     ticket_assignment: None,
                 },
             ) {
@@ -5638,36 +5502,22 @@ impl WorkspaceApi {
                         runtime_diagnostics_message(&result.diagnostics),
                     );
                 }
-                Err(error) => {
-                    return fail("backend_job_cleanup_stop_failed", error.message());
-                }
+                Err(error) => return fail("backend_job_cleanup_stop_unconfirmed", error.message()),
             }
-        }
-        match self.runtime.worker(&worker) {
-            Ok(detail) if detail.state.eq_ignore_ascii_case("stopped") => {}
-            Ok(detail) => {
-                return fail(
-                    "backend_job_cleanup_stop_unconfirmed",
-                    format!(
-                        "Runtime reported Worker state `{}` after accepting stop",
-                        detail.state
-                    ),
-                );
-            }
-            Err(error) => {
-                return fail(
-                    "backend_job_cleanup_stop_confirmation_failed",
-                    error.message(),
-                );
+            if let Err(error) = self.fence_backend_job_effects(&attempt).await {
+                return fail("backend_job_cleanup_effects_unconfirmed", error.to_string());
             }
         }
 
         let response = WorkerRemovalService::new(self)
-            .execute_target_removal_on_host(
+            .execute_target_removal_on_host_checked(
                 self.runtime.as_ref(),
                 &worker,
                 &format!("Terminal Backend Job attempt {attempt_id}"),
                 None,
+                retained_removal
+                    .as_ref()
+                    .map(|(id, fingerprint)| (id.as_str(), fingerprint.as_str())),
             )
             .await
             .map_err(|message| Error::RuntimeOperationFailed {
@@ -5682,168 +5532,36 @@ impl WorkspaceApi {
         if response.status == StatusCode::OK.as_u16() {
             return complete();
         }
-        let runtime_absent = matches!(
-            self.runtime.worker(&worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        );
-        let catalog_absent = self
-            .store
-            .get_worker_registry(&self.config.workspace_id, &worker)?
-            .is_none();
-        if runtime_absent && catalog_absent {
-            return complete();
-        }
         fail("backend_job_cleanup_removal_rejected", response.body)
     }
 
-    /// Reconcile durable non-terminal attempts after Backend restart. Reserved
-    /// attempts are replay-dispatched through their deterministic allocation;
-    /// dispatched attempts keep running only while their bound Worker remains
-    /// known, and always receive a fresh deadline task.
+    /// Restore owners for current-contract attempts without replaying uncertain effects.
     pub fn recover_backend_jobs(&self) -> Result<()> {
-        let attempts = self.store.list_recoverable_backend_job_attempts(
-            &self.config.workspace_id,
+        for attempt in self.store.list_recoverable_backend_job_attempts(
+            self.workspace_id(),
             usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS),
-        )?;
-        for attempt in attempts {
-            match attempt.state {
-                BackendJobAttemptState::Reserved => {
-                    let job = self
-                        .store
-                        .get_backend_job(&self.config.workspace_id, &attempt.job_id)?
-                        .ok_or_else(|| {
-                            Error::Store("recoverable Backend Job disappeared".to_string())
-                        })?;
-                    if let Err(error) =
-                        self.dispatch_backend_job_reservation(BackendJobReservation {
-                            job,
-                            attempt,
-                            replayed: true,
-                            resource_reused: false,
-                        })
-                    {
-                        tracing::warn!(%error, "Backend Job reserved-attempt recovery failed");
-                    }
-                }
-                BackendJobAttemptState::Dispatching => {
-                    self.finish_backend_job_attempt(
-                        &attempt.job_id,
-                        &attempt.attempt_id,
-                        BackendJobAttemptState::Unknown,
-                        "recovery_dispatch_claim_unknown",
-                        "a Backend Job dispatch claim could not be safely replayed after restart",
-                    )?;
-                }
-                BackendJobAttemptState::Dispatched => {
-                    if attempt.runtime_run_id.is_none() {
-                        self.finish_backend_job_attempt(
-                            &attempt.job_id,
-                            &attempt.attempt_id,
-                            BackendJobAttemptState::Unknown,
-                            "recovery_runtime_run_unknown",
-                            "the Runtime accepted Worker dispatch without durable run evidence",
-                        )?;
-                        continue;
-                    }
-                    let observed = attempt
-                        .worker
-                        .as_ref()
-                        .map(|worker| self.runtime.worker(worker));
-                    if observed.as_ref().is_some_and(|result| {
-                        result.as_ref().is_ok_and(|detail| {
-                            detail.state.eq_ignore_ascii_case("stopped")
-                                || detail.execution_reconstructed
-                        })
-                    }) && self
-                        .store
-                        .get_backend_job(self.workspace_id(), &attempt.job_id)?
-                        .is_some_and(|job| job.request.grants.subjektiv_journal.is_some())
-                    {
-                        // This is not success evidence. Move to Unknown to fence tools;
-                        // only domain completion or confirmed canonical cleanup resolves it.
-                        self.finish_backend_job_attempt(&attempt.job_id, &attempt.attempt_id,
-                            BackendJobAttemptState::Unknown, "recovery_journal_execution_ended",
-                            "Runtime reports the prior Journal execution ended; reconciling saved domain receipts")?;
-                        continue;
-                    }
-                    let worker_known = observed.as_ref().is_some_and(|result| result.is_ok());
-                    if !worker_known {
-                        self.finish_backend_job_attempt(
-                            &attempt.job_id,
-                            &attempt.attempt_id,
-                            BackendJobAttemptState::Unknown,
-                            "recovery_worker_unknown",
-                            "the bound Runtime Worker was not recoverable after Backend restart",
-                        )?;
-                    } else {
-                        self.schedule_backend_job_timeout(
-                            &attempt.job_id,
-                            &attempt.attempt_id,
-                            &attempt.deadline_at,
-                        );
-                    }
-                }
-                BackendJobAttemptState::Completed
-                | BackendJobAttemptState::Failed
-                | BackendJobAttemptState::Unknown => {}
-            }
+        )? {
+            self.own_backend_job_recovery(&attempt);
         }
-        subjektiv_journal::recover_unknowns(self)?;
+        subjektiv_journal::recover_attempts(self)?;
         self.recover_backend_job_worker_cleanups()?;
         self.drain_reserved_backend_jobs();
         Ok(())
     }
 
-    fn schedule_backend_job_timeout(&self, job_id: &str, attempt_id: &str, deadline_at: &str) {
-        let Ok(deadline) = chrono::DateTime::parse_from_rfc3339(deadline_at) else {
-            return;
-        };
-        let delay = (deadline.with_timezone(&Utc) - Utc::now())
-            .to_std()
-            .unwrap_or_default();
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let api = self.clone();
-        let job_id = job_id.to_string();
-        let attempt_id = attempt_id.to_string();
-        handle.spawn(async move {
-            tokio::time::sleep(delay).await;
-            let admission = api.host_executors.host().and_then(|executor| executor.dispatch(move || {
-            let Ok(Some(attempt)) =
-                api.store
-                    .get_backend_job_attempt(&api.config.workspace_id, &job_id, &attempt_id)
-            else {
-                return;
-            };
-            if attempt.state != BackendJobAttemptState::Dispatched {
-                return;
-            }
-            // Fence result acceptance before stopping the Worker so a late
-            // completion cannot turn a timed-out attempt into success.
-            if api
-                .finish_backend_job_attempt(
-                    &job_id,
-                    &attempt_id,
-                    BackendJobAttemptState::Failed,
-                    "timeout",
-                    "Backend Job attempt exceeded its durable deadline",
-                )
-                .is_ok()
-            {
-                api.drain_reserved_backend_jobs();
-            }
-            }));
-            if let Err(error) = admission {
-                tracing::warn!(%error, "Backend Job timeout was not admitted; its deadline remains durable");
-            }
-        });
+    fn schedule_backend_job_timeout(&self, job_id: &str, attempt_id: &str, _deadline_at: &str) {
+        if let Ok(Some(attempt)) =
+            self.store
+                .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)
+        {
+            self.own_backend_job_recovery(&attempt);
+        }
     }
 
     /// Accept the only authoritative success signal for a Job attempt. The
     /// source identity is fenced against the durable Worker binding. Result
     /// persistence precedes best-effort notification delivery.
-    pub fn accept_backend_job_result(
+    fn accept_backend_job_result_inner(
         &self,
         source_worker: &RuntimeWorkerRef,
         submission: &BackendJobResultSubmission,
@@ -5995,14 +5713,8 @@ impl WorkspaceApi {
             &accepted_at,
         )?;
         drop(subject_guard);
-        if let Some(job) = self
-            .store
-            .get_backend_job(&self.config.workspace_id, &submission.job_id)?
-            && job.request.grants.subjektiv_journal.is_some()
-        {
-            subjektiv_journal::close(self, &job.request, &acceptance.attempt)?;
-            subjektiv_journal::drain_after_completion(self, &job.request);
-        }
+        // Closing a generation/releasing pins is a writer operation, not a consequence
+        // of accepting a result. Canonical cleanup performs it after independent fences.
         notification_delivery::deliver_job_result(self, &acceptance);
         let _ = self.schedule_backend_job_worker_cleanup(&acceptance.attempt);
         self.drain_reserved_backend_jobs();
@@ -15079,9 +14791,13 @@ fn build_inner_router(api: WorkspaceApi) -> Router {
     .route("/api/w/{workspace_id}/subjektiv/journal/job", post(subjektiv_journal::job_route))
     .route("/api/w/{workspace_id}/subjektiv/journal/job/finish", post(subjektiv_journal::finish_route))
     .fallback(get(static_or_spa_fallback))
-    .with_state(api)
+    .with_state(api.clone())
     .merge(generated_workspace_contract_router(contract_service));
     auth.merge(workspace)
+        .layer(middleware::from_fn_with_state(
+            api,
+            backend_job_recovery::admit_host_request,
+        ))
         .layer(middleware::from_fn(log_failed_api_response))
 }
 
@@ -15253,6 +14969,7 @@ pub async fn serve(
 // Feature shutdown fences new operations and waits for synchronous connection
 // holders. Accepted close retains ownership after its async waiter disappears.
 async fn shutdown_workspace_feature_storage(api: &WorkspaceApi) -> Result<()> {
+    api.stop_backend_job_recovery().await;
     // Aborting the async hook cannot cancel an already admitted Host closure.
     // Fence all delivery entry points and wait for their actual I/O owners first.
     api.notification_delivery_lifecycle.stop_and_drain().await;
@@ -51717,6 +51434,8 @@ mod tests {
     // The receiver belongs to one mock execution, not to a Runtime WorkerRecord.
     // Bound protocol senders become terminal when Stop drops this execution.
     struct DeterministicWorkerExecution {
+        execution_id: uuid::Uuid,
+        background: Mutex<Vec<std::thread::JoinHandle<()>>>,
         subject_release: std::sync::Mutex<
             Option<(
                 runtime_api::SubjectReleaseRequest,
@@ -51743,6 +51462,8 @@ mod tests {
             let (method_tx, method_rx) = tokio::sync::mpsc::channel(32);
             let (events, _) = tokio::sync::broadcast::channel(32);
             Self {
+                execution_id: uuid::Uuid::now_v7(),
+                background: Mutex::new(Vec::new()),
                 subject_release: std::sync::Mutex::new(None),
                 dispatch_hook: std::sync::Mutex::new(None),
                 context,
@@ -51852,6 +51573,23 @@ mod tests {
     }
 
     struct DeterministicExecutionBackend {
+        receipts: Mutex<
+            HashMap<
+                (worker_runtime::identity::WorkerRef, String),
+                (
+                    serde_json::Value,
+                    worker_runtime::execution::WorkerExecutionResult,
+                ),
+            >,
+        >,
+        terminations: Mutex<
+            HashMap<
+                worker_runtime::identity::WorkerRef,
+                worker_runtime::execution::WorkerExecutionTermination,
+            >,
+        >,
+        lose_input_ack: std::sync::atomic::AtomicBool,
+        reject_input_definitively: std::sync::atomic::AtomicBool,
         assignment_release_enabled: std::sync::atomic::AtomicBool,
         contexts: std::sync::Mutex<
             std::collections::HashMap<
@@ -51901,6 +51639,10 @@ mod tests {
                     .as_nanos()
             );
             Self {
+                receipts: Mutex::new(HashMap::new()),
+                terminations: Mutex::new(HashMap::new()),
+                lose_input_ack: std::sync::atomic::AtomicBool::new(false),
+                reject_input_definitively: std::sync::atomic::AtomicBool::new(false),
                 assignment_release_enabled: std::sync::atomic::AtomicBool::new(false),
                 contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
                 materializer: worker_runtime::working_directory::RuntimeGitMaterializer::new(
@@ -52288,6 +52030,117 @@ mod tests {
             Ok(())
         }
 
+        fn termination_receipt(
+            &self,
+            worker_ref: &worker_runtime::identity::WorkerRef,
+        ) -> std::result::Result<
+            Option<worker_runtime::execution::WorkerExecutionTermination>,
+            String,
+        > {
+            let receipt = self.terminations.lock().unwrap().get(worker_ref).cloned();
+            if let Some(current) = self.contexts.lock().unwrap().get(worker_ref)
+                && receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.execution_id != current.execution_id)
+            {
+                return Err(
+                    "Fixture execution was replaced; old termination is not current evidence"
+                        .into(),
+                );
+            }
+            Ok(receipt)
+        }
+
+        fn stop_worker_operation(
+            &self,
+            request: worker_runtime::execution::WorkerExecutionStopRequest,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            use worker_runtime::execution::*;
+            if let Some(receipt) = self
+                .terminations
+                .lock()
+                .unwrap()
+                .get(&request.worker_ref)
+                .cloned()
+                && receipt.stop_operation_id == request.operation_id
+            {
+                let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+                result.execution_id = Some(receipt.execution_id);
+                result.termination = Some(receipt);
+                return result;
+            }
+            let execution = self
+                .contexts
+                .lock()
+                .unwrap()
+                .get(&request.worker_ref)
+                .cloned();
+            let Some(execution) = execution else {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "No fixture execution or matching stop receipt",
+                );
+            };
+            let mut result = self.stop_worker(&request.worker_ref);
+            // This fixture has no real Controller/Features. Join its actual echo
+            // threads before attesting its explicitly substituted execution boundary.
+            for task in std::mem::take(&mut *execution.background.lock().unwrap()) {
+                if task.join().is_err() {
+                    return WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Stop,
+                        "Fixture background join failed",
+                    );
+                }
+            }
+            let submissions = self
+                .receipts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((worker, _), (_, result))| {
+                    worker == &request.worker_ref
+                        && result.execution_id == Some(execution.execution_id)
+                })
+                .filter_map(|(_, (_, result))| result.submission.clone())
+                .collect();
+            let receipt = WorkerExecutionTermination {
+                scope: WorkerExecutionTerminationScope::Controller,
+                worker_ref: request.worker_ref.clone(),
+                stop_operation_id: request.operation_id,
+                execution_id: execution.execution_id,
+                shutdown_command_id: Some(1),
+                submissions,
+                feature_failures: Vec::new(),
+            };
+            self.terminations
+                .lock()
+                .unwrap()
+                .insert(request.worker_ref, receipt.clone());
+            result.execution_id = Some(receipt.execution_id);
+            result.termination = Some(receipt);
+            result
+        }
+
+        fn reconcile_submission(
+            &self,
+            worker_ref: &worker_runtime::identity::WorkerRef,
+            input: worker_runtime::interaction::WorkerInput,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            use worker_runtime::execution::*;
+            let key = (
+                worker_ref.clone(),
+                input.submission_request_id.clone().unwrap_or_default(),
+            );
+            let payload = serde_json::to_value(input).unwrap();
+            match self.receipts.lock().unwrap().get(&key) {
+                Some((saved, receipt)) if saved == &payload => receipt.clone(),
+                _ => WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Input,
+                    "Fixture exact input receipt missing or mismatched",
+                ),
+            }
+        }
+
         fn stop_worker(
             &self,
             worker_ref: &worker_runtime::identity::WorkerRef,
@@ -52339,9 +52192,14 @@ mod tests {
                 );
             };
             let bound_execution = Arc::downgrade(&execution);
-            drop(execution);
             if let Some(hook) = self.input_hook.lock().unwrap().take() {
                 hook(worker_ref);
+            }
+            if self.reject_input_definitively.load(Ordering::Acquire) {
+                return worker_runtime::execution::WorkerExecutionResult::rejected(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    "Fixture admission rejected before acceptance",
+                );
             }
             if let Some(message) = self.input_failure.lock().unwrap().clone() {
                 return worker_runtime::execution::WorkerExecutionResult::errored(
@@ -52352,7 +52210,7 @@ mod tests {
             let submission_request_id = input.submission_request_id.clone();
             let input_kind = input.kind.clone();
             let content = input.content.clone();
-            std::thread::spawn(move || {
+            let background = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(25));
                 if let Some(execution) = bound_execution.upgrade() {
                     let _ = execution.publish_event(protocol::Event::TextDone {
@@ -52360,7 +52218,9 @@ mod tests {
                     });
                 }
             });
-            if input_kind == worker_runtime::interaction::WorkerInputKind::Notify {
+            execution.background.lock().unwrap().push(background);
+            let mut receipt = if input_kind == worker_runtime::interaction::WorkerInputKind::Notify
+            {
                 worker_runtime::execution::WorkerExecutionResult::accepted_notification(
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                     submission_request_id.expect("Notify test input has a Runtime request id"),
@@ -52383,7 +52243,23 @@ mod tests {
                     worker_runtime::execution::WorkerExecutionOperation::Input,
                 )
                 .with_worker_state(protocol::WorkerStateSnapshot::initial())
+            };
+            receipt.execution_id = Some(execution.execution_id);
+            if let Some(id) = &input.submission_request_id {
+                self.receipts.lock().unwrap().insert(
+                    (worker_ref.clone(), id.clone()),
+                    (serde_json::to_value(&input).unwrap(), receipt.clone()),
+                );
             }
+            if self.lose_input_ack.swap(false, Ordering::AcqRel) {
+                let mut lost = worker_runtime::execution::WorkerExecutionResult::errored(
+                    worker_runtime::execution::WorkerExecutionOperation::Input,
+                    "Fixture response lost after durable input acceptance",
+                );
+                lost.execution_id = Some(execution.execution_id);
+                return lost;
+            }
+            receipt
         }
     }
 
@@ -53346,1127 +53222,7 @@ mod tests {
         assert!(execution.take_inputs().is_empty());
     }
 
-    #[tokio::test]
-    async fn backend_job_runner_uses_registered_embedded_worker_and_structured_result_authority() {
-        let temp = tempfile::tempdir().unwrap();
-        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
-        let request = BackendJobRequest {
-            job_id: "runner-check-1".to_string(),
-            purpose: "runner_contract_check".to_string(),
-            input_ref: "test://runner/input/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-
-        let stale_reservation = api
-            .store
-            .reserve_backend_job(
-                TEST_WORKSPACE_ID,
-                &request,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        let dispatched = api
-            .dispatch_backend_job_reservation(stale_reservation.clone())
-            .unwrap();
-        let concurrent_replay = api
-            .dispatch_backend_job_reservation(stale_reservation)
-            .unwrap();
-        assert!(concurrent_replay.replayed);
-        assert_eq!(
-            execution.take_inputs().len(),
-            1,
-            "a stale concurrent dispatch replay must not submit the attempt twice"
-        );
-        assert_eq!(dispatched.attempt.state, BackendJobAttemptState::Dispatched);
-        assert!(
-            dispatched.attempt.runtime_run_id.is_some(),
-            "accepted Job input must be fenced to durable Runtime run evidence"
-        );
-        let worker = dispatched.attempt.worker.clone().expect("bound Job Worker");
-        assert_eq!(worker.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
-        assert!(
-            api.store
-                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
-                .unwrap()
-                .is_some(),
-            "Job dispatch must use the ordinary Workspace Worker registry"
-        );
-        assert_eq!(
-            api.store
-                .worker_registry_projection(TEST_WORKSPACE_ID, &worker)
-                .unwrap()
-                .unwrap()
-                .job,
-            Some(crate::backend_job::BackendJobWorkerBinding {
-                job_id: request.job_id.clone(),
-                attempt_id: dispatched.attempt.attempt_id.clone(),
-                purpose: request.purpose.clone(),
-            })
-        );
-        let input_error = send_runtime_worker_input(
-            State(api.clone()),
-            AxumPath((worker.runtime_id.clone(), worker.worker_id.clone())),
-            Json(server_api::RuntimeWorkerInputRequest {
-                submission_request_id: None,
-                kind: Some("user".to_string()),
-                content: "attempt to rerun immutable Job input".to_string(),
-                segments: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            input_error.into_response().status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert!(
-            execution.take_inputs().is_empty(),
-            "Job-owned Workers must reject interactive reruns"
-        );
-        let replay = api.dispatch_backend_job(&request).unwrap();
-        assert!(replay.replayed);
-        assert_eq!(replay.attempt.worker, Some(worker.clone()));
-
-        let accepted = api
-            .accept_backend_job_result(
-                &worker,
-                &BackendJobResultSubmission {
-                    job_id: request.job_id.clone(),
-                    attempt_id: dispatched.attempt.attempt_id,
-                    input_digest: request.input_digest().unwrap(),
-                    result: serde_json::json!({"valid": true}),
-                },
-            )
-            .unwrap();
-        assert_eq!(accepted.job.state, BackendJobState::Completed);
-    }
-
-    #[tokio::test]
-    async fn terminal_backend_job_cleanup_removes_only_bound_worker_and_retains_result_delivery() {
-        let temp = tempfile::tempdir().unwrap();
-        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
-        let notification_target = spawn_ticket_check_source(&api, "job-cleanup-target");
-        let request = BackendJobRequest {
-            job_id: "runner-cleanup-success-1".to_string(),
-            purpose: "cleanup_contract_check".to_string(),
-            input_ref: "test://runner/cleanup/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: Some(notification_target.clone()),
-            notification_target: Some(notification_target.clone()),
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-        let dispatched = api.dispatch_backend_job(&request).unwrap();
-        execution.take_inputs();
-        execution.reject_inputs("notification unavailable");
-        let worker = dispatched.attempt.worker.clone().unwrap();
-        seed_worker_session_for_cleanup(temp.path(), &worker);
-        let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
-        let _ = subscriber.take_snapshot();
-        let submission = BackendJobResultSubmission {
-            job_id: request.job_id.clone(),
-            attempt_id: dispatched.attempt.attempt_id.clone(),
-            input_digest: request.input_digest().unwrap(),
-            result: serde_json::json!({"valid": true}),
-        };
-
-        let accepted = api.accept_backend_job_result(&worker, &submission).unwrap();
-        assert_eq!(accepted.job.state, BackendJobState::Completed);
-        let cleaned = wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &dispatched.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert_eq!(cleaned.result, Some(serde_json::json!({"valid": true})));
-        assert!(matches!(
-            api.runtime.worker(&worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        ));
-        assert!(
-            !temp
-                .path()
-                .join(".test-embedded-runtime-store/workers")
-                .join(&worker.worker_id)
-                .exists(),
-            "Runtime Worker and Session storage must be removed"
-        );
-        assert!(
-            api.store
-                .get_worker_registry(TEST_WORKSPACE_ID, &worker)
-                .unwrap()
-                .is_none(),
-            "canonical removal must delete the Backend catalog projection"
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                let event = subscriber.recv().await.expect("projection event");
-                if event.changes.iter().any(|change| {
-                    matches!(change, crate::store::WorkerCatalogChange::Removed(removed) if removed == &worker)
-                }) {
-                    return;
-                }
-            }
-        })
-        .await
-        .expect("Backend Job cleanup must publish canonical Worker removal");
-        assert!(
-            api.runtime.worker(&notification_target).is_ok(),
-            "origin/notification Workers are not cleanup targets"
-        );
-        assert!(
-            api.store
-                .get_worker_registry(TEST_WORKSPACE_ID, &notification_target)
-                .unwrap()
-                .is_some()
-        );
-        let replay = api.accept_backend_job_result(&worker, &submission).unwrap();
-        assert!(
-            replay.replayed,
-            "duplicate result remains idempotent after cleanup"
-        );
-        let delivery_id =
-            crate::backend_job::delivery_id(&request.job_id, &dispatched.attempt.attempt_id);
-        let evidence = job_notification_evidence(&api, &delivery_id);
-        assert_eq!(evidence.0, "deliver");
-        assert!(!evidence.2);
-        assert_eq!(evidence.3.as_deref(), Some("acceptance_unknown"));
-        assert!(
-            api.store
-                .job_notification_request(TEST_WORKSPACE_ID, &delivery_id)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn backend_job_cleanup_guard_failure_retries_old_attempt_without_touching_new_worker() {
-        let temp = tempfile::tempdir().unwrap();
-        let (api, _execution) = test_api_with_recording_backend(temp.path()).await;
-        let request = BackendJobRequest {
-            job_id: "runner-cleanup-retry-1".to_string(),
-            purpose: "cleanup_retry_contract_check".to_string(),
-            input_ref: "test://runner/cleanup-retry/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-        let first = api.dispatch_backend_job(&request).unwrap();
-        let first_worker = first.attempt.worker.clone().unwrap();
-        seed_worker_session_for_cleanup(temp.path(), &first_worker);
-        let _ = set_worker_retention(
-            api.clone(),
-            first_worker.runtime_id.clone(),
-            first_worker.worker_id.clone(),
-            true,
-        )
-        .await
-        .unwrap();
-        api.finish_backend_job_attempt(
-            &request.job_id,
-            &first.attempt.attempt_id,
-            BackendJobAttemptState::Failed,
-            "model_failure",
-            "model rejected the request",
-        )
-        .unwrap();
-        let blocked = wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &first.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Failed,
-        )
-        .await;
-        assert_eq!(blocked.failure_category.as_deref(), Some("model_failure"));
-        assert_eq!(
-            blocked.worker_cleanup_failure_category.as_deref(),
-            Some("backend_job_cleanup_removal_rejected")
-        );
-
-        assert!(
-            api.retry_backend_job(&request.job_id).is_err(),
-            "retry must not overlap an incompletely cleaned attempt"
-        );
-        let _ = set_worker_retention(
-            api.clone(),
-            first_worker.runtime_id.clone(),
-            first_worker.worker_id.clone(),
-            false,
-        )
-        .await
-        .unwrap();
-        api.recover_backend_jobs().unwrap();
-        wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &first.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        let second = api.retry_backend_job(&request.job_id).unwrap();
-        let second_worker = second.attempt.worker.clone().unwrap();
-        seed_worker_session_for_cleanup(temp.path(), &second_worker);
-        assert_ne!(first_worker, second_worker);
-        api.recover_backend_jobs().unwrap();
-        assert!(api.runtime.worker(&second_worker).is_ok());
-
-        api.accept_backend_job_result(
-            &second_worker,
-            &BackendJobResultSubmission {
-                job_id: request.job_id.clone(),
-                attempt_id: second.attempt.attempt_id.clone(),
-                input_digest: request.input_digest().unwrap(),
-                result: serde_json::json!({"retried": true}),
-            },
-        )
-        .unwrap();
-        wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &second.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert_eq!(
-            api.store
-                .get_backend_job_attempt(
-                    TEST_WORKSPACE_ID,
-                    &request.job_id,
-                    &first.attempt.attempt_id,
-                )
-                .unwrap()
-                .unwrap()
-                .failure_detail
-                .as_deref(),
-            Some("model rejected the request")
-        );
-    }
-
-    #[tokio::test]
-    async fn backend_job_cleanup_restart_before_run_finish_marker_converges() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = test_server_config(temp.path());
-        let request = BackendJobRequest {
-            job_id: "runner-cleanup-pre-marker-restart-1".to_string(),
-            purpose: "cleanup_pre_marker_restart_contract_check".to_string(),
-            input_ref: "test://runner/cleanup-pre-marker-restart/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-        let store =
-            Arc::new(SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap());
-        seed_test_registered_workspace(store.as_ref(), &config)
-            .await
-            .unwrap();
-        let execution = Arc::new(DeterministicExecutionBackend::default());
-        let embedded = EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
-            TEST_WORKSPACE_ID,
-            config.embedded_runtime_store_root.clone(),
-            execution.clone(),
-        )
-        .unwrap();
-        let binding = test_create_binding();
-        let runtime = embedded.subscription_runtime();
-        let runtime_worker_ref = worker_runtime::identity::WorkerRef::new(binding.worker_id);
-        let detail = runtime
-            .create_worker_scoped(
-                &worker_runtime::RuntimeWorkspaceScope::new(TEST_WORKSPACE_ID, "embedded-backend"),
-                worker_runtime::catalog::CreateWorkerRequest {
-                    plugin_execution: None,
-                    worker_id: binding.worker_id,
-                    create_fingerprint: binding.create_fingerprint,
-                    profile: ProfileSelector::Builtin(request.profile.clone()),
-                    display_name: Some("job:cleanup_pre_marker_restart_contract_check".to_string()),
-                    config_bundle: None,
-                    profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Embedded {
-                        archive: crate::profile_settings::builtin_profile_source_archive(
-                            &ProfileSelector::Builtin(request.profile.clone()),
-                        )
-                        .unwrap(),
-                    },
-                    initial_input: None,
-                    workdir_attachment_requests: Vec::new(),
-                    workdir_attachments: Vec::new(),
-                    worker_observation_enabled: false,
-                    worker_observation_grants: Vec::new(),
-                    workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
-                    memory_settings: Some(test_worker_memory_settings()),
-                    subjektiv_attached: false,
-                    backend_job: None,
-                },
-            )
-            .unwrap();
-        let worker =
-            RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, detail.worker_id.to_string());
-        runtime
-            .observe_worker_event(
-                &runtime_worker_ref,
-                protocol::Event::WorkerState {
-                    snapshot: protocol::WorkerStateSnapshot {
-                        last_command_id: 0,
-                        last_finished_submission_request_id: None,
-                        state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                            protocol::WorkerRunState::Running,
-                        )),
-                    },
-                },
-            )
-            .unwrap();
-        let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-        let reservation = store
-            .reserve_backend_job(TEST_WORKSPACE_ID, &request, &now)
-            .unwrap();
-        let (_, claimed) = store
-            .claim_backend_job_attempt_dispatch(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &reservation.attempt.attempt_id,
-                &now,
-            )
-            .unwrap();
-        assert!(claimed);
-        let runtime_run_id = crate::backend_job::runtime_run_id(&reservation.attempt.attempt_id);
-        store
-            .upsert_worker_registry(&WorkerRegistryRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                worker: worker.clone(),
-                display_name: "job:cleanup_pre_marker_restart_contract_check".to_string(),
-                profile: Some(request.profile.clone()),
-                retention_state: "normal".to_string(),
-                transcript_ref: None,
-                session_ref: None,
-                summary_ref: None,
-                diagnostics_ref: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            })
-            .unwrap();
-        store
-            .bind_backend_job_attempt_worker(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &reservation.attempt.attempt_id,
-                &worker,
-                Some(&runtime_run_id),
-                &now,
-            )
-            .unwrap();
-        seed_worker_session_for_cleanup(temp.path(), &worker);
-        let before_restart = runtime.worker_detail(&runtime_worker_ref).unwrap();
-        assert!(!before_restart.execution_reconstructed);
-        assert!(before_restart.worker_state.is_some_and(|snapshot| {
-            snapshot.last_command_id == 0
-                && snapshot.last_finished_submission_request_id.is_none()
-                && snapshot.state
-                    == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                        protocol::WorkerRunState::Running,
-                    ))
-        }));
-        store
-            .accept_backend_job_result(
-                TEST_WORKSPACE_ID,
-                &worker,
-                &BackendJobResultSubmission {
-                    job_id: request.job_id.clone(),
-                    attempt_id: reservation.attempt.attempt_id.clone(),
-                    input_digest: request.input_digest().unwrap(),
-                    result: serde_json::json!({"persisted": true}),
-                },
-                &now,
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .get_backend_job_attempt(
-                    TEST_WORKSPACE_ID,
-                    &request.job_id,
-                    &reservation.attempt.attempt_id,
-                )
-                .unwrap()
-                .unwrap()
-                .worker_cleanup_state,
-            Some(BackendJobWorkerCleanupState::Pending)
-        );
-        let attempt_id = reservation.attempt.attempt_id;
-        drop(runtime);
-        drop(embedded);
-        drop(store);
-        drop(execution);
-
-        let restarted_store =
-            SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
-        let restarted_execution = Arc::new(DeterministicExecutionBackend::default());
-        restarted_execution.accept_restores();
-        let restarted = WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(restarted_store),
-            restarted_execution,
-        )
-        .await
-        .unwrap();
-        let cleaned = wait_for_backend_job_worker_cleanup(
-            &restarted,
-            &request.job_id,
-            &attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert_eq!(cleaned.result, Some(serde_json::json!({"persisted": true})));
-        assert!(matches!(
-            restarted.runtime.worker(&worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn backend_job_fast_result_is_accepted_after_prebound_tracked_run() {
-        let temp = tempfile::tempdir().unwrap();
-        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
-        let request = BackendJobRequest {
-            job_id: "r".repeat(256),
-            purpose: "fast_result_contract_check".to_string(),
-            input_ref: "test://runner/fast-result/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-        let acceptance_observed = Arc::new(std::sync::Mutex::new(None));
-        let hook_api = api.clone();
-        let hook_request = request.clone();
-        let hook_observed = acceptance_observed.clone();
-        let hook_root = temp.path().to_path_buf();
-        execution.before_input_returns(move |worker| {
-            let source =
-                RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, worker.worker_id.to_string());
-            seed_worker_session_for_cleanup(&hook_root, &source);
-            let accepted = hook_api
-                .accept_backend_job_result(
-                    &source,
-                    &BackendJobResultSubmission {
-                        job_id: hook_request.job_id.clone(),
-                        attempt_id: crate::backend_job::attempt_id(&hook_request.job_id, 1),
-                        input_digest: hook_request.input_digest().unwrap(),
-                        result: serde_json::json!({"valid": true}),
-                    },
-                )
-                .is_ok();
-            *hook_observed.lock().unwrap() = Some(accepted);
-        });
-
-        let dispatched = api.dispatch_backend_job(&request).unwrap();
-        assert_eq!(*acceptance_observed.lock().unwrap(), Some(true));
-        assert_eq!(dispatched.job.state, BackendJobState::Completed);
-        let expected_run_id =
-            crate::backend_job::runtime_run_id(&crate::backend_job::attempt_id(&request.job_id, 1));
-        assert_eq!(
-            dispatched.attempt.runtime_run_id.as_deref(),
-            Some(expected_run_id.as_str())
-        );
-        let worker = dispatched.attempt.worker.clone().unwrap();
-        wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &dispatched.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert!(matches!(
-            api.runtime.worker(&worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn backend_job_result_http_response_precedes_cleanup_until_tracked_run_finishes() {
-        let temp = tempfile::tempdir().unwrap();
-        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
-        let request = BackendJobRequest {
-            job_id: "runner-result-response-fence-1".to_string(),
-            purpose: "result_response_fence_check".to_string(),
-            input_ref: "test://runner/result-response-fence/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-        let dispatched = api.dispatch_backend_job(&request).unwrap();
-        let worker = dispatched.attempt.worker.clone().unwrap();
-        let runtime_run_id = dispatched.attempt.runtime_run_id.clone().unwrap();
-        seed_worker_session_for_cleanup(temp.path(), &worker);
-        execution.publish_worker_state(
-            &worker,
-            protocol::WorkerStateSnapshot {
-                last_command_id: 0,
-                last_finished_submission_request_id: None,
-                state: protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                    protocol::WorkerRunState::Running,
-                )),
-            },
-        );
-        assert!(
-            api.runtime
-                .worker(&worker)
-                .unwrap()
-                .worker_state
-                .is_some_and(|snapshot| snapshot.state
-                    == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                        protocol::WorkerRunState::Running
-                    )))
-        );
-
-        let Json(acceptance) = scoped_submit_backend_job_result(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            ticket_check_headers(&worker),
-            Json(SubmitBackendJobResultRequest {
-                result: serde_json::json!({"valid": true}),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(acceptance.job.state, BackendJobState::Completed);
-        let still_running = api.runtime.worker(&worker).unwrap();
-        assert!(still_running.worker_state.is_some_and(|snapshot| {
-            snapshot.state
-                == protocol::WorkerState::Busy(protocol::WorkerBusyState::Run(
-                    protocol::WorkerRunState::Running,
-                ))
-        }));
-        // Cleanup admission precedes its durable claim. The accepted job may
-        // still be queued, but neither queued nor executing ownership may stop
-        // this Run before the exact tracked finish marker below is published.
-        assert!(matches!(
-            api.store
-                .get_backend_job_attempt(
-                    TEST_WORKSPACE_ID,
-                    &request.job_id,
-                    &dispatched.attempt.attempt_id,
-                )
-                .unwrap()
-                .unwrap()
-                .worker_cleanup_state,
-            Some(BackendJobWorkerCleanupState::Pending | BackendJobWorkerCleanupState::Executing)
-        ));
-
-        execution.publish_worker_state(
-            &worker,
-            protocol::WorkerStateSnapshot {
-                last_command_id: 0,
-                last_finished_submission_request_id: Some(runtime_run_id),
-                state: protocol::WorkerState::Idle,
-            },
-        );
-        wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &dispatched.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert!(matches!(
-            api.runtime.worker(&worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
-        let temp = tempfile::tempdir().unwrap();
-        let config = test_server_config(temp.path());
-        let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
-        let execution = Arc::new(DeterministicExecutionBackend::default());
-        let api = WorkspaceApi::new_with_execution_backend(
-            config.clone(),
-            Arc::new(store),
-            execution.clone(),
-        )
-        .await
-        .unwrap();
-        seed_test_delivery_binding(&api);
-        let target = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    requested_worker_name: Some("job-notification-target".to_string()),
-                    intent: WorkerSpawnIntent::WorkspaceCompanion,
-                    singleton_key: None,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: ProfileSelector::Builtin("builtin:companion".to_string()),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: Some(runtime_test_bundle()),
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                },
-            )
-            .unwrap()
-            .worker
-            .unwrap()
-            .worker;
-        let request = BackendJobRequest {
-            job_id: "n".repeat(256),
-            purpose: "delivery_recovery_contract_check".to_string(),
-            input_ref: "test://runner/delivery-recovery/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: Some(target.clone()),
-            limits: crate::backend_job::BackendJobLimits {
-                timeout_seconds: 1,
-                ..Default::default()
-            },
-        };
-        let dispatched = api.dispatch_backend_job(&request).unwrap();
-        let worker = dispatched.attempt.worker.clone().unwrap();
-        let acceptance = api
-            .store
-            .accept_backend_job_result(
-                TEST_WORKSPACE_ID,
-                &worker,
-                &BackendJobResultSubmission {
-                    job_id: request.job_id.clone(),
-                    attempt_id: dispatched.attempt.attempt_id.clone(),
-                    input_digest: request.input_digest().unwrap(),
-                    result: serde_json::json!({"valid": true}),
-                },
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        let delivery_id =
-            crate::backend_job::delivery_id(&request.job_id, &acceptance.attempt.attempt_id);
-        let (_, claimed) = api
-            .store
-            .reserve_backend_job_delivery(
-                TEST_WORKSPACE_ID,
-                &delivery_id,
-                &request.job_id,
-                &target,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert!(claimed);
-        let recoverable = api
-            .store
-            .recover_backend_job_deliveries(
-                TEST_WORKSPACE_ID,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert_eq!(recoverable.len(), 1);
-        execution.take_input_request_ids();
-        api.deliver_backend_job_result(&acceptance, &target);
-        let request_ids = execution.take_input_request_ids();
-        assert!(
-            request_ids
-                .iter()
-                .any(|request_id| request_id.as_deref() == Some(delivery_id.as_str())),
-            "recovery must replay the durable delivery id as the tracked notification id: {request_ids:?}"
-        );
-        assert_eq!(job_notification_evidence(&api, &delivery_id).2, true);
-        assert!(
-            api.store
-                .list_pending_job_notifications(TEST_WORKSPACE_ID, 100)
-                .unwrap()
-                .is_empty()
-        );
-        notification_delivery::recover_job_notifications(&api);
-        assert!(execution.take_input_request_ids().is_empty());
-    }
-
-    #[tokio::test]
-    async fn backend_job_spawn_transport_error_terminalizes_reserved_attempt() {
-        let temp = tempfile::tempdir().unwrap();
-        let api = test_api(temp.path()).await;
-        api.runtime
-            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 10)
-            .unwrap();
-        let request = BackendJobRequest {
-            job_id: "runner-spawn-error-1".to_string(),
-            purpose: "spawn_error_contract_check".to_string(),
-            input_ref: "test://runner/spawn-error/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-
-        assert!(api.dispatch_backend_job(&request).is_err());
-        let attempt = api
-            .store
-            .get_backend_job_attempt(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &crate::backend_job::attempt_id(&request.job_id, 1),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
-        assert_eq!(attempt.failure_category.as_deref(), Some("dispatch_error"));
-    }
-
-    #[tokio::test]
-    async fn backend_job_input_error_is_durable_unknown_and_not_automatically_retried() {
-        let temp = tempfile::tempdir().unwrap();
-        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
-        let cleanup_root = temp.path().to_path_buf();
-        execution.before_input_returns(move |worker| {
-            let worker =
-                RuntimeWorkerRef::new(EMBEDDED_WORKER_RUNTIME_ID, worker.worker_id.to_string());
-            seed_worker_session_for_cleanup(&cleanup_root, &worker);
-        });
-        execution.reject_inputs("model transport unavailable");
-        let request = BackendJobRequest {
-            job_id: "runner-input-failure-1".to_string(),
-            purpose: "failure_contract_check".to_string(),
-            input_ref: "test://runner/failure/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-
-        assert!(api.dispatch_backend_job(&request).is_err());
-        let failed = api
-            .store
-            .get_backend_job_attempt(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &crate::backend_job::attempt_id(&request.job_id, 1),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(failed.state, BackendJobAttemptState::Unknown);
-        assert_eq!(
-            failed.failure_category.as_deref(),
-            Some("input_outcome_unknown")
-        );
-        let worker = failed.worker.clone().unwrap();
-        wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &failed.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert!(matches!(
-            api.runtime.worker(&worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        ));
-        assert!(
-            api.retry_backend_job(&request.job_id).is_err(),
-            "an ambiguous input outcome must not be retried automatically"
-        );
-        assert!(
-            api.store
-                .get_backend_job_attempt(
-                    TEST_WORKSPACE_ID,
-                    &request.job_id,
-                    &crate::backend_job::attempt_id(&request.job_id, 2),
-                )
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn backend_job_recovery_drains_more_than_one_reserved_page() {
-        let temp = tempfile::tempdir().unwrap();
-        let api = test_api(temp.path()).await;
-        api.runtime
-            .unregister_if_idle(EMBEDDED_WORKER_RUNTIME_ID, 10)
-            .unwrap();
-        let mut jobs = Vec::new();
-        for index in 0..(usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS) + 6) {
-            let request = BackendJobRequest {
-                job_id: format!("restart-page-{index:03}"),
-                purpose: "restart_page_contract_check".to_string(),
-                input_ref: format!("fixture://restart-page/{index}"),
-                input: serde_json::json!({"index": index}),
-                instruction: "Return a structured fixture result.".to_string(),
-                profile: "builtin:backend-job".to_string(),
-                grants: Default::default(),
-                serialization_key: None,
-                source_worker: None,
-                notification_target: None,
-                limits: crate::backend_job::BackendJobLimits {
-                    max_concurrent_jobs: ABSOLUTE_MAX_CONCURRENT_JOBS,
-                    ..Default::default()
-                },
-            };
-            api.store
-                .reserve_backend_job(
-                    TEST_WORKSPACE_ID,
-                    &request,
-                    &format!("2026-09-01T00:{:02}:{:02}Z", index / 60, index % 60),
-                )
-                .unwrap();
-            jobs.push(request.job_id);
-        }
-
-        api.recover_backend_jobs().unwrap();
-        assert!(
-            api.store
-                .list_reserved_backend_job_attempts(TEST_WORKSPACE_ID, jobs.len())
-                .unwrap()
-                .is_empty(),
-            "restart recovery must continue beyond its first bounded page when dispatches terminalize"
-        );
-        assert!(jobs.iter().all(|job_id| {
-            api.store
-                .get_backend_job(TEST_WORKSPACE_ID, job_id)
-                .unwrap()
-                .is_some_and(|job| job.state == BackendJobState::Failed)
-        }));
-    }
-
-    #[tokio::test]
-    async fn backend_job_recovery_dispatches_reserved_attempt_without_duplicate_worker() {
-        let temp = tempfile::tempdir().unwrap();
-        let api = test_api(temp.path()).await;
-        let request = BackendJobRequest {
-            job_id: "runner-restart-1".to_string(),
-            purpose: "restart_contract_check".to_string(),
-            input_ref: "test://runner/restart/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-        let reserved = api
-            .store
-            .reserve_backend_job(
-                TEST_WORKSPACE_ID,
-                &request,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        assert_eq!(reserved.attempt.state, BackendJobAttemptState::Reserved);
-        api.recover_backend_jobs().unwrap();
-
-        let recovered = api
-            .store
-            .get_backend_job_attempt(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &reserved.attempt.attempt_id,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(recovered.state, BackendJobAttemptState::Dispatched);
-        let recovered_worker = recovered.worker.clone().expect("recovered Job Worker");
-        let replay = api.dispatch_backend_job(&request).unwrap();
-        assert!(replay.replayed);
-        assert_eq!(replay.attempt.worker, Some(recovered_worker));
-    }
-
-    #[tokio::test]
-    async fn backend_job_recovery_marks_unreconcilable_worker_execution_unknown() {
-        let temp = tempfile::tempdir().unwrap();
-        let api = test_api(temp.path()).await;
-        let request = BackendJobRequest {
-            job_id: "runner-unknown-1".to_string(),
-            purpose: "unknown_contract_check".to_string(),
-            input_ref: "test://runner/unknown/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Return a structured check result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits::default(),
-        };
-        let reserved = api
-            .store
-            .reserve_backend_job(
-                TEST_WORKSPACE_ID,
-                &request,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-        let missing_worker = RuntimeWorkerRef::new(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            "0199a3ae-ecdf-7eb2-883e-a5b7b5f04a0d",
-        );
-        api.store
-            .upsert_worker_registry(&WorkerRegistryRecord {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                worker: missing_worker.clone(),
-                display_name: "Missing Job Worker".to_string(),
-                profile: Some("builtin:backend-job".to_string()),
-                retention_state: "normal".to_string(),
-                transcript_ref: None,
-                session_ref: None,
-                summary_ref: None,
-                diagnostics_ref: None,
-                created_at: "2026-09-01T00:00:00Z".to_string(),
-                updated_at: "2026-09-01T00:00:00Z".to_string(),
-            })
-            .unwrap();
-        let (_, claimed) = api
-            .store
-            .claim_backend_job_attempt_dispatch(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &reserved.attempt.attempt_id,
-                "2026-09-01T00:00:00Z",
-            )
-            .unwrap();
-        assert!(claimed);
-        api.store
-            .bind_backend_job_attempt_worker(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &reserved.attempt.attempt_id,
-                &missing_worker,
-                Some("missing-runtime-run"),
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )
-            .unwrap();
-
-        api.recover_backend_jobs().unwrap();
-        let attempt = api
-            .store
-            .get_backend_job_attempt(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &reserved.attempt.attempt_id,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(attempt.state, BackendJobAttemptState::Unknown);
-        assert_eq!(
-            attempt.failure_category.as_deref(),
-            Some("recovery_worker_unknown")
-        );
-        assert_eq!(
-            api.store
-                .get_backend_job(TEST_WORKSPACE_ID, &request.job_id)
-                .unwrap()
-                .unwrap()
-                .state,
-            BackendJobState::Unknown
-        );
-    }
-
-    #[tokio::test]
-    async fn backend_job_timeout_fences_late_structured_result() {
-        let temp = tempfile::tempdir().unwrap();
-        let api = test_api(temp.path()).await;
-        let request = BackendJobRequest {
-            job_id: "runner-timeout-1".to_string(),
-            purpose: "timeout_contract_check".to_string(),
-            input_ref: "test://runner/timeout/1".to_string(),
-            input: serde_json::json!({"value": "immutable"}),
-            instruction: "Wait for a structured result.".to_string(),
-            profile: "builtin:backend-job".to_string(),
-            grants: Default::default(),
-            serialization_key: None,
-            source_worker: None,
-            notification_target: None,
-            limits: crate::backend_job::BackendJobLimits {
-                timeout_seconds: 1,
-                max_attempts: 1,
-                ..Default::default()
-            },
-        };
-        let dispatched = api.dispatch_backend_job(&request).unwrap();
-        let worker = dispatched.attempt.worker.clone().unwrap();
-        seed_worker_session_for_cleanup(temp.path(), &worker);
-        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
-        let attempt = api
-            .store
-            .get_backend_job_attempt(
-                TEST_WORKSPACE_ID,
-                &request.job_id,
-                &dispatched.attempt.attempt_id,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
-        assert_eq!(attempt.failure_category.as_deref(), Some("timeout"));
-        wait_for_backend_job_worker_cleanup(
-            &api,
-            &request.job_id,
-            &dispatched.attempt.attempt_id,
-            BackendJobWorkerCleanupState::Completed,
-        )
-        .await;
-        assert!(matches!(
-            api.runtime.worker(&worker),
-            Err(RuntimeRegistryError::UnknownWorker { .. })
-        ));
-        assert!(
-            api.accept_backend_job_result(
-                &worker,
-                &BackendJobResultSubmission {
-                    job_id: request.job_id.clone(),
-                    attempt_id: dispatched.attempt.attempt_id,
-                    input_digest: request.input_digest().unwrap(),
-                    result: serde_json::json!({"late": true}),
-                },
-            )
-            .is_err()
-        );
-    }
+    mod backend_job_tests;
 
     #[tokio::test]
     async fn scoped_runtime_workdir_access_requires_workspace_binding() {

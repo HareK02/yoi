@@ -12,10 +12,10 @@
 //! input is rejected. Attempts without execution slots remain durably reserved; dispatch advances
 //! on completion and restart. Only explicit reevaluation adds attempts. The store checks confirmed
 //! failure, remaining attempt budget, completed cleanup of prior attempt Workers, and no occupancy
-//! by other Jobs. Unknown execution outcomes are not rerun as new attempts.
+//! by other Jobs. Missing execution evidence never authorizes a new attempt.
 //!
 //! Serialization-key resource conflicts return the original immutable request as resource_reused.
-//! This does not mean new input was processed. Pending/unknown Jobs and unfinished cleanup
+//! This does not mean new input was processed. Pending Jobs and unfinished cleanup
 //! retain resource occupancy, distinct from replay of an identical request.
 //!
 //! # Structured results and notifications
@@ -28,9 +28,9 @@
 //!
 //! Notifications have delivery records separate from results. After restart, unknown deliveries
 //! are retried with the same tracked notification ID. Results survive stopped/missing destinations
-//! without rerunning the model. Execution recovery matches observable Workers and tracked
-//! submissions; lost evidence leaves the outcome unknown. Exactly-once execution of all external
-//! side effects is not guaranteed.
+//! without rerunning the model. Execution reconciliation and resource release are separate from
+//! the accepted result; absence of a Worker or a response is not proof that its effects ended.
+//! Exactly-once execution of arbitrary external side effects is not guaranteed.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -63,7 +63,6 @@ pub enum BackendJobState {
     Pending,
     Completed,
     Failed,
-    Unknown,
 }
 
 impl From<BackendJobState> for job::JobState {
@@ -72,7 +71,6 @@ impl From<BackendJobState> for job::JobState {
             BackendJobState::Pending => Self::Pending,
             BackendJobState::Completed => Self::Completed,
             BackendJobState::Failed => Self::Failed,
-            BackendJobState::Unknown => Self::Unknown,
         }
     }
 }
@@ -83,7 +81,6 @@ impl BackendJobState {
             Self::Pending => "pending",
             Self::Completed => "completed",
             Self::Failed => "failed",
-            Self::Unknown => "unknown",
         }
     }
 
@@ -92,7 +89,6 @@ impl BackendJobState {
             "pending" => Ok(Self::Pending),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            "unknown" => Ok(Self::Unknown),
             other => Err(Error::Store(format!("unknown Backend Job state `{other}`"))),
         }
     }
@@ -106,7 +102,6 @@ pub enum BackendJobAttemptState {
     Dispatched,
     Completed,
     Failed,
-    Unknown,
 }
 
 impl From<BackendJobAttemptState> for job::JobAttemptState {
@@ -117,7 +112,6 @@ impl From<BackendJobAttemptState> for job::JobAttemptState {
             BackendJobAttemptState::Dispatched => Self::Dispatched,
             BackendJobAttemptState::Completed => Self::Completed,
             BackendJobAttemptState::Failed => Self::Failed,
-            BackendJobAttemptState::Unknown => Self::Unknown,
         }
     }
 }
@@ -130,7 +124,6 @@ impl BackendJobAttemptState {
             Self::Dispatched => "dispatched",
             Self::Completed => "completed",
             Self::Failed => "failed",
-            Self::Unknown => "unknown",
         }
     }
 
@@ -141,7 +134,6 @@ impl BackendJobAttemptState {
             "dispatched" => Ok(Self::Dispatched),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            "unknown" => Ok(Self::Unknown),
             other => Err(Error::Store(format!(
                 "unknown Backend Job attempt state `{other}`"
             ))),
@@ -149,7 +141,7 @@ impl BackendJobAttemptState {
     }
 
     pub fn terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Unknown)
+        matches!(self, Self::Completed | Self::Failed)
     }
 }
 
@@ -282,8 +274,8 @@ pub struct SubjektivConsolidationGrant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivJournalGrant {
-    /// Frozen writer generation. Legacy absence preserves its original canonical wire/digest;
-    /// recovery must use only the immutable original Session and still-current body.
+    /// Frozen writer generation. Legacy absence preserves its original canonical wire/digest
+    /// at the read/migration boundary only; it never authorizes a fresh Session read or selection.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub binding_id: String,
     pub subject_id: String,
@@ -586,6 +578,9 @@ pub struct BackendJobAttemptRecord {
     pub worker: Option<RuntimeWorkerRef>,
     pub runtime_run_id: Option<String>,
     pub dispatched_at: Option<String>,
+    /// The Reserved -> Failed transaction closed dispatch admission before any
+    /// allocation was allowed. Absence of a Worker or a terminal state is not this proof.
+    pub allocation_precluded_at: Option<String>,
     pub deadline_at: String,
     pub result: Option<Value>,
     pub result_digest: Option<String>,
@@ -756,12 +751,11 @@ mod tests {
     }
 
     #[test]
-    fn backend_state_projections_preserve_existing_wire_vocabulary() {
+    fn backend_state_projections_use_current_execution_vocabulary() {
         for state in [
             BackendJobState::Pending,
             BackendJobState::Completed,
             BackendJobState::Failed,
-            BackendJobState::Unknown,
         ] {
             let shared = job::JobState::from(state);
             assert_eq!(
@@ -775,7 +769,6 @@ mod tests {
             BackendJobAttemptState::Dispatched,
             BackendJobAttemptState::Completed,
             BackendJobAttemptState::Failed,
-            BackendJobAttemptState::Unknown,
         ] {
             let shared = job::JobAttemptState::from(state);
             assert_eq!(
@@ -783,6 +776,11 @@ mod tests {
                 serde_json::to_value(shared).unwrap()
             );
         }
+        // Legacy uncertain outcomes are accepted only by the migration reader.
+        assert!(BackendJobState::parse("unknown").is_err());
+        assert!(BackendJobAttemptState::parse("unknown").is_err());
+        assert!(serde_json::from_str::<BackendJobState>("\"unknown\"").is_err());
+        assert!(serde_json::from_str::<BackendJobAttemptState>("\"unknown\"").is_err());
         // The shared read vocabulary does not add Backend cancellation support.
         assert!(BackendJobState::parse("cancelled").is_err());
         assert!(BackendJobAttemptState::parse("cancelled").is_err());
@@ -851,7 +849,6 @@ mod tests {
             ),
             (BackendJobState::Pending, BackendJobAttemptState::Dispatched),
             (BackendJobState::Failed, BackendJobAttemptState::Failed),
-            (BackendJobState::Unknown, BackendJobAttemptState::Unknown),
         ] {
             reservation.job.state = state;
             reservation.attempt.state = attempt_state;

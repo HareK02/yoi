@@ -110,6 +110,40 @@ pub(crate) async fn run_internal_worker_with_cancel_sender<F>(
 where
     F: FnOnce(tokio::sync::mpsc::Sender<()>),
 {
+    run_internal_worker_with_cancel_sender_impl(spec, on_cancel_sender, &mut None).await
+}
+
+pub(crate) struct InternalWorkerExecution {
+    pub result: Result<InternalWorkerResult, InternalWorkerError>,
+    // None means construction did not return a Worker whose Feature runtime could be joined.
+    pub feature_shutdown: Option<Result<(), Vec<crate::hook::HookError>>>,
+}
+
+pub(crate) async fn run_internal_worker_owned<F>(
+    spec: InternalWorkerSpec,
+    on_cancel_sender: F,
+) -> InternalWorkerExecution
+where
+    F: FnOnce(tokio::sync::mpsc::Sender<()>),
+{
+    let mut feature_shutdown = None;
+    let result =
+        run_internal_worker_with_cancel_sender_impl(spec, on_cancel_sender, &mut feature_shutdown)
+            .await;
+    InternalWorkerExecution {
+        result,
+        feature_shutdown,
+    }
+}
+
+async fn run_internal_worker_with_cancel_sender_impl<F>(
+    spec: InternalWorkerSpec,
+    on_cancel_sender: F,
+    feature_shutdown: &mut Option<Result<(), Vec<crate::hook::HookError>>>,
+) -> Result<InternalWorkerResult, InternalWorkerError>
+where
+    F: FnOnce(tokio::sync::mpsc::Sender<()>),
+{
     let InternalWorkerSpec {
         identity,
         mut manifest,
@@ -208,9 +242,11 @@ where
             .copied()
             .collect::<Vec<_>>()
             .join(", ");
-        worker
-            .stop_feature_runtime("internal Worker feature installation failed")
-            .await;
+        *feature_shutdown = Some(
+            worker
+                .stop_feature_runtime_report("internal Worker feature installation failed")
+                .await,
+        );
         return Err(InternalWorkerError {
             source: WorkerError::FeatureInstall(format!(
                 "internal Worker feature installation failed: {diagnostics}; missing tools: {missing}"
@@ -255,9 +291,11 @@ where
             history_entries: store.entries_count(session_id, segment_id),
         }),
     };
-    worker
-        .stop_feature_runtime("internal Worker terminal outcome")
-        .await;
+    *feature_shutdown = Some(
+        worker
+            .stop_feature_runtime_report("internal Worker terminal outcome")
+            .await,
+    );
     outcome
 }
 

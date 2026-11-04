@@ -3556,6 +3556,29 @@ mod tests {
         fn stop_worker(&self, _worker_ref: &WorkerRef) -> WorkerExecutionResult {
             WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
         }
+
+        fn stop_worker_operation(
+            &self,
+            request: crate::execution::WorkerExecutionStopRequest,
+        ) -> WorkerExecutionResult {
+            // Only execution is substituted in these HTTP/retention fixtures.
+            // Model its bound stop report explicitly; do not relax Runtime's
+            // production requirement or claim real Controller/Host coverage.
+            let execution_id =
+                uuid::Uuid::parse_str(&request.worker_ref.worker_id.to_string()).unwrap();
+            let mut result = self.stop_worker(&request.worker_ref);
+            result.execution_id = Some(execution_id);
+            result.termination = Some(crate::execution::WorkerExecutionTermination {
+                scope: crate::execution::WorkerExecutionTerminationScope::Controller,
+                worker_ref: request.worker_ref,
+                stop_operation_id: request.operation_id,
+                execution_id,
+                shutdown_command_id: None,
+                submissions: Vec::new(),
+                feature_failures: Vec::new(),
+            });
+            result
+        }
     }
 
     #[cfg(feature = "fs-store")]

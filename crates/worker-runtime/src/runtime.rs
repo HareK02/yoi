@@ -1842,6 +1842,44 @@ impl Runtime {
         Ok(worker.detail())
     }
 
+    /// Look up the originally reserved Job Worker by its saved creation identity.
+    /// This confirms identity only: it never creates/activates a Controller or
+    /// proves Submit acceptance, execution termination, or Host drain.
+    pub fn lookup_job_worker_creation(
+        &self,
+        workspace_id: &str,
+        worker_ref: &WorkerRef,
+        create_fingerprint: &str,
+        binding: &crate::catalog::BackendJobExecutionBinding,
+    ) -> Result<Option<WorkerDetail>, RuntimeError> {
+        if workspace_id.is_empty() || create_fingerprint.is_empty() {
+            return Err(RuntimeError::InvalidRequest(
+                "Job creation lookup requires Workspace and fingerprint".into(),
+            ));
+        }
+        let state = self.lock()?;
+        let Some(worker) = state.workers.get(&worker_ref.worker_id) else {
+            return Ok(None);
+        };
+        let request = worker
+            .request
+            .as_ref()
+            .filter(|_| worker.execution_metadata_available)
+            .ok_or_else(|| RuntimeError::WorkerExecutionUnavailable {
+                worker_id: worker_ref.worker_id,
+                message: "saved Job Worker creation metadata unavailable".into(),
+            })?;
+        if worker.workspace_id.as_deref() != Some(workspace_id)
+            || request.create_fingerprint != create_fingerprint
+            || request.backend_job.as_ref() != Some(binding)
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "saved Job Worker creation binding mismatch".into(),
+            ));
+        }
+        Ok(Some(worker.detail()))
+    }
+
     fn ensure_worker_in_workspace(
         &self,
         scope: &RuntimeWorkspaceScope,
@@ -3217,6 +3255,102 @@ impl Runtime {
         self.send_input_with_scope(worker_ref, input, None)
     }
 
+    /// Read the execution owner's retained termination receipt without stopping,
+    /// restoring or inferring shutdown from persisted status or process restart.
+    pub fn execution_termination(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<Option<crate::execution::WorkerExecutionTermination>, RuntimeError> {
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_worker_ref(worker_ref)?;
+            state.worker(worker_ref)?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id,
+                    message: "runtime has no execution backend".into(),
+                }
+            })?
+        };
+        let receipt = backend.termination_receipt(worker_ref).map_err(|message| {
+            RuntimeError::WorkerExecutionUnavailable {
+                worker_id: worker_ref.worker_id,
+                message,
+            }
+        })?;
+        if receipt
+            .as_ref()
+            .is_some_and(|receipt| &receipt.worker_ref != worker_ref)
+        {
+            return Err(RuntimeError::WorkerExecutionUnavailable {
+                worker_id: worker_ref.worker_id,
+                message: "scope-termination receipt Worker mismatch".into(),
+            });
+        }
+        Ok(receipt)
+    }
+
+    /// Read the existing exact Submit receipt without dispatching input, restoring a
+    /// Controller, changing lifecycle state, or replacing retained execution failures.
+    /// A missing receipt does not establish nonacceptance.
+    pub fn reconcile_input(
+        &self,
+        worker_ref: &WorkerRef,
+        input: WorkerInput,
+    ) -> Result<WorkerExecutionResult, RuntimeError> {
+        validate_worker_input(&input)?;
+        let expected = input
+            .submission_request_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                RuntimeError::InvalidRequest(
+                    "receipt lookup requires a stable submission request id".into(),
+                )
+            })?;
+        if !matches!(
+            input.kind,
+            WorkerInputKind::User | WorkerInputKind::UserIfIdle
+        ) {
+            return Err(RuntimeError::InvalidRequest(
+                "receipt lookup requires Submit input".into(),
+            ));
+        }
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_worker_ref(worker_ref)?;
+            state.worker(worker_ref)?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::WorkerExecutionUnavailable {
+                    worker_id: worker_ref.worker_id,
+                    message: "runtime has no execution backend".into(),
+                }
+            })?
+        };
+        let mut receipt = backend.reconcile_submission(worker_ref, input.clone());
+        if receipt.is_accepted()
+            && (receipt.operation != WorkerExecutionOperation::Input
+                || receipt.submission.as_ref().is_none_or(|ack| {
+                    ack.submission_request_id != expected || ack.submission_id.trim().is_empty()
+                }))
+        {
+            receipt.outcome = crate::execution::WorkerExecutionOutcome::Errored;
+            receipt.submission = None;
+            receipt.message =
+                Some("exact submission receipt mismatch; acceptance is not established".into());
+        }
+        Ok(receipt)
+    }
+
     fn send_input_with_scope(
         &self,
         worker_ref: &WorkerRef,
@@ -3283,7 +3417,47 @@ impl Runtime {
             })?
         };
 
-        let dispatch_result = backend.dispatch_input(worker_ref, input.clone());
+        let mut dispatch_result = backend.dispatch_input(worker_ref, input.clone());
+        if let Some(expected) = expected_submission_id.as_ref()
+            && matches!(
+                dispatch_result.outcome,
+                crate::execution::WorkerExecutionOutcome::Accepted
+                    | crate::execution::WorkerExecutionOutcome::Errored
+            )
+            && dispatch_result.submission.as_ref().is_none_or(|ack| {
+                &ack.submission_request_id != expected || ack.submission_id.trim().is_empty()
+            })
+        {
+            let receipt = backend.reconcile_submission(worker_ref, input.clone());
+            if receipt.is_accepted()
+                && receipt.operation == WorkerExecutionOperation::Input
+                && dispatch_result
+                    .execution_id
+                    .is_none_or(|execution_id| receipt.execution_id == Some(execution_id))
+                && receipt.submission.as_ref().is_some_and(|ack| {
+                    &ack.submission_request_id == expected && !ack.submission_id.trim().is_empty()
+                })
+            {
+                // Receipt acceptance is independent of a later dispatch failure.
+                // Keep the original outcome and startup failure attachments intact.
+                dispatch_result.submission = receipt.submission;
+                if dispatch_result.is_accepted() && receipt.worker_state.is_some() {
+                    dispatch_result.worker_state = receipt.worker_state;
+                }
+            } else {
+                // A missing receipt, changed Controller or mismatched acknowledgement
+                // cannot establish rejection. Do not retain a foreign request's ack.
+                dispatch_result.submission = None;
+                dispatch_result.outcome = crate::execution::WorkerExecutionOutcome::Errored;
+                let uncertainty = format!(
+                    "submission acceptance is unknown for request {expected}; exact receipt reconciliation did not confirm acceptance on the same execution"
+                );
+                dispatch_result.message = Some(match dispatch_result.message.take() {
+                    Some(message) => format!("{message}; {uncertainty}"),
+                    None => uncertainty,
+                });
+            }
+        }
         if !dispatch_result.is_accepted() {
             self.record_execution_result(worker_ref, dispatch_result.clone())?;
             return Err(RuntimeError::WorkerExecutionRejected {
@@ -3292,25 +3466,6 @@ impl Runtime {
                 outcome: dispatch_result.outcome,
                 message: dispatch_result.message_or_default(),
                 result: dispatch_result,
-            });
-        }
-        if let Some(expected_submission_id) = expected_submission_id
-            && dispatch_result
-                .submission
-                .as_ref()
-                .is_none_or(|ack| ack.submission_request_id != expected_submission_id)
-        {
-            let result = WorkerExecutionResult::rejected(
-                WorkerExecutionOperation::Input,
-                "execution backend did not acknowledge the committed Runtime submission request id",
-            );
-            self.record_execution_result(worker_ref, result.clone())?;
-            return Err(RuntimeError::WorkerExecutionRejected {
-                worker_id: worker_ref.worker_id.clone(),
-                operation: result.operation,
-                outcome: result.outcome,
-                message: result.message_or_default(),
-                result,
             });
         }
 
@@ -3805,9 +3960,12 @@ impl Runtime {
         if matches!(&method, Method::Shutdown { .. }) {
             let operation_id = WorkerLifecycleOperationId::new();
             self.begin_stop_operation(worker_ref, operation_id)?;
-            let events = transport.dispatch(method).map_err(rejection)?;
-            self.commit_stopped_worker(worker_ref, operation_id)?;
-            return Ok(events);
+            let result = transport.stop(WorkerExecutionStopRequest {
+                operation_id,
+                worker_ref: worker_ref.clone(),
+            });
+            self.commit_stopped_worker(worker_ref, operation_id, result)?;
+            return Ok(Vec::new());
         }
         transport.dispatch(method).map_err(rejection)
     }
@@ -3852,8 +4010,16 @@ impl Runtime {
         backend: &WorkerExecutionBackendRef,
         worker_ref: &WorkerRef,
     ) -> Result<(), RuntimeError> {
-        let stop_result = backend.stop_worker(worker_ref);
-        if stop_result.is_accepted() {
+        let operation_id = WorkerLifecycleOperationId::new();
+        let stop_result = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            operation_id,
+            worker_ref: worker_ref.clone(),
+        });
+        if stop_result.is_accepted()
+            && stop_result.termination.as_ref().is_some_and(|termination| {
+                termination.confirms_scope_shutdown(worker_ref, operation_id)
+            })
+        {
             return self.rollback_failed_create(worker_ref);
         }
         let mut state = self.lock()?;
@@ -4197,7 +4363,7 @@ impl Runtime {
                 result,
             });
         }
-        self.commit_stopped_worker(worker_ref, operation_id)
+        self.commit_stopped_worker(worker_ref, operation_id, result)
     }
 
     fn admit_worker_stop_under_lock(
@@ -4945,7 +5111,7 @@ impl Runtime {
                 result,
             });
         }
-        self.commit_stopped_worker(worker_ref, operation_id)?;
+        self.commit_stopped_worker(worker_ref, operation_id, result)?;
         Ok(())
     }
 
@@ -5011,7 +5177,27 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
         operation_id: WorkerLifecycleOperationId,
+        mut result: WorkerExecutionResult,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        if !result.is_accepted()
+            || result.operation != WorkerExecutionOperation::Stop
+            || result.termination.as_ref().is_none_or(|termination| {
+                !termination.confirms_scope_shutdown(worker_ref, operation_id)
+            })
+        {
+            if result.is_accepted() {
+                result.outcome = crate::execution::WorkerExecutionOutcome::Errored;
+                result.message = Some("stop has no matching actual scope termination evidence; reconciliation remains pending".into());
+            }
+            self.record_execution_result(worker_ref, result.clone())?;
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id,
+                operation: result.operation,
+                outcome: result.outcome,
+                message: result.message_or_default(),
+                result,
+            });
+        }
         let mut state = self.lock()?;
         let mut candidate = state.worker(worker_ref)?.clone();
         if candidate
@@ -9030,6 +9216,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn job_creation_lookup_checks_saved_identity_without_activating_or_resubmitting() {
+        let (runtime, backend) = runtime_and_backend();
+        let mut request = scoped_task_request("saved allocation", "workspace-a");
+        let binding = crate::catalog::BackendJobExecutionBinding {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            input_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            subjektiv_consolidation: false,
+            subjektiv_journal: false,
+        };
+        request.backend_job = Some(binding.clone());
+        let worker = runtime
+            .create_worker_scoped(&scope("workspace-a", "server-a"), request.clone())
+            .unwrap();
+        let bindings_before = backend.job_bindings.lock().unwrap().clone();
+        let activations_before = backend.activation_operation_ids.lock().unwrap().clone();
+        let query = |workspace: &str,
+                     fingerprint: &str,
+                     binding: &crate::catalog::BackendJobExecutionBinding| {
+            runtime.lookup_job_worker_creation(workspace, &worker.worker_ref, fingerprint, binding)
+        };
+        assert!(
+            query("workspace-a", &request.create_fingerprint, &binding)
+                .unwrap()
+                .is_some()
+        );
+        assert!(query("workspace-b", &request.create_fingerprint, &binding).is_err());
+        assert!(query("workspace-a", "foreign-fingerprint", &binding).is_err());
+        let mut foreign = binding.clone();
+        foreign.attempt_id = "attempt-other".into();
+        assert!(query("workspace-a", &request.create_fingerprint, &foreign).is_err());
+        foreign = binding.clone();
+        foreign.input_digest = Some("foreign-input".into());
+        assert!(query("workspace-a", &request.create_fingerprint, &foreign).is_err());
+        let mut absent = worker.worker_ref.clone();
+        absent.worker_id = WorkerId::now_v7();
+        assert!(
+            runtime
+                .lookup_job_worker_creation(
+                    "workspace-a",
+                    &absent,
+                    &request.create_fingerprint,
+                    &binding
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(*backend.job_bindings.lock().unwrap(), bindings_before);
+        assert_eq!(
+            *backend.activation_operation_ids.lock().unwrap(),
+            activations_before
+        );
+        assert!(backend.dispatched_inputs.lock().unwrap().is_empty());
+        assert_eq!(*backend.restore_count.lock().unwrap(), 0);
+    }
+
     #[cfg(feature = "fs-store")]
     #[test]
     fn backend_job_binding_survives_restart_and_restore_without_profile_inference() {
@@ -9565,10 +9808,18 @@ mod tests {
         before_spawn_result: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         job_bindings: Mutex<Vec<Option<crate::catalog::BackendJobExecutionBinding>>>,
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
+        submission_receipt_result: Mutex<Option<WorkerExecutionResult>>,
+        submission_receipt_queries: Mutex<Vec<WorkerInput>>,
         stop_result: Mutex<Option<WorkerExecutionResult>>,
         stop_gate: Mutex<Option<Arc<RestoreGate>>>,
         stop_count: Mutex<u64>,
         stop_operation_ids: Mutex<Vec<WorkerLifecycleOperationId>>,
+        stop_terminations: Mutex<
+            std::collections::HashMap<
+                WorkerLifecycleOperationId,
+                crate::execution::WorkerExecutionTermination,
+            >,
+        >,
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         preflight_restore_result: Mutex<Option<WorkerExecutionResult>>,
         restore_gate: Mutex<Option<Arc<RestoreGate>>>,
@@ -10009,6 +10260,24 @@ mod tests {
             }]
         }
 
+        fn reconcile_submission(
+            &self,
+            _worker_ref: &WorkerRef,
+            input: WorkerInput,
+        ) -> WorkerExecutionResult {
+            self.submission_receipt_queries.lock().unwrap().push(input);
+            self.submission_receipt_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Input,
+                        "receipt missing; acceptance unknown",
+                    )
+                })
+        }
+
         fn dispatch_input(
             &self,
             worker_ref: &WorkerRef,
@@ -10068,7 +10337,30 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.operation_id);
-            self.stop_worker(&request.worker_ref)
+            let configured = self.stop_result.lock().unwrap().is_some();
+            let mut result = self.stop_worker(&request.worker_ref);
+            if !configured && result.is_accepted() {
+                // This catalog fixture substitutes only the backend response;
+                // real Controller completion/join is tested in worker_backend.
+                let termination = self
+                    .stop_terminations
+                    .lock()
+                    .unwrap()
+                    .entry(request.operation_id)
+                    .or_insert_with(|| crate::execution::WorkerExecutionTermination {
+                        scope: crate::execution::WorkerExecutionTerminationScope::Controller,
+                        worker_ref: request.worker_ref.clone(),
+                        stop_operation_id: request.operation_id,
+                        execution_id: uuid::Uuid::now_v7(),
+                        shutdown_command_id: None,
+                        submissions: Vec::new(),
+                        feature_failures: Vec::new(),
+                    })
+                    .clone();
+                result.execution_id = Some(termination.execution_id);
+                result.termination = Some(termination);
+            }
+            result
         }
 
         fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
@@ -14794,6 +15086,214 @@ mod tests {
         let after = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(after.status, WorkerStatus::Idle);
         assert_eq!(after.worker_state, Some(fresh));
+    }
+
+    #[test]
+    fn input_ack_mismatch_queries_exact_receipt_without_resubmitting_or_claiming_rejection() {
+        for found in [false, true] {
+            let (runtime, backend) = runtime_and_backend();
+            let detail = runtime
+                .create_worker(task_request("receipt reconciliation"))
+                .unwrap();
+            backend.preserve_submission_acknowledgement_id();
+            backend.set_dispatch_result(WorkerExecutionResult::accepted_submission(
+                WorkerExecutionOperation::Input,
+                "another-request",
+                "another-submission",
+                protocol::SubmissionDisposition::Started,
+            ));
+            let mut input = WorkerInput::user("same payload");
+            input.submission_request_id = Some("exact-request".into());
+            if found {
+                *backend.submission_receipt_result.lock().unwrap() =
+                    Some(WorkerExecutionResult::accepted_submission(
+                        WorkerExecutionOperation::Input,
+                        "exact-request",
+                        "retained-submission",
+                        protocol::SubmissionDisposition::Started,
+                    ));
+            }
+            let response = runtime.send_input(&detail.worker_ref, input);
+            if found {
+                assert_eq!(
+                    response.unwrap().submission.unwrap().submission_id,
+                    "retained-submission"
+                );
+            } else {
+                assert!(matches!(
+                    response,
+                    Err(RuntimeError::WorkerExecutionRejected {
+                        outcome: crate::execution::WorkerExecutionOutcome::Errored,
+                        ..
+                    })
+                ));
+            }
+            let queries = backend.submission_receipt_queries.lock().unwrap();
+            assert_eq!(queries.len(), 1);
+            assert_eq!(
+                queries[0].submission_request_id.as_deref(),
+                Some("exact-request")
+            );
+            assert_eq!(queries[0].content, "same payload");
+            assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
+            assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn receipt_from_replacement_controller_does_not_repair_original_dispatch_ack() {
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime
+            .create_worker(task_request("receipt execution binding"))
+            .unwrap();
+        let original_execution_id = uuid::Uuid::now_v7();
+        let mut dispatched = WorkerExecutionResult::accepted(WorkerExecutionOperation::Input);
+        dispatched.execution_id = Some(original_execution_id);
+        backend.set_dispatch_result(dispatched);
+        let mut receipt = WorkerExecutionResult::accepted_submission(
+            WorkerExecutionOperation::Input,
+            "bound-request",
+            "retained-submission",
+            protocol::SubmissionDisposition::Started,
+        );
+        receipt.execution_id = Some(uuid::Uuid::now_v7());
+        *backend.submission_receipt_result.lock().unwrap() = Some(receipt);
+        let mut input = WorkerInput::user("same payload");
+        input.submission_request_id = Some("bound-request".into());
+        let RuntimeError::WorkerExecutionRejected { result, .. } =
+            runtime.send_input(&detail.worker_ref, input).unwrap_err()
+        else {
+            panic!("replacement Controller cannot repair original execution acknowledgement");
+        };
+        assert_eq!(
+            result.outcome,
+            crate::execution::WorkerExecutionOutcome::Errored
+        );
+        assert_eq!(result.execution_id, Some(original_execution_id));
+        assert!(result.submission.is_none());
+        assert!(result.termination.is_none());
+        assert_eq!(backend.submission_receipt_queries.lock().unwrap().len(), 1);
+        assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconciled_receipt_preserves_independent_dispatch_failure_facts() {
+        use protocol::startup_failure::*;
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime
+            .create_worker(task_request("receipt and Worker failure"))
+            .unwrap();
+        let mut failure = WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Input,
+            "post-admission Worker failure",
+        )
+        .with_startup_failure(
+            worker::startup_failure::runtime_startup_attachment(RuntimeStartupCause {
+                stage: StartupStage::Feature,
+                reason: RuntimeStartupReason::FeatureFailed,
+            })
+            .unwrap(),
+        );
+        failure.execution_id = Some(uuid::Uuid::now_v7());
+        failure
+            .secondary_failures
+            .push(StartupSecondaryFailure::Cleanup {
+                failure: StartupCleanupFailure::Feature,
+            });
+        failure.startup_resources = Some(StartupResourceFacts {
+            resources: StartupResources::WorkerStartup,
+            cleanup: StartupCleanup::Failed(StartupCleanupFailure::Feature),
+            durable_effects_possible: true,
+        });
+        failure.startup_failure_persistence = Some(StartupPersistenceOutcome::NotSaved);
+        backend.set_dispatch_result(failure.clone());
+        let mut receipt = WorkerExecutionResult::accepted_submission(
+            WorkerExecutionOperation::Input,
+            "accepted-before-failure",
+            "retained-submission",
+            protocol::SubmissionDisposition::Started,
+        );
+        receipt.execution_id = failure.execution_id;
+        failure.submission = receipt.submission.clone();
+        *backend.submission_receipt_result.lock().unwrap() = Some(receipt);
+        let mut input = WorkerInput::user("same payload");
+        input.submission_request_id = Some("accepted-before-failure".into());
+        let RuntimeError::WorkerExecutionRejected { result, .. } = runtime
+            .send_input(&detail.worker_ref, input.clone())
+            .unwrap_err()
+        else {
+            panic!("receipt must not erase a later Worker failure");
+        };
+        assert_eq!(result, failure);
+        assert_eq!(
+            backend
+                .submission_receipt_queries
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[input]
+        );
+        assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn explicit_receipt_lookup_is_read_only_and_rejects_foreign_acknowledgements() {
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime
+            .create_worker(task_request("read-only receipt lookup"))
+            .unwrap();
+        let mut input = WorkerInput::user("frozen input");
+        input.submission_request_id = Some("exact-request".into());
+        let before = runtime.worker_detail(&detail.worker_ref).unwrap();
+        let receipts = [None, Some("exact-request"), Some("foreign-request")];
+        for request_id in receipts {
+            *backend.submission_receipt_result.lock().unwrap() = request_id.map(|id| {
+                WorkerExecutionResult::accepted_submission(
+                    WorkerExecutionOperation::Input,
+                    id,
+                    "retained-submission",
+                    protocol::SubmissionDisposition::Started,
+                )
+            });
+            let result = runtime
+                .reconcile_input(&detail.worker_ref, input.clone())
+                .unwrap();
+            assert_eq!(result.is_accepted(), request_id == Some("exact-request"));
+            assert_eq!(runtime.worker_detail(&detail.worker_ref).unwrap(), before);
+            assert!(backend.dispatched_inputs.lock().unwrap().is_empty());
+            assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        }
+        let queries = backend.submission_receipt_queries.lock().unwrap().len();
+        input.submission_request_id = None;
+        assert!(runtime.reconcile_input(&detail.worker_ref, input).is_err());
+        assert_eq!(
+            backend.submission_receipt_queries.lock().unwrap().len(),
+            queries
+        );
+    }
+
+    #[test]
+    fn accepted_stop_without_bound_termination_keeps_operation_pending() {
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime
+            .create_worker(task_request("stop evidence"))
+            .unwrap();
+        backend.set_stop_result(WorkerExecutionResult::accepted(
+            WorkerExecutionOperation::Stop,
+        ));
+        let error = runtime.stop_worker(&detail.worker_ref, None).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerExecutionRejected {
+                outcome: crate::execution::WorkerExecutionOutcome::Errored,
+                ..
+            }
+        ));
+        let state = runtime.lock().unwrap();
+        let worker = state.worker(&detail.worker_ref).unwrap();
+        assert!(worker.pending_stop.is_some());
+        assert_ne!(worker.status, WorkerStatus::Stopped);
     }
 
     #[test]

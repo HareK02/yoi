@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod authority;
 pub mod backend_job;
+mod backend_job_host_effects;
 pub mod companion;
 pub mod config;
 pub mod config_adoption;

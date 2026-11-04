@@ -1,5 +1,98 @@
 [
   {
+    "path": "crates/standalone/src/job_store/recovery.rs",
+    "kind": "saved_data",
+    "reason": "旧standalone Job schema 1/2の実migration fixtureに必要な保存列・JSON key。旧入力tokenの保持と新digestへの既存移行を検証する境界だけに残し、現行実行の状態・CASへ流用しない。",
+    "lines": [
+      {
+        "sha256": "969de6ed2a496597ba3d80cc06e76d273e73a641e438eee10cb8b708696f29ad",
+        "count": 1
+      },
+      {
+        "sha256": "c69cf30db18c35ff26a854bf47ecd4f67bc70513ab41a7b74b78e232e2e34a68",
+        "count": 1
+      },
+      {
+        "sha256": "f88b9c3ac64944b6e957f9d85a54081925f70cbd2563d936f2a5f9d746093940",
+        "count": 2
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/backend_job_upgrade.rs",
+    "kind": "saved_data",
+    "reason": "schema85以前のJob/全attemptの原保存列をschema86の本文変換前に同transactionで捕捉・検証する読み取り/移行境界。旧tokenを履歴として保ち、raw本文は既Job消去ownerと連動してretireする。現行Job入力digestの別名や新しい実行状態を作らない。",
+    "lines": [
+      {
+        "sha256": "b80515c50a007075bcde4268cd5362d4f03e8e1b768b3f5d7d9400b408252de1",
+        "count": 2
+      },
+      {
+        "sha256": "3476b390e729656e898805367f93d86368a1660d7fc59142f588767470eb6b4f",
+        "count": 1
+      },
+      {
+        "sha256": "1fe9f975d2ae4ee3186faefdbde6f29a93c43423a1993b7def62cd757c903472",
+        "count": 1
+      },
+      {
+        "sha256": "37c5715b8ac1eb001ebd75d90078751313b1c0bff0717446a4a17481efd7267a",
+        "count": 1
+      },
+      {
+        "sha256": "acf5ef6e7e4fef26678263c18fe4bf29fbac42046dc94cc0a727e94e7942da32",
+        "count": 1
+      },
+      {
+        "sha256": "f121db497084c3889dba8545ee27e0225db94cfde2d662ea922c723a1fea31ff",
+        "count": 1
+      },
+      {
+        "sha256": "656f37d2121e4c564555684926b6917d273d9ca97e9b3112c6733925397410f6",
+        "count": 1
+      },
+      {
+        "sha256": "3265977c091a93b4f70af0c9f93fa19f15b0022ec5c90400b29e885dd4b941e0",
+        "count": 1
+      },
+      {
+        "sha256": "f621d8c70aecdc042ed8dfa68bcf6f7d69b23eb3f2dcc32464dbba25175d5c40",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/backend_job_upgrade_tests.rs",
+    "kind": "saved_data",
+    "reason": "実旧schemaのJob入力列・request JSONと全attempt原値をfixtureに挿入し、正規runner前後の保持・rollback/retry/reopenを比較する保存互換試験。現行producer/実行型には旧keyを導入しない。",
+    "lines": [
+      {
+        "sha256": "430e40af773fc80bc14662b74fa4cd960aaf30b78b9b1b02be32004ada56d886",
+        "count": 1
+      },
+      {
+        "sha256": "030aed0d240185b411ef3a190dbd718e00df8e91f0ac799ff39fa524a6f704de",
+        "count": 2
+      },
+      {
+        "sha256": "d03c3392bb2443aa9384c3340960c07aacc605af847dc3525ea934d928bc9844",
+        "count": 1
+      },
+      {
+        "sha256": "2cf9adfc96b54eecc5545a04e5d651c8a03f9d78eb1f8bf9dc981a5d91a76e2e",
+        "count": 1
+      },
+      {
+        "sha256": "7253a381f932f6fce62caae83f6c1cc25553dbb662a795638d83f19101790f00",
+        "count": 1
+      },
+      {
+        "sha256": "c72df513101625c8bff4c62b7826fc9f4ef02cb207a6d302fe1ccecb09583ec9",
+        "count": 1
+      }
+    ]
+  },
+  {
     "path": "crates/subjektiv/src/storage_format_tests.rs",
     "kind": "saved_data",
     "reason": "最古対応Subjektiv保存形式のデータ入り移行fixture。旧Subject JSONの保存keyを実形式のまま検証し、移行前原文と移行後データの保持を確認するため残す。現行状態契約の新設ではない。",

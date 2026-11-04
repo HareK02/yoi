@@ -111,7 +111,7 @@ async fn local_host_compaction_freezes_pending_journal_through_request_and_durab
         assert_eq!(journal.process_byte, before.current_journal.process_byte);
         assert_eq!(journal.process_order, 0);
         assert_eq!(journal.process_byte, 0, "saved open records do not advance processing checkpoint");
-        let expected_json = serde_json::to_string(&expected).unwrap();
+        let expected_json = serde_json::to_value(&expected).unwrap();
         let adapter = Arc::new(adapter);
         let model = MockClient { adapter: adapter.clone(), requests: Arc::default(), updated: Arc::new(AtomicBool::new(false)) };
         let workers = StandaloneWorkerStore::open_existing(&fixture.host().catalog.state_root).unwrap();
@@ -142,7 +142,11 @@ async fn local_host_compaction_freezes_pending_journal_through_request_and_durab
         assert_eq!(journal_items.len(), 1);
         let journal_item = Item::from(journal_items[0].item.clone());
         let body = journal_item.as_text().unwrap();
-        assert!(body.contains(&expected_json), "durable seed contains the full selected JSON and processing checkpoint");
+        // Display is concise YAML; the Feature payload retains the full frozen
+        // snapshot, including processing checkpoints omitted from display.
+        let payload: serde_json::Value = journal_items[0].metadata.input_metadata.as_ref()
+            .unwrap().feature_payload().unwrap().decode("journal:compaction", 1).unwrap();
+        assert_eq!(payload["snapshot"], expected_json, "durable payload retains the complete frozen snapshot and processing checkpoint");
         assert!(body.contains(BEFORE));
         assert!(!body.contains(AFTER));
         assert!(seed.iter().any(|entry| entry.metadata.input_metadata.as_ref().is_some_and(|input| input.usage().compaction == session_store::InputCompactionUse::OpeningSummary) && Item::from(entry.item.clone()).as_text().is_some_and(|text| text.contains(COMPLEMENT))));
@@ -152,7 +156,7 @@ async fn local_host_compaction_freezes_pending_journal_through_request_and_durab
             _ => None,
         }).expect("actual compactor user request");
         assert!(input.ends_with(body), "exact same frozen reference goes to actual compactor and seed");
-        assert_eq!(input.matches(&expected_json).count(), 1);
+        assert_eq!(input.matches(body).count(), 1);
         assert!(!input.contains(AFTER));
         drop(requests);
         let latest = fixture.host().journal_compaction_context(&fixture.context).unwrap();

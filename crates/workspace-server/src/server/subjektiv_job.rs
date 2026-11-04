@@ -241,6 +241,47 @@ pub(super) fn dispatch(
     })
 }
 
+/// Read the existing candidate dispositions and terminal surface outcome for this
+/// exact consolidation attempt. Recovery does not rerun candidate decisions or
+/// surface generation, and migration-retired Jobs never reach the domain lookup.
+pub(super) fn lookup_result(
+    api: &WorkspaceApi,
+    job: &crate::backend_job::BackendJobRecord,
+    attempt: &BackendJobAttemptRecord,
+) -> Result<Option<serde_json::Value>> {
+    if api
+        .store
+        .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
+    {
+        return Ok(None);
+    }
+    let Some(grant) = &job.request.grants.subjektiv_consolidation else {
+        return Ok(None);
+    };
+    if job.workspace_id != api.workspace_id()
+        || attempt.workspace_id != job.workspace_id
+        || attempt.job_id != job.request.job_id
+        || attempt.attempt != job.current_attempt
+        || attempt.attempt_id != crate::backend_job::attempt_id(&attempt.job_id, attempt.attempt)
+        || attempt.input_digest != job.input_digest
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "Consolidation recovery owner mismatch".into(),
+        ));
+    }
+    job.load_executable_request()?;
+    subject_authorization::authorize_job_input(api, &job.request).map_err(|error| error.error)?;
+    let store = open_subjektiv_store(api).map_err(|error| error.error)?;
+    subjektiv::job::lookup_result(
+        &store,
+        &grant.subject_id,
+        &grant.candidate_ids,
+        &job.request.job_id,
+        &attempt.attempt_id,
+    )
+    .map_err(Error::from)
+}
+
 pub(super) fn validate_result(
     api: &WorkspaceApi,
     request: &BackendJobRequest,

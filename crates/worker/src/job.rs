@@ -6,9 +6,10 @@
 //! not a final answer or completion of execution.
 //!
 //! The Host manages concurrency, timeouts, and retries, and awaits `run` and resource release even
-//! after cancellation. Emergency drop or abort cannot confirm asynchronous cleanup, so leases and
-//! unknown-outcome state remain. The result Feature has no background work, but dropping a tool
-//! future cannot interrupt a running synchronous sink. The Host must also bound the sink's work.
+//! after cancellation. Emergency drop or abort cannot confirm asynchronous cleanup, so the Host
+//! retains the exact execution obligations and their diagnosis. The result Feature has no background
+//! work, but dropping a tool future cannot interrupt a running synchronous sink. The Host must also
+//! bound the sink's work.
 
 mod result;
 pub use result::{JobResultFeature, JobResultFinalizer, JobResultSink, SUBMIT_JOB_RESULT_TOOL};
@@ -18,11 +19,11 @@ use std::sync::Arc;
 
 use agen::llm_client::LlmClient;
 use manifest::{ProfileDiscovery, ProfileResolveOptions, ProfileResolver, Scope, WorkerManifest};
+use sha2::{Digest, Sha256};
 
 use crate::feature::FeatureRegistryBuilder;
 use crate::internal_worker::{
-    InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec,
-    run_internal_worker_with_cancel_sender,
+    InternalWorkerAuthority, InternalWorkerIdentity, InternalWorkerSpec, run_internal_worker_owned,
 };
 use crate::{
     PromptCatalog, PromptCatalogSource, SystemPromptContext, SystemPromptTemplate,
@@ -48,7 +49,7 @@ pub enum JobExecutionError {
     #[error("Job model configuration failed: {0}")]
     Model(#[from] crate::ProviderError),
     #[error("Job execution failed: {0}")]
-    Worker(String),
+    Worker(#[source] Box<crate::WorkerError>),
     /// A sink error can follow durable acceptance. Hosts must reconcile their store and must
     /// not classify this as a known retryable failure unless they can prove non-acceptance.
     #[error(
@@ -66,6 +67,76 @@ pub enum JobExecutionError {
 pub struct InternalJobResult {
     pub submission: ::job::JobResultSubmission,
     pub usage: Option<agen::timeline::event::UsageEvent>,
+}
+
+/// Result acceptance and owned Feature shutdown from one exact internal execution.
+///
+/// Feature shutdown covers the Worker-managed stopping hooks and background registry only.
+/// Hosts must separately join/revoke their domain callbacks and persistence operations before
+/// releasing an attempt. Neither a dropped future nor this value's absence is shutdown evidence.
+#[derive(Debug)]
+pub struct OwnedInternalJobExecution {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub input_digest: String,
+    pub run_id: uuid::Uuid,
+    pub result: Result<InternalJobResult, JobExecutionError>,
+    unconfirmed_submission: Option<::job::JobResultSubmission>,
+    post_result_failure: Option<Box<crate::WorkerError>>,
+    feature_shutdown: Option<Result<(), Vec<crate::hook::HookError>>>,
+}
+
+impl OwnedInternalJobExecution {
+    /// The exact sealed submission whose sink acknowledgement failed, after finalization and
+    /// result validation. The Host can reconcile/retry only this payload against its saved
+    /// attempt; this is not accepted output or authority to rerun the finalizer/model.
+    pub fn unconfirmed_submission(&self) -> Option<&::job::JobResultSubmission> {
+        self.unconfirmed_submission.as_ref()
+    }
+
+    pub fn feature_shutdown_complete(&self) -> bool {
+        matches!(self.feature_shutdown, Some(Ok(())))
+    }
+
+    pub fn feature_shutdown_failures(&self) -> &[crate::hook::HookError] {
+        match &self.feature_shutdown {
+            Some(Err(errors)) => errors,
+            _ => &[],
+        }
+    }
+
+    /// Existing typed cleanup ownership is distinct from a failed model/Run diagnosis. False
+    /// is not termination proof: callers still require the independently joined Feature scope
+    /// and their exact Host effects. Construction and compaction cleanup must retain their owner.
+    pub fn requires_worker_cleanup_reconciliation(&self) -> bool {
+        fn retained(error: &crate::WorkerError) -> bool {
+            use crate::WorkerError;
+            match error {
+                WorkerError::ConstructionCleanup { .. }
+                | WorkerError::CompactionCleanupPending { .. } => true,
+                WorkerError::StartupFailure { source, .. }
+                | WorkerError::RunFailureAlreadyDelivered { source }
+                | WorkerError::RestoreActivationEffects { source } => retained(source),
+                WorkerError::RunTerminalPersistence {
+                    run_failure,
+                    persist_error,
+                } => retained(run_failure) || retained(persist_error),
+                _ => false,
+            }
+        }
+        self.worker_failure().is_some_and(retained)
+    }
+
+    /// A later Worker failure does not invalidate durable result acceptance. Keep its typed
+    /// cause (including startup attachments and retained cleanup handles) for the Host owner.
+    pub fn worker_failure(&self) -> Option<&crate::WorkerError> {
+        self.post_result_failure
+            .as_deref()
+            .or_else(|| match &self.result {
+                Err(JobExecutionError::Worker(error)) => Some(error.as_ref()),
+                _ => None,
+            })
+    }
 }
 
 /// Resolved policy/model/prompt, with no running resources and no inherited authority.
@@ -196,11 +267,32 @@ fn prepare_job_from_registry_with_grant(
     })
 }
 
+/// Stable internal execution identity for the immutable attempt. Hosts can persist this binding
+/// before dispatch; replay of a receipt must never start a second execution with the same identity.
+pub fn execution_run_id(
+    request: &::job::JobRequest,
+    attempt_id: &str,
+) -> Result<uuid::Uuid, ::job::JobError> {
+    request.validate()?;
+    ::job::validate_identifier("attempt_id", attempt_id, 512)?;
+    let identity = ::job::fingerprint(&(
+        "internal-job-execution",
+        &request.job_id,
+        attempt_id,
+        request.input_digest()?,
+    ))?;
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // UUIDv8 reserves application-defined identity bits; this is not a random run token.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(uuid::Uuid::from_bytes(bytes))
+}
+
 impl PreparedInternalJob {
-    /// Run one immutable attempt. The sink must perform fenced, durable acceptance before
-    /// returning Ok. Timeout is Host-owned: cancel and then await this future for cleanup.
-    /// A result already accepted by the sink remains success even if the model subsequently
-    /// fails, reaches its turn limit or is cancelled; callers never rerun an accepted result.
+    /// Return result acceptance only. This convenience API does not prove Feature or Host
+    /// shutdown; resource-owning callers must use [Self::run_owned] and their domain fence.
     pub async fn run<F>(
         self,
         attempt_id: String,
@@ -210,6 +302,26 @@ impl PreparedInternalJob {
     where
         F: FnOnce(tokio::sync::mpsc::Sender<()>),
     {
+        self.run_owned(attempt_id, submit, on_cancel_sender)
+            .await?
+            .result
+    }
+
+    /// Await the actual run and Feature shutdown, independently of accepted model output.
+    /// Timeout is Host-owned: cancel and keep owning this future and domain operations until
+    /// their separate termination/write-revocation evidence has been observed.
+    pub async fn run_owned<F>(
+        self,
+        attempt_id: String,
+        submit: Arc<dyn JobResultSink>,
+        on_cancel_sender: F,
+    ) -> Result<OwnedInternalJobExecution, JobExecutionError>
+    where
+        F: FnOnce(tokio::sync::mpsc::Sender<()>),
+    {
+        let run_id = execution_run_id(&self.request, &attempt_id)?;
+        let job_id = self.request.job_id.clone();
+        let input_digest = self.request.input_digest()?;
         let mut feature = JobResultFeature::new(&self.request, attempt_id.clone(), submit)?;
         if let Some(finalizer) = self.finalizer {
             feature =
@@ -220,7 +332,7 @@ impl PreparedInternalJob {
         let spec = InternalWorkerSpec {
             identity: InternalWorkerIdentity {
                 kind: "job",
-                run_id: uuid::Uuid::now_v7(),
+                run_id,
             },
             max_turns: engine_policy.max_turns.map(|n| n.get()),
             compaction_budget: None,
@@ -241,29 +353,40 @@ impl PreparedInternalJob {
                 workdir_session: None,
             },
         };
-        let outcome = run_internal_worker_with_cancel_sender(spec, on_cancel_sender).await;
+        let execution = run_internal_worker_owned(spec, on_cancel_sender).await;
+        feature.revoke_and_join().await;
+        let outcome = execution.result;
         let usage = match &outcome {
             Ok(run) => run.usage.clone(),
             Err(error) => error.usage.clone(),
         };
-        if let Some(submission) = accepted.lock().expect("Job result state poisoned").clone() {
-            return Ok(InternalJobResult { submission, usage });
-        }
-        if let Some(error) = feature.unconfirmed() {
-            return Err(JobExecutionError::ResultUnconfirmed(error));
-        }
-        match outcome {
-            Err(error) => Err(JobExecutionError::Worker(error.source.to_string())),
-            Ok(run)
-                if matches!(
-                    run.lifecycle,
-                    WorkerRunResult::Cancelled | WorkerRunResult::RolledBack
-                ) =>
-            {
-                Err(JobExecutionError::Cancelled)
-            }
-            Ok(_) => Err(JobExecutionError::MissingResult),
-        }
+        let lifecycle = outcome.as_ref().ok().map(|run| run.lifecycle.clone());
+        let mut worker_failure = outcome.err().map(|error| Box::new(error.source));
+        let submission = accepted.lock().expect("Job result state poisoned").clone();
+        let result = if let Some(submission) = submission {
+            Ok(InternalJobResult { submission, usage })
+        } else if let Some(error) = feature.unconfirmed() {
+            Err(JobExecutionError::ResultUnconfirmed(error))
+        } else if let Some(error) = worker_failure.take() {
+            Err(JobExecutionError::Worker(error))
+        } else if matches!(
+            lifecycle,
+            Some(WorkerRunResult::Cancelled | WorkerRunResult::RolledBack)
+        ) {
+            Err(JobExecutionError::Cancelled)
+        } else {
+            Err(JobExecutionError::MissingResult)
+        };
+        Ok(OwnedInternalJobExecution {
+            job_id,
+            attempt_id,
+            input_digest,
+            run_id,
+            result,
+            unconfirmed_submission: feature.unconfirmed_submission(),
+            post_result_failure: worker_failure,
+            feature_shutdown: execution.feature_shutdown,
+        })
     }
 }
 

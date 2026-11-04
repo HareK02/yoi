@@ -442,6 +442,7 @@ mod tests {
             state: BackendJobAttemptState::Completed,
             worker: Some(RuntimeWorkerRef::new("runtime", "checker")),
             runtime_run_id: Some("run".into()),
+            allocation_precluded_at: None,
             dispatched_at: Some("1".into()),
             deadline_at: "3".into(),
             result: Some(result.clone()),

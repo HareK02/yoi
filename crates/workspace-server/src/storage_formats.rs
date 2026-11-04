@@ -75,6 +75,26 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
 }
 
 fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
+    verify_raw_capture_shape(conn, current, rows)?;
+    if current == 123 {
+        verify_execution_shape(conn)?;
+        super::backend_job_upgrade::verify(conn)?;
+        if rows == [(123, super::SCHEMA_BASELINE_NAME.to_owned())] {
+            verify_configuration_shape(conn)?;
+            require_shape(conn, Stage::Base)?;
+            return verify_103_features(conn, current, rows);
+        }
+        if rows.last().map(|(version, name)| (*version, name.as_str()))
+            != Some((123, super::backend_job_upgrade::MIGRATION_NAME))
+        {
+            return Err(invalid("unrecognized Backend Job execution receipt"));
+        }
+        let prefix = &rows[..rows.len() - 1];
+        if prefix.last().map(|row| row.0) != Some(122) {
+            return Err(invalid("missing Backend Job execution predecessor"));
+        }
+        return verify_history_records(conn, 122, prefix);
+    }
     if current == 122 {
         verify_configuration_shape(conn)?;
         if rows == [(122, super::SCHEMA_BASELINE_NAME.to_owned())] {
@@ -216,15 +236,18 @@ pub(super) fn published_plan(
     verify_history(conn, current)?;
     Ok(Some(super::WorkspaceSchemaMigrationPlan {
         current_schema_version: current,
-        target_schema_version: 122,
-        migrations: if current < 122 {
-            vec![super::WorkspaceSchemaMigrationStep {
-                version: 122,
-                name: crate::config_adoption::MIGRATION_NAME.to_owned(),
-            }]
-        } else {
-            vec![]
-        },
+        target_schema_version: 123,
+        migrations: [
+            (122, crate::config_adoption::MIGRATION_NAME),
+            (123, super::backend_job_upgrade::MIGRATION_NAME),
+        ]
+        .into_iter()
+        .filter(|(version, _)| *version > current)
+        .map(|(version, name)| super::WorkspaceSchemaMigrationStep {
+            version,
+            name: name.to_owned(),
+        })
+        .collect(),
     }))
 }
 
@@ -347,6 +370,139 @@ fn build_references() -> Result<References> {
     })
 }
 
+fn extension_shape(sql: &str) -> Result<Shape> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch("CREATE TABLE backend_jobs(workspace_id TEXT,job_id TEXT,request_json TEXT); CREATE TABLE backend_job_attempts(workspace_id TEXT,job_id TEXT,attempt_id TEXT); CREATE TABLE backend_job_deliveries(workspace_id TEXT,delivery_id TEXT);")?;
+    reference.execute_batch(sql)?;
+    let mut shape = snapshot(&reference)?;
+    for name in [
+        "backend_jobs",
+        "backend_job_attempts",
+        "backend_job_deliveries",
+    ] {
+        shape.remove(name);
+    }
+    Ok(shape)
+}
+
+fn require_extension(conn: &Connection, sql: &str) -> Result<Shape> {
+    let expected = extension_shape(sql)?;
+    let actual = snapshot(conn)?;
+    let tables: BTreeSet<_> = expected
+        .iter()
+        .filter(|(_, object)| object.0 == "table")
+        .map(|(_, object)| object.1.clone())
+        .collect();
+    for (name, object) in &actual {
+        if tables.contains(&object.1) && !expected.contains_key(name) {
+            return Err(invalid(format!("unreceipted Job evidence object: {name}")));
+        }
+    }
+    for (name, object) in &expected {
+        if actual.get(name) != Some(object) {
+            return Err(invalid(format!("Job evidence schema drift: {name}")));
+        }
+    }
+    Ok(expected)
+}
+
+fn verify_raw_capture_shape(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
+    let expected = extension_shape(super::backend_job_upgrade::RAW_SCHEMA)?;
+    let actual = snapshot(conn)?;
+    let mut execution = extension_shape(super::backend_job_upgrade::SCHEMA)?;
+    execution.extend(extension_shape(super::backend_job_recovery_store::SCHEMA)?);
+    if current < 123
+        && super::current_schema_version(conn)? < 123
+        && execution.keys().any(|name| actual.contains_key(name))
+    {
+        return Err(invalid("Backend Job execution objects before receipt 123"));
+    }
+    let present = expected.keys().any(|name| actual.contains_key(name));
+    if !present {
+        return Ok(());
+    }
+    if current < 86 {
+        return Err(invalid("pre-content capture before its schema-86 boundary"));
+    }
+    require_extension(conn, super::backend_job_upgrade::RAW_SCHEMA)?;
+    let populated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM backend_job_pre_content_history)",
+        [],
+        |row| row.get(0),
+    )?;
+    if populated
+        && !(rows.first().is_some_and(|row| row.0 <= 85) && rows.iter().any(|row| row.0 == 86))
+    {
+        return Err(invalid(
+            "populated pre-content capture without retained schema-86 history",
+        ));
+    }
+    super::backend_job_upgrade::verify_pre_content(conn)
+}
+
+fn verify_execution_shape(conn: &Connection) -> Result<()> {
+    require_extension(conn, super::backend_job_upgrade::RAW_SCHEMA)?;
+    require_extension(conn, super::backend_job_upgrade::SCHEMA)?;
+    require_extension(conn, super::backend_job_recovery_store::SCHEMA)?;
+    Ok(())
+}
+
+// Ignore only separately validated evidence programs, not arbitrary extra Job
+// triggers. The retained family's CHECK is transformed only after receipt 123;
+// all other retained columns, programs and original receipt names remain exact.
+fn legacy_shape(conn: &Connection) -> Result<Shape> {
+    let mut shape = snapshot(conn)?;
+    for sql in [
+        super::backend_job_upgrade::RAW_SCHEMA,
+        super::backend_job_upgrade::SCHEMA,
+        super::backend_job_recovery_store::SCHEMA,
+    ] {
+        for name in extension_shape(sql)?.keys() {
+            shape.remove(name);
+        }
+    }
+    Ok(shape)
+}
+
+fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
+    if super::current_schema_version(conn)? != 123 {
+        return Ok(shape);
+    }
+    for table in ["backend_jobs", "backend_job_attempts"] {
+        if let Some((_, _, tokens)) = shape.get_mut(table) {
+            if table == "backend_job_attempts" {
+                // This exact nullable declaration belongs only to receipt 123.
+                // Canonical declarations are sorted; allocation precedes attempt.
+                let start = tokens
+                    .iter()
+                    .position(|token| token == "(")
+                    .ok_or_else(|| invalid("missing attempt declarations"))?;
+                tokens.splice(
+                    start + 1..start + 1,
+                    [
+                        "word:allocation_precluded_at".into(),
+                        "word:text".into(),
+                        ",".into(),
+                    ],
+                );
+            }
+            // These exact retained state declarations put the legacy value last.
+            let start = tokens
+                .windows(5)
+                .position(|w| w == ["word:check", "(", "word:state", "word:in", "("]);
+            if let Some(start) = start {
+                if let Some(end) = tokens[start + 5..].iter().position(|token| token == ")") {
+                    let end = start + 5 + end;
+                    if end >= 2 && tokens[end - 1] == "literal:unknown" && tokens[end - 2] == "," {
+                        tokens.drain(end - 2..end);
+                    }
+                }
+            }
+        }
+    }
+    Ok(shape)
+}
+
 fn require_shape(conn: &Connection, stage: Stage) -> Result<()> {
     let references = references()?;
     let selected = |shape: Shape| -> Shape {
@@ -355,8 +511,8 @@ fn require_shape(conn: &Connection, stage: Stage) -> Result<()> {
             .filter(|(_, object)| references.tables.contains(&object.1))
             .collect()
     };
-    let expected = selected(references.stages[&stage].clone());
-    let actual = selected(snapshot(conn)?);
+    let expected = selected(upgraded_reference(conn, references.stages[&stage].clone())?);
+    let actual = selected(legacy_shape(conn)?);
     if actual != expected {
         let changed: BTreeSet<_> = actual
             .keys()
@@ -373,7 +529,7 @@ fn reject_early_tail(conn: &Connection, current: i64) -> Result<()> {
         return Ok(());
     }
     let references = references()?;
-    let actual = snapshot(conn)?;
+    let actual = legacy_shape(conn)?;
     let base = &references.stages[&Stage::Base];
     for (name, object) in &actual {
         if references.tables.contains(&object.1) && !base.contains_key(name) {

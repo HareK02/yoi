@@ -305,11 +305,11 @@ impl LocalSubjectHost {
             .pending()
             .map_err(service_error)?
             .into_iter()
-            .chain(jobs.unknown_granted().map_err(service_error)?)
+            .chain(jobs.unreleased_granted().map_err(service_error)?)
             .chain(jobs.unacknowledged_results().map_err(service_error)?)
         {
             let _ = job;
-            return Err(SubjektivHostError::Conflict { code: "journal_outcome_unconfirmed".into(), message: "Subject has queued/running or Unknown/unacknowledged delegated work; binding retained".into() });
+            return Err(SubjektivHostError::Conflict { code: "journal_outcome_unconfirmed".into(), message: "Subject has queued/running, unreleased or unacknowledged delegated work; binding retained".into() });
         }
         let released = self
             .catalog
@@ -474,6 +474,7 @@ impl LocalSubjectHost {
     pub(super) fn recover_journals(&self) {
         let result = (|| {
             self.ensure_live()?;
+            self.jobs()?.recover_storage().map_err(service_error)?;
             for attribution in self
                 .catalog
                 .store
@@ -565,9 +566,16 @@ impl LocalSubjectHost {
                         // Continue even without a further user turn. A later admission has
                         // remained in the ledger, never in this running Job's frozen input.
                     }
+                    Ok(snapshot)
+                        if snapshot.state == JobState::Failed
+                            && snapshot.executions_released()
+                            && !snapshot.version_stopped =>
+                    {
+                        // The next pass reconciles saved operations/checkpoints and resumes
+                        // this exact Job/input within its attempt budget, without resampling.
+                    }
                     Ok(_) | Err(_) => {
-                        // Failure is not permission to consume sources or blindly rerun the model.
-                        // Reopen/reconnect performs domain reconciliation before replacement.
+                        // Neither failure nor a missing task proves resource shutdown.
                         *host
                             .journal_dispatch
                             .lock()
@@ -593,54 +601,8 @@ impl LocalSubjectHost {
             if pending.request.purpose != PURPOSE {
                 continue;
             }
-            self.journal_grant_scope(&pending)?;
-            if pending.request.input.get("capture").is_some() {
-                self.journal_grant(&pending)?;
-                return Ok(Some((jobs, pending.request.job_id)));
-            }
-            // Old descriptor jobs never acquire new execution authority. Their immutable
-            // identity/input is retired, not upgraded in place; saved checkpoint wins.
-            let replacement = self.replace_legacy_journal_job(&jobs, &pending)?;
-            if let Some(id) = replacement {
-                return Ok(Some((jobs, id)));
-            }
-        }
-        for unknown in jobs.unknown_granted().map_err(service_error)? {
-            let Ok(grant) = self.journal_grant_scope(&unknown) else {
-                continue;
-            };
-            let context = authority(self, &grant.session_id)?;
-            if let Some(active) = self
-                .catalog
-                .store
-                .active_journal_generation(&context, &grant.journal_id)
-                .map_err(journal_error)?
-            {
-                if active.job.job_id != unknown.request.job_id
-                    || active.job.attempt_id != unknown.attempt.attempt_id
-                {
-                    continue;
-                }
-                self.catalog
-                    .store
-                    .close_journal_generation(&context, &active.id, &active.job)
-                    .map_err(journal_error)?;
-            }
-            // This grant has no ambient side effects: every successful mutation and exact
-            // receipt is in the shared store. Its closed generation fences delayed tools.
-            // Observe actual saved current/open/cursor before freeing generic serialization;
-            // the replacement reads these receipts, never resubmits an aggregate old result.
-            let _ = self
-                .catalog
-                .store
-                .journal_resume_state(&context, &grant.journal_id)
-                .map_err(journal_error)?;
-            jobs.reconcile_granted_attempt(
-                &unknown.request.job_id,
-                &unknown.attempt.attempt_id,
-                &format!("journal-fenced:{}", unknown.attempt.attempt_id),
-            )
-            .map_err(service_error)?;
+            self.journal_grant(&pending)?;
+            return Ok(Some((jobs, pending.request.job_id)));
         }
         let reader =
             JournalHostContext::validated_reader(&self.catalog.store, &self.binding.subject_id)
@@ -662,112 +624,63 @@ impl LocalSubjectHost {
                     continue;
                 }
                 let context = authority(self, &journal.source_session_id)?;
-                if let Some(active) = self
-                    .catalog
-                    .store
-                    .active_journal_generation(&context, &journal.id)
-                    .map_err(journal_error)?
-                {
-                    let existing = jobs.get(&active.job.job_id).map_err(service_error)?;
-                    if existing.attempt.attempt_id != active.job.attempt_id {
-                        return Err(SubjektivHostError::Unavailable(
-                            "Journal Job attempt changed without reconciliation".into(),
-                        ));
-                    }
-                    match existing.attempt.state {
-                        JobAttemptState::Reserved | JobAttemptState::Dispatched => continue,
-                        JobAttemptState::Completed => {
-                            self.complete_journal_job(&jobs, &existing)?
-                        }
-                        JobAttemptState::Unknown
-                        | JobAttemptState::Failed
-                        | JobAttemptState::Cancelled => {
-                            // The generic Host has durably fenced this attempt. Close its domain
-                            // generation before replacement; saved record receipts remain visible.
-                            self.catalog
-                                .store
-                                .close_journal_generation(&context, &active.id, &active.job)
-                                .map_err(journal_error)?;
-                        }
-                    }
-                }
-                let mut retained = None;
-                // Saved body snapshots always win over descriptor migration. In particular,
-                // a failed continuation must not recapture its original text even if an
-                // invalidated legacy grant still bounds a larger unprocessed suffix.
-                for legacy_pass in [false, true] {
-                    let mut after_job = None;
-                    loop {
-                        let page = jobs
-                            .list_session_snapshots(
-                                &journal.source_session_id,
-                                after_job.as_deref(),
-                                100,
-                            )
-                            .map_err(service_error)?;
-                        if page.is_empty() {
-                            break;
-                        }
-                        for saved in &page {
-                            if saved.request.purpose != PURPOSE {
-                                continue;
-                            }
-                            let legacy = saved.input_disposition
-                                == JobInputDisposition::Invalidated
-                                || (saved.input_disposition == JobInputDisposition::Available
-                                    && saved.request.input.get("capture").is_none());
-                            if legacy != legacy_pass
-                                || (!legacy
-                                    && saved.input_disposition != JobInputDisposition::Available)
-                            {
-                                continue;
-                            }
-                            let saved_grant = self.journal_grant_scope(saved)?;
-                            if saved_grant.journal_id != journal.id {
-                                continue;
-                            }
-                            if legacy {
-                                if let Some(id) = self.replace_legacy_journal_job(&jobs, saved)? {
-                                    return Ok(Some((jobs, id)));
-                                }
-                                continue;
-                            }
-                            self.journal_grant(saved)?;
-                            let original = JournalInput::decode(&saved.request.input)
-                                .map_err(journal_error)?;
-                            let continuation = self.build_journal_input(
-                                &context,
-                                &journal.id,
-                                Some(&original.capture),
-                            )?;
-                            if !continuation.selected_ranges.is_empty() {
-                                retained = Some(continuation);
-                                break;
-                            }
-                            if saved.state == JobState::Completed && saved.acknowledged {
-                                // Recover the acknowledgement-before-reclamation gap without
-                                // turning a retained receipt into an executable empty input.
-                                jobs.reclaim_input(
-                                    &saved.request.job_id,
-                                    &saved.input_digest,
-                                    JobInputRetirementReason::Completed,
-                                )
-                                .map_err(service_error)?;
-                            }
-                        }
-                        if retained.is_some() {
-                            break;
-                        }
-                        after_job = page.last().map(|job| job.request.job_id.clone());
-                    }
-                    if retained.is_some() {
+                // Resolve every saved owner before admitting a new prefix. A failed
+                // Job is not permission to resample its input into a replacement Job.
+                let mut after_job = None;
+                loop {
+                    let saved_page = jobs
+                        .list_session_snapshots(
+                            &journal.source_session_id,
+                            after_job.as_deref(),
+                            100,
+                        )
+                        .map_err(service_error)?;
+                    if saved_page.is_empty() {
                         break;
                     }
+                    for saved in &saved_page {
+                        if saved.request.purpose != PURPOSE {
+                            continue;
+                        }
+                        let grant = self.journal_grant_scope(saved)?;
+                        if grant.journal_id != journal.id {
+                            continue;
+                        }
+                        if saved.version_stopped {
+                            // Migration is not normal recovery or Journal completion.
+                            // Keep the original ranges/input, even when fully checkpointed.
+                            if !self.saved_ranges_reflected(&context, &grant)?
+                                || !saved.executions_released()
+                            {
+                                return Err(SubjektivHostError::Conflict { code: "journal_version_stopped".into(), message: "Version-stopped Journal retains input/checkpoint and unproven execution obligations".into() });
+                            }
+                            continue;
+                        }
+                        match saved.state {
+                            JobState::Completed => self.complete_journal_job(&jobs, saved)?,
+                            JobState::Pending
+                                if saved.attempt.state == JobAttemptState::Reserved =>
+                            {
+                                self.journal_grant(saved)?;
+                                return Ok(Some((jobs, saved.request.job_id.clone())));
+                            }
+                            JobState::Pending | JobState::Failed => {
+                                if let Some(resumed) = self.recover_journal_job(&jobs, saved)? {
+                                    return Ok(Some((jobs, resumed.request.job_id)));
+                                }
+                            }
+                            JobState::Cancelled => {
+                                if !saved.executions_released()
+                                    || !self.saved_ranges_reflected(&context, &grant)?
+                                {
+                                    return Err(SubjektivHostError::Conflict {code:"journal_cancelled_input_retained".into(),message:"Cancelled Journal has unreleased execution or unreflected saved input".into()});
+                                }
+                            }
+                        }
+                    }
+                    after_job = saved_page.last().map(|job| job.request.job_id.clone());
                 }
-                let input = match retained {
-                    Some(input) => input,
-                    None => self.build_journal_input(&context, &journal.id, None)?,
-                };
+                let input = self.build_journal_input(&context, &journal.id, None)?;
 
                 if input.selected_ranges.is_empty() {
                     continue;
@@ -797,120 +710,105 @@ impl LocalSubjectHost {
         }
     }
 
-    fn replace_legacy_journal_job(
+    fn saved_ranges_reflected(
+        &self,
+        context: &JournalHostContext,
+        grant: &LocalJournalGrant,
+    ) -> Result<bool, SubjektivHostError> {
+        for range in &grant.ranges {
+            let status = self
+                .catalog
+                .store
+                .read_journal_source(context, &grant.journal_id, range.source.order)
+                .map_err(journal_error)?;
+            if status.source != range.source || status.reflected_bytes < range.bytes.end {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn recover_journal_job(
         &self,
         jobs: &crate::jobs::StandaloneJobs,
-        old: &JobSnapshot,
-    ) -> Result<Option<String>, SubjektivHostError> {
-        let grant = self.journal_grant_scope(old)?;
-        if old.input_disposition == JobInputDisposition::Available {
-            old.load_executable_request()
-                .map_err(|e| SubjektivHostError::InvalidArgument(e.to_string()))?;
-            if old.request.input
-                != serde_json::json!({"selected_ranges":grant.ranges,"origins":grant.origins})
-            {
-                return Err(SubjektivHostError::InvalidArgument(
-                    "invalid legacy Journal descriptor input".into(),
-                ));
-            }
-        } else if old.input_disposition != JobInputDisposition::Invalidated {
-            return Err(SubjektivHostError::InvalidArgument(
-                "legacy Journal input is unavailable".into(),
-            ));
+        saved: &JobSnapshot,
+    ) -> Result<Option<JobSnapshot>, SubjektivHostError> {
+        let current = jobs.get(&saved.request.job_id).map_err(service_error)?;
+        if current.attempt.attempt_id != saved.attempt.attempt_id
+            || current.input_digest != saved.input_digest
+        {
+            return Err(SubjektivHostError::Conflict {
+                code: "journal_attempt_changed".into(),
+                message: "Journal recovery snapshot no longer names the current attempt/input"
+                    .into(),
+            });
         }
+        let saved = &current;
+        if saved.version_stopped {
+            return Err(SubjektivHostError::Conflict {
+                code: "journal_version_stopped".into(),
+                message:
+                    "Version-stopped Journal cannot resume or convert checkpoints into completion"
+                        .into(),
+            });
+        }
+        self.journal_grant(saved)?; // verifies the immutable body; never fetch live text
+        let grant = self.journal_grant_scope(saved)?;
         let context = authority(self, &grant.session_id)?;
-        if let Some(active) = self
+        let binding = JobAttemptBinding {
+            job_id: saved.request.job_id.clone(),
+            attempt_id: saved.attempt.attempt_id.clone(),
+        };
+        let generation = self
             .catalog
             .store
-            .active_journal_generation(&context, &grant.journal_id)
-            .map_err(journal_error)?
-        {
-            if active.job.job_id != old.request.job_id {
-                return Err(SubjektivHostError::InvalidArgument(
-                    "another generation owns legacy migration".into(),
-                ));
+            .retained_journal_generation(&context, &grant.journal_id, &binding)
+            .map_err(journal_error)?;
+        if let Some(generation) = generation.as_ref() {
+            let recovery = JournalJobContext::validated_recovery(
+                &self.catalog.store,
+                &context,
+                &generation.id,
+                binding.clone(),
+            )
+            .map_err(journal_error)?;
+            match subjektiv::journal::service::finish(&self.catalog.store, &recovery) {
+                Ok(completion) => {
+                    let settled = jobs
+                        .accept_reconciled(&job::JobResultSubmission {
+                            job_id: binding.job_id.clone(),
+                            attempt_id: binding.attempt_id.clone(),
+                            input_digest: saved.input_digest.clone(),
+                            result: serde_json::to_value(completion)
+                                .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))?,
+                        })
+                        .map_err(service_error)?;
+                    self.complete_journal_job(jobs, &settled)?;
+                    return Ok(None);
+                }
+                Err(JournalError::Conflict(_)) => {} // incomplete, retained checkpoint
+                Err(error) => return Err(journal_error(error)),
             }
+        }
+        if !saved.executions_released() {
+            return Err(SubjektivHostError::Conflict {code:"journal_execution_unreleased".into(),message:"Saved Journal input/operations retained; preceding execution/cleanup is not proven stopped".into()});
+        }
+        let receipt = if let Some(generation) = generation {
             self.catalog
                 .store
-                .close_journal_generation(&context, &active.id, &active.job)
+                .close_journal_generation(&context, &generation.id, &binding)
                 .map_err(journal_error)?;
-        }
-        jobs.cancel(&old.request.job_id).map_err(service_error)?;
-        let current = self
-            .catalog
-            .store
-            .read_journal(&context, &grant.journal_id)
-            .map_err(journal_error)?;
-        let end = grant
-            .ranges
-            .last()
-            .ok_or_else(|| SubjektivHostError::InvalidArgument("empty legacy selection".into()))?;
-        let end_position = if end.bytes.end == end.source.total_bytes {
-            (end.source.order + 1, 0)
+            format!("journal-generation-closed:{}", generation.id)
         } else {
-            (end.source.order, end.bytes.end)
+            // The authoritative domain lookup found no generation for this exact attempt.
+            "journal-no-generation".to_string()
         };
-        let replacement = if (current.process_order, current.process_byte) >= end_position {
-            None
-        } else {
-            let mut capture = self.recording_capture(&grant.session_id)?;
-            capture
-                .entries
-                .retain(|entry| grant.ranges.iter().any(|r| r.source.order == entry.order));
-            for entry in &mut capture.entries {
-                let range = grant
-                    .ranges
-                    .iter()
-                    .find(|r| r.source.order == entry.order)
-                    .unwrap();
-                let session_store::capture::CaptureBody::CanonicalPublic {
-                    descriptor,
-                    byte_offset,
-                    text,
-                    ..
-                } = &mut entry.body
-                else {
-                    unreachable!()
-                };
-                if source_descriptor(&grant.session_id, descriptor) != range.source
-                    || !grant.origins.iter().any(|origin| {
-                        origin.pointer == range.source.pointer && origin.origin == descriptor.origin
-                    })
-                    || !text.is_char_boundary(range.bytes.start as usize)
-                    || !text.is_char_boundary(range.bytes.end as usize)
-                {
-                    return Err(SubjektivHostError::InvalidArgument(
-                        "legacy original source identity/range changed".into(),
-                    ));
-                }
-                *text = text[range.bytes.start as usize..range.bytes.end as usize].to_owned();
-                *byte_offset = range.bytes.start;
-            }
-            let input = self.build_journal_input(&context, &grant.journal_id, Some(&capture))?;
-            let request = self.journal_request(&grant.journal_id, &input)?;
-            let next_grant = LocalJournalGrant {
-                ranges: input.selected_ranges.clone(),
-                origins: vec![],
-                ..grant
-            };
-            Some(
-                jobs.request_granted(
-                    request,
-                    serde_json::to_value(next_grant)
-                        .map_err(|e| SubjektivHostError::Unavailable(e.to_string()))?,
-                )
-                .map_err(service_error)?
-                .request
-                .job_id,
-            )
-        };
-        jobs.reclaim_input(
-            &old.request.job_id,
-            &old.input_digest,
-            JobInputRetirementReason::LegacyInvalidation,
-        )
-        .map_err(service_error)?;
-        Ok(replacement)
+        jobs.reconcile_granted_attempt(&binding.job_id, &binding.attempt_id, &receipt)
+            .map_err(service_error)?;
+        let resumed = jobs
+            .resume_granted(&binding.job_id, &binding.attempt_id)
+            .map_err(service_error)?;
+        Ok(Some(resumed))
     }
 
     fn journal_request(
@@ -1455,6 +1353,9 @@ impl LocalSubjectHost {
         }
         jobs.acknowledge(&snapshot.request.job_id)
             .map_err(service_error)?;
+        if !snapshot.executions_released() {
+            return Err(SubjektivHostError::Conflict {code:"journal_cleanup_unconfirmed".into(),message:"Checkpoint/result completed; execution cleanup remains independent and unconfirmed".into()});
+        }
         jobs.reclaim_input(
             &snapshot.request.job_id,
             &snapshot.input_digest,
@@ -1560,6 +1461,10 @@ impl JournalJobHost for LocalJournalHost {
         &self,
         request: JournalJobRequest,
     ) -> Result<JournalJobResponse, SubjektivHostError> {
+        let _effects = self
+            .fence
+            .enter()
+            .map_err(SubjektivHostError::Unavailable)?;
         let context = self.live()?;
         // The generic runner has supplied this exact immutable input before it can
         // invoke this bound tool. Preparation alone is not evidence of delivery.
@@ -1579,6 +1484,10 @@ impl JournalJobHost for LocalJournalHost {
         .map_err(journal_error)
     }
     fn finish(&self) -> Result<JournalJobCompletion, SubjektivHostError> {
+        let _effects = self
+            .fence
+            .enter()
+            .map_err(SubjektivHostError::Unavailable)?;
         let context = self.live()?;
         subjektiv::journal::service::finish(&self.host.catalog.store, &context)
             .map_err(journal_error)

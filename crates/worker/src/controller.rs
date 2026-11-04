@@ -42,6 +42,14 @@ use workdir::{
 // WorkerHandle — client-facing, Clone-able
 // ---------------------------------------------------------------------------
 
+/// Saved acceptance only; neither processing nor execution cleanup is implied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionReceipt {
+    pub submission_request_id: String,
+    pub submission_id: String,
+    pub disposition: protocol::SubmissionDisposition,
+}
+
 #[derive(Clone)]
 pub struct WorkerHandle {
     method_tx: mpsc::Sender<Method>,
@@ -61,6 +69,25 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Read the existing receipt without resending input or activating a run.
+    /// Missing evidence is not proof of rejection and must not authorize replay.
+    pub fn reconcile_submission(
+        &self,
+        submission_request_id: &str,
+        input: &[protocol::Segment],
+        source: &protocol::AuthenticatedInputSource,
+    ) -> Result<Option<SubmissionReceipt>, String> {
+        let namespace = if matches!(source, protocol::AuthenticatedInputSource::UntrustedWire) {
+            format!("direct:{}", self.session_id)
+        } else {
+            source.namespace()
+        };
+        self.pending_activations
+            .lock()
+            .map_err(|_| "pending activation receipt state is poisoned".to_string())?
+            .reconcile_submission(submission_request_id, input, &namespace)
+    }
+
     /// Transport closure belongs to this Controller endpoint, not a WorkerRef.
     pub fn protocol_is_closed(&self) -> bool {
         self.method_tx.is_closed()
@@ -651,7 +678,15 @@ fn prepare_pending_run<St: Store + Clone>(
 // WorkerController — actor that owns a Worker
 // ---------------------------------------------------------------------------
 
-pub type ShutdownReceiver = oneshot::Receiver<()>;
+/// Sent only after Controller admission, child tasks, Workdir sessions, and observer tasks
+/// have closed. Feature cleanup failures are retained separately; this is not Backend Host
+/// operation drain, domain writer revocation, or a resource-removal receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControllerShutdownReport {
+    pub feature_failures: Vec<crate::hook::HookError>,
+}
+
+pub type ShutdownReceiver = oneshot::Receiver<ControllerShutdownReport>;
 
 pub struct WorkerController;
 
@@ -664,7 +699,7 @@ pub(crate) struct InitializedWorkerController<C: LlmClient, St: Store> {
     pub(crate) worker: Worker<C, St>,
     pub(crate) handle: WorkerHandle,
     method_rx: mpsc::Receiver<Method>,
-    shutdown_tx: oneshot::Sender<()>,
+    shutdown_tx: oneshot::Sender<ControllerShutdownReport>,
     shutdown_rx: ShutdownReceiver,
     registry_reclaim: PreparedSpawnedWorkerRegistryLoad<St>,
     shutdown_after_idle: ShutdownAfterIdleRequest,
@@ -858,7 +893,7 @@ impl WorkerController {
 
         // === 1. Initialization (channels / RuntimeDir / worker-immutable
         //         snapshots / SpawnedWorkerRegistry / alerter attach) ===
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<ControllerShutdownReport>();
         let (method_tx, method_rx) = mpsc::channel::<Method>(32);
         let (working_event_tx, _) = broadcast::channel::<Event>(256);
         let alerter = Alerter::new(working_event_tx.clone());
@@ -2380,7 +2415,7 @@ async fn controller_loop<C, St>(
     pause_tx: mpsc::Sender<()>,
     notify_buffer: NotifyBuffer,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
-    shutdown_tx: oneshot::Sender<()>,
+    shutdown_tx: oneshot::Sender<ControllerShutdownReport>,
     shutdown_after_idle: ShutdownAfterIdleRequest,
     mut command_observer: Option<tokio::task::JoinHandle<()>>,
 ) where
@@ -3245,7 +3280,11 @@ async fn controller_loop<C, St>(
     drop(method_rx);
     // Feature callbacks and tasks share the Worker scope. Stop them before
     // Memory/Workdir teardown so they cannot observe a partially closed Worker.
-    worker.stop_feature_runtime("controller shutdown").await;
+    let feature_failures = worker
+        .stop_feature_runtime_report("controller shutdown")
+        .await
+        .err()
+        .unwrap_or_default();
 
     loop {
         match spawned_registry.shutdown_internal().await {
@@ -3275,7 +3314,7 @@ async fn controller_loop<C, St>(
         let _ = observer.await;
     }
 
-    let _ = shutdown_tx.send(());
+    let _ = shutdown_tx.send(ControllerShutdownReport { feature_failures });
 }
 
 /// Stage an agent-visible Internal SubWorker lifecycle event.
@@ -5524,7 +5563,7 @@ mod tests {
     fn controller_shutdown_orders_child_cleanup_before_workdir_close() {
         let source = include_str!("controller.rs");
         let shutdown_start = source
-            .rfind("worker.stop_feature_runtime(\"controller shutdown\")")
+            .rfind(".stop_feature_runtime_report(\"controller shutdown\")")
             .expect("controller shutdown block");
         let shutdown = &source[shutdown_start..];
         let children = shutdown

@@ -1,5 +1,48 @@
 use super::*;
 
+// Frozen pre-cutover schema, including the retired persisted state spelling.
+pub(super) const SCHEMA: &str = "
+CREATE TABLE job_intents (
+    job_id TEXT PRIMARY KEY NOT NULL,
+    request_json TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    serialization_key TEXT,
+    max_concurrent INTEGER NOT NULL CHECK (max_concurrent BETWEEN 1 AND 65535),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown', 'cancelled')),
+    current_attempt INTEGER NOT NULL CHECK (current_attempt BETWEEN 1 AND 255),
+    acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
+    CHECK (acknowledged = 0 OR state = 'completed'),
+    FOREIGN KEY (job_id, current_attempt) REFERENCES job_attempts(job_id, number)
+        DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE job_attempts (
+    job_id TEXT NOT NULL REFERENCES job_intents(job_id),
+    number INTEGER NOT NULL CHECK (number BETWEEN 1 AND 255),
+    attempt_id TEXT NOT NULL UNIQUE,
+    input_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'unknown', 'cancelled')),
+    result_json TEXT,
+    result_digest TEXT,
+    failure TEXT,
+    PRIMARY KEY (job_id, number),
+    CHECK ((result_json IS NULL) = (result_digest IS NULL)),
+    CHECK (state <> 'completed' OR result_json IS NOT NULL)
+);
+CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key)
+    WHERE serialization_key IS NOT NULL AND state IN ('pending', 'unknown');
+CREATE INDEX job_attempt_state ON job_attempts(state);
+CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF
+    job_id, request_json, fingerprint, serialization_key, max_concurrent ON job_intents
+BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
+CREATE TRIGGER job_attempt_immutable BEFORE UPDATE OF
+    job_id, number, attempt_id, input_digest ON job_attempts
+BEGIN SELECT RAISE(ABORT, 'immutable Job attempt identity'); END;
+CREATE TRIGGER job_result_immutable BEFORE UPDATE OF result_json, result_digest ON job_attempts
+WHEN OLD.result_json IS NOT NULL AND
+    (NEW.result_json IS NOT OLD.result_json OR NEW.result_digest IS NOT OLD.result_digest)
+BEGIN SELECT RAISE(ABORT, 'immutable accepted Job result'); END;
+";
+
 /// Frozen schema-1/2 adapter. Preserve original intent and attempt bindings
 /// before replacing counters with identities derived from immutable input.
 pub(super) fn migrate_legacy_jobs(conn: &Connection) -> Result<(), JobStoreError> {
@@ -244,10 +287,15 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .unwrap();
             assert_eq!(digests, vec![request("done").input_digest().unwrap(); 2]);
-            assert_eq!(store.get("running").unwrap().state, JobState::Unknown);
+            assert_eq!(store.get("running").unwrap().state, JobState::Failed);
+            assert_eq!(
+                store.get("running").unwrap().attempt.failure.as_deref(),
+                Some(recovery::UPDATE_INTERRUPTION)
+            );
+            assert!(store.get("running").unwrap().version_stopped);
             assert_eq!(
                 store.reserve(request("pending")).unwrap().attempt.state,
-                JobAttemptState::Reserved
+                JobAttemptState::Failed
             );
             assert!(
                 store

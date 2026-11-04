@@ -129,10 +129,15 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
+#[path = "backend_job_recovery_store.rs"]
+mod backend_job_recovery_store;
+#[path = "backend_job_upgrade.rs"]
+pub(crate) mod backend_job_upgrade;
 #[path = "storage_formats.rs"]
 mod storage_formats;
+pub use backend_job_recovery_store::BackendJobReconciliation;
 
-const LATEST_SCHEMA_VERSION: i64 = 122;
+const LATEST_SCHEMA_VERSION: i64 = 123;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -509,6 +514,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 122,
         name: crate::config_adoption::MIGRATION_NAME,
         apply: migrate_configuration_adoption_to_v122,
+    },
+    Migration {
+        version: 123,
+        name: backend_job_upgrade::MIGRATION_NAME,
+        apply: migrate_backend_job_execution_to_v123,
     },
 ];
 
@@ -1961,7 +1971,8 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<BackendJobReservation>;
     fn get_backend_job(&self, workspace_id: &str, job_id: &str)
     -> Result<Option<BackendJobRecord>>;
-    /// Pending/unknown Jobs and terminal Jobs with unfinished Worker cleanup
+    fn backend_job_was_migrated(&self, workspace_id: &str, job_id: &str) -> Result<bool>;
+    /// Pending Jobs and terminal Jobs with unfinished Worker cleanup
     /// retain their resource. This is a query, not an independent lock ledger.
     fn find_active_backend_job_for_resource(
         &self,
@@ -1981,6 +1992,70 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         job_id: &str,
         attempt_id: &str,
     ) -> Result<Option<BackendJobAttemptRecord>>;
+    /// Full ordered execution history for exact-owner release CAS.
+    fn list_backend_job_attempts(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<BackendJobAttemptRecord>>;
+    fn record_backend_job_reconciliation(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        failure_category: &str,
+        failure_detail: &str,
+        next_action: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn probe_backend_job_recovery(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool>;
+    fn record_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        controller_evidence: &str,
+        host_evidence: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn has_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool>;
+    /// Host-only saved non-Journal result reconciliation; no model/finalizer rerun.
+    fn reconcile_backend_job_domain_result(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        submission: &BackendJobResultSubmission,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn get_backend_job_reconciliation(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<BackendJobReconciliation>>;
+    fn claim_backend_job_worker_cleanup_owned(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        now: &str,
+    ) -> Result<(BackendJobAttemptRecord, bool)>;
+    fn finish_backend_job_worker_cleanup_owned(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        state: BackendJobWorkerCleanupState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
     fn list_recoverable_backend_job_attempts(
         &self,
         workspace_id: &str,
@@ -2032,8 +2107,8 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         completion: Option<&BackendJobResultSubmission>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord>;
-    /// Bounded keyset over current Journal Unknown attempts, independent of source liveness.
-    fn list_backend_journal_unknown_attempts(
+    /// Bounded keyset over current Journal Pending attempts, independent of source liveness.
+    fn list_backend_journal_pending_attempts(
         &self,
         workspace_id: &str,
         after_job_id: Option<&str>,
@@ -3784,6 +3859,57 @@ impl SqliteWorkspaceStore {
             "SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2 AND state='removed')",
             params![workspace_id, allocation_key], |row| row.get(0),
         )?))
+    }
+
+    /// Read only: recover the original create reservation, never create/restore a
+    /// Worker. The workspace-store caller must separately check registry Job binding.
+    pub(crate) fn lookup_backend_job_allocation(
+        &self,
+        workspace_id: &str,
+        job: &BackendJobRecord,
+        attempt: &BackendJobAttemptRecord,
+    ) -> Result<Option<(WorkerCreateReservation, String)>> {
+        if job.workspace_id != workspace_id
+            || attempt.workspace_id != workspace_id
+            || job.request.job_id != attempt.job_id
+            || job.current_attempt != attempt.attempt
+            || job.input_digest != attempt.input_digest
+            || job.state != BackendJobState::Pending
+            || attempt.state.terminal()
+            || attempt.attempt_id
+                != crate::backend_job::attempt_id(&job.request.job_id, attempt.attempt)
+        {
+            return Err(Error::InvalidInput(
+                "allocation lookup requires the exact current Job intent".into(),
+            ));
+        }
+        job.load_executable_request()?;
+        let key = crate::backend_job::allocation_key(&attempt.attempt_id);
+        self.with_conn(|conn| {
+            let saved = conn.query_row("SELECT worker_id,runtime_id,request_fingerprint,create_fingerprint,memory_language,state,singleton_key,singleton_generation FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2",params![workspace_id,key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?))).optional()?;
+            let Some((worker_id,runtime,request_fingerprint,create_fingerprint,language,state,singleton,generation))=saved else { return Ok(None); };
+            if state == "removed" || singleton.is_some() || generation.is_some() {
+                return Err(Error::RepositoryConflict("original Job allocation is removed or has different create intent".into()));
+            }
+            // The trusted reservation fixes the original create intent, including
+            // its then-selected Profile. Reading that evidence does not resolve
+            // today's Profile/default or issue any new execution grant.
+            let request_fingerprint = request_fingerprint.filter(|fingerprint| !fingerprint.is_empty())
+                .ok_or_else(|| Error::Store("original Job create fingerprint missing".into()))?;
+            let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: workspace_id.into(),
+                language: language.ok_or_else(||Error::Store("Job allocation Memory snapshot missing".into()))?,
+            };
+            validate_workspace_memory_settings_snapshot(&snapshot,workspace_id)?;
+            if create_fingerprint != bound_worker_create_fingerprint(&request_fingerprint,&snapshot) {
+                return Err(Error::RepositoryConflict("Job allocation create fingerprint mismatch".into()));
+            }
+            let worker_id = worker_id.parse::<WorkerId>().map_err(|_|Error::Store("invalid original Job Worker identity".into()))?;
+            if attempt.worker.as_ref().is_some_and(|worker| worker.runtime_id != runtime || worker.worker_id != worker_id.to_string()) {
+                return Err(Error::RepositoryConflict("Job allocation differs from saved execution binding".into()));
+            }
+            Ok(Some((WorkerCreateReservation{worker_id,create_fingerprint,memory_settings:snapshot,singleton:None},runtime)))
+        })
     }
 
     pub(crate) fn reserved_worker_create_runtime(
@@ -7968,6 +8094,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<BackendJobReservation> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let mut job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
             subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
@@ -8030,6 +8157,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| read_backend_job(conn, workspace_id, job_id))
     }
 
+    fn backend_job_was_migrated(&self, workspace_id: &str, job_id: &str) -> Result<bool> {
+        self.with_conn(|conn| Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM backend_job_upgrade_history WHERE workspace_id=?1 AND job_id=?2)",
+            params![workspace_id, job_id], |row| row.get(0),
+        )?))
+    }
+
     fn find_active_backend_job_for_resource(
         &self,
         workspace_id: &str,
@@ -8069,6 +8203,122 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| read_backend_job_attempt(conn, workspace_id, job_id, attempt_id))
     }
 
+    fn list_backend_job_attempts(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.with_conn(|conn| backend_job_recovery_store::history(conn, workspace_id, job_id))
+    }
+    fn record_backend_job_reconciliation(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        failure_category: &str,
+        failure_detail: &str,
+        next_action: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::record(
+            self,
+            workspace_id,
+            expected,
+            failure_category,
+            failure_detail,
+            next_action,
+            now,
+        )
+    }
+    fn probe_backend_job_recovery(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool> {
+        backend_job_recovery_store::probe(self, workspace_id, expected)
+    }
+    fn record_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        controller_evidence: &str,
+        host_evidence: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::record_fence(
+            self,
+            workspace_id,
+            expected,
+            controller_evidence,
+            host_evidence,
+            now,
+        )
+    }
+    fn has_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool> {
+        self.with_conn(|conn| backend_job_recovery_store::has_fence(conn, workspace_id, expected))
+    }
+    fn reconcile_backend_job_domain_result(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        submission: &BackendJobResultSubmission,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::reconcile_domain_result(
+            self,
+            workspace_id,
+            expected,
+            submission,
+            now,
+        )
+    }
+    fn get_backend_job_reconciliation(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<BackendJobReconciliation>> {
+        self.with_conn(|conn| conn.query_row("SELECT cause,detail,next_action,updated_at FROM backend_job_reconciliation WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace_id,job_id,attempt_id],|row|Ok(BackendJobReconciliation{cause:row.get(0)?,detail:row.get(1)?,next_action:row.get(2)?,updated_at:row.get(3)?})).optional().map_err(Error::from))
+    }
+    fn claim_backend_job_worker_cleanup_owned(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        now: &str,
+    ) -> Result<(BackendJobAttemptRecord, bool)> {
+        backend_job_recovery_store::claim_cleanup_owned(
+            self,
+            workspace_id,
+            expected_history,
+            expected,
+            now,
+        )
+    }
+    fn finish_backend_job_worker_cleanup_owned(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        state: BackendJobWorkerCleanupState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::finish_cleanup_owned(
+            self,
+            workspace_id,
+            expected_history,
+            expected,
+            state,
+            failure_category,
+            failure_detail,
+            now,
+        )
+    }
     fn list_recoverable_backend_job_attempts(
         &self,
         workspace_id: &str,
@@ -8076,15 +8326,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // A dispatch claim has no externally meaningful identity until the
-            // deterministic Worker allocation is bound. Startup can therefore
-            // replay an interrupted claim through the same allocation key.
-            tx.execute(
-                "UPDATE backend_job_attempts SET state = 'reserved' WHERE workspace_id = ?1 AND state = 'dispatching' AND worker_id IS NULL",
-                params![workspace_id],
-            )?;
+            // Preserve the last confirmed dispatch fact. An unbound claim may
+            // already own an external allocation; the Server reconciles its ID.
             let mut statement = tx.prepare(
-                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('reserved', 'dispatched') ORDER BY created_at LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND a.state IN ('reserved', 'dispatching', 'dispatched') AND a.attempt=j.current_attempt AND j.state='pending' AND j.input_disposition='available' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.created_at LIMIT ?2",
             )?;
             let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -8108,6 +8353,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(BackendJobReservation, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
             subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
@@ -8149,7 +8395,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='reserved' AND j.input_disposition='available' ORDER BY a.created_at, a.attempt_id LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='reserved' AND j.input_disposition='available' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.created_at, a.attempt_id LIMIT ?2",
             )?;
             let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -8172,6 +8418,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(WorkerRegistryProjectionCommit, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
             subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
@@ -8237,6 +8484,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         }
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?.ok_or_else(|| Error::InvalidInput("Backend Job missing".into()))?;
             subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
@@ -8323,6 +8571,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, &submission.job_id)?;
             if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending {
                 return Err(Error::InvalidInput(
                     "Backend Job attempt no longer accepts results".to_string(),
@@ -8349,16 +8598,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn list_backend_journal_unknown_attempts(
+    fn list_backend_journal_pending_attempts(
         &self,
         workspace_id: &str,
         after_job_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='unknown' AND j.state='unknown' AND a.attempt=j.current_attempt AND json_type(j.request_json,'$.grants.subjektiv_journal')='object' AND (?2 IS NULL OR a.job_id>?2) ORDER BY a.job_id LIMIT ?3")?;
+            let mut stmt = conn.prepare("SELECT a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='dispatched' AND j.state='pending' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) AND a.attempt=j.current_attempt AND json_type(j.request_json,'$.grants.subjektiv_journal')='object' AND (?2 IS NULL OR a.job_id>?2) ORDER BY a.job_id LIMIT ?3")?;
             let ids = stmt.query_map(params![workspace_id,after_job_id,limit.clamp(1,100) as i64], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            ids.into_iter().map(|(job,id)| read_backend_job_attempt(conn,workspace_id,&job,&id)?.ok_or_else(|| Error::Store("Journal Unknown attempt disappeared".into()))).collect()
+            ids.into_iter().map(|(job,id)| read_backend_job_attempt(conn,workspace_id,&job,&id)?.ok_or_else(|| Error::Store("Journal Pending attempt disappeared".into()))).collect()
         })
     }
 
@@ -8385,6 +8634,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<BackendJobAttemptRecord> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, &expected.job_id)?;
             let job = read_backend_job(&tx, workspace_id, &expected.job_id)?.ok_or_else(|| Error::InvalidInput("Journal Job missing".into()))?;
             subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, &expected.job_id, &expected.attempt_id)?.ok_or_else(|| Error::InvalidInput("Journal attempt missing".into()))?;
@@ -8392,7 +8642,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             if &attempt != expected || job.current_attempt != attempt.attempt
                 || job.request.grants.subjektiv_journal.is_none()
                 || attempt.input_digest != job.input_digest
-                || !matches!(job.state, BackendJobState::Unknown | BackendJobState::Completed | BackendJobState::Failed) {
+                || !matches!(job.state, BackendJobState::Pending | BackendJobState::Completed | BackendJobState::Failed) {
                 return Err(Error::InvalidInput("Journal reconciliation binding changed".into()));
             }
             if let Some(submission) = completion {
@@ -8401,25 +8651,25 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
                 let (digest, json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
                 if attempt.state == BackendJobAttemptState::Completed && attempt.result_digest.as_deref() == Some(digest.as_str()) { tx.commit()?; return Ok(attempt); }
-                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown {
+                if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending {
                     return Err(Error::InvalidInput("Journal completion cannot replace definitive outcome".into()));
                 }
-                tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,json,digest,now])?;
-                tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,json,digest,now])?;
+                tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,worker_cleanup_state=COALESCE(worker_cleanup_state,'pending'),worker_cleanup_updated_at=CASE WHEN worker_cleanup_state IS NULL THEN ?6 ELSE worker_cleanup_updated_at END,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='dispatched'",params![workspace_id,expected.job_id,expected.attempt_id,json,digest,now])?;
+                tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,json,digest,now])?;
                 notification_routing::jobs::capture(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?;
             } else {
                 if attempt.state == BackendJobAttemptState::Failed && attempt.failure_category.as_deref() == Some("journal_attempt_fenced") { tx.commit()?; return Ok(attempt); }
-                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown
+                if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending
                     || attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
                     || attempt.worker_cleanup_completed_at.is_none() {
-                    return Err(Error::InvalidInput("partial Journal Unknown requires completed canonical cleanup fence".into()));
+                    return Err(Error::InvalidInput("partial Journal Pending requires completed canonical cleanup fence".into()));
                 }
                 let purged = if let Some(worker) = &attempt.worker {
                     tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='succeeded' AND session_disposition='purge')",params![workspace_id,worker.runtime_id,worker.worker_id],|r|r.get::<_,bool>(0))?
                 } else { false };
-                if !purged { return Err(Error::InvalidInput("partial Journal Unknown has no committed stop/Purge removal receipt".into())); }
-                tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed; retained operations remain valid',updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,now])?;
-                tx.execute("UPDATE backend_jobs SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,now])?;
+                if !purged { return Err(Error::InvalidInput("partial Journal Pending has no committed stop/Purge removal receipt".into())); }
+                tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed; retained operations remain valid',updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='dispatched'",params![workspace_id,expected.job_id,expected.attempt_id,now])?;
+                tx.execute("UPDATE backend_jobs SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,now])?;
             }
             let result = read_backend_job_attempt(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?.ok_or_else(|| Error::Store("Reconciled Journal attempt missing".into()))?;
             tx.commit()?; Ok(result)
@@ -8436,12 +8686,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         failure_detail: &str,
         now: &str,
     ) -> Result<BackendJobAttemptRecord> {
-        if !matches!(
-            state,
-            BackendJobAttemptState::Failed | BackendJobAttemptState::Unknown
-        ) {
+        if !matches!(state, BackendJobAttemptState::Failed) {
             return Err(Error::InvalidInput(
-                "Backend Job failure completion requires failed or unknown state".to_string(),
+                "Backend Job failure completion requires failed state".to_string(),
             ));
         }
         let detail = bounded_failure_detail(failure_detail);
@@ -8465,16 +8712,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(attempt);
             }
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             tx.execute(
-                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, worker_cleanup_state = CASE WHEN worker_id IS NULL THEN 'completed' ELSE 'pending' END, worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = CASE WHEN worker_id IS NULL THEN ?7 ELSE NULL END, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
+                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, worker_cleanup_state = CASE WHEN state='reserved' AND worker_id IS NULL THEN 'completed' ELSE 'pending' END, worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = CASE WHEN state='reserved' AND worker_id IS NULL THEN ?7 ELSE NULL END, allocation_precluded_at = CASE WHEN state='reserved' AND runtime_id IS NULL AND worker_id IS NULL AND runtime_run_id IS NULL AND dispatched_at IS NULL THEN ?7 ELSE NULL END, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
                 params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now],
             )?;
             if attempt.attempt == job.current_attempt && job.state == BackendJobState::Pending {
-                let job_state = match state {
-                    BackendJobAttemptState::Failed => BackendJobState::Failed,
-                    BackendJobAttemptState::Unknown => BackendJobState::Unknown,
-                    _ => unreachable!(),
-                };
+                let job_state = BackendJobState::Failed;
                 tx.execute(
                     "UPDATE backend_jobs SET state = ?3, failure_category = ?4, failure_detail = ?5, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
                     params![workspace_id, job_id, job_state.as_str(), failure_category, detail, now],
@@ -8490,35 +8734,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn recover_backend_job_worker_cleanups(
         &self,
         workspace_id: &str,
-        now: &str,
+        _now: &str,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE backend_job_attempts SET worker_cleanup_state = 'pending', worker_cleanup_failure_category = 'cleanup_interrupted', worker_cleanup_failure_detail = 'Backend restart interrupted Worker cleanup; retrying canonical removal', worker_cleanup_updated_at = ?2 WHERE workspace_id = ?1 AND worker_cleanup_state = 'executing'",
-                params![workspace_id, now],
-            )?;
-            let mut statement = tx.prepare(
-                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('completed', 'failed', 'unknown') AND runtime_id IS NOT NULL AND worker_cleanup_state IN ('pending', 'failed') ORDER BY worker_cleanup_updated_at, created_at LIMIT ?2",
-            )?;
-            let identities = statement
-                .query_map(params![workspace_id, limit as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(statement);
-            let attempts = identities
-                .into_iter()
-                .map(|(job_id, attempt_id)| {
-                    read_backend_job_attempt(&tx, workspace_id, &job_id, &attempt_id)?.ok_or_else(
-                        || Error::Store("recoverable Backend Job Worker cleanup disappeared".to_string()),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            tx.commit()?;
-            Ok(attempts)
-        })
+        // Reopening observes retained owners; it does not revoke an executing
+        // cleanup or authorize a new one by resetting its state.
+        self.list_backend_job_worker_cleanups(workspace_id, limit)
     }
 
     fn list_backend_job_worker_cleanups(
@@ -8528,7 +8749,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('completed', 'failed', 'unknown') AND runtime_id IS NOT NULL AND worker_cleanup_state IN ('pending', 'failed') ORDER BY worker_cleanup_updated_at, created_at LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR (a.state='completed' AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.worker_cleanup_updated_at, a.created_at LIMIT ?2",
             )?;
             let identities = statement
                 .query_map(params![workspace_id, limit as i64], |row| {
@@ -8555,6 +8776,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(BackendJobAttemptRecord, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
             if !attempt.state.terminal() || attempt.worker.is_none() {
@@ -8607,6 +8829,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         let failure_detail = failure_detail.map(bounded_failure_detail);
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let current = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
             if current.worker_cleanup_state == Some(state) {
@@ -8620,7 +8843,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let completed_at = (state == BackendJobWorkerCleanupState::Completed).then_some(now);
             let changed = tx.execute(
-                "UPDATE backend_job_attempts SET worker_cleanup_state = ?4, worker_cleanup_failure_category = ?5, worker_cleanup_failure_detail = ?6, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = ?8 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND worker_cleanup_state = 'executing'",
+                "UPDATE backend_job_attempts SET worker_cleanup_state = ?4, worker_cleanup_failure_category = ?5, worker_cleanup_failure_detail = ?6, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = ?8 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND worker_cleanup_state = 'executing' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=backend_job_attempts.workspace_id AND h.job_id=backend_job_attempts.job_id)",
                 params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, failure_detail, now, completed_at],
             )?;
             if changed != 1 {
@@ -12809,7 +13032,7 @@ fn read_active_backend_job_for_resource(
     // effects block even after Worker removal; cleanup is not outcome resolution.
     let id = conn.query_row(
         "SELECT job.job_id FROM backend_jobs job WHERE job.workspace_id = ?1 AND job.resource_key = ?2
-         AND (job.state IN ('pending', 'unknown') OR EXISTS (
+         AND (job.state='pending' OR EXISTS (
              SELECT 1 FROM backend_job_attempts attempt WHERE attempt.workspace_id = job.workspace_id
              AND attempt.job_id = job.job_id
              AND attempt.worker_cleanup_state IS NOT 'completed'))
@@ -12921,7 +13144,7 @@ fn read_backend_job_attempt(
     attempt_id: &str,
 ) -> Result<Option<BackendJobAttemptRecord>> {
     let row = conn.query_row(
-        "SELECT attempt, input_digest, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
+        "SELECT attempt, input_digest, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at, allocation_precluded_at FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
         params![workspace_id, job_id, attempt_id],
         |row| Ok((
             row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
@@ -12930,7 +13153,7 @@ fn read_backend_job_attempt(
             row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?,
             row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?,
             row.get::<_, Option<String>>(15)?, row.get::<_, Option<String>>(16)?, row.get::<_, String>(17)?,
-            row.get::<_, String>(18)?, row.get::<_, Option<String>>(19)?,
+            row.get::<_, String>(18)?, row.get::<_, Option<String>>(19)?, row.get::<_, Option<String>>(20)?,
         )),
     ).optional()?;
     let Some((
@@ -12954,6 +13177,7 @@ fn read_backend_job_attempt(
         created_at,
         updated_at,
         completed_at,
+        allocation_precluded_at,
     )) = row
     else {
         return Ok(None);
@@ -12987,6 +13211,7 @@ fn read_backend_job_attempt(
         worker,
         runtime_run_id,
         dispatched_at,
+        allocation_precluded_at,
         deadline_at,
         result,
         result_digest,
@@ -16074,6 +16299,36 @@ fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_backend_job_execution_to_v123(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 122 {
+        return Err(Error::Store(
+            "Backend Job execution migration requires schema 122".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 122)?;
+    let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let migration = (|| -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        backend_job_upgrade::install(&tx)?;
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations(version,name) VALUES(123,?1)",
+            [backend_job_upgrade::MIGRATION_NAME],
+        )?;
+        storage_formats::verify_history(&tx, 123)?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = conn
+        .execute_batch(if foreign_keys {
+            "PRAGMA foreign_keys=ON;"
+        } else {
+            "PRAGMA foreign_keys=OFF;"
+        })
+        .map_err(Error::from);
+    migration.and(restore)
+}
+
 fn migrate_configuration_adoption_to_v122(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     if !(113..=121).contains(&current) {
@@ -16192,6 +16447,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_through_v113(conn)?;
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
+    backend_job_upgrade::install_fresh(conn)?;
     Ok(())
 }
 
@@ -16229,7 +16485,11 @@ fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)?;
+    create_workspace_schema_structure_from_sql(
+        conn,
+        &backend_job_upgrade::retained_checks(include_str!("latest_schema.sql")),
+        true,
+    )?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
     conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
@@ -27498,20 +27758,32 @@ INSERT INTO worker_registry (
     }
 
     #[tokio::test]
-    async fn backend_job_input_unknown_retention_and_legacy_invalidation_do_not_reinterpret_outcome()
+    async fn backend_job_input_pending_retention_and_legacy_invalidation_do_not_reinterpret_outcome()
      {
         use crate::backend_job::{JobInputDisposition, JobInputRetirementReason};
         let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         seed_resource_job_workspace(&store).await;
         for (id, state) in [
             ("unfinished", None),
-            ("unknown-input", Some(BackendJobAttemptState::Unknown)),
+            ("reconciling-input", None),
             ("failed-input", Some(BackendJobAttemptState::Failed)),
         ] {
             let original = resource_job_request(id, id, "candidate");
             let reservation = store
                 .reserve_backend_job("resource-workspace", &original, RESOURCE_JOB_NOW)
                 .unwrap();
+            if id == "reconciling-input" {
+                store
+                    .record_backend_job_reconciliation(
+                        "resource-workspace",
+                        &reservation.attempt,
+                        "receipt_missing",
+                        "acceptance lookup temporarily unavailable",
+                        "reconcile_saved_acceptance",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+            }
             if let Some(state) = state {
                 store
                     .finish_backend_job_attempt(
@@ -27685,12 +27957,24 @@ INSERT INTO worker_registry (
         migrate_job_input_retention_v102_to_v103(&conn).unwrap();
         drop(conn);
         let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let migrated = reopened
+            .get_backend_job("resource-workspace", "upgrade")
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.state, BackendJobState::Failed);
         assert_eq!(
+            migrated.failure_category.as_deref(),
+            Some("version_upgrade_execution_aborted")
+        );
+        let mut preserved = migrated.clone();
+        preserved.state = before.job.state;
+        preserved.failure_category = before.job.failure_category.clone();
+        preserved.failure_detail = before.job.failure_detail.clone();
+        assert_eq!(preserved, before.job);
+        assert!(
             reopened
-                .get_backend_job("resource-workspace", "upgrade")
+                .backend_job_was_migrated("resource-workspace", "upgrade")
                 .unwrap()
-                .unwrap(),
-            before.job
         );
         let erased = reopened
             .reclaim_backend_job_input(
@@ -27701,7 +27985,8 @@ INSERT INTO worker_registry (
             )
             .unwrap();
         assert_eq!(erased.input_disposition, JobInputDisposition::Erased);
-        assert_eq!(erased.state, BackendJobState::Pending);
+        assert_eq!(erased.state, BackendJobState::Failed);
+        assert_eq!(erased.failure_category, migrated.failure_category);
         assert_eq!(
             reopened
                 .reserve_backend_job("resource-workspace", &original, RESOURCE_JOB_NOW)
@@ -27926,18 +28211,50 @@ INSERT INTO worker_registry (
         assert_eq!(second.job.request, request);
         assert_eq!(second.attempt.attempt, 2);
         bind_resource_job_worker(&store, &second, "unknown-worker");
-        store
-            .finish_backend_job_attempt(
+        let expected = store
+            .get_backend_job_attempt(
                 "resource-workspace",
                 &request.job_id,
                 &second.attempt.attempt_id,
-                BackendJobAttemptState::Unknown,
-                "unknown_effects",
-                "domain outcome unknown",
+            )
+            .unwrap()
+            .unwrap();
+        let pending = store
+            .record_backend_job_reconciliation(
+                "resource-workspace",
+                &expected,
+                "receipt_unavailable",
+                "domain completion must be reconciled",
+                "read_saved_domain_completion",
                 RESOURCE_JOB_NOW,
             )
             .unwrap();
-        finish_resource_job_cleanup(&store, &second);
+        let history = store
+            .list_backend_job_attempts("resource-workspace", &request.job_id)
+            .unwrap();
+        let (executing, claimed) = store
+            .claim_backend_job_worker_cleanup_owned(
+                "resource-workspace",
+                &history,
+                &pending,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(claimed);
+        let history = store
+            .list_backend_job_attempts("resource-workspace", &request.job_id)
+            .unwrap();
+        store
+            .finish_backend_job_worker_cleanup_owned(
+                "resource-workspace",
+                &history,
+                &executing,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
         drop(store);
         let restarted = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let active = restarted
@@ -27947,7 +28264,7 @@ INSERT INTO worker_registry (
             )
             .unwrap()
             .unwrap();
-        assert_eq!(active.state, BackendJobState::Unknown);
+        assert_eq!(active.state, BackendJobState::Pending);
         assert_eq!(active.request, request);
         assert!(
             restarted
@@ -28946,13 +29263,12 @@ INSERT INTO worker_registry (
             .unwrap();
         assert_eq!(second.attempt.attempt, 2);
         store
-            .finish_backend_job_attempt(
+            .record_backend_job_reconciliation(
                 workspace_id,
-                &retry_request.job_id,
-                &second.attempt.attempt_id,
-                BackendJobAttemptState::Unknown,
-                "worker_unknown",
-                "worker unavailable",
+                &second.attempt,
+                "worker_unavailable",
+                "worker acceptance must be reconciled",
+                "reconcile_saved_acceptance",
                 "2026-09-01T00:01:05Z",
             )
             .unwrap();

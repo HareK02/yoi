@@ -872,13 +872,16 @@ mod tests {
             &crate::backend_job::allocation_key(&second.attempt.attempt_id),
             None,
         );
-        s.finish_backend_job_attempt(
+        let current = s
+            .get_backend_job_attempt("w", "job", &second.attempt.attempt_id)
+            .unwrap()
+            .unwrap();
+        s.record_backend_job_reconciliation(
             "w",
-            "job",
-            &second.attempt.attempt_id,
-            BackendJobAttemptState::Unknown,
-            "unknown",
-            "unknown outcome",
+            &current,
+            "submission_receipt_unconfirmed",
+            "fixture dispatch reply lost",
+            "Read the exact original allocation receipt",
             NOW,
         )
         .unwrap();

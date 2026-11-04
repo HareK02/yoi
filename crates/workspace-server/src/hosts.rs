@@ -1437,6 +1437,45 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Ok(None)
     }
 
+    /// Original allocation identity only, not execution or input acceptance.
+    fn lookup_job_worker_creation(
+        &self,
+        _worker_id: &str,
+        _create_fingerprint: &str,
+        _binding: &worker_runtime::catalog::BackendJobExecutionBinding,
+    ) -> Result<Option<InternalWorkerSummary>, RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_owned(),
+            code: "worker_creation_receipt_unsupported".into(),
+            message: "Runtime does not support original Job Worker identity lookup".into(),
+        })
+    }
+
+    fn backend_job_termination(
+        &self,
+        _worker_id: &str,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>, RuntimeRegistryError>
+    {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_owned(),
+            code: "worker_termination_receipt_unsupported".into(),
+            message: "Runtime does not support actual scope-termination receipt lookup".into(),
+        })
+    }
+
+    /// Read-only exact receipt lookup. Unsupported lookup is not proof of rejection.
+    fn reconcile_worker_input(
+        &self,
+        _worker_id: &str,
+        _request: WorkerInputRequest,
+    ) -> Result<WorkerInputResult, RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_owned(),
+            code: "worker_input_receipt_unsupported".into(),
+            message: "Runtime does not support read-only submission receipt lookup".into(),
+        })
+    }
+
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
         WorkerInputResult {
             state: InternalWorkerOperationState::Unsupported,
@@ -2073,6 +2112,40 @@ impl RuntimeRegistry {
             ));
         }
         runtime.send_protocol_method(worker_id, method)
+    }
+
+    pub fn lookup_job_worker_creation(
+        &self,
+        worker: &RuntimeWorkerRef,
+        create_fingerprint: &str,
+        binding: &worker_runtime::catalog::BackendJobExecutionBinding,
+    ) -> Result<Option<InternalWorkerSummary>, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", worker.runtime_id.as_str())?;
+        validate_backend_identifier("worker_id", worker.worker_id.as_str())?;
+        self.runtime(worker.runtime_id.as_str())?
+            .lookup_job_worker_creation(worker.worker_id.as_str(), create_fingerprint, binding)
+    }
+
+    pub fn backend_job_termination(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>, RuntimeRegistryError>
+    {
+        validate_backend_identifier("runtime_id", worker.runtime_id.as_str())?;
+        validate_backend_identifier("worker_id", worker.worker_id.as_str())?;
+        self.runtime(worker.runtime_id.as_str())?
+            .backend_job_termination(worker.worker_id.as_str())
+    }
+
+    pub fn reconcile_worker_input(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerInputRequest,
+    ) -> Result<WorkerInputResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", worker.runtime_id.as_str())?;
+        validate_backend_identifier("worker_id", worker.worker_id.as_str())?;
+        self.runtime(worker.runtime_id.as_str())?
+            .reconcile_worker_input(worker.worker_id.as_str(), request)
     }
 
     pub fn send_input(
@@ -3790,6 +3863,111 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 code: "embedded_worker_protocol_command_failed".to_string(),
                 message: error.to_string(),
             })
+    }
+
+    fn lookup_job_worker_creation(
+        &self,
+        worker_id: &str,
+        create_fingerprint: &str,
+        binding: &worker_runtime::catalog::BackendJobExecutionBinding,
+    ) -> Result<Option<InternalWorkerSummary>, RuntimeRegistryError> {
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        self.runtime
+            .lookup_job_worker_creation(
+                &self.workspace_id,
+                &worker_ref,
+                create_fingerprint,
+                binding,
+            )
+            .map(|worker| worker.map(|worker| self.map_worker_detail(worker)))
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_job_creation_lookup_failed".into(),
+                message: error.to_string(),
+            })
+    }
+
+    fn backend_job_termination(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>, RuntimeRegistryError>
+    {
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        self.runtime
+            .execution_termination(&worker_ref)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_termination_lookup_failed".into(),
+                message: error.to_string(),
+            })
+    }
+
+    fn reconcile_worker_input(
+        &self,
+        worker_id: &str,
+        request: WorkerInputRequest,
+    ) -> Result<WorkerInputResult, RuntimeRegistryError> {
+        if !self.execution_enabled {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_execution_unavailable".into(),
+                message: "Runtime has no execution backend for receipt lookup".into(),
+            });
+        }
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        let input = EmbeddedWorkerInput {
+            kind: match request.kind {
+                WorkerInputKind::User => EmbeddedWorkerInputKind::User,
+                WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
+                WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
+                WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
+                WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
+            },
+            content: request.content,
+            source: request.source,
+            submission_request_id: request.submission_request_id,
+            segments: request.segments,
+        };
+        let receipt = self
+            .runtime
+            .reconcile_input(&worker_ref, input)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_receipt_lookup_failed".into(),
+                message: error.to_string(),
+            })?;
+        if receipt.is_accepted() {
+            Ok(WorkerInputResult {
+                state: InternalWorkerOperationState::Accepted,
+                disposition: WorkerInputDisposition::Accepted,
+                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                runtime_run_id: receipt.submission.map(|ack| ack.submission_request_id),
+                diagnostics: Vec::new(),
+            })
+        } else {
+            Ok(embedded_input_rejected(
+                &self.runtime_id,
+                worker_id,
+                WorkerInputDisposition::Unknown,
+                diagnostic(
+                    "embedded_worker_receipt_not_confirmed",
+                    HostDiagnosticSeverity::Warning,
+                    receipt.message_or_default(),
+                ),
+            ))
+        }
     }
 
     fn send_input(&self, worker_id: &str, request: WorkerInputRequest) -> WorkerInputResult {
@@ -8585,6 +8763,122 @@ mod tests {
         assert_eq!(input.content, Segment::flatten_to_text(&segments));
         assert_eq!(input.segments, Some(segments));
         assert!(initial_worker_input(&[]).is_none());
+    }
+
+    #[test]
+    fn registry_receipt_lookup_uses_embedded_read_boundary_without_input_dispatch() {
+        use worker_runtime::execution::{
+            WorkerExecutionBackend, WorkerExecutionOperation, WorkerExecutionResult,
+        };
+        #[derive(Default)]
+        struct ReceiptBackend {
+            creation: AcceptingExecutionBackend,
+            receipt: Mutex<Option<WorkerExecutionResult>>,
+            queries: Mutex<Vec<EmbeddedWorkerInput>>,
+        }
+        impl WorkerExecutionBackend for ReceiptBackend {
+            fn backend_id(&self) -> &str {
+                "receipt-only-test-backend"
+            }
+            fn spawn_worker(
+                &self,
+                request: worker_runtime::execution::WorkerExecutionSpawnRequest,
+            ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+                self.creation.spawn_worker(request)
+            }
+            fn dispatch_input(
+                &self,
+                _: &EmbeddedWorkerRef,
+                _: EmbeddedWorkerInput,
+            ) -> WorkerExecutionResult {
+                panic!("a receipt query must not dispatch input")
+            }
+            fn reconcile_submission(
+                &self,
+                _: &EmbeddedWorkerRef,
+                input: EmbeddedWorkerInput,
+            ) -> WorkerExecutionResult {
+                self.queries.lock().unwrap().push(input);
+                self.receipt.lock().unwrap().clone().unwrap_or_else(|| {
+                    WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Input,
+                        "no stored receipt",
+                    )
+                })
+            }
+        }
+        let backend = Arc::new(ReceiptBackend::default());
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "workspace-test",
+            backend.clone(),
+        )
+        .unwrap();
+        let mut spawn = embedded_spawn_request();
+        spawn.intent = WorkerSpawnIntent::BackendJob {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            purpose: "receipt-only test".into(),
+            input_digest: format!("sha256:{}", "a".repeat(64)),
+            subjektiv_consolidation: false,
+            subjektiv_journal: false,
+        };
+        let binding = worker_runtime::catalog::BackendJobExecutionBinding {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            input_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            subjektiv_consolidation: false,
+            subjektiv_journal: false,
+        };
+        let created = runtime.spawn_worker(test_create_binding(), spawn);
+        let worker = created.worker.unwrap().worker;
+        let registry = RuntimeRegistry::for_workspace(runtime);
+        let saved = registry
+            .lookup_job_worker_creation(&worker, "sha256:test-create", &binding)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.worker, worker);
+        let mut foreign = binding.clone();
+        foreign.attempt_id = "attempt-foreign".into();
+        assert!(
+            registry
+                .lookup_job_worker_creation(&worker, "sha256:test-create", &foreign)
+                .is_err()
+        );
+        assert!(
+            registry
+                .lookup_job_worker_creation(&worker, "foreign-create", &binding)
+                .is_err()
+        );
+        let request = || WorkerInputRequest {
+            source: None,
+            kind: WorkerInputKind::User,
+            content: "frozen input".into(),
+            submission_request_id: Some("stored-request".into()),
+            segments: None,
+        };
+        let absent = registry.reconcile_worker_input(&worker, request()).unwrap();
+        assert_eq!(absent.disposition, WorkerInputDisposition::Unknown);
+        *backend.receipt.lock().unwrap() = Some(WorkerExecutionResult::accepted_submission(
+            WorkerExecutionOperation::Input,
+            "stored-request",
+            "stored-submission",
+            protocol::SubmissionDisposition::Started,
+        ));
+        let accepted = registry.reconcile_worker_input(&worker, request()).unwrap();
+        assert_eq!(accepted.state, InternalWorkerOperationState::Accepted);
+        assert_eq!(accepted.runtime_run_id.as_deref(), Some("stored-request"));
+        *backend.receipt.lock().unwrap() = Some(WorkerExecutionResult::accepted_submission(
+            WorkerExecutionOperation::Input,
+            "foreign-request",
+            "stored-submission",
+            protocol::SubmissionDisposition::Started,
+        ));
+        let foreign = registry.reconcile_worker_input(&worker, request()).unwrap();
+        assert_eq!(foreign.disposition, WorkerInputDisposition::Unknown);
+        let queries = backend.queries.lock().unwrap();
+        assert_eq!(queries.len(), 3);
+        assert!(queries.iter().all(|input| input.content == "frozen input"
+            && input.submission_request_id.as_deref() == Some("stored-request")));
     }
 
     #[test]

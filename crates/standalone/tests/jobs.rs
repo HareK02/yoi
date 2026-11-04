@@ -137,6 +137,18 @@ async fn host_job_runs_without_dialog_and_result_survives_restore_and_ack() {
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(completed.result, Some(serde_json::json!({"valid":true})));
     assert!(!completed.acknowledged);
+    assert!(completed.executions_released());
+    assert_eq!(completed.executions.len(), 1);
+    assert_eq!(
+        completed.executions[0].run_id,
+        worker::job::execution_run_id(&intent, &completed.attempt.attempt_id)
+            .unwrap()
+            .to_string()
+    );
+    assert_eq!(
+        completed.executions[0].cleanup_receipt.as_deref(),
+        Some(format!("owned-run:{}", completed.executions[0].run_id).as_str())
+    );
     let neutral = completed.outcome();
     assert_eq!(neutral.state, job::JobState::Completed);
     assert_eq!(neutral.result, completed.result);
@@ -193,6 +205,46 @@ async fn host_job_runs_without_dialog_and_result_survives_restore_and_ack() {
     let restored_jobs = restored.jobs();
     assert_eq!(restored_jobs.get("success").unwrap(), completed);
     assert!(restored_jobs.acknowledge("success").unwrap().acknowledged);
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn host_restore_resumes_reserved_result_job_on_same_attempt_without_client_action() {
+    let temp = tempfile::tempdir().unwrap();
+    let (host, dialog) = host(&temp).await;
+    let worker_id = host.worker_id();
+    let saved = host
+        .jobs()
+        .request(request("reserved-before-dispatch"))
+        .unwrap();
+    host.shutdown().await.unwrap();
+    assert!(dialog.requests().is_empty());
+
+    let model = success();
+    let restored = StandaloneHost::restore_with_model_client(
+        temp.path().join("state"),
+        worker_id,
+        model.clone(),
+    )
+    .await
+    .unwrap();
+    // The production from_started dispatcher, not a test start/retry/probe call,
+    // must supply the already-accepted immutable input to the result-only Job.
+    wait_started(&model).await;
+    let completed = tokio::time::timeout(
+        Duration::from_secs(10),
+        restored.jobs().wait("reserved-before-dispatch"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(completed.attempt.attempt_id, saved.attempt.attempt_id);
+    assert_eq!(completed.input_digest, saved.input_digest);
+    assert_eq!(completed.request, saved.request);
+    assert_eq!(completed.executions.len(), 1);
+    assert!(completed.executions_released());
+    assert_eq!(model.requests().len(), 2);
     restored.shutdown().await.unwrap();
 }
 
@@ -261,13 +313,13 @@ async fn prose_failure_requires_explicit_bounded_new_attempt_and_exact_replay_do
 }
 
 #[tokio::test]
-async fn timeout_is_unknown_not_prose_success_or_automatic_retry() {
+async fn timeout_fails_without_automatic_retry_and_cleanup_allows_explicit_retry() {
     let temp = tempfile::tempdir().unwrap();
     let (host, _) = host(&temp).await;
     let jobs = host.jobs();
     let mut intent = request("timeout");
     intent.limits.timeout_seconds = 1;
-    jobs.request(intent).unwrap();
+    let reserved = jobs.request(intent.clone()).unwrap();
     let stalled = ScriptedClient::stall();
     jobs.start_with_model_client("timeout", stalled.clone())
         .await
@@ -277,22 +329,45 @@ async fn timeout_is_unknown_not_prose_success_or_automatic_retry() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(outcome.state, JobState::Unknown);
+    assert_eq!(outcome.state, JobState::Failed);
+    assert_eq!(
+        outcome.attempt.state,
+        standalone::jobs::JobAttemptState::Failed
+    );
+    assert_eq!(outcome.attempt.failure.as_deref(), Some("timeout"));
+    assert_eq!(outcome.attempt.attempt_id, reserved.attempt.attempt_id);
+    assert_eq!(outcome.request, intent);
     assert!(outcome.result.is_none());
-    assert!(jobs.retry("timeout").is_err());
+    assert!(outcome.executions_released());
+    assert_eq!(jobs.request(intent).unwrap(), outcome);
+    assert_eq!(
+        stalled.requests().len(),
+        1,
+        "timeout never reexecutes the model"
+    );
+    let retried = jobs.retry("timeout").unwrap();
+    assert_eq!(retried.attempt.number, 2);
+    assert_ne!(retried.attempt.attempt_id, outcome.attempt.attempt_id);
+    jobs.start_with_model_client("timeout", success())
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.wait("timeout").await.unwrap().state,
+        JobState::Completed
+    );
     host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn shutdown_keeps_reserved_results_and_fences_running_attempts_on_reopen() {
+async fn shutdown_preserves_reserved_intent_and_reopen_preserves_confirmed_failure() {
     let temp = tempfile::tempdir().unwrap();
     let (host, _) = host(&temp).await;
     let id = host.worker_id();
     let jobs = host.jobs();
-    jobs.request(request("reserved")).unwrap();
+    let reserved = jobs.request(request("reserved")).unwrap();
     jobs.request(request("cancelled")).unwrap();
-    jobs.cancel("cancelled").unwrap();
-    jobs.request(request("running")).unwrap();
+    let cancelled = jobs.cancel("cancelled").unwrap();
+    let running = jobs.request(request("running")).unwrap();
     let stalled = ScriptedClient::stall();
     jobs.start_with_model_client("running", stalled.clone())
         .await
@@ -300,32 +375,51 @@ async fn shutdown_keeps_reserved_results_and_fences_running_attempts_on_reopen()
     wait_started(&stalled).await;
     host.shutdown().await.unwrap();
     assert!(matches!(jobs.get("running"), Err(JobServiceError::Closed)));
+    let resume_model = success();
     let restored = StandaloneHost::restore_with_model_client(
         temp.path().join("state"),
         id,
-        ScriptedClient::new(Vec::new()),
+        resume_model.clone(),
     )
     .await
     .unwrap();
+    wait_started(&resume_model).await;
     let jobs = restored.jobs();
+    let resumed = jobs.wait("reserved").await.unwrap();
+    assert_eq!(resumed.state, JobState::Completed);
+    assert_eq!(resumed.attempt.attempt_id, reserved.attempt.attempt_id);
+    assert_eq!(resumed.input_digest, reserved.input_digest);
+    assert_eq!(resumed.request, reserved.request);
+    assert!(jobs.pending().unwrap().is_empty());
+    assert_eq!(jobs.get("cancelled").unwrap(), cancelled);
+    let stopped = jobs.get("running").unwrap();
+    assert_eq!(stopped.state, JobState::Failed);
     assert_eq!(
-        jobs.pending()
-            .unwrap()
-            .iter()
-            .map(|snapshot| snapshot.request.job_id.as_str())
-            .collect::<Vec<_>>(),
-        ["reserved"]
+        stopped.attempt.state,
+        standalone::jobs::JobAttemptState::Failed
     );
-    assert_eq!(jobs.get("cancelled").unwrap().state, JobState::Cancelled);
-    assert_eq!(jobs.get("running").unwrap().state, JobState::Unknown);
-    assert!(jobs.retry("running").is_err());
-    jobs.start_with_model_client("reserved", success())
+    assert_eq!(
+        stopped.attempt.failure.as_deref(),
+        Some("Host cancellation/shutdown")
+    );
+    assert_eq!(stopped.request, running.request);
+    assert_eq!(stopped.attempt.attempt_id, running.attempt.attempt_id);
+    assert!(stopped.executions_released());
+    assert!(
+        !stopped.version_stopped,
+        "ordinary shutdown is not a version cutover"
+    );
+    let retry = jobs.retry("running").unwrap();
+    assert_eq!(retry.attempt.number, 2);
+    jobs.start_with_model_client("running", success())
         .await
         .unwrap();
     assert_eq!(
-        jobs.wait("reserved").await.unwrap().state,
+        jobs.wait("running").await.unwrap().state,
         JobState::Completed
     );
+    assert_eq!(jobs.get("reserved").unwrap(), resumed);
+    assert_eq!(resume_model.requests().len(), 2);
     restored.shutdown().await.unwrap();
 }
 
@@ -357,7 +451,7 @@ async fn profile_requirements_are_rejected_without_model_execution_or_implicit_f
 // The child exits deliberately without destructors to prove actual process-loss
 // recovery, rather than treating a hand-edited SQLite fixture as that evidence.
 #[tokio::test]
-#[ignore = "entry point for process_loss_recovers_durable_jobs_without_replaying_unknown"]
+#[ignore = "entry point for process_loss_fails_same_attempt_without_claiming_execution_cleanup"]
 async fn process_job_fixture() {
     let root = std::path::PathBuf::from(
         std::env::var_os("YOI_JOB_PROCESS_FIXTURE_DIR").expect("fixture root"),
@@ -392,12 +486,17 @@ async fn process_job_fixture() {
         .await
         .unwrap();
     wait_started(&stalled).await;
+    std::fs::write(
+        root.join("interrupted-snapshot.json"),
+        serde_json::to_vec(&jobs.get("interrupted").unwrap()).unwrap(),
+    )
+    .unwrap();
     // Test-owned process only, never the operating Yoi Worker or dogfood daemon.
     std::process::exit(23);
 }
 
 #[tokio::test]
-async fn process_loss_recovers_durable_jobs_without_replaying_unknown() {
+async fn process_loss_fails_same_attempt_without_claiming_execution_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "process_job_fixture", "--ignored", "--nocapture"])
@@ -415,34 +514,73 @@ async fn process_loss_recovers_durable_jobs_without_replaying_unknown() {
         .unwrap()
         .parse()
         .unwrap();
+    let recovery_model = success();
     let host = StandaloneHost::restore_with_model_client(
         temp.path().join("state"),
         worker_id,
-        ScriptedClient::new(Vec::new()),
+        recovery_model.clone(),
     )
     .await
     .unwrap();
     let jobs = host.jobs();
-    assert_eq!(jobs.get("interrupted").unwrap().state, JobState::Unknown);
+    let persisted: standalone::jobs::JobSnapshot = serde_json::from_slice(
+        &std::fs::read(temp.path().join("interrupted-snapshot.json")).unwrap(),
+    )
+    .unwrap();
+    let interrupted = jobs.get("interrupted").unwrap();
+    assert_eq!(interrupted.request, persisted.request);
+    assert_eq!(interrupted.input_digest, persisted.input_digest);
+    assert_eq!(interrupted.attempt.attempt_id, persisted.attempt.attempt_id);
+    assert_eq!(interrupted.attempt.number, persisted.attempt.number);
+    assert_eq!(interrupted.executions, persisted.executions);
+    assert_eq!(interrupted.result, persisted.result);
+    assert_eq!(interrupted.state, JobState::Failed);
+    assert_eq!(
+        interrupted.attempt.state,
+        standalone::jobs::JobAttemptState::Failed
+    );
+    assert!(
+        interrupted
+            .attempt
+            .failure
+            .as_deref()
+            .unwrap()
+            .starts_with("host_restart_execution_unconfirmed:")
+    );
+    assert_eq!(interrupted.executions.len(), 1);
+    assert!(!interrupted.executions_released());
+    assert!(interrupted.executions[0].cleanup_receipt.is_none());
+    assert!(!interrupted.executions[0].writes_revoked);
+    assert!(!interrupted.version_stopped);
     assert!(jobs.retry("interrupted").is_err());
+    let replay = success();
+    assert!(
+        jobs.start_with_model_client("interrupted", replay.clone())
+            .await
+            .is_err()
+    );
+    assert!(replay.requests().is_empty());
+    assert_eq!(jobs.wait("interrupted").await.unwrap(), interrupted);
     let completed = jobs.get("accepted").unwrap();
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(completed.result, Some(serde_json::json!({"valid":true})));
     assert!(!completed.acknowledged);
     assert_eq!(jobs.get("cancelled").unwrap().state, JobState::Cancelled);
-    assert_eq!(jobs.pending().unwrap().len(), 1);
-    jobs.start_with_model_client("reserved", success())
-        .await
-        .unwrap();
+    wait_started(&recovery_model).await;
+    let reserved = jobs.wait("reserved").await.unwrap();
+    assert_eq!(reserved.state, JobState::Completed);
+    assert_eq!(reserved.attempt.number, 1);
+    assert_eq!(recovery_model.requests().len(), 2);
+    assert!(jobs.pending().unwrap().is_empty());
+    assert_eq!(jobs.get("interrupted").unwrap(), interrupted);
     assert_eq!(
-        jobs.wait("reserved").await.unwrap().state,
-        JobState::Completed
+        host.shutdown().await,
+        Err(standalone::StandaloneShutdownError::JobCleanup)
     );
-    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn model_failure_is_durable_known_failure_with_explicit_successful_retry() {
+async fn model_failure_retains_unconfirmed_execution_and_forbids_retry() {
     let temp = tempfile::tempdir().unwrap();
     let (host, _) = host(&temp).await;
     let jobs = host.jobs();
@@ -454,24 +592,26 @@ async fn model_failure_is_durable_known_failure_with_explicit_successful_retry()
     jobs.start_with_model_client("model-failure", client)
         .await
         .unwrap();
-    let failure = jobs.wait("model-failure").await.unwrap();
+    assert!(matches!(
+        jobs.wait("model-failure").await,
+        Err(JobServiceError::Cleanup(_))
+    ));
+    let failure = jobs.get("model-failure").unwrap();
     assert_eq!(failure.state, JobState::Failed);
     assert!(failure.result.is_none());
     assert!(
         failure
             .attempt
             .failure
+            .as_deref()
             .unwrap()
             .contains("scripted model failure")
     );
-    let next = jobs.retry("model-failure").unwrap();
-    assert_eq!(next.attempt.number, 2);
-    jobs.start_with_model_client("model-failure", success())
-        .await
-        .unwrap();
+    assert!(!failure.executions_released());
+    assert!(jobs.retry("model-failure").is_err());
+    assert_eq!(jobs.get("model-failure").unwrap(), failure);
     assert_eq!(
-        jobs.wait("model-failure").await.unwrap().state,
-        JobState::Completed
+        host.shutdown().await,
+        Err(standalone::StandaloneShutdownError::JobCleanup)
     );
-    host.shutdown().await.unwrap();
 }

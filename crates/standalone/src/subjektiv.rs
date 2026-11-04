@@ -14,8 +14,9 @@
 //! The selected Subject's Job store is shared across Workers; the generic Jobs service owns execution
 //! and cleanup. Consolidation grants allow only immutable candidate batches and limited operations,
 //! not body leases or parent filesystems. Startup pending processing follows Host connections.
-//! Unknown attempts are not rerun; delivery failures for accepted results do not trigger model
-//! reexecution. Memory application and surface repair use shared-domain CAS/receipts.
+//! Execution receipts and domain results are reconciled without blindly replaying effects;
+//! delivery failures for accepted results do not trigger model reexecution. Memory application
+//! and surface repair use shared-domain CAS/receipts.
 
 mod journal;
 pub(crate) use journal::prepare_worker_deletion;
@@ -712,19 +713,134 @@ impl LocalSubjectHost {
                 }
             }
         }
-        if let Ok(pending) = jobs.pending() {
-            for job in pending {
-                if job
-                    .domain_grant
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value::<LocalConsolidationGrant>(v.clone()).ok())
-                    .is_some_and(|g| g.binding == self.binding)
-                {
-                    schedule_job(jobs.clone(), job.request.job_id, self.self_weak.clone());
+        // Restart reconciliation can leave a failed attempt with a saved domain
+        // result. Pending alone lists only unstarted reservations, not those cuts.
+        let candidates = jobs.pending().and_then(|mut pending| {
+            pending.extend(jobs.unreleased_granted()?);
+            Ok(pending)
+        });
+        match candidates {
+            Ok(candidates) => {
+                let mut seen = std::collections::HashSet::new();
+                for job in candidates {
+                    if job.request.purpose != "subjektiv_consolidation"
+                        || !seen.insert(job.request.job_id.clone())
+                        || !job
+                            .domain_grant
+                            .as_ref()
+                            .and_then(|v| {
+                                serde_json::from_value::<LocalConsolidationGrant>(v.clone()).ok()
+                            })
+                            .is_some_and(|g| g.binding == self.binding)
+                    {
+                        continue;
+                    }
+                    match self.recover_consolidation_job(&jobs, &job) {
+                        Ok(true) => {}
+                        Ok(false)
+                            if job.state == crate::jobs::JobState::Pending
+                                && job.attempt.state == crate::jobs::JobAttemptState::Reserved
+                                && job.executions_released() =>
+                        {
+                            schedule_job(jobs.clone(), job.request.job_id, self.self_weak.clone());
+                        }
+                        Ok(false) => {} // Missing receipts never authorize replay of effects.
+                        Err(error) => eprintln!(
+                            "standalone consolidation Job {} reconciliation blocked: {error}",
+                            job.request.job_id
+                        ),
+                    }
                 }
             }
+            Err(error) => eprintln!("standalone consolidation recovery lookup failed: {error}"),
         }
         self.recover_journals();
+    }
+
+    /// Reconstructs a result from domain receipts, never by reentering the finalizer.
+    /// Acceptance does not assert prior owner shutdown or discharge cleanup ownership.
+    fn recover_consolidation_job(
+        &self,
+        jobs: &crate::jobs::StandaloneJobs,
+        observed: &crate::jobs::JobSnapshot,
+    ) -> Result<bool, SubjektivHostError> {
+        let service_error = |error: crate::jobs::JobServiceError| {
+            SubjektivHostError::Unavailable(error.to_string())
+        };
+        self.ensure_live()?;
+        let current = jobs.get(&observed.request.job_id).map_err(service_error)?;
+        if current.attempt.attempt_id != observed.attempt.attempt_id
+            || current.input_digest != observed.input_digest
+        {
+            return Err(SubjektivHostError::InvalidArgument(
+                "consolidation recovery attempt/input changed".into(),
+            ));
+        }
+        if current.version_stopped
+            || current.input_disposition != crate::jobs::JobInputDisposition::Available
+            || current.state == crate::jobs::JobState::Cancelled
+        {
+            return Err(SubjektivHostError::InvalidArgument(
+                "stopped or retired consolidation cannot be recovered".into(),
+            ));
+        }
+        current
+            .load_executable_request()
+            .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
+        let grant = self.consolidation_grant(&current)?;
+        let Some(result) = subjektiv::job::lookup_result(
+            &self.catalog.store,
+            &grant.binding.subject_id,
+            &grant.candidate_ids,
+            &current.request.job_id,
+            &current.attempt.attempt_id,
+        )
+        .map_err(operation_error)?
+        else {
+            return Ok(false);
+        };
+        self.ensure_live()?;
+        let settled = jobs
+            .accept_reconciled(&job::JobResultSubmission {
+                job_id: current.request.job_id,
+                attempt_id: current.attempt.attempt_id,
+                input_digest: current.input_digest,
+                result,
+            })
+            .map_err(service_error)?;
+        jobs.acknowledge(&settled.request.job_id)
+            .map_err(service_error)?;
+        Ok(true)
+    }
+
+    fn consolidation_grant(
+        &self,
+        snapshot: &crate::jobs::JobSnapshot,
+    ) -> Result<LocalConsolidationGrant, SubjektivHostError> {
+        let grant: LocalConsolidationGrant =
+            serde_json::from_value(snapshot.domain_grant.clone().ok_or_else(|| {
+                SubjektivHostError::InvalidArgument("missing explicit Subject delegation".into())
+            })?)
+            .map_err(|error| SubjektivHostError::InvalidArgument(error.to_string()))?;
+        if grant.binding != self.binding
+            || snapshot.request.purpose != "subjektiv_consolidation"
+            || snapshot.request.input
+                != serde_json::json!({"subject_id":self.binding.subject_id,"candidate_ids":grant.candidate_ids})
+        {
+            return Err(SubjektivHostError::InvalidArgument(
+                "persisted Job grant/input does not match local Subject capability".into(),
+            ));
+        }
+        let subject = self
+            .catalog
+            .store
+            .subject(&self.binding.subject_id)
+            .map_err(domain_error)?
+            .ok_or_else(|| SubjektivHostError::Unavailable("Subject missing".into()))?;
+        if subject.state != subjektiv::SubjectState::Active {
+            return Err(SubjektivHostError::Unavailable("Subject is retired".into()));
+        }
+        Ok(grant)
     }
     fn validate_evidence(
         &self,
@@ -1125,7 +1241,7 @@ impl SubjektivHost for LocalSubjectHost {
                 .store
                 .pending_staging_backlog(&self.binding.subject_id)
                 .map_err(domain_error)?;
-            return Ok(memory::backend::MemoryConsolidationOutput { status:"resumed_pending".into(),summary:"Resumed the existing immutable reserved Subject Job; unknown attempts are never replayed".into(),candidate_count:count,total_bytes:bytes });
+            return Ok(memory::backend::MemoryConsolidationOutput { status:"resumed_pending".into(),summary:"Resumed the existing immutable reserved Subject Job; prior execution receipts remain independently fenced".into(),candidate_count:count,total_bytes:bytes });
         }
         let (count, bytes) = self
             .catalog
@@ -1195,6 +1311,12 @@ struct LocalConsolidationGrant {
 }
 struct LocalDomainProvider(std::sync::Weak<LocalSubjectHost>);
 impl crate::jobs::JobDomainProvider for LocalDomainProvider {
+    fn callbacks_use_attempt_fence(&self) -> bool {
+        // Consolidation memory effects and Journal execute/finish hold the attempt gate.
+        // Result finalizers are independently revoked and joined by the owned Job runner.
+        true
+    }
+
     fn grant(
         &self,
         snapshot: &crate::jobs::JobSnapshot,
@@ -1205,20 +1327,9 @@ impl crate::jobs::JobDomainProvider for LocalDomainProvider {
         if snapshot.request.purpose == journal::PURPOSE {
             return journal::grant(host, snapshot, fence);
         }
-        let grant: LocalConsolidationGrant = serde_json::from_value(
-            snapshot
-                .domain_grant
-                .clone()
-                .ok_or("missing explicit Subject delegation")?,
-        )
-        .map_err(|e| e.to_string())?;
-        if grant.binding != host.binding
-            || snapshot.request.purpose != "subjektiv_consolidation"
-            || snapshot.request.input
-                != serde_json::json!({"subject_id":host.binding.subject_id,"candidate_ids":grant.candidate_ids})
-        {
-            return Err("persisted Job grant/input does not match local Subject capability".into());
-        }
+        let grant = host
+            .consolidation_grant(snapshot)
+            .map_err(|error| error.to_string())?;
         let adapter = Arc::new(LocalConsolidationHost {
             host,
             grant,
@@ -1311,7 +1422,11 @@ impl SubjektivHost for LocalConsolidationHost {
         _context: &SubjektivHostContext,
         operation: SubjektivMemoryBackendOperation,
     ) -> Result<SubjektivMemoryBackendResponse, SubjektivHostError> {
-        self.live()?;
+        let _effects = self
+            .fence
+            .enter()
+            .map_err(SubjektivHostError::Unavailable)?;
+        self.host.ensure_live()?;
         let authority = subjektiv::api::HostOperationContext::validated_consolidation(
             &self.host.catalog.store,
             &self.grant.binding.subject_id,

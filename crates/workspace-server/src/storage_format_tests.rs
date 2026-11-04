@@ -110,13 +110,18 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     verify_history(conn, current).unwrap();
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
-        assert_eq!(plan.migrations.len(), 1);
+        assert_eq!(plan.migrations.len(), 2);
         assert_eq!(plan.migrations[0].version, 122);
         assert_eq!(
             plan.migrations[0].name,
             crate::config_adoption::MIGRATION_NAME
         );
-        assert_eq!(plan.target_schema_version, 122);
+        assert_eq!(plan.migrations[1].version, 123);
+        assert_eq!(
+            plan.migrations[1].name,
+            super::super::backend_job_upgrade::MIGRATION_NAME
+        );
+        assert_eq!(plan.target_schema_version, 123);
     }
     assert_eq!(rows, saved_rows(conn));
     assert_eq!(shape, snapshot(conn).unwrap());
@@ -171,59 +176,121 @@ fn converged_shapes_keep_all_real_predecessor_receipts_and_erasure_fences() {
     }
 }
 
+// Snapshot every retained value except the three fields the new migration owns.
+// Existing published-family history tables remain byte-for-byte in this check.
+fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
+    let mut result = Vec::new();
+    for (name, _) in saved_rows(conn) {
+        if name == "__yoi_schema_migrations" {
+            continue;
+        }
+        let columns = super::super::table_columns(conn, &name)
+            .unwrap()
+            .into_iter()
+            .filter(|column| {
+                !["backend_jobs", "backend_job_attempts"].contains(&name.as_str())
+                    || !["state", "failure_category", "failure_detail"].contains(&column.as_str())
+            })
+            .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement = conn
+            .prepare(&format!("SELECT {columns} FROM \"{name}\""))
+            .unwrap();
+        let count = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..count)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .map(|row| format!("{:?}", row.unwrap()))
+            .collect::<Vec<_>>();
+        rows.sort();
+        result.push((name, rows));
+    }
+    result
+}
+
+fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(Family, usize)>) {
+    let source = fixture(stage, baseline, predecessor);
+    let expected = immutable_rows(&source);
+    let original_receipts = super::super::workspace_schema_migration_history(&source).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.db");
+    let mut destination = Connection::open(&path).unwrap();
+    Backup::new(&source, &mut destination)
+        .unwrap()
+        .run_to_completion(128, std::time::Duration::ZERO, None)
+        .unwrap();
+    drop(destination);
+    let mut committed_history = None;
+    for _ in 0..2 {
+        let conn = Connection::open(&path).unwrap();
+        // Actual production open/ordered runner, including the new migration.
+        super::super::prepare_connection(&conn).unwrap();
+        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 123);
+        let actual = immutable_rows(&conn);
+        for (table, rows) in &expected {
+            assert_eq!(
+                &actual.iter().find(|(name, _)| name == table).unwrap().1,
+                rows,
+                "{table}, from {stage:?}, baseline {baseline}"
+            );
+        }
+        let outcome:(String,String,Option<String>)=conn.query_row("SELECT state,failure_category,completed_at FROM backend_jobs WHERE job_id='saved-job'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(
+            outcome,
+            (
+                "failed".into(),
+                super::super::backend_job_upgrade::FAILURE_CATEGORY.into(),
+                None
+            )
+        );
+        let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
+        assert_eq!(
+            history.pop(),
+            Some((
+                123,
+                super::super::backend_job_upgrade::MIGRATION_NAME.into()
+            ))
+        );
+        assert_eq!(
+            history.pop(),
+            Some((122, crate::config_adoption::MIGRATION_NAME.into()))
+        );
+        assert_eq!(history, original_receipts);
+        verify_history(&conn, 123).unwrap();
+        let saved = saved_rows(&conn);
+        if let Some(previous) = &committed_history {
+            assert_eq!(previous, &saved);
+        } else {
+            committed_history = Some(saved);
+        }
+    }
+}
+
 #[test]
 fn published_database_runs_normal_store_preparation_and_reopens_without_downgrade() {
-    for stage in [
-        Stage::Published(Family::Permissions, 2),
-        Stage::Published(Family::Removal, 4),
-        Stage::Published(Family::Jobs, 5),
-        Stage::Converged(119),
-        Stage::Converged(120),
-        Stage::Converged(121),
-    ] {
-        let current = match stage {
-            Stage::Published(_, count) => 113 + count as i64,
-            Stage::Converged(version) => version,
-            Stage::Base => 113,
-        };
-        let source = fixture(stage, 113, None);
-        let expected = saved_rows(&source);
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("catalog.db");
-        let mut destination = Connection::open(&path).unwrap();
-        Backup::new(&source, &mut destination)
-            .unwrap()
-            .run_to_completion(128, std::time::Duration::ZERO, None)
-            .unwrap();
-        drop(destination);
-        for _ in 0..2 {
-            let conn = Connection::open(&path).unwrap();
-            // Production store owner, not a separate test migration implementation.
-            super::super::prepare_connection(&conn).unwrap();
-            assert_eq!(super::super::current_schema_version(&conn).unwrap(), 122);
-            for (table, rows) in &expected {
-                if table != "__yoi_schema_migrations" {
-                    assert_eq!(
-                        saved_rows(&conn)
-                            .into_iter()
-                            .find(|(name, _)| name == table)
-                            .unwrap()
-                            .1,
-                        *rows,
-                        "{table}, from {current}"
-                    );
-                }
+    for family in FAMILIES {
+        for count in 1..=family.names().len() {
+            let stage = Stage::Published(family, count);
+            for baseline in 113..=113 + count as i64 {
+                exercise_published_runner(stage, baseline, None);
             }
-            let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
-            assert_eq!(
-                history.pop(),
-                Some((122, crate::config_adoption::MIGRATION_NAME.into()))
-            );
-            assert_eq!(
-                history,
-                super::super::workspace_schema_migration_history(&source).unwrap()
-            );
-            verify_history(&conn, 122).unwrap();
+        }
+    }
+    for current in 119..=121 {
+        for baseline in 119..=current {
+            exercise_published_runner(Stage::Converged(current), baseline, None);
+        }
+        for origin in
+            std::iter::once(None).chain(FAMILIES.into_iter().flat_map(|family| {
+                (1..=family.names().len()).map(move |count| Some((family, count)))
+            }))
+        {
+            exercise_published_runner(Stage::Converged(current), 113, origin);
         }
     }
 }

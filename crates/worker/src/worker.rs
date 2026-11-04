@@ -273,6 +273,36 @@ where
 }
 
 impl PendingActivationState {
+    pub(crate) fn reconcile_submission(
+        &self,
+        request_id: &str,
+        input: &[Segment],
+        namespace: &str,
+    ) -> Result<Option<crate::controller::SubmissionReceipt>, String> {
+        let Some(receipt) = self.receipts.iter().find(|receipt| {
+            receipt.submission_request_id == request_id && receipt.source_namespace == namespace
+        }) else {
+            return Ok(None);
+        };
+        if receipt.payload_digest != submission_payload_digest(input) {
+            return Err(PendingSubmissionError::IdempotencyConflict.to_string());
+        }
+        // Immediate admission is only durable after UserInput and its clearing
+        // checkpoint commit. Queued admission already persisted its receipt.
+        if receipt.disposition == protocol::SubmissionDisposition::Started
+            && self.activating.as_ref().is_some_and(|pending| {
+                pending.submission_id == receipt.submission_id && !pending.was_queued
+            })
+        {
+            return Ok(None);
+        }
+        Ok(Some(crate::controller::SubmissionReceipt {
+            submission_request_id: receipt.submission_request_id.clone(),
+            submission_id: receipt.submission_id.clone(),
+            disposition: receipt.disposition,
+        }))
+    }
+
     pub(crate) fn has_unfinished_admission(&self) -> bool {
         self.activating.is_some()
             || !self.pending.is_empty()
@@ -4696,29 +4726,43 @@ impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
     }
 
     pub async fn stop_feature_runtime(&mut self, reason: impl Into<String>) {
+        if let Err(failures) = self.stop_feature_runtime_report(reason).await {
+            for error in failures {
+                tracing::warn!(%error, "Feature runtime shutdown requires attention");
+            }
+        }
+    }
+
+    /// Await Worker-owned stopping hooks/background tasks and report actual failures separately
+    /// from a Run/result. Success covers only this Feature scope, not external Host callbacks,
+    /// Controller children, domain writer fencing or resource removal.
+    pub async fn stop_feature_runtime_report(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Result<(), Vec<crate::hook::HookError>> {
+        let mut failures = Vec::new();
         if let Some(hooks) = self.hook_registry.clone() {
             let context = WorkerStoppingContext {
                 invocation: self.hook_invocation_context(None),
                 reason: reason.into(),
             };
-            match tokio::time::timeout(
+            let mut hook_failures = Vec::new();
+            let deadline = tokio::time::timeout(
                 FEATURE_HOOK_CHAIN_TIMEOUT,
-                hooks.on_worker_stopping(&context),
+                hooks.on_worker_stopping_report(&context, &mut hook_failures),
             )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(error = %error, "worker-stopping hook requires attention");
-                }
-                Err(_) => {
-                    hooks.record_chain_timeout("worker-stopping");
-                    tracing::warn!("worker-stopping hook chain exceeded its host deadline");
-                }
+            .await;
+            failures.extend(hook_failures.into_iter().map(|error| error.source));
+            if deadline.is_err() {
+                hooks.record_chain_timeout("worker-stopping");
+                failures.push(crate::hook::HookError::new(
+                    crate::hook::HookErrorCategory::Timeout,
+                    "worker-stopping hook chain exceeded its host deadline",
+                ));
             }
         }
         if let Err(error) = self.feature_background_tasks.shutdown().await {
-            tracing::warn!(error = %error, "feature background task shutdown failed");
+            failures.push(error);
         }
         if let Some(plugins) = &self.plugin_tools {
             // The registry has joined the drivers, including bounded on-stop.
@@ -4728,6 +4772,11 @@ impl<C: LlmClient + 'static, St: Store + 'static> Worker<C, St> {
                 tracing::warn!(error = %error, "Plugin Service lease release pending; retaining cleanup ownership");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures)
         }
     }
 }
@@ -13152,8 +13201,24 @@ mod build_summary_prompt_tests {
                     .unwrap(),
                 }),
                 AttributionOutcome::Rejected => Ok(WorkspaceResponse {
-                    status: 503,
-                    body: "temporarily unavailable".to_string(),
+                    status: 403,
+                    body: serde_json::to_string(
+                        &server_api::RepositoryApiError::new(
+                            403,
+                            "PermissionDenied",
+                            "Session registration permission denied.",
+                            Vec::new(),
+                        )
+                        .with_failure(
+                            protocol::session_failure::session_registration_attachment(
+                                protocol::session_failure::SessionRegistrationCause::denied(
+                                    protocol::session_failure::SessionPrincipal::Subject,
+                                ),
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                    .unwrap(),
                 }),
                 AttributionOutcome::Success => {
                     let input: server_api::SubjektivRecordSessionRequest =
@@ -13484,10 +13549,23 @@ mod build_summary_prompt_tests {
 
     #[tokio::test]
     async fn unknown_and_failed_attribution_remain_incomplete_until_lifecycle_retry() {
-        for (first, expected_state) in [
-            (AttributionOutcome::TransportUnknown, "outcome_unknown"),
-            (AttributionOutcome::Rejected, "failed"),
-            (AttributionOutcome::Unauthorized, "failed"),
+        use protocol::session_failure::{SessionPrincipal, SessionRegistrationCause};
+        for (first, expected_state, expected_cause) in [
+            (
+                AttributionOutcome::TransportUnknown,
+                "outcome_unknown",
+                SessionRegistrationCause::outcome_unknown(),
+            ),
+            (
+                AttributionOutcome::Rejected,
+                "failed",
+                SessionRegistrationCause::denied(SessionPrincipal::Subject),
+            ),
+            (
+                AttributionOutcome::Unauthorized,
+                "outcome_unknown",
+                SessionRegistrationCause::outcome_unknown(),
+            ),
         ] {
             let client = Arc::new(AttributionLifecycleClient::new([
                 first,
@@ -13500,10 +13578,10 @@ mod build_summary_prompt_tests {
                     SubjektivSessionAttributionLifecycle::NewSession,
                 )
                 .unwrap_err();
-            assert!(error.to_string().contains(expected_state));
+            assert_eq!(error.session_registration_cause(), Some(expected_cause));
             if matches!(first, AttributionOutcome::Unauthorized) {
-                assert!(error.to_string().contains("rejected with HTTP 401"));
-                assert!(!error.to_string().contains("outcome_unknown"));
+                // A legacy HTTP status is not a domain authorization attestation.
+                // Attribution remains incomplete and no implicit retry is issued.
                 assert_eq!(
                     client.requests.lock().unwrap().len(),
                     1,
@@ -13672,7 +13750,12 @@ mod build_summary_prompt_tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("legacy_unknown"));
+        assert_eq!(
+            error.session_registration_cause(),
+            Some(protocol::session_failure::SessionRegistrationCause::denied(
+                protocol::session_failure::SessionPrincipal::Subject,
+            )),
+        );
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let request: server_api::SubjektivRecordSessionRequest =
@@ -17785,6 +17868,109 @@ permission = "write"
         let state = handle.state.lock().unwrap();
         assert_eq!(state.pending[0].provenance, account_a);
         assert_eq!(state.pending[1].provenance, account_b);
+    }
+
+    #[test]
+    fn submission_receipt_reconciliation_reads_persisted_identity_without_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let input = vec![Segment::text("accepted Job input")];
+        let accepted = handle
+            .accept_from_source(
+                "job-input".into(),
+                input.clone(),
+                "backend:job-attempt".into(),
+                WorkerHistoryProvenance::LegacyUnknown,
+                false,
+            )
+            .unwrap();
+        let location = handle.writer.state.location();
+        let before = handle
+            .writer
+            .store
+            .read_all(location.session_id, location.segment_id)
+            .unwrap();
+        let payload = before
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                LogEntry::Extension {
+                    domain, payload, ..
+                } if domain == SESSION_PENDING_ACTIVATIONS_EXTENSION_DOMAIN => {
+                    Some(payload.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let restored: PendingActivationState = serde_json::from_value(payload).unwrap();
+        let receipt = restored
+            .reconcile_submission("job-input", &input, "backend:job-attempt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.submission_id, accepted.submission_id);
+        assert_eq!(receipt.disposition, protocol::SubmissionDisposition::Queued);
+        assert!(
+            restored
+                .reconcile_submission("job-input", &input, "backend:other-attempt")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            restored
+                .reconcile_submission("missing", &input, "backend:job-attempt")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            restored
+                .reconcile_submission(
+                    "job-input",
+                    &[Segment::text("changed")],
+                    "backend:job-attempt"
+                )
+                .is_err()
+        );
+        assert_eq!(restored.pending.len(), 1);
+        assert_eq!(
+            serde_json::to_value(
+                handle
+                    .writer
+                    .store
+                    .read_all(location.session_id, location.segment_id)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+    }
+
+    #[test]
+    fn submission_receipt_reconciliation_never_confirms_uncommitted_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = PendingSubmissionHandle::for_test(temp.path());
+        let input = vec![Segment::text("not committed yet")];
+        let accepted = handle
+            .accept("job-start".into(), input.clone(), true)
+            .unwrap();
+        assert!(
+            handle
+                .state
+                .lock()
+                .unwrap()
+                .reconcile_submission("job-start", &input, &handle.direct_client_namespace())
+                .unwrap()
+                .is_none()
+        );
+        handle.abort_activation(accepted.activation.unwrap());
+        assert!(
+            handle
+                .state
+                .lock()
+                .unwrap()
+                .reconcile_submission("job-start", &input, &handle.direct_client_namespace())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

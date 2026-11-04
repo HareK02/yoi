@@ -127,6 +127,11 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
             .contains("unresolved")
     );
     assert!(with_dispositions(&store, &subject.id, &batch, &ready).is_err());
+    assert!(
+        lookup_result(&store, &subject.id, &batch, "job", "attempt")
+            .unwrap()
+            .is_none()
+    );
     store
         .decide_candidate(
             &subject.id,
@@ -143,6 +148,10 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
         .unwrap();
     validate_result(&store, &subject.id, &batch, "job", "attempt", &ready).unwrap();
     let enriched = with_dispositions(&store, &subject.id, &batch, &ready).unwrap();
+    assert_eq!(
+        lookup_result(&store, &subject.id, &batch, "job", "attempt").unwrap(),
+        Some(enriched.clone())
+    );
     assert_eq!(
         enriched["candidate_dispositions"],
         serde_json::json!([{"candidate_id": "candidate", "action": "invalid"}])
@@ -176,6 +185,12 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
     let failed = serde_json::json!({"subject_id": subject.id, "candidate_ids": batch,
         "surface": {"availability": "failed", "generation_id": failure.id, "memory_fingerprint": memory_fingerprint, "reason_code": "model_failure"}});
     validate_result(&store, &subject.id, &batch, "job", "attempt", &failed).unwrap();
+    // The same attempt can prepare again after committing Memory. Recovery must
+    // select its compatible stored outcome, not its first/last-arriving generation.
+    assert_eq!(
+        lookup_result(&store, &subject.id, &batch, "job", "attempt").unwrap(),
+        Some(with_dispositions(&store, &subject.id, &batch, &failed).unwrap())
+    );
     assert!(validate_result(&store, &subject.id, &batch, "job", "attempt", &ready).is_err());
     let mut false_reason = failed;
     false_reason["surface"]["reason_code"] = serde_json::json!("invented");

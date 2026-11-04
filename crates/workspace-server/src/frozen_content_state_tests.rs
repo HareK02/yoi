@@ -426,25 +426,25 @@ fn content_cutover_keeps_each_evaluation_provenance_and_deduplicates_only_identi
 }
 
 #[test]
-fn content_cutover_reserved_only_releases_resource_but_uncertain_dispatch_keeps_it() {
+fn content_cutover_version_abort_retains_prior_cleanup_and_uncertain_resource_owners() {
     for (state, expected_job, expected_attempt, expected_cleanup) in [
         (
             "reserved",
             BackendJobState::Failed,
             BackendJobAttemptState::Failed,
-            Some(BackendJobWorkerCleanupState::Completed),
+            None,
         ),
         (
             "dispatching",
-            BackendJobState::Unknown,
-            BackendJobAttemptState::Unknown,
-            Some(BackendJobWorkerCleanupState::Pending),
+            BackendJobState::Failed,
+            BackendJobAttemptState::Failed,
+            None,
         ),
         (
             "dispatched",
-            BackendJobState::Unknown,
-            BackendJobAttemptState::Unknown,
-            Some(BackendJobWorkerCleanupState::Pending),
+            BackendJobState::Failed,
+            BackendJobAttemptState::Failed,
+            None,
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -490,15 +490,11 @@ fn content_cutover_reserved_only_releases_resource_but_uncertain_dispatch_keeps_
         let next = store
             .reserve_backend_job("space", &next, "2026-08-15T00:00:00Z")
             .unwrap();
-        assert_eq!(next.resource_reused, state != "reserved");
-        assert_eq!(
-            next.job.request.job_id,
-            if state == "reserved" {
-                "next-job"
-            } else {
-                "legacy-job"
-            }
+        assert!(
+            next.resource_reused,
+            "migration failure is not termination evidence"
         );
+        assert_eq!(next.job.request.job_id, "legacy-job");
     }
 }
 

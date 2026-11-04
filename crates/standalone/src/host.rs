@@ -53,6 +53,7 @@ pub struct StandaloneHost {
     record: StandaloneWorkerRecord,
     lease: Option<StandaloneWorkerLease>,
     jobs: crate::jobs::StandaloneJobs,
+    result_recovery: Option<tokio::task::JoinHandle<Result<(), crate::jobs::JobServiceError>>>,
     subject: Option<crate::subjektiv::SubjectConnection>,
     subject_release: Option<worker::SubjectReleaseReservation>,
 }
@@ -101,7 +102,7 @@ pub enum StandaloneStartupError {
     InitialContextPending { worker_id: WorkerId },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StandaloneShutdownError {
     #[error("standalone Job execution cleanup or terminal persistence could not be confirmed")]
     JobCleanup,
@@ -109,6 +110,10 @@ pub enum StandaloneShutdownError {
     DeadlineExceeded,
     #[error("the standalone Worker shutdown confirmation was lost")]
     ConfirmationLost,
+    #[error("the standalone Worker Feature cleanup failed")]
+    FeatureCleanup {
+        failures: Vec<worker::hook::HookError>,
+    },
     #[error("the standalone Worker final state could not be committed")]
     StateStore,
 }
@@ -178,7 +183,11 @@ impl StandaloneHost {
             .as_ref()
             .map(|s| s.jobs_path.clone())
             .unwrap_or_else(|| store.jobs_path(worker_id));
-        let jobs = match crate::jobs::StandaloneJobs::open(&jobs_path, launch.cwd.clone()) {
+        let jobs = match crate::jobs::StandaloneJobs::open_for_host(
+            &jobs_path,
+            launch.cwd.clone(),
+            allocation.lease(),
+        ) {
             Ok(jobs) => jobs,
             Err(_) => {
                 cancel_unpublished_start(&store, &mut subject, allocation)?;
@@ -402,8 +411,12 @@ impl StandaloneHost {
             .as_ref()
             .map(|s| s.jobs_path.clone())
             .unwrap_or_else(|| store.jobs_path(worker_id));
-        let jobs = crate::jobs::StandaloneJobs::open(&jobs_path, record.cwd.canonical_path.clone())
-            .map_err(|_| StandaloneStartupError::StateStore)?;
+        let jobs = crate::jobs::StandaloneJobs::open_for_host(
+            &jobs_path,
+            record.cwd.canonical_path.clone(),
+            &lease,
+        )
+        .map_err(|_| StandaloneStartupError::StateStore)?;
         if let Some(client) = &model_client {
             jobs.bind_model_client(client.clone_boxed());
         }
@@ -482,6 +495,13 @@ impl StandaloneHost {
         if let Some(connection) = &subject {
             connection.host.recover_jobs();
         }
+        let reserved_result_jobs = jobs.reserved_result_job_ids();
+        let result_jobs = jobs.clone();
+        let result_recovery = tokio::spawn(async move {
+            result_jobs
+                .resume_reserved_result_jobs(reserved_result_jobs?)
+                .await
+        });
         Self {
             handle: started.handle,
             shutdown: Some(started.shutdown),
@@ -491,6 +511,7 @@ impl StandaloneHost {
             record,
             lease: Some(lease),
             jobs,
+            result_recovery: Some(result_recovery),
             subject,
             subject_release: None,
         }
@@ -594,6 +615,7 @@ impl StandaloneHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), StandaloneShutdownError> {
+        self.stop_result_recovery().await;
         let jobs_result = self.jobs.shutdown().await;
         let command = protocol::WorkerCommandEnvelope::new(u64::MAX);
         let _ = self.handle.send(Method::Shutdown { command }).await;
@@ -601,16 +623,9 @@ impl StandaloneHost {
             self.retain_lease();
             return Err(StandaloneShutdownError::ConfirmationLost);
         };
-        match tokio::time::timeout(self.shutdown_timeout, shutdown).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                self.retain_lease();
-                return Err(StandaloneShutdownError::ConfirmationLost);
-            }
-            Err(_) => {
-                self.retain_lease();
-                return Err(StandaloneShutdownError::DeadlineExceeded);
-            }
+        if let Err(error) = confirm_controller_shutdown(shutdown, self.shutdown_timeout).await {
+            self.retain_lease();
+            return Err(error);
         }
         if jobs_result.is_err() {
             self.retain_lease();
@@ -650,6 +665,16 @@ impl StandaloneHost {
         Ok(())
     }
 
+    async fn stop_result_recovery(&mut self) {
+        self.jobs.close();
+        if let Some(task) = self.result_recovery.take() {
+            // This joins only the dispatcher. Every admitted Worker/Host effect
+            // remains owned by jobs.shutdown; cancelling a waiter proves no cleanup.
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     fn retain_lease(&mut self) {
         if let Some(subject) = &mut self.subject {
             subject.retain();
@@ -660,9 +685,29 @@ impl StandaloneHost {
     }
 }
 
+async fn confirm_controller_shutdown(
+    shutdown: worker::controller::ShutdownReceiver,
+    timeout: Duration,
+) -> Result<(), StandaloneShutdownError> {
+    let report = tokio::time::timeout(timeout, shutdown)
+        .await
+        .map_err(|_| StandaloneShutdownError::DeadlineExceeded)?
+        .map_err(|_| StandaloneShutdownError::ConfirmationLost)?;
+    if report.feature_failures.is_empty() {
+        Ok(())
+    } else {
+        Err(StandaloneShutdownError::FeatureCleanup {
+            failures: report.feature_failures,
+        })
+    }
+}
+
 impl Drop for StandaloneHost {
     fn drop(&mut self) {
         self.jobs.close();
+        if let Some(task) = self.result_recovery.take() {
+            task.abort();
+        }
         // A dropped Host cannot synchronously confirm either controller or Job
         // cleanup. Keep its lease until explicit shutdown or process recovery,
         // preventing another Host from reopening a still-live execution store.
@@ -930,6 +975,45 @@ fn classify_startup_error(error: WorkerBootstrapError) -> StandaloneStartupError
 mod local_input_tests {
     use super::*;
     use protocol::{AuthenticatedInputSource, Method};
+
+    // Production report consumer over a real Controller completion channel. The report sender
+    // is replaced here; actual stopping-hook production is covered by Worker Job tests.
+    #[tokio::test]
+    async fn controller_report_preserves_cleanup_failure_instead_of_accepting_scope_return() {
+        let failure = worker::hook::HookError::new(
+            worker::hook::HookErrorCategory::Dependency,
+            "retained Host cleanup",
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(worker::controller::ControllerShutdownReport {
+                feature_failures: vec![failure.clone()],
+            })
+            .unwrap();
+        assert_eq!(
+            confirm_controller_shutdown(receiver, Duration::from_secs(1)).await,
+            Err(StandaloneShutdownError::FeatureCleanup {
+                failures: vec![failure]
+            })
+        );
+
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(worker::controller::ControllerShutdownReport::default())
+            .unwrap();
+        assert_eq!(
+            confirm_controller_shutdown(receiver, Duration::from_secs(1)).await,
+            Ok(())
+        );
+
+        let (sender, receiver) =
+            tokio::sync::oneshot::channel::<worker::controller::ControllerShutdownReport>();
+        drop(sender);
+        assert_eq!(
+            confirm_controller_shutdown(receiver, Duration::from_secs(1)).await,
+            Err(StandaloneShutdownError::ConfirmationLost)
+        );
+    }
 
     #[test]
     fn local_transport_stamps_operator_without_backend_account() {

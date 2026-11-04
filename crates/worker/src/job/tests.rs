@@ -565,7 +565,7 @@ async fn accepted_result_survives_later_provider_error_and_cancellation() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let recording = sink.clone();
         let run = tokio::spawn(async move {
-            job.run("attempt".into(), recording, move |sender| {
+            job.run_owned("attempt".into(), recording, move |sender| {
                 let _ = tx.send(sender);
             })
             .await
@@ -585,7 +585,22 @@ async fn accepted_result_survives_later_provider_error_and_cancellation() {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(result.submission.result, json!(true));
+        assert_eq!(result.job_id, "job-a");
+        assert_eq!(result.attempt_id, "attempt");
+        assert_eq!(
+            result.input_digest,
+            request("user:a").input_digest().unwrap()
+        );
+        assert!(result.feature_shutdown_complete());
+        assert!(result.feature_shutdown_failures().is_empty());
+        assert!(!result.requires_worker_cleanup_reconciliation());
+        if !cancel {
+            assert!(matches!(
+                result.worker_failure(),
+                Some(crate::WorkerError::Engine(_))
+            ));
+        }
+        assert_eq!(result.result.unwrap().submission.result, json!(true));
         assert_eq!(sink.0.lock().unwrap().len(), 1);
         assert!(sender.is_closed());
     }
@@ -1238,6 +1253,39 @@ async fn unconfirmed_sink_acceptance_is_not_classified_as_missing_result_or_know
 }
 
 #[tokio::test]
+async fn unconfirmed_sink_retains_exact_finalized_payload_without_claiming_acceptance() {
+    let root = tempfile::tempdir().unwrap();
+    let finalizer = Arc::new(ControlledFinalizer::default());
+    let sink = Arc::new(UnknownSink(Mutex::new(vec![])));
+    let mut job = prepared(
+        root.path(),
+        &request("user:a"),
+        ScriptedClient::new(vec![
+            call(SUBMIT_JOB_RESULT_TOOL, json!({"result":{"claim":true}})),
+            prose(),
+        ]),
+    );
+    job.finalizer = Some(finalizer.clone());
+    let execution = job
+        .run_owned("attempt".into(), sink.clone(), |_| {})
+        .await
+        .unwrap();
+    assert!(matches!(
+        &execution.result,
+        Err(JobExecutionError::ResultUnconfirmed(_))
+    ));
+    let observed = sink.0.lock().unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(execution.unconfirmed_submission(), observed.first());
+    assert_eq!(
+        execution.unconfirmed_submission().unwrap().result,
+        json!({"prepared":{"claim":true},"completion":1})
+    );
+    assert_eq!(finalizer.calls.load(Ordering::SeqCst), 1);
+    assert!(execution.feature_shutdown_complete());
+}
+
+#[tokio::test]
 async fn feature_registration_rejects_forged_fences_seals_unknown_outcomes_and_honors_cancel() {
     let sink = Arc::new(UnknownSink(Mutex::new(vec![])));
     let feature =
@@ -1281,4 +1329,225 @@ async fn feature_registration_rejects_forged_fences_seals_unknown_outcomes_and_h
         Err(agen::tool::ToolError::Cancelled(_))
     ));
     assert_eq!(sink.0.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn revocation_joins_finalizer_cleanup_and_disables_every_result_clone() {
+    let root = tempfile::tempdir().unwrap();
+    let prepared = prepared(root.path(), &request("user:a"), ScriptedClient::new(vec![]));
+    let finalizer = Arc::new(ControlledFinalizer {
+        gated: true,
+        ..Default::default()
+    });
+    let sink = Arc::new(RecordingSink::default());
+    let feature = JobResultFeature::new(&request("user:a"), "attempt".into(), sink.clone())
+        .unwrap()
+        .with_finalizer(finalizer.clone(), prepared.manifest, prepared.client);
+    let executing = feature.clone();
+    let operation = tokio::spawn(async move {
+        executing
+            .execute(r#"{"result":true}"#, ToolExecutionContext::direct())
+            .await
+    });
+    signalled(&finalizer.entered).await;
+    let stopping = feature.clone();
+    let shutdown = tokio::spawn(async move { stopping.revoke_and_join().await });
+    signalled(&finalizer.cancellation_seen).await;
+    assert!(
+        !shutdown.is_finished(),
+        "cancellation is not cleanup completion"
+    );
+    assert_eq!(finalizer.active.load(Ordering::SeqCst), 1);
+    assert!(sink.0.lock().unwrap().is_empty());
+    finalizer.cleanup.notify_one();
+    assert!(matches!(
+        operation.await.unwrap(),
+        Err(ToolError::Cancelled(_))
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(finalizer.active.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        feature
+            .execute(r#"{"result":true}"#, ToolExecutionContext::direct())
+            .await,
+        Err(ToolError::Cancelled(_))
+    ));
+    assert_eq!(finalizer.calls.load(Ordering::SeqCst), 1);
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revocation_does_not_claim_a_running_synchronous_sink_has_ended() {
+    struct BlockingSink {
+        entered: tokio::sync::Notify,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        accepted: AtomicUsize,
+    }
+    impl JobResultSink for BlockingSink {
+        fn submit(&self, _: ::job::JobResultSubmission) -> Result<(), String> {
+            self.entered.notify_one();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("test must release the synchronous sink within its finite budget");
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let (release, receiver) = std::sync::mpsc::channel();
+    let sink = Arc::new(BlockingSink {
+        entered: Default::default(),
+        release: Mutex::new(receiver),
+        accepted: AtomicUsize::new(0),
+    });
+    let feature =
+        JobResultFeature::new(&request("user:a"), "attempt".into(), sink.clone()).unwrap();
+    let executing = feature.clone();
+    let operation = tokio::spawn(async move {
+        executing
+            .execute(r#"{"result":true}"#, ToolExecutionContext::direct())
+            .await
+    });
+    signalled(&sink.entered).await;
+    let stopping = feature.clone();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let observed = started.clone();
+    let shutdown = tokio::spawn(async move {
+        observed.notify_one();
+        stopping.revoke_and_join().await;
+    });
+    signalled(&started).await;
+    assert!(
+        !shutdown.is_finished(),
+        "a live sink still owns its Host effect"
+    );
+    assert_eq!(sink.accepted.load(Ordering::SeqCst), 0);
+    release.send(()).unwrap();
+    operation.await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sink.accepted.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        feature
+            .execute(r#"{"result":true}"#, ToolExecutionContext::direct())
+            .await,
+        Err(ToolError::Cancelled(_))
+    ));
+    assert_eq!(sink.accepted.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone)]
+struct StoppingFeature {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    policy: crate::hook::HookFailurePolicy,
+    failure: Option<crate::hook::HookError>,
+}
+
+#[async_trait]
+impl crate::hook::Hook<crate::hook::WorkerStopping> for StoppingFeature {
+    async fn call(
+        &self,
+        _: &crate::hook::WorkerStoppingContext,
+    ) -> Result<(), crate::hook::HookError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.failure.clone().map_or(Ok(()), Err)
+    }
+}
+
+impl FeatureModule for StoppingFeature {
+    fn descriptor(&self) -> FeatureDescriptor {
+        FeatureDescriptor::builtin("job-stop-observation", "Owned stopping observation").with_hook(
+            crate::feature::HookDeclaration::new(
+                "stop",
+                crate::feature::FeatureHookPoint::WorkerStopping,
+            ),
+        )
+    }
+
+    fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
+        context.hooks().add_worker_stopping(
+            "stop",
+            crate::hook::HookExecutionPolicy::new(self.policy, 1_000),
+            self.clone(),
+        )
+    }
+}
+
+// Production Internal Worker/Feature lifecycle and result capability, with only the model
+// transport and one stopping callback replaced. This is not a process-termination test.
+#[tokio::test]
+async fn accepted_result_waits_for_stopping_hook_and_retains_every_failure_policy() {
+    use crate::hook::{HookError, HookErrorCategory, HookFailurePolicy};
+
+    for (policy, failure) in [
+        (HookFailurePolicy::FailClosed, None),
+        (
+            HookFailurePolicy::FailClosed,
+            Some(HookError::new(
+                HookErrorCategory::Dependency,
+                "stop rejected",
+            )),
+        ),
+        (
+            HookFailurePolicy::AttentionRequired,
+            Some(HookError::new(
+                HookErrorCategory::Dependency,
+                "stop rejected",
+            )),
+        ),
+        (
+            HookFailurePolicy::FailOpenWithDiagnostic,
+            Some(HookError::new(
+                HookErrorCategory::Dependency,
+                "stop rejected",
+            )),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let callback = StoppingFeature {
+            entered: Arc::default(),
+            release: Arc::default(),
+            policy,
+            failure: failure.clone(),
+        };
+        let entered = callback.entered.clone();
+        let release = callback.release.clone();
+        let client = ScriptedClient::new(vec![
+            call(SUBMIT_JOB_RESULT_TOOL, json!({"result":true})),
+            prose(),
+        ]);
+        let mut job = prepared(root.path(), &request("user:a"), client);
+        job.features = job.features.with_module(callback);
+        let sink = Arc::new(RecordingSink::default());
+        let recording = sink.clone();
+        let run =
+            tokio::spawn(async move { job.run_owned("attempt".into(), recording, |_| {}).await });
+        signalled(&entered).await;
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(
+            !run.is_finished(),
+            "result acceptance cannot bypass a live stopping hook"
+        );
+        release.notify_one();
+        let execution = tokio::time::timeout(std::time::Duration::from_secs(2), run)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.feature_shutdown_complete(), failure.is_none());
+        match failure {
+            Some(error) => assert!(execution.feature_shutdown_failures().contains(&error)),
+            None => assert!(execution.feature_shutdown_failures().is_empty()),
+        }
+        assert_eq!(execution.result.unwrap().submission.result, json!(true));
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
 }

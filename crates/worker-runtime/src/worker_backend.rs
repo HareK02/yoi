@@ -67,6 +67,22 @@ enum NotificationAcceptance {
     Rejected(String),
 }
 
+// Submit and read-only receipt reconciliation must use identical payload and
+// authenticated namespace inputs. Neither the catalog nor a receipt cache owns them.
+fn runtime_submission_payload(
+    input: &WorkerInput,
+    submission_request_id: &str,
+) -> (Vec<Segment>, protocol::AuthenticatedInputSource) {
+    let segments = input
+        .segments
+        .clone()
+        .unwrap_or_else(|| vec![Segment::text(input.content.trim().to_string())]);
+    let source = protocol::AuthenticatedInputSource::Backend {
+        operation_id: submission_request_id.to_string(),
+    };
+    (segments, source)
+}
+
 fn rollback_materialized_spawn_workdirs(
     materializer: &dyn WorkingDirectoryMaterializer,
     bindings: &BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
@@ -570,6 +586,13 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         Err(session_store::RetainedAttachmentReadError::RetentionMissing)
     }
 
+    async fn cleanup_failed_spawn(
+        &self,
+        _worker_ref: &WorkerRef,
+    ) -> Result<(), RuntimeRestoreCleanupFailure> {
+        Err(RuntimeRestoreCleanupFailure::Unsupported)
+    }
+
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
@@ -931,8 +954,17 @@ pub struct ProfileRuntimeWorkerFactory {
     workspace_request_clients: Arc<HashMap<String, RuntimeWorkspaceRequestClient>>,
     embedded_worker_mutation_dispatcher: Option<Arc<dyn EmbeddedWorkerMutationDispatcher>>,
     failed_restore_resources: Arc<Mutex<HashMap<WorkerRef, FailedRestoreResources>>>,
+    failed_spawn_resources: Arc<Mutex<HashMap<WorkerRef, FailedSpawnResources>>>,
     #[cfg(test)]
     restore_faults: Arc<RestoreFaults>,
+}
+
+#[derive(Clone)]
+struct FailedSpawnResources {
+    run_dir: PathBuf,
+    sessions: Vec<Arc<WorkdirSessionRouter>>,
+    allocation: Option<worker::runtime::worker_allocation::ScopeAllocationCleanup>,
+    feature_tasks: Option<worker::WorkerStartupFeatureCleanup>,
 }
 
 #[derive(Clone)]
@@ -996,6 +1028,41 @@ impl RestoreActivationGate {
 }
 
 impl ProfileRuntimeWorkerFactory {
+    fn retain_spawn_construction_failure(&self, worker_ref: &WorkerRef, error: &WorkerError) {
+        match error {
+            WorkerError::StartupFailure { source, .. }
+            | WorkerError::RestoreActivationEffects { source } => {
+                self.retain_spawn_construction_failure(worker_ref, source)
+            }
+            WorkerError::ConstructionCleanup {
+                allocation,
+                sessions,
+                ..
+            } => {
+                if let Some(owner) = self
+                    .failed_spawn_resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_mut(worker_ref)
+                {
+                    owner.allocation = allocation.clone();
+                    owner.sessions.push(sessions.clone());
+                }
+            }
+            WorkerError::ScopeLock(error) => {
+                if let Some(owner) = self
+                    .failed_spawn_resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_mut(worker_ref)
+                {
+                    owner.allocation = error.allocation_cleanup_handle();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn retain_construction_failure(
         &self,
         request: &WorkerExecutionRestoreRequest,
@@ -1058,6 +1125,7 @@ impl ProfileRuntimeWorkerFactory {
             workspace_request_clients: Arc::new(HashMap::new()),
             embedded_worker_mutation_dispatcher: None,
             failed_restore_resources: Arc::new(Mutex::new(HashMap::new())),
+            failed_spawn_resources: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             restore_faults: Arc::new(RestoreFaults::default()),
         }
@@ -2101,6 +2169,43 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         self.prompt_projection_cache.observe(projection).map(|_| ())
     }
 
+    async fn cleanup_failed_spawn(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<(), RuntimeRestoreCleanupFailure> {
+        let owner = self
+            .failed_spawn_resources
+            .lock()
+            .map_err(|_| RuntimeRestoreCleanupFailure::Ownership)?
+            .get(worker_ref)
+            .cloned()
+            .ok_or(RuntimeRestoreCleanupFailure::Ownership)?;
+        if let Some(features) = owner.feature_tasks.as_ref() {
+            features
+                .shutdown()
+                .await
+                .map_err(|_| RuntimeRestoreCleanupFailure::Feature)?;
+        }
+        for sessions in &owner.sessions {
+            sessions
+                .close_all()
+                .await
+                .map_err(|_| RuntimeRestoreCleanupFailure::Workdir)?;
+        }
+        if let Some(allocation) = owner.allocation.as_ref() {
+            allocation
+                .release()
+                .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
+        }
+        Self::remove_restore_run_artifacts(&owner.run_dir)
+            .map_err(|_| RuntimeRestoreCleanupFailure::Artifacts)?;
+        self.failed_spawn_resources
+            .lock()
+            .map_err(|_| RuntimeRestoreCleanupFailure::Ownership)?
+            .remove(worker_ref);
+        Ok(())
+    }
+
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
@@ -2224,10 +2329,46 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Some(factory) => bootstrap.with_model_client(factory()),
             None => bootstrap,
         };
+        {
+            let mut resources = self
+                .failed_spawn_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if resources.contains_key(&request.worker_ref) {
+                return Err(RuntimeRestoreFailure::unproven(
+                    RuntimeRestoreStage::Reconstruction,
+                    "fresh startup resources already retained",
+                ));
+            }
+            resources.insert(
+                request.worker_ref.clone(),
+                FailedSpawnResources {
+                    run_dir: run_dir.clone(),
+                    sessions: Vec::new(),
+                    allocation: None,
+                    feature_tasks: None,
+                },
+            );
+        }
         let mut prepared = bootstrap.prepare().await.map_err(|error| {
+            if let WorkerBootstrapError::Worker(source) = &error {
+                self.retain_spawn_construction_failure(&request.worker_ref, source);
+            }
             RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Reconstruction, &error)
         })?;
         let worker = prepared.worker_mut();
+        {
+            let mut resources = self
+                .failed_spawn_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let owner = resources
+                .get_mut(&request.worker_ref)
+                .expect("fresh startup owner");
+            owner.allocation = worker.restore_allocation_cleanup_handle();
+            owner.feature_tasks = Some(worker.retain_startup_feature_cleanup());
+            owner.sessions.push(worker.workdir_sessions());
+        }
         if let Some(snapshot) = &request.request.plugin_execution {
             if self.runtime_id.as_deref() != Some(snapshot.plan.execution().runtime_id.as_str()) {
                 return Err("Plugin plan Runtime identity mismatch".into());
@@ -2265,11 +2406,19 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        worker.bind_workdir_sessions(runtime_local_workdir_router(
+        let sessions = runtime_local_workdir_router(
             &request.workdir_attachments,
             &workdir_capabilities,
             Some(worker.workspace_client_handle()),
-        )?);
+        )?;
+        self.failed_spawn_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&request.worker_ref)
+            .expect("fresh startup owner")
+            .sessions
+            .push(sessions.clone());
+        worker.bind_workdir_sessions(sessions);
         if let (Some(runtime_id), Some(workspace_id)) =
             (observation_runtime_id, observation_workspace_id.clone())
             && observation_enabled
@@ -2299,8 +2448,15 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 
         let workspace_client = worker.workspace_client_handle();
         let started = prepared.start().await.map_err(|error| {
+            if let WorkerBootstrapError::Worker(source) = &error {
+                self.retain_spawn_construction_failure(&request.worker_ref, source);
+            }
             RuntimeRestoreFailure::from_bootstrap(RuntimeRestoreStage::Controller, &error)
         })?;
+        self.failed_spawn_resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request.worker_ref);
         let (handle, shutdown_rx, controller_task) =
             (started.handle, started.shutdown, started.controller_task);
         if flow_transition_enabled {
@@ -3131,6 +3287,9 @@ impl ProfileRuntimeWorkerFactory {
 
 #[derive(Clone)]
 struct RuntimeExecutionTaskScope {
+    execution_id: uuid::Uuid,
+    shutdown_report: Arc<Mutex<Option<Vec<crate::execution::WorkerFeatureShutdownFailure>>>>,
+    submissions: Arc<Mutex<Vec<crate::execution::WorkerSubmissionAck>>>,
     #[cfg(feature = "ws-server")]
     protocol_bridge: Arc<Mutex<Option<RuntimeProtocolBridge>>>,
     tasks: Arc<Mutex<Vec<Arc<RuntimeExecutionTask>>>>,
@@ -3230,6 +3389,9 @@ struct RuntimeExecutionTaskCompletion {
 impl RuntimeExecutionTaskScope {
     fn new(controller_task: tokio::task::JoinHandle<()>) -> Self {
         let scope = Self {
+            execution_id: uuid::Uuid::now_v7(),
+            shutdown_report: Arc::default(),
+            submissions: Arc::default(),
             #[cfg(feature = "ws-server")]
             protocol_bridge: Arc::default(),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -3352,7 +3514,19 @@ impl RuntimeExecutionTaskScope {
             let mut guard = shutdown.lock().await;
             if let Some(receiver) = guard.as_mut() {
                 match tokio::time::timeout(Duration::from_secs(5), receiver).await {
-                    Ok(Ok(())) => {
+                    Ok(Ok(report)) => {
+                        *self.shutdown_report.lock().map_err(|_| {
+                            "Controller shutdown report lock is poisoned".to_string()
+                        })? = Some(
+                            report
+                                .feature_failures
+                                .into_iter()
+                                .map(|failure| crate::execution::WorkerFeatureShutdownFailure {
+                                    category: failure.category,
+                                    diagnostic: failure.diagnostic,
+                                })
+                                .collect(),
+                        );
                         guard.take();
                         Ok(())
                     }
@@ -3376,7 +3550,49 @@ impl RuntimeExecutionTaskScope {
         // Drain bridges/relays even after an abnormal completion, while keeping
         // the failed completion and all timed-out handles in their owning scope.
         self.join().await?;
-        confirmation
+        confirmation?;
+        match self
+            .shutdown_report
+            .lock()
+            .map_err(|_| "Controller shutdown report lock is poisoned".to_string())?
+            .as_ref()
+        {
+            Some(failures) if failures.is_empty() => Ok(()),
+            Some(_) => Err(
+                "Controller joined with Feature shutdown failures; cleanup is insufficient".into(),
+            ),
+            None => {
+                Err("Controller shutdown report is missing; scope termination is unproven".into())
+            }
+        }
+    }
+
+    fn termination(
+        &self,
+        worker_ref: &WorkerRef,
+        operation_id: crate::execution::WorkerLifecycleOperationId,
+    ) -> Option<crate::execution::WorkerExecutionTermination> {
+        // Only the original receiver and actual joined task handles establish
+        // this fact. Closed endpoints, empty backend maps and causes do not.
+        if !self.tasks.lock().ok()?.is_empty() || self.has_cleanup_candidates().ok()? {
+            return None;
+        }
+        let feature_failures = self.shutdown_report.lock().ok()?.clone()?;
+        let shutdown_command_id = self
+            .shutdown_admission
+            .try_lock()
+            .ok()?
+            .as_ref()
+            .map(|admission| admission.command_id);
+        Some(crate::execution::WorkerExecutionTermination {
+            scope: crate::execution::WorkerExecutionTerminationScope::Controller,
+            worker_ref: worker_ref.clone(),
+            stop_operation_id: operation_id,
+            execution_id: self.execution_id,
+            shutdown_command_id,
+            submissions: self.submissions.lock().ok()?.clone(),
+            feature_failures,
+        })
     }
 
     async fn join(&self) -> Result<(), String> {
@@ -3453,9 +3669,21 @@ struct RuntimeWorkerExecution {
     workdir_attachments: Vec<crate::catalog::WorkingDirectoryAttachmentStatus>,
 }
 
+// The fresh factory future and its late result stay with the admitting backend.
+// A bounded caller wait never cancels construction or drops a late Controller.
+struct PendingRuntimeSpawn {
+    execution_id: uuid::Uuid,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    result: Mutex<Option<Result<RuntimeWorkerController, RuntimeRestoreFailure>>>,
+    workdir_attachments: BTreeMap<WorkdirAttachmentAlias, WorkingDirectoryBinding>,
+    rollback_workdirs: Vec<String>,
+    failure: Mutex<Option<String>>,
+}
+
 // Actual operation-owned resources, not a second Worker catalog or presence
 // marker. Timeout never drops the factory future or a late Controller result.
 struct PendingRuntimeRestore {
+    execution_id: uuid::Uuid,
     request: WorkerExecutionRestoreRequest,
     // Transient ownership mode, not a durable phase. Cold restart reclamation
     // must never enter preparation, canonical repair, or activation.
@@ -3486,6 +3714,12 @@ impl Drop for RestoreTaskCompletion {
 }
 
 impl PendingRuntimeRestore {
+    fn stop_failure_result(&self, message: String) -> WorkerExecutionResult {
+        let mut result = self.failure_result(message);
+        result.operation = WorkerExecutionOperation::Stop;
+        result
+    }
+
     fn task_completion(self: &Arc<Self>) -> RestoreTaskCompletion {
         self.task_in_flight.store(true, Ordering::Release);
         RestoreTaskCompletion(self.clone())
@@ -3564,6 +3798,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     working_directory_materializer: Option<Arc<dyn WorkingDirectoryMaterializer>>,
     runtime: Mutex<Option<Runtime>>,
     workers: Mutex<HashMap<crate::identity::WorkerRef, RuntimeWorkerExecution>>,
+    pending_spawns: Mutex<HashMap<WorkerRef, Arc<PendingRuntimeSpawn>>>,
     pending_restores: Mutex<HashMap<WorkerRef, Arc<PendingRuntimeRestore>>>,
     // One completed execution receipt per Worker, separate from live resources.
     // Runtime owns durable request replay; retain this until the next admitted
@@ -3577,6 +3812,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
             ),
         >,
     >,
+    completed_stops: Mutex<HashMap<WorkerRef, crate::execution::WorkerExecutionTermination>>,
     worker_locks: Mutex<HashMap<WorkerRef, Arc<Mutex<()>>>>,
     admissions: Mutex<HashMap<WorkerRef, WorkerAdmission>>,
     spawn_restore_timeout: Duration,
@@ -3602,8 +3838,10 @@ where
             working_directory_materializer: None,
             runtime: Mutex::new(Some(runtime)),
             workers: Mutex::new(HashMap::new()),
+            pending_spawns: Mutex::new(HashMap::new()),
             pending_restores: Mutex::new(HashMap::new()),
             completed_restore_failures: Mutex::new(HashMap::new()),
+            completed_stops: Mutex::new(HashMap::new()),
             worker_locks: Mutex::new(HashMap::new()),
             admissions: Mutex::new(HashMap::new()),
             spawn_restore_timeout: SPAWN_RESTORE_TASK_TIMEOUT,
@@ -3619,6 +3857,17 @@ where
         workspace: Option<&str>,
         fingerprint: &str,
     ) -> Result<(), String> {
+        if self
+            .pending_spawns
+            .lock()
+            .map_err(|_| "fresh spawn owner lock is poisoned")?
+            .contains_key(worker)
+        {
+            return Err(
+                "fresh spawn still owns pending resources; Stop must reclaim its original owner"
+                    .into(),
+            );
+        }
         let mut admissions = self
             .admissions
             .lock()
@@ -3815,6 +4064,150 @@ where
         })?;
         rx.recv()
             .map_err(|err| format!("worker adapter task did not complete: {err}"))?
+    }
+
+    fn pending_spawn_exists(&self, worker_ref: &WorkerRef) -> Result<bool, String> {
+        self.pending_spawns
+            .lock()
+            .map(|owners| owners.contains_key(worker_ref))
+            .map_err(|_| "fresh spawn owner lock is poisoned".to_string())
+    }
+
+    fn wait_pending_spawn(
+        &self,
+        pending: &Arc<PendingRuntimeSpawn>,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let owner = pending.clone();
+        self.run_joined_on_adapter_runtime(async move {
+            let mut task = owner.task.lock().await;
+            if let Some(task_handle) = task.as_mut() {
+                match tokio::time::timeout(timeout, task_handle).await {
+                    Ok(Ok(())) => {
+                        task.take();
+                    }
+                    Ok(Err(error)) => {
+                        let message = format!(
+                            "fresh spawn task failed: {error}; resource cleanup is unproven"
+                        );
+                        *owner
+                            .failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(message.clone());
+                        task.take();
+                        return Err(message);
+                    }
+                    Err(_) => return Err(
+                        "fresh spawn is still owned and pending; late Controller retained for Stop"
+                            .into(),
+                    ),
+                }
+            }
+            if let Some(failure) = owner
+                .failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                return Err(failure.clone());
+            }
+            Ok(())
+        })
+    }
+
+    fn spawn_controller_retained(
+        &self,
+        request: WorkerExecutionSpawnRequest,
+        rollback_workdirs: Vec<String>,
+    ) -> Result<Result<RuntimeWorkerController, RuntimeRestoreFailure>, WorkerExecutionSpawnResult>
+    {
+        let worker_ref = request.worker_ref.clone();
+        let owner = Arc::new(PendingRuntimeSpawn {
+            execution_id: uuid::Uuid::now_v7(),
+            task: tokio::sync::Mutex::new(None),
+            result: Mutex::new(None),
+            workdir_attachments: request.workdir_attachments.clone(),
+            rollback_workdirs,
+            failure: Mutex::new(None),
+        });
+        let uncertain = |message| WorkerExecutionSpawnResult::ReconciliationRequired {
+            result: WorkerExecutionResult::errored(WorkerExecutionOperation::Spawn, message),
+            worker_state: None,
+            workdir_attachments: workdir_attachment_statuses(&owner.workdir_attachments),
+        };
+        let mut owners = self
+            .pending_spawns
+            .lock()
+            .map_err(|_| uncertain("fresh spawn owner lock is poisoned".to_string()))?;
+        if owners.contains_key(&worker_ref) {
+            return Err(uncertain(
+                "fresh spawn already owns resources; reconcile with Stop".into(),
+            ));
+        }
+        self.completed_stops
+            .lock()
+            .map_err(|_| uncertain("Worker termination receipt registry poisoned".into()))?
+            .remove(&worker_ref);
+        owners.insert(worker_ref.clone(), owner.clone());
+        drop(owners);
+        let factory = self.factory.clone();
+        let pending = owner.clone();
+        let task = self
+            .spawn_on_adapter_runtime(async move {
+                let worker_ref = request.worker_ref.clone();
+                let mut result = factory.spawn_controller(request).await;
+                if let Err(failure) = &mut result
+                    && failure.needs_cleanup()
+                {
+                    failure.cleanup = match factory.cleanup_failed_spawn(&worker_ref).await {
+                        Ok(()) => RuntimeRestoreCleanup::Confirmed,
+                        Err(RuntimeRestoreCleanupFailure::Unsupported) => failure.cleanup,
+                        Err(error) => {
+                            failure.cleanup_failure.get_or_insert(error);
+                            RuntimeRestoreCleanup::Failed(error)
+                        }
+                    };
+                }
+                *pending
+                    .result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+            })
+            .map_err(|message| {
+                *owner
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message.clone());
+                uncertain(message)
+            })?;
+        *owner
+            .task
+            .try_lock()
+            .expect("fresh spawn task not yet awaited") = Some(task);
+        self.wait_pending_spawn(&owner, self.spawn_restore_timeout)
+            .map_err(uncertain)?;
+        let mut result = owner
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(Err(failure)) = result.as_ref()
+            && failure.needs_cleanup()
+        {
+            return Err(WorkerExecutionSpawnResult::ReconciliationRequired {
+                result: failure.execution_result(WorkerExecutionOperation::Spawn),
+                worker_state: None,
+                workdir_attachments: workdir_attachment_statuses(&owner.workdir_attachments),
+            });
+        }
+        let completed = result
+            .take()
+            .ok_or_else(|| uncertain("fresh spawn completion is missing".into()))?;
+        self.pending_spawns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&worker_ref);
+        Ok(completed)
     }
 
     fn preflight_restore_inputs(
@@ -4103,7 +4496,7 @@ where
             Method::Shutdown { .. } => {
                 // Identity was checked against the captured Controller while
                 // this same operation lock is held. Never unlock/rebind here.
-                let result = self.stop_worker_under_lock(worker_ref);
+                let result = self.stop_worker_under_lock(worker_ref, None);
                 if result.is_accepted() {
                     Ok(Vec::new())
                 } else {
@@ -4718,8 +5111,202 @@ where
         }
     }
 
+    fn cleanup_pending_spawn_bindings(
+        &self,
+        worker_ref: &WorkerRef,
+        pending: &PendingRuntimeSpawn,
+    ) -> Result<(), String> {
+        if !pending.rollback_workdirs.is_empty() {
+            let materializer = self
+                .working_directory_materializer
+                .as_ref()
+                .ok_or("fresh spawn Workdir cleanup owner unavailable")?;
+            for id in pending.rollback_workdirs.iter().rev() {
+                materializer
+                    .cleanup_working_directory(id)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        self.pending_spawns
+            .lock()
+            .map_err(|_| "fresh spawn owner lock is poisoned")?
+            .remove(worker_ref);
+        Ok(())
+    }
+
+    fn stop_worker_operation_under_lock(
+        &self,
+        request: WorkerExecutionStopRequest,
+    ) -> WorkerExecutionResult {
+        let execution = match self.workers.lock() {
+            Ok(workers) => workers.get(&request.worker_ref).cloned(),
+            Err(_) => {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "worker adapter registry lock is poisoned",
+                );
+            }
+        };
+        {
+            let receipts = match self.completed_stops.lock() {
+                Ok(receipts) => receipts,
+                Err(_) => {
+                    return WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Stop,
+                        "stop completion receipts lock is poisoned",
+                    );
+                }
+            };
+            if let Some(receipt) = receipts.get(&request.worker_ref)
+                && receipt.confirms_scope_shutdown(&request.worker_ref, request.operation_id)
+            {
+                if execution.is_some()
+                    || self
+                        .pending_spawn_exists(&request.worker_ref)
+                        .unwrap_or(true)
+                    || !matches!(self.pending_restore(&request.worker_ref), Ok(None))
+                {
+                    return WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Stop,
+                        "historical stop operation cannot target a replacement execution or candidate",
+                    );
+                }
+                let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+                result.execution_id = Some(receipt.execution_id);
+                result.termination = Some(receipt.clone());
+                return result;
+            }
+        }
+        let mut result =
+            self.stop_worker_under_lock(&request.worker_ref, Some(request.operation_id));
+        if result.termination.is_none()
+            && let Some(execution) = execution
+        {
+            result.termination = execution
+                .tasks
+                .termination(&request.worker_ref, request.operation_id);
+        }
+        result.execution_id = result
+            .termination
+            .as_ref()
+            .map(|termination| termination.execution_id);
+        if result.is_accepted() {
+            match result.termination.as_ref() {
+                Some(termination)
+                    if termination
+                        .confirms_scope_shutdown(&request.worker_ref, request.operation_id) =>
+                {
+                    self.completed_stops
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(request.worker_ref, termination.clone());
+                }
+                _ => {
+                    result.outcome = crate::execution::WorkerExecutionOutcome::Errored;
+                    result.message =
+                        Some("actual scope termination is unproven; stop remains pending".into());
+                }
+            }
+        }
+        result
+    }
+
     // Caller owns the per-Worker operation lock for this entire cleanup.
-    fn stop_worker_under_lock(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
+    fn stop_worker_under_lock(
+        &self,
+        worker_ref: &WorkerRef,
+        operation_id: Option<crate::execution::WorkerLifecycleOperationId>,
+    ) -> WorkerExecutionResult {
+        let mut candidate_termination = None;
+        let mut startup_stop_result = None;
+        let pending_spawn = match self.pending_spawns.lock() {
+            Ok(owners) => owners.get(worker_ref).cloned(),
+            Err(_) => {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "fresh spawn owner lock is poisoned",
+                );
+            }
+        };
+        if let Some(pending) = pending_spawn.as_ref() {
+            if let Err(message) = self.wait_pending_spawn(pending, Duration::from_secs(5)) {
+                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+            }
+            let failure = pending
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|result| result.as_ref().err())
+                .filter(|failure| failure.needs_cleanup())
+                .cloned();
+            if let Some(mut failure) = failure {
+                let factory = self.factory.clone();
+                let worker_ref = worker_ref.clone();
+                let owner = pending.clone();
+                if let Err(message) = self.run_joined_on_adapter_runtime(async move {
+                    failure.cleanup = match factory.cleanup_failed_spawn(&worker_ref).await {
+                        Ok(()) => RuntimeRestoreCleanup::Confirmed,
+                        Err(RuntimeRestoreCleanupFailure::Unsupported) => failure.cleanup,
+                        Err(error) => {
+                            failure.cleanup_failure.get_or_insert(error);
+                            RuntimeRestoreCleanup::Failed(error)
+                        }
+                    };
+                    *owner
+                        .result
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Err(failure));
+                    Ok(())
+                }) {
+                    return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+                }
+            }
+            let mut result = pending
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match result.as_ref() {
+                Some(Ok(_)) => {
+                    let controller = result.take().unwrap().unwrap_or_else(|_| unreachable!());
+                    let state = Arc::new(RwLock::new(controller.handle.shared_state.snapshot()));
+                    self.retain_uncertain_unconnected_controller(
+                        worker_ref,
+                        controller.handle,
+                        controller.shutdown,
+                        Arc::new(AtomicBool::new(false)),
+                        RuntimeExecutionTaskScope::new(controller.controller_task),
+                        state,
+                        Some(controller.workspace_client),
+                        None,
+                        workdir_attachment_statuses(&pending.workdir_attachments),
+                    );
+                }
+                Some(Err(failure)) if failure.needs_cleanup() => {
+                    return failure.execution_result(WorkerExecutionOperation::Stop);
+                }
+                Some(Err(failure)) => {
+                    startup_stop_result =
+                        Some(failure.execution_result(WorkerExecutionOperation::Stop));
+                    if failure.cleanup == RuntimeRestoreCleanup::Confirmed
+                        && let Some(operation_id) = operation_id
+                    {
+                        // The original factory task is joined and its resource
+                        // owner explicitly completed cleanup. Never derive this
+                        // fact from a projected startup attachment.
+                        candidate_termination = Some(
+                            crate::execution::WorkerExecutionTermination::joined_startup_candidate(
+                                worker_ref.clone(),
+                                operation_id,
+                                pending.execution_id,
+                            ),
+                        );
+                    }
+                }
+                // A previous Stop transferred the Controller to its execution scope.
+                None => {}
+            }
+        }
         let pending = match self.pending_restore(worker_ref) {
             Ok(pending) => pending,
             Err(message) => {
@@ -4728,13 +5315,13 @@ where
         };
         if let Some(pending) = pending {
             if let Err(message) = self.wait_pending_restore(&pending, Duration::from_secs(5)) {
-                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+                return pending.stop_failure_result(message);
             }
             if let Err(message) = self
                 .retry_pending_restore_cleanup(&pending, false)
                 .and_then(|()| self.wait_pending_restore(&pending, Duration::from_secs(5)))
             {
-                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+                return pending.stop_failure_result(message);
             }
             if let Some(Err(failure)) = pending
                 .result
@@ -4743,10 +5330,7 @@ where
                 .as_ref()
                 && failure.needs_cleanup()
             {
-                return WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Stop,
-                    failure.to_string(),
-                );
+                return failure.execution_result(WorkerExecutionOperation::Stop);
             }
             if pending.activation_started.load(Ordering::Acquire)
                 && !pending.owns_prepared_candidate()
@@ -4784,10 +5368,7 @@ where
                             RuntimeRestoreCleanup::Confirmed | RuntimeRestoreCleanup::NotNeeded
                         ) => {}
                     Some(Err(failure)) => {
-                        return WorkerExecutionResult::errored(
-                            WorkerExecutionOperation::Stop,
-                            failure.to_string(),
-                        );
+                        return failure.execution_result(WorkerExecutionOperation::Stop);
                     }
                     None => {
                         return WorkerExecutionResult::errored(
@@ -4852,7 +5433,7 @@ where
                     *pending.task.try_lock().expect("joined candidate task") = Some(task);
                 }
                 if let Err(message) = self.wait_pending_restore(&pending, Duration::from_secs(5)) {
-                    return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+                    return pending.stop_failure_result(message);
                 }
                 let cleanup = *pending
                     .discard_result
@@ -4862,10 +5443,7 @@ where
                     Some(Ok(())) => {}
                     Some(Err(error)) => {
                         pending.discard_started.store(false, Ordering::Release);
-                        return WorkerExecutionResult::errored(
-                            WorkerExecutionOperation::Stop,
-                            error.to_string(),
-                        );
+                        return pending.stop_failure_result(error.to_string());
                     }
                     None => {
                         return WorkerExecutionResult::errored(
@@ -4875,8 +5453,52 @@ where
                     }
                 }
             }
-            if let Err(message) = self.remove_pending_restore(worker_ref) {
-                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+            let discarded = *pending
+                .discard_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == Some(Ok(()));
+            let preparation = pending
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prepared_cleanup = discarded
+                && match preparation.as_ref() {
+                    None => true, // The actual candidate's discard completed and joined.
+                    Some(Err(failure)) => failure.cleanup == RuntimeRestoreCleanup::Confirmed,
+                    Some(Ok(_)) => false,
+                };
+            if let Some(Err(failure)) = preparation.as_ref() {
+                startup_stop_result =
+                    Some(failure.execution_result(WorkerExecutionOperation::Stop));
+            }
+            drop(preparation);
+            let activation = pending
+                .activated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let activated_cleanup = matches!(activation.as_ref(), Some(Err(failure)) if failure.cleanup == RuntimeRestoreCleanup::Confirmed);
+            if let Some(Err(failure)) = activation.as_ref() {
+                startup_stop_result =
+                    Some(failure.execution_result(WorkerExecutionOperation::Stop));
+            }
+            drop(activation);
+            if !pending.cleanup_only
+                && (prepared_cleanup || activated_cleanup)
+                && let Some(operation_id) = operation_id
+            {
+                candidate_termination = Some(
+                    crate::execution::WorkerExecutionTermination::joined_startup_candidate(
+                        worker_ref.clone(),
+                        operation_id,
+                        pending.execution_id,
+                    ),
+                );
+            }
+            if candidate_termination.is_none() {
+                if let Err(message) = self.remove_pending_restore(worker_ref) {
+                    return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+                }
             }
         }
         let execution = match self.workers.lock() {
@@ -4889,23 +5511,58 @@ where
             }
         };
         let Some(execution) = execution else {
-            // The execution backend cleanup may have committed before the
-            // Runtime catalog commit failed. Treat the retry as converged so
-            // the Runtime can durably finish its Stopped transition.
+            let mut result = startup_stop_result.unwrap_or_else(|| WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Stop,
+                "no retained actual execution termination evidence; map absence is not shutdown proof",
+            ));
+            // Reconciliation alone cannot issue evidence: the original candidate
+            // task must already be joined and its resource owner cleanup confirmed.
             let factory = Arc::clone(&self.factory);
-            let worker_ref = worker_ref.clone();
-            return match self.run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
-                factory.reconcile_stopped_worker(&worker_ref).await
-            }) {
-                Ok(()) => WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop),
-                Err(message) => {
-                    WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message)
+            let stopped_ref = worker_ref.clone();
+            if let Err(message) = self
+                .run_cancellable_on_adapter_runtime(RUNTIME_TASK_TIMEOUT, async move {
+                    factory.reconcile_stopped_worker(&stopped_ref).await
+                })
+            {
+                result.message = Some(message);
+                return result;
+            }
+            if let Some(termination) = candidate_termination {
+                if let Some(pending) = pending_spawn.as_ref() {
+                    if let Err(message) = self.cleanup_pending_spawn_bindings(worker_ref, pending) {
+                        result.message = Some(message);
+                        return result;
+                    }
                 }
-            };
+                if let Err(message) = self.remove_pending_restore(worker_ref) {
+                    result.message = Some(message);
+                    return result;
+                }
+                result.outcome = crate::execution::WorkerExecutionOutcome::Accepted;
+                result.termination = Some(termination);
+            }
+            return result;
         };
 
         if let Err(message) = self.cleanup_execution_resources(&execution) {
-            return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+            let mut result = startup_stop_result.clone().unwrap_or_else(|| {
+                WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message.clone())
+            });
+            result.outcome = crate::execution::WorkerExecutionOutcome::Errored;
+            result.message = Some(message);
+            result.termination = operation_id
+                .and_then(|operation_id| execution.tasks.termination(worker_ref, operation_id));
+            return result;
+        }
+        if let Some(pending) = pending_spawn {
+            if let Err(message) = self.cleanup_pending_spawn_bindings(worker_ref, &pending) {
+                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+            }
+        }
+        if candidate_termination.is_some() {
+            if let Err(message) = self.remove_pending_restore(worker_ref) {
+                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+            }
         }
         // External consumers may retain a closed handle indefinitely. Weak
         // shared-state liveness is not evidence of a published execution.
@@ -4927,7 +5584,12 @@ where
                 );
             }
         }
-        WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
+        let mut result = startup_stop_result
+            .unwrap_or_else(|| WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop));
+        result.outcome = crate::execution::WorkerExecutionOutcome::Accepted;
+        result.termination = operation_id
+            .and_then(|operation_id| execution.tasks.termination(worker_ref, operation_id));
+        result
     }
 }
 
@@ -4995,7 +5657,7 @@ where
                     deletion: Some(request.clone()),
                 },
             );
-        let result = self.stop_worker_under_lock(&worker);
+        let result = self.stop_worker_under_lock(&worker, None);
         if !result.is_accepted() {
             return Err(result.message_or_default());
         }
@@ -5032,6 +5694,9 @@ where
             .is_none()
         {
             return Err("execution backend is unavailable".into());
+        }
+        if self.pending_spawn_exists(&worker_ref)? {
+            return Err("Subject create fresh spawn still owns resources".into());
         }
         if self
             .pending_restores
@@ -5513,13 +6178,9 @@ where
                 && request.request.workdir_attachments.is_empty()
             {
                 // No provider is needed for a Workdir-less Worker.
-                let factory = self.factory.clone();
                 let bridge_context = request.context.clone();
                 let worker_ref = request.worker_ref.clone();
-                let spawn_result = self
-                    .run_cancellable_on_adapter_runtime(self.spawn_restore_timeout, async move {
-                        Ok(factory.spawn_controller(request).await)
-                    });
+                let spawn_result = self.spawn_controller_retained(request, Vec::new());
                 let controller = match spawn_result {
                     Ok(Ok(controller)) => controller,
                     Ok(Err(failure)) => {
@@ -5527,14 +6188,7 @@ where
                             failure.execution_result(WorkerExecutionOperation::Spawn),
                         );
                     }
-                    Err(message) => {
-                        return WorkerExecutionSpawnResult::Errored(
-                            WorkerExecutionResult::errored(
-                                WorkerExecutionOperation::Spawn,
-                                message,
-                            ),
-                        );
-                    }
+                    Err(result) => return result,
                 };
                 return self.connect_handle(
                     WorkerExecutionOperation::Spawn,
@@ -5651,13 +6305,9 @@ where
         }
         let workdir_attachments = request.workdir_attachments.clone();
 
-        let factory = self.factory.clone();
         let bridge_context = request.context.clone();
         let worker_ref = request.worker_ref.clone();
-        let spawn_result = self
-            .run_cancellable_on_adapter_runtime(self.spawn_restore_timeout, async move {
-                Ok(factory.spawn_controller(request).await)
-            });
+        let spawn_result = self.spawn_controller_retained(request, rollback_workdirs.clone());
 
         let controller = match spawn_result {
             Ok(Ok(controller)) => controller,
@@ -5673,23 +6323,8 @@ where
                 }
                 return WorkerExecutionSpawnResult::Errored(result);
             }
-            Err(message) => {
-                if let Err(result) = rollback_materialized_spawn_workdirs(
-                    materializer.as_ref(),
-                    &workdir_attachments,
-                    &rollback_workdirs,
-                    &WorkerExecutionResult::rejected(
-                        WorkerExecutionOperation::Spawn,
-                        message.clone(),
-                    ),
-                ) {
-                    return result;
-                }
-                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Spawn,
-                    message,
-                ));
-            }
+            // The retained owner, not the timed-out caller, owns these bindings.
+            Err(result) => return result,
         };
 
         self.connect_handle(
@@ -5989,6 +6624,7 @@ where
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&worker_ref);
                 let pending = Arc::new(PendingRuntimeRestore {
+                    execution_id: uuid::Uuid::now_v7(),
                     request: request.clone(),
                     cleanup_only: false,
                     task: tokio::sync::Mutex::new(None),
@@ -6011,6 +6647,19 @@ where
                         );
                     }
                 };
+                match self.completed_stops.lock() {
+                    Ok(mut receipts) => {
+                        receipts.remove(&worker_ref);
+                    }
+                    Err(_) => {
+                        return WorkerExecutionSpawnResult::Rejected(
+                            WorkerExecutionResult::errored(
+                                WorkerExecutionOperation::Restore,
+                                "Worker termination receipt registry poisoned",
+                            ),
+                        );
+                    }
+                }
                 resources.insert(worker_ref.clone(), Arc::clone(&pending));
                 let factory = Arc::clone(&self.factory);
                 let result_owner = Arc::clone(&pending);
@@ -6313,6 +6962,7 @@ where
                     );
                     failure.durable_effects_possible = request.source_repair_possible;
                     let pending = Arc::new(PendingRuntimeRestore {
+                        execution_id: uuid::Uuid::now_v7(),
                         request: request.clone(),
                         cleanup_only: true,
                         task: tokio::sync::Mutex::new(None),
@@ -6666,6 +7316,139 @@ where
         Ok(())
     }
 
+    fn termination_receipt(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+        let operation = self.worker_lock(worker_ref)?;
+        let _guard = operation
+            .lock()
+            .map_err(|_| "Worker operation lock poisoned".to_string())?;
+        if self
+            .pending_spawns
+            .lock()
+            .map_err(|_| "Worker spawn registry poisoned".to_string())?
+            .contains_key(worker_ref)
+            || self
+                .pending_restores
+                .lock()
+                .map_err(|_| "Worker restore registry poisoned".to_string())?
+                .contains_key(worker_ref)
+            || self
+                .subject_reservations
+                .lock()
+                .map_err(|_| "Subject reservation registry poisoned".to_string())?
+                .keys()
+                .any(|(worker, _)| worker == worker_ref)
+        {
+            return Ok(None);
+        }
+        let current_execution = self
+            .workers
+            .lock()
+            .map_err(|_| "Worker execution registry poisoned".to_string())?
+            .get(worker_ref)
+            .map(|execution| execution.tasks.execution_id);
+        let receipt = self
+            .completed_stops
+            .lock()
+            .map_err(|_| "Worker termination receipts poisoned".to_string())?
+            .get(worker_ref)
+            .cloned();
+        // The positive receipt comes only from the joined scope, never from
+        // absence. A Restore's new Controller cannot reuse its predecessor's end.
+        Ok(receipt.filter(|receipt| current_execution.is_none_or(|id| id == receipt.execution_id)))
+    }
+
+    fn reconcile_submission(
+        &self,
+        worker_ref: &WorkerRef,
+        input: WorkerInput,
+    ) -> WorkerExecutionResult {
+        let unknown =
+            |message| WorkerExecutionResult::errored(WorkerExecutionOperation::Input, message);
+        if !matches!(
+            input.kind,
+            WorkerInputKind::User | WorkerInputKind::UserIfIdle
+        ) {
+            return unknown(
+                "receipt reconciliation requires a Submit input; acceptance remains unknown",
+            );
+        }
+        let Some(request_id) = input
+            .submission_request_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        else {
+            return unknown(
+                "receipt reconciliation has no submission request id; acceptance remains unknown",
+            );
+        };
+        let operation_lock = match self.worker_lock(worker_ref) {
+            Ok(lock) => lock,
+            Err(_) => {
+                return unknown(
+                    "Worker operation lock unavailable; submission acceptance remains unknown",
+                );
+            }
+        };
+        let _operation_guard = match operation_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return unknown(
+                    "Worker operation lock is poisoned; submission acceptance remains unknown",
+                );
+            }
+        };
+        let execution = match self.workers.lock() {
+            Ok(workers) => match workers.get(worker_ref) {
+                Some(execution) => execution.clone(),
+                None => {
+                    return unknown(
+                        "no retained Controller for receipt lookup; submission acceptance remains unknown",
+                    );
+                }
+            },
+            Err(_) => {
+                return unknown(
+                    "Worker registry is unavailable; submission acceptance remains unknown",
+                );
+            }
+        };
+        let (segments, source) = runtime_submission_payload(&input, request_id);
+        // This reads the Worker's existing namespace+digest receipt. It must not
+        // dispatch a Method, reopen admission, or infer nonacceptance from None.
+        let mut result = match execution
+            .handle
+            .reconcile_submission(request_id, &segments, &source)
+        {
+            Ok(Some(receipt))
+                if receipt.submission_request_id == request_id
+                    && !receipt.submission_id.trim().is_empty() =>
+            {
+                WorkerExecutionResult::accepted_submission(
+                    WorkerExecutionOperation::Input,
+                    receipt.submission_request_id,
+                    receipt.submission_id,
+                    receipt.disposition,
+                )
+            }
+            Ok(Some(_)) => unknown(
+                "Worker returned a mismatched receipt; submission acceptance remains unknown",
+            ),
+            Ok(None) => unknown(
+                "exact submission receipt is missing; submission acceptance remains unknown",
+            ),
+            Err(_) => unknown(
+                "exact submission receipt lookup failed; submission acceptance remains unknown",
+            ),
+        };
+        // Identify the Controller observed, not the originating run of a receipt
+        // retained across Controller replacement. This is not termination evidence.
+        result.execution_id = Some(execution.tasks.execution_id);
+        result
+    }
+
     fn dispatch_input(&self, worker_ref: &WorkerRef, input: WorkerInput) -> WorkerExecutionResult {
         let operation_lock = match self.worker_lock(worker_ref) {
             Ok(lock) => lock,
@@ -6733,19 +7516,16 @@ where
             WorkerInputKind::User | WorkerInputKind::UserIfIdle => {
                 let Some(submission_id) = input
                     .submission_request_id
+                    .as_ref()
                     .filter(|submission_id| !submission_id.trim().is_empty())
+                    .cloned()
                 else {
                     return WorkerExecutionResult::rejected(
                         WorkerExecutionOperation::Input,
                         "Runtime user input is missing its internal submission id",
                     );
                 };
-                let segments = input
-                    .segments
-                    .unwrap_or_else(|| vec![Segment::text(input.content.trim().to_string())]);
-                let source = protocol::AuthenticatedInputSource::Backend {
-                    operation_id: submission_id.clone(),
-                };
+                let (segments, source) = runtime_submission_payload(&input, &submission_id);
                 let method = if input.kind == WorkerInputKind::UserIfIdle {
                     Method::SubmitIfIdle {
                         submission_request_id: submission_id.clone(),
@@ -6774,16 +7554,40 @@ where
         };
         let waits_for_submission_acceptance = submission_request_id.is_some();
 
-        if waits_for_submission_acceptance {
+        let mut result = if waits_for_submission_acceptance {
             self.send_submit_and_wait_for_acceptance(
                 WorkerExecutionOperation::Input,
                 worker,
                 method,
-                submission_request_id.expect("Submit must have a submission request id"),
+                submission_request_id
+                    .clone()
+                    .expect("Submit must have a submission request id"),
             )
         } else {
             self.send_method(WorkerExecutionOperation::Input, worker, method)
+        };
+        if let Some(execution) = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(worker_ref)
+        {
+            result.execution_id = Some(execution.tasks.execution_id);
+            if result.is_accepted()
+                && let Some(ack) = result.submission.as_ref()
+                && Some(&ack.submission_request_id) == submission_request_id.as_ref()
+            {
+                let mut submissions = execution
+                    .tasks
+                    .submissions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !submissions.contains(ack) {
+                    submissions.push(ack.clone());
+                }
+            }
         }
+        result
     }
 
     fn upload_file(
@@ -6903,7 +7707,22 @@ where
     }
 
     fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
-        self.stop_worker(&request.worker_ref)
+        let lock = match self.worker_lock(&request.worker_ref) {
+            Ok(lock) => lock,
+            Err(message) => {
+                return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
+            }
+        };
+        let _guard = match lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "worker operation lock is poisoned",
+                );
+            }
+        };
+        self.stop_worker_operation_under_lock(request)
     }
 
     fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
@@ -6920,7 +7739,7 @@ where
                 return WorkerExecutionResult::errored(WorkerExecutionOperation::Stop, message);
             }
         };
-        self.stop_worker_under_lock(worker_ref)
+        self.stop_worker_under_lock(worker_ref, None)
     }
 
     fn cancel_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
@@ -7055,6 +7874,33 @@ where
                 method,
             )
         });
+        let stop_backend = Arc::clone(&self);
+        let stop_lock = Arc::clone(&operation_lock);
+        let stop_execution = execution.clone();
+        let stop_worker_ref = worker_ref.clone();
+        let stop = Arc::new(move |request: WorkerExecutionStopRequest| {
+            let _guard = match stop_lock.lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Stop,
+                        "worker operation lock is poisoned",
+                    );
+                }
+            };
+            if request.worker_ref != stop_worker_ref {
+                return WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Stop,
+                    "bound stop target mismatch",
+                );
+            }
+            if let Err(result) = stop_backend
+                .validate_protocol_execution_under_lock(&stop_worker_ref, &stop_execution)
+            {
+                return result;
+            }
+            stop_backend.stop_worker_operation_under_lock(request)
+        });
         let validator_backend = Arc::clone(&self);
         let validator_lock = Arc::clone(&operation_lock);
         let validator_worker_ref = worker_ref.clone();
@@ -7068,13 +7914,10 @@ where
             validator_backend
                 .validate_protocol_execution_under_lock(&validator_worker_ref, &execution)
         });
-        Ok(WorkerProtocolTransport::new(
-            worker_ref.clone(),
-            snapshot,
-            events,
-            dispatch,
-            validate,
-        ))
+        Ok(
+            WorkerProtocolTransport::new(worker_ref.clone(), snapshot, events, dispatch, validate)
+                .with_stop_dispatch(stop),
+        )
     }
 
     #[cfg(feature = "ws-server")]
@@ -8608,6 +9451,7 @@ mod tests {
         backend.pending_restores.lock().unwrap().insert(
             worker_ref.clone(),
             Arc::new(PendingRuntimeRestore {
+                execution_id: uuid::Uuid::now_v7(),
                 request: direct_restore_request(worker_ref.clone()),
                 cleanup_only: false,
                 task: tokio::sync::Mutex::new(None),
@@ -8653,6 +9497,7 @@ mod tests {
             })
             .unwrap();
         let pending = Arc::new(PendingRuntimeRestore {
+            execution_id: uuid::Uuid::now_v7(),
             request: request.clone(),
             cleanup_only: false,
             task: tokio::sync::Mutex::new(Some(failed)),
@@ -9754,6 +10599,63 @@ mod tests {
         assert_eq!(
             claims.path,
             "/api/w/workspace-b/runtime-config?profile=coder"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_feature_failure_is_retained_after_real_scope_join_without_cleanup_success()
+    {
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async {}));
+        scope.push(
+            "protocol bridge",
+            tokio::spawn(std::future::pending()),
+            true,
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let failure = worker::hook::HookError::new(
+            worker::hook::HookErrorCategory::Timeout,
+            "Feature cleanup timed out",
+        );
+        sender
+            .send(worker::controller::ControllerShutdownReport {
+                feature_failures: vec![failure.clone()],
+            })
+            .unwrap();
+        let shutdown = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        for _ in 0..2 {
+            assert!(
+                scope
+                    .confirm_shutdown_and_join(&shutdown)
+                    .await
+                    .unwrap_err()
+                    .contains("Feature shutdown failures")
+            );
+            assert!(scope.tasks.lock().unwrap().is_empty());
+            let termination = scope.termination(&worker_ref, operation_id).unwrap();
+            assert!(!termination.confirms_scope_shutdown(&worker_ref, operation_id));
+            assert_eq!(termination.feature_failures[0].category, failure.category);
+            assert_eq!(
+                termination.feature_failures[0].diagnostic,
+                failure.diagnostic
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn joined_tasks_without_controller_report_do_not_issue_termination() {
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async {}));
+        scope.join().await.unwrap();
+        let shutdown = Arc::new(tokio::sync::Mutex::new(None));
+        assert!(scope.confirm_shutdown_and_join(&shutdown).await.is_err());
+        assert!(
+            scope
+                .termination(
+                    &WorkerRef::new(WorkerId::now_v7()),
+                    crate::execution::WorkerLifecycleOperationId::new()
+                )
+                .is_none()
         );
     }
 
@@ -10880,7 +11782,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_restart_stop_cleans_prior_restore_artifacts_and_retains_journal_on_failure() {
+    fn fs_restart_artifact_cleanup_does_not_replace_lost_execution_termination_evidence() {
         require_restore_test_environment();
         let root = tempfile::tempdir_in(".").unwrap();
         let socket_base = Path::new(root.path().file_name().unwrap()).join("controllers");
@@ -11000,18 +11902,14 @@ mod tests {
         fs::remove_file(&artifact).unwrap();
         fs::create_dir(&artifact).unwrap();
         fs::write(artifact.join("worker.err.log"), "stale restore diagnostics").unwrap();
-        restarted.stop_worker(&worker.worker_ref, None).unwrap();
+        let unresolved = restarted.stop_worker(&worker.worker_ref, None).unwrap_err();
+        assert!(
+            unresolved
+                .to_string()
+                .contains("map absence is not shutdown proof")
+        );
         assert!(!artifact.exists());
-        assert_eq!(
-            restarted.worker_detail(&worker.worker_ref).unwrap().status,
-            crate::catalog::WorkerStatus::Stopped
-        );
-        let journal: serde_json::Value =
-            serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
-        assert_ne!(
-            journal["execution_state"]["state"],
-            "reconciliation_required"
-        );
+        assert_eq!(fs::read(&journal_path).unwrap(), journal_before);
         assert_eq!(
             fs::read_to_string(aggregate.join("session").join("keep-authority")).unwrap(),
             "saved Session authority"
@@ -11020,7 +11918,7 @@ mod tests {
         assert!(another_worker.join("keep.log").is_file());
         assert!(!profile_base.exists());
         assert!(backend.workers.lock().unwrap().is_empty());
-        restarted.stop_worker(&worker.worker_ref, None).unwrap();
+        assert!(restarted.stop_worker(&worker.worker_ref, None).is_err());
     }
 
     #[tokio::test]
@@ -11482,6 +12380,7 @@ mod tests {
         .unwrap();
         let request = direct_restore_request(WorkerRef::new(WorkerId::now_v7()));
         let owner = Arc::new(PendingRuntimeRestore {
+            execution_id: uuid::Uuid::now_v7(),
             request: request.clone(),
             cleanup_only: false,
             task: tokio::sync::Mutex::new(None),
@@ -11575,7 +12474,21 @@ mod tests {
             operation_id
         );
         cleanup_allowed.store(true, Ordering::SeqCst);
-        assert!(backend.stop_worker_operation(stop.clone()).is_accepted());
+        let cleaned = backend.stop_worker_operation(stop.clone());
+        assert!(cleaned.is_accepted(), "{cleaned:?}");
+        assert_eq!(cleaned.startup_failure, failed.startup_failure);
+        assert_eq!(cleaned.secondary_failures, failed.secondary_failures);
+        assert_eq!(
+            cleaned.startup_failure_persistence,
+            failed.startup_failure_persistence
+        );
+        assert!(cleaned.startup_resources.is_some());
+        let termination = cleaned.termination.as_ref().unwrap();
+        assert_eq!(
+            termination.scope,
+            crate::execution::WorkerExecutionTerminationScope::UnpublishedStartupCandidate
+        );
+        assert!(termination.confirms_scope_shutdown(&worker_ref, stop.operation_id));
         assert!(backend.pending_restore(&worker_ref).unwrap().is_none());
         assert!(
             backend.stop_worker_operation(stop).is_accepted(),
@@ -11583,6 +12496,99 @@ mod tests {
         );
         assert_eq!(restore_calls.load(Ordering::SeqCst), 1);
         assert_eq!(cleanup_calls.load(Ordering::SeqCst), 3);
+    }
+
+    struct LateSpawnFactory {
+        inner: MockFactory,
+        spawns: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeWorkerFactory for LateSpawnFactory {
+        async fn spawn_controller(
+            &self,
+            request: WorkerExecutionSpawnRequest,
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            self.inner.spawn_controller(request).await
+        }
+
+        async fn prepare_restore(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
+            self.inner.prepare_restore(request).await
+        }
+    }
+
+    #[test]
+    fn fresh_spawn_timeout_retains_factory_and_late_controller_until_bound_stop_joins() {
+        let root = tempfile::tempdir().unwrap();
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let backend = WorkerRuntimeExecutionBackend::new(LateSpawnFactory {
+            inner: MockFactory {
+                client: MockClient::sequential(vec![]),
+                runtime_base: root.path().join("runtime"),
+                cwd: root.path().to_path_buf(),
+                store_dir: root.path().join("sessions"),
+                worker_metadata_dir: root.path().join("workers"),
+                observed_cwds: Arc::new(Mutex::new(Vec::new())),
+                observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+            },
+            spawns: spawns.clone(),
+            release: release.clone(),
+        })
+        .unwrap()
+        .with_spawn_restore_timeout(Duration::from_millis(1));
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let request = WorkerExecutionSpawnRequest {
+            worker_ref: worker_ref.clone(),
+            request: create_request("late fresh Controller"),
+            workspace_scope: None,
+            context: test_execution_context(worker_ref.clone()),
+            workdir_attachments: BTreeMap::new(),
+            config_bundle: None,
+        };
+        assert!(matches!(
+            backend.spawn_worker(request),
+            WorkerExecutionSpawnResult::ReconciliationRequired { .. }
+        ));
+        assert!(
+            backend
+                .pending_spawns
+                .lock()
+                .unwrap()
+                .contains_key(&worker_ref)
+        );
+        assert!(backend.workers.lock().unwrap().is_empty());
+        assert!(backend.termination_receipt(&worker_ref).unwrap().is_none());
+        release.notify_one();
+        let stop = WorkerExecutionStopRequest {
+            worker_ref: worker_ref.clone(),
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+        };
+        let result = backend.stop_worker_operation(stop.clone());
+        assert!(result.is_accepted(), "{result:?}");
+        let termination = result.termination.unwrap();
+        assert!(termination.confirms_scope_shutdown(&worker_ref, stop.operation_id));
+        assert_eq!(
+            backend.termination_receipt(&worker_ref).unwrap(),
+            Some(termination.clone())
+        );
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        assert!(backend.pending_spawns.lock().unwrap().is_empty());
+        assert!(backend.workers.lock().unwrap().is_empty());
+        let replay = backend.stop_worker_operation(stop);
+        assert_eq!(replay.termination, Some(termination));
+        let unrelated = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            worker_ref,
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+        });
+        assert!(!unrelated.is_accepted());
+        assert!(unrelated.termination.is_none());
     }
 
     struct LateControllerFactory {
@@ -11655,7 +12661,12 @@ mod tests {
         ));
         assert!(backend.workers.lock().unwrap().is_empty());
         release.notify_one();
-        assert!(backend.stop_worker(&worker_ref).is_accepted());
+        let stopped = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            worker_ref: worker_ref.clone(),
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+        });
+        assert!(stopped.is_accepted(), "{stopped:?}");
+        assert!(backend.termination_receipt(&worker_ref).unwrap().is_some());
         assert_eq!(
             restores.load(Ordering::SeqCst),
             1,
@@ -11674,6 +12685,10 @@ mod tests {
             backend.restore_worker(direct_restore_request(worker_ref.clone())),
             WorkerExecutionSpawnResult::Connected { .. }
         ));
+        assert!(
+            backend.termination_receipt(&worker_ref).unwrap().is_none(),
+            "the replacement Controller must not reuse its predecessor's termination"
+        );
         let old_send = backend.run_on_adapter_runtime(async move {
             old_handle
                 .send(Method::ListWorkers)
@@ -11685,7 +12700,16 @@ mod tests {
             "old protocol transport must stay closed after restore"
         );
         assert_eq!(restores.load(Ordering::SeqCst), 2);
-        assert!(backend.stop_worker(&worker_ref).is_accepted());
+        let second = backend.stop_worker_operation(WorkerExecutionStopRequest {
+            worker_ref: worker_ref.clone(),
+            operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+        });
+        assert!(second.is_accepted(), "{second:?}");
+        let retained = backend.termination_receipt(&worker_ref).unwrap().unwrap();
+        assert_ne!(
+            retained.execution_id,
+            stopped.termination.unwrap().execution_id
+        );
         #[cfg(feature = "ws-server")]
         assert!(backend.worker_snapshot(&worker_ref).is_none());
     }
@@ -11733,7 +12757,102 @@ mod tests {
     }
 
     #[test]
-    fn absent_execution_has_typed_input_rejection_and_safe_stop() {
+    #[cfg(feature = "ws-server")]
+    #[serial_test::serial(worker_allocation)]
+    fn receipt_reconciliation_reads_worker_receipts_without_appending_or_activating_input() {
+        // Real Runtime adapter + Controller + pending receipt storage. Only the
+        // model stream is gated so queries cannot race unrelated history appends.
+        for explicit_segments in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let client = MockClient::sequential(vec![MockResponse::Gated {
+                started: started.clone(),
+                release: release.clone(),
+                events: simple_text_events(),
+            }]);
+            let calls = client.call_count.clone();
+            let backend = Arc::new(
+                WorkerRuntimeExecutionBackend::new(MockFactory {
+                    client,
+                    runtime_base: root.path().join("runtime"),
+                    cwd: root.path().to_path_buf(),
+                    store_dir: root.path().join("sessions"),
+                    worker_metadata_dir: root.path().join("workers"),
+                    observed_cwds: Arc::new(Mutex::new(Vec::new())),
+                    observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+                })
+                .unwrap(),
+            );
+            let runtime =
+                EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
+                    .unwrap();
+            runtime.store_config_bundle(test_bundle()).unwrap();
+            let detail = runtime
+                .create_worker(create_request("read-only receipt"))
+                .unwrap();
+            let handle = backend.get_execution(&detail.worker_ref).unwrap().0;
+            let session = || match handle.snapshot_event() {
+                Event::Snapshot { session, .. } => session,
+                _ => unreachable!("Controller full snapshot"),
+            };
+            let mut input = WorkerInput::user("  fallback text  ");
+            input.kind = WorkerInputKind::UserIfIdle;
+            input.submission_request_id = Some("receipt-query".into());
+            if explicit_segments {
+                input.segments = Some(vec![Segment::text("  explicit text  ")]);
+            }
+            let before = session();
+            let missing = backend.reconcile_submission(&detail.worker_ref, input.clone());
+            assert_eq!(
+                missing.outcome,
+                crate::execution::WorkerExecutionOutcome::Errored
+            );
+            assert!(missing.submission.is_none());
+            assert!(missing.termination.is_none());
+            assert_eq!(session(), before);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let accepted = backend.dispatch_input(&detail.worker_ref, input.clone());
+            assert!(accepted.is_accepted(), "{accepted:?}");
+            backend
+                .run_on_adapter_runtime(async move {
+                    tokio::time::timeout(Duration::from_secs(5), started.notified())
+                        .await
+                        .map_err(|_| "model stream did not reach query gate".to_string())
+                })
+                .unwrap();
+            let before = session();
+            let found = backend.reconcile_submission(&detail.worker_ref, input.clone());
+            assert!(found.is_accepted(), "{found:?}");
+            assert_eq!(found.submission, accepted.submission);
+            assert_eq!(found.execution_id, accepted.execution_id);
+            assert!(found.termination.is_none());
+
+            let mut conflicting = input.clone();
+            conflicting.segments = Some(vec![Segment::text("different payload")]);
+            let conflict = backend.reconcile_submission(&detail.worker_ref, conflicting);
+            assert_eq!(
+                conflict.outcome,
+                crate::execution::WorkerExecutionOutcome::Errored
+            );
+            assert!(conflict.submission.is_none());
+            let mut missing_input = input;
+            missing_input.submission_request_id = Some("absent-request".into());
+            let missing = backend.reconcile_submission(&detail.worker_ref, missing_input);
+            assert_eq!(
+                missing.outcome,
+                crate::execution::WorkerExecutionOutcome::Errored
+            );
+            assert!(missing.submission.is_none());
+            assert_eq!(session(), before);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn absent_execution_has_typed_input_rejection_but_no_stop_evidence() {
         let backend = WorkerRuntimeExecutionBackend::new(FailingFactory).unwrap();
         let worker_ref = WorkerRef::new(WorkerId::now_v7());
         let rejected = backend.dispatch_input(&worker_ref, WorkerInput::user("input"));
@@ -11743,7 +12862,9 @@ mod tests {
             crate::execution::WorkerExecutionOutcome::Rejected
         );
         assert!(rejected.message.unwrap().contains("live Worker execution"));
-        assert!(backend.stop_worker(&worker_ref).is_accepted());
+        let stopped = backend.stop_worker(&worker_ref);
+        assert!(!stopped.is_accepted());
+        assert!(stopped.termination.is_none());
         assert!(backend.workers.lock().unwrap().is_empty());
     }
 

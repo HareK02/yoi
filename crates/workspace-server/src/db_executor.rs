@@ -53,10 +53,31 @@ tokio::task_local! {
     static OPERATION_LIFETIME: Arc<dyn DbOperationLifetime>;
 }
 
+struct NestedOperationLifetime {
+    outer: Arc<dyn DbOperationLifetime>,
+    inner: Arc<dyn DbOperationLifetime>,
+}
+
+impl DbOperationLifetime for NestedOperationLifetime {
+    fn retain(&self) -> Box<dyn Send> {
+        Box::new((self.outer.retain(), self.inner.retain()))
+    }
+}
+
 pub(crate) async fn with_operation_lifetime<F: Future>(
     lifetime: Arc<dyn DbOperationLifetime>,
     future: F,
 ) -> F::Output {
+    // An inner attempt scope must not replace its Workspace admission lease. Carry both
+    // sources through actual SQL, synchronous continuations, and discarded-result cleanup.
+    let lifetime = OPERATION_LIFETIME
+        .try_with(|outer| {
+            Arc::new(NestedOperationLifetime {
+                outer: outer.clone(),
+                inner: lifetime.clone(),
+            }) as Arc<dyn DbOperationLifetime>
+        })
+        .unwrap_or(lifetime);
     OPERATION_LIFETIME.scope(lifetime, future).await
 }
 
@@ -589,6 +610,94 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_workspace_and_attempt_lifetimes_survive_sql_child_and_discarded_reply_cleanup()
+    {
+        struct ReplyCleanup {
+            entered: Option<oneshot::Sender<()>>,
+            finish: mpsc::Receiver<()>,
+        }
+        impl Drop for ReplyCleanup {
+            fn drop(&mut self) {
+                self.entered.take().unwrap().send(()).unwrap();
+                self.finish.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        let (dir, owner, mut parent_conn) = database();
+        let mut child_conn = Connection::open(dir.path().join("jobs.sqlite")).unwrap();
+        let parent = executor(1);
+        let child = executor(1);
+        let child_owner = child.clone();
+        let workspace = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let outer: Arc<dyn DbOperationLifetime> = Arc::new(Lease(workspace.clone()));
+        let inner: Arc<dyn DbOperationLifetime> = Arc::new(Lease(attempt.clone()));
+        let (entered, running) = oneshot::channel();
+        let (release, permit) = mpsc::channel();
+        let (reply_dropping, dropping) = oneshot::channel();
+        let (finish_reply, finish) = mpsc::channel();
+        let mut operation = Box::pin(with_operation_lifetime(
+            outer,
+            with_operation_lifetime(
+                inner,
+                parent.run(move || -> Result<()> {
+                    entered.send(()).unwrap();
+                    permit.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let tx =
+                        parent_conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    tx.execute("INSERT INTO writes VALUES (1)", [])?;
+                    tx.commit()?;
+                    let reply = child_owner.submit(move || {
+                        let tx = child_conn
+                            .transaction_with_behavior(TransactionBehavior::Immediate)
+                            .unwrap();
+                        let committed: i64 = tx
+                            .query_row("SELECT count(*) FROM writes", [], |r| r.get(0))
+                            .unwrap();
+                        assert_eq!(committed, 1);
+                        tx.execute("INSERT INTO writes VALUES (2)", []).unwrap();
+                        tx.commit().unwrap();
+                        // Failed reply delivery drops this result outside the SQL transaction.
+                        Ok::<_, Error>(ReplyCleanup {
+                            entered: Some(reply_dropping),
+                            finish,
+                        })
+                    })?;
+                    drop(reply);
+                    Ok(())
+                }),
+            ),
+        ));
+        assert!(futures::poll!(&mut operation).is_pending());
+        observed(running).await.unwrap();
+        drop(operation);
+        for count in [&workspace, &attempt] {
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        release.send(()).unwrap();
+        observed(dropping).await.unwrap();
+        observed(parent.drain()).await.unwrap();
+        for count in [&workspace, &attempt] {
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "both owners must survive the parent and cancelled waiter"
+            );
+        }
+        let mut drain = Box::pin(child.drain());
+        assert!(futures::poll!(&mut drain).is_pending());
+        assert_eq!(
+            owner
+                .query_row("SELECT count(*) FROM writes", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        finish_reply.send(()).unwrap();
+        observed(drain).await.unwrap();
+        assert_eq!(workspace.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(attempt.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
