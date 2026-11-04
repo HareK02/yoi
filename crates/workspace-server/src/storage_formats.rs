@@ -87,8 +87,13 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
             return Err(invalid("unrecognized configuration adoption receipt"));
         }
         let prefix = &rows[..rows.len() - 1];
-        let prior = prefix.last().map(|row| row.0).ok_or_else(|| invalid("missing configuration predecessor"))?;
-        if !(113..=121).contains(&prior) { return Err(invalid("invalid configuration predecessor")); }
+        let prior = prefix
+            .last()
+            .map(|row| row.0)
+            .ok_or_else(|| invalid("missing configuration predecessor"))?;
+        if !(113..=121).contains(&prior) {
+            return Err(invalid("invalid configuration predecessor"));
+        }
         return verify_history_records(conn, prior, prefix);
     }
     let Some((baseline, name)) = rows.first() else {
@@ -217,7 +222,9 @@ pub(super) fn published_plan(
                 version: 122,
                 name: crate::config_adoption::MIGRATION_NAME.to_owned(),
             }]
-        } else { vec![] },
+        } else {
+            vec![]
+        },
     }))
 }
 
@@ -227,9 +234,13 @@ fn verify_configuration_shape(conn: &Connection) -> Result<()> {
     expected_db.execute_batch(crate::config_adoption::SCHEMA)?;
     let expected = snapshot(&expected_db)?;
     let tables: BTreeSet<_> = expected.values().map(|object| object.1.clone()).collect();
-    let actual: Shape = snapshot(conn)?.into_iter()
-        .filter(|(_, object)| tables.contains(&object.1)).collect();
-    if actual != expected { return Err(invalid("configuration adoption receipt/shape mismatch")); }
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| tables.contains(&object.1))
+        .collect();
+    if actual != expected {
+        return Err(invalid("configuration adoption receipt/shape mismatch"));
+    }
     Ok(())
 }
 

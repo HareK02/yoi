@@ -586,46 +586,96 @@ fn permission_transfer_extension_reopens_on_every_published_family_without_relab
         let temp = tempfile::tempdir().unwrap();
         published_fixture(temp.path(), format);
         let (scope, db) = open(temp.path(), REGISTRATION);
-        let saved = db.with_connection(|connection| Ok(receipts(connection))).unwrap();
-        let old_seal = db.with_connection(|connection| {
-            if format == Format::Permission18 {
-                Ok(Some(connection.query_row("SELECT export_json FROM permission_authority_seal", [], |row| row.get::<_, String>(0))?))
-            } else { Ok(None) }
-        }).unwrap();
+        let saved = db
+            .with_connection(|connection| Ok(receipts(connection)))
+            .unwrap();
+        let old_seal = db
+            .with_connection(|connection| {
+                if format == Format::Permission18 {
+                    Ok(Some(connection.query_row(
+                        "SELECT export_json FROM permission_authority_seal",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .unwrap();
         db.transaction(install_permission_transfer).unwrap();
         db.with_connection(|connection| {
             assert_eq!(receipts(connection), saved);
-            assert_eq!(domain_shape(connection)?, reference_shape_with_transfer(format, true)?);
+            assert_eq!(
+                domain_shape(connection)?,
+                reference_shape_with_transfer(format, true)?
+            );
             if let Some(raw) = &old_seal {
-                assert_eq!(connection.query_row("SELECT export_json FROM permission_authority_seal", [], |row| row.get::<_, String>(0))?, *raw);
+                assert_eq!(
+                    connection.query_row(
+                        "SELECT export_json FROM permission_authority_seal",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )?,
+                    *raw
+                );
             }
             assert_foreign_keys(connection);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         let store = SubjektivStore::from_database(db.clone()).unwrap();
         if old_seal.is_some() {
             let identity = store.database_identity().unwrap();
-            assert!(matches!(store.preview_permission_transfer(&identity), Err(crate::SubjektivError::PermissionAuthoritySealed)));
-            assert!(matches!(store.seal_permission_sources(&identity, "new-transfer", "export"), Err(crate::SubjektivError::PermissionAuthoritySealed)));
+            assert!(matches!(
+                store.preview_permission_transfer(&identity),
+                Err(crate::SubjektivError::PermissionAuthoritySealed)
+            ));
+            assert!(matches!(
+                store.seal_permission_sources(&identity, "new-transfer", "export"),
+                Err(crate::SubjektivError::PermissionAuthoritySealed)
+            ));
             struct CanonicalEmpty;
             impl crate::CanonicalPermissionSource for CanonicalEmpty {
-                fn subject_permissions(&self, workspace: &str, _subject: &str) -> crate::Result<Option<server_api::authorization::SubjectPermissions>> {
+                fn subject_permissions(
+                    &self,
+                    workspace: &str,
+                    _subject: &str,
+                ) -> crate::Result<Option<server_api::authorization::SubjectPermissions>>
+                {
                     assert_eq!(workspace, SCOPE);
                     Ok(Some(server_api::authorization::SubjectPermissions {
-                        change_id: "canonical-source".into(), execution: vec![], delegation: vec![],
+                        change_id: "canonical-source".into(),
+                        execution: vec![],
+                        delegation: vec![],
                     }))
                 }
             }
-            let connected = store.clone().with_canonical_permission_source(std::sync::Arc::new(CanonicalEmpty));
+            let connected = store
+                .clone()
+                .with_canonical_permission_source(std::sync::Arc::new(CanonicalEmpty));
             let subject = connected.list_subjects(1).unwrap().items[0].id.clone();
-            assert_eq!(connected.subject_permissions(&subject).unwrap().unwrap().change_id, "canonical-source");
-            connected.bind_worker_execution_grant(&server_api::authorization::WorkerExecutionGrant {
-                subject_id: subject, source_change_id: "canonical-source".into(),
-                runtime_id: "runtime".into(), worker_id: "canonical-child".into(),
-                origin_runtime_id: "runtime".into(), origin_worker_id: "root".into(),
-                profile: "builtin:coder".into(), profile_digest: "resolved-profile".into(),
-                permissions: vec![], redelegation: vec![],
-            }).unwrap();
+            assert_eq!(
+                connected
+                    .subject_permissions(&subject)
+                    .unwrap()
+                    .unwrap()
+                    .change_id,
+                "canonical-source"
+            );
+            connected
+                .bind_worker_execution_grant(&server_api::authorization::WorkerExecutionGrant {
+                    subject_id: subject,
+                    source_change_id: "canonical-source".into(),
+                    runtime_id: "runtime".into(),
+                    worker_id: "canonical-child".into(),
+                    origin_runtime_id: "runtime".into(),
+                    origin_worker_id: "root".into(),
+                    profile: "builtin:coder".into(),
+                    profile_digest: "resolved-profile".into(),
+                    permissions: vec![],
+                    redelegation: vec![],
+                })
+                .unwrap();
         }
         drop(store);
         drop(db);
@@ -633,10 +683,14 @@ fn permission_transfer_extension_reopens_on_every_published_family_without_relab
         let (scope, db) = open(temp.path(), REGISTRATION);
         db.with_connection(|connection| {
             assert_eq!(receipts(connection), saved);
-            assert_eq!(domain_shape(connection)?, reference_shape_with_transfer(format, true)?);
+            assert_eq!(
+                domain_shape(connection)?,
+                reference_shape_with_transfer(format, true)?
+            );
             assert_foreign_keys(connection);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         drop(db);
         scope.shutdown().unwrap();
     }
@@ -647,7 +701,9 @@ fn permission_extension_ddl_rolls_back_as_a_unit_and_missing_fence_rejects_reope
     let temp = tempfile::tempdir().unwrap();
     let (scope, db) = open(temp.path(), REGISTRATION);
     let before_shape = db.with_connection(domain_shape).unwrap();
-    let before_rows = db.with_connection(|connection| Ok(all_rows(connection))).unwrap();
+    let before_rows = db
+        .with_connection(|connection| Ok(all_rows(connection)))
+        .unwrap();
     let result = db.transaction(|tx| {
         install_permission_transfer(tx)?;
         tx.execute_batch("INSERT INTO injected_missing_table VALUES(1)")?;
@@ -658,16 +714,24 @@ fn permission_extension_ddl_rolls_back_as_a_unit_and_missing_fence_rejects_reope
         assert_eq!(domain_shape(connection)?, before_shape);
         assert_eq!(all_rows(connection), before_rows);
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     db.transaction(install_permission_transfer).unwrap();
     db.with_connection(|connection| {
-        connection.execute_batch("DROP TRIGGER permission_transfer_fence_subject_permissions_INSERT")?;
+        connection
+            .execute_batch("DROP TRIGGER permission_transfer_fence_subject_permissions_INSERT")?;
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     drop(db);
     scope.shutdown().unwrap();
-    let scope = feature_storage::FeatureStorage::new(temp.path()).scope(SCOPE).unwrap();
+    let scope = feature_storage::FeatureStorage::new(temp.path())
+        .scope(SCOPE)
+        .unwrap();
     let registered = scope.register(REGISTRATION).unwrap();
-    assert!(matches!(scope.open(&registered), Err(FeatureStorageError::MigrationHistory { .. })));
+    assert!(matches!(
+        scope.open(&registered),
+        Err(FeatureStorageError::MigrationHistory { .. })
+    ));
     scope.shutdown().unwrap();
 }

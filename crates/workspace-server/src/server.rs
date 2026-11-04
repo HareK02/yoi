@@ -60,6 +60,8 @@ mod plugin_host;
 #[path = "server_plugin_runtime.rs"]
 mod plugin_runtime;
 pub use plugin_delivery::InProcessPluginArtifactSource;
+#[path = "server_configuration_adoption.rs"]
+mod configuration_adoption;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -3530,6 +3532,8 @@ fn is_workspace_config_editor_path(path: &str) -> bool {
     };
     resource == "config/source-tree"
         || resource.starts_with("config/source-tree/")
+        || resource == "config/adoption"
+        || resource.starts_with("config/adoption/")
         || resource == "settings/profiles"
         || resource.starts_with("settings/profiles/")
 }
@@ -4106,7 +4110,8 @@ fn workspace_server_router(api: WorkspaceServerApi) -> Router {
         .merge(generated_auth_contract_router(contract_service.clone()))
         .merge(generated_workspace_catalog_contract_router(
             contract_service,
-        ));
+        ))
+        .merge(configuration_adoption::routes(api.clone()));
     catalog.layer(axum::middleware::from_fn_with_state(
         api,
         enforce_server_cookie_mutation_origin,
@@ -4636,6 +4641,9 @@ impl WorkspaceApi {
                 crate::profile_settings::ProfileConfigSchemaProvider,
             ))
             .with_provider(Arc::new(crate::prompt_settings::PromptConfigSchemaProvider))
+            .with_provider(Arc::new(
+                crate::policy_config::PermissionConfigSchemaProvider,
+            ))
             .with_provider(Arc::new(RuntimeConfigSchemaProvider))
             .with_provider(Arc::new(RepositoryAccessConfigSchemaProvider))
             .with_provider(Arc::new(skills::SkillConfigSchemaProvider))
@@ -16486,22 +16494,13 @@ async fn scoped_get_workspace_config_entry(
 }
 
 async fn scoped_commit_workspace_config_tree(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<server_api::ConfigCommitRequest>,
+    State(_api): State<WorkspaceApi>,
+    AxumPath(_path): AxumPath<ScopedWorkspacePath>,
+    Json(_request): Json<server_api::ConfigCommitRequest>,
 ) -> ApiResult<(StatusCode, Json<server_api::WorkspaceConfigTreeResponse>)> {
-    api.host_executors
-        .host()?
-        .run(move || {
-            let request = config_commit_request_from_api(request)?;
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            let state = commit_workspace_config_tree(&api, &path.workspace_id, &request)?;
-            Ok((
-                StatusCode::CREATED,
-                Json(workspace_config_state_to_api(state)),
-            ))
-        })
-        .await
+    Err(Error::WorkspaceConfigConflict(
+        "source-tree commits lack an editing head and request identity; use /config/adoption to preview, adopt and reconcile the owner request".into(),
+    ).into())
 }
 
 /// Shared canonical commit and activation boundary for UI and logical config operations.
@@ -24198,9 +24197,25 @@ where
     executor.run(move || runtime.block_on(future)).await
 }
 
-fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
+fn open_legacy_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
     crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
         .map_err(|error| ApiError::from(Error::Store(error.to_string())))
+}
+
+fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
+    let host = worker::feature::permissions::builtin_permission_host(
+        feature_permissions::WorkspaceId::parse(api.config.workspace_id.clone())
+            .map_err(|error| Error::InvalidInput(error.to_string()))?,
+    )
+    .map_err(|error| Error::Config(error.to_string()))?;
+    Ok(
+        open_legacy_subjektiv_store(api)?.with_canonical_permission_source(Arc::new(
+            crate::config_adoption::CanonicalConfigurationSource {
+                store: api.config_store.as_ref().clone(),
+                host,
+            },
+        )),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40388,6 +40403,7 @@ mod tests {
     mod workspace_admission_tests;
     mod workspace_protocol_backpressure_tests;
     include!("server_workspace_config_tests.rs");
+    include!("server_configuration_adoption_tests.rs");
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;

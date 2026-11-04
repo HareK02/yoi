@@ -9,3 +9,4 @@ Backend that manages persistent Workspace resources and authorization and provid
 - [`hosts`] / [`worker_source`] — Runtime delegation and request source verification
 - [`backend_job`] — Immutable input, attempt, and structured result boundaries
 - [`workspace_catalog`] — Workspace creation and replay contracts
+- [`config_adoption`] / [`policy_config`] — Owner source adoption, cutover boundaries and payload-free Subject assignments

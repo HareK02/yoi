@@ -9,8 +9,8 @@ pub mod journal;
 mod legacy_migrations;
 pub mod permissions;
 pub use permissions::{
-    CanonicalPermissionSource, DatabaseIdentity, PermissionSourceExport,
-    PermissionTransferReceipt, PermissionTransferSnapshot,
+    CanonicalPermissionSource, DatabaseIdentity, PermissionSourceExport, PermissionTransferReceipt,
+    PermissionTransferSnapshot,
 };
 mod schema;
 mod subject_creation;
@@ -755,7 +755,10 @@ impl SubjektivStore {
                 }
             }
         })?;
-        Ok(Self { database, canonical_permission_source: None })
+        Ok(Self {
+            database,
+            canonical_permission_source: None,
+        })
     }
 
     pub fn scope_id(&self) -> &str {

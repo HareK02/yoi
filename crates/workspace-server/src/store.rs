@@ -16077,13 +16077,18 @@ fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
 fn migrate_configuration_adoption_to_v122(conn: &Connection) -> Result<()> {
     let current = current_schema_version(conn)?;
     if !(113..=121).contains(&current) {
-        return Err(Error::Store("Configuration adoption migration requires a recognized schema 113..121".into()));
+        return Err(Error::Store(
+            "Configuration adoption migration requires a recognized schema 113..121".into(),
+        ));
     }
     storage_formats::verify_history(conn, current)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(content_history_store::SCHEMA)?;
     tx.execute_batch(crate::config_adoption::SCHEMA)?;
-    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(122,?1)", [crate::config_adoption::MIGRATION_NAME])?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(122,?1)",
+        [crate::config_adoption::MIGRATION_NAME],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -18904,12 +18909,15 @@ mod tests {
 
     #[test]
     fn current_schema_accepts_every_retained_canonical_provenance() {
-        for baseline_version in (OLDEST_SCHEMA_VERSION..=113).chain(std::iter::once(LATEST_SCHEMA_VERSION)) {
+        for baseline_version in
+            (OLDEST_SCHEMA_VERSION..=113).chain(std::iter::once(LATEST_SCHEMA_VERSION))
+        {
             let conn = Connection::open_in_memory().unwrap();
             configure_sqlite(&conn).unwrap();
             ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
             merge_request::migrate(&conn).unwrap();
-            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;").unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
+                .unwrap();
             create_latest_workspace_schema(&conn).unwrap();
             conn.execute(
                 "INSERT INTO __yoi_schema_migrations(version, name) VALUES (?1, ?2)",

@@ -112,7 +112,10 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
         let plan = published_plan(conn, current).unwrap().unwrap();
         assert_eq!(plan.migrations.len(), 1);
         assert_eq!(plan.migrations[0].version, 122);
-        assert_eq!(plan.migrations[0].name, crate::config_adoption::MIGRATION_NAME);
+        assert_eq!(
+            plan.migrations[0].name,
+            crate::config_adoption::MIGRATION_NAME
+        );
         assert_eq!(plan.target_schema_version, 122);
     }
     assert_eq!(rows, saved_rows(conn));
@@ -200,12 +203,26 @@ fn published_database_runs_normal_store_preparation_and_reopens_without_downgrad
             assert_eq!(super::super::current_schema_version(&conn).unwrap(), 122);
             for (table, rows) in &expected {
                 if table != "__yoi_schema_migrations" {
-                    assert_eq!(saved_rows(&conn).into_iter().find(|(name, _)| name == table).unwrap().1, *rows, "{table}, from {current}");
+                    assert_eq!(
+                        saved_rows(&conn)
+                            .into_iter()
+                            .find(|(name, _)| name == table)
+                            .unwrap()
+                            .1,
+                        *rows,
+                        "{table}, from {current}"
+                    );
                 }
             }
             let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
-            assert_eq!(history.pop(), Some((122, crate::config_adoption::MIGRATION_NAME.into())));
-            assert_eq!(history, super::super::workspace_schema_migration_history(&source).unwrap());
+            assert_eq!(
+                history.pop(),
+                Some((122, crate::config_adoption::MIGRATION_NAME.into()))
+            );
+            assert_eq!(
+                history,
+                super::super::workspace_schema_migration_history(&source).unwrap()
+            );
             verify_history(&conn, 122).unwrap();
         }
     }

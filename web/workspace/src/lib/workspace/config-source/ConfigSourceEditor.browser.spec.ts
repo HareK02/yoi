@@ -3,6 +3,7 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import ConfigSourceEditor from "./ConfigSourceEditor.svelte";
+import type { WorkspaceConfigTreeResponse } from "./types.ts";
 
 const toolchain = vi.hoisted(() => ({
   construct: vi.fn(),
@@ -30,7 +31,7 @@ vi.mock("./toolchain.ts", () => ({
 }));
 
 const schemaSource = "schema body\n".repeat(6000);
-const tree = {
+const tree: WorkspaceConfigTreeResponse = {
   snapshot: {
     digest: "sha256:tree",
     entries: {
@@ -64,7 +65,27 @@ const tree = {
   projection_digest: "sha256:projection",
 };
 const fetcher = vi.fn();
-const response = () => new Response(JSON.stringify(tree));
+const sourceResponse = (state = tree) => ({
+  state,
+  history_head: "head:observed",
+  source_stored: true,
+  catalog: { workspace: "w", namespaces: [] },
+  catalog_digest: "sha256:catalog",
+  expected_legacy_export: "sha256:legacy",
+  policies: [],
+  migration_diagnostics: [],
+});
+const response = () => new Response(JSON.stringify(sourceResponse()));
+const jsonResponse = (body: unknown) => new Response(JSON.stringify(body));
+const previewResponse = (state = tree, expected_head: string | null = "head:observed") => jsonResponse({
+  expected_head, state, changed_paths: ["module.dcdl"], changed_subjects: [],
+});
+function receipt(operation_id: string, state = tree, history_head = "head:adopted") {
+  return {
+    workspace_id: "w", operation_id, history_head, state,
+    source_stored: true, policy_committed: true, runtime_application: "next_current_policy_check",
+  };
+}
 
 beforeEach(() => {
   vi.resetAllMocks();
@@ -129,7 +150,7 @@ test("loading is not an empty source tree; editing waits for schema installation
   finishSetup();
   await expectReady(view);
   expect(fetcher).toHaveBeenCalledWith(
-    "/api/w/w%2Fone/config/source-tree",
+    "/api/w/w%2Fone/config/adoption",
     expect.anything(),
   );
 });
@@ -140,7 +161,7 @@ test.each(["http", "invalid"])(
     fetcher.mockResolvedValueOnce(
       failure === "http"
         ? new Response("Backend unavailable", { status: 503 })
-        : new Response(JSON.stringify({ ...tree, unexpected: true })),
+        : new Response(JSON.stringify({ ...sourceResponse(), unexpected: true })),
     );
     const view = renderEditor();
     await waitFor(() =>
@@ -190,10 +211,10 @@ test.each(["construct", "setSnapshot"] as const)(
 
 test("a successfully loaded empty tree still offers source creation", async () => {
   fetcher.mockResolvedValueOnce(
-    new Response(JSON.stringify({
+    new Response(JSON.stringify(sourceResponse({
       ...tree,
       snapshot: { ...tree.snapshot, entries: {} },
-    })),
+    }))),
   );
   const view = renderEditor();
   await waitFor(() =>
@@ -328,49 +349,186 @@ test("diagnostics from another tree digest are not displayed", async () => {
   expect(view.container.textContent).not.toContain("Wrong tree diagnostic");
 });
 
-test.each([409, 422])("failed commit %s preserves the local draft and authoritative base digest for retry", async (status) => {
-  const change = { kind: "create", path: "module.dcdl", content_type: "decodal", content: "{}\n" };
-  const candidate = {
-    digest: "sha256:local-draft",
-    entries: {
-      ...tree.snapshot.entries,
-      "module.dcdl": {
-        path: change.path,
-        content_type: change.content_type,
-        content: change.content,
-        content_digest: "sha256:module",
-      },
+const change = { kind: "create", path: "module.dcdl", content_type: "decodal", content: "{}\n" } as const;
+const candidate = {
+  digest: "sha256:local-draft",
+  entries: {
+    ...tree.snapshot.entries,
+    "module.dcdl": {
+      path: change.path, content_type: change.content_type, content: change.content,
+      content_digest: "sha256:module",
     },
-  };
+  },
+};
+const candidateState = { ...tree, snapshot: candidate };
+
+async function prepareDraft() {
   toolchain.applyChanges.mockResolvedValue(candidate);
   toolchain.changesBetween.mockResolvedValue([change]);
   toolchain.format.mockImplementation(async (source: string) => source);
   const view = renderEditor();
   await expectReady(view);
   await fireEvent.click(view.getByRole("button", { name: "Create local source" }));
+  return view;
+}
+
+const requestAt = (index: number) => JSON.parse(fetcher.mock.calls[index][1].body);
+
+function commitReceiptResponse(state = candidateState, historyHead = "head:adopted") {
+  return async (_input: string, init: RequestInit) =>
+    jsonResponse(receipt(JSON.parse(String(init.body)).operation_id, state, historyHead));
+}
+
+test.each([409, 422])("preview rejection %s preserves the draft and observed editing metadata", async (status) => {
+  const view = await prepareDraft();
   const commit = view.getByRole("button", { name: "Commit" });
-  expect(commit).toBeInstanceOf(HTMLButtonElement);
   fetcher.mockResolvedValueOnce(new Response(
-    status === 409 ? "base content digest mismatch" : "candidate evaluation failed",
-    { status },
+    status === 409 ? "editing head mismatch" : "candidate evaluation failed", { status },
   ));
   await fireEvent.click(commit);
   await waitFor(() => expect(view.container.textContent).toContain(
-    status === 409 ? "base content digest mismatch" : "candidate evaluation failed",
+    status === 409 ? "editing head mismatch" : "candidate evaluation failed",
   ));
-  const expectedRequest = {
-    base_digest: tree.snapshot.digest, changes: [change], entrypoints: ["main.dcdl"],
-  };
-  expect(JSON.parse(fetcher.mock.calls[1][1].body)).toEqual(expectedRequest);
+  const first = requestAt(1);
+  expect(first).toEqual({
+    operation_id: expect.any(String), expected_head: "head:observed",
+    expected_catalog_digest: "sha256:catalog", expected_legacy_export: "sha256:legacy",
+    source: { base_digest: tree.snapshot.digest, changes: [change], entrypoints: ["main.dcdl"] },
+  });
+  expect(fetcher.mock.calls[1][0]).toBe("/api/w/w/config/adoption/preview");
   expect(view.container.querySelector(".cm-content")?.textContent).toContain("{}");
   expect(commit).toHaveProperty("disabled", false);
   expect(toolchain.setSnapshot).toHaveBeenCalledOnce();
   if (status === 409) expect(view.getByRole("alert").textContent).toContain("Discard local candidate");
 
-  fetcher.mockResolvedValueOnce(new Response(JSON.stringify({ ...tree, snapshot: candidate })));
+  fetcher.mockResolvedValueOnce(previewResponse(candidateState));
+  fetcher.mockImplementationOnce(commitReceiptResponse());
   await fireEvent.click(commit);
   await waitFor(() => expect(view.container.textContent).toContain("Committed formatted source tree"));
-  expect(JSON.parse(fetcher.mock.calls[2][1].body)).toEqual(expectedRequest);
+  const second = requestAt(2);
+  expect(second).toEqual({ ...first, operation_id: expect.any(String) });
+  expect(second.operation_id).not.toBe(first.operation_id);
+  expect(requestAt(3)).toEqual(second);
   expect(toolchain.setSnapshot).toHaveBeenLastCalledWith(candidate, tree.contract.schema_bundle);
   expect(commit).toHaveProperty("disabled", true);
+});
+
+test("initial editable migration draft can be adopted without manually changing a file", async () => {
+  fetcher.mockResolvedValueOnce(jsonResponse({
+    ...sourceResponse(), history_head: null, source_stored: false,
+  }));
+  toolchain.changesBetween.mockResolvedValue([]);
+  const view = renderEditor();
+  await expectReady(view);
+  const commit = view.getByRole("button", { name: "Commit" });
+  expect(commit).toHaveProperty("disabled", false);
+  fetcher.mockResolvedValueOnce(previewResponse(tree, null));
+  fetcher.mockImplementationOnce(commitReceiptResponse(tree));
+  await fireEvent.click(commit);
+  await waitFor(() => expect(view.container.textContent).toContain("Committed formatted source tree"));
+  expect(requestAt(1).expected_head).toBeNull();
+  expect(requestAt(1).source.changes).toEqual([]);
+  expect(requestAt(2)).toEqual(requestAt(1));
+  expect(commit).toHaveProperty("disabled", true);
+});
+
+test("commit rejection does not refresh the head or discard local source", async () => {
+  const view = await prepareDraft();
+  fetcher.mockResolvedValueOnce(previewResponse(candidateState));
+  fetcher.mockResolvedValueOnce(new Response("editing head mismatch", { status: 409 }));
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Discard local candidate"));
+  expect(fetcher).toHaveBeenCalledTimes(3);
+  expect(view.queryByRole("button", { name: "Reconcile adoption" })).toBeNull();
+  expect(view.container.querySelector(".cm-content")?.textContent).toContain("{}");
+  fetcher.mockResolvedValueOnce(previewResponse(candidateState));
+  fetcher.mockImplementationOnce(commitReceiptResponse());
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(view.container.textContent).toContain("Committed formatted source tree"));
+  expect(requestAt(3).expected_head).toBe(requestAt(1).expected_head);
+  expect(requestAt(3).operation_id).not.toBe(requestAt(1).operation_id);
+});
+
+test.each(["not_observed", "pending_transfer"])("lost commit followed by %s retains the exact request for explicit resume", async (status) => {
+  const view = await prepareDraft();
+  const unknown = status === "not_observed" ? { status } : {
+    status, transfer_identity: "transfer:one", export_digest: "sha256:legacy",
+  };
+  fetcher.mockResolvedValueOnce(previewResponse(candidateState));
+  fetcher.mockRejectedValueOnce(new TypeError("response lost"));
+  fetcher.mockResolvedValueOnce(jsonResponse(unknown));
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(view.container.textContent).toContain(
+    status === "not_observed" ? "not observed does not mean failed" : "transfer pending",
+  ));
+  expect(fetcher).toHaveBeenCalledTimes(4);
+  const request = requestAt(1);
+  expect(requestAt(2)).toEqual(request);
+  expect(requestAt(3)).toEqual(request);
+  expect(fetcher.mock.calls[3][0]).toBe("/api/w/w/config/adoption/reconcile");
+  expect(toolchain.setSnapshot).toHaveBeenCalledOnce();
+  expect(view.container.querySelector(".cm-content")?.textContent).toContain("{}");
+
+  fetcher.mockResolvedValueOnce(jsonResponse(unknown));
+  fetcher.mockImplementationOnce(commitReceiptResponse());
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(view.container.textContent).toContain("Committed formatted source tree"));
+  expect(fetcher).toHaveBeenCalledTimes(6);
+  expect(requestAt(4)).toEqual(request);
+  expect(requestAt(5)).toEqual(request);
+  expect(view.queryByRole("button", { name: "Reconcile adoption" })).toBeNull();
+});
+
+test("adopted reconciliation updates head and clears the legacy export for the next explicit adoption", async () => {
+  const view = await prepareDraft();
+  fetcher.mockResolvedValueOnce(previewResponse(candidateState));
+  fetcher.mockResolvedValueOnce(new Response("invalid receipt"));
+  fetcher.mockImplementationOnce(async (_input: string, init: RequestInit) => jsonResponse({
+    status: "adopted", receipt: receipt(JSON.parse(String(init.body)).operation_id, candidateState),
+  }));
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(view.container.textContent).toContain("Committed formatted source tree"));
+  const first = requestAt(2);
+  expect(requestAt(3)).toEqual(first);
+  // A local deletion is another explicit adoption, not a retry of the lost reply.
+  const deletion = { kind: "delete", path: "module.dcdl", expected_digest: "sha256:module" };
+  toolchain.applyChanges.mockResolvedValue(tree.snapshot);
+  toolchain.changesBetween.mockResolvedValue([deletion]);
+  await fireEvent.click(view.getByRole("button", { name: "Delete" }));
+  fetcher.mockResolvedValueOnce(previewResponse(tree, "head:adopted"));
+  fetcher.mockImplementationOnce(commitReceiptResponse(tree, "head:second"));
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(6));
+  const second = requestAt(4);
+  expect(second.expected_head).toBe("head:adopted");
+  expect(second.expected_legacy_export).toBeNull();
+  expect(second.expected_catalog_digest).toBe(first.expected_catalog_digest);
+  expect(second.operation_id).not.toBe(first.operation_id);
+  expect(second.source.base_digest).toBe(candidate.digest);
+});
+
+test("edited draft requires reconciliation and cannot replace or resume an unknown request", async () => {
+  const view = await prepareDraft();
+  fetcher.mockResolvedValueOnce(previewResponse(candidateState));
+  fetcher.mockRejectedValueOnce(new TypeError("response lost"));
+  fetcher.mockResolvedValueOnce(jsonResponse({ status: "not_observed" }));
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(view.container.textContent).toContain("not observed does not mean failed"));
+  const original = requestAt(2);
+  toolchain.format.mockResolvedValue("{ changed: true }\n");
+  await fireEvent.click(view.getByRole("button", { name: "Format" }));
+  await waitFor(() => expect(view.container.querySelector(".cm-content")?.textContent).toContain("changed"));
+  fetcher.mockResolvedValueOnce(jsonResponse({ status: "not_observed" }));
+  await fireEvent.click(view.getByRole("button", { name: "Commit" }));
+  await waitFor(() => expect(view.container.textContent).toContain("Draft changed; reconcile the original request"));
+  expect(fetcher).toHaveBeenCalledTimes(5);
+  expect(requestAt(4)).toEqual(original);
+  expect(toolchain.setSnapshot).toHaveBeenCalledOnce();
+
+  fetcher.mockResolvedValueOnce(jsonResponse({ status: "adopted", receipt: receipt(original.operation_id, candidateState) }));
+  await fireEvent.click(view.getByRole("button", { name: "Reconcile adoption" }));
+  await waitFor(() => expect(view.container.textContent).toContain("Later local edits remain unsaved"));
+  expect(view.container.querySelector(".cm-content")?.textContent).toContain("changed");
+  expect(requestAt(5)).toEqual(original);
+  expect(view.queryByRole("button", { name: "Reconcile adoption" })).toBeNull();
 });

@@ -5,6 +5,53 @@
 //! after seal leaves an explicit, resumable transfer, never a legacy fallback.
 //! Normal saves never touch the old database. Object preparation, source,
 //! projection, policy, editing head and receipt commit in one caller-owned transaction.
+//!
+//! # Editing and reconciliation
+//!
+//! Owner authentication precedes all source, preview, adoption and reconciliation
+//! operations. The public transport contract belongs to
+//! [`server_api::configuration_adoption`]. It extends the existing virtual tree;
+//! imports resolve within one snapshot and no host filesystem path grants access.
+//! Before cutover, retrieval returns an evaluated editable migration draft, not a
+//! saved change. Preview is read-only and reports changed paths and Subjects.
+//!
+//! Content identity and editing history are distinct. Adoption compares the
+//! observed history head as well as the source digest, so A -> B -> A cannot
+//! authorize an old editor. The request fingerprint binds Workspace, authenticated
+//! owner and the entire request (including catalog, export, head and changes).
+//! Reuse of an operation ID with different input is a conflict. Exact replay
+//! returns historical evidence before stale-head checks; it never reapplies policy.
+//!
+//! After a lost response, retain the full request and reconcile it with that same
+//! ID. An adopted receipt proves that request's stored result, not today's head.
+//! A pending transfer proves the immutable legacy seal, not Server adoption.
+//! Absence of either is not evidence of failure or permission to generate a new
+//! ID. Retry the exact request; read current source before a distinct edit.
+//!
+//! # Cutover boundary
+//!
+//! Initial cutover and legacy logical config writes acquire the guarded Feature
+//! authority transaction before Server storage. Sealing commits independently;
+//! the outer Feature connection guard remains held through the Server result.
+//! After seal, both old policy writes and old logical source writes reject,
+//! including when Server persistence rolls back. Reopen/retry uses the same
+//! identity-bound export and request. No in-memory mutex is the durable fence.
+//! Validation (including blocking migration diagnostics) precedes seal. Failure
+//! there retains legacy authority and the previous source/policy/head/receipt.
+//! A failure after seal retains the old Server source but fails closed for runtime
+//! reads until the same transfer is adopted. This is not a distributed atomic
+//! commit or a guarantee for arbitrary machine loss at every instruction.
+//!
+//! Existing explicit permissions are never automatically merged or replaced,
+//! even when empty. Unsupported operations or child-expanding conversions block
+//! adoption rather than dropping entries. Exact limited legacy constraints and
+//! change identities remain in the domain, separate from editable permission keys.
+//! History and child grants are retained, not regenerated as new authorizations.
+//!
+//! A receipt separately confirms source storage and policy commit. Its typed
+//! runtime application means the next current-policy check, not interruption,
+//! reload or termination of an already-running Worker. Legacy consumers cannot
+//! turn a new unrepresented key into an all-target grant.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -78,13 +125,26 @@ pub(crate) struct CanonicalConfigurationSource {
 }
 
 impl subjektiv::CanonicalPermissionSource for CanonicalConfigurationSource {
-    fn subject_permissions(&self, workspace: &str, subject: &str) -> subjektiv::Result<Option<server_api::authorization::SubjectPermissions>> {
+    fn subject_permissions(
+        &self,
+        workspace: &str,
+        subject: &str,
+    ) -> subjektiv::Result<Option<server_api::authorization::SubjectPermissions>> {
         if self.host.catalog().workspace.as_str() != workspace {
             return Err(subjektiv::SubjektivError::PermissionTransferConflict);
         }
-        self.store.adopted_subject_policy(workspace, subject)
-            .and_then(|policy| policy.map(|policy| policy.legacy_read(&self.host)).transpose())
-            .map_err(|error| subjektiv::SubjektivError::InvalidRecord(format!("canonical configuration policy unavailable: {error}")))
+        self.store
+            .adopted_subject_policy(workspace, subject)
+            .and_then(|policy| {
+                policy
+                    .map(|policy| policy.legacy_read(&self.host))
+                    .transpose()
+            })
+            .map_err(|error| {
+                subjektiv::SubjektivError::InvalidRecord(format!(
+                    "canonical configuration policy unavailable: {error}"
+                ))
+            })
     }
 }
 
@@ -106,7 +166,8 @@ pub(crate) struct ConfigurationMigrationBaseline<'a> {
 struct OwnerScope<'a>(&'a str);
 impl Authority for OwnerScope<'_> {
     fn allows(&self, key: &ScopeKey, access: Access) -> bool {
-        key.workspace == self.0 && key.target == "configuration"
+        key.workspace == self.0
+            && key.target == "configuration"
             && matches!(access, Access::Read | Access::Write)
     }
 }
@@ -124,75 +185,137 @@ fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).map_err(|e| Error::RegistryInconsistency(e.to_string()))
 }
 fn scope(workspace: &str) -> ScopeKey {
-    ScopeKey { workspace: workspace.into(), target: "configuration".into() }
+    ScopeKey {
+        workspace: workspace.into(),
+        target: "configuration".into(),
+    }
 }
 fn require_owner(conn: &Connection, workspace: &str, account: &str) -> Result<()> {
     let allowed: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id=?1 AND owner_account_id=?2 AND state='active')",
         params![workspace, account], |r| r.get(0),
     )?;
-    if !allowed { return Err(Error::WorkspacePermissionDenied("configuration management requires the Workspace owner".into())); }
+    if !allowed {
+        return Err(Error::WorkspacePermissionDenied(
+            "configuration management requires the Workspace owner".into(),
+        ));
+    }
     Ok(())
 }
 
 pub(crate) fn head(conn: &Connection, workspace: &str) -> Result<Option<HistoryId>> {
-    let bytes: Option<Vec<u8>> = conn.query_row(
-        "SELECT head FROM content_scopes WHERE workspace=?1 AND target='configuration'", [workspace], |r| r.get(0),
-    ).optional()?.flatten();
-    bytes.map(|bytes| bytes.try_into().map(HistoryId::from_bytes)
-        .map_err(|_| Error::RegistryInconsistency("invalid configuration editing head".into()))).transpose()
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT head FROM content_scopes WHERE workspace=?1 AND target='configuration'",
+            [workspace],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    bytes
+        .map(|bytes| {
+            bytes.try_into().map(HistoryId::from_bytes).map_err(|_| {
+                Error::RegistryInconsistency("invalid configuration editing head".into())
+            })
+        })
+        .transpose()
 }
 
-pub(crate) fn request_fingerprint(workspace: &str, account: &str, request: &ConfigurationAdoptionRequest) -> Result<String> {
-    server_api::authorization::validate_authorization_identifier(&request.operation_id).map_err(Error::InvalidInput)?;
-    Ok(config_source::digest_bytes(json(&(workspace, account, request))?.as_bytes()))
+pub(crate) fn request_fingerprint(
+    workspace: &str,
+    account: &str,
+    request: &ConfigurationAdoptionRequest,
+) -> Result<String> {
+    server_api::authorization::validate_authorization_identifier(&request.operation_id)
+        .map_err(Error::InvalidInput)?;
+    Ok(config_source::digest_bytes(
+        json(&(workspace, account, request))?.as_bytes(),
+    ))
 }
 
 pub(crate) fn canonical(conn: &Connection, workspace: &str) -> Result<bool> {
-    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_configuration_authorities WHERE workspace_id=?1)", [workspace], |row| row.get(0))?)
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_configuration_authorities WHERE workspace_id=?1)",
+        [workspace],
+        |row| row.get(0),
+    )?)
 }
 
 pub fn catalog_digest(host: &PermissionHost) -> Result<String> {
-    Ok(config_source::digest_bytes(json(&host.catalog())?.as_bytes()))
+    Ok(config_source::digest_bytes(
+        json(&host.catalog())?.as_bytes(),
+    ))
 }
 
 fn policies(conn: &Connection, workspace: &str) -> Result<BTreeMap<String, AdoptedSubjectPolicy>> {
     let mut query = conn.prepare("SELECT subject_id,policy_json FROM workspace_configuration_policies WHERE workspace_id=?1 ORDER BY subject_id")?;
     let mut result = BTreeMap::new();
-    for row in query.query_map([workspace], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))? {
+    for row in query.query_map([workspace], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
         let (subject, raw) = row?;
         let policy: AdoptedSubjectPolicy = decode(&raw)?;
-        if subject != policy.source.subject_id { return Err(Error::RegistryInconsistency("Subject policy identity mismatch".into())); }
+        if subject != policy.source.subject_id {
+            return Err(Error::RegistryInconsistency(
+                "Subject policy identity mismatch".into(),
+            ));
+        }
         result.insert(subject, policy);
     }
     Ok(result)
 }
 
-fn receipt(conn: &Connection, workspace: &str, operation: &str) -> Result<Option<(String, ConfigurationAdoptionResult)>> {
+fn receipt(
+    conn: &Connection,
+    workspace: &str,
+    operation: &str,
+) -> Result<Option<(String, ConfigurationAdoptionResult)>> {
     let row: Option<(String,String)> = conn.query_row(
         "SELECT request_fingerprint,result_json FROM workspace_configuration_receipts WHERE workspace_id=?1 AND operation_id=?2",
         params![workspace,operation], |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?;
-    row.map(|(fingerprint,result)| Ok((fingerprint,decode(&result)?))).transpose()
+    row.map(|(fingerprint, result)| Ok((fingerprint, decode(&result)?)))
+        .transpose()
 }
 
 fn changed_paths(before: &ConfigTreeSnapshot, after: &ConfigTreeSnapshot) -> Vec<String> {
-    before.entries.keys().chain(after.entries.keys()).collect::<BTreeSet<_>>().into_iter()
+    before
+        .entries
+        .keys()
+        .chain(after.entries.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .filter(|path| before.entries.get(*path) != after.entries.get(*path))
-        .map(|path| path.as_str().to_owned()).collect()
+        .map(|path| path.as_str().to_owned())
+        .collect()
 }
-fn changed_subjects(before: &BTreeMap<String,AdoptedSubjectPolicy>, after: &BTreeMap<String,AdoptedSubjectPolicy>) -> Vec<String> {
-    before.keys().chain(after.keys()).collect::<BTreeSet<_>>().into_iter()
-        .filter(|subject| before.get(*subject) != after.get(*subject)).cloned().collect()
+fn changed_subjects(
+    before: &BTreeMap<String, AdoptedSubjectPolicy>,
+    after: &BTreeMap<String, AdoptedSubjectPolicy>,
+) -> Vec<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|subject| before.get(*subject) != after.get(*subject))
+        .cloned()
+        .collect()
 }
 
 impl SqliteWorkspaceStore {
-    pub(crate) fn configuration_current(&self, workspace: &str, account: &str) -> Result<ConfigurationCurrent> {
+    pub(crate) fn configuration_current(
+        &self,
+        workspace: &str,
+        account: &str,
+    ) -> Result<ConfigurationCurrent> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             require_owner(&tx, workspace, account)?;
             Ok(ConfigurationCurrent {
-                state: crate::config_source::load_state(&tx, workspace)?.ok_or_else(|| Error::InvalidInput("Workspace source not materialized".into()))?,
+                state: crate::config_source::load_state(&tx, workspace)?.ok_or_else(|| {
+                    Error::InvalidInput("Workspace source not materialized".into())
+                })?,
                 history_head: head(&tx, workspace)?.map(|id| id.to_string()),
                 canonical: canonical(&tx, workspace)?,
                 policies: policies(&tx, workspace)?,
@@ -200,7 +323,12 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub(crate) fn configuration_request_result(&self, workspace: &str, account: &str, request: &ConfigurationAdoptionRequest) -> Result<Option<ConfigurationAdoptionResult>> {
+    pub(crate) fn configuration_request_result(
+        &self,
+        workspace: &str,
+        account: &str,
+        request: &ConfigurationAdoptionRequest,
+    ) -> Result<Option<ConfigurationAdoptionResult>> {
         let fingerprint = request_fingerprint(workspace, account, request)?;
         self.with_conn(|conn| {
             require_owner(conn, workspace, account)?;
@@ -214,31 +342,58 @@ impl SqliteWorkspaceStore {
 
     /// Authentication supplies `account`; it is never accepted from an adoption DTO.
     pub fn configuration_head(&self, workspace: &str, account: &str) -> Result<Option<String>> {
-        self.with_conn(|conn| { require_owner(conn, workspace, account)?; Ok(head(conn,workspace)?.map(|id|id.to_string())) })
+        self.with_conn(|conn| {
+            require_owner(conn, workspace, account)?;
+            Ok(head(conn, workspace)?.map(|id| id.to_string()))
+        })
     }
 
     /// Result lookup is a read. A historical receipt never reactivates policy.
-    pub fn configuration_adoption_result(&self, workspace: &str, account: &str, operation: &str) -> Result<Option<ConfigurationAdoptionResult>> {
-        self.with_conn(|conn| { require_owner(conn,workspace,account)?; Ok(receipt(conn,workspace,operation)?.map(|(_,result)|result)) })
+    pub fn configuration_adoption_result(
+        &self,
+        workspace: &str,
+        account: &str,
+        operation: &str,
+    ) -> Result<Option<ConfigurationAdoptionResult>> {
+        self.with_conn(|conn| {
+            require_owner(conn, workspace, account)?;
+            Ok(receipt(conn, workspace, operation)?.map(|(_, result)| result))
+        })
     }
 
     pub(crate) fn preview_configuration_adoption(
-        &self, workspace: &str, account: &str, request: &ConfigurationAdoptionRequest,
-        schema: WorkspaceConfigSchemaBundle, host: &PermissionHost,
+        &self,
+        workspace: &str,
+        account: &str,
+        request: &ConfigurationAdoptionRequest,
+        schema: WorkspaceConfigSchemaBundle,
+        host: &PermissionHost,
         baseline: Option<&ConfigurationMigrationBaseline<'_>>,
         mut require_subject: impl FnMut(&str) -> Result<()>,
     ) -> Result<ConfigurationPreview> {
         self.with_conn(|conn| {
-            require_owner(conn,workspace,account)?;
+            require_owner(conn, workspace, account)?;
             let tx = conn.unchecked_transaction()?;
-            let (current,state,source) = prepare(&tx,workspace,request,schema,host,baseline,&mut require_subject)?;
-            let before = match baseline { Some(baseline) => baseline.policies.clone(), None => policies(&tx,workspace)? };
+            let (current, state, source) = prepare(
+                &tx,
+                workspace,
+                request,
+                schema,
+                host,
+                baseline,
+                &mut require_subject,
+            )?;
+            let before = match baseline {
+                Some(baseline) => baseline.policies.clone(),
+                None => policies(&tx, workspace)?,
+            };
             let mut after = before.clone();
-            policy_config::apply(&mut after,&source,"preview");
+            policy_config::apply(&mut after, &source, "preview");
             Ok(ConfigurationPreview {
                 expected_head: request.expected_head.clone(),
-                changed_paths: changed_paths(&current.snapshot,&state.snapshot),
-                changed_subjects: changed_subjects(&before,&after), state,
+                changed_paths: changed_paths(&current.snapshot, &state.snapshot),
+                changed_subjects: changed_subjects(&before, &after),
+                state,
             })
         })
     }
@@ -247,8 +402,12 @@ impl SqliteWorkspaceStore {
     /// current-head checks. If subsequent Server persistence fails, that specific
     /// transfer remains pending; callers reconcile/retry the same request, not a new ID.
     pub(crate) fn adopt_configuration(
-        &self, workspace: &str, account: &str, request: &ConfigurationAdoptionRequest,
-        schema: WorkspaceConfigSchemaBundle, host: &PermissionHost,
+        &self,
+        workspace: &str,
+        account: &str,
+        request: &ConfigurationAdoptionRequest,
+        schema: WorkspaceConfigSchemaBundle,
+        host: &PermissionHost,
         baseline: Option<&ConfigurationMigrationBaseline<'_>>,
         mut require_subject: impl FnMut(&str) -> Result<()>,
         mut prepare_transfer: impl FnMut(&str) -> Result<ConfigurationPolicyTransfer>,
@@ -301,7 +460,11 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub fn adopted_subject_policy(&self, workspace: &str, subject: &str) -> Result<Option<AdoptedSubjectPolicy>> {
+    pub fn adopted_subject_policy(
+        &self,
+        workspace: &str,
+        subject: &str,
+    ) -> Result<Option<AdoptedSubjectPolicy>> {
         self.with_conn(|conn| {
             let canonical: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_configuration_authorities WHERE workspace_id=?1)",[workspace],|r|r.get(0))?;
             if !canonical { return Err(Error::InvalidInput("Workspace policy transfer is not adopted".into())); }
@@ -312,39 +475,68 @@ impl SqliteWorkspaceStore {
 }
 
 fn prepare(
-    tx: &Transaction<'_>, workspace: &str, request: &ConfigurationAdoptionRequest,
-    schema: WorkspaceConfigSchemaBundle, host: &PermissionHost,
+    tx: &Transaction<'_>,
+    workspace: &str,
+    request: &ConfigurationAdoptionRequest,
+    schema: WorkspaceConfigSchemaBundle,
+    host: &PermissionHost,
     baseline: Option<&ConfigurationMigrationBaseline<'_>>,
     require_subject: &mut impl FnMut(&str) -> Result<()>,
-) -> Result<(WorkspaceConfigState,WorkspaceConfigState,PermissionSource)> {
+) -> Result<(WorkspaceConfigState, WorkspaceConfigState, PermissionSource)> {
     if let Some(baseline) = baseline {
-        if baseline.diagnostics.iter().any(|diagnostic| matches!(diagnostic, policy_config::MigrationDiagnostic::ExplicitConfigurationRequired { .. })) {
+        if baseline.diagnostics.iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                policy_config::MigrationDiagnostic::ExplicitConfigurationRequired { .. }
+            )
+        }) {
             return Err(Error::InvalidInput("legacy permissions require explicit configuration before adoption; legacy authority was not sealed".into()));
         }
     }
     if host.catalog().workspace.as_str() != workspace {
-        return Err(Error::WorkspacePermissionDenied("permission registry belongs to another Workspace".into()));
+        return Err(Error::WorkspacePermissionDenied(
+            "permission registry belongs to another Workspace".into(),
+        ));
     }
-    if catalog_digest(host)? != request.expected_catalog_digest { return Err(conflict("Feature catalog changed")); }
-    if head(tx,workspace)?.map(|id|id.to_string()) != request.expected_head { return Err(conflict("editing history head changed")); }
-    let current = crate::config_source::load_state(tx,workspace)?.ok_or_else(|| Error::InvalidInput("Workspace source not materialized".into()))?;
+    if catalog_digest(host)? != request.expected_catalog_digest {
+        return Err(conflict("Feature catalog changed"));
+    }
+    if head(tx, workspace)?.map(|id| id.to_string()) != request.expected_head {
+        return Err(conflict("editing history head changed"));
+    }
+    let current = crate::config_source::load_state(tx, workspace)?
+        .ok_or_else(|| Error::InvalidInput("Workspace source not materialized".into()))?;
     let editing_base = if let Some(baseline) = baseline {
-        if *baseline.original != current || request.expected_legacy_export.as_deref() != Some(baseline.export_digest) {
+        if *baseline.original != current
+            || request.expected_legacy_export.as_deref() != Some(baseline.export_digest)
+        {
             return Err(conflict("migration source or export changed"));
         }
         baseline.state
-    } else { &current };
-    if editing_base.snapshot.digest != request.source.base_digest { return Err(conflict("source content changed")); }
+    } else {
+        &current
+    };
+    if editing_base.snapshot.digest != request.source.base_digest {
+        return Err(conflict("source content changed"));
+    }
     crate::config_source::validate_entrypoint_request(&request.source.entrypoints)?;
     let candidate = crate::config_source::evaluate_candidate_in_transaction(
-        tx,workspace,editing_base.clone(),crate::config_source::load_evaluation_identity(tx,workspace)?,
-        &request.source.changes,schema,
+        tx,
+        workspace,
+        editing_base.clone(),
+        crate::config_source::load_evaluation_identity(tx, workspace)?,
+        &request.source.changes,
+        schema,
     )?;
-    crate::config_source::validate_workspace_config_candidate_projections(workspace,&candidate)?;
+    crate::config_source::validate_workspace_config_candidate_projections(workspace, &candidate)?;
     let source = policy_config::source(&candidate.evaluation)?;
-    policy_config::validate_source(host,&source,require_subject)?;
-    let state = WorkspaceConfigState { snapshot:candidate.snapshot,contract:candidate.contract,projection_digest:candidate.evaluation.projection_digest };
-    Ok((current,state,source))
+    policy_config::validate_source(host, &source, require_subject)?;
+    let state = WorkspaceConfigState {
+        snapshot: candidate.snapshot,
+        contract: candidate.contract,
+        projection_digest: candidate.evaluation.projection_digest,
+    };
+    Ok((current, state, source))
 }
 
 #[cfg(test)]

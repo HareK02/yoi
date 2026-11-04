@@ -183,49 +183,56 @@ impl SqliteWorkspaceStore {
         schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<WorkspaceConfigState> {
         let desired_schema = schema_bundle.clone();
-        let (state, requires_toolchain_refresh, base_identity) = self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let workspace_exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
-                [workspace_id],
-                |row| row.get(0),
-            )?;
-            if !workspace_exists {
-                return Err(Error::WorkspaceIdMismatch);
-            }
-            let stored_decodal_version = tx
+        let (state, requires_toolchain_refresh, base_identity, canonical) =
+            self.with_conn_mut(|conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let workspace_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
+                    [workspace_id],
+                    |row| row.get(0),
+                )?;
+                if !workspace_exists {
+                    return Err(Error::WorkspaceIdMismatch);
+                }
+                let stored_decodal_version = tx
                 .query_row(
                     "SELECT decodal_version FROM workspace_config_trees WHERE workspace_id = ?1",
                     [workspace_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            let requires_toolchain_refresh = stored_decodal_version
-                .as_deref()
-                .is_some_and(|version| version != DECODAL_VERSION);
-            let state = match load_state(&tx, workspace_id)? {
-                Some(state) => state,
-                None => {
-                    let mut state = initial_state_with_schema(schema_bundle.clone())?;
-                    if has_plugin_provider(&schema_bundle) {
-                        let (contract, evaluation, _) =
-                            crate::plugin_settings::evaluate_catalog_config(
-                                &tx,
-                                workspace_id,
-                                &state.snapshot,
-                                schema_bundle.clone(),
-                            )?;
-                        state.contract = contract;
-                        state.projection_digest = evaluation.projection_digest;
+                let requires_toolchain_refresh = stored_decodal_version
+                    .as_deref()
+                    .is_some_and(|version| version != DECODAL_VERSION);
+                let state = match load_state(&tx, workspace_id)? {
+                    Some(state) => state,
+                    None => {
+                        let mut state = initial_state_with_schema(schema_bundle.clone())?;
+                        if has_plugin_provider(&schema_bundle) {
+                            let (contract, evaluation, _) =
+                                crate::plugin_settings::evaluate_catalog_config(
+                                    &tx,
+                                    workspace_id,
+                                    &state.snapshot,
+                                    schema_bundle.clone(),
+                                )?;
+                            state.contract = contract;
+                            state.projection_digest = evaluation.projection_digest;
+                        }
+                        insert_materialized_state(&tx, workspace_id, &state, materialized_at)?;
+                        state
                     }
-                    insert_materialized_state(&tx, workspace_id, &state, materialized_at)?;
-                    state
-                }
-            };
-            let base_identity = load_evaluation_identity(&tx, workspace_id)?;
-            tx.commit()?;
-            Ok((state, requires_toolchain_refresh, base_identity))
-        })?;
+                };
+                let base_identity = load_evaluation_identity(&tx, workspace_id)?;
+                let canonical = crate::config_adoption::canonical(&tx, workspace_id)?;
+                tx.commit()?;
+                Ok((state, requires_toolchain_refresh, base_identity, canonical))
+            })?;
+        // Once adopted, schema changes must be previewed/adopted by the owner,
+        // not persisted as a second startup writer outside the policy/history tx.
+        if canonical {
+            return Ok(state);
+        }
         let desired_schema = crate::plugin_settings::materialization_schema(
             desired_schema,
             &state.contract.schema_bundle,
@@ -570,14 +577,21 @@ fn evaluate_candidate(
 }
 
 pub(crate) fn sync_adopted_config_references(
-    tx: &rusqlite::Transaction<'_>, workspace: &str, state: &WorkspaceConfigState,
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    state: &WorkspaceConfigState,
 ) -> Result<()> {
     if has_plugin_provider(&state.contract.schema_bundle) {
         let (contract, evaluation, resolved) = crate::plugin_settings::evaluate_catalog_config(
-            tx, workspace, &state.snapshot, state.contract.schema_bundle.clone(),
+            tx,
+            workspace,
+            &state.snapshot,
+            state.contract.schema_bundle.clone(),
         )?;
         if contract != state.contract || evaluation.projection_digest != state.projection_digest {
-            return Err(config_conflict("Plugin catalog/schema changed during adoption"));
+            return Err(config_conflict(
+                "Plugin catalog/schema changed during adoption",
+            ));
         }
         crate::plugin_settings::sync_config_references(tx, workspace, &resolved)?;
     }

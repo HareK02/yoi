@@ -3,6 +3,38 @@
 //! An omitted Subject is unchanged; removal is explicit. Assignments contain only
 //! references to Feature-owned Sets and Namespaces. Legacy resource restrictions
 //! remain separate domain constraints, never payloads on permission keys.
+//!
+//! Assigning a Subject replaces both execution and delegation assignments for
+//! that Subject. An omitted lane is empty, not its old value. `{}` is explicit
+//! empty; `revoked = true` denies that lane without altering the other lane.
+//! `remove_subjects` removes policy, not the Subject, and never restores a default.
+//! Omitting `permissions`, or omitting an individual Subject, preserves policy.
+//! Consequently deleting an assignment from source alone is not revocation.
+//!
+//! For example, when the catalog declares `filesystem.read` and `subject-a` exists:
+//!
+//! ```text
+//! {
+//!     permissions = {
+//!         subjects = [{
+//!             subject_id = "subject-a";
+//!             execution = {
+//!                 namespaces = [{ namespace = "filesystem"; keys = ["filesystem.read"]; }];
+//!             };
+//!             delegation = {};
+//!         }];
+//!         remove_subjects = [];
+//!     };
+//! } as WorkspaceConfigSchema
+//! ```
+//!
+//! `sets` and `exclude_sets` reference Feature-owned shared definitions;
+//! `namespaces` and `exclude_namespaces` reference exact keys in their declared
+//! Namespace. This source does not redeclare Sets, infer children from dot
+//! prefixes, attach payloads/arguments to keys or issue provider capabilities.
+//! Multi-segment keys remain exact. Only catalog-declared children expand them.
+//! Unknown references are rejected even in revoked assignments, so reactivation
+//! cannot conceal invalid configuration.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -68,8 +100,16 @@ pub struct AssignmentSource {
 impl AssignmentSource {
     pub fn assignment(&self) -> PermissionAssignment {
         let references = |sets: &[PermissionSetId], namespaces: &[NamespacePermissions]| {
-            sets.iter().cloned().map(PermissionReference::Set)
-                .chain(namespaces.iter().cloned().map(PermissionReference::Namespace)).collect()
+            sets.iter()
+                .cloned()
+                .map(PermissionReference::Set)
+                .chain(
+                    namespaces
+                        .iter()
+                        .cloned()
+                        .map(PermissionReference::Namespace),
+                )
+                .collect()
         };
         PermissionAssignment {
             grants: references(&self.sets, &self.namespaces),
@@ -112,16 +152,29 @@ pub struct AdoptedSubjectPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum MigrationDiagnostic {
-    Converted { subject_id: String, operation: String },
-    DomainConstraint { subject_id: String, permission: ScopedPermission },
-    ExplicitConfigurationRequired { subject_id: String, permission: ScopedPermission },
+    Converted {
+        subject_id: String,
+        operation: String,
+    },
+    DomainConstraint {
+        subject_id: String,
+        permission: ScopedPermission,
+    },
+    ExplicitConfigurationRequired {
+        subject_id: String,
+        permission: ScopedPermission,
+    },
 }
 
 pub fn source(evaluation: &EvaluationResult) -> Result<PermissionSource> {
-    let value = evaluation.projections.first()
+    let value = evaluation
+        .projections
+        .first()
         .and_then(|p| p.data_json.get("permissions"))
-        .cloned().unwrap_or_else(|| serde_json::json!({}));
-    serde_json::from_value(value).map_err(|e| Error::InvalidInput(format!("invalid Subject assignments: {e}")))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::from_value(value)
+        .map_err(|e| Error::InvalidInput(format!("invalid Subject assignments: {e}")))
 }
 
 fn validate_assignment(host: &PermissionHost, source: &AssignmentSource) -> Result<()> {
@@ -130,10 +183,18 @@ fn validate_assignment(host: &PermissionHost, source: &AssignmentSource) -> Resu
     let mut assignment = source.assignment();
     assignment.revoked = false;
     let resolution = host.resolve(Some(&assignment));
-    if resolution.projection().diagnostics.iter().any(|d| matches!(d,
-        PermissionDiagnostic::UnknownKey(_) | PermissionDiagnostic::UnknownNamespace(_)
-        | PermissionDiagnostic::UnknownSet(_))) {
-        return Err(Error::InvalidInput(format!("invalid permission references: {:?}", resolution.projection().diagnostics)));
+    if resolution.projection().diagnostics.iter().any(|d| {
+        matches!(
+            d,
+            PermissionDiagnostic::UnknownKey(_)
+                | PermissionDiagnostic::UnknownNamespace(_)
+                | PermissionDiagnostic::UnknownSet(_)
+        )
+    }) {
+        return Err(Error::InvalidInput(format!(
+            "invalid permission references: {:?}",
+            resolution.projection().diagnostics
+        )));
     }
     Ok(())
 }
@@ -158,7 +219,9 @@ pub fn validate_source(
         server_api::authorization::validate_authorization_identifier(subject)
             .map_err(Error::InvalidInput)?;
         if !subjects.insert(subject) {
-            return Err(Error::InvalidInput("Subject both assigned and removed, or removed twice".into()));
+            return Err(Error::InvalidInput(
+                "Subject both assigned and removed, or removed twice".into(),
+            ));
         }
         require_subject(subject)?;
     }
@@ -172,19 +235,26 @@ pub fn apply(
     source: &PermissionSource,
     change_id: &str,
 ) {
-    for subject in &source.remove_subjects { policies.remove(subject); }
+    for subject in &source.remove_subjects {
+        policies.remove(subject);
+    }
     for item in &source.subjects {
         match policies.get_mut(&item.subject_id) {
-            Some(previous) if previous.source == *item => {},
+            Some(previous) if previous.source == *item => {}
             Some(previous) => {
                 previous.source = item.clone();
                 previous.change_id = change_id.to_owned();
-            },
+            }
             None => {
-                policies.insert(item.subject_id.clone(), AdoptedSubjectPolicy {
-                    source: item.clone(), change_id: change_id.to_owned(), legacy_constraints: None,
-                });
-            },
+                policies.insert(
+                    item.subject_id.clone(),
+                    AdoptedSubjectPolicy {
+                        source: item.clone(),
+                        change_id: change_id.to_owned(),
+                        legacy_constraints: None,
+                    },
+                );
+            }
         }
     }
 }
@@ -201,36 +271,66 @@ pub fn migrate_subject(
     let mut lane = |permissions: &[ScopedPermission]| -> Result<AssignmentSource> {
         let mut by_namespace: BTreeMap<NamespaceId, BTreeSet<PermissionKey>> = BTreeMap::new();
         for permission in permissions {
-            let operation = server_api::authorization::canonical_worker_operation(&permission.operation).unwrap_or(&permission.operation);
-            let key = PermissionKey::parse(operation.to_owned()).map_err(Error::InvalidInput)?;
-            let assignment = PermissionAssignment { grants: vec![PermissionReference::Namespace(NamespacePermissions {
-                namespace: key.namespace(), keys: vec![key.clone()],
-            })], exclusions: vec![], revoked: false };
+            let operation =
+                server_api::authorization::canonical_worker_operation(&permission.operation)
+                    .unwrap_or(&permission.operation);
+            let Ok(key) = PermissionKey::parse(operation.to_owned()) else {
+                diagnostics.push(MigrationDiagnostic::ExplicitConfigurationRequired {
+                    subject_id: subject_id.into(),
+                    permission: permission.clone(),
+                });
+                continue;
+            };
+            let assignment = PermissionAssignment {
+                grants: vec![PermissionReference::Namespace(NamespacePermissions {
+                    namespace: key.namespace(),
+                    keys: vec![key.clone()],
+                })],
+                exclusions: vec![],
+                revoked: false,
+            };
             let resolution = host.resolve(Some(&assignment));
             let exact = resolution.projection().diagnostics.is_empty()
                 && resolution.projection().allowed.len() == 1
                 && resolution.projection().allowed.contains_key(&key);
             if !exact {
                 diagnostics.push(MigrationDiagnostic::ExplicitConfigurationRequired {
-                    subject_id: subject_id.into(), permission: permission.clone(),
+                    subject_id: subject_id.into(),
+                    permission: permission.clone(),
                 });
                 continue;
             }
             by_namespace.entry(key.namespace()).or_default().insert(key);
             diagnostics.push(MigrationDiagnostic::DomainConstraint {
-                subject_id: subject_id.into(), permission: permission.clone(),
+                subject_id: subject_id.into(),
+                permission: permission.clone(),
             });
         }
-        Ok(AssignmentSource { namespaces: by_namespace.into_iter().map(|(namespace, keys)| NamespacePermissions {
-            namespace, keys: keys.into_iter().collect(),
-        }).collect(), ..Default::default() })
+        Ok(AssignmentSource {
+            namespaces: by_namespace
+                .into_iter()
+                .map(|(namespace, keys)| NamespacePermissions {
+                    namespace,
+                    keys: keys.into_iter().collect(),
+                })
+                .collect(),
+            ..Default::default()
+        })
     };
     let execution = lane(&legacy.execution)?;
     let delegation = lane(&legacy.delegation)?;
-    Ok((AdoptedSubjectPolicy {
-        source: SubjectAssignmentSource { subject_id: subject_id.into(), execution, delegation },
-        change_id: legacy.change_id.clone(), legacy_constraints: Some(legacy.clone()),
-    }, diagnostics))
+    Ok((
+        AdoptedSubjectPolicy {
+            source: SubjectAssignmentSource {
+                subject_id: subject_id.into(),
+                execution,
+                delegation,
+            },
+            change_id: legacy.change_id.clone(),
+            legacy_constraints: Some(legacy.clone()),
+        },
+        diagnostics,
+    ))
 }
 
 impl AdoptedSubjectPolicy {
@@ -241,12 +341,15 @@ impl AdoptedSubjectPolicy {
     pub fn legacy_read(&self, host: &PermissionHost) -> Result<SubjectPermissions> {
         let execution = host.resolve(Some(&self.source.execution.assignment()));
         let delegation = host.resolve(Some(&self.source.delegation.assignment()));
-        let filter = |allowed: &feature_permissions::PermissionResolution, constraints: &[ScopedPermission]| -> Result<Vec<ScopedPermission>> {
+        let filter = |allowed: &feature_permissions::PermissionResolution,
+                      constraints: &[ScopedPermission]|
+         -> Result<Vec<ScopedPermission>> {
             let mut represented = BTreeSet::new();
             let mut output = vec![];
             for permission in constraints {
-                let operation = server_api::authorization::canonical_worker_operation(&permission.operation)
-                    .unwrap_or(&permission.operation);
+                let operation =
+                    server_api::authorization::canonical_worker_operation(&permission.operation)
+                        .unwrap_or(&permission.operation);
                 if let Ok(key) = PermissionKey::parse(operation.to_owned()) {
                     if allowed.allowed.contains_key(&key) {
                         represented.insert(key);
@@ -259,12 +362,16 @@ impl AdoptedSubjectPolicy {
             }
             Ok(output)
         };
-        let empty = SubjectPermissions { change_id:self.change_id.clone(),execution:vec![],delegation:vec![] };
+        let empty = SubjectPermissions {
+            change_id: self.change_id.clone(),
+            execution: vec![],
+            delegation: vec![],
+        };
         let retained = self.legacy_constraints.as_ref().unwrap_or(&empty);
         Ok(SubjectPermissions {
-            change_id:self.change_id.clone(),
-            execution:filter(execution.projection(),&retained.execution)?,
-            delegation:filter(delegation.projection(),&retained.delegation)?,
+            change_id: self.change_id.clone(),
+            execution: filter(execution.projection(), &retained.execution)?,
+            delegation: filter(delegation.projection(), &retained.delegation)?,
         })
     }
 }

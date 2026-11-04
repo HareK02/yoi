@@ -21,7 +21,10 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
 impl SubjektivStore {
     /// Creation-only enrollment evidence for the canonical domain. Never a current permission
     /// source or a read-time default; the Host must not apply it to an existing/unset policy.
-    pub fn subject_permission_enrollment(&self, subject_id: &str) -> Result<Option<SubjectPermissions>> {
+    pub fn subject_permission_enrollment(
+        &self,
+        subject_id: &str,
+    ) -> Result<Option<SubjectPermissions>> {
         self.database.try_transaction(|tx| {
             require_subject(tx, subject_id)?;
             if !permissions::transfer::has_table(tx, "permission_authority_seal")? {

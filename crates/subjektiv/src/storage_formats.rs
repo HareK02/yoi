@@ -86,7 +86,9 @@ pub(super) fn validate(
         [], |row| row.get::<_, bool>(0),
     )?;
     if transfer && matches!(format, Format::Common(count) if count < COMMON_COUNT) {
-        return Err(incompatible("permission transfer requires complete common 1..17"));
+        return Err(incompatible(
+            "permission transfer requires complete common 1..17",
+        ));
     }
     let expected = reference_shape_with_transfer(format, transfer)?;
     let actual = domain_shape(tx)?;
@@ -127,7 +129,10 @@ fn reference_shape(format: Format) -> feature_storage::Result<Vec<SchemaObject>>
     reference_shape_with_transfer(format, false)
 }
 
-fn reference_shape_with_transfer(format: Format, transfer: bool) -> feature_storage::Result<Vec<SchemaObject>> {
+fn reference_shape_with_transfer(
+    format: Format,
+    transfer: bool,
+) -> feature_storage::Result<Vec<SchemaObject>> {
     // Cache reference shapes only; every target is reread under its caller's transaction.
     static SHAPES: [OnceLock<Vec<SchemaObject>>; 50] = [const { OnceLock::new() }; 50];
     let index = match format {
@@ -208,8 +213,11 @@ fn reference_shape_with_transfer(format: Format, transfer: bool) -> feature_stor
 /// Existing published seals and their serialized exports are never rewritten or relabelled.
 /// The FeatureDatabase guard and caller's transaction cover validation and installation.
 pub(super) fn install_permission_transfer(tx: &Transaction<'_>) -> feature_storage::Result<()> {
-    let mut statement = tx.prepare(&format!("SELECT version,name FROM {HISTORY_TABLE} ORDER BY version"))?;
-    let applied = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+    let mut statement = tx.prepare(&format!(
+        "SELECT version,name FROM {HISTORY_TABLE} ORDER BY version"
+    ))?;
+    let applied = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<std::result::Result<Vec<(u32, String)>, _>>()?;
     let format = recognize(&applied)?;
     if matches!(format, Format::Common(count) if count < COMMON_COUNT) {
@@ -226,7 +234,10 @@ pub(super) fn install_permission_transfer(tx: &Transaction<'_>) -> feature_stora
     validate(tx, &applied)
 }
 
-fn install_transfer_shape(tx: &Transaction<'_>, published_permission: bool) -> feature_storage::Result<()> {
+fn install_transfer_shape(
+    tx: &Transaction<'_>,
+    published_permission: bool,
+) -> feature_storage::Result<()> {
     if !published_permission {
         tx.execute_batch(PERMISSION_SEAL_SQL)?;
     }
@@ -237,7 +248,9 @@ fn install_transfer_shape(tx: &Transaction<'_>, published_permission: bool) -> f
         for action in ["INSERT", "UPDATE", "DELETE"] {
             let deletion_exception = if action == "DELETE" {
                 " AND NOT EXISTS(SELECT 1 FROM subject_deletions WHERE subject_id=OLD.subject_id)"
-            } else { "" };
+            } else {
+                ""
+            };
             tx.execute_batch(&format!(
                 "CREATE TRIGGER permission_transfer_fence_{table}_{action} BEFORE {action} ON {table}
                  WHEN EXISTS(SELECT 1 FROM permission_authority_seal){deletion_exception}

@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) mod transfer;
 pub use transfer::{
-    CanonicalPermissionSource, DatabaseIdentity, PermissionSourceExport,
+    CanonicalPermissionSource, DatabaseIdentity, PermissionAuthorityGuard, PermissionSourceExport,
     PermissionTransferReceipt, PermissionTransferSnapshot,
 };
 
@@ -238,11 +238,7 @@ fn grant_in_connection(
         "SELECT record_json FROM worker_execution_grants WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=worker_execution_grants.subject_id)"
     };
     let raw: Option<String> = connection
-        .query_row(
-            sql,
-            params![runtime, worker],
-            |row| row.get(0),
-        )
+        .query_row(sql, params![runtime, worker], |row| row.get(0))
         .optional()?;
     raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
         .transpose()

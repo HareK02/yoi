@@ -407,7 +407,10 @@ impl SubjektivStore {
                 )?;
             }
             if permissions::transfer::has_table(tx, "canonical_worker_execution_grants")? {
-                tx.execute("DELETE FROM canonical_worker_execution_grants WHERE subject_id=?1", [subject])?;
+                tx.execute(
+                    "DELETE FROM canonical_worker_execution_grants WHERE subject_id=?1",
+                    [subject],
+                )?;
             }
             for table in DIRECT {
                 tx.execute(
