@@ -267,3 +267,53 @@ fn consolidation_operation_policy_is_attempt_bound_and_does_not_inherit_body_rig
             .is_err()
     );
 }
+
+#[test]
+fn session_registration_uses_real_capability_and_attribution_decisions() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    let catalog = StandaloneSubjects::open(&root).unwrap();
+    let subject = catalog.create("registration-owner", None).unwrap();
+    let id = protocol::WorkerId::now_v7();
+    let mut connection = catalog.connect(&subject.id, id).unwrap();
+    let port = connection.host.clone();
+    let context = SubjektivHostContext {
+        worker_id: format!("standalone-{id}"),
+        session_id: session_store::SessionId::now_v7().to_string(),
+    };
+    assert_eq!(
+        port.record_session(&context, false)
+            .unwrap_err()
+            .session_registration_cause(),
+        SessionRegistrationCause::attribution_missing(),
+    );
+    let foreign = SubjektivHostContext {
+        worker_id: "unbound-private-worker".into(),
+        ..context.clone()
+    };
+    assert_eq!(
+        port.record_session(&foreign, true)
+            .unwrap_err()
+            .session_registration_cause(),
+        SessionRegistrationCause::binding_mismatch(),
+    );
+    let success = port.record_session(&context, true).unwrap();
+    assert_eq!(success.subject_id, subject.id);
+    assert_eq!(success.session_id, context.session_id);
+    assert!(port.record_session(&context, false).is_ok());
+    let reopened = StandaloneSubjects::open_existing(&root).unwrap();
+    let actual = reopened
+        .store
+        .session_attribution(&context.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.subject_id, subject.id);
+    assert_eq!(actual.worker_id, id.to_string());
+    connection.close().unwrap();
+    assert_eq!(
+        port.record_session(&context, true)
+            .unwrap_err()
+            .session_registration_cause(),
+        SessionRegistrationCause::denied(SessionPrincipal::Subject),
+    );
+}

@@ -64,6 +64,12 @@ pub struct SubjektivHostSettings {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SubjektivHostError {
+    #[error("{cause}")]
+    SessionRegistration {
+        cause: protocol::session_failure::SessionRegistrationCause,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     #[error("{message}")]
     Conflict { code: String, message: String },
     #[error("{0}")]
@@ -72,6 +78,30 @@ pub enum SubjektivHostError {
     PermissionDenied(String),
     #[error("{0}")]
     Unavailable(String),
+}
+
+impl SubjektivHostError {
+    pub fn session_registration(
+        cause: protocol::session_failure::SessionRegistrationCause,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::SessionRegistration {
+            cause,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    pub fn session_registration_cause(
+        &self,
+    ) -> protocol::session_failure::SessionRegistrationCause {
+        use protocol::session_failure::SessionRegistrationCause;
+        match self {
+            Self::SessionRegistration { cause, .. } => cause.clone(),
+            // Old Host implementations have not attested a domain verdict. Their prose
+            // must not become a permission or binding decision at the caller.
+            _ => SessionRegistrationCause::outcome_unknown(),
+        }
+    }
 }
 
 impl From<SubjektivHostError> for ToolError {
@@ -85,6 +115,9 @@ impl From<SubjektivHostError> for ToolError {
                 Self::ExecutionFailed(format!("Subjektiv operation permission denied: {message}"))
             }
             SubjektivHostError::Unavailable(message) => Self::ExecutionFailed(message),
+            SubjektivHostError::SessionRegistration { cause, .. } => {
+                Self::ExecutionFailed(cause.to_string())
+            }
         }
     }
 }
@@ -247,6 +280,84 @@ impl BackendSubjektivHost {
             .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
         decode(response)
     }
+}
+
+/// Session registration is an internal operation boundary, not a Browser HTTP
+/// classifier. Only the domain's codec attestation can establish a denial.
+/// Neither legacy bodies nor transport error prose are retained in metadata.
+pub(crate) fn record_backend_session(
+    client: &dyn WorkspaceClient,
+    session_id: &str,
+    create_if_missing: bool,
+) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
+    use protocol::session_failure::SessionRegistrationCause;
+    let response = client
+        .execute_server_operation(WorkspaceServerOperation::SubjektivRecordSession(
+            SubjektivRecordSessionRequest {
+                session_id: session_id.into(),
+                create_if_missing,
+            },
+        ))
+        .map_err(|error| {
+            let cause = match &error {
+                crate::WorkspaceClientError::Unavailable(_) => {
+                    SessionRegistrationCause::transport()
+                }
+                crate::WorkspaceClientError::Request(_) => {
+                    SessionRegistrationCause::outcome_unknown()
+                }
+                crate::WorkspaceClientError::InvalidPath(_) => {
+                    SessionRegistrationCause::invalid_response()
+                }
+            };
+            SubjektivHostError::session_registration(cause, error)
+        })?;
+    if !response.is_success() {
+        let cause = match serde_json::from_str::<RepositoryApiError>(&response.body) {
+            Ok(error) => match error.failure {
+                Some(failure) => match failure.decode::<SessionRegistrationCause>() {
+                    error_contract::DecodeFailure::Known(received) => {
+                        received.facts().cause().clone()
+                    }
+                    error_contract::DecodeFailure::Unsupported(_) => {
+                        SessionRegistrationCause::outcome_unknown()
+                    }
+                    error_contract::DecodeFailure::Corrupt(_) => {
+                        SessionRegistrationCause::invalid_response()
+                    }
+                },
+                None => SessionRegistrationCause::outcome_unknown(),
+            },
+            Err(_) => SessionRegistrationCause::invalid_response(),
+        };
+        return Err(SubjektivHostError::SessionRegistration {
+            cause,
+            source: None,
+        });
+    }
+    let output = serde_json::from_str(&response.body).map_err(|error| {
+        SubjektivHostError::session_registration(
+            SessionRegistrationCause::invalid_response(),
+            error,
+        )
+    })?;
+    validate_session_registration(output, session_id)
+}
+
+pub(crate) fn validate_session_registration(
+    output: SubjektivRecordSessionResponse,
+    session_id: &str,
+) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
+    if output.session_id != session_id
+        || output.subject_id.trim().is_empty()
+        || output.subject_id.chars().any(char::is_control)
+    {
+        return Err(SubjektivHostError::SessionRegistration {
+            cause: protocol::session_failure::SessionRegistrationCause::invalid_response(),
+            source: None,
+        });
+    }
+    Ok(output)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(
@@ -490,12 +601,7 @@ impl SubjektivHost for BackendSubjektivHost {
         context: &SubjektivHostContext,
         create_if_missing: bool,
     ) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
-        self.execute(WorkspaceServerOperation::SubjektivRecordSession(
-            SubjektivRecordSessionRequest {
-                session_id: context.session_id.clone(),
-                create_if_missing,
-            },
-        ))
+        record_backend_session(self.client.as_ref(), &context.session_id, create_if_missing)
     }
     fn request_consolidation(
         &self,

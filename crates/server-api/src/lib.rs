@@ -88,6 +88,10 @@ pub struct RepositoryApiError {
     pub message: String,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
+    /// An origin-projected error-contract attachment, not raw HTTP error text.
+    /// Receiving it does not authorize redisclosure to a different audience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<protocol::startup_failure::StartupFailureAttachment>,
     #[serde(skip, default = "default_repository_error_status")]
     status: u16,
 }
@@ -107,8 +111,17 @@ impl RepositoryApiError {
             error: error.into(),
             message: message.into(),
             diagnostics,
+            failure: None,
             status,
         }
+    }
+
+    pub fn with_failure(
+        mut self,
+        failure: protocol::startup_failure::StartupFailureAttachment,
+    ) -> Self {
+        self.failure = Some(failure);
+        self
     }
 }
 

@@ -28,6 +28,7 @@ use subjektiv::api::*;
 mod backend_job_profile;
 mod chat;
 mod external_operation_audit;
+mod session_registration;
 mod subject_authorization;
 mod subject_body;
 mod subjektiv_deletion;
@@ -19529,7 +19530,12 @@ fn source_ref_readiness_blocker(code: &str) -> &'static str {
 }
 
 fn remap_source_ref_error(error: ApiError) -> ApiError {
-    let ApiError { error, diagnostics } = error;
+    let ApiError {
+        error,
+        diagnostics,
+        session_registration_cause,
+        session_registration_source,
+    } = error;
     match error {
         Error::RuntimeOperationFailed {
             runtime_id,
@@ -19541,7 +19547,12 @@ fn remap_source_ref_error(error: ApiError) -> ApiError {
             message,
         }
         .into(),
-        error => ApiError { error, diagnostics },
+        error => ApiError {
+            error,
+            diagnostics,
+            session_registration_cause,
+            session_registration_source,
+        },
     }
 }
 
@@ -20145,7 +20156,9 @@ async fn scoped_list_merge_requests(
 }
 
 fn merge_ref_diagnostic(error: ApiError) -> MergeRequestRefDiagnostic {
-    let ApiError { error, diagnostics } = error;
+    let ApiError {
+        error, diagnostics, ..
+    } = error;
     diagnostics
         .into_iter()
         .next()
@@ -24276,18 +24289,50 @@ fn subjektiv_worker_scope_from_store(
     workspace_id: &str,
     context: &server_api::ServerRequestContext,
 ) -> ApiResult<SubjektivStoredWorkerScope> {
+    subjektiv_worker_scope_with_judgment(
+        api,
+        workspace_id,
+        context,
+        session_registration::Judgment::Other,
+    )
+}
+
+fn subjektiv_worker_scope_with_judgment(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    context: &server_api::ServerRequestContext,
+    judgment: session_registration::Judgment,
+) -> ApiResult<SubjektivStoredWorkerScope> {
     let source = context.runtime_source.as_ref().ok_or_else(|| {
-        Error::WorkspacePermissionDenied(
-            "subjektiv operations require authenticated Runtime-owned source authority".to_string(),
+        judgment.error(
+            Error::WorkspacePermissionDenied(
+                "subjektiv operations require authenticated Runtime-owned source authority"
+                    .to_string(),
+            ),
+            protocol::session_failure::SessionRegistrationCause::denied(
+                if context.actor.is_some() {
+                    protocol::session_failure::SessionPrincipal::Operator
+                } else {
+                    protocol::session_failure::SessionPrincipal::Unknown
+                },
+            ),
         )
     })?;
     let worker_id = source.worker_id.as_deref().ok_or_else(|| {
-        Error::WorkspacePermissionDenied(
-            "subjektiv operations require Runtime-bound Worker identity".to_string(),
+        judgment.error(
+            Error::WorkspacePermissionDenied(
+                "subjektiv operations require Runtime-bound Worker identity".to_string(),
+            ),
+            protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
         )
     })?;
     let worker = RuntimeWorkerRef::new(&source.runtime_id, worker_id);
-    if let Some(grant) = subjektiv_job::active_grant(api, workspace_id, &worker)? {
+    if let Some(grant) =
+        subjektiv_job::active_grant(api, workspace_id, &worker).map_err(|error| {
+            judgment
+                .permission_rejection(error, protocol::session_failure::SessionPrincipal::Subject)
+        })?
+    {
         return Ok(SubjektivStoredWorkerScope {
             subject_id: grant.subject_id,
             worker,
@@ -24296,13 +24341,18 @@ fn subjektiv_worker_scope_from_store(
     }
     let lease = api
         .store
-        .require_current_worker_singleton_owner(workspace_id, &worker)?
+        .require_current_worker_singleton_owner(workspace_id, &worker)
+        .map_err(|error| judgment.binding_rejection(error.into()))?
         .ok_or_else(|| {
-            Error::WorkspacePermissionDenied(
-                "current Worker has no keyed singleton ownership".to_string(),
+            judgment.error(
+                Error::WorkspacePermissionDenied(
+                    "current Worker has no keyed singleton ownership".to_string(),
+                ),
+                protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
             )
         })?;
-    let (subject_id, authority) = subjektiv_scope_from_singleton_key(&lease.key)?;
+    let (subject_id, authority) = subjektiv_scope_from_singleton_key(&lease.key)
+        .map_err(|error| judgment.binding_rejection(error))?;
     let authority = match authority {
         SubjektivWorkerAuthority::Subject => SubjektivStoredScopeAuthority::Subject,
         SubjektivWorkerAuthority::Consolidation => {
@@ -24367,6 +24417,14 @@ fn authorize_subjektiv_operation(
             resource: resource.clone(),
         },
     )
+    .map_err(|error| {
+        if operation == "session.record" {
+            session_registration::Judgment::SessionRecord
+                .permission_rejection(error, protocol::session_failure::SessionPrincipal::Subject)
+        } else {
+            error
+        }
+    })
     // The binding query returns only the authorized concrete target, never a
     // wildcard ceiling or a broader permission that happened to cover it.
     .map(|scope| scope.map(|_| resource))
@@ -24387,18 +24445,23 @@ fn require_subjektiv_worker_authority(
     }
 }
 
-fn subjektiv_session_attribution(
+fn subjektiv_session_attribution_with_judgment(
     api: &WorkspaceApi,
     workspace_id: &str,
     context: &server_api::ServerRequestContext,
     session_id: &str,
+    judgment: session_registration::Judgment,
 ) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
-    let scope = subjektiv_worker_scope_from_store(api, workspace_id, context)?;
+    let scope = subjektiv_worker_scope_with_judgment(api, workspace_id, context, judgment)?;
     if !matches!(scope.authority, SubjektivStoredScopeAuthority::Subject) {
-        return Err(Error::WorkspacePermissionDenied(
-            "subject Session attribution requires the current subject Worker".into(),
-        )
-        .into());
+        return Err(judgment.error(
+            Error::WorkspacePermissionDenied(
+                "subject Session attribution requires the current subject Worker".into(),
+            ),
+            protocol::session_failure::SessionRegistrationCause::denied(
+                protocol::session_failure::SessionPrincipal::Subject,
+            ),
+        ));
     }
     let session_id = session_id.trim();
     if session_id.is_empty() || session_id.chars().any(char::is_control) {
@@ -24419,24 +24482,52 @@ fn require_existing_subjektiv_session_attribution(
     context: &server_api::ServerRequestContext,
     session_id: &str,
 ) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
-    let expected = subjektiv_session_attribution(api, workspace_id, context, session_id)?;
+    require_existing_subjektiv_session_attribution_with_judgment(
+        api,
+        workspace_id,
+        context,
+        session_id,
+        session_registration::Judgment::Other,
+    )
+}
+
+fn require_existing_subjektiv_session_attribution_with_judgment(
+    api: &WorkspaceApi,
+    workspace_id: &str,
+    context: &server_api::ServerRequestContext,
+    session_id: &str,
+    judgment: session_registration::Judgment,
+) -> ApiResult<crate::subjektiv::SubjectSessionAttribution> {
+    let expected = subjektiv_session_attribution_with_judgment(
+        api,
+        workspace_id,
+        context,
+        session_id,
+        judgment,
+    )?;
     let existing = open_subjektiv_store(api)?
         .session_attribution(&expected.session_id)
         .map_err(subjektiv_store_error)?
         .ok_or_else(|| {
-            Error::RepositoryConflict(format!(
-                "subjektiv_session_attribution_incomplete: Session {} has not completed its Host attribution lifecycle",
-                expected.session_id
-            ))
+            judgment.error(
+                Error::RepositoryConflict(format!(
+                    "subjektiv_session_attribution_incomplete: Session {} has not completed its Host attribution lifecycle",
+                    expected.session_id
+                )),
+                protocol::session_failure::SessionRegistrationCause::attribution_missing(),
+            )
         })?;
     if existing.subject_id != expected.subject_id
         || existing.runtime_id != expected.runtime_id
         || existing.worker_id != expected.worker_id
     {
-        return Err(Error::WorkspacePermissionDenied(
-            "existing Session attribution does not match the authorized subject Worker".to_string(),
-        )
-        .into());
+        return Err(judgment.error(
+            Error::WorkspacePermissionDenied(
+                "existing Session attribution does not match the authorized subject Worker"
+                    .to_string(),
+            ),
+            protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
+        ));
     }
     Ok(existing)
 }
@@ -24855,18 +24946,20 @@ async fn scoped_record_subjektiv_session(
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
             let attribution = if request.create_if_missing {
-                subjektiv_session_attribution(
+                subjektiv_session_attribution_with_judgment(
                     &api,
                     &path.workspace_id,
                     &context,
                     &request.session_id,
+                    session_registration::Judgment::SessionRecord,
                 )?
             } else {
-                require_existing_subjektiv_session_attribution(
+                require_existing_subjektiv_session_attribution_with_judgment(
                     &api,
                     &path.workspace_id,
                     &context,
                     &request.session_id,
+                    session_registration::Judgment::SessionRecord,
                 )?
             };
             authorize_subjektiv_operation(
@@ -24876,13 +24969,14 @@ async fn scoped_record_subjektiv_session(
                 &attribution.subject_id,
                 "session.record",
             )?;
-            subjektiv_journal::bind_host_session(&api, attribution.clone())?;
+            session_registration::bind_host_session(&api, attribution.clone())?;
             Ok(Json(server_api::SubjektivRecordSessionResponse {
                 subject_id: attribution.subject_id,
                 session_id: attribution.session_id,
             }))
         })
         .await
+        .map_err(session_registration::execution_error)
 }
 
 const SUBJEKTIV_SESSION_DEFAULT_LIMIT: usize = 20;
@@ -39369,6 +39463,8 @@ fn workspace_id_mismatch_error() -> ApiError {
 struct ApiError {
     error: Error,
     diagnostics: Vec<RuntimeDiagnostic>,
+    session_registration_cause: Option<protocol::session_failure::SessionRegistrationCause>,
+    session_registration_source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39582,7 +39678,12 @@ impl From<Error> for ApiError {
             }
             _ => Vec::new(),
         };
-        Self { error, diagnostics }
+        Self {
+            error,
+            diagnostics,
+            session_registration_cause: None,
+            session_registration_source: None,
+        }
     }
 }
 
@@ -39599,13 +39700,21 @@ fn subjektiv_diagnostic_code(message: &str) -> Option<&'static str> {
 
 impl ApiError {
     fn with_diagnostics(error: Error, diagnostics: Vec<RuntimeDiagnostic>) -> Self {
-        Self { error, diagnostics }
+        Self {
+            error,
+            diagnostics,
+            session_registration_cause: None,
+            session_registration_source: None,
+        }
     }
 
     fn into_repository_api_error(self) -> server_api::RepositoryApiError {
         let status = api_error_status(&self.error);
-        let message = api_error_response_message(&self.error);
-        server_api::RepositoryApiError::new(
+        let message = self
+            .session_registration_cause
+            .map(|cause| cause.to_string())
+            .unwrap_or_else(|| api_error_response_message(&self.error));
+        let response = server_api::RepositoryApiError::new(
             status.as_u16(),
             match self.error {
                 Error::RestoreObservationConflict => "restore_observation_conflict",
@@ -39616,7 +39725,15 @@ impl ApiError {
             },
             message,
             working_directory_diagnostics(self.diagnostics),
-        )
+        );
+        match self.session_registration_cause {
+            Some(cause) => response.with_failure(
+                protocol::session_failure::session_registration_attachment(cause).expect(
+                    "enum-only Session registration cause must satisfy the transfer contract",
+                ),
+            ),
+            None => response,
+        }
     }
 }
 
