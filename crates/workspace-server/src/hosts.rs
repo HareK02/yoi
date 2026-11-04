@@ -117,6 +117,9 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
+    /// Internal startup observations; public consumers must separately authorize projection.
+    #[serde(skip)]
+    pub startup: Option<runtime_api::WorkerStartupFailure>,
     pub code: String,
     pub severity: HostDiagnosticSeverity,
     pub message: String,
@@ -6649,7 +6652,7 @@ fn sanitize_embedded_execution_detail(summary: &str, message: &str) -> String {
 }
 
 fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnostic {
-    match error {
+    let mut projection = match error {
         EmbeddedRuntimeError::RestoreAdmissionBusy { .. } => diagnostic(
             "restore_admission_busy",
             HostDiagnosticSeverity::Warning,
@@ -6767,7 +6770,19 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             HostDiagnosticSeverity::Error,
             "Embedded Runtime state is unavailable".to_string(),
         ),
+    };
+    if let EmbeddedRuntimeError::WorkerExecutionRejected { result, .. } = error {
+        projection.startup = result.startup_failure.as_ref().and_then(|primary| {
+            internal_startup_transfer(runtime_api::WorkerStartupFailure {
+                primary: primary.clone(),
+                secondary: result.secondary_failures.clone(),
+                resources: result.startup_resources,
+                persistence: result.startup_failure_persistence,
+                io_kind: result.startup_io_kind,
+            })
+        });
     }
+    projection
 }
 
 fn host_id_for_embedded_workspace(workspace_id: &str) -> String {
@@ -6846,6 +6861,7 @@ fn runtime_api_diagnostic(
 ) -> RuntimeDiagnostic {
     match error {
         runtime_api::client_support::ClientError::Public { status, error } => {
+            let startup = error.error.startup.and_then(internal_startup_transfer);
             let remote_code = error.error.code;
             let message = sanitize_remote_runtime_message(&remote_code, &error.error.message);
             let (code, severity) = match status {
@@ -6862,13 +6878,15 @@ fn runtime_api_diagnostic(
                     },
                 ),
             };
-            diagnostic(
+            let mut projection = diagnostic(
                 code,
                 severity,
                 format!(
                     "Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {message}"
                 ),
-            )
+            );
+            projection.startup = startup;
+            projection
         }
         runtime_api::client_support::ClientError::Failure(failure) => {
             let code = match failure {
@@ -6945,11 +6963,25 @@ fn remote_http_status_diagnostic(
         }
         _ => (remote_code, HostDiagnosticSeverity::Warning),
     };
-    diagnostic(
+    let mut projection = diagnostic(
         code,
         severity,
         format!("Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {remote_message}"),
-    )
+    );
+    projection.startup = error
+        .and_then(|error| error.error.startup)
+        .and_then(internal_startup_transfer);
+    projection
+}
+
+/// Treat transferred details as untrusted observations and reproject through the
+/// same domain allowlist; HTTP status and text never supply a missing cause.
+fn internal_startup_transfer(
+    mut startup: runtime_api::WorkerStartupFailure,
+) -> Option<runtime_api::WorkerStartupFailure> {
+    startup.primary =
+        worker::startup_failure::reproject_internal_startup_failure(&startup.primary).ok()?;
+    Some(startup)
 }
 
 fn diagnostic(
@@ -6958,6 +6990,7 @@ fn diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        startup: None,
         code: code.into(),
         severity,
         message: message.into(),

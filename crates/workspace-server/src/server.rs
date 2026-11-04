@@ -8612,6 +8612,7 @@ fn worker_input_result_to_api(
     // distinguishable without collapsing it into a definite refusal or replaying input.
     if result.disposition == WorkerInputDisposition::Unknown {
         result.diagnostics.push(RuntimeDiagnostic {
+            startup: None,
             code: "worker_input_outcome_unknown".into(),
             severity: HostDiagnosticSeverity::Warning,
             message: "Worker input delivery outcome is unknown; inspect the current session before retrying".into(),
@@ -27020,6 +27021,7 @@ fn skill_api_error(error: skills::SkillError) -> ApiError {
                 message: format!("unknown Skill `{name}`"),
             },
             vec![RuntimeDiagnostic {
+                startup: None,
                 code: "skill_not_found".to_string(),
                 severity: HostDiagnosticSeverity::Error,
                 message: format!("unknown Skill `{name}`"),
@@ -30426,6 +30428,7 @@ fn prepare_workspace_workdir_create(
                             .to_string(),
                     ),
                     vec![RuntimeDiagnostic {
+                        startup: None,
                         code: "default_runtime_not_configured".to_string(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "Workspace default Runtime is not configured".to_string(),
@@ -30580,6 +30583,7 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 Error::UnknownRuntime(reserved.resolved_runtime_id),
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "runtime_unavailable".to_string(),
                     severity: HostDiagnosticSeverity::Error,
                     message: "Selected Runtime is not available".to_string(),
@@ -30603,6 +30607,7 @@ async fn create_workspace_working_directory(
                 message: "Selected Runtime is not connected".to_string(),
             },
             vec![RuntimeDiagnostic {
+                startup: None,
                 code: "runtime_unavailable".to_string(),
                 severity: HostDiagnosticSeverity::Error,
                 message: "Selected Runtime is not available".to_string(),
@@ -30659,6 +30664,7 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 error.into_error(),
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: failure_code,
                     severity: HostDiagnosticSeverity::Error,
                     message: "Selected Runtime could not inspect the reserved Workdir".to_string(),
@@ -30697,6 +30703,7 @@ async fn create_workspace_working_directory(
                 return Err(ApiError::with_diagnostics(
                     error.into_error(),
                     vec![RuntimeDiagnostic {
+                        startup: None,
                         code: failure_code,
                         severity: HostDiagnosticSeverity::Error,
                         message: "Selected Runtime rejected Workdir creation".to_string(),
@@ -30736,6 +30743,7 @@ async fn create_workspace_working_directory(
             diagnostics.insert(
                 0,
                 RuntimeDiagnostic {
+                    startup: None,
                     code: failure_code.clone(),
                     severity: HostDiagnosticSeverity::Error,
                     message: "Runtime did not create the reserved Workdir".to_string(),
@@ -31490,6 +31498,7 @@ fn build_runtime_cleanup_plan(
                 let mut diagnostics = error.diagnostics;
                 if diagnostics.is_empty() {
                     diagnostics.push(RuntimeDiagnostic {
+                        startup: None,
                         code: "workspace_cleanup_runtime_observation_unavailable".to_string(),
                         severity: HostDiagnosticSeverity::Warning,
                         message: sanitize_backend_error(&error.error.to_string()),
@@ -35599,6 +35608,7 @@ fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> A
             message: "The embedded Runtime does not accept working directories".to_string(),
         },
         vec![RuntimeDiagnostic {
+            startup: None,
             code: "embedded_worker_workdir_unsupported".to_string(),
             severity: HostDiagnosticSeverity::Error,
             message: "Choose a non-embedded Runtime for workspace-file Workers; embedded Workers are no-workdir Workspace-API workers.".to_string(),
@@ -35689,6 +35699,7 @@ fn finalize_worker_spawn_stage<T>(
         .map(|assignment| assignment.operation_id.as_str())
         .unwrap_or("none");
     let mut diagnostics = vec![RuntimeDiagnostic {
+        startup: None,
         code: format!("worker_spawn_finalize_{}_failed", stage.as_str()),
         severity: HostDiagnosticSeverity::Error,
         message: format!(
@@ -35704,6 +35715,7 @@ fn finalize_worker_spawn_stage<T>(
     diagnostics.extend(compensation_errors);
     if !compensation_failed {
         diagnostics.push(RuntimeDiagnostic {
+            startup: None,
             code: "worker_spawn_compensated".to_string(),
             severity: HostDiagnosticSeverity::Info,
             message: format!(
@@ -36039,6 +36051,7 @@ fn lifecycle_failure_detail(
 
 fn spawn_compensation_diagnostic(code: &str, message: String) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        startup: None,
         code: code.to_string(),
         severity: HostDiagnosticSeverity::Error,
         message,
@@ -37044,6 +37057,7 @@ fn project_workspace_worker_with_attachments(
             summary.state = "unavailable".to_string();
             summary.worker_state = None;
             summary.diagnostics.push(RuntimeDiagnostic {
+                startup: None,
                 code: "worker_singleton_fenced".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
                 message: "This historical singleton generation is fenced by Backend ownership."
@@ -37749,6 +37763,7 @@ fn working_directory_summaries(
         }
         if let Some(grant_id) = legacy_external_workdir_grant_id(api, &record)? {
             diagnostics.push(RuntimeDiagnostic {
+                startup: None,
                 code: "external_workdir_legacy_permissions".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
                 message: format!(
@@ -37955,6 +37970,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
         },
         workdir_attachments: Vec::new(),
         diagnostics: vec![RuntimeDiagnostic {
+            startup: None,
             code: "backend_worker_missing".to_string(),
             severity: HostDiagnosticSeverity::Info,
             message:
@@ -37999,6 +38015,7 @@ fn worker_summary_from_projection(
         Vec::new()
     } else {
         vec![RuntimeDiagnostic {
+            startup: None,
             code: "worker_observation_unavailable".to_string(),
             severity: HostDiagnosticSeverity::Info,
             message: "The Worker remains in the Backend catalog, but its Runtime observation is currently unavailable.".to_string(),
@@ -38645,6 +38662,7 @@ fn validate_working_directory_claims_for_browser(
                         message: "working directory relative_cwd must stay inside the Runtime-owned working directory".to_string(),
                     },
                     vec![RuntimeDiagnostic {
+                        startup: None,
                         code: "working_directory_relative_cwd_invalid".to_string(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "relative_cwd must be a relative path without parent traversal".to_string(),
@@ -39239,6 +39257,7 @@ fn settings_diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        startup: None,
         code: code.into(),
         severity,
         message: message.into(),
@@ -39260,6 +39279,7 @@ fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -
                     message: message.clone(),
                 },
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "repository_not_configured".to_string(),
                     severity: HostDiagnosticSeverity::Error,
                     message,
@@ -39277,6 +39297,7 @@ fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -
                     message: message.clone(),
                 },
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "repository_provider_unsupported".to_string(),
                     severity: HostDiagnosticSeverity::Error,
                     message,
@@ -39292,6 +39313,7 @@ fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -
                     message: message.clone(),
                 },
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "repository_evidence_invalid".to_string(),
                     severity: HostDiagnosticSeverity::Error,
                     message,
@@ -39452,6 +39474,7 @@ fn workspace_id_mismatch_error() -> ApiError {
     ApiError::with_diagnostics(
         Error::WorkspaceIdMismatch,
         vec![RuntimeDiagnostic {
+            startup: None,
             code: "workspace_id_mismatch".to_string(),
             severity: HostDiagnosticSeverity::Error,
             message,
@@ -39561,6 +39584,7 @@ impl ApiErrorLog {
                 .diagnostics
                 .iter()
                 .map(|diagnostic| RuntimeDiagnostic {
+                    startup: None,
                     code: diagnostic.code.clone(),
                     severity: match diagnostic.severity {
                         server_api::DiagnosticSeverity::Info => HostDiagnosticSeverity::Info,
@@ -39598,6 +39622,7 @@ impl From<Error> for ApiError {
             Error::DbCapacityExceeded
             | Error::DbExecutorUnavailable
             | Error::DbOperationOutcomeUnknown => vec![RuntimeDiagnostic {
+                startup: None,
                 code: match &error {
                     Error::DbCapacityExceeded => "db_capacity_exceeded",
                     Error::DbExecutorUnavailable => "db_executor_unavailable",
@@ -39608,21 +39633,25 @@ impl From<Error> for ApiError {
                 message: error.to_string(),
             }],
             Error::WorkdirSessionOpenFailed { transport, .. } => vec![RuntimeDiagnostic {
+                startup: None,
                 code: "workdir_session_open_failed".to_string(),
                 severity: HostDiagnosticSeverity::Error,
                 message: transport.message.clone(),
             }],
             Error::RuntimeOperationFailed { code, message, .. } => vec![RuntimeDiagnostic {
+                startup: None,
                 code: code.clone(),
                 severity: HostDiagnosticSeverity::Error,
                 message: sanitize_backend_error(message),
             }],
             Error::WorkspaceSigningIdentity { code, message } => vec![RuntimeDiagnostic {
+                startup: None,
                 code: code.clone(),
                 severity: HostDiagnosticSeverity::Error,
                 message: sanitize_backend_error(message),
             }],
             Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
+                startup: None,
                 code: match ticket_error {
                     ticket::TicketError::NotFound(_) => "ticket_not_found",
                     ticket::TicketError::Ambiguous { .. } => "ticket_ambiguous",
@@ -39669,6 +39698,7 @@ impl From<Error> for ApiError {
                 subjektiv_diagnostic_code(message)
                     .map(|code| {
                         vec![RuntimeDiagnostic {
+                            startup: None,
                             code: code.to_string(),
                             severity: HostDiagnosticSeverity::Error,
                             message: sanitize_backend_error(message),
@@ -43074,6 +43104,7 @@ mod tests {
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![RuntimeDiagnostic {
+                        startup: None,
                         code: "fixture_runtime_rejected".to_string(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "fixture rejected Worker create".to_string(),
@@ -44981,6 +45012,7 @@ mod tests {
             kind: "ticket_backend_error".to_string(),
             message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
             diagnostics: vec![RuntimeDiagnostic {
+                startup: None,
                 code: "ticket_backend_error".to_string(),
                 severity: HostDiagnosticSeverity::Error,
                 message: "FOREIGN KEY constraint failed".to_string(),
@@ -51633,6 +51665,7 @@ mod tests {
     #[test]
     fn unrecoverable_pending_workspace_restore_is_typed_for_replacement() {
         let diagnostics = [RuntimeDiagnostic {
+            startup: None,
             code: "embedded_worker_execution_rejected".to_string(),
             severity: HostDiagnosticSeverity::Error,
             message: "Restore Errored: pending Workspace Worker restore requires operation-owned launch material; generic restore must not reconstruct it from current Workspace config".to_string(),
@@ -51644,6 +51677,7 @@ mod tests {
     #[test]
     fn workdir_runtime_miss_uses_exact_typed_code() {
         let typed_not_found = [RuntimeDiagnostic {
+            startup: None,
             code: "working_directory_not_found".to_string(),
             severity: HostDiagnosticSeverity::Warning,
             message: "missing".to_string(),
@@ -51655,6 +51689,7 @@ mod tests {
         assert!(workdir_runtime_miss_is_not_found(&typed_not_found));
 
         let unrelated = [RuntimeDiagnostic {
+            startup: None,
             code: "some_other_not_found".to_string(),
             severity: HostDiagnosticSeverity::Warning,
             message: "not a typed workdir miss".to_string(),
@@ -63358,6 +63393,7 @@ mod tests {
             &api,
             deleted,
             &[RuntimeDiagnostic {
+                startup: None,
                 code: "working_directory_not_found".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
                 message: "missing".to_string(),
@@ -63384,6 +63420,7 @@ mod tests {
             &api,
             unknown,
             &[RuntimeDiagnostic {
+                startup: None,
                 code: "runtime_unavailable".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
                 message: "temporarily unavailable".to_string(),
@@ -65080,6 +65117,7 @@ mod tests {
             InternalWorkerOperationState::Rejected,
             None,
             vec![RuntimeDiagnostic {
+                startup: None,
                 code: "working_directory_not_found".into(),
                 severity: HostDiagnosticSeverity::Warning,
                 message: "authoritatively absent".into(),
@@ -65131,6 +65169,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "working_directory_cleanup_resource_busy".into(),
                     severity: HostDiagnosticSeverity::Warning,
                     message: "busy".into(),
@@ -65360,6 +65399,7 @@ mod tests {
 
         let (missing_operation, _) = reserve_removal_fixture(&api, "provider-not-found");
         let not_found = RuntimeDiagnostic {
+            startup: None,
             code: "working_directory_not_found".to_string(),
             severity: HostDiagnosticSeverity::Error,
             message: "missing".to_string(),
@@ -65395,6 +65435,7 @@ mod tests {
                 InternalWorkerOperationState::Accepted,
                 None,
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "working_directory_provider_timeout".to_string(),
                     severity: HostDiagnosticSeverity::Error,
                     message: "timeout".to_string(),
@@ -65511,6 +65552,7 @@ mod tests {
                 InternalWorkerOperationState::Unsupported,
                 None,
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "working_directory_unsupported".to_string(),
                     severity: HostDiagnosticSeverity::Error,
                     message: "unsupported".to_string(),
@@ -65571,6 +65613,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: code.into(),
                     severity: HostDiagnosticSeverity::Error,
                     message: "secret /private/path".into(),
@@ -65602,6 +65645,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    startup: None,
                     code: "working_directory_cleanup_mount_present".into(),
                     severity: HostDiagnosticSeverity::Error,
                     message: "/private/mount credentials must not escape".into(),
@@ -65752,6 +65796,7 @@ mod tests {
                     InternalWorkerOperationState::Rejected,
                     None,
                     vec![RuntimeDiagnostic {
+                        startup: None,
                         code: "working_directory_cleanup_permission_denied".into(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "permission denied /private/path".into(),
@@ -65938,6 +65983,7 @@ mod tests {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                startup: None,
                 code: "working_directory_not_found".to_string(),
                 severity: HostDiagnosticSeverity::Error,
                 message: "missing".to_string(),
@@ -65949,6 +65995,7 @@ mod tests {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                startup: None,
                 code: "working_directory_provider_timeout".to_string(),
                 severity: HostDiagnosticSeverity::Error,
                 message: "timeout".to_string(),
@@ -67641,11 +67688,13 @@ mod tests {
     fn provider_rejection_classification_prefers_stable_error_diagnostic() {
         let diagnostics = vec![
             RuntimeDiagnostic {
+                startup: None,
                 code: "runtime_capacity_warning".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
                 message: "capacity is low".to_string(),
             },
             RuntimeDiagnostic {
+                startup: None,
                 code: "runtime_capacity_unavailable".to_string(),
                 severity: HostDiagnosticSeverity::Error,
                 message: "capacity is exhausted".to_string(),
@@ -67705,6 +67754,7 @@ mod tests {
             })
             .unwrap();
         let diagnostics = vec![RuntimeDiagnostic {
+            startup: None,
             code: "runtime_capacity_unavailable".to_string(),
             severity: HostDiagnosticSeverity::Error,
             message: "capacity is exhausted".to_string(),
