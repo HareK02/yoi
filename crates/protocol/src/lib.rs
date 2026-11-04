@@ -2,6 +2,7 @@
 
 pub mod identity;
 pub mod invocation;
+pub mod startup_failure;
 #[cfg(feature = "stream")]
 pub mod stream;
 pub mod subscription;

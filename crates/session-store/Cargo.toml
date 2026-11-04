@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+error-contract.workspace = true
 base64.workspace = true
 agen = { workspace = true }
 fs4.workspace = true

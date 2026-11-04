@@ -10,6 +10,11 @@ use protocol::{CompletionEntry, CompletionKind, Segment, WorkerId, WorkerStateSn
 use serde::{Deserialize, Serialize};
 use workdir::workspace::{MaterializerKind, RuntimeWorkerRef, RuntimeWorkingDirectorySummary};
 
+pub use protocol::startup_failure::{
+    RuntimeStartupCause, StartupCleanupFailure, StartupFailureAttachment, StartupFailurePhase,
+    StartupPersistenceOutcome, StartupSecondaryFailure, StartupStage,
+};
+
 pub const RUNTIME_API_VERSION: &str = "v1";
 pub const RUNTIME_API_BASE_PATH: &str = "/v1";
 /// Runtime transport classification for a materialized Repository source.
