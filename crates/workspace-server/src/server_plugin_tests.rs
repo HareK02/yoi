@@ -77,6 +77,53 @@ async fn get(app: Router, token: Option<&str>, path: &str, expected: StatusCode)
     request(app, token, "GET", path, vec![], false, expected).await
 }
 
+pub(super) async fn adopt_plugin_config(api: WorkspaceApi, owner: &str, content: String) {
+    let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    catalog
+        .apis
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), api.clone());
+    catalog
+        .routers
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api));
+    let app = workspace_server_router(catalog);
+    let prefix = format!("/api/w/{TEST_WORKSPACE_ID}/config/adoption");
+    let current = get(app.clone(), Some(owner), &prefix, StatusCode::OK).await;
+    let adoption = serde_json::json!({
+        "operation_id": uuid::Uuid::now_v7().to_string(),
+        "expected_head": current["history_head"],
+        "expected_catalog_digest": current["catalog_digest"],
+        "expected_legacy_export": current["expected_legacy_export"],
+        "source": {
+            "base_digest": current["state"]["snapshot"]["digest"],
+            "entrypoints": ["main.dcdl"],
+            "changes": [{"kind":"update", "path":"main.dcdl",
+                "expected_digest": current["state"]["snapshot"]["entries"]["main.dcdl"]["content_digest"],
+                "content": content}]
+        }
+    });
+    let preview = json(
+        app.clone(),
+        owner,
+        &format!("{prefix}/preview"),
+        adoption.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    let saved = json(
+        app,
+        owner,
+        &format!("{prefix}/commit"),
+        adoption,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(saved["state"], preview["state"]);
+}
+
 #[tokio::test]
 async fn authenticated_catalog_lifecycle_replay_cas_and_current_read_authority() {
     let dir = tempfile::tempdir().unwrap();
@@ -414,12 +461,23 @@ async fn api_restart_recovers_orphan_publication_and_preserves_committed_catalog
 }
 
 #[tokio::test]
-async fn workspace_owner_without_hosting_admin_configures_plugin_through_existing_config_commit() {
+async fn workspace_owner_without_hosting_admin_configures_plugin_through_owner_adoption() {
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;
     let owner = seed_test_workspace_owner_token(api.store.as_ref(), "plugin-config-owner").await;
     let reader = seed_test_api_token(api.store.as_ref(), "plugin-config-reader");
-    let app = build_router(api.clone());
+    let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    catalog
+        .apis
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), api.clone());
+    catalog
+        .routers
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), build_inner_router(api.clone()));
+    let app = workspace_server_router(catalog);
     let prefix = format!("/api/w/{TEST_WORKSPACE_ID}");
     let upload = request(
         app.clone(),
@@ -435,7 +493,7 @@ async fn workspace_owner_without_hosting_admin_configures_plugin_through_existin
     let state = get(
         app.clone(),
         Some(&owner),
-        &format!("{prefix}/config/source-tree"),
+        &format!("{prefix}/config/adoption"),
         StatusCode::OK,
     )
     .await;
@@ -447,11 +505,15 @@ async fn workspace_owner_without_hosting_admin_configures_plugin_through_existin
         a["package_digest"],
         a["artifact_digest"]
     );
-    let change = serde_json::json!({"base_digest":state["snapshot"]["digest"],"entrypoints":["main.dcdl"],"changes":[{"kind":"update","path":"main.dcdl","expected_digest":state["snapshot"]["entries"]["main.dcdl"]["content_digest"],"content":source}]});
+    let change = serde_json::json!({
+        "operation_id": "config-plugin-adopt", "expected_head":state["history_head"],
+        "expected_catalog_digest":state["catalog_digest"], "expected_legacy_export":state["expected_legacy_export"],
+        "source": {"base_digest":state["state"]["snapshot"]["digest"],"entrypoints":["main.dcdl"],"changes":[{"kind":"update","path":"main.dcdl","expected_digest":state["state"]["snapshot"]["entries"]["main.dcdl"]["content_digest"],"content":source}]}
+    });
     json(
         app.clone(),
         &reader,
-        &format!("{prefix}/config/source-tree/commit"),
+        &format!("{prefix}/config/adoption/commit"),
         change.clone(),
         StatusCode::FORBIDDEN,
     )
@@ -459,7 +521,7 @@ async fn workspace_owner_without_hosting_admin_configures_plugin_through_existin
     json(
         app.clone(),
         &reader,
-        &format!("{prefix}/config/source-tree/preview"),
+        &format!("{prefix}/config/adoption/preview"),
         change.clone(),
         StatusCode::FORBIDDEN,
     )
@@ -467,7 +529,7 @@ async fn workspace_owner_without_hosting_admin_configures_plugin_through_existin
     let preview = json(
         app.clone(),
         &owner,
-        &format!("{prefix}/config/source-tree/preview"),
+        &format!("{prefix}/config/adoption/preview"),
         change.clone(),
         StatusCode::OK,
     )
@@ -475,26 +537,42 @@ async fn workspace_owner_without_hosting_admin_configures_plugin_through_existin
     let unchanged = get(
         app.clone(),
         Some(&owner),
-        &format!("{prefix}/config/source-tree"),
+        &format!("{prefix}/config/adoption"),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(unchanged["snapshot"]["digest"], state["snapshot"]["digest"]);
+    assert_eq!(unchanged, state);
     let saved = json(
         app.clone(),
         &owner,
-        &format!("{prefix}/config/source-tree/commit"),
+        &format!("{prefix}/config/adoption/commit"),
         change.clone(),
-        StatusCode::CREATED,
+        StatusCode::OK,
     )
     .await;
-    assert_eq!(saved, preview);
-    assert_ne!(saved["snapshot"]["digest"], state["snapshot"]["digest"]);
+    assert_eq!(saved["state"], preview["state"]);
+    assert_ne!(
+        saved["state"]["snapshot"]["digest"],
+        state["state"]["snapshot"]["digest"]
+    );
+    assert_eq!(
+        json(
+            app.clone(),
+            &owner,
+            &format!("{prefix}/config/adoption/commit"),
+            change.clone(),
+            StatusCode::OK
+        )
+        .await,
+        saved
+    );
+    let mut stale = change;
+    stale["operation_id"] = "stale-plugin-adoption".into();
     json(
         app.clone(),
         &owner,
-        &format!("{prefix}/config/source-tree/commit"),
-        change,
+        &format!("{prefix}/config/adoption/commit"),
+        stale,
         StatusCode::CONFLICT,
     )
     .await;

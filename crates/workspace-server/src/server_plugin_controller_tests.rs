@@ -252,32 +252,7 @@ mod plugin_controller_tests {
                 crate::plugin_settings::render_value(&plugins).unwrap(),
                 crate::plugin_settings::render_value(&selection).unwrap()
             );
-            let state = self
-                .api
-                .config_store
-                .load_workspace_config(TEST_WORKSPACE_ID)
-                .unwrap()
-                .unwrap();
-            let path = config_source::VirtualPath::parse("main.dcdl").unwrap();
-            let commit = ConfigCommitRequest {
-                base_digest: state.snapshot.digest.clone(),
-                entrypoints: state.contract.entrypoints.clone(),
-                changes: vec![config_source::ConfigTreeChange::Update {
-                    path: path.clone(),
-                    expected_digest: state.snapshot.get(&path).unwrap().content_digest.clone(),
-                    content,
-                }],
-            };
-            request(
-                build_router(self.api.clone()),
-                Some(&self.owner),
-                "POST",
-                &format!("/api/w/{TEST_WORKSPACE_ID}/config/source-tree/commit"),
-                serde_json::to_vec(&commit).unwrap(),
-                false,
-                StatusCode::CREATED,
-            )
-            .await;
+            super::plugin_tests::adopt_plugin_config(self.api.clone(), &self.owner, content).await;
         }
 
         async fn revoke(&self, installed: &server_api::PluginOperationResponse) {

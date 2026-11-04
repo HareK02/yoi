@@ -132,7 +132,7 @@ const OLDEST_SCHEMA_VERSION: i64 = 50;
 #[path = "storage_formats.rs"]
 mod storage_formats;
 
-const LATEST_SCHEMA_VERSION: i64 = 113;
+const LATEST_SCHEMA_VERSION: i64 = 122;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -504,6 +504,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 113,
         name: "Ticket work-decomposition parent links",
         apply: migrate_ticket_parents_v112_to_v113,
+    },
+    Migration {
+        version: 122,
+        name: crate::config_adoption::MIGRATION_NAME,
+        apply: migrate_configuration_adoption_to_v122,
     },
 ];
 
@@ -2993,10 +2998,25 @@ impl SqliteWorkspaceStore {
             }
         };
         self.with_immediate_transaction(|tx| {
-            let row: Option<(String,String)> = tx.query_row(
-                "SELECT owner_account_id,created_at FROM workspaces WHERE workspace_id=?1 AND state='active'",[storage.scope_id()],
-                |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
-            let (owner,created) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            let row: Option<(String,String,String)> = tx.query_row(
+                "SELECT owner_account_id,created_at,state FROM workspaces WHERE workspace_id=?1",[storage.scope_id()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+            let (owner,created,state) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            if state == "deleting" {
+                // A retained deletion consumer can validate completed ownership,
+                // but cannot authorize new legacy adoption or replacement storage.
+                let reserved: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_deletion_operations WHERE workspace_id=?1 AND owner_account_id=?2 AND state!='succeeded')",
+                    params![storage.scope_id(),owner], |row| row.get(0))?;
+                if !reserved {
+                    return Err(Error::Store("Workspace storage requires a retained deletion reservation".into()));
+                }
+                storage.verify_owned_if_present(registration)?;
+                return Ok(());
+            }
+            if state != "active" {
+                return Err(Error::Store("Workspace storage adoption requires an active catalog owner".into()));
+            }
             let evidence = format!("catalog:{}:{owner}:{created}",storage.scope_id());
             let request = format!("legacy-storage:{}:{}",storage.scope_id(),registration.feature_id());
             storage.adopt_legacy_if_present(registration,&request,&evidence,|feature_tx| {
@@ -6566,19 +6586,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         repository_key: &str,
     ) -> Result<Option<RepositoryRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                          source_kind, source_uri, default_ref,
-                          source_fingerprint, observed_status, observed_at, created_at, updated_at
-                   FROM repositories
-                   WHERE workspace_id = ?1 AND repository_key = ?2"#,
-                params![workspace_id, repository_key],
-                read_repository_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
+        self.with_conn(|conn| read_repository_by_key(conn, workspace_id, repository_key))
     }
 
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>> {
@@ -12205,6 +12213,24 @@ fn validate_repository_record_identity(record: &RepositoryRecord) -> Result<()> 
     Ok(())
 }
 
+pub(crate) fn read_repository_by_key(
+    conn: &Connection,
+    workspace_id: &str,
+    repository_key: &str,
+) -> Result<Option<RepositoryRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
+                  source_kind, source_uri, default_ref,
+                  source_fingerprint, observed_status, observed_at, created_at, updated_at
+           FROM repositories
+           WHERE workspace_id = ?1 AND repository_key = ?2"#,
+        params![workspace_id, repository_key],
+        read_repository_record,
+    )
+    .optional()
+    .map_err(Error::from)
+}
+
 fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {
     let source_kind_value = row.get::<_, String>(5)?;
     let source_kind = server_api::RepositorySourceKind::parse(&source_kind_value)
@@ -16069,6 +16095,25 @@ fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_configuration_adoption_to_v122(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if !(113..=121).contains(&current) {
+        return Err(Error::Store(
+            "Configuration adoption migration requires a recognized schema 113..121".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, current)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(content_history_store::SCHEMA)?;
+    tx.execute_batch(crate::config_adoption::SCHEMA)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(122,?1)",
+        [crate::config_adoption::MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_ticket_parents_v112_to_v113(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 112 {
         return Err(Error::Store(
@@ -16165,6 +16210,13 @@ fn migrate_plugin_receipts_v108_to_v109(conn: &Connection) -> Result<()> {
 }
 
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
+    create_workspace_schema_through_v113(conn)?;
+    conn.execute_batch(content_history_store::SCHEMA)?;
+    conn.execute_batch(crate::config_adoption::SCHEMA)?;
+    Ok(())
+}
+
+fn create_workspace_schema_through_v113(conn: &Connection) -> Result<()> {
     create_workspace_schema_structure(conn)?;
     assignment_delivery::install(conn)?;
     assignment_delivery::install_post_inputs(conn)?;
@@ -17083,7 +17135,7 @@ fn workspace_schema_migration_history(conn: &Connection) -> Result<Vec<(i64, Str
 }
 
 fn verify_schema_history(conn: &Connection, current: i64) -> Result<()> {
-    if current > LATEST_SCHEMA_VERSION {
+    if current > 113 {
         return storage_formats::verify_history(conn, current);
     }
     let rows = workspace_schema_migration_history(conn)?;
@@ -18878,9 +18930,16 @@ mod tests {
 
     #[test]
     fn current_schema_accepts_every_retained_canonical_provenance() {
-        for baseline_version in OLDEST_SCHEMA_VERSION..=LATEST_SCHEMA_VERSION {
+        for baseline_version in
+            (OLDEST_SCHEMA_VERSION..=113).chain(std::iter::once(LATEST_SCHEMA_VERSION))
+        {
             let conn = Connection::open_in_memory().unwrap();
             configure_sqlite(&conn).unwrap();
+            ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+            merge_request::migrate(&conn).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
+                .unwrap();
+            create_latest_workspace_schema(&conn).unwrap();
             conn.execute(
                 "INSERT INTO __yoi_schema_migrations(version, name) VALUES (?1, ?2)",
                 params![baseline_version, SCHEMA_BASELINE_NAME],

@@ -4,7 +4,6 @@
  * Browserの解析成功はServerのcommit受理を代替しない。
  */
 import type {
-  ConfigCommitRequest,
   ConfigContentType,
   ConfigEntry,
   ConfigProjectionValidator,
@@ -14,6 +13,20 @@ import type {
   WorkspaceConfigSchemaBundle,
   WorkspaceConfigTreeResponse,
 } from "./types.ts";
+
+import type {
+  ConfigurationAdoptionReceipt,
+  ConfigurationAdoptionRequest,
+  ConfigurationPreviewResponse,
+  ConfigurationReconciliation,
+  ConfigurationSourceResponse,
+} from "#lib/generated/configuration-adoption.generated.ts";
+
+// 未使用のpolicy/catalogを認可判定へ転用しない。editorが使う観測値だけを型へ変換する。
+export type ConfigurationEditingState = Pick<
+  ConfigurationSourceResponse,
+  "state" | "history_head" | "catalog_digest" | "expected_legacy_export" | "source_stored"
+>;
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 // Schema bodies are documents, not short metadata. Keep them within the
@@ -277,15 +290,138 @@ export function parseWorkspaceConfigTreeResponse(
   };
 }
 
+function adoptionUrl(workspaceId: string): string {
+  return `/api/w/${encodeURIComponent(workspaceId)}/config/adoption`;
+}
+
+function nullableDigest(value: unknown): string | null {
+  return value === null ? null : boundedString(value, MAX_DIGEST_BYTES);
+}
+
+// 非表示のpolicy/catalogも大きさと深さを制限するが、その内部を型付け・再解釈しない。
+function checkOpaqueData(value: unknown, depth = 0, budget = { nodes: 65536 }): void {
+  if (depth > 16 || --budget.nodes < 0) throw schemaError();
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "string") {
+    boundedString(value);
+    return;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) return;
+  if (Array.isArray(value)) {
+    for (const child of boundedArray(value)) checkOpaqueData(child, depth + 1, budget);
+    return;
+  }
+  const entries = Object.entries(objectValue(value));
+  if (entries.length > MAX_COLLECTION_ITEMS) throw schemaError();
+  for (const [key, child] of entries) {
+    boundedString(key);
+    checkOpaqueData(child, depth + 1, budget);
+  }
+}
+
+export function parseConfigurationSourceResponse(value: unknown): ConfigurationEditingState {
+  const item = record(value, [
+    "state", "history_head", "source_stored", "catalog", "catalog_digest",
+    "expected_legacy_export", "policies", "migration_diagnostics",
+  ]);
+  if (typeof item.source_stored !== "boolean") throw schemaError();
+  objectValue(item.catalog);
+  boundedArray(item.policies);
+  boundedArray(item.migration_diagnostics);
+  checkOpaqueData([item.catalog, item.policies, item.migration_diagnostics]);
+  return {
+    state: parseWorkspaceConfigTreeResponse(item.state),
+    history_head: nullableDigest(item.history_head),
+    source_stored: item.source_stored,
+    catalog_digest: boundedString(item.catalog_digest, MAX_DIGEST_BYTES),
+    expected_legacy_export: nullableDigest(item.expected_legacy_export),
+  };
+}
+
+export function parseConfigurationPreviewResponse(value: unknown): ConfigurationPreviewResponse {
+  const item = record(value, ["expected_head", "state", "changed_paths", "changed_subjects"]);
+  return {
+    expected_head: nullableDigest(item.expected_head),
+    state: parseWorkspaceConfigTreeResponse(item.state),
+    changed_paths: boundedArray(item.changed_paths).map((path) => boundedString(path, MAX_PATH_BYTES)),
+    changed_subjects: boundedArray(item.changed_subjects).map((subject) => boundedString(subject)),
+  };
+}
+
+export function parseConfigurationAdoptionReceipt(value: unknown): ConfigurationAdoptionReceipt {
+  const item = record(value, [
+    "workspace_id", "operation_id", "history_head", "state", "source_stored",
+    "policy_committed", "runtime_application",
+  ]);
+  if (item.source_stored !== true || item.policy_committed !== true ||
+    item.runtime_application !== "next_current_policy_check") throw schemaError();
+  return {
+    workspace_id: boundedString(item.workspace_id),
+    operation_id: boundedString(item.operation_id),
+    history_head: boundedString(item.history_head, MAX_DIGEST_BYTES),
+    state: parseWorkspaceConfigTreeResponse(item.state),
+    source_stored: true,
+    policy_committed: true,
+    runtime_application: "next_current_policy_check",
+  };
+}
+
+export function parseConfigurationReconciliation(value: unknown): ConfigurationReconciliation {
+  const status = objectValue(value).status;
+  if (status === "adopted") {
+    const item = record(value, ["status", "receipt"]);
+    return { status, receipt: parseConfigurationAdoptionReceipt(item.receipt) };
+  }
+  if (status === "pending_transfer") {
+    const item = record(value, ["status", "transfer_identity", "export_digest"]);
+    return {
+      status,
+      transfer_identity: boundedString(item.transfer_identity),
+      export_digest: boundedString(item.export_digest, MAX_DIGEST_BYTES),
+    };
+  }
+  if (status === "not_observed") {
+    record(value, ["status"]);
+    return { status };
+  }
+  throw schemaError();
+}
+
+function matchingReceipt(
+  receipt: ConfigurationAdoptionReceipt,
+  workspaceId: string,
+  request: ConfigurationAdoptionRequest,
+): ConfigurationAdoptionReceipt {
+  if (receipt.workspace_id !== workspaceId || receipt.operation_id !== request.operation_id) throw schemaError();
+  return receipt;
+}
+
+async function postAdoption<T>(
+  workspaceId: string,
+  action: "preview" | "commit" | "reconcile",
+  request: ConfigurationAdoptionRequest,
+  parser: Parser<T>,
+  fetcher: typeof fetch,
+): Promise<T> {
+  return await readJson(
+    await fetcher(`${adoptionUrl(workspaceId)}/${action}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(request),
+    }),
+    parser,
+  );
+}
+
 export async function fetchConfigTree(
   workspaceId: string,
   fetcher: typeof fetch = fetch,
-): Promise<WorkspaceConfigTreeResponse> {
+): Promise<ConfigurationEditingState> {
   return await readJson(
-    await fetcher(sourceTreeUrl(workspaceId), {
+    await fetcher(adoptionUrl(workspaceId), {
       headers: { accept: "application/json" },
     }),
-    parseWorkspaceConfigTreeResponse,
+    parseConfigurationSourceResponse,
   );
 }
 
@@ -318,30 +454,32 @@ export async function fetchConfigHistory(
 
 export async function previewConfigTree(
   workspaceId: string,
-  request: ConfigCommitRequest,
+  request: ConfigurationAdoptionRequest,
   fetcher: typeof fetch = fetch,
-): Promise<WorkspaceConfigTreeResponse> {
-  return await readJson(
-    await fetcher(`${sourceTreeUrl(workspaceId)}/preview`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(request),
-    }),
-    parseWorkspaceConfigTreeResponse,
-  );
+): Promise<ConfigurationPreviewResponse> {
+  const preview = await postAdoption(workspaceId, "preview", request, parseConfigurationPreviewResponse, fetcher);
+  if (preview.expected_head !== request.expected_head) throw schemaError();
+  return preview;
 }
 
 export async function commitConfigTree(
   workspaceId: string,
-  request: ConfigCommitRequest,
+  request: ConfigurationAdoptionRequest,
   fetcher: typeof fetch = fetch,
-): Promise<WorkspaceConfigTreeResponse> {
-  return await readJson(
-    await fetcher(`${sourceTreeUrl(workspaceId)}/commit`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(request),
-    }),
-    parseWorkspaceConfigTreeResponse,
+): Promise<ConfigurationAdoptionReceipt> {
+  return matchingReceipt(
+    await postAdoption(workspaceId, "commit", request, parseConfigurationAdoptionReceipt, fetcher),
+    workspaceId,
+    request,
   );
+}
+
+export async function reconcileConfigTree(
+  workspaceId: string,
+  request: ConfigurationAdoptionRequest,
+  fetcher: typeof fetch = fetch,
+): Promise<ConfigurationReconciliation> {
+  const result = await postAdoption(workspaceId, "reconcile", request, parseConfigurationReconciliation, fetcher);
+  if (result.status === "adopted") matchingReceipt(result.receipt, workspaceId, request);
+  return result;
 }

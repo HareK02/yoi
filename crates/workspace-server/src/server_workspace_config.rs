@@ -619,22 +619,31 @@ pub(super) async fn commit(
                 {
                     return Err(fail(409, "authority_changed"));
                 }
-                // Preserve the shared helper's ordering and atomic CAS, but never
-                // run its remote Runtime publication on the sole DB worker.
-                project_repository_access_candidate(
-                    &*persistence_api.store,
-                    &persistence_api.repository_secrets,
-                    &persistence_api.config.workspace_id,
-                    &candidate,
-                )
-                .map_err(|_| unknown())?;
-                let state = persistence_api
-                    .config_store
-                    .commit_evaluated_workspace_config(
-                        &persistence_api.config.workspace_id,
-                        &candidate,
-                    )
-                    .map_err(|_| unknown())?;
+                // Legacy logical writes share the physical authority gate with
+                // initial cutover, in Feature -> Server order. A durable seal
+                // fences this writer even when the Server adoption rolled back.
+                let legacy = open_legacy_subjektiv_store(&persistence_api).map_err(pre_error)?;
+                let identity = legacy.database_identity().map_err(|_| unknown())?;
+                let state = legacy.with_permission_authority_guard(&identity, |authority| {
+                    authority.require_unsealed()?;
+                    Ok((|| {
+                        project_repository_access_candidate(
+                            &*persistence_api.store,
+                            &persistence_api.repository_secrets,
+                            &persistence_api.config.workspace_id,
+                            &candidate,
+                        ).map_err(|_| unknown())?;
+                        // Repository projection may already have auxiliary secret
+                        // effects. A subsequent save error cannot promise that the
+                        // whole operation had no durable effect, even on SQL rollback.
+                        persistence_api.config_store.commit_evaluated_workspace_config(
+                            &persistence_api.config.workspace_id, &candidate,
+                        ).map_err(|_| unknown())
+                    })())
+                }).map_err(|error| match error {
+                    subjektiv::SubjektivError::PermissionAuthoritySealed => fail(409, "owner_adoption_required"),
+                    _ => unknown(),
+                })??;
                 let publication = persistence_api
                     .prompt_projection_cache
                     .resolve(&persistence_api.config.workspace_id, &state)

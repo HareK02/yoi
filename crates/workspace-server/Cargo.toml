@@ -21,6 +21,10 @@ axum = { workspace = true, features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures.workspace = true
 config-source.workspace = true
+content-history.workspace = true
+content-history-store.workspace = true
+content-history-adapters.workspace = true
+feature-permissions.workspace = true
 feature-storage.workspace = true
 workspace-drive.workspace = true
 subjektiv.workspace = true

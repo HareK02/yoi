@@ -8,6 +8,10 @@ pub use deletion::{DeletionSubjectJob, SubjectDeletion};
 pub mod journal;
 mod legacy_migrations;
 pub mod permissions;
+pub use permissions::{
+    CanonicalPermissionSource, DatabaseIdentity, PermissionSourceExport, PermissionTransferReceipt,
+    PermissionTransferSnapshot,
+};
 mod schema;
 mod subject_creation;
 use legacy_migrations::{
@@ -95,6 +99,10 @@ pub enum SubjektivError {
     SubjectPermissionsConflict(String),
     #[error("permission operation `{0}` was reused with different input")]
     PermissionOperationConflict(String),
+    #[error("legacy permission authority is permanently sealed")]
+    PermissionAuthoritySealed,
+    #[error("permission transfer conflicts with identity, export or retained receipt")]
+    PermissionTransferConflict,
     #[error("authorization denied: {0}")]
     AuthorizationDenied(String),
     #[error("Worker execution grant binding conflicts for `{0}`")]
@@ -689,6 +697,7 @@ pub const REGISTRATION: FeatureRegistration =
 #[derive(Clone)]
 pub struct SubjektivStore {
     database: FeatureDatabase,
+    canonical_permission_source: Option<std::sync::Arc<dyn permissions::CanonicalPermissionSource>>,
 }
 
 impl SubjektivStore {
@@ -746,7 +755,10 @@ impl SubjektivStore {
                 }
             }
         })?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            canonical_permission_source: None,
+        })
     }
 
     pub fn scope_id(&self) -> &str {

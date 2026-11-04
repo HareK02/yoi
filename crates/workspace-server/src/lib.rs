@@ -5,7 +5,11 @@ pub mod authority;
 pub mod backend_job;
 pub mod companion;
 pub mod config;
+pub mod config_adoption;
 pub mod config_source;
+mod configuration_migration;
+#[cfg(test)]
+mod configuration_transfer_tests;
 #[cfg(test)]
 mod content_history_tests;
 pub mod db_executor;
@@ -24,6 +28,7 @@ pub mod plugin_plan;
 pub mod plugin_receipt;
 pub mod plugin_service;
 pub mod plugin_settings;
+pub mod policy_config;
 pub mod profile_settings;
 pub mod prompt_settings;
 pub mod records;

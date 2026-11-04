@@ -108,6 +108,32 @@ fn has_identity(connection: &Connection) -> bool {
 }
 
 #[test]
+fn lifecycle_verification_never_provisions_or_adopts_optional_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("storage");
+    let (manager, registration) = registered(&root);
+    let scoped = manager.scope(SCOPE).unwrap();
+    scoped.verify_owned_if_present(&registration).unwrap();
+    assert!(!root.exists());
+    let path = legacy(&root, SCOPE);
+    assert_identity_error(scoped.verify_owned_if_present(&registration));
+    assert!(!has_identity(&Connection::open(&path).unwrap()));
+    let database = scoped
+        .adopt_existing(&registration, REQUEST, EVIDENCE, validate_legacy)
+        .unwrap();
+    let identity = database.identity().clone();
+    scoped.verify_owned_if_present(&registration).unwrap();
+    assert_eq!(values(&database), vec!["preserved"]);
+    drop(database);
+    fs::remove_file(&path).unwrap();
+    assert!(matches!(scoped.verify_owned_if_present(&registration),
+        Err(FeatureStorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
+    assert!(!path.exists());
+    assert!(matches!(scoped.open_existing(&registration, &identity),
+        Err(FeatureStorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
+}
+
+#[test]
 fn provision_then_reopen_retains_physical_identity_and_committed_data() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("storage");

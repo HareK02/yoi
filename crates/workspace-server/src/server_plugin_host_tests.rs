@@ -1373,25 +1373,24 @@ fn assert_check_physical_initializations(
         .subjektiv_registration
         .open_observation()
         .since(before);
-    let directory = f
-        .api
-        .config
-        .database_path
-        .parent()
-        .unwrap()
-        .join("feature-storage")
-        .join(TEST_WORKSPACE_ID)
-        .join("features");
-    let resolved = fs::canonicalize(&directory).unwrap();
-    let ancestors: std::collections::HashSet<_> =
-        directory.ancestors().chain(resolved.ancestors()).collect();
+    // Subject creation has already durably provisioned this physical DB. Cold
+    // connection opens must still initialize/read SQLite, but must not provision
+    // or sync new metadata ancestors. Initial publication sync is owned below
+    // FeatureStorage's identity boundary, not repeated per authorization check.
+    assert!(
+        before.directory_sync_attempts > 0,
+        "fixture must exercise initial publication I/O"
+    );
+    assert_eq!(
+        before.directory_sync_successes,
+        before.directory_sync_attempts
+    );
     assert_eq!(observed.completed_initializations, expected, "{observed:?}");
     assert_eq!(observed.physical_open_attempts, expected, "{observed:?}");
     assert_eq!(observed.physical_opens, expected, "{observed:?}");
     assert_eq!(
-        observed.directory_sync_attempts,
-        expected * ancestors.len() as u64,
-        "{observed:?}"
+        observed.directory_sync_attempts, 0,
+        "owned DB reopen must not publish directories: {observed:?}"
     );
     assert_eq!(
         observed.directory_sync_successes,
