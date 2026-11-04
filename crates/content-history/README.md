@@ -63,3 +63,11 @@ and `parity_word(index)` (four digest bytes interpreted big-endian). It has no J
 or host-import dependency. A runner can compare its words with the fixture hashes
 on native and `wasm32-unknown-unknown`; an out-of-range index returns `u32::MAX`.
 Building a WASM module alone is not evidence of executed native/WASM parity.
+The optional execution adapter uses only Deno's built-in WebAssembly runtime;
+run from the workspace root after registering this crate and installing the target:
+
+```text
+cargo test -p content-history
+cargo build -p content-history --example wasm_parity --target wasm32-unknown-unknown
+deno run --allow-read crates/content-history/tests/wasm_parity.ts target/wasm32-unknown-unknown/debug/examples/wasm_parity.wasm
+```

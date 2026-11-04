@@ -174,7 +174,10 @@ fn restore_directory(
                 // A valid directory must lead to an as-yet unrestored metadata entry. This also
                 // bounds traversal of adversarial shared subtrees by the existing entry/path limits.
                 let child_prefix = format!("{path}/");
-                if !metadata.keys().any(|key| key.as_str().starts_with(&child_prefix)) {
+                if !metadata
+                    .keys()
+                    .any(|key| key.as_str().starts_with(&child_prefix))
+                {
                     return Err(Error::Structure("config directory has no file metadata"));
                 }
                 restore_directory(child, path.as_str(), read, metadata, entries, total)?

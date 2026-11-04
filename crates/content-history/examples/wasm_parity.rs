@@ -4,7 +4,7 @@ mod common;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn parity_len() -> u32 {
-    64
+    (common::objects().len() * 8) as u32
 }
 
 #[unsafe(no_mangle)]

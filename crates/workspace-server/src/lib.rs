@@ -6,6 +6,8 @@ pub mod backend_job;
 pub mod companion;
 pub mod config;
 pub mod config_source;
+#[cfg(test)]
+mod content_history_tests;
 pub mod db_executor;
 pub mod feature_storage;
 pub mod hosts;
