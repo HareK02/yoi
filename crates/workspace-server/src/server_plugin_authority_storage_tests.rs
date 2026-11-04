@@ -104,7 +104,7 @@ async fn scoped_subject_database_rereads_policy_changed_on_independent_connectio
 }
 
 #[tokio::test]
-async fn scoped_subject_database_does_not_survive_deletion_or_refresh_itself_after_restore() {
+async fn scoped_subject_database_observes_irreversible_erasure_after_check_finishes() {
     let f = Fixture::new(None).await;
     let snapshot_dir = tempfile::tempdir().unwrap();
     let snapshot = snapshot_dir.path().join("snapshot");
@@ -112,25 +112,19 @@ async fn scoped_subject_database_does_not_survive_deletion_or_refresh_itself_aft
     let request = permission(&f);
     plugin_host::with_authority_database(&f.api, || {
         subject_authorization::authorize_scope(&f.api, &f.source, &request).unwrap();
-        // The guard retains no connection lock: deletion completes synchronously.
-        f.api.feature_storage.delete().unwrap();
-        assert!(subject_authorization::authorize_scope(&f.api, &f.source, &request).is_err());
-        assert!(f.api.feature_storage.restore(&snapshot).is_err());
-        let fresh =
-            crate::FeatureStorage::for_server_database(&f.api.config.database_path).unwrap();
-        let scope = fresh.workspace(TEST_WORKSPACE_ID).unwrap();
-        scope.restore(&snapshot).unwrap();
-        let registration = crate::subjektiv::SubjektivStore::register(&scope).unwrap();
-        let mut restored = f.api.clone();
-        restored.feature_storage = scope;
-        restored.subjektiv_registration = registration;
-        // A fresh Host binding can read the restored DB; the old binding stays fenced.
-        subject_authorization::authorize_scope(&restored, &f.source, &request).unwrap();
-        assert!(subject_authorization::authorize_scope(&f.api, &f.source, &request).is_err());
-        restored.feature_storage.shutdown().unwrap();
         Ok(())
-    })
-    .unwrap();
+    }).unwrap();
+    // The short check's lifecycle guard is released before destructive maintenance.
+    f.api.feature_storage.delete().unwrap();
+    assert!(subject_authorization::authorize_scope(&f.api, &f.source, &request).is_err());
+    assert!(f.api.feature_storage.restore(&snapshot).is_err());
+    let fresh = crate::FeatureStorage::for_server_database(&f.api.config.database_path).unwrap();
+    let scope = fresh.workspace(TEST_WORKSPACE_ID).unwrap();
+    assert!(scope.restore(&snapshot).is_err());
+    let another = crate::FeatureStorage::new(snapshot_dir.path().join("another-owner"));
+    assert!(another.workspace(TEST_WORKSPACE_ID).unwrap()
+        .restore_from(&snapshot, &scope).is_err());
+    assert!(subject_authorization::authorize_scope(&f.api, &f.source, &request).is_err());
     f.shutdown().await;
 }
 

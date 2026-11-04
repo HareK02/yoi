@@ -530,7 +530,7 @@ fn implementation_legacy96_fixture() -> (tempfile::TempDir, SqliteWorkspaceStore
         INSERT INTO worker_singleton_owners(workspace_id,singleton_key,runtime_id,worker_id,generation,created_at,updated_at) VALUES('w','workspace-orchestrator','r','worker',1,'1','1');
         INSERT INTO repositories(workspace_id,repository_id,repository_key,kind,provider,uri,created_at,updated_at,source_kind,source_uri,source_fingerprint) VALUES('w','main','main','git','git','file:///main','1','1','file','file:///main','sha256:fixture');").unwrap();
     let store = SqliteWorkspaceStore {
-        conn: Arc::new(Mutex::new(conn)),
+        conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
         db_executor: crate::db_executor::DbExecutor::new(
             crate::db_executor::DbExecutorLimits::default(),
         )

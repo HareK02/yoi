@@ -76,6 +76,14 @@ impl WorkspaceDriveHost {
             drive: Mutex::new(None),
         })
     }
+    pub(crate) fn adopt_legacy_storage(
+        &self,
+        storage: &WorkspaceFeatureStorage,
+        catalog: &crate::SqliteWorkspaceStore,
+    ) -> Result<()> {
+        catalog.adopt_workspace_feature_storage(storage, &self.registration, "drive_state")
+    }
+
     pub(crate) async fn open(
         &self,
         storage: &WorkspaceFeatureStorage,

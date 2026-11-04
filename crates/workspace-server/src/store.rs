@@ -129,6 +129,9 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
+#[path = "storage_formats.rs"]
+mod storage_formats;
+
 const LATEST_SCHEMA_VERSION: i64 = 113;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
@@ -2786,8 +2789,20 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
 }
 
 #[derive(Clone)]
+enum StoreConnection {
+    Managed(feature_storage::FeatureDatabase),
+    Fixture(Arc<Mutex<Connection>>),
+}
+
+impl From<feature_storage::FeatureStorageError> for Error {
+    fn from(error: feature_storage::FeatureStorageError) -> Self {
+        Error::Store(error.to_string())
+    }
+}
+
+#[derive(Clone)]
 pub struct SqliteWorkspaceStore {
-    conn: Arc<Mutex<Connection>>,
+    conn: StoreConnection,
     db_executor: crate::db_executor::DbExecutor,
 }
 
@@ -2797,8 +2812,18 @@ pub mod fixture_support;
 
 impl SqliteWorkspaceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        let path = path.as_ref();
+        let owner = feature_storage::FeatureStorage::for_server_database(path)?;
+        let database = owner.open_host_catalog(
+            path,
+            "server-catalog",
+            "Host configured Server database",
+            |conn| prepare_connection(conn),
+        )?;
+        Ok(Self {
+            conn: StoreConnection::Managed(database),
+            db_executor: crate::db_executor::DbExecutor::shared(),
+        })
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -2842,7 +2867,7 @@ impl SqliteWorkspaceStore {
     ) -> Result<Self> {
         prepare_connection(&conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
             db_executor,
         })
     }
@@ -2851,7 +2876,11 @@ impl SqliteWorkspaceStore {
     // fixture's admission/SQL/drain lifetime or a permanent global worker.
     #[cfg(test)]
     pub(crate) fn open_for_test(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_connection_for_test(Connection::open(path)?)
+        Ok(
+            Self::open(path)?.with_db_executor(crate::db_executor::DbExecutor::new(
+                crate::db_executor::DbExecutorLimits::default(),
+            )?),
+        )
     }
 
     #[cfg(test)]
@@ -2878,22 +2907,30 @@ impl SqliteWorkspaceStore {
     }
 
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
-        f(&conn)
+        match &self.conn {
+            StoreConnection::Managed(database) => database.try_with_connection(f),
+            StoreConnection::Fixture(connection) => {
+                let conn = connection
+                    .lock()
+                    .map_err(|_| Error::Store("sqlite connection lock poisoned".into()))?;
+                f(&conn)
+            }
+        }
     }
 
     pub(crate) fn with_conn_mut<T>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
-        f(&mut conn)
+        match &self.conn {
+            StoreConnection::Managed(database) => database.try_with_connection_mut(f),
+            StoreConnection::Fixture(connection) => {
+                let mut conn = connection
+                    .lock()
+                    .map_err(|_| Error::Store("sqlite connection lock poisoned".into()))?;
+                f(&mut conn)
+            }
+        }
     }
 
     /// Acquire SQLite write ownership before the first authority/journal read (Restore and
@@ -2912,6 +2949,43 @@ impl SqliteWorkspaceStore {
             let value = f(&tx)?;
             tx.commit()?;
             Ok(value)
+        })
+    }
+
+    /// The current catalog row authorizes Host storage setup, not model access
+    /// or past provisioning. Persisted Feature attribution must independently
+    /// match before adopting a data-bearing legacy file.
+    pub(crate) fn adopt_workspace_feature_storage(
+        &self,
+        storage: &feature_storage::ScopedFeatureStorage,
+        registration: &feature_storage::RegisteredFeature,
+        attribution_table: &str,
+    ) -> Result<()> {
+        let table = match attribution_table {
+            "store_scope" => "store_scope",
+            "drive_state" => "drive_state",
+            _ => {
+                return Err(Error::InvalidInput(
+                    "unsupported storage attribution owner".into(),
+                ));
+            }
+        };
+        self.with_immediate_transaction(|tx| {
+            let row: Option<(String,String)> = tx.query_row(
+                "SELECT owner_account_id,created_at FROM workspaces WHERE workspace_id=?1 AND state='active'",[storage.scope_id()],
+                |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+            let (owner,created) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            let evidence = format!("catalog:{}:{owner}:{created}",storage.scope_id());
+            let request = format!("legacy-storage:{}:{}",storage.scope_id(),registration.feature_id());
+            storage.adopt_legacy_if_present(registration,&request,&evidence,|feature_tx| {
+                let stored: String = feature_tx.query_row(
+                    &format!("SELECT workspace_id FROM {table} WHERE singleton=1"),[],|row|row.get(0))?;
+                if stored != storage.scope_id() {
+                    return Err(feature_storage::FeatureStorageError::Identity("legacy Feature attribution differs from authorized Workspace".into()));
+                }
+                Ok(())
+            })?;
+            Ok(())
         })
     }
 
@@ -16987,6 +17061,9 @@ fn workspace_schema_migration_history(conn: &Connection) -> Result<Vec<(i64, Str
 }
 
 fn verify_schema_history(conn: &Connection, current: i64) -> Result<()> {
+    if current > LATEST_SCHEMA_VERSION {
+        return storage_formats::verify_history(conn, current);
+    }
     let rows = workspace_schema_migration_history(conn)?;
     let Some((baseline_version, baseline_name)) = rows.first() else {
         return Err(Error::Store(format!(
@@ -17030,6 +17107,9 @@ fn verify_schema_history(conn: &Connection, current: i64) -> Result<()> {
 
 fn workspace_schema_migration_plan(conn: &Connection) -> Result<WorkspaceSchemaMigrationPlan> {
     let current = current_schema_version(conn)?;
+    if let Some(plan) = storage_formats::published_plan(conn, current)? {
+        return Ok(plan);
+    }
     if current > LATEST_SCHEMA_VERSION {
         return Err(Error::Store(format!(
             "database schema version {current} is newer than this server supports ({LATEST_SCHEMA_VERSION}); refusing to serve with an older binary"
@@ -17041,7 +17121,7 @@ fn workspace_schema_migration_plan(conn: &Connection) -> Result<WorkspaceSchemaM
         )));
     }
     if current != 0 {
-        verify_schema_history(conn, current)?;
+        storage_formats::verify_history(conn, current)?;
     }
 
     let migrations = if current == 0 {
@@ -17150,7 +17230,7 @@ fn apply_migrations_with_secret_source(
         }
     }
 
-    verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
+    storage_formats::verify_history(conn, current_schema_version(conn)?)?;
     crate::plugin_catalog::verify_with_data(conn)?;
     verify_plugin_data_schema(conn)?;
     verify_plugin_service_schema(conn)?;
@@ -17185,6 +17265,10 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Error::from)
 }
+
+#[cfg(test)]
+#[path = "storage_owner_tests.rs"]
+mod storage_owner_tests;
 
 #[cfg(test)]
 #[path = "store_test_support.rs"]

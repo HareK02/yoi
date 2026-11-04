@@ -534,7 +534,7 @@ mod existing_workspace_provisioning {
         // unrelated full Server schema. Exercise the real service/store methods.
         Arc::new(SqliteWorkspaceStore {
             db_executor: crate::db_executor::DbExecutor::shared(),
-            conn: Arc::new(Mutex::new(conn)),
+            conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
         })
     }
 
@@ -646,7 +646,7 @@ mod existing_workspace_provisioning {
         drop(store);
         let store = Arc::new(SqliteWorkspaceStore {
             db_executor: crate::db_executor::DbExecutor::shared(),
-            conn: Arc::new(Mutex::new(Connection::open(&path).unwrap())),
+            conn: StoreConnection::Fixture(Arc::new(Mutex::new(Connection::open(&path).unwrap()))),
         });
         let service = WorkspaceSigningIdentityService::new(
             store.clone(),

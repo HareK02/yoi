@@ -1,5 +1,16 @@
 [
   {
+    "path": "crates/subjektiv/src/storage_format_tests.rs",
+    "kind": "saved_data",
+    "reason": "最古対応Subjektiv保存形式のデータ入り移行fixture。旧Subject JSONの保存keyを実形式のまま検証し、移行前原文と移行後データの保持を確認するため残す。現行状態契約の新設ではない。",
+    "lines": [
+      {
+        "sha256": "5b22a15424eb27bcd68e737cf3549b7ce4231632cdda2bd2d826b4a2c766e270",
+        "count": 1
+      }
+    ]
+  },
+  {
     "path": "tests/e2e/fixtures/worker-codex-v1/manifest.json",
     "kind": "saved_data",
     "reason": "ユーザー提供済v1固定資産の生成元Git commitの保存key。原本の取得証拠とSHA-256を保持するため変更しない。Worker実行状態や競合制御の番号ではなく、生成元resources照合のみに使う。",

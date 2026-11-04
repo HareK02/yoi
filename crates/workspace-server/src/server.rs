@@ -4661,6 +4661,7 @@ impl WorkspaceApi {
         }
         let database_path = config.database_path.clone();
         let workspace_id = config.workspace_id.clone();
+        let storage_catalog = config_store.clone();
         let (feature_storage, subjektiv_registration, authority) = store
             .db_executor()
             .run(move || {
@@ -4673,12 +4674,26 @@ impl WorkspaceApi {
                     .map_err(|error| {
                         Error::Store(format!("failed to register subjektiv storage: {error}"))
                     })?;
+                storage_catalog.adopt_workspace_feature_storage(
+                    &feature_storage,
+                    &registration,
+                    "store_scope",
+                )?;
                 let authority = database_preparation.open_authority(database_path, workspace_id)?;
                 Ok::<_, Error>((feature_storage, registration, authority))
             })
             .await?;
         let drive_host =
             Arc::new(crate::workspace_drive_host::WorkspaceDriveHost::new(&feature_storage).await?);
+        {
+            let catalog = config_store.clone();
+            let scope = feature_storage.clone();
+            let host = drive_host.clone();
+            store
+                .db_executor()
+                .run(move || host.adopt_legacy_storage(&scope, &catalog))
+                .await?;
+        }
         let mut api = Self {
             host_executors,
             drive_host,

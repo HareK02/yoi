@@ -673,8 +673,11 @@ static MIGRATIONS: &[FeatureMigration] = &[
     ),
 ];
 
+mod storage_formats;
+
 pub const REGISTRATION: FeatureRegistration =
-    FeatureRegistration::new(SUBJEKTIV_FEATURE_ID, MIGRATIONS);
+    FeatureRegistration::new(SUBJEKTIV_FEATURE_ID, MIGRATIONS)
+        .with_history_validation(storage_formats::validate);
 
 /// Subject Memory repository restricted to a Host storage scope.
 /// Owns schemas, validation, queries, and domain transactions; delegates physical layout
@@ -5623,10 +5626,11 @@ mod tests {
             )
             .unwrap();
         assert!(second.previous_change_id.is_some());
-        workspace.delete().unwrap();
         drop(reopened);
         drop(workspace);
         drop(manager);
+        // Simulated physical loss retains owner receipts, unlike explicit erasure.
+        std::fs::remove_dir_all(root.join("workspace-a")).unwrap();
 
         let manager = FeatureStorage::new(&root);
         let workspace = manager.workspace("workspace-a").unwrap();

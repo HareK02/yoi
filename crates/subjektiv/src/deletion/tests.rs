@@ -159,10 +159,21 @@ fn purge_failure_rolls_back_content_but_not_the_committed_fence_and_restart_reco
             c.execute_batch("CREATE TRIGGER injected_failure BEFORE DELETE ON subjects BEGIN SELECT RAISE(ABORT, 'simulated purge failure'); END;")?;
             Ok(())
         }).unwrap();
-        assert!(store.finish_subject_deletion(&id, "delete").is_err());
+        let error = store.finish_subject_deletion(&id, "delete").unwrap_err();
+        assert!(
+            error.to_string().contains("simulated purge failure"),
+            "{error}"
+        );
         assert_eq!(count(&store, "memory_records"), 1);
         assert_eq!(count(&store, "memory_changes"), 1);
         assert_eq!(store.subject_deletion(&id).unwrap(), Some(pending.clone()));
+        store
+            .database
+            .try_with_connection::<_, SubjektivError>(|c| {
+                c.execute_batch("DROP TRIGGER injected_failure")?;
+                Ok(())
+            })
+            .unwrap();
         drop(store);
         drop(scope);
         manager.shutdown().unwrap();
@@ -177,13 +188,6 @@ fn purge_failure_rolls_back_content_but_not_the_committed_fence_and_restart_reco
         pending
     );
     assert!(store.list_memories(&id).is_err());
-    store
-        .database
-        .try_with_connection::<_, SubjektivError>(|c| {
-            c.execute_batch("DROP TRIGGER injected_failure")?;
-            Ok(())
-        })
-        .unwrap();
     assert!(
         store
             .finish_subject_deletion(&id, "delete")

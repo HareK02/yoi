@@ -25,7 +25,7 @@ impl SqliteWorkspaceStore {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         configure_sqlite(&conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
             db_executor: crate::db_executor::DbExecutor::new(
                 crate::db_executor::DbExecutorLimits::default(),
             )?,
@@ -56,7 +56,7 @@ impl SqliteWorkspaceStore {
         // Existing DBs above still pass through full production startup checks.
         configure_sqlite(&conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
             db_executor: crate::db_executor::DbExecutor::new(
                 crate::db_executor::DbExecutorLimits::default(),
             )?,

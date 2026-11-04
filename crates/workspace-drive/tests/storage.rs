@@ -473,8 +473,9 @@ fn stopped_writer_backup_restores_ids_last_mutation_ids_receipts_and_sequence_wi
         std::fs::copy(file.path(), restored_blobs.join(file.file_name())).unwrap();
     }
     let restored = FeatureStorage::new(t.path().join("restored/metadata"));
+    let source_scope = scope;
     let scope = restored.workspace("ws").unwrap();
-    scope.restore(&snapshot).unwrap();
+    scope.restore_from(&snapshot, &source_scope).unwrap();
     let registered = Drive::register(&scope).unwrap();
     let d = Drive::open(&scope, &registered, &restored_blobs).unwrap();
     assert_eq!(d.metadata(latest.id).unwrap(), latest);

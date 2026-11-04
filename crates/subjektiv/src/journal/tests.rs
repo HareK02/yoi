@@ -498,8 +498,8 @@ mod input_delivery {
     }
 
     #[test]
-    fn input_delivery_migration_failure_rolls_back_table_creation_and_retries() {
-        // A colliding trigger is created before migration so failure occurs after its new table DDL.
+    fn input_delivery_migration_collision_is_rejected_before_ddl_and_retries() {
+        // A colliding trigger must be diagnosed before pending migration DDL.
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("rollback");
         let manager = FeatureStorage::new(&root);
@@ -529,12 +529,16 @@ mod input_delivery {
         let manager = FeatureStorage::new(&root);
         let scope = manager.scope("input-delivery-rollback").unwrap();
         let registration = SubjektivStore::register(&scope).unwrap();
-        assert!(matches!(
-            SubjektivStore::open(&scope, &registration),
+        match SubjektivStore::open(&scope, &registration) {
             Err(crate::SubjektivError::Storage(
-                feature_storage::FeatureStorageError::MigrationFailed { .. }
-            ))
-        ));
+                feature_storage::FeatureStorageError::MigrationHistory { detail, .. },
+            )) => assert!(
+                detail.contains("journal_generation_input_delivery_no_update"),
+                "{detail}"
+            ),
+            Err(error) => panic!("expected pre-DDL shape refusal, got {error:?}"),
+            Ok(_) => panic!("colliding schema was accepted"),
+        }
         drop(scope);
         manager.shutdown().unwrap();
         drop(manager);
@@ -551,6 +555,11 @@ mod input_delivery {
         assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
         store.database.try_transaction(|tx| {
             assert!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='journal_generation_input_deliveries')", [], |r| r.get::<_, bool>(0))?);
+            let receipts = tx.prepare("SELECT version,name FROM __yoi_feature_schema_migrations ORDER BY version")?
+                .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let expected: Vec<_> = (&crate::MIGRATIONS[..12]).iter().map(|m| (m.version(), m.name().to_string())).collect();
+            assert_eq!(receipts, expected);
             tx.execute_batch("DROP TRIGGER journal_generation_input_delivery_no_update")?;
             Ok::<_, JournalError>(())
         }).unwrap();
@@ -5083,10 +5092,12 @@ fn backup_restore_preserves_generation_records_corrections_sources_position_and_
         vec![],
     );
     fixture.close(&generation);
-    fixture.workspace.as_ref().unwrap().delete().unwrap();
     fixture.store.take();
     fixture.workspace.take();
     fixture.manager.take().unwrap().shutdown().unwrap();
+    // Data-file loss is recoverable while the durable source owner remains intact.
+    // Explicit delete is a separate irreversible fence, covered by storage-owner tests.
+    std::fs::remove_dir_all(fixture.temp.path().join("storage/journal-tests")).unwrap();
     let manager = FeatureStorage::new(fixture.temp.path().join("storage"));
     let workspace = manager.workspace("journal-tests").unwrap();
     workspace.restore(&snapshot).unwrap();
@@ -5222,16 +5233,20 @@ fn failure_before_receipt_rolls_back_record_and_checkpoint_then_exact_retry_succ
     );
     let before = fixture.state();
     let sources = fixture.sources();
-    assert!(matches!(
-        fixture.store().execute_journal(&ctx, record.clone()),
-        Err(JournalError::Storage(_))
-    ));
+    let error = fixture
+        .store()
+        .execute_journal(&ctx, record.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected before receipt"),
+        "{error}"
+    );
+    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     fixture.reopen();
     assert_eq!(fixture.state(), before);
     assert_eq!(fixture.sources(), sources);
     assert!(fixture.entries().is_empty());
     assert!(fixture.receipt("fault-record").is_none());
-    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     let saved = fixture
         .store()
         .execute_journal(&ctx, record.clone())
@@ -5248,16 +5263,20 @@ fn failure_before_receipt_rolls_back_record_and_checkpoint_then_exact_retry_succ
     );
     fixture.sql("CREATE TRIGGER fail_test_receipt BEFORE INSERT ON journal_operations WHEN NEW.request_id='fault-checkpoint' BEGIN SELECT RAISE(ABORT, 'injected before receipt'); END;").unwrap();
     let before_checkpoint = fixture.state();
-    assert!(matches!(
-        fixture.store().execute_journal(&ctx, cp.clone()),
-        Err(JournalError::Storage(_))
-    ));
+    let error = fixture
+        .store()
+        .execute_journal(&ctx, cp.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected before receipt"),
+        "{error}"
+    );
+    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     fixture.reopen();
     assert_eq!(fixture.state(), before_checkpoint);
     assert_eq!(fixture.sources(), sources);
     assert_eq!(fixture.receipt("fault-record"), Some(saved));
     assert!(fixture.receipt("fault-checkpoint").is_none());
-    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     let reflected = fixture.store().execute_journal(&ctx, cp.clone()).unwrap();
     assert_eq!((reflected.process_order, reflected.process_byte), (2, 0));
     fixture.reopen();
@@ -5529,7 +5548,8 @@ fn serialized_metadata_and_text_budgets_preserve_continuation_and_availability_r
 }
 
 #[test]
-fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existing_subject() {
+fn journal_migration_collision_is_rejected_before_ddl_and_retries_without_changing_existing_subject()
+ {
     for (baseline, collision, rolled_back) in [
         (&crate::MIGRATIONS[..7], "journal_entries", "journals"),
         (
@@ -5564,12 +5584,13 @@ fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existin
         let manager = FeatureStorage::new(&root);
         let scope = manager.scope("migration-rollback").unwrap();
         let registration = SubjektivStore::register(&scope).unwrap();
-        assert!(matches!(
-            SubjektivStore::open(&scope, &registration),
+        match SubjektivStore::open(&scope, &registration) {
             Err(crate::SubjektivError::Storage(
-                feature_storage::FeatureStorageError::MigrationFailed { .. }
-            ))
-        ));
+                feature_storage::FeatureStorageError::MigrationHistory { detail, .. },
+            )) => assert!(detail.contains(collision), "{detail}"),
+            Err(error) => panic!("expected pre-DDL shape refusal, got {error:?}"),
+            Ok(_) => panic!("colliding schema was accepted"),
+        }
         drop(scope);
         manager.shutdown().unwrap();
         drop(manager);
@@ -5591,6 +5612,17 @@ fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existin
                     [rolled_back],
                     |r| r.get::<_, bool>(0)
                 )?);
+                let receipts = tx
+                    .prepare(
+                        "SELECT version,name FROM __yoi_feature_schema_migrations ORDER BY version",
+                    )?
+                    .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let expected: Vec<_> = (baseline)
+                    .iter()
+                    .map(|m| (m.version(), m.name().to_string()))
+                    .collect();
+                assert_eq!(receipts, expected);
                 tx.execute_batch(&format!("DROP TABLE {collision}"))?;
                 Ok(())
             })
@@ -5994,16 +6026,19 @@ fn subject_deletion_fence_denies_all_journal_read_write_binding_and_recovery_pat
         ),
     );
     // Failed purge and restart must not revive any cached context or exact receipt.
-    f.sql("CREATE TRIGGER injected_subject_purge_failure BEFORE DELETE ON subjects BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    f.sql("CREATE TRIGGER injected_subject_purge_failure BEFORE DELETE ON subjects BEGIN SELECT RAISE(ABORT,'injected subject purge'); END;").unwrap();
+    let error = f
+        .store()
+        .finish_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap_err();
     assert!(
-        f.store()
-            .finish_subject_deletion(&f.host.subject_id, "delete")
-            .is_err()
+        error.to_string().contains("injected subject purge"),
+        "{error}"
     );
-    f.reopen();
-    subject_deleted(f.store().execute_journal(&ctx, operation));
     f.sql("DROP TRIGGER injected_subject_purge_failure;")
         .unwrap();
+    f.reopen();
+    subject_deleted(f.store().execute_journal(&ctx, operation));
     f.store()
         .finish_subject_deletion(&f.host.subject_id, "delete")
         .unwrap();
