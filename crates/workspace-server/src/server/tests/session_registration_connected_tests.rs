@@ -3,6 +3,7 @@
 //! Worker metadata. Only the unused external model is replaced. No restore,
 //! operation replay, singleton-release, or Browser rendering contract is asserted.
 use super::*;
+use api_macros::HttpError as _;
 use protocol::session_failure::{
     SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
 };
@@ -29,11 +30,17 @@ impl agen::llm_client::LlmClient for UnusedModel {
     }
 }
 
+type ReleaseFence = (
+    crate::store::WorkerSingletonLease,
+    subjektiv::journal::JournalWriterBinding,
+);
+
 struct RegistrationFixture {
     connected: ConnectedWorkerHarness,
     subject: String,
     callbacks: Arc<Mutex<Vec<(StatusCode, Value)>>>,
     model: UnusedModel,
+    release_fence: Arc<Mutex<Option<ReleaseFence>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -41,6 +48,7 @@ enum RegistrationFault {
     Allow,
     Deny,
     DenyWithMetadataReadFailure,
+    ReleasePending,
 }
 
 impl RegistrationFixture {
@@ -53,11 +61,14 @@ impl RegistrationFixture {
         let callbacks = Arc::new(Mutex::new(Vec::new()));
         let observed = callbacks.clone();
         let model = UnusedModel::default();
+        let release_fence = Arc::new(Mutex::new(None));
+        let reserved = release_fence.clone();
         let connected = ConnectedWorkerHarness::start_with_layer(model.clone(), move |router| {
             router.layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
                     let hook = hook.clone();
                     let observed = observed.clone();
+                    let reserved = reserved.clone();
                     async move {
                         if request.method() != axum::http::Method::POST
                             || request.uri().path()
@@ -82,22 +93,39 @@ impl RegistrationFixture {
                                     .iter()
                                     .any(|p| p.operation == "session.record")
                             );
-                            store
-                                .set_subject_permissions(
-                                    &subject,
-                                    &SubjectPermissionsUpdate {
-                                        operation_id: "session-registration-revoke-at-callback"
-                                            .into(),
-                                        expected_change_id: Some(policy.change_id),
-                                        execution: policy
-                                            .execution
-                                            .into_iter()
-                                            .filter(|p| p.operation != "session.record")
-                                            .collect(),
-                                        delegation: policy.delegation,
-                                    },
-                                )
-                                .unwrap();
+                            if matches!(fault, RegistrationFault::ReleasePending) {
+                                let key = crate::subjektiv::subject_worker_singleton_key(&subject).unwrap();
+                                let lease = api.store
+                                    .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+                                    .unwrap().unwrap();
+                                let writer = store.claim_journal_writer(
+                                    &subject, &lease.worker.runtime_id, &lease.worker.worker_id,
+                                ).unwrap();
+                                api.config_store.reserve_subject_release(
+                                    TEST_WORKSPACE_ID, &lease, &writer.binding_id,
+                                    "registration-release-fence",
+                                ).unwrap();
+                                assert!(store.journal_writer_active(&writer).unwrap());
+                                assert_eq!(api.store.current_worker_singleton_owner(TEST_WORKSPACE_ID, &key).unwrap(), Some(lease.clone()));
+                                *reserved.lock().unwrap() = Some((lease, writer));
+                            } else {
+                                store
+                                    .set_subject_permissions(
+                                        &subject,
+                                        &SubjectPermissionsUpdate {
+                                            operation_id: "session-registration-revoke-at-callback"
+                                                .into(),
+                                            expected_change_id: Some(policy.change_id),
+                                            execution: policy
+                                                .execution
+                                                .into_iter()
+                                                .filter(|p| p.operation != "session.record")
+                                                .collect(),
+                                            delegation: policy.delegation,
+                                        },
+                                    )
+                                    .unwrap();
+                            }
                         }
                         let (parts, body) = request.into_parts();
                         let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
@@ -171,6 +199,7 @@ impl RegistrationFixture {
             subject,
             callbacks,
             model,
+            release_fence,
         }
     }
 
@@ -483,6 +512,147 @@ async fn real_session_record_denial_and_metadata_save_failure_remain_separate() 
     assert!(
         reopened.read_by_name(&name).is_err(),
         "the real read failure remains, not a false saved cause"
+    );
+}
+
+#[tokio::test]
+async fn pending_release_binding_refusal_retains_original_conflict_source() {
+    let f = Fixture::new().await;
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let lease = f
+        .api
+        .store
+        .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &f.source)
+        .unwrap()
+        .unwrap();
+    let writer = store
+        .claim_journal_writer(&f.subject, &f.source.runtime_id, &f.source.worker_id)
+        .unwrap();
+    f.api
+        .config_store
+        .reserve_subject_release(
+            TEST_WORKSPACE_ID,
+            &lease,
+            &writer.binding_id,
+            "registration-source-release",
+        )
+        .unwrap();
+    let session = session_store::new_session_id().to_string();
+    let attr = crate::subjektiv::SubjectSessionAttribution::new(
+        &f.subject,
+        &f.source.runtime_id,
+        &f.source.worker_id,
+        &session,
+    )
+    .unwrap();
+    let error = session_registration::bind_host_session(&f.api, attr).unwrap_err();
+    assert_eq!(
+        error.session_registration_cause,
+        Some(SessionRegistrationCause::binding_mismatch())
+    );
+    assert!(matches!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<Error>(),
+        Some(Error::RepositoryConflict(_))
+    ));
+    assert_eq!(
+        error.into_repository_api_error().status_code(),
+        StatusCode::CONFLICT.as_u16()
+    );
+    assert!(store.session_attribution(&session).unwrap().is_none());
+    // A conflict without this explicit decision must not acquire a denial.
+    let unrelated = session_registration::Judgment::SessionRecord
+        .binding_rejection(Error::RepositoryConflict("an unrelated conflict".into()).into());
+    assert!(unrelated.session_registration_cause.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn release_fence_refusal_survives_signed_registration_and_metadata_reopen() {
+    let fixture = RegistrationFixture::new(RegistrationFault::ReleasePending).await;
+    let api = &fixture.connected.api;
+    let store = open_subjektiv_store(api).unwrap();
+    let policy = store
+        .subject_permissions(&fixture.subject)
+        .unwrap()
+        .unwrap();
+    let error = scoped_create_workspace_worker(
+        State(api.clone()),
+        AxumPath(ScopedWorkspacePath {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        }),
+        HeaderMap::new(),
+        Json(fixture.request()),
+    )
+    .await
+    .unwrap_err();
+    let session = fixture.assert_callback(StatusCode::CONFLICT);
+    let (lease, writer) = fixture.release_fence.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        store.subject_permissions(&fixture.subject).unwrap(),
+        Some(policy)
+    );
+    assert!(store.session_attribution(&session).unwrap().is_none());
+    assert!(store.journal_writer_active(&writer).unwrap());
+    api.config_store
+        .require_subject_release_intent(
+            TEST_WORKSPACE_ID,
+            &lease,
+            &writer.binding_id,
+            "registration-release-fence",
+        )
+        .unwrap();
+    assert!(
+        api.config_store
+            .subject_release_pending(TEST_WORKSPACE_ID, &lease.worker)
+            .unwrap()
+    );
+    assert!(
+        !api.config_store
+            .subject_release_proven(
+                TEST_WORKSPACE_ID,
+                &lease,
+                &writer.binding_id,
+                "registration-release-fence"
+            )
+            .unwrap()
+    );
+
+    let failures = fixture.connected.runtime_startup_failures.lock().unwrap();
+    assert_eq!(failures.len(), 1, "one real factory startup, not replay");
+    let wire = &failures[0];
+    let expected =
+        session_registration_attachment(SessionRegistrationCause::binding_mismatch()).unwrap();
+    assert_eq!(wire.primary, expected);
+    assert_eq!(
+        wire.persistence,
+        Some(protocol::startup_failure::StartupPersistenceOutcome::Persisted)
+    );
+    let host = error
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.startup.as_ref())
+        .find(|failure| failure.primary == expected)
+        .expect("Remote Host retains known refusal");
+    assert_eq!(host.primary, wire.primary);
+    assert!(
+        host.secondary.iter().any(|failure| matches!(
+            failure,
+            protocol::startup_failure::StartupSecondaryFailure::Persistence {
+                phase: protocol::startup_failure::StartupFailurePhase::RuntimeRecordDelete,
+                ..
+            }
+        )),
+        "retention cleanup failure is separate from refusal"
+    );
+    let saved = read_metadata(&fixture.connected.runtime_root, &lease.worker.worker_id);
+    assert!(contains_saved_value(
+        &saved,
+        &serde_json::to_value(&expected).unwrap()
+    ));
+    assert_eq!(
+        read_metadata(&fixture.connected.runtime_root, &lease.worker.worker_id),
+        saved
     );
 }
 

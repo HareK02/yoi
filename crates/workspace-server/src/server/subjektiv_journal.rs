@@ -470,10 +470,14 @@ pub(super) fn bind_host_session_for_registration(
         .config_store
         .subject_release_pending(api.workspace_id(), &worker)?
     {
-        return Err(Error::RepositoryConflict(
-            "Subject release intent fences Controller publication".into(),
-        )
-        .into());
+        // The current body is explicitly fenced from publication, not an
+        // unobserved callback outcome. Keep the conflict separate from its cause.
+        return Err(session_registration::Judgment::SessionRecord.error(
+            Error::RepositoryConflict(
+                "Subject release intent fences Controller publication".into(),
+            ),
+            protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
+        ));
     }
     let store = store(api)?;
     if store
