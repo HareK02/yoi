@@ -1608,17 +1608,95 @@ mod tests {
 
     #[test]
     fn input_retirement_migration_preserves_receipts_and_rolls_back_failed_ddl() {
-        let (dir, mut store) = fixture();
-        let original = store.reserve(request("upgrade")).unwrap();
-        store.conn.execute_batch("DROP TRIGGER job_input_retirement; DROP TRIGGER job_intent_immutable;
-            ALTER TABLE job_intents DROP COLUMN input_disposition;
-            CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF job_id,request_json,fingerprint,serialization_key,max_concurrent ON job_intents
-            BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
-            PRAGMA user_version=4;
-            CREATE TRIGGER job_input_retirement BEFORE UPDATE ON job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;").unwrap();
-        drop(store);
+        // The version/state matrix and FK rebuild belong to recovery::tests.
+        // Exercise the input-retirement DDL collision from the retained v4 schema,
+        // then prove that explicit erasure preserves the migrated receipts.
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("jobs.sqlite3");
-        assert!(JobStore::open(&path).is_err());
+        let mut conn = Connection::open(&path).unwrap();
+        feature_storage::configure_connection(&conn).unwrap();
+        let result = json!({"accepted":true});
+        let (result_digest, result_json) = job::result_digest(&result, 1024).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(legacy_migrations::SCHEMA).unwrap();
+        tx.execute_batch(GRANT_SCHEMA).unwrap();
+        tx.execute_batch(RECONCILIATION_SCHEMA).unwrap();
+        for (id, state, attempt_state) in [
+            ("upgrade", "pending", "reserved"),
+            ("receipt", "completed", "completed"),
+        ] {
+            let req = request(id);
+            tx.execute(
+                "INSERT INTO job_intents
+                 (job_id,request_json,fingerprint,max_concurrent,state,current_attempt,acknowledged)
+                 VALUES(?1,?2,?3,?4,?5,1,?6)",
+                params![
+                    id,
+                    serde_json::to_string(&req).unwrap(),
+                    req.fingerprint().unwrap(),
+                    req.limits.max_concurrent_jobs,
+                    state,
+                    id == "receipt"
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO job_attempts
+                 (job_id,number,attempt_id,input_digest,state,result_json,result_digest)
+                 VALUES(?1,1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    job::attempt_id(id, 1),
+                    req.input_digest().unwrap(),
+                    attempt_state,
+                    (id == "receipt").then_some(&result_json),
+                    (id == "receipt").then_some(&result_digest)
+                ],
+            )
+            .unwrap();
+        }
+        tx.execute_batch(
+            "INSERT INTO job_domain_grants VALUES('receipt','{\"domain\":\"fixture\"}');
+             INSERT INTO job_domain_reconciliations
+             VALUES('receipt','receipt:attempt:1','retained-domain-receipt');",
+        )
+        .unwrap();
+        tx.pragma_update(None, "user_version", 4).unwrap();
+        tx.commit().unwrap();
+        let read_receipts = |conn: &Connection| {
+            conn.query_row(
+                "SELECT a.result_json,a.result_digest,r.domain_receipt
+                 FROM job_attempts a JOIN job_domain_reconciliations r
+                 ON r.job_id=a.job_id AND r.attempt_id=a.attempt_id
+                 WHERE a.job_id='receipt'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let receipts = read_receipts(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER job_input_retirement BEFORE UPDATE ON job_attempts
+             BEGIN SELECT RAISE(ABORT,'collision'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = JobStore::open(&path)
+            .err()
+            .expect("DDL collision must fail");
+        assert!(matches!(&error, JobStoreError::Sqlite(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("trigger job_input_retirement already exists")
+        );
         let conn = Connection::open(&path).unwrap();
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1626,33 +1704,119 @@ mod tests {
         assert_eq!(version, 4);
         let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('job_intents') WHERE name='input_disposition')",[],|r|r.get(0)).unwrap();
         assert!(!present);
+        assert!(conn.prepare("SELECT * FROM job_version_history").is_err());
+        assert_eq!(read_receipts(&conn), receipts);
+        let original: (String, String, String) = conn
+            .query_row(
+                "SELECT i.request_json,i.state,a.state FROM job_intents i
+                 JOIN job_attempts a ON a.job_id=i.job_id WHERE i.job_id='upgrade'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            original,
+            (
+                serde_json::to_string(&request("upgrade")).unwrap(),
+                "pending".into(),
+                "reserved".into()
+            )
+        );
+        // Rollback must restore the v4 input immutability trigger, not only the column.
+        assert!(
+            conn.execute_batch("UPDATE job_intents SET request_json='{}' WHERE job_id='upgrade'")
+                .is_err()
+        );
         conn.execute_batch("DROP TRIGGER job_input_retirement")
             .unwrap();
         drop(conn);
+
         let mut reopened = JobStore::open(&path).unwrap();
-        assert_eq!(reopened.get("upgrade").unwrap(), original);
+        let stopped = reopened.get("upgrade").unwrap();
+        assert_eq!(stopped.request, request("upgrade"));
+        assert_eq!(stopped.state, JobState::Failed);
+        assert_eq!(stopped.attempt.state, JobAttemptState::Failed);
         assert_eq!(
-            reopened
-                .get("upgrade")
-                .unwrap()
-                .load_executable_request()
-                .unwrap(),
-            &request("upgrade")
+            stopped.attempt.failure.as_deref(),
+            Some(recovery::UPDATE_INTERRUPTION)
         );
-        let retired = reopened
-            .reclaim_input(
-                "upgrade",
-                &original.input_digest,
-                JobInputRetirementReason::ExplicitErasure,
-            )
-            .unwrap();
-        assert_eq!(retired.state, JobState::Pending);
+        assert!(stopped.version_stopped);
+        assert!(!stopped.executions_released());
+        assert!(stopped.start_rejected_by.is_none());
+        assert!(reopened.retry("upgrade").is_err());
         assert!(
             reopened
-                .conn
-                .execute_batch("UPDATE job_intents SET input_disposition='available'")
+                .dispatch("upgrade", &stopped.attempt.attempt_id, 8)
                 .is_err()
         );
+        assert!(reopened.pending().unwrap().is_empty());
+        let completed = reopened.get("receipt").unwrap();
+        assert_eq!(completed.request, request("receipt"));
+        assert_eq!(completed.state, JobState::Completed);
+        assert_eq!(completed.result, Some(result));
+        assert!(completed.acknowledged);
+        assert_eq!(read_receipts(&reopened.conn), receipts);
+        let history: (String, String) = reopened
+            .conn
+            .query_row(
+                "SELECT job_state,attempt_state FROM job_version_history WHERE job_id='upgrade'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(history, ("pending".into(), "reserved".into()));
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM job_attempts WHERE job_id='upgrade'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+
+        let mut retired_receipts = Vec::new();
+        for before in [stopped, completed] {
+            let id = &before.request.job_id;
+            let retired = reopened
+                .reclaim_input(
+                    id,
+                    &before.input_digest,
+                    JobInputRetirementReason::ExplicitErasure,
+                )
+                .unwrap();
+            assert_eq!(retired.state, before.state);
+            assert_eq!(retired.attempt, before.attempt);
+            assert_eq!(retired.result, before.result);
+            assert_eq!(retired.input_digest, before.input_digest);
+            assert_eq!(retired.intent_fingerprint, before.intent_fingerprint);
+            assert_eq!(retired.input_disposition, JobInputDisposition::Erased);
+            assert!(retired.request.input.is_null());
+            assert!(retired.load_executable_request().is_err());
+            assert!(
+                reopened
+                    .conn
+                    .execute(
+                        "UPDATE job_intents SET input_disposition='available' WHERE job_id=?1",
+                        [id]
+                    )
+                    .is_err()
+            );
+            retired_receipts.push(retired);
+        }
+        assert_eq!(read_receipts(&reopened.conn), receipts);
+        let fresh = reopened.reserve(request("after-upgrade")).unwrap();
+        assert!(!fresh.version_stopped);
+        drop(reopened);
+        let reopened = JobStore::open(&path).unwrap();
+        for retired in retired_receipts {
+            assert_eq!(reopened.get(&retired.request.job_id).unwrap(), retired);
+        }
+        assert_eq!(read_receipts(&reopened.conn), receipts);
+        assert_eq!(reopened.get("after-upgrade").unwrap(), fresh);
+        assert_eq!(reopened.pending().unwrap(), vec![fresh]);
     }
 
     #[test]
@@ -1846,6 +2010,9 @@ mod tests {
             )
         );
         store
+            .dispatch("retry", &second.attempt.attempt_id, 8)
+            .unwrap();
+        store
             .finish(
                 "retry",
                 &second.attempt.attempt_id,
@@ -1853,7 +2020,15 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!store.get("retry").unwrap().executions_released());
+        assert!(matches!(
+            store.retry("retry"),
+            Err(JobStoreError::InvalidTransition(
+                "version stop or unreleased execution forbids retry"
+            ))
+        ));
         record_runner_cleanup(&mut store, "retry");
+        assert!(store.get("retry").unwrap().executions_released());
         assert!(matches!(
             store.retry("retry"),
             Err(JobStoreError::InvalidTransition("attempt limit reached"))
@@ -2112,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn serialization_fences_pending_unknown_and_conflicting_retry() {
+    fn serialization_fences_unreleased_execution_and_conflicting_retry() {
         let (dir, mut store) = fixture();
         let mut first = request("first");
         first.serialization_key = Some("resource".into());
@@ -2133,10 +2308,13 @@ mod tests {
             reopened.reserve(second.clone()),
             Err(JobStoreError::SerializationConflict(_))
         ));
-        let cancelled_unknown = reopened.cancel("first").unwrap();
-        assert_eq!(cancelled_unknown.state, JobState::Cancelled);
-        assert_eq!(cancelled_unknown.attempt.state, JobAttemptState::Cancelled);
-        assert!(!cancelled_unknown.executions_released());
+        let cancelled_unreleased = reopened.cancel("first").unwrap();
+        assert_eq!(cancelled_unreleased.state, JobState::Cancelled);
+        assert_eq!(
+            cancelled_unreleased.attempt.state,
+            JobAttemptState::Cancelled
+        );
+        assert!(!cancelled_unreleased.executions_released());
         assert!(matches!(
             reopened.reserve(second.clone()),
             Err(JobStoreError::SerializationConflict(_))
@@ -2146,6 +2324,9 @@ mod tests {
         second.serialization_key = Some("independent-resource".into());
         let second_snapshot = reopened.reserve(second.clone()).unwrap();
         reopened
+            .dispatch("second", &second_snapshot.attempt.attempt_id, 8)
+            .unwrap();
+        reopened
             .finish(
                 "second",
                 &second_snapshot.attempt.attempt_id,
@@ -2153,6 +2334,15 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!reopened.get("second").unwrap().executions_released());
+        assert!(matches!(
+            reopened.retry("second"),
+            Err(JobStoreError::InvalidTransition(
+                "version stop or unreleased execution forbids retry"
+            ))
+        ));
+        record_runner_cleanup(&mut reopened, "second");
+        assert!(reopened.get("second").unwrap().executions_released());
         let mut third = request("third");
         third.serialization_key = Some("independent-resource".into());
         reopened.reserve(third).unwrap();
@@ -2312,11 +2502,11 @@ mod tests {
     #[test]
     fn failure_detail_is_utf8_bounded_and_terminal_classification_is_stable() {
         let (_dir, mut store) = fixture();
-        let reserved = store.reserve(request("failure")).unwrap();
+        let active = dispatched(&mut store, request("failure"));
         let failed = store
             .finish(
                 "failure",
-                &reserved.attempt.attempt_id,
+                &active.attempt.attempt_id,
                 JobAttemptState::Failed,
                 Some(&"猫".repeat(1024)),
             )
@@ -2328,7 +2518,7 @@ mod tests {
             store
                 .finish(
                     "failure",
-                    &reserved.attempt.attempt_id,
+                    &active.attempt.attempt_id,
                     JobAttemptState::Failed,
                     Some("different detail")
                 )
@@ -2339,7 +2529,7 @@ mod tests {
             store
                 .finish(
                     "failure",
-                    &reserved.attempt.attempt_id,
+                    &active.attempt.attempt_id,
                     JobAttemptState::Cancelled,
                     None
                 )
@@ -2349,15 +2539,26 @@ mod tests {
             store
                 .finish(
                     "failure",
-                    &reserved.attempt.attempt_id,
+                    &active.attempt.attempt_id,
                     JobAttemptState::Completed,
                     None
                 )
                 .is_err()
         );
-        assert!(store.accept(&submission(&reserved, json!({}))).is_err());
+        assert!(store.accept(&submission(&active, json!({}))).is_err());
         assert!(store.ack("failure").is_err());
         assert_eq!(store.cancel("failure").unwrap(), failed);
+        assert!(!failed.executions_released());
+        assert!(matches!(
+            store.retry("failure"),
+            Err(JobStoreError::InvalidTransition(
+                "version stop or unreleased execution forbids retry"
+            ))
+        ));
+        record_runner_cleanup(&mut store, "failure");
+        let released = store.get("failure").unwrap();
+        assert!(released.executions_released());
+        assert_eq!(released.attempt, failed.attempt);
         assert_eq!(store.retry("failure").unwrap().attempt.number, 2);
     }
 
