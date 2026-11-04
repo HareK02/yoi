@@ -43,7 +43,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 15;
+pub(crate) const SCHEMA_VERSION: u32 = 16;
+const SESSION_ARCHIVE_SCHEMA_VERSION: u32 = 15;
 const RESTORE_REPAIR_SCHEMA_VERSION: u32 = 14;
 const RESTORE_DECISION_SCHEMA_VERSION: u32 = 13;
 const RESTORE_ADMISSION_SCHEMA_VERSION: u32 = 12;
@@ -912,11 +913,12 @@ fn plan_runtime_store_migration(
             | RESTORE_ADMISSION_SCHEMA_VERSION
             | RESTORE_DECISION_SCHEMA_VERSION
             | RESTORE_REPAIR_SCHEMA_VERSION
+            | SESSION_ARCHIVE_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1253,6 +1255,7 @@ fn migrate_worker_record(
             | RESTORE_ADMISSION_SCHEMA_VERSION
             | RESTORE_DECISION_SCHEMA_VERSION
             | RESTORE_REPAIR_SCHEMA_VERSION
+            | SESSION_ARCHIVE_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -1744,6 +1747,7 @@ fn migrate_runtime_document(
             | RESTORE_ADMISSION_SCHEMA_VERSION
             | RESTORE_DECISION_SCHEMA_VERSION
             | RESTORE_REPAIR_SCHEMA_VERSION
+            | SESSION_ARCHIVE_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2295,6 +2299,7 @@ fn migrate_runtime_store_in_place(
                     | RESTORE_ADMISSION_SCHEMA_VERSION
                     | RESTORE_DECISION_SCHEMA_VERSION
                     | RESTORE_REPAIR_SCHEMA_VERSION
+                    | SESSION_ARCHIVE_SCHEMA_VERSION
             )
         {
             atomic_write_json(

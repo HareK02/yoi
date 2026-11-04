@@ -4518,6 +4518,11 @@ mod tests {
         let initial_ref = bound.status().summary.creation_ref.expect("creation ref");
 
         git(&bound.root, &["switch", "-c", "observed-branch"]);
+        git(&bound.root, &["config", "user.name", "Yoi Test"]);
+        git(
+            &bound.root,
+            &["config", "user.email", "test@example.invalid"],
+        );
         fs::write(bound.root.join("observed.txt"), "observed\n").unwrap();
         git(&bound.root, &["add", "observed.txt"]);
         git(&bound.root, &["commit", "-m", "advance workdir"]);

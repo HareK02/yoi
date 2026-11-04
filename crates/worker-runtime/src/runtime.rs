@@ -2400,6 +2400,7 @@ impl Runtime {
                         last_settled_status: candidate.status,
                     });
                 let operation_id = pending.operation_id;
+                candidate.restore_guard.execution_termination = None;
                 candidate.pending_restore = Some(pending);
                 candidate.restore_guard.rotate();
                 candidate.restore_guard.active_request_id = Some(request.request_id.clone());
@@ -3265,30 +3266,52 @@ impl Runtime {
         let _guard = operation_lock
             .lock()
             .map_err(|_| RuntimeError::StatePoisoned)?;
-        let backend = {
-            let state = self.lock()?;
+        let (backend, saved) = {
+            let mut state = self.lock()?;
             state.ensure_worker_ref(worker_ref)?;
-            state.worker(worker_ref)?;
-            state.execution_backend.clone().ok_or_else(|| {
+            // Unknown save acknowledgements must resolve against the same
+            // canonical operation before exposing its termination evidence.
+            state.refresh_uncertain_worker_write(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            let saved = worker
+                .restore_guard
+                .execution_termination
+                .clone()
+                .filter(|receipt| {
+                    worker.pending_stop.map_or_else(
+                        || {
+                            worker.status == WorkerStatus::Stopped
+                                && worker.pending_restore.is_none()
+                        },
+                        |pending| pending.operation_id == receipt.stop_operation_id,
+                    )
+                });
+            let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::WorkerExecutionUnavailable {
                     worker_id: worker_ref.worker_id,
                     message: "runtime has no execution backend".into(),
                 }
-            })?
+            })?;
+            (backend, saved)
         };
-        let receipt = backend.termination_receipt(worker_ref).map_err(|message| {
-            RuntimeError::WorkerExecutionUnavailable {
+        let Some(saved) = saved else {
+            // A backend map or stopped observation alone is not durable evidence.
+            return Ok(None);
+        };
+        let receipt = backend
+            .reconcile_termination_receipt(worker_ref, &saved)
+            .map_err(|message| RuntimeError::WorkerExecutionUnavailable {
                 worker_id: worker_ref.worker_id,
                 message,
-            }
-        })?;
-        if receipt
-            .as_ref()
-            .is_some_and(|receipt| &receipt.worker_ref != worker_ref)
-        {
+            })?;
+        if receipt.as_ref().is_some_and(|receipt| {
+            !receipt.confirms_scope_shutdown(worker_ref, receipt.stop_operation_id)
+                || &saved != receipt
+        }) {
             return Err(RuntimeError::WorkerExecutionUnavailable {
                 worker_id: worker_ref.worker_id,
-                message: "scope-termination receipt Worker mismatch".into(),
+                message: "scope-termination receipt does not match canonical operation evidence"
+                    .into(),
             });
         }
         Ok(receipt)
@@ -4354,15 +4377,6 @@ impl Runtime {
             operation_id,
             worker_ref: worker_ref.clone(),
         });
-        if !result.is_accepted() {
-            return Err(RuntimeError::WorkerExecutionRejected {
-                worker_id: worker_ref.worker_id,
-                operation: result.operation,
-                outcome: result.outcome,
-                message: result.message_or_default(),
-                result,
-            });
-        }
         self.commit_stopped_worker(worker_ref, operation_id, result)
     }
 
@@ -5102,15 +5116,6 @@ impl Runtime {
             operation_id,
             worker_ref: worker_ref.clone(),
         });
-        if !result.is_accepted() {
-            return Err(RuntimeError::WorkerExecutionRejected {
-                worker_id: worker_ref.worker_id,
-                operation: result.operation,
-                outcome: result.outcome,
-                message: result.message_or_default(),
-                result,
-            });
-        }
         self.commit_stopped_worker(worker_ref, operation_id, result)?;
         Ok(())
     }
@@ -5144,6 +5149,7 @@ impl Runtime {
             )));
         }
         candidate.restore_guard.rotate();
+        candidate.restore_guard.execution_termination = None;
         candidate.pending_stop = Some(PendingWorkerStop {
             operation_id,
             last_settled_status: candidate.status,
@@ -5179,12 +5185,25 @@ impl Runtime {
         operation_id: WorkerLifecycleOperationId,
         mut result: WorkerExecutionResult,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
-        if !result.is_accepted()
-            || result.operation != WorkerExecutionOperation::Stop
-            || result.termination.as_ref().is_none_or(|termination| {
-                !termination.confirms_scope_shutdown(worker_ref, operation_id)
+        let termination = result
+            .termination
+            .as_ref()
+            .filter(|termination| {
+                result.operation == WorkerExecutionOperation::Stop
+                    && result.execution_id == Some(termination.execution_id)
+                    && termination.confirms_scope_shutdown(worker_ref, operation_id)
             })
-        {
+            .cloned();
+        if !result.is_accepted() || termination.is_none() {
+            if let Some(termination) = termination {
+                // Scope join is independent of an artifact/resource cleanup error.
+                // Retain the original evidence without settling the pending Stop.
+                let mut state = self.lock()?;
+                let mut candidate = state.worker(worker_ref)?.clone();
+                candidate.retain_stop_termination(operation_id, termination)?;
+                state.persist_stop_worker_record(&candidate)?;
+                state.workers.insert(worker_ref.worker_id, candidate);
+            }
             if result.is_accepted() {
                 result.outcome = crate::execution::WorkerExecutionOutcome::Errored;
                 result.message = Some("stop has no matching actual scope termination evidence; reconciliation remains pending".into());
@@ -5212,6 +5231,8 @@ impl Runtime {
         if let Some(context) = candidate.restore_candidate_context.take() {
             context.discard_candidate();
         }
+        candidate
+            .retain_stop_termination(operation_id, termination.expect("validated termination"))?;
         let (candidate, ack) = candidate.stopped_candidate(operation_id);
         state.persist_stop_worker_record(&candidate)?;
         state.workers.insert(worker_ref.worker_id, candidate);
@@ -5264,6 +5285,7 @@ impl Runtime {
             owner.execution_started = true;
         }
         candidate.restore_guard.rotate();
+        candidate.restore_guard.execution_termination = None;
         candidate.pending_restore = Some(PendingWorkerRestore {
             operation_id,
             mode,
@@ -7509,6 +7531,10 @@ pub(crate) struct RestoreGuard {
     // eviction would forget request-ID conflicts and historical receipts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     stop_owners: BTreeMap<String, StopRequestOwner>,
+    // Original execution-owner evidence, independent of lifecycle/cleanup success.
+    // Older aggregates lack it; neither migration nor a stopped status creates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_termination: Option<crate::execution::WorkerExecutionTermination>,
 }
 
 impl Default for RestoreGuard {
@@ -7518,6 +7544,7 @@ impl Default for RestoreGuard {
             active_request_id: None,
             owners: BTreeMap::new(),
             stop_owners: BTreeMap::new(),
+            execution_termination: None,
         }
     }
 }
@@ -7579,6 +7606,29 @@ struct WorkerRecord {
 }
 
 impl WorkerRecord {
+    fn retain_stop_termination(
+        &mut self,
+        operation_id: WorkerLifecycleOperationId,
+        termination: crate::execution::WorkerExecutionTermination,
+    ) -> Result<(), RuntimeError> {
+        if self
+            .pending_stop
+            .is_none_or(|pending| pending.operation_id != operation_id)
+            || !termination.confirms_scope_shutdown(&self.worker_ref, operation_id)
+            || self
+                .restore_guard
+                .execution_termination
+                .as_ref()
+                .is_some_and(|saved| saved != &termination)
+        {
+            return Err(RuntimeError::InvalidRequest(
+                "scope termination differs from the canonical Stop operation".into(),
+            ));
+        }
+        self.restore_guard.execution_termination = Some(termination);
+        Ok(())
+    }
+
     // Pure projection shared by terminal commit and stop-owner capacity preflight.
     // Resource cleanup is deliberately outside this method.
     fn stopped_candidate(
@@ -10329,6 +10379,19 @@ mod tests {
             result
         }
 
+        fn termination_receipt(
+            &self,
+            worker_ref: &WorkerRef,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            Ok(self
+                .stop_terminations
+                .lock()
+                .unwrap()
+                .values()
+                .find(|receipt| &receipt.worker_ref == worker_ref)
+                .cloned())
+        }
+
         fn stop_worker_operation(
             &self,
             request: WorkerExecutionStopRequest,
@@ -12416,6 +12479,9 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], ids[1]);
     }
+
+    #[cfg(feature = "fs-store")]
+    include!("runtime/execution_termination_tests.rs");
 
     #[cfg(feature = "fs-store")]
     #[test]
@@ -16318,9 +16384,16 @@ mod tests {
             display_name: None,
         })
         .unwrap_err();
-        assert!(error.to_string().contains(
-            "unsupported Runtime store schema version 2; expected 6, 7, 8, 9, 10, 11, 12, 13, 14, or 15"
-        ));
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Runtime store schema version 2")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("or {}", crate::fs_store::SCHEMA_VERSION))
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

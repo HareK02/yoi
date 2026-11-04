@@ -1157,6 +1157,18 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Err("execution backend has no scope-termination receipt reader".into())
     }
 
+    /// Reconcile canonical execution-owner evidence against current backend
+    /// ownership. The default cannot certify a receipt lost by this backend.
+    fn reconcile_termination_receipt(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: &WorkerExecutionTermination,
+    ) -> Result<Option<WorkerExecutionTermination>, String> {
+        Ok(self
+            .termination_receipt(worker_ref)?
+            .filter(|current| current == saved))
+    }
+
     fn dispatch_input(&self, worker_ref: &WorkerRef, input: WorkerInput) -> WorkerExecutionResult;
 
     fn upload_file(
@@ -1458,11 +1470,13 @@ impl WorkerExecutionBackendRef {
         self.backend.reconcile_submission(worker_ref, input)
     }
 
-    pub(crate) fn termination_receipt(
+    pub(crate) fn reconcile_termination_receipt(
         &self,
         worker_ref: &WorkerRef,
+        saved: &WorkerExecutionTermination,
     ) -> Result<Option<WorkerExecutionTermination>, String> {
-        self.backend.termination_receipt(worker_ref)
+        self.backend
+            .reconcile_termination_receipt(worker_ref, saved)
     }
 
     pub(crate) fn dispatch_input(

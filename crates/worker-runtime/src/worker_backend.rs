@@ -158,8 +158,6 @@ use workdir::{
     WorkdirSessionHandle, WorkdirSessionRouter,
 };
 
-#[cfg(test)]
-use worker::WorkerController;
 use worker::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession;
 use worker::feature::contracts::{
     WorkerObservationError, WorkerObservationProvider, WorkerObservationSubject,
@@ -3290,6 +3288,9 @@ struct RuntimeExecutionTaskScope {
     execution_id: uuid::Uuid,
     shutdown_report: Arc<Mutex<Option<Vec<crate::execution::WorkerFeatureShutdownFailure>>>>,
     submissions: Arc<Mutex<Vec<crate::execution::WorkerSubmissionAck>>>,
+    // Dispatch provenance belongs to this original Controller scope, not its
+    // WorkerRef or the session receipts inherited by a replacement Controller.
+    submission_attempts: Arc<Mutex<HashMap<String, [u8; 32]>>>,
     #[cfg(feature = "ws-server")]
     protocol_bridge: Arc<Mutex<Option<RuntimeProtocolBridge>>>,
     tasks: Arc<Mutex<Vec<Arc<RuntimeExecutionTask>>>>,
@@ -3392,6 +3393,7 @@ impl RuntimeExecutionTaskScope {
             execution_id: uuid::Uuid::now_v7(),
             shutdown_report: Arc::default(),
             submissions: Arc::default(),
+            submission_attempts: Arc::default(),
             #[cfg(feature = "ws-server")]
             protocol_bridge: Arc::default(),
             tasks: Arc::new(Mutex::new(Vec::new())),
@@ -3400,6 +3402,83 @@ impl RuntimeExecutionTaskScope {
         };
         scope.push("controller", controller_task, false);
         scope
+    }
+
+    fn submission_fingerprint(
+        input: &[Segment],
+        source: &protocol::AuthenticatedInputSource,
+    ) -> Result<[u8; 32], String> {
+        use sha2::Digest as _;
+        let payload = serde_json::to_vec(&(input, source))
+            .map_err(|_| "cannot bind original Controller submission payload".to_string())?;
+        Ok(sha2::Sha256::digest(payload).into())
+    }
+
+    fn prepare_submission(
+        &self,
+        handle: &WorkerHandle,
+        request_id: &str,
+        input: &[Segment],
+        source: &protocol::AuthenticatedInputSource,
+    ) -> Result<[u8; 32], String> {
+        let fingerprint = Self::submission_fingerprint(input, source)?;
+        let mut attempts = self
+            .submission_attempts
+            .lock()
+            .map_err(|_| "original Controller submission ownership is poisoned".to_string())?;
+        // An inherited receipt can be read or replayed, but neither attributes
+        // its original acceptance to this new Controller. None alone grants no
+        // acceptance/replay: bind only the actual dispatch that follows, then
+        // require the same handle's exact durable receipt before retaining an ack.
+        if !attempts.contains_key(request_id)
+            && matches!(
+                handle.reconcile_submission(request_id, input, source),
+                Ok(None)
+            )
+        {
+            attempts.insert(request_id.to_string(), fingerprint);
+        }
+        Ok(fingerprint)
+    }
+
+    fn retain_submission_acceptance(
+        &self,
+        ack: &crate::execution::WorkerSubmissionAck,
+        fingerprint: &[u8; 32],
+    ) -> Result<(), String> {
+        let attempts = self
+            .submission_attempts
+            .lock()
+            .map_err(|_| "original Controller submission ownership is poisoned".to_string())?;
+        if attempts.get(&ack.submission_request_id) != Some(fingerprint) {
+            return Ok(());
+        }
+        let mut submissions = self
+            .submissions
+            .lock()
+            .map_err(|_| "original Controller submission receipts are poisoned".to_string())?;
+        if let Some(saved) = submissions
+            .iter()
+            .find(|saved| saved.submission_request_id == ack.submission_request_id)
+        {
+            if saved != ack {
+                return Err("original Controller submission acceptance changed".into());
+            }
+        } else {
+            // A joined scope may already have an original canonical receipt,
+            // including a pending Stop after resource-cleanup failure. A later
+            // read must never amend that immutable evidence.
+            if self
+                .shutdown_report
+                .lock()
+                .map_err(|_| "Controller shutdown report lock is poisoned".to_string())?
+                .is_some()
+            {
+                return Ok(());
+            }
+            submissions.push(ack.clone());
+        }
+        Ok(())
     }
 
     fn has_cleanup_candidates(&self) -> Result<bool, String> {
@@ -3793,6 +3872,8 @@ struct WorkerAdmission {
 pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     #[cfg(test)]
     bridge_fault: Mutex<Option<crate::execution::RestoreTestGate<WorkerHandle>>>,
+    #[cfg(test)]
+    lost_submission_ack: Mutex<Option<String>>,
     backend_id: String,
     factory: Arc<F>,
     working_directory_materializer: Option<Arc<dyn WorkingDirectoryMaterializer>>,
@@ -3833,6 +3914,8 @@ where
         Ok(Self {
             #[cfg(test)]
             bridge_fault: Mutex::default(),
+            #[cfg(test)]
+            lost_submission_ack: Mutex::default(),
             backend_id: DEFAULT_BACKEND_ID.to_string(),
             factory: Arc::new(factory),
             working_directory_materializer: None,
@@ -4550,6 +4633,8 @@ where
         submission_request_id: String,
     ) -> WorkerExecutionResult {
         let request_id = submission_request_id.clone();
+        #[cfg(test)]
+        let lost_ack = self.lost_submission_ack.lock().unwrap().take();
         self.run_cancellable_on_adapter_runtime(USER_INPUT_TASK_TIMEOUT, async move {
             // Subscribe before enqueueing so a fast durable acceptance cannot
             // race the Runtime acknowledgement.
@@ -4567,6 +4652,12 @@ where
                             submission_id,
                             disposition,
                         }) if submission_request_id == request_id => {
+                            #[cfg(test)]
+                            if lost_ack.as_deref() == Some(request_id.as_str()) {
+                                // Lose only the caller's delivery after the real
+                                // Controller emitted its durable acceptance.
+                                continue;
+                            }
                             return Ok((submission_id, disposition));
                         }
                         Ok(Event::SubmissionRejected {
@@ -5132,6 +5223,57 @@ where
             .map_err(|_| "fresh spawn owner lock is poisoned")?
             .remove(worker_ref);
         Ok(())
+    }
+
+    fn read_termination_receipt(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: Option<&crate::execution::WorkerExecutionTermination>,
+    ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+        let operation = self.worker_lock(worker_ref)?;
+        let _guard = operation
+            .lock()
+            .map_err(|_| "Worker operation lock poisoned".to_string())?;
+        if self
+            .pending_spawns
+            .lock()
+            .map_err(|_| "Worker spawn registry poisoned".to_string())?
+            .contains_key(worker_ref)
+            || self
+                .pending_restores
+                .lock()
+                .map_err(|_| "Worker restore registry poisoned".to_string())?
+                .contains_key(worker_ref)
+            || self
+                .subject_reservations
+                .lock()
+                .map_err(|_| "Subject reservation registry poisoned".to_string())?
+                .keys()
+                .any(|(worker, _)| worker == worker_ref)
+        {
+            return Ok(None);
+        }
+        let current_execution = self
+            .workers
+            .lock()
+            .map_err(|_| "Worker execution registry poisoned".to_string())?
+            .get(worker_ref)
+            .map(|execution| execution.tasks.execution_id);
+        let receipt = self
+            .completed_stops
+            .lock()
+            .map_err(|_| "Worker termination receipts poisoned".to_string())?
+            .get(worker_ref)
+            .cloned();
+        if let (Some(current), Some(saved)) = (&receipt, saved)
+            && current != saved
+        {
+            return Err("retained scope termination differs from canonical Stop receipt".into());
+        }
+        let receipt = receipt.or_else(|| saved.cloned());
+        // The positive receipt comes only from the joined scope, never from
+        // absence. A Restore's new Controller cannot reuse its predecessor's end.
+        Ok(receipt.filter(|receipt| current_execution.is_none_or(|id| id == receipt.execution_id)))
     }
 
     fn stop_worker_operation_under_lock(
@@ -7320,44 +7462,20 @@ where
         &self,
         worker_ref: &WorkerRef,
     ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
-        let operation = self.worker_lock(worker_ref)?;
-        let _guard = operation
-            .lock()
-            .map_err(|_| "Worker operation lock poisoned".to_string())?;
-        if self
-            .pending_spawns
-            .lock()
-            .map_err(|_| "Worker spawn registry poisoned".to_string())?
-            .contains_key(worker_ref)
-            || self
-                .pending_restores
-                .lock()
-                .map_err(|_| "Worker restore registry poisoned".to_string())?
-                .contains_key(worker_ref)
-            || self
-                .subject_reservations
-                .lock()
-                .map_err(|_| "Subject reservation registry poisoned".to_string())?
-                .keys()
-                .any(|(worker, _)| worker == worker_ref)
-        {
-            return Ok(None);
+        self.read_termination_receipt(worker_ref, None)
+    }
+
+    fn reconcile_termination_receipt(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: &crate::execution::WorkerExecutionTermination,
+    ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+        if !saved.confirms_scope_shutdown(worker_ref, saved.stop_operation_id) {
+            return Err(
+                "canonical scope termination has a Worker mismatch or Feature failure".into(),
+            );
         }
-        let current_execution = self
-            .workers
-            .lock()
-            .map_err(|_| "Worker execution registry poisoned".to_string())?
-            .get(worker_ref)
-            .map(|execution| execution.tasks.execution_id);
-        let receipt = self
-            .completed_stops
-            .lock()
-            .map_err(|_| "Worker termination receipts poisoned".to_string())?
-            .get(worker_ref)
-            .cloned();
-        // The positive receipt comes only from the joined scope, never from
-        // absence. A Restore's new Controller cannot reuse its predecessor's end.
-        Ok(receipt.filter(|receipt| current_execution.is_none_or(|id| id == receipt.execution_id)))
+        self.read_termination_receipt(worker_ref, Some(saved))
     }
 
     fn reconcile_submission(
@@ -7443,8 +7561,22 @@ where
                 "exact submission receipt lookup failed; submission acceptance remains unknown",
             ),
         };
+        if result.is_accepted()
+            && let Some(ack) = result.submission.as_ref()
+            && let Err(message) = RuntimeExecutionTaskScope::submission_fingerprint(
+                &segments, &source,
+            )
+            .and_then(|fingerprint| {
+                execution
+                    .tasks
+                    .retain_submission_acceptance(ack, &fingerprint)
+            })
+        {
+            result = unknown(&message);
+        }
         // Identify the Controller observed, not the originating run of a receipt
-        // retained across Controller replacement. This is not termination evidence.
+        // retained across Controller replacement. Only this scope's original
+        // dispatch binding above permits adding it to termination evidence.
         result.execution_id = Some(execution.tasks.execution_id);
         result
     }
@@ -7469,13 +7601,27 @@ where
                 error.to_string(),
             );
         }
-        let (worker, worker_state, _workspace_client) = match self.get_execution(worker_ref) {
-            Ok(execution) => execution,
-            Err(mut result) => {
-                result.operation = WorkerExecutionOperation::Input;
-                return result;
+        // Pin the actual endpoint and scope while holding the per-Worker lock;
+        // do not attach a late acceptance through a fresh WorkerRef lookup.
+        let execution = match self.workers.lock() {
+            Ok(workers) => match workers.get(worker_ref) {
+                Some(execution) => execution.clone(),
+                None => {
+                    return WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Input,
+                        "WorkerRef does not reference a live Worker execution",
+                    );
+                }
+            },
+            Err(_) => {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Input,
+                    "worker adapter registry lock is poisoned",
+                );
             }
         };
+        let worker = execution.handle.clone();
+        let worker_state = execution.worker_state.clone();
 
         if input.kind == WorkerInputKind::Notify {
             let notification_request_id = input
@@ -7512,6 +7658,7 @@ where
             );
         }
 
+        let mut submission_binding = None;
         let (method, submission_request_id) = match input.kind {
             WorkerInputKind::User | WorkerInputKind::UserIfIdle => {
                 let Some(submission_id) = input
@@ -7526,6 +7673,20 @@ where
                     );
                 };
                 let (segments, source) = runtime_submission_payload(&input, &submission_id);
+                submission_binding = match execution.tasks.prepare_submission(
+                    &worker,
+                    &submission_id,
+                    &segments,
+                    &source,
+                ) {
+                    Ok(fingerprint) => Some(fingerprint),
+                    Err(message) => {
+                        return WorkerExecutionResult::errored(
+                            WorkerExecutionOperation::Input,
+                            message,
+                        );
+                    }
+                };
                 let method = if input.kind == WorkerInputKind::UserIfIdle {
                     Method::SubmitIfIdle {
                         submission_request_id: submission_id.clone(),
@@ -7566,27 +7727,17 @@ where
         } else {
             self.send_method(WorkerExecutionOperation::Input, worker, method)
         };
-        if let Some(execution) = self
-            .workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(worker_ref)
+        if result.is_accepted()
+            && let Some(ack) = result.submission.as_ref()
+            && Some(&ack.submission_request_id) == submission_request_id.as_ref()
+            && let Some(fingerprint) = submission_binding
+            && let Err(message) = execution
+                .tasks
+                .retain_submission_acceptance(ack, &fingerprint)
         {
-            result.execution_id = Some(execution.tasks.execution_id);
-            if result.is_accepted()
-                && let Some(ack) = result.submission.as_ref()
-                && Some(&ack.submission_request_id) == submission_request_id.as_ref()
-            {
-                let mut submissions = execution
-                    .tasks
-                    .submissions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !submissions.contains(ack) {
-                    submissions.push(ack.clone());
-                }
-            }
+            result = WorkerExecutionResult::errored(WorkerExecutionOperation::Input, message);
         }
+        result.execution_id = Some(execution.tasks.execution_id);
         result
     }
 
@@ -8004,6 +8155,8 @@ mod tests {
 
     include!("subject_delete_backend_tests.rs");
     include!("worker_backend/startup_binding_tests.rs");
+    include!("worker_backend/termination_persistence_tests.rs");
+    include!("worker_backend/submission_termination_tests.rs");
     #[cfg(feature = "fs-store")]
     include!("subject_delete_create_tests.rs");
 
@@ -11263,20 +11416,11 @@ mod tests {
         observed_workspace_clients: Arc<Mutex<Vec<(String, Option<String>, bool)>>>,
     }
 
-    #[async_trait]
-    impl RuntimeWorkerFactory for MockFactory {
-        async fn prepare_restore(
-            &self,
-            request: WorkerExecutionRestoreRequest,
-        ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
-            self.restore_controller(request).await.map(|controller| {
-                Box::new(TestRestoreCandidate(Some(controller))) as Box<dyn RuntimeRestoreCandidate>
-            })
-        }
-
-        async fn spawn_controller(
+    impl MockFactory {
+        async fn spawn_controller_with_saved_source(
             &self,
             request: WorkerExecutionSpawnRequest,
+            save_restore_source: bool,
         ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
             let manifest = WorkerManifest::from_toml(
                 r#"
@@ -11356,7 +11500,7 @@ mod tests {
                 workspace_client.is_available(),
             ));
             let scope = Scope::writable(&scope_root).map_err(|err| err.to_string())?;
-            let worker = Worker::new(
+            let mut worker = Worker::new(
                 manifest,
                 Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
                     self.client.clone(),
@@ -11368,17 +11512,49 @@ mod tests {
             )
             .await
             .map_err(|err| err.to_string())?;
-            let (handle, shutdown_rx) =
-                WorkerController::spawn_runtime_managed(worker, &self.runtime_base)
-                    .await
-                    .map_err(|err| err.to_string())?;
+            if save_restore_source {
+                worker
+                    .engine_mut()
+                    .set_system_prompt("saved original Controller fixture prompt");
+                worker
+                    .enable_worker_metadata_write_through()
+                    .map_err(|error| error.to_string())?;
+            }
+            let started = worker::bootstrap::start_worker_controller(
+                worker,
+                worker::bootstrap::WorkerBootstrapLayout::Direct {
+                    runtime_base: self.runtime_base.clone(),
+                },
+            )
+            .await
+            .map_err(|err| err.to_string())?;
             Ok(RuntimeWorkerController {
-                handle,
-                shutdown: Arc::new(tokio::sync::Mutex::new(Some(shutdown_rx))),
-                controller_task: tokio::spawn(async {}),
+                handle: started.handle,
+                shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
+                controller_task: started.controller_task,
                 workspace_client,
                 restore_streams: None,
             })
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeWorkerFactory for MockFactory {
+        async fn prepare_restore(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> Result<Box<dyn RuntimeRestoreCandidate>, RuntimeRestoreFailure> {
+            self.restore_controller(request).await.map(|controller| {
+                Box::new(TestRestoreCandidate(Some(controller))) as Box<dyn RuntimeRestoreCandidate>
+            })
+        }
+
+        async fn spawn_controller(
+            &self,
+            request: WorkerExecutionSpawnRequest,
+        ) -> Result<RuntimeWorkerController, RuntimeRestoreFailure> {
+            self.spawn_controller_with_saved_source(request, false)
+                .await
         }
         async fn restore_controller(
             &self,
