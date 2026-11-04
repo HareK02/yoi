@@ -852,7 +852,7 @@ mod tests {
         assert!(acquired);
         assert_eq!(
             store
-                .recover_backend_job_worker_cleanups("workspace", "later", 100)
+                .list_backend_job_worker_cleanups("workspace", None, 100)
                 .unwrap(),
             vec![executing.clone()]
         );
@@ -953,7 +953,7 @@ mod tests {
         }).unwrap();
         assert!(
             store
-                .list_backend_job_worker_cleanups("workspace", 100)
+                .list_backend_job_worker_cleanups("workspace", None, 100)
                 .unwrap()
                 .is_empty()
         );
@@ -977,7 +977,7 @@ mod tests {
             Ok(())
         }).unwrap();
         let selected = store
-            .recover_backend_job_worker_cleanups("workspace", NOW, 100)
+            .list_backend_job_worker_cleanups("workspace", None, 100)
             .unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].attempt_id, journal.attempt.attempt_id);
@@ -1000,7 +1000,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .recover_backend_job_worker_cleanups("workspace", NOW, 100)
+                .list_backend_job_worker_cleanups("workspace", None, 100)
                 .unwrap()
                 .is_empty()
         );

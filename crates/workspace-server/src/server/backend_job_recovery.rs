@@ -23,9 +23,21 @@ pub(super) struct RecoveryOwners {
     pub(super) storage_probe_started: tokio::sync::Notify,
     #[cfg(test)]
     pub(super) nonjournal_lookup_pending: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) cleanup_before_claim: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl RecoveryOwners {
+    #[cfg(test)]
+    pub(super) fn resume_after_test_pause(&self) {
+        self.stopping.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_owner_ids(&self) -> HashSet<String> {
+        self.cleanup_running.lock().unwrap().clone()
+    }
+
     async fn pause(&self, duration: Duration) {
         let notified = self.changed.notified();
         tokio::pin!(notified);
@@ -389,6 +401,21 @@ impl WorkspaceApi {
         // inside the result's Job lease would make close_and_drain wait on itself.
         runtime.spawn(async move {
             let _lease = lease;
+            #[cfg(test)]
+            {
+                let gate = api
+                    .backend_job_recovery
+                    .cleanup_before_claim
+                    .lock()
+                    .unwrap()
+                    .clone();
+                if let Some(gate) = gate {
+                    let Ok(permit) = gate.acquire().await else {
+                        return;
+                    };
+                    drop(permit);
+                }
+            }
             if let Err(error) = api.run_backend_job_cleanup(expected.clone()).await {
                 tracing::warn!(job_id=%expected.job_id, attempt_id=%expected.attempt_id, %error,
                     "Job cleanup stopped; execution/input/resource fences remain retained");

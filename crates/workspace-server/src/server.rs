@@ -5386,25 +5386,28 @@ impl WorkspaceApi {
         // Available input. Its owner takes the retirement-only step before claim;
         // neither a live Worker nor a new removal operation is required.
         let page_limit = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS);
-        let mut attempts = self.store.recover_backend_job_worker_cleanups(
-            &self.config.workspace_id,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            page_limit,
-        )?;
+        let mut after: Option<(String, String)> = None;
         loop {
-            if attempts.is_empty() {
+            let attempts = self.store.list_backend_job_worker_cleanups(
+                &self.config.workspace_id,
+                after
+                    .as_ref()
+                    .map(|(job, attempt)| (job.as_str(), attempt.as_str())),
+                page_limit,
+            )?;
+            let Some(last) = attempts.last() else {
+                return Ok(());
+            };
+            let next = (last.job_id.clone(), last.attempt_id.clone());
+            for attempt in &attempts {
+                self.schedule_backend_job_worker_cleanup(attempt);
+            }
+            if attempts.len() < page_limit {
                 return Ok(());
             }
-            let scheduled = attempts
-                .iter()
-                .filter(|attempt| self.schedule_backend_job_worker_cleanup(attempt))
-                .count();
-            if attempts.len() < page_limit || scheduled == 0 {
-                return Ok(());
-            }
-            attempts = self
-                .store
-                .list_backend_job_worker_cleanups(&self.config.workspace_id, page_limit)?;
+            // Deduplicated/Executing owners must not hide a later page. Their
+            // progress and timestamps are independent of this read-only cursor.
+            after = Some(next);
         }
     }
 

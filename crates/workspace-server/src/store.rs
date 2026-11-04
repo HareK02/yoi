@@ -2131,15 +2131,10 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         failure_detail: &str,
         now: &str,
     ) -> Result<BackendJobAttemptRecord>;
-    fn recover_backend_job_worker_cleanups(
-        &self,
-        workspace_id: &str,
-        now: &str,
-        limit: usize,
-    ) -> Result<Vec<BackendJobAttemptRecord>>;
     fn list_backend_job_worker_cleanups(
         &self,
         workspace_id: &str,
+        after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>>;
     fn claim_backend_job_worker_cleanup(
@@ -8731,28 +8726,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn recover_backend_job_worker_cleanups(
-        &self,
-        workspace_id: &str,
-        _now: &str,
-        limit: usize,
-    ) -> Result<Vec<BackendJobAttemptRecord>> {
-        // Reopening observes retained owners; it does not revoke an executing
-        // cleanup or authorize a new one by resetting its state.
-        self.list_backend_job_worker_cleanups(workspace_id, limit)
-    }
-
     fn list_backend_job_worker_cleanups(
         &self,
         workspace_id: &str,
+        after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR (a.state='completed' AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.worker_cleanup_updated_at, a.created_at LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR (a.state='completed' AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
+            // Immutable identities keep the boundary stable while admitted
+            // owners change cleanup state/timestamps. Selection grants no claim.
             let identities = statement
-                .query_map(params![workspace_id, limit as i64], |row| {
+                .query_map(params![workspace_id, limit as i64, after.map(|(job, _)| job), after.map(|(_, attempt)| attempt)], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

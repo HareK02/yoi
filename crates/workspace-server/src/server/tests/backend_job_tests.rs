@@ -1422,6 +1422,120 @@ async fn backend_job_input_response_loss_is_owned_until_deadline_without_resubmi
 }
 
 #[tokio::test]
+async fn cleanup_recovery_owns_later_pages_while_first_page_is_held_before_claim() {
+    let temp = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+    // Seed accepted/terminal Jobs without automatic owner tasks. Keep the actual
+    // original Host owners: this fixture pause is not a reconstructed restart fence.
+    api.stop_backend_job_recovery().await;
+    let count = usize::from(ABSOLUTE_MAX_CONCURRENT_JOBS) + 2;
+    let mut attempts = Vec::new();
+    for index in 0..count {
+        let request = recovery_request(&format!("cleanup-page-{index:03}"));
+        let dispatched = api.dispatch_backend_job(&request).unwrap();
+        seed_worker_session_for_cleanup(temp.path(), dispatched.attempt.worker.as_ref().unwrap());
+        let terminal = api
+            .store
+            .finish_backend_job_attempt(
+                TEST_WORKSPACE_ID,
+                &request.job_id,
+                &dispatched.attempt.attempt_id,
+                BackendJobAttemptState::Failed,
+                "fixture_failure",
+                "Original result retained",
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        attempts.push(terminal);
+    }
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *api.backend_job_recovery
+        .cleanup_before_claim
+        .lock()
+        .unwrap() = Some(gate.clone());
+    api.backend_job_recovery.resume_after_test_pause();
+    api.recover_backend_job_worker_cleanups().unwrap();
+    let owners = api.backend_job_recovery.cleanup_owner_ids();
+    assert_eq!(
+        owners.len(),
+        count,
+        "later pages must be owned before any prior cleanup claim progresses"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| owners.contains(&attempt.attempt_id))
+    );
+    for attempt in &attempts {
+        assert_eq!(
+            api.store
+                .get_backend_job_attempt(TEST_WORKSPACE_ID, &attempt.job_id, &attempt.attempt_id)
+                .unwrap()
+                .unwrap()
+                .worker_cleanup_state,
+            Some(BackendJobWorkerCleanupState::Pending)
+        );
+    }
+    // A concurrent sweep sees the same admitted owners and must advance past
+    // them too, without creating another owner or needing a later user request.
+    api.recover_backend_job_worker_cleanups().unwrap();
+    assert_eq!(api.backend_job_recovery.cleanup_owner_ids(), owners);
+    gate.add_permits(count);
+    // The two finite cleanup workers perform real canonical removal/retention
+    // writes for every fixture Worker; allow bounded per-Worker drain time.
+    tokio::time::timeout(std::time::Duration::from_secs(3 * count as u64), async {
+        loop {
+            let mut complete = true;
+            for attempt in &attempts {
+                let saved = api
+                    .store
+                    .get_backend_job_attempt(
+                        TEST_WORKSPACE_ID,
+                        &attempt.job_id,
+                        &attempt.attempt_id,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(saved.worker, attempt.worker);
+                assert_eq!(saved.runtime_run_id, attempt.runtime_run_id);
+                assert_eq!(saved.failure_category, attempt.failure_category);
+                if saved.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
+                    && !api.backend_job_recovery.cleanup_owner_ids().contains(&saved.attempt_id)
+                {
+                    panic!("cleanup owner exited before completion: job={} state={:?} cause={:?}: {:?}",
+                        saved.job_id, saved.worker_cleanup_state,
+                        saved.worker_cleanup_failure_category, saved.worker_cleanup_failure_detail);
+                }
+                complete &=
+                    saved.worker_cleanup_state == Some(BackendJobWorkerCleanupState::Completed);
+            }
+            if complete {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let pending: Vec<_> = attempts.iter().filter_map(|attempt| {
+            let saved = api.store.get_backend_job_attempt(TEST_WORKSPACE_ID, &attempt.job_id, &attempt.attempt_id)
+                .unwrap().unwrap();
+            (saved.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)).then_some((
+                saved.job_id, saved.worker_cleanup_state,
+                saved.worker_cleanup_failure_category, saved.worker_cleanup_failure_detail))
+        }).collect();
+        panic!("cleanup page did not finish: live_owners={}, pending={pending:?}",
+            api.backend_job_recovery.cleanup_owner_ids().len());
+    });
+    assert_eq!(
+        execution.take_inputs().len(),
+        count,
+        "cleanup never repeats model input"
+    );
+    api.stop_backend_job_recovery().await;
+}
+
+#[tokio::test]
 async fn backend_job_recovery_drains_more_than_one_reserved_page() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
