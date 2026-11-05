@@ -66,7 +66,52 @@ impl StandaloneJobs {
         ))
     }
 
-    async fn recovery_closed(&self) {
+    /// Subscribe before attempting admission; callers must enable the returned
+    /// notification before checking capacity to retain releases racing that check.
+    pub(crate) fn admission_changed(&self) -> tokio::sync::futures::OwnedNotified {
+        self.capacity_changed.clone().notified_owned()
+    }
+
+    /// A completion notification precedes task return. Join only successful
+    /// completions before releasing their slot; an error retains actual ownership.
+    pub(crate) async fn join_completed_admissions(&self) {
+        let completed: Vec<_> = self
+            .executions
+            .lock()
+            .expect("Job executions poisoned")
+            .jobs
+            .iter()
+            .filter(|(_, run)| matches!(run.complete.borrow().as_ref(), Some(Ok(()))))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in completed {
+            let _ = self.wait(&id).await;
+        }
+    }
+
+    /// Exact granted admission only, never a lookup of a future attempt by ID.
+    /// The start lock rechecks input, grant and ALL prior execution cleanup.
+    pub(crate) fn start_reserved_granted(
+        &self,
+        expected: &JobSnapshot,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), JobServiceError> {
+        self.start_with_admission(&expected.request.job_id, None, Some((expected, deadline)))
+    }
+
+    pub(crate) fn reject_reserved_granted(
+        &self,
+        expected: &JobSnapshot,
+        cause: &str,
+    ) -> Result<(), JobServiceError> {
+        let executions = self.executions.lock().expect("Job executions poisoned");
+        if executions.closed {
+            return Err(JobServiceError::Closed);
+        }
+        self.with_store_write(|store| store.fail_reserved_granted(expected, cause))
+    }
+
+    pub(crate) async fn recovery_closed(&self) {
         loop {
             let changed = self.capacity_changed.notified();
             tokio::pin!(changed);
@@ -95,20 +140,7 @@ impl StandaloneJobs {
             let changed = self.capacity_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let completed: Vec<_> = self
-                .executions
-                .lock()
-                .expect("Job executions poisoned")
-                .jobs
-                .iter()
-                .filter(|(_, run)| matches!(run.complete.borrow().as_ref(), Some(Ok(()))))
-                .map(|(id, _)| id.clone())
-                .collect();
-            for completed_id in completed {
-                // wait joins task return and only then removes a successful slot.
-                // A failed read here is not evidence against this reservation.
-                let _ = self.wait(&completed_id).await;
-            }
+            self.join_completed_admissions().await;
             let started = recover_owned_settlement(
                 &self.storage_recovered,
                 issue,

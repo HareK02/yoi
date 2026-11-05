@@ -4,6 +4,9 @@
 //! cleanup receipt, not the domain lookup. No test here proves an OS crash/drain.
 use super::*;
 
+#[path = "admission_tests.rs"]
+mod admission_tests;
+
 struct ConsolidationRecoveryFixture {
     body: SubjectConnection,
     jobs: crate::jobs::StandaloneJobs,
@@ -279,12 +282,13 @@ async fn failed_consolidation_closes_only_attempt_and_preserves_unresolved_input
             memory
         );
         // Stable exact replay; a reference does not mean all candidate work is done.
-        assert!(
+        assert_eq!(
             fixture
                 .body
                 .host
                 .recover_consolidation_job(&fixture.jobs, &before)
-                .unwrap()
+                .unwrap(),
+            ConsolidationRecovery::Settled
         );
         assert_eq!(fixture.domain_closure(), Some(receipt));
         let reopened = crate::job_store::JobStore::open(&fixture.body.jobs_path).unwrap();
@@ -356,7 +360,10 @@ async fn failed_consolidation_retains_unreleased_stale_inactive_migrated_and_era
             .body
             .host
             .recover_consolidation_job(&fixture.jobs, &observed);
-        assert!(!matches!(outcome, Ok(true)), "{case}");
+        assert!(
+            !matches!(outcome, Ok(ConsolidationRecovery::Settled)),
+            "{case}"
+        );
         assert!(fixture.domain_closure().is_none(), "{case}");
         assert_eq!(
             fixture.jobs.get(&fixture.saved.request.job_id).unwrap(),

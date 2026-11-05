@@ -41,6 +41,8 @@ pub enum JobServiceError {
     Store(#[from] JobStoreError),
     #[error("standalone Job execution requirements are unavailable: {0}")]
     Configuration(String),
+    #[error(transparent)]
+    DomainStorage(#[from] feature_storage::FeatureStorageError),
     #[error("the standalone Job Host is shutting down")]
     Closed,
     #[error("standalone Job execution capacity is exhausted")]
@@ -82,7 +84,7 @@ pub(crate) trait JobDomainProvider: Send + Sync {
         &self,
         snapshot: &JobSnapshot,
         fence: Arc<dyn JobAttemptFence>,
-    ) -> Result<worker::job::JobFeatureGrant, String>;
+    ) -> Result<worker::job::JobFeatureGrant, JobServiceError>;
 }
 
 type OwnedExecutionReport = Arc<
@@ -521,6 +523,15 @@ impl StandaloneJobs {
         job_id: &str,
         client: Option<Box<dyn LlmClient>>,
     ) -> Result<(), JobServiceError> {
+        self.start_with_admission(job_id, client, None)
+    }
+
+    fn start_with_admission(
+        &self,
+        job_id: &str,
+        client: Option<Box<dyn LlmClient>>,
+        admission: Option<(&JobSnapshot, tokio::time::Instant)>,
+    ) -> Result<(), JobServiceError> {
         // Preparation owns copies of the immutable input and domain adapter too. Exclude
         // owner shutdown before creating them, not only before publishing the task.
         let mut executions = self.executions.lock().expect("Job executions poisoned");
@@ -535,6 +546,16 @@ impl StandaloneJobs {
                 .map(|c| c.clone_boxed())
         });
         let snapshot = self.get(job_id)?;
+        if let Some((expected, _)) = admission {
+            if snapshot.attempt.attempt_id != expected.attempt.attempt_id
+                || snapshot.input_digest != expected.input_digest
+                || snapshot.domain_grant != expected.domain_grant
+                || snapshot.domain_grant.is_none()
+                || !snapshot.executions_released()
+            {
+                return Err(JobStoreError::AttemptMismatch.into());
+            }
+        }
         snapshot.load_executable_request()?;
         if snapshot.version_stopped
             || snapshot.state != JobState::Pending
@@ -547,8 +568,19 @@ impl StandaloneJobs {
         }
         let effect_gate = Arc::new(Mutex::new(()));
         let revoked = Arc::new(AtomicBool::new(false));
-        let timeout = Duration::from_secs(u64::from(snapshot.request.limits.timeout_seconds));
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = admission.map_or_else(
+            || {
+                tokio::time::Instant::now()
+                    + Duration::from_secs(u64::from(snapshot.request.limits.timeout_seconds))
+            },
+            |(_, deadline)| deadline,
+        );
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if timeout.is_zero() {
+            return Err(JobServiceError::Configuration(
+                "consolidation_admission_deadline_exceeded".into(),
+            ));
+        }
         let fence: Arc<dyn JobAttemptFence> = Arc::new(BoundAttemptFence {
             revoked: revoked.clone(),
             effect_gate: effect_gate.clone(),
@@ -569,9 +601,7 @@ impl StandaloneJobs {
             &snapshot.domain_grant,
             self.domain.lock().expect("Job domain poisoned").as_ref(),
         ) {
-            (Some(_), Some(provider)) => provider
-                .grant(&snapshot, fence)
-                .map_err(JobServiceError::Configuration)?,
+            (Some(_), Some(provider)) => provider.grant(&snapshot, fence)?,
             (Some(_), None) => {
                 return Err(JobServiceError::Configuration(
                     "persisted Job requires an unavailable explicit domain capability".into(),
@@ -625,6 +655,11 @@ impl StandaloneJobs {
                 return Err(JobServiceError::Capacity);
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(JobServiceError::Configuration(
+                "consolidation_admission_deadline_exceeded during preparation".into(),
+            ));
+        }
         let snapshot = self.with_store_write(|store| {
             store.dispatch(job_id, &snapshot.attempt.attempt_id, self.capacity)
         })?;
@@ -669,7 +704,7 @@ impl StandaloneJobs {
                 result = &mut run => result,
                 reason = async {
                     tokio::select! {
-                        _ = tokio::time::sleep(timeout) => "timeout",
+                        _ = tokio::time::sleep_until(deadline) => "timeout",
                         _ = cancellation.wait_for(|cancelled| *cancelled) => "Host cancellation/shutdown",
                     }
                 } => {

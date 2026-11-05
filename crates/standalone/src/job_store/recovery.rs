@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "admission_tests.rs"]
+mod admission_tests;
+
 pub(super) const UPDATE_INTERRUPTION: &str = "バージョン更新による実行打切り";
 
 impl JobStore {
@@ -46,6 +50,42 @@ impl JobStore {
         tx.execute(
             "INSERT INTO job_start_rejections(job_id,attempt_id,owner_id) VALUES(?1,?2,?3)",
             params![job_id, attempt_id, self.owner_id],
+        )?;
+        set_terminal(&tx, &saved, JobAttemptState::Failed, Some(cause))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A pre-dispatch refusal is not execution cleanup. Bind it to the exact
+    /// available granted reservation and never clear historical execution owners.
+    pub(crate) fn fail_reserved_granted(
+        &mut self,
+        expected: &JobSnapshot,
+        cause: &str,
+    ) -> Result<(), JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = require_snapshot(&tx, &expected.request.job_id)?;
+        check_attempt(&saved, &expected.attempt.attempt_id)?;
+        saved.load_executable_request()?;
+        if saved.input_digest != expected.input_digest
+            || saved.domain_grant != expected.domain_grant
+            || saved.domain_grant.is_none()
+            || saved.version_stopped
+            || saved.state != JobState::Pending
+            || saved.attempt.state != JobAttemptState::Reserved
+            || !saved.executions_released()
+        {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        tx.execute(
+            "INSERT INTO job_start_rejections(job_id,attempt_id,owner_id) VALUES(?1,?2,?3)",
+            params![
+                saved.request.job_id,
+                saved.attempt.attempt_id,
+                self.owner_id
+            ],
         )?;
         set_terminal(&tx, &saved, JobAttemptState::Failed, Some(cause))?;
         tx.commit()?;
@@ -205,7 +245,7 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), JobStoreError> {
                 }
                 migrate(&tx)?;
             }
-            6 => {}
+            6 | 7 => {}
             SCHEMA_VERSION => {}
             other => return Err(JobStoreError::UnsupportedSchema(other)),
         }
@@ -213,6 +253,11 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), JobStoreError> {
             // Additive admission evidence only. Do not rerun the v6 cutover or
             // reinterpret preexisting Failed rows as rejected-before-dispatch.
             tx.execute_batch(START_REJECTION_SCHEMA)?;
+        }
+        if version <= 7 {
+            // Extend the existing refusal evidence to explicit domain admissions.
+            // No Job is cut over, reissued or retroactively declared unstarted.
+            tx.execute_batch(GRANTED_START_REJECTION_SCHEMA)?;
         }
         if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
             return Err(JobStoreError::Corrupt(
@@ -316,6 +361,19 @@ CREATE TRIGGER job_start_rejection_immutable BEFORE UPDATE ON job_start_rejectio
 BEGIN SELECT RAISE(ABORT,'immutable Job start rejection'); END;
 CREATE TRIGGER job_start_rejection_retained BEFORE DELETE ON job_start_rejections
 BEGIN SELECT RAISE(ABORT,'retained Job start rejection'); END;
+";
+
+// v8 changes only the guard. Keep the original v7 migration above intact.
+const GRANTED_START_REJECTION_SCHEMA: &str = "
+DROP TRIGGER job_start_rejection_guard;
+CREATE TRIGGER job_start_rejection_guard BEFORE INSERT ON job_start_rejections
+WHEN NOT EXISTS(SELECT 1 FROM job_intents i JOIN job_attempts a ON a.job_id=i.job_id AND a.number=i.current_attempt
+    WHERE i.job_id=NEW.job_id AND a.attempt_id=NEW.attempt_id AND i.state='pending' AND a.state='reserved'
+      AND i.input_disposition='available')
+ OR EXISTS(SELECT 1 FROM job_execution_ownership WHERE attempt_id=NEW.attempt_id)
+ OR EXISTS(SELECT 1 FROM job_execution_ownership WHERE job_id=NEW.job_id AND (writes_revoked=0 OR cleanup_receipt IS NULL))
+ OR EXISTS(SELECT 1 FROM job_version_stops WHERE job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'start rejection requires an available unstarted reservation and prior cleanup'); END;
 ";
 
 pub(super) const SCHEMA: &str = "

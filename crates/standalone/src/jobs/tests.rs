@@ -121,9 +121,11 @@ impl JobDomainProvider for RecordingDomainProvider {
         &self,
         snapshot: &JobSnapshot,
         fence: Arc<dyn JobAttemptFence>,
-    ) -> Result<worker::job::JobFeatureGrant, String> {
+    ) -> Result<worker::job::JobFeatureGrant, JobServiceError> {
         if snapshot.domain_grant != Some(domain_grant(&snapshot.request.job_id)) {
-            return Err("foreign or mismatched immutable domain grant".into());
+            return Err(JobServiceError::Configuration(
+                "foreign or mismatched immutable domain grant".into(),
+            ));
         }
         self.0.lock().unwrap().push((snapshot.clone(), fence));
         Ok(worker::job::JobFeatureGrant {
@@ -201,7 +203,7 @@ impl JobDomainProvider for ControlledShutdown {
         &self,
         _: &JobSnapshot,
         _: Arc<dyn JobAttemptFence>,
-    ) -> Result<worker::job::JobFeatureGrant, String> {
+    ) -> Result<worker::job::JobFeatureGrant, JobServiceError> {
         Ok(worker::job::JobFeatureGrant {
             features: worker::feature::FeatureRegistryBuilder::new().with_module(self.clone()),
             satisfied_requirements: vec!["feature.subjektiv"],

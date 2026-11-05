@@ -33,7 +33,7 @@ mod recovery;
 #[path = "job_store/start_rejection_tests.rs"]
 mod start_rejection_tests;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// Availability of the immutable input body, independent of execution outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
