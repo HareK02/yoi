@@ -49,6 +49,9 @@ export function failureNotice<D>(
     // 同義wrapperをtitle/detail/explanationの三重表示にしない。
     supplements: [
       ...new Set(failure.context.diagnostics.map((item) => item.explanation)),
+      ...(failure.context.supplementary_omitted
+        ? ["Some additional information was omitted by the server."]
+        : []),
     ].filter((text) => text !== failure.explanation),
     compensation: [],
     details,

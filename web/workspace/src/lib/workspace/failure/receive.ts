@@ -7,6 +7,7 @@ import type {
 import {
   readBoundedText,
   ResponseByteLimitError,
+  ResponseTextDecodeError,
 } from "#lib/workspace/api/http.ts";
 
 // domain固有detailsの検証は公開schemaを所有するadapterへ渡す。
@@ -117,13 +118,16 @@ function parseBounded(text: string): unknown {
         if (text[i] === "\\") i++;
         else if (text[i] === '"') break;
       }
+      const token: unknown = JSON.parse(text.slice(start, i + 1));
+      if (typeof token !== "string" || /[\uD800-\uDFFF]/u.test(token)) {
+        return invalid();
+      }
       let next = i + 1;
       while (/\s/u.test(text[next] ?? "") && next < text.length) next++;
       if (text[next] === ":") {
-        const key: unknown = JSON.parse(text.slice(start, i + 1));
         const keys = stack.at(-1);
-        if (!keys || typeof key !== "string" || keys.has(key)) return invalid();
-        keys.add(key);
+        if (!keys || keys.has(token)) return invalid();
+        keys.add(token);
       }
     } else if (char === "{" || char === "[") {
       stack.push(char === "{" ? new Set<string>() : null);
@@ -197,12 +201,49 @@ function decodeEnvelope<D>(value: unknown, decode: DetailsDecoder<D>):
 }
 
 function uriReference(value: unknown): string {
-  // URIは表示/取得先として使わない。WHATWG URLの補正も行わない。
+  // RFC 3986のcomponentを検査するだけで、base解決/取得/正規化はしない。
   if (
     typeof value !== "string" ||
     utf8.encode(value).length > FAILURE_LIMITS.explanationBytes ||
-    /[^\x21-\x7e]/u.test(value) || /%(?![0-9a-f]{2})/iu.test(value)
+    /%(?![0-9a-f]{2})/iu.test(value)
   ) return invalid();
+  const match =
+    /^(?:([a-z][a-z0-9+.-]*):)?(?:\/\/([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#([^#]*))?$/iu
+      .exec(value);
+  if (!match) return invalid();
+  const [, scheme, authority, path, query, fragment] = match;
+  const pchar = /^[a-z0-9._~!$&'()*+,;=:@%/-]*$/iu;
+  const queryChars = /^[a-z0-9._~!$&'()*+,;=:@%/?-]*$/iu;
+  if (
+    !pchar.test(path) || (query !== undefined && !queryChars.test(query)) ||
+    (fragment !== undefined && !queryChars.test(fragment))
+  ) return invalid();
+  if (
+    scheme === undefined && authority === undefined &&
+    path.split("/")[0].includes(":")
+  ) return invalid();
+  if (authority !== undefined) {
+    const parts = authority.split("@");
+    if (
+      parts.length > 2 ||
+      (parts.length === 2 && !/^[a-z0-9._~!$&'()*+,;=:%-]*$/iu.test(parts[0]))
+    ) return invalid();
+    const hostPort = parts.at(-1)!;
+    if (hostPort.startsWith("[")) {
+      const literal = /^\[([^\]]+)\](?::[0-9]*)?$/u.exec(hostPort);
+      if (!literal) return invalid();
+      if (literal[1].startsWith("v") || literal[1].startsWith("V")) {
+        if (!/^v[0-9a-f]+\.[a-z0-9._~!$&'()*+,;=:-]+$/iu.test(literal[1])) {
+          return invalid();
+        }
+      } else {
+        // URLのhost validatorだけをIPv6構文に利用し、値は一切置換しない。
+        new URL(`http://[${literal[1]}]/`);
+      }
+    } else if (!/^[a-z0-9._~!$&'()*+,;=%-]*(?::[0-9]*)?$/iu.test(hostPort)) {
+      return invalid();
+    }
+  }
   return value;
 }
 
@@ -266,7 +307,7 @@ export async function receiveProblem<D>(
     return {
       kind: error instanceof ResponseByteLimitError
         ? "too_large"
-        : error instanceof TypeError
+        : error instanceof ResponseTextDecodeError
         ? "invalid"
         : "transport",
     };

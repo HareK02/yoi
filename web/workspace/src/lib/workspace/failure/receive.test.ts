@@ -248,9 +248,144 @@ Deno.test("bounded response text, unknown MIME, broken transport and UTF8 never 
       { status: 502, headers: { "content-type": "application/problem+json" } },
     ),
   ];
-  for (const response of cases) {
+  for (const [index, response] of cases.entries()) {
     const received = await receiveProblem(response, fixtureDecoder);
+    equal(received.kind, ["http", "invalid", "transport"][index]);
     if (received.kind === "problem") throw new Error("unexpected problem");
     equal(JSON.stringify(failureNotice(received)).includes("secret"), false);
   }
+});
+
+Deno.test("Problem URI references are syntax checked without normalization, navigation or fetching", () => {
+  for (
+    const reference of [
+      "",
+      "../requests/1",
+      "?occurrence=1",
+      "#s",
+      "g:h",
+      "a/b:c",
+      "///path",
+      "https://user:pass@example.test:443/a?b#c",
+      "//[2001:db8::1]:443/a",
+      "//[::ffff:192.0.2.128]/",
+      "//[v1.a:b]/x",
+      "a%20b/%5B?x=%25&y=?/#%2f",
+    ]
+  ) {
+    const received = decode({
+      ...problem(),
+      type: reference,
+      instance: reference,
+    });
+    if (received.kind !== "problem") {
+      throw new Error(`${reference}: ${received.kind}`);
+    }
+    equal(received.problem.instance, reference);
+  }
+  for (
+    const reference of [
+      "/requests/%GG",
+      "/requests/[invalid",
+      "foo%",
+      "//user@@host/x",
+      "//host:wrongport/x",
+      "//[::not-ipv6]/",
+      "//[v.a]/",
+      "//[vG.foo]/",
+      "//[v1.]/",
+      "//[::1]tail/",
+      "//[::1",
+      "//host]/",
+      "bad space",
+      "1invalid:rest",
+      ":rest",
+      "a{b",
+      "a#b#c",
+      "a\\b",
+      "日本語",
+      "/a\n",
+      "?x=\0",
+    ]
+  ) {
+    equal(
+      decode({ ...problem(), type: reference, instance: reference }).kind,
+      "invalid",
+    );
+  }
+});
+
+Deno.test("all shared collection budgets and UTF8 identifiers are validated before presentation", () => {
+  for (
+    const [key, max, item] of [
+      ["operations", 8, subject.context.operations[0]],
+      ["causes", 4, {
+        domain: "subject",
+        reason: "operation_denied",
+        correlation: "safe",
+      }],
+      ["diagnostics", 8, {
+        code: "safe",
+        explanation: "Additional information",
+      }],
+    ] as const
+  ) {
+    equal(
+      decode(
+        problem({
+          ...subject,
+          context: { ...subject.context, [key]: Array(max).fill(item) },
+        }),
+      ).kind,
+      "problem",
+    );
+    equal(
+      decode(
+        problem({
+          ...subject,
+          context: { ...subject.context, [key]: Array(max + 1).fill(item) },
+        }),
+      ).kind,
+      "invalid",
+    );
+  }
+  const received = decode(
+    problem({
+      ...subject,
+      context: { ...subject.context, supplementary_omitted: true },
+    }),
+  );
+  equal(failureNotice(received).supplements, [
+    "Some additional information was omitted by the server.",
+  ]);
+  equal(
+    decode(
+      problem({
+        ...subject,
+        context: { ...subject.context, correlation: "あ".repeat(43) },
+      }),
+    ).kind,
+    "invalid",
+  );
+  equal(
+    decodeProblem(
+      " ".repeat(FAILURE_LIMITS.bytes) + JSON.stringify(problem()),
+      409,
+      "application/problem+json",
+      fixtureDecoder,
+    ).kind,
+    "too_large",
+  );
+});
+
+Deno.test("JSON Unicode scalars agree with the Rust wire reader rather than replacing lone surrogates", () => {
+  for (const explanation of ["bad\ud800", "bad\udfff"]) {
+    equal(decode(problem({ ...subject, explanation })).kind, "invalid");
+  }
+  equal(
+    decode(
+      problem({ ...subject, explanation: "Valid supplementary scalar: 🚀" }),
+    ).kind,
+    "problem",
+  );
 });

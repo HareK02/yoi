@@ -31,6 +31,7 @@ const SKILL_API_LOAD_POLICY: JsonLoadPolicy = {
 };
 
 export class ResponseByteLimitError extends Error {}
+export class ResponseTextDecodeError extends Error {}
 
 function normalizePath(path: string): string {
   if (!path || path === "/") return "";
@@ -198,7 +199,11 @@ export async function readBoundedText(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ResponseTextDecodeError();
+  }
 }
 
 async function requireJson<T>(
