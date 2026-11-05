@@ -56,9 +56,27 @@ struct ConnectedJournalModel {
     dialogs: Arc<Mutex<Vec<Request>>>,
     journal_inputs: Arc<Mutex<Vec<String>>>,
     journal_observations: Arc<Mutex<Vec<Value>>>,
+    lifecycle_storage: Arc<Mutex<Option<crate::WorkspaceFeatureStorage>>>,
+    clock: Arc<Mutex<Option<std::time::Instant>>>,
+    http_observations: Arc<Mutex<Vec<Value>>>,
+    poll_observations: Arc<Mutex<Vec<Value>>>,
 }
 
 impl ConnectedJournalModel {
+    fn elapsed_micros(&self) -> u64 {
+        self.clock.lock().unwrap().as_ref().map_or(0, |clock| {
+            clock.elapsed().as_micros().min(u64::MAX as u128) as u64
+        })
+    }
+
+    fn observe_bounded(observations: &Mutex<Vec<Value>>, value: Value) {
+        let mut observations = observations.lock().unwrap();
+        if observations.len() == 64 {
+            observations.remove(0);
+        }
+        observations.push(value);
+    }
+
     fn journal_response(request: &Request) -> Vec<Event> {
         // Consume the actual Controller-rendered input, not a fixture generation or
         // a Source tool response. Decode also checks complete bodies/ranges/digests.
@@ -264,6 +282,14 @@ impl LlmClient for ConnectedJournalModel {
             }
             observations.push(json!({
                 "observed_at": Utc::now().to_rfc3339(),
+                "elapsed_micros": self.elapsed_micros(),
+                "lifecycle_manager": self.lifecycle_storage.lock().unwrap().as_ref()
+                    .map(|storage| { let timing = storage.lifecycle_observation(); json!({
+                        "acquisitions":timing.acquisitions,"sync_attempts":timing.sync_attempts,
+                        "sync_nanoseconds":timing.sync_nanoseconds,"lock_attempts":timing.lock_attempts,
+                        "lock_nanoseconds":timing.lock_nanoseconds,"failed_syncs":timing.failed_syncs,
+                        "failed_locks":timing.failed_locks,
+                    }) }),
                 "tool_results": request.items.iter().rev().filter_map(|item| match item {
                     Item::ToolResult { call_id, is_error, summary, .. } =>
                         Some(json!({"call_id":call_id,"is_error":is_error,"summary":summary.chars().take(256).collect::<String>()})),
@@ -352,15 +378,17 @@ async fn connected_wait_for_recording(
 ) {
     let host = JournalHostContext::validated_session(store, attr.clone()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(25));
         loop {
-            tick.tick().await;
+            let poll_started = model.elapsed_micros();
             let jobs = api
                 .store
                 .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
                 .unwrap();
-            let generation_closed =
-                store
+            let ready = !jobs.is_empty()
+                && jobs
+                    .iter()
+                    .all(|job| job.state == BackendJobState::Completed)
+                && store
                     .journal_for_session(&host)
                     .unwrap()
                     .is_some_and(|journal| {
@@ -368,22 +396,21 @@ async fn connected_wait_for_recording(
                             .active_journal_generation(&host, &journal)
                             .unwrap()
                             .is_none()
-                    });
-            if !jobs.is_empty()
-                && generation_closed
-                && jobs
-                    .iter()
-                    .all(|job| job.state == BackendJobState::Completed)
+                    })
                 && !store.journal_retention_required(&host).unwrap()
                 && api
                     .runtime
                     .worker(&RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id))
                     .unwrap()
                     .worker_state
-                    .is_some_and(|state| state.catalog_status() == protocol::WorkerStatus::Idle)
-            {
+                    .is_some_and(|state| state.catalog_status() == protocol::WorkerStatus::Idle);
+            ConnectedJournalModel::observe_bounded(&model.poll_observations,
+                json!({"phase":phase,"start_micros":poll_started,
+                    "end_micros":model.elapsed_micros()}));
+            if ready {
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
     .await
@@ -399,12 +426,20 @@ async fn connected_wait_for_recording(
             (job.request.job_id.clone(), history, workers)
         }).collect::<Vec<_>>();
         panic!(
-            "real Controller recording did not complete: phase={phase}; jobs={jobs:?}; attempts={attempts:?}; recovery_owners={:?}; cleanup_owners={:?}; model_observations={:?}",
+            "real Controller recording did not complete: phase={phase}; jobs={jobs:?}; attempts={attempts:?}; recovery_owners={:?}; cleanup_owners={:?}; model_observations={:?}; http_observations={:?}; poll_observations={:?}",
             api.backend_job_recovery.recovery_owner_ids(),
             api.backend_job_recovery.cleanup_owner_ids(),
             model.journal_observations.lock().unwrap(),
+            model.http_observations.lock().unwrap(),
+            model.poll_observations.lock().unwrap(),
         )
     });
+    eprintln!(
+        "recording progress timing: phase={phase}; model={:?}; http={:?}; polls={:?}",
+        model.journal_observations.lock().unwrap(),
+        model.http_observations.lock().unwrap(),
+        model.poll_observations.lock().unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -457,14 +492,25 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     .await
     .unwrap();
     seed_test_delivery_binding(&api);
+    *model.clock.lock().unwrap() = Some(std::time::Instant::now());
+    *model.lifecycle_storage.lock().unwrap() = Some(api.feature_storage.clone());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let observed = requests.clone();
+    let timing_model = model.clone();
     let app = build_router(api.clone()).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let observed = observed.clone();
+            let timing_model = timing_model.clone();
             async move {
                 let path = request.uri().path().to_string();
+                let started = timing_model.elapsed_micros();
+                ConnectedJournalModel::observe_bounded(&timing_model.http_observations,
+                    json!({"event":"ingress","path":path.chars().take(256).collect::<String>(),"start_micros":started}));
                 let response = next.run(request).await;
+                ConnectedJournalModel::observe_bounded(&timing_model.http_observations,
+                    json!({"event":"return","path":path.chars().take(256).collect::<String>(),
+                        "start_micros":started,"end_micros":timing_model.elapsed_micros(),
+                        "status":response.status().as_u16()}));
                 observed.lock().unwrap().push((path, response.status()));
                 response
             }

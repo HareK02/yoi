@@ -1161,6 +1161,21 @@ async fn backend_job_cleanup_commit_failure_retries_old_attempt_without_touching
         api.retry_backend_job(&request.job_id).is_err(),
         "retry must not overlap an incompletely cleaned attempt"
     );
+    // This is a permanent SQL constraint, not a transient-storage recovery test.
+    // Wait for the failed owner's admission lease to leave before explicitly
+    // sweeping; otherwise that request can coalesce with the still-ending owner.
+    // Map absence here is only admission ordering, never execution/cleanup proof.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while api
+            .backend_job_recovery
+            .cleanup_owner_ids()
+            .contains(&first.attempt.attempt_id)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permanent-failure cleanup owner must return before explicit sweep");
     api.config_store
         .with_conn(|conn| {
             conn.execute_batch("DROP TRIGGER fail_job_cleanup_catalog_commit;")?;

@@ -152,6 +152,11 @@ impl FeatureRegistration {
 }
 
 #[cfg(feature = "test-support")]
+mod lifecycle_observation;
+#[cfg(feature = "test-support")]
+pub use lifecycle_observation::LifecycleObservation;
+
+#[cfg(feature = "test-support")]
 #[path = "open_observation.rs"]
 mod open_observation;
 #[cfg(feature = "test-support")]
@@ -194,6 +199,9 @@ struct FeatureStorageInner {
     id: Uuid,
     root: PathBuf,
     state: Mutex<FeatureStorageState>,
+    lifecycle_established: Arc<owner::EstablishedLocks>,
+    #[cfg(feature = "test-support")]
+    lifecycle_observation: Arc<lifecycle_observation::Counters>,
 }
 
 struct FeatureStorageState {
@@ -251,8 +259,18 @@ impl FeatureStorage {
                     maintenance: HashSet::new(),
                     deletion_fences: HashSet::new(),
                 }),
+                lifecycle_established: Arc::default(),
+                #[cfg(feature = "test-support")]
+                lifecycle_observation: Arc::default(),
             }),
         }
+    }
+
+    /// Read-only cumulative lifecycle diagnostics shared by this manager's Host
+    /// and Feature handles, independent of per-registration open observations.
+    #[cfg(feature = "test-support")]
+    pub fn lifecycle_observation(&self) -> LifecycleObservation {
+        self.inner.lifecycle_observation.snapshot()
     }
 
     pub fn for_server_database(database_path: impl AsRef<Path>) -> Result<Self> {
@@ -359,6 +377,9 @@ impl FeatureStorage {
                 accepting_operations: AtomicBool::new(true),
                 connection: Mutex::new(Some(connection)),
                 root: self.inner.root.clone(),
+                lifecycle_established: self.inner.lifecycle_established.clone(),
+                #[cfg(feature = "test-support")]
+                lifecycle_observation: self.inner.lifecycle_observation.clone(),
                 path: path.into(),
                 binding,
             }),
@@ -471,6 +492,9 @@ impl FeatureStorage {
         owner::Lifecycle {
             root: self.inner.root.clone(),
             scope: scope_id.into(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
         }
     }
 
@@ -574,6 +598,9 @@ impl FeatureStorage {
             accepting_operations: AtomicBool::new(true),
             connection: Mutex::new(Some(connection)),
             root: self.inner.root.clone(),
+            lifecycle_established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            lifecycle_observation: self.inner.lifecycle_observation.clone(),
             path,
             binding,
         });
@@ -897,6 +924,13 @@ pub struct ScopedFeatureStorage {
 pub type WorkspaceFeatureStorage = ScopedFeatureStorage;
 
 impl ScopedFeatureStorage {
+    /// Manager-wide lifecycle totals, including other scopes and retained handles.
+    /// This scope handle neither filters the observation nor changes storage I/O.
+    #[cfg(feature = "test-support")]
+    pub fn lifecycle_observation(&self) -> LifecycleObservation {
+        self.manager.lifecycle_observation()
+    }
+
     pub fn scope_id(&self) -> &str {
         &self.scope_id
     }
@@ -1142,6 +1176,9 @@ struct FeatureDatabaseInner {
     accepting_operations: AtomicBool,
     connection: Mutex<Option<Connection>>,
     root: PathBuf,
+    lifecycle_established: Arc<owner::EstablishedLocks>,
+    #[cfg(feature = "test-support")]
+    lifecycle_observation: Arc<lifecycle_observation::Counters>,
     path: PathBuf,
     binding: owner::Binding,
 }
@@ -1175,6 +1212,9 @@ impl FeatureDatabase {
         let lease = owner::Lifecycle {
             root: self.inner.root.clone(),
             scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
         }
         .lock(false)?;
         self.inner.ensure_accepting()?;
@@ -1232,6 +1272,9 @@ impl FeatureDatabase {
         let lifecycle = owner::Lifecycle {
             root: self.inner.root.clone(),
             scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
         };
         let _lease = lifecycle.lock(false).map_err(E::from)?;
         self.inner.ensure_accepting().map_err(E::from)?;
@@ -1308,6 +1351,9 @@ impl FeatureDatabaseInner {
         owner::Lifecycle {
             root: self.root.clone(),
             scope: self.scope_id.clone(),
+            established: self.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.lifecycle_observation.clone(),
         }
         .verify(
             &self.binding,
@@ -1751,6 +1797,149 @@ mod tests {
 
     fn registration(feature_id: &'static str) -> FeatureRegistration {
         FeatureRegistration::new(feature_id, MIGRATIONS)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn lifecycle_observation_is_manager_local_and_counts_retained_feature_operations() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let manager = FeatureStorage::new(&root);
+        let observer = manager.clone();
+        // Even managers sharing a physical root must not share observation state.
+        let other = FeatureStorage::new(&root);
+        let feature = manager.register(registration("test-feature")).unwrap();
+        let database = manager.scope("workspace").unwrap().open(&feature).unwrap();
+        assert_eq!(
+            other.lifecycle_observation(),
+            LifecycleObservation::default()
+        );
+        let other_feature = other.register(registration("test-feature")).unwrap();
+        let other_database = other
+            .scope("workspace")
+            .unwrap()
+            .open(&other_feature)
+            .unwrap();
+        assert_eq!(database.identity(), other_database.identity());
+        let identity = database.identity().clone();
+        let lock_path = root.join(".lifecycle/workspace.lock");
+        let lock_inode = fs::metadata(&lock_path).unwrap().ino();
+        let other_before = other.lifecycle_observation();
+        let opens_before = feature.open_observation();
+        let before = observer.lifecycle_observation();
+
+        database
+            .with_connection(|connection| {
+                let synchronous: u32 =
+                    connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+                assert_eq!(synchronous, 2, "durability policy remains FULL");
+                Ok(())
+            })
+            .unwrap();
+        let after_read = observer.lifecycle_observation();
+        let read = after_read.since(before);
+        assert_eq!(read.acquisitions, 1);
+        assert_eq!(
+            read.sync_attempts, 0,
+            "same durable lifecycle needs no re-sync"
+        );
+        assert_eq!(read.lock_attempts, 1);
+        assert_eq!(read.sync_nanoseconds, 0);
+        assert!(read.lock_nanoseconds > 0);
+        assert_eq!((read.failed_syncs, read.failed_locks), (0, 0));
+
+        insert(&database.clone(), "observed commit").unwrap();
+        let after_write = observer.lifecycle_observation();
+        let write = after_write.since(after_read);
+        assert_eq!(write.acquisitions, 1);
+        assert_eq!(write.sync_attempts, 0);
+        assert_eq!(write.lock_attempts, 1);
+        assert_eq!(write.sync_nanoseconds, 0);
+        assert!(write.lock_nanoseconds > 0);
+        assert_eq!((write.failed_syncs, write.failed_locks), (0, 0));
+        assert_eq!(after_write, manager.lifecycle_observation());
+        assert_eq!(other_before, other.lifecycle_observation());
+        assert_eq!(opens_before, feature.open_observation());
+        assert_eq!(database.identity(), &identity);
+        assert_eq!(fs::metadata(&lock_path).unwrap().ino(), lock_inode);
+        // Re-read committed data through the independent manager's verified DB.
+        assert_eq!(values(&other_database).unwrap(), ["observed commit"]);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn lifecycle_observation_includes_retained_host_catalog_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = FeatureStorage::new(temp.path().join("storage"));
+        let database = manager
+            .open_host_catalog::<FeatureStorageError>(
+                &temp.path().join("host.sqlite"),
+                "host-provision",
+                "isolated test Host",
+                |connection| {
+                    connection.execute_batch(
+                        "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);",
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let before = manager.lifecycle_observation();
+        assert_eq!(before.acquisitions, 1);
+        assert_eq!(before.sync_attempts, 1);
+        assert_eq!(before.lock_attempts, 1);
+        let identity = database.identity().clone();
+        insert(&database, "host commit").unwrap();
+        assert_eq!(values(&database).unwrap(), ["host commit"]);
+        let delta = manager.lifecycle_observation().since(before);
+        assert_eq!(delta.acquisitions, 2);
+        assert_eq!(delta.sync_attempts, 0);
+        assert_eq!(delta.lock_attempts, 2);
+        assert_eq!(delta.sync_nanoseconds, 0);
+        assert!(delta.lock_nanoseconds > 0);
+        assert_eq!((delta.failed_syncs, delta.failed_locks), (0, 0));
+        assert_eq!(database.identity(), &identity);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn lifecycle_observation_counts_failed_directory_attempts_without_suppressing_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        fs::create_dir(&root).unwrap();
+        let obstacle = root.join(".lifecycle");
+        fs::write(&obstacle, b"not a directory").unwrap();
+        let manager = FeatureStorage::new(&root);
+        let feature = manager.register(registration("test-feature")).unwrap();
+        let scoped = manager.scope("workspace").unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                scoped.open(&feature),
+                Err(FeatureStorageError::Io(_))
+            ));
+        }
+        let failed = manager.lifecycle_observation();
+        assert_eq!(failed.acquisitions, 2);
+        assert_eq!(failed.sync_attempts, 2);
+        assert_eq!(failed.failed_syncs, 2);
+        assert!(failed.sync_nanoseconds > 0);
+        assert_eq!(failed.lock_attempts, 0);
+        assert_eq!(failed.lock_nanoseconds, 0);
+        assert_eq!(failed.failed_locks, 0);
+        assert_eq!(feature.open_observation(), OpenObservation::default());
+        assert!(!root.join("workspace/features/test-feature.sqlite").exists());
+
+        fs::remove_file(obstacle).unwrap();
+        let database = scoped.open(&feature).unwrap();
+        insert(&database, "retry committed").unwrap();
+        assert_eq!(values(&database).unwrap(), ["retry committed"]);
+        let retried = manager.lifecycle_observation().since(failed);
+        assert!(retried.acquisitions > 0);
+        assert_eq!(retried.sync_attempts, 1);
+        assert_eq!(retried.lock_attempts, retried.acquisitions);
+        assert_eq!((retried.failed_syncs, retried.failed_locks), (0, 0));
     }
 
     #[test]

@@ -315,6 +315,9 @@ fn reserved_adoption_reconciles_at_each_real_identity_commit_boundary() {
         let lifecycle = owner::Lifecycle {
             root: temp.path().into(),
             scope: SCOPE.into(),
+            established: Arc::default(),
+            #[cfg(feature = "test-support")]
+            observation: Arc::default(),
         };
         let expected = {
             let _lease = lifecycle.lock(true).unwrap();

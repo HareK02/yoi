@@ -381,28 +381,78 @@ enum ConsolidationRecoveryError {
     Service(#[from] crate::jobs::JobServiceError),
     #[error(transparent)]
     Domain(#[from] subjektiv::api::OperationError),
+    #[error(transparent)]
+    Writer(#[from] subjektiv::journal::JournalError),
 }
 
 impl ConsolidationRecoveryError {
     fn retryable_read_or_storage(&self) -> bool {
         use crate::jobs::{JobServiceError, JobStoreError};
-        matches!(
-            self,
-            Self::Service(JobServiceError::Store(
-                JobStoreError::Sqlite(_) | JobStoreError::Storage(_) | JobStoreError::Io(_)
-            )) | Self::Domain(subjektiv::api::OperationError::Storage(_))
-            // The Host's writer/Subject liveness reads wrap storage errors in
-            // Unavailable. Recheck them within this same finite read-only budget;
-            // their failure NEVER authorizes a receipt, release, or execution.
-            | Self::Host(SubjektivHostError::Unavailable(_))
-        )
+        fn sqlite(error: &rusqlite::Error) -> bool {
+            matches!(error, rusqlite::Error::SqliteFailure(cause, _)
+                if matches!(cause.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::SystemIoFailure | rusqlite::ErrorCode::DiskFull
+                    | rusqlite::ErrorCode::CannotOpen))
+        }
+        fn io(error: &std::io::Error) -> bool {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+            )
+        }
+        fn storage(error: &feature_storage::FeatureStorageError) -> bool {
+            match error {
+                feature_storage::FeatureStorageError::Sqlite(error) => sqlite(error),
+                feature_storage::FeatureStorageError::Io(error) => io(error),
+                _ => false,
+            }
+        }
+        match self {
+            Self::Service(JobServiceError::Store(JobStoreError::Sqlite(error))) => sqlite(error),
+            Self::Service(JobServiceError::Store(JobStoreError::Io(error))) => io(error),
+            Self::Service(JobServiceError::Store(JobStoreError::Storage(error)))
+            | Self::Domain(subjektiv::api::OperationError::Storage(error))
+            | Self::Writer(subjektiv::journal::JournalError::Storage(error))
+            | Self::Writer(subjektiv::journal::JournalError::Subject(
+                subjektiv::SubjektivError::Storage(error),
+            )) => storage(error),
+            // Authority loss, permanent SQL constraints, malformed data and
+            // untyped Host unavailability never acquire a storage retry owner.
+            _ => false,
+        }
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConsolidationRecoveryProgress {
+    FastRetry,
+    RetainedStorage,
+    Blocked,
+}
+
 struct ConsolidationRecoveryOwner {
-    running: bool,
+    progress: ConsolidationRecoveryProgress,
     passes: usize,
     error: ConsolidationRecoveryError,
+}
+
+impl ConsolidationRecoveryOwner {
+    fn next_action(&self) -> &'static str {
+        match self.progress {
+            ConsolidationRecoveryProgress::FastRetry => {
+                "reconcile the same attempt after short storage backoff"
+            }
+            ConsolidationRecoveryProgress::RetainedStorage => {
+                "recheck the original binding/attempt/input/grant and same domain operation with capped storage backoff"
+            }
+            ConsolidationRecoveryProgress::Blocked => {
+                "resolve the recorded permanent storage or authority cause; no automatic execution or cleanup"
+            }
+        }
+    }
 }
 
 pub(crate) struct LocalSubjectHost {
@@ -813,6 +863,23 @@ impl LocalSubjectHost {
         self.recover_journals();
     }
 
+    /// Recheck the actual writer store without erasing its typed storage cause.
+    /// A released writer/closed Host is authority loss, not a transient outage.
+    fn ensure_consolidation_live(&self) -> Result<(), ConsolidationRecoveryError> {
+        if !self.live.load(Ordering::Acquire) {
+            return Err(
+                SubjektivHostError::Unavailable("local Subject Host is closed".into()).into(),
+            );
+        }
+        if !self.catalog.store.journal_writer_active(&self.writer)? {
+            return Err(SubjektivHostError::Unavailable(
+                "Subject writer binding was released".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Prefer a complete saved result. Otherwise close only this failed attempt's
     /// domain reservation, retaining unresolved work and the original failure.
     /// Neither path reruns the finalizer or proves prior execution shutdown.
@@ -821,7 +888,7 @@ impl LocalSubjectHost {
         jobs: &crate::jobs::StandaloneJobs,
         observed: &crate::jobs::JobSnapshot,
     ) -> Result<bool, ConsolidationRecoveryError> {
-        self.ensure_live()?;
+        self.ensure_consolidation_live()?;
         let current = jobs.get(&observed.request.job_id)?;
         if current.attempt.attempt_id != observed.attempt.attempt_id
             || current.input_digest != observed.input_digest
@@ -852,7 +919,7 @@ impl LocalSubjectHost {
             &current.request.job_id,
             &current.attempt.attempt_id,
         )? {
-            self.ensure_live()?;
+            self.ensure_consolidation_live()?;
             let settled = jobs.accept_reconciled(&job::JobResultSubmission {
                 job_id: current.request.job_id,
                 attempt_id: current.attempt.attempt_id,
@@ -891,7 +958,7 @@ impl LocalSubjectHost {
             &current.input_digest,
         ))
         .map_err(|error| SubjektivHostError::InvalidArgument(error.to_string()))?;
-        self.ensure_live()?;
+        self.ensure_consolidation_live()?;
         // Recheck the exact Host/grant before persistence. The service/store also
         // fence the current attempt and independently require ALL executions released.
         let checked = jobs.get(&current.request.job_id)?;
@@ -910,23 +977,16 @@ impl LocalSubjectHost {
         Ok(true)
     }
 
-    /// Keep a finite recovery owner for read/storage failure of this exact
-    /// snapshot. No startup-only repair, disconnect polling, new attempt or model
-    /// call. Exhaustion retains the typed cause and original durable obligation;
-    /// a fresh Host can reconcile it, never infer success from budget exhaustion.
+    /// Retain only typed temporary storage failures of this exact operation.
+    /// After eight fast passes the same owner uses capped backoff, not another
+    /// execution budget or a healthy-other-store probe. Each pass rereads the
+    /// current binding/attempt/input/grant/retirement and actual domain receipts.
     fn own_consolidation_recovery(
         &self,
         jobs: crate::jobs::StandaloneJobs,
         observed: crate::jobs::JobSnapshot,
         error: ConsolidationRecoveryError,
     ) {
-        eprintln!(
-            "standalone consolidation Job {} reconciliation blocked: {error}",
-            observed.request.job_id
-        );
-        if !error.retryable_read_or_storage() {
-            return;
-        }
         let key = (
             observed.request.job_id.clone(),
             observed.attempt.attempt_id.clone(),
@@ -936,14 +996,8 @@ impl LocalSubjectHost {
             .consolidation_recovery
             .lock()
             .expect("consolidation recovery poisoned");
-        if let Some(owner) = owners.get(&key) {
-            if !owner.running {
-                eprintln!(
-                    "standalone consolidation Job {} retains exhausted reconciliation after {} passes: {}; next action: resolve cause and restore the same Host binding",
-                    key.0, owner.passes, owner.error
-                );
-            }
-            return; // Repeated disconnect cannot refill a running or exhausted budget.
+        if owners.contains_key(&key) {
+            return; // Duplicate notifications cannot refill a budget or revive a blocked owner.
         }
         let Some(host) = self.self_weak.upgrade() else {
             return;
@@ -951,18 +1005,42 @@ impl LocalSubjectHost {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        owners.insert(
-            key.clone(),
-            ConsolidationRecoveryOwner {
-                running: true,
-                passes: 1,
-                error,
+        let retry = error.retryable_read_or_storage();
+        let owner = ConsolidationRecoveryOwner {
+            progress: if retry {
+                ConsolidationRecoveryProgress::FastRetry
+            } else {
+                ConsolidationRecoveryProgress::Blocked
             },
+            passes: 1,
+            error,
+        };
+        eprintln!(
+            "standalone consolidation Job {} reconciliation {:?} after {} passes: {}; next action: {}",
+            key.0,
+            owner.progress,
+            owner.passes,
+            owner.error,
+            owner.next_action()
         );
+        owners.insert(key.clone(), owner);
+        if !retry {
+            return;
+        }
         runtime.spawn(async move {
-            const PASSES: usize = 8;
-            for pass in 2..=PASSES {
-                tokio::time::sleep(std::time::Duration::from_millis(100 << (pass - 2).min(5))).await;
+            const FAST_PASSES: usize = 8;
+            let mut pass = 1usize;
+            let mut retained_delay = std::time::Duration::from_secs(1);
+            loop {
+                let delay = if pass < FAST_PASSES {
+                    std::time::Duration::from_millis(100 << (pass - 1).min(5))
+                } else {
+                    let delay = retained_delay;
+                    retained_delay = (retained_delay * 2).min(std::time::Duration::from_secs(30));
+                    delay
+                };
+                tokio::time::sleep(delay).await;
+                pass = pass.saturating_add(1);
                 let result = host.recover_consolidation_job(&jobs, &observed);
                 let mut owners = host.consolidation_recovery.lock().expect("consolidation recovery poisoned");
                 match result {
@@ -973,15 +1051,18 @@ impl LocalSubjectHost {
                         return;
                     }
                     Err(error) => {
-                        let retry = error.retryable_read_or_storage() && pass < PASSES;
+                        let retry = error.retryable_read_or_storage();
                         let owner = owners.get_mut(&key).expect("retained consolidation owner");
                         owner.passes = pass;
-                        owner.running = retry;
                         owner.error = error;
-                        if !retry {
-                            eprintln!("standalone consolidation Job {} reconciliation stopped after {} passes: {}; original Failed/input/receipts retained; next action: resolve storage/authority failure and restore the same Host binding", key.0, owner.passes, owner.error);
-                            return;
+                        owner.progress = if !retry { ConsolidationRecoveryProgress::Blocked }
+                            else if pass < FAST_PASSES { ConsolidationRecoveryProgress::FastRetry }
+                            else { ConsolidationRecoveryProgress::RetainedStorage };
+                        if !retry || pass == FAST_PASSES {
+                            eprintln!("standalone consolidation Job {} reconciliation {:?} after {} passes: {}; original input/receipts retained; next action: {}",
+                                key.0, owner.progress, owner.passes, owner.error, owner.next_action());
                         }
+                        if !retry { return; }
                     }
                 }
             }
@@ -991,7 +1072,7 @@ impl LocalSubjectHost {
     fn consolidation_grant(
         &self,
         snapshot: &crate::jobs::JobSnapshot,
-    ) -> Result<LocalConsolidationGrant, SubjektivHostError> {
+    ) -> Result<LocalConsolidationGrant, ConsolidationRecoveryError> {
         let grant: LocalConsolidationGrant =
             serde_json::from_value(snapshot.domain_grant.clone().ok_or_else(|| {
                 SubjektivHostError::InvalidArgument("missing explicit Subject delegation".into())
@@ -1004,16 +1085,17 @@ impl LocalSubjectHost {
         {
             return Err(SubjektivHostError::InvalidArgument(
                 "persisted Job grant/input does not match local Subject capability".into(),
-            ));
+            )
+            .into());
         }
         let subject = self
             .catalog
             .store
             .subject(&self.binding.subject_id)
-            .map_err(domain_error)?
+            .map_err(subjektiv::api::subjektiv_store_error)?
             .ok_or_else(|| SubjektivHostError::Unavailable("Subject missing".into()))?;
         if subject.state != subjektiv::SubjectState::Active {
-            return Err(SubjektivHostError::Unavailable("Subject is retired".into()));
+            return Err(SubjektivHostError::Unavailable("Subject is retired".into()).into());
         }
         Ok(grant)
     }

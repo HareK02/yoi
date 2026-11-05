@@ -16,6 +16,10 @@ use std::os::unix::fs::MetadataExt;
 
 const IDENTITY_TABLE: &str = "__yoi_storage_identity";
 
+#[path = "lifecycle_lock.rs"]
+mod lifecycle_lock;
+pub(super) use lifecycle_lock::EstablishedLocks;
+
 /// Expected storage target, retained with authorization and rechecked on resume.
 /// This is a physical identity, not an authorization credential or a Job lease.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,27 +40,14 @@ pub(super) struct Binding {
 pub(super) struct Lifecycle {
     pub root: PathBuf,
     pub scope: String,
+    pub established: Arc<EstablishedLocks>,
+    #[cfg(feature = "test-support")]
+    pub observation: Arc<lifecycle_observation::Counters>,
 }
 
 impl Lifecycle {
     pub fn lock(&self, exclusive: bool) -> Result<File> {
-        durable_create_directory(&self.root.join(".lifecycle"), &mut sync_directory)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(
-                self.root
-                    .join(".lifecycle")
-                    .join(format!("{}.lock", self.scope)),
-            )?;
-        if exclusive {
-            lock.lock()?;
-        } else {
-            lock.lock_shared()?;
-        }
-        Ok(lock)
+        self.lock_with_sync(exclusive, &mut sync_directory)
     }
 
     fn catalog(&self, create: bool) -> Result<Connection> {

@@ -99,6 +99,16 @@ impl ConsolidationRecoveryFixture {
         }
     }
 
+    fn domain_path(&self) -> PathBuf {
+        self.body
+            .host
+            .catalog
+            .root
+            .join("features")
+            .join(&self.body.host.catalog.scope_id)
+            .join("features/subjektiv.sqlite")
+    }
+
     fn domain_closure(&self) -> Option<String> {
         use rusqlite::OptionalExtension;
         rusqlite::Connection::open(&self.body.jobs_path)
@@ -356,8 +366,226 @@ async fn failed_consolidation_retains_unreleased_stale_inactive_migrated_and_era
     }
 }
 
+fn assert_real_busy(error: &ConsolidationRecoveryError, domain: bool) {
+    let cause = match error {
+        ConsolidationRecoveryError::Domain(subjektiv::api::OperationError::Storage(
+            feature_storage::FeatureStorageError::Sqlite(rusqlite::Error::SqliteFailure(cause, _)),
+        )) if domain => cause,
+        ConsolidationRecoveryError::Service(crate::jobs::JobServiceError::Store(
+            crate::jobs::JobStoreError::Sqlite(rusqlite::Error::SqliteFailure(cause, _)),
+        )) if !domain => cause,
+        other => panic!("expected typed Busy from original domain={domain}: {other:?}"),
+    };
+    assert_eq!(cause.code, rusqlite::ErrorCode::DatabaseBusy);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_consolidation_real_sqlite_busy_beyond_fast_budget_recovers_without_restore() {
+    real_sqlite_busy_consolidation_recovery(false, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_consolidation_real_domain_busy_beyond_fast_budget_recovers_without_restore() {
+    real_sqlite_busy_consolidation_recovery(true, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_consolidation_real_busy_retained_owner_rejects_stale_domain() {
+    real_sqlite_busy_consolidation_recovery(true, Some("stale")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_consolidation_real_busy_retained_owner_rejects_retired_input() {
+    real_sqlite_busy_consolidation_recovery(true, Some("retired")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_consolidation_real_busy_retained_owner_requires_actual_execution_cleanup() {
+    real_sqlite_busy_consolidation_recovery(true, Some("cleanup")).await;
+}
+
+async fn real_sqlite_busy_consolidation_recovery(domain: bool, control: Option<&str>) {
+    let mut fixture = ConsolidationRecoveryFixture::new();
+    if control != Some("cleanup") {
+        fixture.confirm_execution_joined();
+    }
+    if control == Some("stale") {
+        fixture.generation(&fixture.saved.attempt.attempt_id);
+        fixture
+            .body
+            .host
+            .catalog
+            .store
+            .create_memory(
+                &fixture.body.binding.subject_id,
+                subjektiv::MemoryDraft::active(
+                    memory::extract::CandidateKind::Lesson,
+                    "changed",
+                    "body",
+                    "reason",
+                    "change",
+                ),
+            )
+            .unwrap();
+    }
+    let before = fixture.saved.clone();
+    let path = if domain {
+        fixture.domain_path()
+    } else {
+        fixture.body.jobs_path.clone()
+    };
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let error = fixture
+        .body
+        .host
+        .recover_consolidation_job(&fixture.jobs, &before)
+        .unwrap_err();
+    assert_real_busy(&error, domain);
+    eprintln!(
+        "S1 real SQLite Busy domain={domain}; unchanged exact attempt; holding through pass8"
+    );
+    fixture
+        .body
+        .host
+        .own_consolidation_recovery(fixture.jobs.clone(), before.clone(), error);
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let reached = fixture
+                .body
+                .host
+                .consolidation_recovery
+                .lock()
+                .unwrap()
+                .values()
+                .any(|owner| owner.passes >= 8);
+            if reached {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real SQLite fault must remain through all eight passes");
+    {
+        let owners = fixture.body.host.consolidation_recovery.lock().unwrap();
+        assert_eq!(owners.len(), 1);
+        let owner = owners.values().next().unwrap();
+        assert_eq!(
+            owner.progress,
+            ConsolidationRecoveryProgress::RetainedStorage
+        );
+        assert_real_busy(&owner.error, domain);
+        assert!(owner.next_action().contains("same domain operation"));
+    }
+    assert!(fixture.domain_closure().is_none());
+    assert_eq!(fixture.jobs.get(&before.request.job_id).unwrap(), before);
+    if control == Some("retired") {
+        // While the original Feature DB is STILL unavailable, explicitly erase
+        // the Job's original input. A healthy Job DB is not Feature recovery.
+        fixture
+            .jobs
+            .reclaim_input(
+                &before.request.job_id,
+                &before.input_digest,
+                crate::jobs::JobInputRetirementReason::ExplicitErasure,
+            )
+            .unwrap();
+    }
+    let expected = fixture.jobs.get(&before.request.job_id).unwrap();
+    eprintln!("S1 pass8 observed while real lock still held; releasing only SQLite transaction");
+    connection.execute_batch("ROLLBACK;").unwrap();
+    // No restore, recover_jobs, notification, repeated own call, new Job, model or finalizer.
+    if let Some(control) = control {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let owners = fixture.body.host.consolidation_recovery.lock().unwrap();
+                let stopped = if control == "cleanup" {
+                    owners.is_empty()
+                } else {
+                    owners
+                        .values()
+                        .any(|owner| owner.progress == ConsolidationRecoveryProgress::Blocked)
+                };
+                drop(owners);
+                if stopped {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retained owner must honor current stale/retirement/cleanup refusal");
+        assert!(fixture.domain_closure().is_none(), "{control}");
+        assert_eq!(
+            fixture.jobs.get(&before.request.job_id).unwrap(),
+            expected,
+            "{control}"
+        );
+        assert_eq!(
+            expected.executions, before.executions,
+            "no invented cleanup proof"
+        );
+        if control == "cleanup" {
+            assert!(!expected.executions_released());
+            assert!(
+                expected
+                    .executions
+                    .iter()
+                    .all(|execution| !execution.writes_revoked)
+            );
+            assert!(!fixture.jobs.unreleased_granted().unwrap().is_empty());
+        } else {
+            let owners = fixture.body.host.consolidation_recovery.lock().unwrap();
+            let owner = owners.values().next().unwrap();
+            assert!(owner.passes > 8);
+            assert!(!owner.error.retryable_read_or_storage());
+            assert!(
+                owner
+                    .next_action()
+                    .contains("no automatic execution or cleanup")
+            );
+        }
+        return;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while fixture.domain_closure().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("same original domain obligation must recover after only fault release");
+    assert!(fixture.jobs.unreleased_granted().unwrap().is_empty());
+    assert_eq!(fixture.jobs.get(&before.request.job_id).unwrap(), before);
+    assert!(
+        fixture
+            .body
+            .host
+            .consolidation_recovery
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    let retained = subjektiv::job::inspect_abandoned_attempt(
+        &fixture.body.host.catalog.store,
+        &fixture.body.binding.subject_id,
+        &["candidate".into()],
+        &before.request.job_id,
+        &before.attempt.attempt_id,
+    )
+    .unwrap();
+    assert!(
+        retained.prepared_generation_id.is_none(),
+        "no finalizer replay"
+    );
+    assert!(retained.disposition_ids.is_empty(), "no model effects");
+    assert_eq!(retained.unresolved_candidate_ids, vec!["candidate"]);
+    let reopened = crate::job_store::JobStore::open(&fixture.body.jobs_path).unwrap();
+    assert_eq!(reopened.get(&before.request.job_id).unwrap(), before);
+}
+
 #[tokio::test]
-async fn failed_consolidation_receipt_storage_error_has_autonomous_exact_attempt_recovery() {
+async fn failed_consolidation_permanent_receipt_constraint_retains_cause_without_retry() {
     let mut fixture = ConsolidationRecoveryFixture::new();
     fixture.confirm_execution_joined();
     let before = fixture.saved.clone();
@@ -375,7 +603,7 @@ async fn failed_consolidation_receipt_storage_error_has_autonomous_exact_attempt
         .host
         .recover_consolidation_job(&fixture.jobs, &before)
         .unwrap_err();
-    assert!(error.retryable_read_or_storage());
+    assert!(!error.retryable_read_or_storage());
     assert!(fixture.domain_closure().is_none());
     fixture
         .body
@@ -384,24 +612,23 @@ async fn failed_consolidation_receipt_storage_error_has_autonomous_exact_attempt
     connection
         .execute_batch("DROP TRIGGER fail_domain_closure;")
         .unwrap();
-    // No disconnect, recover_jobs call, restart, new Job, model or finalizer.
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while fixture.domain_closure().is_none() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(fixture.jobs.unreleased_granted().unwrap().is_empty());
+    // Removing a permanent constraint does not reclassify it as a transient
+    // outage or refill the same owner's budget. Diagnose it, never blind retry.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(fixture.domain_closure().is_none());
     assert_eq!(fixture.jobs.get(&before.request.job_id).unwrap(), before);
+    let owners = fixture.body.host.consolidation_recovery.lock().unwrap();
+    let owner = owners.values().next().unwrap();
+    assert_eq!(owner.progress, ConsolidationRecoveryProgress::Blocked);
+    assert_eq!(owner.passes, 1);
+    assert!(matches!(&owner.error,
+        ConsolidationRecoveryError::Service(crate::jobs::JobServiceError::Store(
+            crate::jobs::JobStoreError::Sqlite(rusqlite::Error::SqliteFailure(cause, _))))
+        if cause.code == rusqlite::ErrorCode::ConstraintViolation));
     assert!(
-        fixture
-            .body
-            .host
-            .consolidation_recovery
-            .lock()
-            .unwrap()
-            .is_empty()
+        owner
+            .next_action()
+            .contains("permanent storage or authority")
     );
 }
 
