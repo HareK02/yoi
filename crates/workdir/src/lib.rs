@@ -8,6 +8,7 @@ pub use checkout::{
 mod environment;
 pub use environment::WorkdirSessionEnvironment;
 pub mod external;
+pub mod failure;
 pub mod http;
 mod local;
 mod operation;
