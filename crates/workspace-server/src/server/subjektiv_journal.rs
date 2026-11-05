@@ -780,6 +780,9 @@ fn dispatch_saved_or_new(
 }
 
 fn queue_reservation(api: &WorkspaceApi, reservation: BackendJobReservation) -> Result<()> {
+    // The durable intent is already accepted. Host capacity is only an eager-dispatch
+    // optimization: its rejection must not leave this same attempt without recovery.
+    api.own_backend_job_recovery(&reservation.attempt);
     let queued = api.clone();
     if let Err(error)=api.host_executors.host()?.dispatch(move || {
         if let Err(error)=queued.dispatch_backend_job_reservation(reservation) {

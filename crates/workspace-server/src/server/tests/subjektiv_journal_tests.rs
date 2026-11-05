@@ -267,6 +267,173 @@ async fn journal_route_rejects_missing_authenticated_source_before_admission() {
     ));
 }
 
+// Saturate the real finite Host lane without blocking the separate recording callback lane.
+// Drop releases both workers even if a regression assertion panics.
+struct JournalHostCapacityBarrier(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl JournalHostCapacityBarrier {
+    async fn hold(api: &WorkspaceApi) -> Self {
+        let barrier = Self(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
+        let host = api.host_executors.host().unwrap();
+        for _ in 0..2 {
+            let held = barrier.0.clone();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            host.dispatch(move || {
+                let _ = started.send(());
+                let (lock, changed) = &*held;
+                let (_guard, timeout) = changed
+                    .wait_timeout_while(
+                        lock.lock().unwrap(),
+                        std::time::Duration::from_secs(30),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                assert!(
+                    !timeout.timed_out(),
+                    "Host capacity barrier was not released"
+                );
+            })
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for _ in 0..64 {
+            match host.dispatch(|| {}) {
+                Ok(()) => {}
+                Err(Error::DbCapacityExceeded) => return barrier,
+                other => panic!("unexpected Host admission: {other:?}"),
+            }
+        }
+        panic!("finite Host lane did not reject admission");
+    }
+}
+
+impl Drop for JournalHostCapacityBarrier {
+    fn drop(&mut self) {
+        let (lock, changed) = &*self.0;
+        *lock.lock().unwrap() = true;
+        changed.notify_all();
+    }
+}
+
+#[tokio::test]
+async fn journal_host_capacity_rejection_keeps_same_reservation_autonomously_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(crate::subjektiv::SubjectRole::new("capacity-recording").unwrap())
+        .unwrap();
+    let source = spawn_journal_source(&api, &subject.id, "capacity-source");
+    let session = session_store::new_session_id();
+    seed_session(
+        &session_root(dir.path(), &source),
+        session,
+        message(SOURCE_SENTINEL),
+        session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
+    );
+    let attr = store
+        .record_session_attribution(
+            crate::subjektiv::SubjectSessionAttribution::new(
+                &subject.id,
+                &source.runtime_id,
+                &source.worker_id,
+                session.to_string(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    bind_fixture_session(&store, attr);
+    let callback = || {
+        subjektiv_journal::recording_route(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            Some(axum::Extension(
+                crate::worker_source::VerifiedRuntimeRequestSource {
+                    runtime_id: source.runtime_id.clone(),
+                    worker_id: Some(source.worker_id.clone()),
+                    authentication_binding_id: "fixture-verified-binding".into(),
+                    token_id_hash: None,
+                },
+            )),
+            Json(JournalRecordingRequest {
+                reason: JournalRecordingReason::RunCommitted,
+            }),
+        )
+    };
+    let held = JournalHostCapacityBarrier::hold(&api).await;
+    assert_eq!(
+        callback().await.unwrap().0,
+        JournalRecordingResponse::Accepted
+    );
+    let jobs = api
+        .store
+        .list_backend_journal_jobs(TEST_WORKSPACE_ID, &session.to_string(), None, 100)
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    let job = &jobs[0];
+    let attempt_id = crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt);
+    let before = api
+        .store
+        .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.state, BackendJobAttemptState::Reserved);
+    assert!(before.worker.is_none());
+    assert!(execution.take_inputs().is_empty());
+    assert!(
+        api.backend_job_recovery
+            .recovery_owner_ids()
+            .contains(&attempt_id),
+        "accepted Journal reservation lost its owner when Host admission was rejected"
+    );
+    drop(held);
+    // No request replay, manual sweep, restart or replacement Job drives this transition.
+    let dispatched = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
+            tick.tick().await;
+            let current = api
+                .store
+                .get_backend_job_attempt(TEST_WORKSPACE_ID, &job.request.job_id, &attempt_id)
+                .unwrap()
+                .unwrap();
+            if current.state == BackendJobAttemptState::Dispatched
+                && !execution.inputs.lock().unwrap().is_empty()
+            {
+                break current;
+            }
+        }
+    })
+    .await
+    .expect("same accepted Journal did not recover after Host capacity returned");
+    assert_eq!(dispatched.attempt_id, before.attempt_id);
+    assert_eq!(dispatched.deadline_at, before.deadline_at);
+    assert_eq!(dispatched.input_digest, before.input_digest);
+    assert_eq!(
+        callback().await.unwrap().0,
+        JournalRecordingResponse::Accepted
+    );
+    let inputs = execution.take_inputs();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].1, job.request.worker_input(&attempt_id).unwrap());
+    assert_eq!(
+        api.store
+            .list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    api.stop_backend_job_recovery().await;
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     api: WorkspaceApi,
@@ -2210,17 +2377,22 @@ async fn saved_checkpoint_recovery_completes_without_proving_failed_cleanup_ende
         let dispatched = f.dispatch_input();
         let worker = dispatched.attempt.worker.as_ref().unwrap();
 
+        // Inject a recoverable cleanup commit failure before checkpoint publication.
+        // Pin/unpin changes Worker authority and deliberately makes the original child stale;
+        // that negative contract is covered by the canonical-cleanup staleness tests.
+        f.api
+            .config_store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_checkpoint_cleanup_commit
+                 BEFORE INSERT ON worker_registry_projection_removals
+                 BEGIN SELECT RAISE(ABORT, 'injected checkpoint cleanup failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
         f.checkpoint(worker); // Deliberately do not call finish: checkpoint receipt is durable.
         f.execution.take_inputs();
-        f.api
-            .store
-            .update_worker_retention(
-                TEST_WORKSPACE_ID,
-                worker,
-                "pinned",
-                &Utc::now().to_rfc3339(),
-            )
-            .unwrap();
 
         if recovery == "journal" {
             subjektiv_journal::recover_attempts(&f.api).unwrap();
@@ -2252,22 +2424,31 @@ async fn saved_checkpoint_recovery_completes_without_proving_failed_cleanup_ende
                 .unwrap()
                 .contains(SOURCE_SENTINEL)
         );
-        assert!(
-            session_root(f.dir.path(), worker).exists(),
-            "cleanup failure is not hidden by outcome resolution"
+        assert_eq!(
+            saved.input_disposition,
+            crate::backend_job::JobInputDisposition::Available,
+            "Job completion cannot retire input before canonical cleanup succeeds"
+        );
+        let original_removal = f
+            .api
+            .config_store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            original_removal.prior_failure_category.as_deref(),
+            Some("metadata_commit_failed")
         );
         assert!(
             f.execution.take_inputs().is_empty(),
             "saved checkpoint must not cause model rerun"
         );
         f.api
-            .store
-            .update_worker_retention(
-                TEST_WORKSPACE_ID,
-                worker,
-                "normal",
-                &Utc::now().to_rfc3339(),
-            )
+            .config_store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_checkpoint_cleanup_commit;")?;
+                Ok(())
+            })
             .unwrap();
 
         f.api.recover_backend_jobs().unwrap();
@@ -2280,6 +2461,20 @@ async fn saved_checkpoint_recovery_completes_without_proving_failed_cleanup_ende
         )
         .await;
         f.assert_purged(worker);
+        let completed_removal = f
+            .api
+            .config_store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed_removal.plan.operation_id,
+            original_removal.plan.operation_id
+        );
+        assert_eq!(
+            completed_removal.plan.input_fingerprint,
+            original_removal.plan.input_fingerprint
+        );
         assert_eq!(
             f.api
                 .store
