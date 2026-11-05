@@ -2212,6 +2212,97 @@ impl ServerApiContractService {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum WorkerRemovalFailure {
+    #[error("{0}")]
+    Internal(String),
+    #[error("{error}")]
+    Storage {
+        error: Error,
+        response: Option<worker::WorkspaceResponse>,
+    },
+}
+
+impl From<String> for WorkerRemovalFailure {
+    fn from(message: String) -> Self {
+        Self::Internal(message)
+    }
+}
+
+impl From<&str> for WorkerRemovalFailure {
+    fn from(message: &str) -> Self {
+        Self::Internal(message.to_owned())
+    }
+}
+
+impl From<Error> for WorkerRemovalFailure {
+    fn from(error: Error) -> Self {
+        Self::Storage {
+            error,
+            response: None,
+        }
+    }
+}
+
+impl WorkerRemovalFailure {
+    fn retention_response(
+        error: crate::retention::WorkerRetentionError,
+    ) -> std::result::Result<worker::WorkspaceResponse, Self> {
+        match error {
+            crate::retention::WorkerRetentionError::Store(error) => Err(Self::Storage {
+                error,
+                response: Some(worker_remove_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "worker_removal_authority_unavailable",
+                    "Worker removal authority is unavailable; removal can be retried",
+                )),
+            }),
+            error => Ok(worker_retention_error_response(error)),
+        }
+    }
+
+    fn storage_response(
+        response: worker::WorkspaceResponse,
+        error: Error,
+    ) -> std::result::Result<worker::WorkspaceResponse, Self> {
+        match error {
+            Error::Io(_)
+            | Error::Sqlite(_)
+            | Error::SubjektivStorage(_)
+            | Error::DbCapacityExceeded
+            | Error::DbExecutorUnavailable
+            | Error::DbOperationOutcomeUnknown
+            | Error::Store(_) => Err(Self::Storage {
+                error,
+                response: Some(response),
+            }),
+            _ => Ok(response),
+        }
+    }
+
+    fn into_error(self, runtime_id: &str) -> Error {
+        match self {
+            Self::Internal(message) => Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_owned(),
+                code: "backend_job_cleanup_removal_failed".to_string(),
+                message,
+            },
+            Self::Storage { error, .. } => error,
+        }
+    }
+
+    fn into_response(self) -> std::result::Result<worker::WorkspaceResponse, String> {
+        match self {
+            Self::Internal(message) => Err(message),
+            Self::Storage {
+                response: Some(response),
+                ..
+            } => Ok(response),
+            Self::Storage { error, .. } => Err(error.to_string()),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WorkerRemovalService {
     workspace_id: String,
@@ -2376,7 +2467,7 @@ impl WorkerRemovalService {
         target: &RuntimeWorkerRef,
         mut prepared: crate::retention::PreparedWorkerRemoval,
         parent_workspace_deletion_operation_id: Option<&str>,
-    ) -> std::result::Result<worker::WorkspaceResponse, String> {
+    ) -> std::result::Result<worker::WorkspaceResponse, WorkerRemovalFailure> {
         if prepared.plan.session_disposition
             == worker_runtime::retention::SessionDisposition::Archive
         {
@@ -2385,11 +2476,14 @@ impl WorkerRemovalService {
             ) {
                 Ok(ack) => ack,
                 Err(error) => {
-                    return Ok(worker_remove_error_response(
-                        StatusCode::CONFLICT,
-                        "erased_removal_reconciliation_unconfirmed",
-                        &error.to_string(),
-                    ));
+                    return WorkerRemovalFailure::storage_response(
+                        worker_remove_error_response(
+                            StatusCode::CONFLICT,
+                            "erased_removal_reconciliation_unconfirmed",
+                            &error.to_string(),
+                        ),
+                        error,
+                    );
                 }
             };
             if let Some(ack) = erasure_ack {
@@ -2401,7 +2495,7 @@ impl WorkerRemovalService {
                             .store
                             .audit_erased_worker_removal_receipt(&prepared, &ack, &result)
                         {
-                            return Ok(worker_retention_error_response(error));
+                            return WorkerRemovalFailure::retention_response(error);
                         }
                         return match self.worker_projection.publish_ordered(|| {
                             self.store
@@ -2414,7 +2508,7 @@ impl WorkerRemovalService {
                                 .map(|commit| ((), commit.catalog))
                         }) {
                             Ok(()) => Ok(worker_remove_success_response(target)),
-                            Err(error) => Ok(worker_retention_error_response(error)),
+                            Err(error) => WorkerRemovalFailure::retention_response(error),
                         };
                     }
                     Err(_) => {
@@ -2434,7 +2528,7 @@ impl WorkerRemovalService {
                             .store
                             .supersede_erased_worker_removal(&prepared, &ack, &inventory)
                         {
-                            return Ok(worker_retention_error_response(error));
+                            return WorkerRemovalFailure::retention_response(error);
                         }
                         let request = crate::retention::WorkerRemovalPlanRequest {
                             workspace_id: self.workspace_id.clone(),
@@ -2444,7 +2538,7 @@ impl WorkerRemovalService {
                         };
                         let plan = match self.store.plan_worker_removal(&request, &inventory) {
                             Ok(plan) => plan,
-                            Err(error) => return Ok(worker_retention_error_response(error)),
+                            Err(error) => return WorkerRemovalFailure::retention_response(error),
                         };
                         prepared = match self.store.prepare_worker_removal_execution(
                             &self.workspace_id,
@@ -2452,7 +2546,7 @@ impl WorkerRemovalService {
                             &plan.input_fingerprint,
                         ) {
                             Ok(prepared) => prepared,
-                            Err(error) => return Ok(worker_retention_error_response(error)),
+                            Err(error) => return WorkerRemovalFailure::retention_response(error),
                         };
                         if let Some(parent) = parent_workspace_deletion_operation_id {
                             self.store
@@ -2460,18 +2554,21 @@ impl WorkerRemovalService {
                                     parent,
                                     &prepared.plan.operation_id,
                                 )
-                                .map_err(|error| error.to_string())?;
+                                .map_err(WorkerRemovalFailure::from)?;
                         }
                     }
                 }
             }
         }
         if let Err(error) = subjektiv_journal::validate_removal_retention(self, target, &prepared) {
-            return Ok(worker_remove_error_response(
-                StatusCode::CONFLICT,
-                "journal_retention_unconfirmed",
-                &error.to_string(),
-            ));
+            return WorkerRemovalFailure::storage_response(
+                worker_remove_error_response(
+                    StatusCode::CONFLICT,
+                    "journal_retention_unconfirmed",
+                    &error.to_string(),
+                ),
+                error,
+            );
         }
         let result =
             match runtime.execute_worker_retention(target, prepared.runtime_request.clone()) {
@@ -2500,11 +2597,14 @@ impl WorkerRemovalService {
             }) {
                 Ok(result) => result,
                 Err(error) => {
-                    return Ok(worker_remove_error_response(
-                        StatusCode::CONFLICT,
-                        "subject_removal_completion_unconfirmed",
-                        &error.to_string(),
-                    ));
+                    return WorkerRemovalFailure::storage_response(
+                        worker_remove_error_response(
+                            StatusCode::CONFLICT,
+                            "subject_removal_completion_unconfirmed",
+                            &error.to_string(),
+                        ),
+                        error,
+                    );
                 }
             };
         match commit_result {
@@ -2512,7 +2612,7 @@ impl WorkerRemovalService {
                 subjektiv_journal::after_worker_removal(self, &result);
                 Ok(worker_remove_success_response(target))
             }
-            Err(error) => Ok(worker_retention_error_response(error)),
+            Err(error) => WorkerRemovalFailure::retention_response(error),
         }
     }
 
@@ -2653,6 +2753,7 @@ impl WorkerRemovalService {
             None,
         )
         .await
+        .or_else(WorkerRemovalFailure::into_response)
     }
 
     /// Restarted Job cleanup may resume only its already-observed canonical
@@ -2665,7 +2766,7 @@ impl WorkerRemovalService {
         reason: &str,
         parent_workspace_deletion_operation_id: Option<&str>,
         job_cleanup_owner: Option<&Mutex<Option<(String, String)>>>,
-    ) -> std::result::Result<worker::WorkspaceResponse, String> {
+    ) -> std::result::Result<worker::WorkspaceResponse, WorkerRemovalFailure> {
         let remove_lock = {
             let mut locks = self
                 .worker_remove_locks
@@ -2692,7 +2793,14 @@ impl WorkerRemovalService {
         let prepared = self
             .store
             .recover_worker_removal_execution(&self.workspace_id, &target)
-            .map_err(|_| "Worker removal recovery authority is unavailable".to_string())?;
+            .map_err(|error| match error {
+                crate::retention::WorkerRetentionError::Store(error) => {
+                    WorkerRemovalFailure::from(error)
+                }
+                _ => WorkerRemovalFailure::Internal(
+                    "Worker removal recovery authority is unavailable".to_string(),
+                ),
+            })?;
         let expected_removal = job_cleanup_owner
             .map(|owner| {
                 owner
@@ -2746,7 +2854,7 @@ impl WorkerRemovalService {
                             .recover_succeeded_worker_removal_catalog(&self.workspace_id, target)
                             .map(|commit| ((), commit))
                     })
-                    .map_err(|error| error.to_string())?;
+                    .map_err(WorkerRemovalFailure::from)?;
                 return Ok(worker_remove_success_response(target));
             }
             let prepared = if matches!(
@@ -2760,7 +2868,7 @@ impl WorkerRemovalService {
                     &prepared.plan.input_fingerprint,
                 ) {
                     Ok(prepared) => prepared,
-                    Err(error) => return Ok(worker_retention_error_response(error)),
+                    Err(error) => return WorkerRemovalFailure::retention_response(error),
                 }
             } else {
                 prepared
@@ -2771,7 +2879,7 @@ impl WorkerRemovalService {
                         parent_operation_id,
                         &prepared.plan.operation_id,
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(WorkerRemovalFailure::from)?;
             }
             if close_worker_workdir_sessions(&self.workdir_sessions, &target)
                 .await
@@ -2789,27 +2897,26 @@ impl WorkerRemovalService {
                     "Worker Workdir sessions could not be closed; removal can be retried",
                 ));
             }
-            if self
-                .store
-                .detach_worker_workdir(
-                    &self.workspace_id,
-                    &target,
-                    None,
-                    &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                )
-                .is_err()
-            {
+            if let Err(error) = self.store.detach_worker_workdir(
+                &self.workspace_id,
+                &target,
+                None,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            ) {
                 let _ = self.store.fail_worker_removal(
                     &self.workspace_id,
                     &prepared.plan.operation_id,
                     &prepared.plan.input_fingerprint,
                     "workdir_attachment_release_failed",
                 );
-                return Ok(worker_remove_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "attachment_release_failed",
-                    "Worker Workdir attachment could not be released; removal can be retried",
-                ));
+                return WorkerRemovalFailure::storage_response(
+                    worker_remove_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "attachment_release_failed",
+                        "Worker Workdir attachment could not be released; removal can be retried",
+                    ),
+                    error,
+                );
             }
             return self
                 .resume_worker_retention(
@@ -2843,11 +2950,14 @@ impl WorkerRemovalService {
         {
             Ok(proof) => proof,
             Err(error) => {
-                return Ok(worker_remove_error_response(
-                    StatusCode::CONFLICT,
-                    "journal_handoff_incomplete",
-                    &error.to_string(),
-                ));
+                return WorkerRemovalFailure::storage_response(
+                    worker_remove_error_response(
+                        StatusCode::CONFLICT,
+                        "journal_handoff_incomplete",
+                        &error.to_string(),
+                    ),
+                    error,
+                );
             }
         };
         let inventory = match runtime.worker_retention_inventory(&target) {
@@ -2873,7 +2983,7 @@ impl WorkerRemovalService {
             self.store.plan_worker_removal(&request, &inventory)
         } {
             Ok(plan) => plan,
-            Err(error) => return Ok(worker_retention_error_response(error)),
+            Err(error) => return WorkerRemovalFailure::retention_response(error),
         };
         if let Some(owner) = job_cleanup_owner {
             *owner
@@ -2887,7 +2997,7 @@ impl WorkerRemovalService {
             &plan.input_fingerprint,
         ) {
             Ok(prepared) => prepared,
-            Err(error) => return Ok(worker_retention_error_response(error)),
+            Err(error) => return WorkerRemovalFailure::retention_response(error),
         };
 
         if let Some(parent_operation_id) = parent_workspace_deletion_operation_id {
@@ -2896,7 +3006,7 @@ impl WorkerRemovalService {
                     parent_operation_id,
                     &prepared.plan.operation_id,
                 )
-                .map_err(|error| error.to_string())?;
+                .map_err(WorkerRemovalFailure::from)?;
         }
         if close_worker_workdir_sessions(&self.workdir_sessions, &target)
             .await
@@ -2915,7 +3025,7 @@ impl WorkerRemovalService {
             ));
         }
 
-        if let Err(_) = self.store.detach_worker_workdir(
+        if let Err(error) = self.store.detach_worker_workdir(
             &self.workspace_id,
             &target,
             None,
@@ -2927,19 +3037,25 @@ impl WorkerRemovalService {
                 &plan.input_fingerprint,
                 "workdir_attachment_release_failed",
             );
-            return Ok(worker_remove_error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "attachment_release_failed",
-                "Worker Workdir attachment could not be released; removal can be retried",
-            ));
+            return WorkerRemovalFailure::storage_response(
+                worker_remove_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "attachment_release_failed",
+                    "Worker Workdir attachment could not be released; removal can be retried",
+                ),
+                error,
+            );
         }
 
         if let Err(error) = subjektiv_journal::validate_removal_retention(self, target, &prepared) {
-            return Ok(worker_remove_error_response(
-                StatusCode::CONFLICT,
-                "journal_retention_unconfirmed",
-                &error.to_string(),
-            ));
+            return WorkerRemovalFailure::storage_response(
+                worker_remove_error_response(
+                    StatusCode::CONFLICT,
+                    "journal_retention_unconfirmed",
+                    &error.to_string(),
+                ),
+                error,
+            );
         }
         let retention_result =
             match runtime.execute_worker_retention(&target, prepared.runtime_request.clone()) {
@@ -2979,11 +3095,14 @@ impl WorkerRemovalService {
         ) {
             Ok(result) => result,
             Err(error) => {
-                return Ok(worker_remove_error_response(
-                    StatusCode::CONFLICT,
-                    "subject_removal_completion_unconfirmed",
-                    &error.to_string(),
-                ));
+                return WorkerRemovalFailure::storage_response(
+                    worker_remove_error_response(
+                        StatusCode::CONFLICT,
+                        "subject_removal_completion_unconfirmed",
+                        &error.to_string(),
+                    ),
+                    error,
+                );
             }
         };
         match commit_result {
@@ -2995,7 +3114,7 @@ impl WorkerRemovalService {
                     &plan.input_fingerprint,
                     "metadata_commit_failed",
                 );
-                return Ok(worker_retention_error_response(error));
+                return WorkerRemovalFailure::retention_response(error);
             }
         };
         subjektiv_journal::after_worker_removal(self, &retention_result);
@@ -5469,21 +5588,38 @@ impl WorkspaceApi {
             Error::Store("claimed Backend Job Worker cleanup lost its binding".to_string())
         })?;
 
-        let fail = |category: &str, detail: String| -> Result<()> {
+        let record_failure = |category: &str, detail: &str| -> Result<()> {
             self.store.finish_backend_job_worker_cleanup_owned(
                 &self.config.workspace_id,
                 &history,
                 &attempt,
                 BackendJobWorkerCleanupState::Failed,
                 Some(category),
-                Some(&detail),
+                Some(detail),
                 &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
             )?;
+            Ok(())
+        };
+        let fail = |category: &str, detail: String| -> Result<()> {
+            record_failure(category, &detail)?;
             Err(Error::RuntimeOperationFailed {
                 runtime_id: worker.runtime_id.clone(),
                 code: category.to_string(),
                 message: detail,
             })
+        };
+        let fail_with_error = |category: &str, error: Error| -> Result<()> {
+            if let Err(diagnostic) = record_failure(category, &error.to_string()) {
+                tracing::warn!(%error, %diagnostic, "Cleanup failure diagnosis was not confirmed");
+                // Keep transient storage ownership even when a definitive operation
+                // failure could not be diagnosed durably. Neither error proves cleanup.
+                if !backend_job_recovery::transient_storage(&error)
+                    && backend_job_recovery::transient_storage(&diagnostic)
+                {
+                    return Err(diagnostic);
+                }
+            }
+            Err(error)
         };
         let complete = || -> Result<()> {
             self.require_backend_job_attempt_effects_ended(&attempt)?;
@@ -5495,7 +5631,10 @@ impl WorkspaceApi {
                 let removal = self
                     .config_store
                     .recover_worker_removal_execution(self.workspace_id(), &worker)
-                    .map_err(|e| Error::Store(e.to_string()))?;
+                    .map_err(|error| match error {
+                        crate::retention::WorkerRetentionError::Store(error) => error,
+                        error => Error::Store(error.to_string()),
+                    })?;
                 if !removal.is_some_and(|p| {
                     p.plan.state == crate::retention::WorkerRemovalPlanState::Succeeded
                         && p.runtime_request.session_disposition
@@ -5552,7 +5691,7 @@ impl WorkspaceApi {
                 Err(error) => return fail("backend_job_cleanup_stop_unconfirmed", error.message()),
             }
             if let Err(error) = self.fence_backend_job_effects(&attempt, drain).await {
-                return fail("backend_job_cleanup_effects_unconfirmed", error.to_string());
+                return fail_with_error("backend_job_cleanup_effects_unconfirmed", error);
             }
         }
 
@@ -5564,15 +5703,15 @@ impl WorkspaceApi {
                 None,
                 Some(removal_owner),
             )
-            .await
-            .map_err(|message| Error::RuntimeOperationFailed {
-                runtime_id: worker.runtime_id.clone(),
-                code: "backend_job_cleanup_removal_failed".to_string(),
-                message,
-            });
+            .await;
         let response = match response {
             Ok(response) => response,
-            Err(error) => return fail("backend_job_cleanup_removal_failed", error.to_string()),
+            Err(error) => {
+                return fail_with_error(
+                    "backend_job_cleanup_removal_failed",
+                    error.into_error(&worker.runtime_id),
+                );
+            }
         };
         if response.status == StatusCode::OK.as_u16() {
             return complete();

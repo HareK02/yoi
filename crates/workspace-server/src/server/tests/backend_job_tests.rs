@@ -1111,15 +1111,15 @@ async fn backend_job_cleanup_commit_failure_retries_old_attempt_without_touching
     assert_eq!(blocked.failure_category.as_deref(), Some("model_failure"));
     assert_eq!(
         blocked.worker_cleanup_failure_category.as_deref(),
-        Some("backend_job_cleanup_removal_rejected")
+        Some("backend_job_cleanup_removal_failed")
     );
     assert!(
         blocked
             .worker_cleanup_failure_detail
             .as_deref()
             .unwrap()
-            .contains("worker_removal_authority_unavailable"),
-        "canonical catalog commit failure must remain a removal error: {blocked:?}"
+            .contains("injected cleanup catalog failure"),
+        "cleanup must retain the original catalog cause, not a flattened HTTP rejection: {blocked:?}"
     );
     let blocked_removal = api
         .config_store

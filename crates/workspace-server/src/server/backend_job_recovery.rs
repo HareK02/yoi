@@ -33,6 +33,10 @@ pub(super) struct RecoveryOwners {
     #[cfg(test)]
     pub(super) nonjournal_lookup_pending: tokio::sync::Notify,
     #[cfg(test)]
+    pub(super) cleanup_storage_settlement: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) cleanup_stopped: tokio::sync::Notify,
+    #[cfg(test)]
     pub(super) cleanup_before_claim: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     #[cfg(test)]
     pub(super) cleanup_before_writer_fence: tokio::sync::Notify,
@@ -205,7 +209,7 @@ fn transient_subjektiv_storage(error: &Error) -> bool {
     }
 }
 
-fn transient_storage(error: &Error) -> bool {
+pub(super) fn transient_storage(error: &Error) -> bool {
     transient_subjektiv_storage(error) || workspace_storage_failure(error)
 }
 
@@ -483,6 +487,8 @@ impl WorkspaceApi {
             if let Err(error) = api.run_backend_job_cleanup(expected.clone()).await {
                 tracing::warn!(job_id=%expected.job_id, attempt_id=%expected.attempt_id, %error,
                     "Job cleanup stopped; execution/input/resource fences remain retained");
+                #[cfg(test)]
+                api.backend_job_recovery.cleanup_stopped.notify_one();
             }
         });
         true
@@ -494,7 +500,7 @@ impl WorkspaceApi {
     ) -> Result<()> {
         // Pin the observed canonical operation across this owner's storage retries.
         let removal_owner = Arc::new(Mutex::new(None::<(String, String)>));
-        let mut failures = 0;
+        let mut failures = 0usize;
         loop {
             if self.backend_job_recovery.stopping.load(Ordering::Acquire) {
                 return Ok(());
@@ -611,7 +617,7 @@ impl WorkspaceApi {
                         .lock()
                         .unwrap()
                         .clone();
-                    runtime.block_on(async {
+                    let result = runtime.block_on(async {
                         #[cfg(test)]
                         if let Some(gate) = after_claim {
                             api.backend_job_recovery.cleanup_claimed_writer.notify_one();
@@ -625,9 +631,40 @@ impl WorkspaceApi {
                         }
                         api.cleanup_backend_job_attempt_worker(attempt, &removal_owner, &drain)
                             .await
-                    })
+                    });
+                    if let Err(error) = &result
+                        && transient_subjektiv_storage(error)
+                    {
+                        let history = api.store.list_backend_job_attempts(api.workspace_id(), &owner.job_id)?;
+                        let current = history.iter().find(|attempt| attempt.attempt_id == owner.attempt_id)
+                            .ok_or_else(|| Error::Store("Feature cleanup owner disappeared".into()))?;
+                        if JobHostOwner::try_from(current)? != JobHostOwner::try_from(&owner)?
+                            || !current.state.terminal()
+                        {
+                            return Err(Error::RepositoryConflict("Feature cleanup diagnostic owner changed".into()));
+                        }
+                        api.store.finish_backend_job_worker_cleanup_owned(
+                            api.workspace_id(), &history, current,
+                            BackendJobWorkerCleanupState::Failed,
+                            Some("backend_job_cleanup_feature_storage_unavailable"),
+                            Some(&format!("{error}; original cleanup owner retains input and canonical child; reconcile the same Feature operation after backoff, never infer termination or resubmit input")),
+                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        )?;
+                    }
+                    result
                 })
                 .await;
+            #[cfg(test)]
+            if failures >= 5
+                && result.as_ref().is_err_and(|error| {
+                    transient_storage(error)
+                        || matches!(error, Error::RuntimeOperationFailed { .. })
+                })
+            {
+                self.backend_job_recovery
+                    .cleanup_storage_settlement
+                    .notify_one();
+            }
             match result {
                 Ok(()) => return Ok(()),
                 Err(error)
@@ -639,6 +676,16 @@ impl WorkspaceApi {
                         .pause(Duration::from_millis(100 << failures))
                         .await;
                     failures += 1;
+                }
+                Err(error) if transient_subjektiv_storage(&error) => {
+                    // This is the original Feature operation, not a healthy Workspace
+                    // probe. Re-enter its owner/history, retained-writer and canonical
+                    // child checks; no new execution or replacement removal is allowed.
+                    // Terminal Job deadlines do not authorize discarding failed cleanup.
+                    let delay =
+                        Duration::from_secs((1u64 << failures.saturating_sub(5).min(5)).min(30));
+                    failures = failures.saturating_add(1);
+                    self.backend_job_recovery.pause(delay).await;
                 }
                 Err(error) if workspace_storage_failure(&error) => {
                     tracing::warn!(attempt_id=%expected.attempt_id, %error, "Cleanup settlement budget exhausted; exact-owner storage probe only");

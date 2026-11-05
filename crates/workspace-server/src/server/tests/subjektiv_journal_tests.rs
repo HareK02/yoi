@@ -1340,6 +1340,342 @@ fn lock_journal_domain(f: &RuntimeFixture) -> JournalCompletionSaveFault {
 }
 
 #[tokio::test]
+async fn cleanup_feature_storage_outage_beyond_budget_recovers_without_sweep() {
+    let f = RuntimeFixture::new().await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *f.api
+        .backend_job_recovery
+        .cleanup_after_claim
+        .lock()
+        .unwrap() = Some(gate.clone());
+    let dispatched = f.dispatch_input();
+    let worker = dispatched.attempt.worker.as_ref().unwrap();
+    f.execution.take_inputs();
+    f.api
+        .finish_backend_job_attempt(
+            &f.request.job_id,
+            &dispatched.attempt.attempt_id,
+            BackendJobAttemptState::Failed,
+            "cancelled",
+            "retain the uncheckpointed original input",
+        )
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.api.backend_job_recovery.cleanup_claimed_writer.notified(),
+    )
+    .await
+    .unwrap();
+    let fault = lock_journal_domain(&f);
+    *f.api
+        .backend_job_recovery
+        .cleanup_after_claim
+        .lock()
+        .unwrap() = None;
+    gate.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        f.api
+            .backend_job_recovery
+            .cleanup_storage_settlement
+            .notified(),
+    )
+    .await
+    .expect("real Feature storage fault did not exhaust initial cleanup settlement");
+    let blocked = current_journal_attempt(&f, &dispatched.attempt.attempt_id);
+    assert_eq!(blocked.state, BackendJobAttemptState::Failed);
+    assert_eq!(blocked.failure_category.as_deref(), Some("cancelled"));
+    assert_ne!(
+        blocked.worker_cleanup_state,
+        Some(BackendJobWorkerCleanupState::Completed)
+    );
+    assert!(
+        f.api
+            .backend_job_recovery
+            .cleanup_owner_ids()
+            .contains(&blocked.attempt_id),
+        "Feature outage exhausted cleanup retries and lost its autonomous owner"
+    );
+    assert_eq!(
+        blocked.worker_cleanup_failure_category.as_deref(),
+        Some("backend_job_cleanup_feature_storage_unavailable")
+    );
+    // The Workspace is healthy, but cannot certify the locked Feature operation.
+    assert!(
+        f.api
+            .store
+            .probe_backend_job_recovery(TEST_WORKSPACE_ID, &blocked)
+            .unwrap()
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.api
+            .backend_job_recovery
+            .cleanup_storage_settlement
+            .notified(),
+    )
+    .await
+    .expect("source-aware cleanup reconciliation lost its owner after settlement");
+    assert_ne!(
+        current_journal_attempt(&f, &blocked.attempt_id).worker_cleanup_state,
+        Some(BackendJobWorkerCleanupState::Completed)
+    );
+    assert!(
+        f.api
+            .backend_job_recovery
+            .cleanup_owner_ids()
+            .contains(&blocked.attempt_id)
+    );
+    let original = f
+        .api
+        .config_store
+        .recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)
+        .unwrap()
+        .unwrap();
+    drop(fault);
+    // Only release the original Feature writer lock; do not sweep, reopen or replay.
+    let cleaned = wait_for_backend_job_worker_cleanup(
+        &f.api,
+        &f.request.job_id,
+        &blocked.attempt_id,
+        BackendJobWorkerCleanupState::Completed,
+    )
+    .await;
+    assert_eq!(cleaned.worker, blocked.worker);
+    assert_eq!(cleaned.runtime_run_id, blocked.runtime_run_id);
+    assert_eq!(cleaned.failure_category, blocked.failure_category);
+    let after = f
+        .api
+        .config_store
+        .recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.plan.operation_id, original.plan.operation_id);
+    assert_eq!(
+        after.plan.input_fingerprint,
+        original.plan.input_fingerprint
+    );
+    assert!(f.execution.take_inputs().is_empty());
+    let saved = f
+        .api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.input_disposition,
+        crate::backend_job::JobInputDisposition::Available
+    );
+    assert!(f.store.journal_retention_required(&f.host).unwrap());
+    f.api.stop_backend_job_recovery().await;
+}
+
+struct CleanupCatalogCapacityFault {
+    store: Arc<SqliteWorkspaceStore>,
+    previous_limit: i64,
+}
+
+impl CleanupCatalogCapacityFault {
+    fn install(f: &RuntimeFixture) -> Self {
+        let previous_limit = f
+            .job_store
+            .with_conn(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE cleanup_capacity_fault(payload BLOB);
+                 CREATE TRIGGER fill_cleanup_catalog_capacity
+                 BEFORE INSERT ON worker_registry_projection_removals
+                 BEGIN INSERT INTO cleanup_capacity_fault VALUES(zeroblob(4194304)); END;",
+                )?;
+                let previous: i64 =
+                    connection.query_row("PRAGMA max_page_count", [], |row| row.get(0))?;
+                let pages: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+                // Small owner/diagnostic writes fit; the catalog commit's trigger does not.
+                connection.pragma_update(None, "max_page_count", pages + 32)?;
+                let error = connection
+                    .execute(
+                        "INSERT INTO cleanup_capacity_fault VALUES(zeroblob(4194304))",
+                        [],
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, rusqlite::Error::SqliteFailure(error, _)
+                if error.code == rusqlite::ErrorCode::DiskFull));
+                Ok(previous)
+            })
+            .unwrap();
+        Self {
+            store: f.job_store.clone(),
+            previous_limit,
+        }
+    }
+}
+
+impl Drop for CleanupCatalogCapacityFault {
+    fn drop(&mut self) {
+        self.store.with_conn(|connection| {
+            connection.pragma_update(None, "max_page_count", self.previous_limit)?;
+            connection.execute_batch("DROP TRIGGER fill_cleanup_catalog_capacity; DROP TABLE cleanup_capacity_fault;")?;
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cleanup_catalog_storage_outage_beyond_budget_recovers_original_child() {
+    cleanup_catalog_storage_reconciliation(false).await;
+}
+
+#[tokio::test]
+async fn cleanup_catalog_storage_recovery_rejects_changed_canonical_authority() {
+    cleanup_catalog_storage_reconciliation(true).await;
+}
+
+async fn cleanup_catalog_storage_reconciliation(change_authority: bool) {
+    let f = RuntimeFixture::new().await;
+    let dispatched = f.dispatch_input();
+    let worker = dispatched.attempt.worker.as_ref().unwrap();
+    f.execution.take_inputs();
+    let fault = CleanupCatalogCapacityFault::install(&f);
+    f.api
+        .finish_backend_job_attempt(
+            &f.request.job_id,
+            &dispatched.attempt.attempt_id,
+            BackendJobAttemptState::Failed,
+            "cancelled",
+            "retain the uncheckpointed original input",
+        )
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        f.api
+            .backend_job_recovery
+            .cleanup_storage_settlement
+            .notified(),
+    )
+    .await
+    .expect("real catalog capacity fault did not exhaust initial cleanup settlement");
+    let blocked = current_journal_attempt(&f, &dispatched.attempt.attempt_id);
+    assert_eq!(blocked.failure_category.as_deref(), Some("cancelled"));
+    assert_ne!(
+        blocked.worker_cleanup_state,
+        Some(BackendJobWorkerCleanupState::Completed)
+    );
+    assert!(
+        f.api
+            .backend_job_recovery
+            .cleanup_owner_ids()
+            .contains(&blocked.attempt_id),
+        "catalog capacity outage lost its autonomous cleanup owner"
+    );
+    let original = f
+        .api
+        .config_store
+        .recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        original.prior_failure_category.as_deref(),
+        Some("metadata_commit_failed")
+    );
+    assert!(
+        f.api
+            .require_backend_job_attempt_effects_ended(&blocked)
+            .is_ok()
+    );
+    if change_authority {
+        // Simulate a canonical child's invalidation while storage is unavailable.
+        // Normal pin updates are fenced during an admitted removal and cannot do this.
+        f.api.config_store.with_conn(|connection| {
+            assert_eq!(connection.execute("UPDATE worker_removal_operations SET state='stale', failure_category='fixture_child_invalidated' WHERE workspace_id=?1 AND operation_id=?2 AND input_fingerprint=?3",
+                rusqlite::params![TEST_WORKSPACE_ID, original.plan.operation_id, original.plan.input_fingerprint])?, 1);
+            Ok(())
+        }).unwrap();
+    }
+    drop(fault);
+    // Restore only the failed catalog write's capacity; no sweep/reopen/result replay.
+    if change_authority {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            f.api.backend_job_recovery.cleanup_stopped.notified(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("changed removal authority did not reach bounded rejection: {error}; current={:?}; owners={:?}; removal={:?}",
+            current_journal_attempt(&f, &blocked.attempt_id), f.api.backend_job_recovery.cleanup_owner_ids(),
+            f.api.config_store.recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)));
+        assert!(
+            !f.api
+                .backend_job_recovery
+                .cleanup_owner_ids()
+                .contains(&blocked.attempt_id)
+        );
+        let rejected = current_journal_attempt(&f, &blocked.attempt_id);
+        assert_eq!(
+            rejected.worker_cleanup_state,
+            Some(BackendJobWorkerCleanupState::Failed)
+        );
+        assert_eq!(rejected.failure_category, blocked.failure_category);
+        f.api.config_store.with_conn(|connection| {
+            let count: i64 = connection.query_row("SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3", rusqlite::params![TEST_WORKSPACE_ID, worker.runtime_id, worker.worker_id], |row| row.get(0))?;
+            assert_eq!(count, 1);
+            Ok(())
+        }).unwrap();
+        assert!(f.execution.take_inputs().is_empty());
+        assert_eq!(
+            f.api
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+                .unwrap()
+                .unwrap()
+                .input_disposition,
+            crate::backend_job::JobInputDisposition::Available
+        );
+        assert!(f.store.journal_retention_required(&f.host).unwrap());
+        f.api.stop_backend_job_recovery().await;
+        return;
+    }
+    let cleaned = wait_for_backend_job_worker_cleanup(
+        &f.api,
+        &f.request.job_id,
+        &blocked.attempt_id,
+        BackendJobWorkerCleanupState::Completed,
+    )
+    .await;
+    let after = f
+        .api
+        .config_store
+        .recover_worker_removal_execution(TEST_WORKSPACE_ID, worker)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.plan.operation_id, original.plan.operation_id);
+    assert_eq!(
+        after.plan.input_fingerprint,
+        original.plan.input_fingerprint
+    );
+    assert_eq!(cleaned.worker, blocked.worker);
+    assert_eq!(cleaned.runtime_run_id, blocked.runtime_run_id);
+    assert_eq!(cleaned.failure_category, blocked.failure_category);
+    assert!(f.execution.take_inputs().is_empty());
+    assert_eq!(
+        f.api
+            .store
+            .list_backend_job_attempts(TEST_WORKSPACE_ID, &f.request.job_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.api
+            .store
+            .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+            .unwrap()
+            .unwrap()
+            .input_disposition,
+        crate::backend_job::JobInputDisposition::Available
+    );
+    assert!(f.store.journal_retention_required(&f.host).unwrap());
+    f.api.stop_backend_job_recovery().await;
+}
+
+#[tokio::test]
 async fn domain_storage_lock_beyond_initial_settlement_recovers_original_journal_attempt() {
     for already_prepared in [false, true] {
         let f = RuntimeFixture::new().await;
@@ -2377,7 +2713,8 @@ async fn saved_checkpoint_recovery_completes_without_proving_failed_cleanup_ende
         let dispatched = f.dispatch_input();
         let worker = dispatched.attempt.worker.as_ref().unwrap();
 
-        // Inject a recoverable cleanup commit failure before checkpoint publication.
+        // A deterministic SQL constraint failure needs explicit fault correction,
+        // not autonomous transient-storage probing. Preserve the original child.
         // Pin/unpin changes Worker authority and deliberately makes the original child stale;
         // that negative contract is covered by the canonical-cleanup staleness tests.
         f.api
@@ -2388,6 +2725,14 @@ async fn saved_checkpoint_recovery_completes_without_proving_failed_cleanup_ende
                  BEFORE INSERT ON worker_registry_projection_removals
                  BEGIN SELECT RAISE(ABORT, 'injected checkpoint cleanup failure'); END;",
                 )?;
+                let error = conn
+                    .execute(
+                        "INSERT INTO worker_registry_projection_removals DEFAULT VALUES",
+                        [],
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, rusqlite::Error::SqliteFailure(error, _)
+                    if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER));
                 Ok(())
             })
             .unwrap();
@@ -2442,6 +2787,19 @@ async fn saved_checkpoint_recovery_completes_without_proving_failed_cleanup_ende
         assert!(
             f.execution.take_inputs().is_empty(),
             "saved checkpoint must not cause model rerun"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            f.api.backend_job_recovery.cleanup_stopped.notified(),
+        )
+        .await
+        .expect("deterministic commit failure did not stop with its retained cause");
+        assert!(
+            !f.api
+                .backend_job_recovery
+                .cleanup_owner_ids()
+                .contains(&blocked.attempt_id),
+            "permanent constraint failure must not become an endless transient probe"
         );
         f.api
             .config_store
