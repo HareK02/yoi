@@ -578,7 +578,8 @@ where
                 "flow:{}:{}",
                 attempt.instance_id, attempt.attempt_id
             )),
-            max_turns: Some(12),
+            // Evidence exploration is not bounded by an arbitrary model-turn count.
+            max_turns: None,
             compaction_budget: None,
             engine_configurator: None,
             features,
@@ -882,35 +883,45 @@ mod tests {
     #[derive(Clone)]
     struct FinishVerifierClient {
         calls: Arc<AtomicUsize>,
+        exploration_turns: usize,
     }
 
     #[async_trait]
     impl LlmClient for FinishVerifierClient {
         async fn stream(&self, _request: Request) -> Result<ResponseStream, ClientError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0 {
-                let input = serde_json::json!({
-                    "results": [
-                        {
-                            "transition_id": "done",
-                            "verdict": "met",
-                            "rationale": "the captured implementation evidence is complete"
-                        },
-                        {
-                            "transition_id": "cancel",
-                            "verdict": "not_met",
-                            "rationale": "no exceptional cancellation condition exists"
-                        }
-                    ]
-                })
-                .to_string();
+            if call <= self.exploration_turns {
+                let input = if call < self.exploration_turns {
+                    "{}".to_string()
+                } else {
+                    serde_json::json!({
+                        "results": [
+                            {
+                                "transition_id": "done",
+                                "verdict": "met",
+                                "rationale": "the captured implementation evidence is complete"
+                            },
+                            {
+                                "transition_id": "cancel",
+                                "verdict": "not_met",
+                                "rationale": "no exceptional cancellation condition exists"
+                            }
+                        ]
+                    })
+                    .to_string()
+                };
                 Ok(Box::pin(stream::iter(vec![
                     Ok(LlmEvent::BlockStart(BlockStart {
                         index: 0,
                         block_type: BlockType::ToolUse,
                         metadata: BlockMetadata::ToolUse {
-                            id: "finish-flow".to_string(),
-                            name: "FinishFlowVerification".to_string(),
+                            id: format!("flow-evidence-{call}"),
+                            name: if call < self.exploration_turns {
+                                "ShowOverview"
+                            } else {
+                                "FinishFlowVerification"
+                            }
+                            .to_string(),
                         },
                     })),
                     Ok(LlmEvent::BlockDelta(BlockDelta {
@@ -978,6 +989,15 @@ permission = "read"
 
     #[tokio::test]
     async fn worker_backed_verifier_requires_structured_finish_result() {
+        assert_worker_backed_verifier_completes(0).await;
+    }
+
+    #[tokio::test]
+    async fn worker_backed_verifier_can_finish_after_more_than_twelve_turns() {
+        assert_worker_backed_verifier_completes(16).await;
+    }
+
+    async fn assert_worker_backed_verifier_completes(exploration_turns: usize) {
         let directory = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(directory.path()).unwrap();
         let session_id: SessionId = Uuid::now_v7();
@@ -998,11 +1018,16 @@ permission = "read"
                 },
             )
             .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut manifest = verifier_manifest();
+        // A parent's own turn limit must not cap the private verifier either.
+        manifest.engine.max_turns = std::num::NonZeroU32::new(2);
         let verifier = WorkerBackedFlowVerifier::new(
             FinishVerifierClient {
-                calls: Arc::new(AtomicUsize::new(0)),
+                calls: calls.clone(),
+                exploration_turns,
             },
-            verifier_manifest(),
+            manifest,
             StoreFlowParentCapture::new(store, session_id, segment_id),
             Vec::new(),
         );
@@ -1013,6 +1038,7 @@ permission = "read"
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].verdict, ConditionVerdict::Met);
         assert_eq!(results[1].verdict, ConditionVerdict::NotMet);
+        assert!(calls.load(Ordering::SeqCst) > exploration_turns);
     }
 
     #[test]
