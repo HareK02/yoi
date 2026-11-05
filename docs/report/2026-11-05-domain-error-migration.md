@@ -10,16 +10,16 @@ T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/client�
 
 | domain / 発生源 | 現行のtyped情報と変換 | consumerと残る接続 |
 | --- | --- | --- |
-| Repository lookup | `repositories.rs::RepositoryLookupError` の不存在、provider不対応、selector不足/不正、commit不存在、relation不正、provider失敗 | `server.rs::repository_lookup` は最初の2種をcode/messageへ、残りをDebug文字列へ落とす。`repository_merge_evidence_error` にもDebug変換がある。原variantを保持するdomain mappingが必要。 |
+| Repository lookup | `RepositoryLookupError` の7variantを `repository_failure::RepositoryFailure` が原sourceごと保持する | `repository_lookup` と `repository_merge_evidence_error` のDebug変換を除き、`Error::RepositoryLookup` へ接続した。HTTP分類は操作とtyped reasonから決定し、既存公開diagnostic codeを保つ。共通HTTP応答とWebへのdetails接続は未完。 |
 | Repository構成・SSH access | `scoped_create_repository` の同一intent replayと異intent競合、`require_workspace_owner`、`repository_access.rs` のcredential/trust/CAS検査 | 登録、SSH操作、Workdir materialization、Web repository-access。汎用 `RepositoryConflict(String)` / `WorkspacePermissionDenied(String)` の全発生元を一つのRepository理由と誤認せず、Repositoryの決定点でtyped causeを付ける。秘密の鍵やleaseをdetailsへ渡さない。 |
 | Workdir provider | `WorkdirError::classification_source`、`denial_reason`、`failure_reason`、`WorkdirTransportError` | 本差分の `workdir::failure` が既存型からT-810へ接続する。元sourceはローカルに保持し、Browser/Tool/transfer/storage/telemetryにはclosed detailsだけを投影する。既存HTTP/statusや操作実行は変更しない。 |
 | Workdir Runtime / Backend | `RuntimeHttpWorkdirError`、`RuntimeRegistryError::WorkdirSessionOpenFailed`、`InternalWorkdirOperationError::into_contract_error` | `WorkdirOperationApiError` は理由をserver-local metadataに保持するがwireではskipする。T-812の共通response/clientへの接続と生成型変更が残る。owner mismatchの404等、外側境界の秘匿分類を内側codeで上書きしない。 |
 | Workdir Tool / 監査 | `WorkspaceAttachedWorkdirSession::operate`、`WorkdirSessionOperationResponse`、`WorkdirAuditFailure` | Workerは監査receiptをtracingへ通知し、操作resultだけを返す。T-814の既存Tool envelopeへの接続で成功＋監査失敗を別々に保持する必要がある。成功を実行失敗へ変更したり、監査失敗で再送したりしない。 |
 | Workdir deferred open / cleanup | `DeferredWorkdirSession` はopener task失敗、open失敗、identity mismatchを区別。失敗したcloseの所有者も保持する | openerは `Result<WorkdirSessionHandle, String>` のため、より具体的な原因は現契約から証明できない。identity mismatch後のcleanup理由はログだけ。元原因をcleanupで置換せず、別の副次結果として接続する作業が残る。 |
 | Workdir removal | `WorkdirRemovalOperation`、request fingerprint、attempt、disposition、failure category、既存reconciliation | `workdir_removal_response`、Web `workdir-removal.ts`、Worker lifecycle Tool。復旧は観測のみで削除を再実行しない。Backend/Worker/Webの説明表はdomain説明へ集約するが、結果・再実行条件はこの正本を利用する。 |
-| Drive storage / HTTP | `workspace_drive::Error` とsource、`Drive::mutate` のmetadata/receipt同一transaction、`request_status` | `server_drive.rs::domain_error` で公開codeへ縮退。構造化原因の接続が残る。mutationで保存等の完了を証明できない場合のUnknownを、原因分類の変更で否定しない。 |
+| Drive storage / HTTP | `workspace_drive::failure::DriveFailure` が9variantの元errorを保持し、closed operation/reasonを共通coreへ投影する。metadata/receiptは既存同一transactionのまま | 実storageでconflict/CAS/grant/replay/fence/SQLite障害からcodecまで検証した。`server_drive.rs::domain_error` はまだ既存公開codeへ縮退し、共通HTTP/Toolへの接続は未完。storage原因はremote更新の確定/Unknownを証明しない。 |
 | Drive Worker / Tool | `drive/backend.rs` の `DriveError`、`backend_diagnostic::{Stage,Reason}`、同request status照会 | 内部理由は主にtracing、Toolは文字列へ変換される。理由を返値に保持するdomain mappingとT-814接続が残る。status GETは同IDであり2回目のmutationではない。 |
-| config owner採用 | `config_adoption.rs`、`server_configuration_adoption.rs` のsource/preview/adopt/reconcile | T-838の単一writerが正本。エラーは共有 `RepositoryApiError`。`ConfigTreeError`、policy/contentの既知原因をDisplayへ落とす前の保持が必要。評価済みJSON writerや旧source-tree commitを復元しない。 |
+| config owner採用 | `ConfigurationFailure` が現 `ConfigTreeError` 15variantのsourceと、採用決定点のcatalog/head/export/source/owner/request理由を保持する | source helper、実SQLite採用、owner HTTPのsource/preview/adopt/reconcileへ接続した。非active/drainingもHTTPの決定点で付ける。T-838のwriter/transaction/receiptは変更せず、HTTP分類はtyped reasonから決定する。formatterのString診断、policy/contentの未型付け原因、共通応答/表示への接続は残る。 |
 | config Worker論理tree | `server_workspace_config.rs`、`workspace_config/backend.rs`、post-commit observe | 旧writerはauthority sealとcanonical採用で拒否される。T-776回帰のUnknown/非再送を保つが、この旧経路だけの試験をowner採用の証拠にしない。 |
 | 内部 / 背景 | Drive maintenance、config採用後のRuntime publication、既存Job/Service結果 | configのpublicationはcommit後best effortで失敗を返却/保存していない。採用receiptをrollback/Unknownへ変更せず、T-814の共有保存/照会方式へ副次失敗を接続する。別ledgerは作らない。 |
 
@@ -29,7 +29,7 @@ T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/client�
 
 Web `api/workspace-model.ts::parseRepositoryApiError` は `diagnostics/error/message` のみをexact-keyで受ける。`api/runtime-management.ts::repositoryApiError` にも独立parserがある。型の追加だけではruntime parserの拒否を防げない。T-813の共有decoderへ移行する単位で、既存readerを照合する。
 
-生成元は `server-api` のAPI trait/OpenAPIと既存 `repository_openapi_typescript`。Repository、Workdir、Drive、Runtime、Worker launch、configuration adoption等の各生成器を、それぞれの変更元に合わせて検証する。共通型の手書きTS複製は作らない。T-813の早期source `work/t813-error-web@8c71ec719a7b906dd2d8742c64cf7b802c71ec02` は取得・API確認済みだが、本記録時点では未採用で正式review済みでもない。
+生成元は `server-api` のAPI trait/OpenAPIと既存 `repository_openapi_typescript`。Repository、Workdir、Drive、Runtime、Worker launch、configuration adoption等の各生成器を、それぞれの変更元に合わせて検証する。共通型の手書きTS複製は作らない。T-813のsource `work/t813-error-web@838b6cd3c3dbf45fe555958ef9c017f1bc09bc6b` は取得・API確認済みだが、本記録時点では未採用で正式review済みでもない。
 
 ## Workdir公開field対応と制約
 
@@ -46,6 +46,20 @@ Web `api/workspace-model.ts::parseRepositoryApiError` は `diagnostics/error/mes
 | Unknown、監査、cleanup、同request照合 | 既存domain結果が正本 | この原因型へretryable、mutation identity、汎用rollback状態を追加しない。成功時監査receiptをこの実行失敗型へ変換しない。 |
 
 Browserとモデル向けToolは、現在の可視性が同じなら同じ原因意味・説明を使う。保存/transferからの再公開にも再投影を要求し、保存時の公開ラベルを新しい閲覧者の権限にしない。全opaque sourceを公開するのでも、具体原因を一律omittedへ消すのでもない。
+
+## Repository・Drive・configの公開field対応
+
+これらの追加でも共通coreのdomain match、formatter、秘匿処理、codecを増やしていない。domainが `FailureCause` / `WireDetails` / `ProjectFor` を実装し、既存codecへ同じ方法で接続する。
+
+| domain | sourceから採る公開field | ローカル限定・独立する正本 |
+| --- | --- | --- |
+| Repository | `RepositoryFailureDetails { operation, reason }`。reasonは元lookup variantのみ。provider一般失敗から細かい原因を推測しない | Repository ID/key、provider名、selector、commit、path、provider診断は元source内に限る。access/grant/trust/登録intentの競合はこのlookup原因とは別の決定点。 |
+| Drive storage | `DriveFailureDetails { operation, reason }`。reasonは元storage error variantのみ | `Invalid` は複数の不正条件、`Conflict` はCAS/name/folder/request競合を含み、それ以上の細分化を捏造しない。SQL/blob/storage source、名前/内容/物理identityは非公開。remote Unknownは別の結果契約。 |
+| config | `ConfigurationFailureDetails { operation, reason }`。tree variantまたは実際の採用/owner分岐で決まった理由 | path/import/source/schema本文/診断を公開しない。tree sourceは保持するが既知の分岐に架空のsource errorを作らない。joint migration baseline検査はsource/export不一致のまま保持する。head/catalog/receipt/policyはT-838の正本。 |
+
+各domainのvisibilityはdefault拒否で、Browser/Toolだけでなくtransfer/storage/telemetryも現在の診断可視性を要求する。許可後の説明はclosed factsと操作の固定表現から再構成し、受信説明や任意context/correlationを転送しない。安全な原因を公開することと、原sourceを全公開することは別である。
+
+実Gitのancestry拒否と実SQLite採用のhead/catalog/source/entry拒否からBrowser/Tool/codecまでの接続を検証した。採用失敗後のsource/policy/head/receiptと同request replayも検証したが、これは実Tool結果の保存・照会、HTTP→Web、相関検索基盤の完成証拠ではない。保存バイトの再読試験も、新しい背景結果storeの実装や検証とは区別する。
 
 ## 相関検索から正本・復旧へのrunbook
 

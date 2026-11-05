@@ -398,7 +398,9 @@ fn independent_database_connections_serialize_concurrent_web_and_cli_heads() {
         (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
         results => panic!("exactly one observed head may adopt: {results:?}"),
     };
-    assert!(matches!(loser, Error::WorkspaceConfigConflict(_)));
+    assert!(
+        matches!(loser, Error::Configuration(cause) if cause.details().reason == FailureReason::EditingHeadChanged)
+    );
     assert_eq!(
         db.load_workspace_config(WORKSPACE).unwrap(),
         Some(winner.state)
@@ -415,3 +417,6 @@ fn independent_database_connections_serialize_concurrent_web_and_cli_heads() {
         db.configuration_head(WORKSPACE, OWNER).unwrap()
     );
 }
+
+#[path = "config_adoption_failure_tests.rs"]
+mod failure_contract;

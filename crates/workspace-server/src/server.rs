@@ -19602,8 +19602,9 @@ fn validate_assigned_workdir_source(
 }
 
 fn repository_merge_evidence_error(error: RepositoryLookupError) -> ApiError {
-    Error::InvalidInput(format!(
-        "repository merge evidence validation failed: {error:?}"
+    Error::from(crate::repository_failure::RepositoryFailure::new(
+        crate::repository_failure::RepositoryFailureOperation::ObserveMergeTarget,
+        error,
     ))
     .into()
 }
@@ -33745,6 +33746,7 @@ async fn repository_detail(
             let item = repository_lookup(
                 api.live_repository_reader()?
                     .summary_by_key(&repository_key),
+                crate::repository_failure::RepositoryFailureOperation::SummaryByKey,
             )?;
             Ok(Json(RepositoryDetailResponse {
                 workspace_id: api.config.workspace_id.clone(),
@@ -33777,6 +33779,7 @@ async fn repository_log(
             } = repository_lookup(
                 api.live_repository_reader()?
                     .recent_log(&repository_key, query.limit),
+                crate::repository_failure::RepositoryFailureOperation::RecentLog,
             )?;
             Ok(Json(RepositoryLogResponse {
                 workspace_id: api.config.workspace_id,
@@ -39205,58 +39208,14 @@ fn sanitize_backend_error(message: &str) -> String {
     message.to_string()
 }
 
-fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -> ApiResult<T> {
-    result.map_err(|error| match error {
-        RepositoryLookupError::UnknownRepository { id } => {
-            let message = format!("repository `{id}` is not configured for this workspace");
-            ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: "workspace-repository-registry".to_string(),
-                    code: "repository_not_configured".to_string(),
-                    message: message.clone(),
-                },
-                vec![RuntimeDiagnostic {
-                    startup: None,
-                    code: "repository_not_configured".to_string(),
-                    severity: HostDiagnosticSeverity::Error,
-                    message,
-                }],
-            )
-        }
-        RepositoryLookupError::UnsupportedProvider { id, provider } => {
-            let message = format!(
-                "repository `{id}` uses unsupported provider `{provider}` for this operation"
-            );
-            ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: "workspace-repository-registry".to_string(),
-                    code: "repository_provider_unsupported".to_string(),
-                    message: message.clone(),
-                },
-                vec![RuntimeDiagnostic {
-                    startup: None,
-                    code: "repository_provider_unsupported".to_string(),
-                    severity: HostDiagnosticSeverity::Error,
-                    message,
-                }],
-            )
-        }
-        other => {
-            let message = format!("repository evidence validation failed: {other:?}");
-            ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: "workspace-repository-registry".to_string(),
-                    code: "repository_evidence_invalid".to_string(),
-                    message: message.clone(),
-                },
-                vec![RuntimeDiagnostic {
-                    startup: None,
-                    code: "repository_evidence_invalid".to_string(),
-                    severity: HostDiagnosticSeverity::Error,
-                    message,
-                }],
-            )
-        }
+fn repository_lookup<T>(
+    result: std::result::Result<T, RepositoryLookupError>,
+    operation: crate::repository_failure::RepositoryFailureOperation,
+) -> ApiResult<T> {
+    result.map_err(|error| {
+        ApiError::from(Error::from(
+            crate::repository_failure::RepositoryFailure::new(operation, error),
+        ))
     })
 }
 
@@ -39556,6 +39515,21 @@ impl From<Error> for server_api::RuntimeManagementApiError {
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
+            Error::RepositoryLookup(cause) => vec![RuntimeDiagnostic {
+                startup: None,
+                code: match cause.details().reason {
+                    crate::repository_failure::RepositoryFailureReason::UnknownRepository => {
+                        "repository_not_configured"
+                    }
+                    crate::repository_failure::RepositoryFailureReason::UnsupportedProvider => {
+                        "repository_provider_unsupported"
+                    }
+                    _ => "repository_evidence_invalid",
+                }
+                .into(),
+                severity: HostDiagnosticSeverity::Error,
+                message: cause.to_string(),
+            }],
             Error::DbCapacityExceeded
             | Error::DbExecutorUnavailable
             | Error::DbOperationOutcomeUnknown => vec![RuntimeDiagnostic {
@@ -39706,6 +39680,50 @@ impl ApiError {
 
 fn api_error_status(error: &Error) -> StatusCode {
     match error {
+        Error::Configuration(failure) => {
+            use crate::configuration_failure::ConfigurationFailureReason as Reason;
+            match failure.details().reason {
+                Reason::OwnerRequired => StatusCode::FORBIDDEN,
+                Reason::CatalogChanged
+                | Reason::EditingHeadChanged
+                | Reason::LegacyExportChanged
+                | Reason::SourceContentChanged
+                | Reason::WorkspaceInactive
+                | Reason::WorkspaceDraining
+                | Reason::RequestIdentityConflict => StatusCode::CONFLICT,
+                Reason::InvalidPath
+                | Reason::InvalidImport
+                | Reason::ImportEscape
+                | Reason::AlreadyExists
+                | Reason::NotFound
+                | Reason::EntryConflict
+                | Reason::EntryDigestMismatch
+                | Reason::EntryPathMismatch
+                | Reason::TreeDigestMismatch
+                | Reason::PathChangedMoreThanOnce
+                | Reason::DuplicatePath
+                | Reason::DuplicateSchemaProvider
+                | Reason::DuplicateSchemaNamespace
+                | Reason::InvalidSchemaContribution
+                | Reason::LimitExceeded => StatusCode::BAD_REQUEST,
+            }
+        }
+        Error::RepositoryLookup(failure) => {
+            use crate::repository_failure::{RepositoryFailureOperation, RepositoryFailureReason};
+            // Preserve the merge-validation endpoint client-error boundary.
+            if failure.details().operation == RepositoryFailureOperation::ObserveMergeTarget {
+                return StatusCode::BAD_REQUEST;
+            }
+            match failure.details().reason {
+                RepositoryFailureReason::UnknownRepository => StatusCode::NOT_FOUND,
+                RepositoryFailureReason::UnsupportedProvider => StatusCode::BAD_REQUEST,
+                RepositoryFailureReason::MissingDefaultSelector
+                | RepositoryFailureReason::InvalidSelector
+                | RepositoryFailureReason::CommitNotFound
+                | RepositoryFailureReason::InvalidCommitRelation
+                | RepositoryFailureReason::ProviderFailure => StatusCode::BAD_GATEWAY,
+            }
+        }
         Error::RuntimeOperationFailed {
             runtime_id, code, ..
         } if runtime_id == "workspace-auth" && code == "auth_required" => StatusCode::FORBIDDEN,

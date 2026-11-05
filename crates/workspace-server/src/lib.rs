@@ -8,6 +8,7 @@ pub mod companion;
 pub mod config;
 pub mod config_adoption;
 pub mod config_source;
+pub mod configuration_failure;
 mod configuration_migration;
 #[cfg(test)]
 mod configuration_transfer_tests;
@@ -35,6 +36,7 @@ pub mod prompt_settings;
 pub mod records;
 pub mod repositories;
 pub mod repository_access;
+pub mod repository_failure;
 pub mod repository_source;
 pub mod resource_broker;
 #[cfg(test)]
@@ -110,6 +112,8 @@ pub enum Error {
     InvalidInput(String),
     #[error("invalid project record id `{0}`")]
     InvalidRecordId(String),
+    #[error("{0}")]
+    Configuration(#[from] configuration_failure::ConfigurationFailure),
     #[error("workspace backend config error: {0}")]
     Config(String),
     #[error("record `{0}` is missing frontmatter")]
@@ -140,6 +144,8 @@ pub enum Error {
         runtime_id: String,
         capability: String,
     },
+    #[error("{0}")]
+    RepositoryLookup(#[from] repository_failure::RepositoryFailure),
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
     #[error("subjektiv subject `{0}` was not found in this Workspace")]

@@ -63,6 +63,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config_source::{ConfigCommitRequest, WorkspaceConfigState};
+use crate::configuration_failure::{
+    ConfigurationFailure, ConfigurationFailureOperation as FailureOperation,
+    ConfigurationFailureReason as FailureReason,
+};
 use crate::policy_config::{self, AdoptedSubjectPolicy, PermissionSource};
 use crate::{Error, Result, SqliteWorkspaceStore};
 
@@ -175,6 +179,15 @@ impl Authority for OwnerScope<'_> {
 fn content_error(e: impl std::fmt::Display) -> Error {
     Error::Store(format!("configuration content: {e}"))
 }
+fn failure(operation: FailureOperation, reason: FailureReason) -> Error {
+    ConfigurationFailure::new(operation, reason).into()
+}
+fn during(operation: FailureOperation, error: Error) -> Error {
+    match error {
+        Error::Configuration(cause) => cause.with_operation(operation).into(),
+        other => other,
+    }
+}
 fn conflict(message: &str) -> Error {
     Error::WorkspaceConfigConflict(message.into())
 }
@@ -190,15 +203,18 @@ fn scope(workspace: &str) -> ScopeKey {
         target: "configuration".into(),
     }
 }
-fn require_owner(conn: &Connection, workspace: &str, account: &str) -> Result<()> {
+fn require_owner(
+    conn: &Connection,
+    workspace: &str,
+    account: &str,
+    operation: FailureOperation,
+) -> Result<()> {
     let allowed: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id=?1 AND owner_account_id=?2 AND state='active')",
         params![workspace, account], |r| r.get(0),
     )?;
     if !allowed {
-        return Err(Error::WorkspacePermissionDenied(
-            "configuration management requires the Workspace owner".into(),
-        ));
+        return Err(failure(operation, FailureReason::OwnerRequired));
     }
     Ok(())
 }
@@ -311,7 +327,7 @@ impl SqliteWorkspaceStore {
     ) -> Result<ConfigurationCurrent> {
         self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
-            require_owner(&tx, workspace, account)?;
+            require_owner(&tx, workspace, account, FailureOperation::Source)?;
             Ok(ConfigurationCurrent {
                 state: crate::config_source::load_state(&tx, workspace)?.ok_or_else(|| {
                     Error::InvalidInput("Workspace source not materialized".into())
@@ -331,10 +347,13 @@ impl SqliteWorkspaceStore {
     ) -> Result<Option<ConfigurationAdoptionResult>> {
         let fingerprint = request_fingerprint(workspace, account, request)?;
         self.with_conn(|conn| {
-            require_owner(conn, workspace, account)?;
+            require_owner(conn, workspace, account, FailureOperation::Reconcile)?;
             match receipt(conn, workspace, &request.operation_id)? {
                 Some((saved, result)) if saved == fingerprint => Ok(Some(result)),
-                Some(_) => Err(conflict("operation ID reused with another request")),
+                Some(_) => Err(failure(
+                    FailureOperation::Reconcile,
+                    FailureReason::RequestIdentityConflict,
+                )),
                 None => Ok(None),
             }
         })
@@ -343,7 +362,7 @@ impl SqliteWorkspaceStore {
     /// Authentication supplies `account`; it is never accepted from an adoption DTO.
     pub fn configuration_head(&self, workspace: &str, account: &str) -> Result<Option<String>> {
         self.with_conn(|conn| {
-            require_owner(conn, workspace, account)?;
+            require_owner(conn, workspace, account, FailureOperation::Source)?;
             Ok(head(conn, workspace)?.map(|id| id.to_string()))
         })
     }
@@ -356,7 +375,7 @@ impl SqliteWorkspaceStore {
         operation: &str,
     ) -> Result<Option<ConfigurationAdoptionResult>> {
         self.with_conn(|conn| {
-            require_owner(conn, workspace, account)?;
+            require_owner(conn, workspace, account, FailureOperation::Reconcile)?;
             Ok(receipt(conn, workspace, operation)?.map(|(_, result)| result))
         })
     }
@@ -372,7 +391,7 @@ impl SqliteWorkspaceStore {
         mut require_subject: impl FnMut(&str) -> Result<()>,
     ) -> Result<ConfigurationPreview> {
         self.with_conn(|conn| {
-            require_owner(conn, workspace, account)?;
+            require_owner(conn, workspace, account, FailureOperation::Preview)?;
             let tx = conn.unchecked_transaction()?;
             let (current, state, source) = prepare(
                 &tx,
@@ -382,6 +401,7 @@ impl SqliteWorkspaceStore {
                 host,
                 baseline,
                 &mut require_subject,
+                FailureOperation::Preview,
             )?;
             let before = match baseline {
                 Some(baseline) => baseline.policies.clone(),
@@ -414,12 +434,12 @@ impl SqliteWorkspaceStore {
     ) -> Result<ConfigurationAdoptionResult> {
         let fingerprint = request_fingerprint(workspace, account, request)?;
         self.with_immediate_transaction(|tx| {
-            require_owner(tx,workspace,account)?;
+            require_owner(tx,workspace,account,FailureOperation::Adopt)?;
             if let Some((saved,result)) = receipt(tx,workspace,&request.operation_id)? {
-                if saved != fingerprint { return Err(conflict("operation ID reused with another request")); }
+                if saved != fingerprint { return Err(failure(FailureOperation::Adopt, FailureReason::RequestIdentityConflict)); }
                 return Ok(result);
             }
-            let (_,state,source) = prepare(tx,workspace,request,schema,host,baseline,&mut require_subject)?;
+            let (_,state,source) = prepare(tx,workspace,request,schema,host,baseline,&mut require_subject,FailureOperation::Adopt)?;
             let authority_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_configuration_authorities WHERE workspace_id=?1)", [workspace], |r|r.get(0))?;
             if authority_exists && (baseline.is_some() || request.expected_legacy_export.is_some()) {
                 return Err(conflict("legacy transfer is already adopted; reload current source"));
@@ -482,6 +502,7 @@ fn prepare(
     host: &PermissionHost,
     baseline: Option<&ConfigurationMigrationBaseline<'_>>,
     require_subject: &mut impl FnMut(&str) -> Result<()>,
+    operation: FailureOperation,
 ) -> Result<(WorkspaceConfigState, WorkspaceConfigState, PermissionSource)> {
     if let Some(baseline) = baseline {
         if baseline.diagnostics.iter().any(|diagnostic| {
@@ -499,10 +520,10 @@ fn prepare(
         ));
     }
     if catalog_digest(host)? != request.expected_catalog_digest {
-        return Err(conflict("Feature catalog changed"));
+        return Err(failure(operation, FailureReason::CatalogChanged));
     }
     if head(tx, workspace)?.map(|id| id.to_string()) != request.expected_head {
-        return Err(conflict("editing history head changed"));
+        return Err(failure(operation, FailureReason::EditingHeadChanged));
     }
     let current = crate::config_source::load_state(tx, workspace)?
         .ok_or_else(|| Error::InvalidInput("Workspace source not materialized".into()))?;
@@ -510,14 +531,14 @@ fn prepare(
         if *baseline.original != current
             || request.expected_legacy_export.as_deref() != Some(baseline.export_digest)
         {
-            return Err(conflict("migration source or export changed"));
+            return Err(failure(operation, FailureReason::LegacyExportChanged));
         }
         baseline.state
     } else {
         &current
     };
     if editing_base.snapshot.digest != request.source.base_digest {
-        return Err(conflict("source content changed"));
+        return Err(failure(operation, FailureReason::SourceContentChanged));
     }
     crate::config_source::validate_entrypoint_request(&request.source.entrypoints)?;
     let candidate = crate::config_source::evaluate_candidate_in_transaction(
@@ -527,7 +548,8 @@ fn prepare(
         crate::config_source::load_evaluation_identity(tx, workspace)?,
         &request.source.changes,
         schema,
-    )?;
+    )
+    .map_err(|error| during(operation, error))?;
     crate::config_source::validate_workspace_config_candidate_projections(workspace, &candidate)?;
     crate::repository_access::validate_repository_access_in_transaction(tx, workspace, &candidate)?;
     let source = policy_config::source(&candidate.evaluation)?;

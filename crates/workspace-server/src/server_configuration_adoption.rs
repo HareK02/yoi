@@ -17,6 +17,10 @@
 //! Callbacks must not reenter the Feature store or its canonical source provider.
 
 use super::*;
+use crate::configuration_failure::{
+    ConfigurationFailure, ConfigurationFailureOperation as FailureOperation,
+    ConfigurationFailureReason as FailureReason,
+};
 
 use crate::config_adoption::{
     ConfigurationAdoptionRequest as AdoptionRequest, ConfigurationAdoptionResult as AdoptionResult,
@@ -56,6 +60,7 @@ async fn owner_operation<T: Send + 'static>(
     service: &WorkspaceServerApi,
     context: ServerRequestContext,
     workspace: String,
+    failure_operation: FailureOperation,
     operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
 ) -> std::result::Result<T, RepositoryApiError> {
     // These owner-only routes are mounted above Workspace fallback dispatch.
@@ -74,7 +79,10 @@ async fn owner_operation<T: Send + 'static>(
     let result: ApiResult<T> = async {
         let gate = service.admission_for_workspace(&workspace).await;
         let lease = gate.admit(false).ok_or_else(|| {
-            Error::WorkspaceConfigConflict("Workspace deletion is draining requests".into())
+            Error::from(ConfigurationFailure::new(
+                failure_operation,
+                FailureReason::WorkspaceDraining,
+            ))
         })?;
         crate::db_executor::with_operation_lifetime(Arc::new(lease), async {
             // Authenticate against catalog ownership before resolving an API:
@@ -85,15 +93,18 @@ async fn owner_operation<T: Send + 'static>(
                 .await?
                 .ok_or(Error::WorkspaceIdMismatch)?;
             if record.owner_account_id != actor.account_id {
-                return Err(Error::WorkspacePermissionDenied(
-                    "configuration management requires the Workspace owner".into(),
-                )
+                return Err(Error::from(ConfigurationFailure::new(
+                    failure_operation,
+                    FailureReason::OwnerRequired,
+                ))
                 .into());
             }
             if record.state != "active" {
-                return Err(
-                    Error::WorkspaceConfigConflict("Workspace is not active".into()).into(),
-                );
+                return Err(Error::from(ConfigurationFailure::new(
+                    failure_operation,
+                    FailureReason::WorkspaceInactive,
+                ))
+                .into());
             }
             let api = service
                 .api_for_workspace(&workspace)
@@ -105,7 +116,14 @@ async fn owner_operation<T: Send + 'static>(
             service
                 .store
                 .db_executor()
-                .run(move || operation(api, actor.account_id))
+                .run(move || {
+                    operation(api, actor.account_id).map_err(|error| match error {
+                        Error::Configuration(cause) => {
+                            cause.with_operation(failure_operation).into()
+                        }
+                        other => other,
+                    })
+                })
                 .await
                 .map_err(ApiError::from)
         })
@@ -322,48 +340,54 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
     ) -> std::result::Result<ConfigurationSourceResponse, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, |api, account| {
-            let current = source_snapshot(&api, &account)?;
-            let host = host(&api.config.workspace_id)?;
-            let catalog_digest = crate::config_adoption::catalog_digest(&host)?;
-            let (state, expected_legacy_export, policies, diagnostics) = if current.canonical {
-                (current.state, None, current.policies, vec![])
-            } else {
-                let legacy = raw_legacy(&api)?;
-                let seed = preview_migration(
-                    &api.config_store,
-                    &legacy,
-                    &api.config.workspace_id,
-                    api.config_schema_registry.compose()?,
-                    &host,
-                )?;
-                let observed = source_snapshot(&api, &account)?;
-                if observed.canonical
-                    || observed.history_head != current.history_head
-                    || observed.state != seed.original
-                {
-                    return Err(conflict(
-                        "configuration changed during migration preview; reload source",
-                    ));
-                }
-                (
-                    seed.state,
-                    Some(seed.snapshot.export_digest),
-                    seed.policies,
-                    seed.diagnostics,
-                )
-            };
-            Ok(ConfigurationSourceResponse {
-                state: workspace_config_state_to_api(state),
-                history_head: current.history_head,
-                source_stored: current.canonical,
-                catalog: host.catalog(),
-                catalog_digest,
-                expected_legacy_export,
-                policies: policies.into_values().map(policy_to_api).collect(),
-                migration_diagnostics: diagnostics.into_iter().map(diagnostic_to_api).collect(),
-            })
-        })
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Source,
+            |api, account| {
+                let current = source_snapshot(&api, &account)?;
+                let host = host(&api.config.workspace_id)?;
+                let catalog_digest = crate::config_adoption::catalog_digest(&host)?;
+                let (state, expected_legacy_export, policies, diagnostics) = if current.canonical {
+                    (current.state, None, current.policies, vec![])
+                } else {
+                    let legacy = raw_legacy(&api)?;
+                    let seed = preview_migration(
+                        &api.config_store,
+                        &legacy,
+                        &api.config.workspace_id,
+                        api.config_schema_registry.compose()?,
+                        &host,
+                    )?;
+                    let observed = source_snapshot(&api, &account)?;
+                    if observed.canonical
+                        || observed.history_head != current.history_head
+                        || observed.state != seed.original
+                    {
+                        return Err(conflict(
+                            "configuration changed during migration preview; reload source",
+                        ));
+                    }
+                    (
+                        seed.state,
+                        Some(seed.snapshot.export_digest),
+                        seed.policies,
+                        seed.diagnostics,
+                    )
+                };
+                Ok(ConfigurationSourceResponse {
+                    state: workspace_config_state_to_api(state),
+                    history_head: current.history_head,
+                    source_stored: current.canonical,
+                    catalog: host.catalog(),
+                    catalog_digest,
+                    expected_legacy_export,
+                    policies: policies.into_values().map(policy_to_api).collect(),
+                    migration_diagnostics: diagnostics.into_iter().map(diagnostic_to_api).collect(),
+                })
+            },
+        )
         .await
     }
 
@@ -373,40 +397,46 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
     ) -> std::result::Result<ConfigurationPreviewResponse, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, move |api, account| {
-            let request = request_from_api(request)?;
-            // Detect operation-ID reuse even though preview itself never persists.
-            saved_result(&api, &account, &request)?;
-            let Preparation {
-                host,
-                schema,
-                legacy,
-                identity,
-                seed,
-            } = prepare(&api, &account, &request)?;
-            let baseline = seed.as_ref().map(baseline);
-            // Preview never seals. The native read-only IMMEDIATE transaction
-            // fences metadata updates through core validation, then rolls back.
-            let preview = legacy
-                .with_permission_authority_guard(&identity, |authority| {
-                    Ok(api.config_store.preview_configuration_adoption(
-                        &api.config.workspace_id,
-                        &account,
-                        &request,
-                        schema,
-                        &host,
-                        baseline.as_ref(),
-                        |subject| authority.require_subject(subject).map_err(transfer_error),
-                    ))
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Preview,
+            move |api, account| {
+                let request = request_from_api(request)?;
+                // Detect operation-ID reuse even though preview itself never persists.
+                saved_result(&api, &account, &request)?;
+                let Preparation {
+                    host,
+                    schema,
+                    legacy,
+                    identity,
+                    seed,
+                } = prepare(&api, &account, &request)?;
+                let baseline = seed.as_ref().map(baseline);
+                // Preview never seals. The native read-only IMMEDIATE transaction
+                // fences metadata updates through core validation, then rolls back.
+                let preview = legacy
+                    .with_permission_authority_guard(&identity, |authority| {
+                        Ok(api.config_store.preview_configuration_adoption(
+                            &api.config.workspace_id,
+                            &account,
+                            &request,
+                            schema,
+                            &host,
+                            baseline.as_ref(),
+                            |subject| authority.require_subject(subject).map_err(transfer_error),
+                        ))
+                    })
+                    .map_err(transfer_error)??;
+                Ok(ConfigurationPreviewResponse {
+                    expected_head: preview.expected_head,
+                    state: workspace_config_state_to_api(preview.state),
+                    changed_paths: preview.changed_paths,
+                    changed_subjects: preview.changed_subjects,
                 })
-                .map_err(transfer_error)??;
-            Ok(ConfigurationPreviewResponse {
-                expected_head: preview.expected_head,
-                state: workspace_config_state_to_api(preview.state),
-                changed_paths: preview.changed_paths,
-                changed_subjects: preview.changed_subjects,
-            })
-        })
+            },
+        )
         .await
     }
 
@@ -416,26 +446,31 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
     ) -> std::result::Result<ConfigurationAdoptionReceipt, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, move |api, account| {
-            let request = request_from_api(request)?;
-            if let Some(result) = saved_result(&api, &account, &request)? {
-                return Ok(receipt_to_api(result));
-            }
-            let Preparation {
-                host,
-                schema,
-                legacy,
-                identity,
-                seed,
-            } = prepare(&api, &account, &request)?;
-            let baseline = seed.as_ref().map(baseline);
-            // Feature connection + IMMEDIATE transaction always precede Server.
-            // Never call store-level Feature APIs from inside this closure.
-            let result = legacy
-                .with_permission_authority_guard(&identity, |authority| {
-                    // Keep Server failures as the inner Result. Only native gate
-                    // acquisition/finalization failures belong to the outer lane.
-                    Ok(api.config_store.adopt_configuration(
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Adopt,
+            move |api, account| {
+                let request = request_from_api(request)?;
+                if let Some(result) = saved_result(&api, &account, &request)? {
+                    return Ok(receipt_to_api(result));
+                }
+                let Preparation {
+                    host,
+                    schema,
+                    legacy,
+                    identity,
+                    seed,
+                } = prepare(&api, &account, &request)?;
+                let baseline = seed.as_ref().map(baseline);
+                // Feature connection + IMMEDIATE transaction always precede Server.
+                // Never call store-level Feature APIs from inside this closure.
+                let result = legacy
+                    .with_permission_authority_guard(&identity, |authority| {
+                        // Keep Server failures as the inner Result. Only native gate
+                        // acquisition/finalization failures belong to the outer lane.
+                        Ok(api.config_store.adopt_configuration(
                         &api.config.workspace_id,
                         &account,
                         &request,
@@ -470,28 +505,29 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                             })
                         },
                     ))
-                })
-                .map_err(transfer_error)??;
-            // Core and Feature guards are released before best-effort Runtime
-            // publication. Dispatch transfers the admitted lifetime without
-            // keeping the SQL lane occupied by an external Runtime response.
-            // Exact historical receipt replay above must not publish old state.
-            let publication_api = api.clone();
-            let state = result.state.clone();
-            let _ = api.host_executors.host().and_then(|executor| {
-                executor.dispatch(move || {
-                    if let Ok(projection) = publication_api
-                        .prompt_projection_cache
-                        .resolve(&publication_api.config.workspace_id, &state)
-                    {
-                        let _ = publication_api
-                            .runtime
-                            .observe_workspace_prompt_projection((*projection).clone());
-                    }
-                })
-            });
-            Ok(receipt_to_api(result))
-        })
+                    })
+                    .map_err(transfer_error)??;
+                // Core and Feature guards are released before best-effort Runtime
+                // publication. Dispatch transfers the admitted lifetime without
+                // keeping the SQL lane occupied by an external Runtime response.
+                // Exact historical receipt replay above must not publish old state.
+                let publication_api = api.clone();
+                let state = result.state.clone();
+                let _ = api.host_executors.host().and_then(|executor| {
+                    executor.dispatch(move || {
+                        if let Ok(projection) = publication_api
+                            .prompt_projection_cache
+                            .resolve(&publication_api.config.workspace_id, &state)
+                        {
+                            let _ = publication_api
+                                .runtime
+                                .observe_workspace_prompt_projection((*projection).clone());
+                        }
+                    })
+                });
+                Ok(receipt_to_api(result))
+            },
+        )
         .await
     }
 
@@ -501,41 +537,48 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
     ) -> std::result::Result<ConfigurationReconciliation, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, move |api, account| {
-            let request = request_from_api(request)?;
-            if let Some(result) = saved_result(&api, &account, &request)? {
-                return Ok(ConfigurationReconciliation::Adopted {
-                    receipt: receipt_to_api(result),
-                });
-            }
-            // Canonical operations do not use the old transfer. A missing normal
-            // save receipt is not evidence about the unrelated initial cutover.
-            if source_snapshot(&api, &account)?.canonical {
-                return Ok(match saved_result(&api, &account, &request)? {
-                    Some(result) => ConfigurationReconciliation::Adopted {
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Reconcile,
+            move |api, account| {
+                let request = request_from_api(request)?;
+                if let Some(result) = saved_result(&api, &account, &request)? {
+                    return Ok(ConfigurationReconciliation::Adopted {
                         receipt: receipt_to_api(result),
+                    });
+                }
+                // Canonical operations do not use the old transfer. A missing normal
+                // save receipt is not evidence about the unrelated initial cutover.
+                if source_snapshot(&api, &account)?.canonical {
+                    return Ok(match saved_result(&api, &account, &request)? {
+                        Some(result) => ConfigurationReconciliation::Adopted {
+                            receipt: receipt_to_api(result),
+                        },
+                        None => ConfigurationReconciliation::NotObserved,
+                    });
+                }
+                // No draft generation, validation against today's head/catalog, seal,
+                // or adoption here: this is observation of the exact original input.
+                let legacy = raw_legacy(&api)?;
+                let pending =
+                    pending_transfer(&legacy, &api.config.workspace_id, &account, &request)?;
+                // Adoption may have committed between the first lookup and Feature read.
+                if let Some(result) = saved_result(&api, &account, &request)? {
+                    return Ok(ConfigurationReconciliation::Adopted {
+                        receipt: receipt_to_api(result),
+                    });
+                }
+                Ok(match pending {
+                    Some(receipt) => ConfigurationReconciliation::PendingTransfer {
+                        transfer_identity: receipt.transfer_id,
+                        export_digest: receipt.snapshot.export_digest,
                     },
                     None => ConfigurationReconciliation::NotObserved,
-                });
-            }
-            // No draft generation, validation against today's head/catalog, seal,
-            // or adoption here: this is observation of the exact original input.
-            let legacy = raw_legacy(&api)?;
-            let pending = pending_transfer(&legacy, &api.config.workspace_id, &account, &request)?;
-            // Adoption may have committed between the first lookup and Feature read.
-            if let Some(result) = saved_result(&api, &account, &request)? {
-                return Ok(ConfigurationReconciliation::Adopted {
-                    receipt: receipt_to_api(result),
-                });
-            }
-            Ok(match pending {
-                Some(receipt) => ConfigurationReconciliation::PendingTransfer {
-                    transfer_identity: receipt.transfer_id,
-                    export_digest: receipt.snapshot.export_digest,
-                },
-                None => ConfigurationReconciliation::NotObserved,
-            })
-        })
+                })
+            },
+        )
         .await
     }
 }

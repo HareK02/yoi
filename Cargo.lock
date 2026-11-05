@@ -7416,10 +7416,12 @@ name = "workspace-drive"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "error-contract",
  "feature-storage",
  "futures",
  "object_store",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7599,6 +7601,7 @@ dependencies = [
  "ring",
  "runtime-api",
  "rusqlite",
+ "schemars",
  "secrets",
  "serde",
  "serde_json",
