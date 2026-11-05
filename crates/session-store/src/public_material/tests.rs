@@ -1802,7 +1802,7 @@ fn recording_capture_fence_blocks_publication_and_value_survives_later_append_an
 }
 
 #[test]
-fn recording_capture_rejects_foreign_guard_and_storage_or_body_allocation_excess() {
+fn recording_capture_rejects_foreign_guard_and_record_or_body_allocation_excess() {
     use crate::capture::*;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("session");
@@ -1834,7 +1834,7 @@ fn recording_capture_rejects_foreign_guard_and_storage_or_body_allocation_excess
     ));
     let guard = retention.lock_live(session).unwrap();
     let limits = PublicMaterialLimits {
-        max_storage_bytes: 1,
+        max_record_bytes: 1,
         ..Default::default()
     };
     assert!(matches!(
@@ -2457,10 +2457,6 @@ fn recording_catalog_errors_do_not_invoke_callback_or_relax_resource_and_identit
             Err(PublicMaterialError::Inconsistent)
         ));
         for limits in [
-            PublicMaterialLimits {
-                max_storage_bytes: 1,
-                ..Default::default()
-            },
             PublicMaterialLimits {
                 max_record_bytes: 1,
                 ..Default::default()

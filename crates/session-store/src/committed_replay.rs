@@ -53,8 +53,6 @@ pub struct PublicMaterialLimits {
     pub max_entries: usize,
     /// Allocation ceiling for one persisted JSONL record, not an entire run.
     pub max_record_bytes: u64,
-    /// Aggregate fixed storage extent, bounding replay metadata as well as body decoding.
-    pub max_storage_bytes: u64,
 }
 
 impl Default for PublicMaterialLimits {
@@ -63,7 +61,6 @@ impl Default for PublicMaterialLimits {
             max_segments: 256,
             max_entries: 1_000_000,
             max_record_bytes: 64 * 1024 * 1024,
-            max_storage_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -376,7 +373,6 @@ impl CommittedPublicReplay {
             Layout::Fs(root) => root.clone(),
         };
         let mut file_ends = HashMap::new();
-        let mut fixed_bytes = 0u64;
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
@@ -394,14 +390,8 @@ impl CommittedPublicReplay {
                 return Err(PublicMaterialError::ResourceLimit);
             }
             let reader = RecordReader::open(&path, limits.max_record_bytes)?;
-            // This also bounds retained descriptor/identity allocations during replay,
-            // not just the final capture. Oversized histories fail explicitly.
-            fixed_bytes = fixed_bytes
-                .checked_add(reader.end)
-                .ok_or(PublicMaterialError::ResourceLimit)?;
-            if fixed_bytes > limits.max_storage_bytes {
-                return Err(PublicMaterialError::ResourceLimit);
-            }
+            // Freeze the extent, but do not cap the lifetime storage total. Records
+            // are decoded individually; segment and entry limits bound replay metadata.
             file_ends.insert(id, reader.end);
         }
         let mut chain = Vec::new();

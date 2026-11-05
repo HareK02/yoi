@@ -2070,6 +2070,103 @@ mod tests {
     }
 
     #[test]
+    fn archive_removal_preserves_history_larger_than_256_mib_and_replays_receipt() {
+        use session_store::{
+            LogEntry, LoggedContentPart, LoggedHistoryEntry, LoggedItem, LoggedRole,
+            LoggedSessionHistoryEntryId, LoggedSessionHistoryMetadata, LoggedSessionHistoryOrigin,
+            Store,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let worker = WorkerId::now_v7();
+        let worker_dir = temp.path().join("workers").join(worker.to_string());
+        write_json(
+            &worker_dir.join("worker.json"),
+            &serde_json::json!({"workspace_id": "workspace-a"}),
+        );
+        let session = session_store::new_session_id();
+        let segment = session_store::new_segment_id();
+        let store = session_store::WorkerSessionStore::new(worker_dir.join("session")).unwrap();
+        store
+            .create_segment(
+                session,
+                segment,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id: session,
+                    system_prompt: None,
+                    config: Default::default(),
+                    history: Vec::new(),
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        // Each record is small enough to decode independently. Only the lifetime
+        // total exceeds the former ceiling; no individual resource limit is relaxed.
+        let text = "x".repeat(1024 * 1024);
+        for index in 0..257 {
+            store
+                .append(
+                    session,
+                    segment,
+                    &LogEntry::AnnotatedUserInput {
+                        ts: index + 2,
+                        segments: Vec::new(),
+                        extensions: Vec::new(),
+                        history: vec![LoggedHistoryEntry {
+                            item: LoggedItem::Message {
+                                role: LoggedRole::User,
+                                content: vec![LoggedContentPart::Text { text: text.clone() }],
+                            },
+                            metadata: LoggedSessionHistoryMetadata {
+                                input_metadata: None,
+                                entry_id: LoggedSessionHistoryEntryId(format!("input-{index}")),
+                                origin: LoggedSessionHistoryOrigin::LocalHumanInput,
+                                derivation: None,
+                            },
+                        }],
+                    },
+                )
+                .unwrap();
+        }
+        let mut metadata = session_store::WorkerMetadata::new(
+            worker.to_string(),
+            Some(session_store::WorkerActiveSegmentRef::active_segment(
+                session, segment,
+            )),
+        );
+        metadata.workspace_id = Some("workspace-a".into());
+        write_json(&worker_dir.join("metadata.json"), &metadata);
+        let segment_path = format!("session/segments/{segment}.jsonl");
+        let source_bytes = fs::metadata(worker_dir.join(&segment_path)).unwrap().len();
+        assert!(source_bytes > 256 * 1024 * 1024);
+
+        let provider = FsWorkerRetentionProvider::new(temp.path());
+        let request = request(worker, SessionDisposition::Archive);
+        let result = provider.execute(&request).unwrap();
+        assert!(result.source_removed);
+        assert!(!worker_dir.exists());
+        let archive = provider.archive_dir("archive-a").unwrap();
+        assert_eq!(
+            fs::metadata(archive.join(&segment_path)).unwrap().len(),
+            source_bytes
+        );
+        let reader = session_store::public_material::SessionPublicMaterialReader::open_worker(
+            &archive.join("session"),
+            segment,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(reader.session_id(), session);
+        assert_eq!(reader.descriptors().len(), 257);
+        let retry = provider.execute(&request).unwrap();
+        assert!(retry.source_removed);
+        assert_eq!(retry.archive, result.archive);
+        assert_eq!(retry.operation_id, result.operation_id);
+    }
+
+    #[test]
     fn session_migration_repairs_failed_archive_and_preserves_ingestion_receipt_on_retry() {
         let temp = tempfile::tempdir().unwrap();
         let worker = WorkerId::now_v7();
