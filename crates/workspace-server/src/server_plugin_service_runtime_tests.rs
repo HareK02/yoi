@@ -1554,7 +1554,7 @@ mod service_connection {
                                     operation_key: "queued-write".into(),
                                     mutation: PluginDataMutation::Put {
                                         expected: PluginDataExpectation::NeverWritten,
-                                        value_json: "1".into(),
+                                        value_json: r#""queued""#.into(),
                                     },
                                 },
                             )
@@ -1687,7 +1687,9 @@ mod service_connection {
                         (f.owner(None).await, None)
                     };
                     let response = request(current.as_ref(), current_operation).await
-                        .expect("current binding must retain the authorized operation");
+                        .unwrap_or_else(|error| panic!(
+                            "current binding at {boundary}, remote={remote}, {change:?}: {error:?}"
+                        ));
                     assert!(match boundary {
                         "acquire" => matches!(response, PluginServiceResponse::Acquired { .. }),
                         "complete" => matches!(response, PluginServiceResponse::Completed),
