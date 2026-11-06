@@ -523,6 +523,7 @@ impl WorkerE2eEnvironment {
         let created = self.request_json(
             self.client
                 .post(format!("{server_url}/api/workspaces"))
+                .timeout(STARTUP_WAIT)
                 .json(&serde_json::json!({
                     "operation_key": format!("worker-e2e-{}", self.runtime_id),
                     "display_name": format!("Worker E2E {}", self.runtime_id),
@@ -1217,10 +1218,37 @@ impl WorkerE2eEnvironment {
         redact_stdout: bool,
         timeout: Duration,
     ) -> Result<std::process::Output> {
-        let args_owned = args
-            .iter()
-            .map(|arg| (*arg).to_string())
-            .collect::<Vec<_>>();
+        let output = self.capture_command(binary, args, redact_stdout, timeout)?;
+        if !output.status.success() {
+            return Err(HarnessError::CommandFailed {
+                program: binary.to_path_buf(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                status: output.status,
+                stdout: if redact_stdout {
+                    "<redacted>".to_string()
+                } else {
+                    bounded_text(&output.stdout, MAX_COMMAND_OUTPUT_BYTES)
+                },
+                stderr: bounded_text(&output.stderr, MAX_COMMAND_OUTPUT_BYTES),
+            });
+        }
+        Ok(output)
+    }
+
+    /// Run a product CLI with isolated HOME/XDG/cwd and the shared bounded capture.
+    /// Nonzero exits are returned for assertions; timeout/output overflow are errors.
+    /// Arguments/output enter artifacts: do not pass bearer secrets or mint tokens here.
+    pub fn run_cli(&self, binary: &Path, args: &[&str]) -> Result<std::process::Output> {
+        self.capture_command(binary, args, false, SETUP_WAIT)
+    }
+
+    fn capture_command(
+        &self,
+        binary: &Path,
+        args: &[&str],
+        redact_stdout: bool,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
         let mut command = self.isolated_command(binary);
         command.args(args).stdin(Stdio::null());
         // credentialを含むstdoutは呼出元へだけ返す。raw fileは作らない。
@@ -1257,21 +1285,7 @@ impl WorkerE2eEnvironment {
             }),
         )?;
         writeln!(log)?;
-        let output = result?;
-        if !output.status.success() {
-            return Err(HarnessError::CommandFailed {
-                program: binary.to_path_buf(),
-                args: args_owned,
-                status: output.status,
-                stdout: if redact_stdout {
-                    "<redacted>".to_string()
-                } else {
-                    bounded_text(&output.stdout, MAX_COMMAND_OUTPUT_BYTES)
-                },
-                stderr: bounded_text(&output.stderr, MAX_COMMAND_OUTPUT_BYTES),
-            });
-        }
-        Ok(output)
+        result
     }
 
     /// browser toolだけに必要なtool探索設定を引き継ぎ、profile・HOME・XDG・一時領域は
@@ -1890,6 +1904,29 @@ mod startup_address_tests {
         assert_eq!(fs::read_dir(artifacts.path())?.count(), 1);
         let report = environment.cleanup()?;
         assert!(report.cleanup_success && report.root_cleanup_success);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_runner_returns_nonzero_output_with_isolated_home_xdg_and_cwd() -> Result<()> {
+        let artifacts = tempfile::tempdir()?;
+        let environment = synthetic_environment(artifacts.path())?;
+        let output = environment.run_cli(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "printf '%s\\n' \"$HOME\" \"$XDG_CONFIG_HOME\" \"$PWD\"; printf 'refused' >&2; exit 23",
+            ],
+        )?;
+        assert_eq!(output.status.code(), Some(23));
+        let expected = format!("{}\n", environment.root.display()).repeat(3);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        assert_eq!(output.stderr, b"refused");
+        let log = fs::read_to_string(artifacts.path().join("setup-commands.jsonl"))?;
+        let record: Value = serde_json::from_str(log.trim())?;
+        assert_eq!(record["status"], 23);
+        assert_eq!(record["env_clear"], true);
+        assert!(environment.cleanup()?.cleanup_success);
         Ok(())
     }
 
