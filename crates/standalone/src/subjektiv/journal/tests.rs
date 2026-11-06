@@ -11,6 +11,7 @@ mod compaction;
 mod connected_compaction;
 mod handoff;
 mod memory_links;
+mod native_admission;
 mod recovery;
 
 struct Fixture {
@@ -23,10 +24,17 @@ struct Fixture {
 }
 impl Fixture {
     fn new(text: &str) -> Self {
+        Self::with_policy(text, |_, _| {})
+    }
+    fn with_policy(
+        text: &str,
+        configure: impl FnOnce(&mut StandaloneSubjects, &SubjectRecord),
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
-        let catalog = StandaloneSubjects::open(&state).unwrap();
+        let mut catalog = StandaloneSubjects::open(&state).unwrap();
         let subject = catalog.create("journal-owner", None).unwrap();
+        configure(&mut catalog, &subject);
         let workers = StandaloneWorkerStore::open_existing(&state).unwrap();
         let allocation = workers
             .allocate(temp.path(), StaleLeasePolicy::Reject)
@@ -197,6 +205,7 @@ impl Fixture {
             generation,
             input_digest: snapshot.input_digest.clone(),
             fence: fence.clone(),
+            admission_observer: None,
         };
         (adapter, fence, snapshot)
     }

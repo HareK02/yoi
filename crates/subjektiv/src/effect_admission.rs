@@ -1,24 +1,24 @@
-//! Host revalidation inside native Memory transaction admission, not after effects.
+//! Current Host authority retained through native Subject effects and protected reads.
 use super::*;
 use std::sync::Arc;
 
 /// Trusted Host check, never an input DTO. Returned Host/catalog leases are held
 /// through the native transaction; callbacks must use this view, not reenter the store.
-pub trait MemoryEffectAuthority: Send + Sync {
+pub trait SubjectEffectAuthority: Send + Sync {
     fn enter<'a>(
         &'a self,
-        admission: &MemoryEffectAdmission<'_>,
-    ) -> Result<Box<dyn 'a + MemoryEffectLease>>;
+        admission: &SubjectEffectAdmission<'_>,
+    ) -> Result<Box<dyn 'a + SubjectEffectLease>>;
 }
 
-pub trait MemoryEffectLease {}
-impl<T> MemoryEffectLease for T {}
+pub trait SubjectEffectLease {}
+impl<T> SubjectEffectLease for T {}
 
-pub struct MemoryEffectAdmission<'a> {
+pub struct SubjectEffectAdmission<'a> {
     store: &'a SubjektivStore,
     connection: &'a Connection,
 }
-impl MemoryEffectAdmission<'_> {
+impl SubjectEffectAdmission<'_> {
     pub fn current_policy(
         &self,
         subject: &str,
@@ -39,7 +39,7 @@ impl MemoryEffectAdmission<'_> {
             .store
             .clone()
             .with_canonical_permission_source(canonical_source);
-        MemoryEffectAdmission {
+        SubjectEffectAdmission {
             store: &store,
             connection: self.connection,
         }
@@ -51,30 +51,73 @@ impl MemoryEffectAdmission<'_> {
     }
 }
 impl SubjektivStore {
-    /// A per-call Host adapter. The original store and all unrelated callers are
-    /// unchanged; no cached authorization is persisted or used as a permission.
-    pub fn with_memory_effect_authority(&self, authority: Arc<dyn MemoryEffectAuthority>) -> Self {
+    /// A per-call Host adapter for Memory/Journal operations. Unrelated trusted
+    /// repository/recovery calls remain unchanged; no cached grant is persisted.
+    pub fn with_subject_effect_authority(
+        &self,
+        authority: Arc<dyn SubjectEffectAuthority>,
+    ) -> Self {
         let mut store = self.clone();
-        store.memory_effect_authority = Some(authority);
+        store.effect_authority = Some(authority);
         store
     }
+
+    fn admit_effect(
+        &self,
+        connection: &Connection,
+    ) -> Result<Option<Box<dyn '_ + SubjectEffectLease>>> {
+        self.effect_authority
+            .as_ref()
+            .map(|authority| {
+                authority.enter(&SubjectEffectAdmission {
+                    store: self,
+                    connection,
+                })
+            })
+            .transpose()
+    }
+
     pub(crate) fn memory_transaction<T>(
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.database
+            .try_transaction_admitted(|connection| self.admit_effect(connection), operation)
+    }
+
+    pub(crate) fn journal_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> journal::JournalResult<T>,
+    ) -> journal::JournalResult<T> {
         self.database.try_transaction_admitted(
             |connection| {
-                self.memory_effect_authority
-                    .as_ref()
-                    .map(|authority| {
-                        authority.enter(&MemoryEffectAdmission {
-                            store: self,
-                            connection,
-                        })
-                    })
-                    .transpose()
+                self.admit_effect(connection)
+                    .map_err(journal_authority_error)
             },
             operation,
         )
+    }
+
+    /// Model-facing Journal reads wait for the native connection too. Bind their
+    /// authority inside admission, not before that wait. Unbound Host recovery is
+    /// a repository read and does not acquire a new execution permission.
+    pub(crate) fn journal_connection<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> journal::JournalResult<T>,
+    ) -> journal::JournalResult<T> {
+        if self.effect_authority.is_some() {
+            self.journal_transaction(|connection| read(connection))
+        } else {
+            self.database.try_with_connection(read)
+        }
+    }
+}
+
+fn journal_authority_error(error: SubjektivError) -> journal::JournalError {
+    match error {
+        SubjektivError::AuthorizationDenied(message) => {
+            journal::JournalError::PermissionDenied(message)
+        }
+        error => journal::JournalError::Subject(error),
     }
 }

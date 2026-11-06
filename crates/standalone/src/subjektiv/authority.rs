@@ -120,15 +120,68 @@ impl LocalSubjectHost {
     }
 }
 
+// Shared test-only canonical owner for native-admission schedules. Production Local
+// policy remains in the admitted Feature DB; tests disclose this substitution.
+#[cfg(test)]
+pub(super) struct MutablePolicy {
+    pub(super) workspace: String,
+    subject: String,
+    pub(super) current: Mutex<Option<server_api::authorization::CurrentSubjectPolicy>>,
+}
+#[cfg(test)]
+impl subjektiv::CanonicalPermissionSource for MutablePolicy {
+    fn subject_permissions(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> subjektiv::Result<Option<server_api::authorization::SubjectPermissions>> {
+        panic!("the local consumer must not use the legacy policy projection")
+    }
+    fn current_subject_policy(
+        &self,
+        workspace: &str,
+        subject: &str,
+    ) -> subjektiv::Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
+        assert_eq!(workspace, self.workspace);
+        assert_eq!(subject, self.subject);
+        Ok(self.current.lock().unwrap().clone())
+    }
+}
+#[cfg(test)]
+pub(super) fn bind_canonical_policy(
+    catalog: &mut StandaloneSubjects,
+    subject: &SubjectRecord,
+) -> Arc<MutablePolicy> {
+    let source = Arc::new(MutablePolicy {
+        workspace: catalog.scope_id.clone(),
+        subject: subject.id.clone(),
+        current: Mutex::new(catalog.store.current_subject_policy(&subject.id).unwrap()),
+    });
+    let identity = catalog.store.database_identity().unwrap();
+    let preview = catalog
+        .store
+        .preview_permission_transfer(&identity)
+        .unwrap();
+    catalog
+        .store
+        .seal_permission_sources(&identity, "local-test-transfer", &preview.export_digest)
+        .unwrap();
+    catalog.store = catalog
+        .store
+        .clone()
+        .with_canonical_permission_source(source.clone());
+    source
+}
+
 pub(super) struct LocalMemoryEffectAuthority {
     pub(super) host: Arc<LocalSubjectHost>,
     pub(super) operation: String,
 }
-impl subjektiv::effect_admission::MemoryEffectAuthority for LocalMemoryEffectAuthority {
+impl subjektiv::effect_admission::SubjectEffectAuthority for LocalMemoryEffectAuthority {
     fn enter<'a>(
         &'a self,
-        admission: &subjektiv::effect_admission::MemoryEffectAdmission<'_>,
-    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::MemoryEffectLease>> {
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
         if !self.host.live.load(Ordering::Acquire) || !admission.writer_active(&self.host.writer)? {
             return Err(subjektiv::SubjektivError::AuthorizationDenied(
                 "Subject writer is no longer active".into(),
@@ -163,7 +216,7 @@ impl LocalSubjectHost {
         Ok(self
             .catalog
             .store
-            .with_memory_effect_authority(Arc::new(LocalMemoryEffectAuthority {
+            .with_subject_effect_authority(Arc::new(LocalMemoryEffectAuthority {
                 host,
                 operation: operation.into(),
             })))

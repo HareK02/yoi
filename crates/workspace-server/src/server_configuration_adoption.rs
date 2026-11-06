@@ -1,8 +1,9 @@
 //! Owner-only HTTP boundary for source adoption and the one-way legacy cutover.
 //!
-//! Every preview and adoption acquires the native Feature authority guard before
-//! entering the Server transaction. Subject references are checked against current
-//! metadata/deletion fences under its IMMEDIATE transaction, not a preloaded set.
+//! Every preview and adoption acquires the native Feature authority guard, then
+//! the permission registry, before entering the Server transaction. Subject
+//! references are checked against current metadata/deletion fences under its
+//! IMMEDIATE transaction, not a preloaded set.
 //! Preview and canonical saves never seal: their nonmutating Feature transaction
 //! remains held through the Server operation and rolls back when the guard drops.
 //!
@@ -343,14 +344,12 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         workspace_id: String,
     ) -> std::result::Result<ConfigurationSourceResponse, RepositoryApiError> {
         owner_operation(self, context, workspace_id, |api, account| {
-            api.refresh_plugin_permission_registry()?;
-            let registry = api
-                .permission_registry
-                .read()
-                .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?;
+            // A source GET produces a nonauthoritative draft, not an admission
+            // lease. Retain one catalog snapshot without holding registry read
+            // across legacy Feature reads; preview/adopt revalidate its digest.
+            let host = host(&api)?;
             let current = source_snapshot(&api, &account)?;
-            let host = registry.host();
-            let catalog_digest = crate::config_adoption::catalog_digest(host)?;
+            let catalog_digest = crate::config_adoption::catalog_digest(&host)?;
             let (state, expected_legacy_export, policies, diagnostics) = if current.canonical {
                 (current.state, None, current.policies, vec![])
             } else {
@@ -411,25 +410,28 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                 identity,
                 seed,
             } = prepare(&api, &account, &request)?;
-            let registry = api
-                .permission_registry
-                .read()
-                .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?;
-            let host = registry.host();
             let baseline = seed.as_ref().map(baseline);
             // Preview never seals. The native read-only IMMEDIATE transaction
             // fences metadata updates through core validation, then rolls back.
             let preview = legacy
                 .with_permission_authority_guard(&identity, |authority| {
-                    Ok(api.config_store.preview_configuration_adoption(
-                        &api.config.workspace_id,
-                        &account,
-                        &request,
-                        schema,
-                        &host,
-                        baseline.as_ref(),
-                        |subject| authority.require_subject(subject).map_err(transfer_error),
-                    ))
+                    Ok((|| -> Result<_> {
+                        // Feature DB -> registry -> Host, matching native Memory.
+                        // Keep current declarations pinned through core validation.
+                        let registry = api.permission_registry.read().map_err(|_| {
+                            Error::Config("current Feature declarations unavailable".into())
+                        })?;
+                        let host = registry.host();
+                        api.config_store.preview_configuration_adoption(
+                            &api.config.workspace_id,
+                            &account,
+                            &request,
+                            schema,
+                            &host,
+                            baseline.as_ref(),
+                            |subject| authority.require_subject(subject).map_err(transfer_error),
+                        )
+                    })())
                 })
                 .map_err(transfer_error)??;
             Ok(ConfigurationPreviewResponse {
@@ -459,11 +461,6 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                 identity,
                 seed,
             } = prepare(&api, &account, &request)?;
-            let registry = api
-                .permission_registry
-                .read()
-                .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?;
-            let host = registry.host();
             let baseline = seed.as_ref().map(baseline);
             // Feature connection + IMMEDIATE transaction always precede Server.
             // Never call store-level Feature APIs from inside this closure.
@@ -471,7 +468,14 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                 .with_permission_authority_guard(&identity, |authority| {
                     // Keep Server failures as the inner Result. Only native gate
                     // acquisition/finalization failures belong to the outer lane.
-                    Ok(api.config_store.adopt_configuration(
+                    Ok((|| -> Result<_> {
+                        // Acquire declarations only after native Feature admission,
+                        // retaining them through seal and the Server commit.
+                        let registry = api.permission_registry.read().map_err(|_| {
+                            Error::Config("current Feature declarations unavailable".into())
+                        })?;
+                        let host = registry.host();
+                        api.config_store.adopt_configuration(
                         &api.config.workspace_id,
                         &account,
                         &request,
@@ -505,10 +509,10 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                                 policies: seed.policies.clone(),
                             })
                         },
-                    ))
+                        )
+                    })())
                 })
                 .map_err(transfer_error)??;
-            drop(registry);
             api.refresh_plugin_permission_registry()?;
             // Core and Feature guards are released before best-effort Runtime
             // publication. Dispatch transfers the admitted lifetime without

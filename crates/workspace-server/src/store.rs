@@ -3049,12 +3049,12 @@ impl SqliteWorkspaceStore {
     /// Using the ordinary connection could deadlock against a writer that holds its
     /// mutex while waiting for this reservation. Clones retain the reservation, not
     /// the ordinary connection; native query-only mode rejects accidental effects.
-    pub(crate) fn memory_authority_reader(&self) -> Result<Self> {
+    pub(crate) fn subject_authority_reader(&self) -> Result<Self> {
         let fence = match &self.conn {
             StoreConnection::Managed(database) => database.writer_fence()?,
             StoreConnection::Fixture(_) | StoreConnection::AuthorityReader(_) => {
                 return Err(Error::Store(
-                    "Memory effect authority requires a managed Host catalog".into(),
+                    "Subject effect authority requires a managed Host catalog".into(),
                 ));
             }
         };
@@ -17774,7 +17774,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.db");
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
-        let reader = store.memory_authority_reader().unwrap();
+        let reader = store.subject_authority_reader().unwrap();
         assert!(
             reader
                 .with_conn(|connection| {
@@ -17785,7 +17785,7 @@ mod tests {
         );
         assert!(reader.with_conn_mut(|_| Ok(())).is_err());
         assert!(reader.drive_authority(&path).is_err());
-        assert!(reader.memory_authority_reader().is_err());
+        assert!(reader.subject_authority_reader().is_err());
         let clone = reader.clone();
         drop(reader);
         clone
@@ -17813,7 +17813,7 @@ mod tests {
         assert!(
             SqliteWorkspaceStore::in_memory_for_test()
                 .unwrap()
-                .memory_authority_reader()
+                .subject_authority_reader()
                 .is_err()
         );
     }

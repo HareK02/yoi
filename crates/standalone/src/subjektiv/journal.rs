@@ -243,13 +243,15 @@ pub(crate) fn prepare_worker_deletion(
 
 pub(super) fn journal_error(error: JournalError) -> SubjektivHostError {
     match error {
+        JournalError::Subject(subjektiv::SubjektivError::AuthorizationDenied(message))
+        | JournalError::PermissionDenied(message) => SubjektivHostError::PermissionDenied(message),
         JournalError::Conflict(message) => SubjektivHostError::Conflict {
             code: "journal_conflict".into(),
             message,
         },
-        JournalError::PermissionDenied(message)
-        | JournalError::InvalidInput(message)
-        | JournalError::NotFound(message) => SubjektivHostError::InvalidArgument(message),
+        JournalError::InvalidInput(message) | JournalError::NotFound(message) => {
+            SubjektivHostError::InvalidArgument(message)
+        }
         other => SubjektivHostError::Unavailable(other.to_string()),
     }
 }
@@ -1481,6 +1483,8 @@ pub(super) fn grant(
         generation,
         input_digest,
         fence,
+        #[cfg(test)]
+        admission_observer: None,
     });
     Ok(worker::job::JobFeatureGrant {
         features: worker::feature::FeatureRegistryBuilder::new()
@@ -1500,8 +1504,80 @@ struct LocalJournalHost {
     generation: JournalGeneration,
     input_digest: String,
     fence: Arc<dyn crate::jobs::JobAttemptFence>,
+    #[cfg(test)]
+    admission_observer: Option<JournalAdmissionObserver>,
 }
+
+struct LocalJournalEffectAuthority {
+    actual: authority::LocalMemoryEffectAuthority,
+    grant: LocalJournalGrant,
+    fence: Arc<dyn crate::jobs::JobAttemptFence>,
+}
+impl subjektiv::effect_admission::SubjectEffectAuthority for LocalJournalEffectAuthority {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
+        // execute/finish already hold enter() through the whole synchronous call.
+        // Only recheck the current attempt here; entering its gate again would recurse.
+        self.fence
+            .ensure_live()
+            .map_err(subjektiv::SubjektivError::AuthorizationDenied)?;
+        self.grant
+            .authorize_operation(&self.actual.operation)
+            .map_err(|error| subjektiv::SubjektivError::AuthorizationDenied(error.to_string()))?;
+        // Use the admitted connection for active Subject/writer/current policy. Calling
+        // live() or authorize_current() here would reenter this same Feature database.
+        // The real Local authority returns the current registry lease through commit/read.
+        subjektiv::effect_admission::SubjectEffectAuthority::enter(&self.actual, admission)
+    }
+}
+
+#[cfg(test)]
+type JournalAdmissionObserver = Arc<dyn Fn(&str) -> subjektiv::Result<()> + Send + Sync>;
+#[cfg(test)]
+struct ObservedJournalAuthority {
+    actual: LocalJournalEffectAuthority,
+    observer: JournalAdmissionObserver,
+}
+#[cfg(test)]
+impl subjektiv::effect_admission::SubjectEffectAuthority for ObservedJournalAuthority {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
+        (self.observer)(&self.actual.actual.operation)?;
+        subjektiv::effect_admission::SubjectEffectAuthority::enter(&self.actual, admission)
+    }
+}
+
 impl LocalJournalHost {
+    fn effect_store(&self, operation: &str) -> SubjektivStore {
+        let actual = LocalJournalEffectAuthority {
+            actual: authority::LocalMemoryEffectAuthority {
+                host: self.host.clone(),
+                operation: operation.into(),
+            },
+            grant: self.grant.clone(),
+            fence: self.fence.clone(),
+        };
+        #[cfg(test)]
+        if let Some(observer) = &self.admission_observer {
+            return self
+                .host
+                .catalog
+                .store
+                .with_subject_effect_authority(Arc::new(ObservedJournalAuthority {
+                    actual,
+                    observer: observer.clone(),
+                }));
+        }
+        self.host
+            .catalog
+            .store
+            .with_subject_effect_authority(Arc::new(actual))
+    }
+
     fn live(&self, operation: &str) -> Result<JournalJobContext, SubjektivHostError> {
         self.grant.authorize_operation(operation)?;
         self.host.authorize_current(operation)?;
@@ -1565,14 +1641,14 @@ impl JournalJobHost for LocalJournalHost {
         // The generic runner has supplied this exact immutable input before it can
         // invoke this bound tool. Preparation alone is not evidence of delivery.
         subjektiv::journal::service::attest_input_delivery(
-            &self.host.catalog.store,
+            &self.effect_store("journal.job.input.supply"),
             &context,
             &self.input_digest,
             &self.grant.ranges,
         )
         .map_err(journal_error)?;
         let response = subjektiv::journal::service::execute_snapshot(
-            &self.host.catalog.store,
+            &self.effect_store(operation),
             &context,
             &self.input_digest,
             request,
@@ -1587,8 +1663,9 @@ impl JournalJobHost for LocalJournalHost {
             .enter()
             .map_err(SubjektivHostError::Unavailable)?;
         let context = self.live("journal.finish")?;
-        let result = subjektiv::journal::service::finish(&self.host.catalog.store, &context)
-            .map_err(journal_error)?;
+        let result =
+            subjektiv::journal::service::finish(&self.effect_store("journal.finish"), &context)
+                .map_err(journal_error)?;
         self.live("journal.finish")?;
         Ok(result)
     }

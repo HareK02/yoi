@@ -699,7 +699,7 @@ pub const REGISTRATION: FeatureRegistration =
 pub struct SubjektivStore {
     database: FeatureDatabase,
     canonical_permission_source: Option<std::sync::Arc<dyn permissions::CanonicalPermissionSource>>,
-    memory_effect_authority: Option<std::sync::Arc<dyn effect_admission::MemoryEffectAuthority>>,
+    effect_authority: Option<std::sync::Arc<dyn effect_admission::SubjectEffectAuthority>>,
 }
 
 impl SubjektivStore {
@@ -760,7 +760,7 @@ impl SubjektivStore {
         Ok(Self {
             database,
             canonical_permission_source: None,
-            memory_effect_authority: None,
+            effect_authority: None,
         })
     }
 

@@ -5,54 +5,13 @@ use super::*;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::subjektiv::authority::{MutablePolicy, bind_canonical_policy};
 use server_api::authorization::{CurrentSubjectPolicy, SubjectPermissions};
-
-struct MutablePolicy {
-    workspace: String,
-    subject: String,
-    current: Mutex<Option<CurrentSubjectPolicy>>,
-}
-impl subjektiv::CanonicalPermissionSource for MutablePolicy {
-    fn subject_permissions(
-        &self,
-        _: &str,
-        _: &str,
-    ) -> subjektiv::Result<Option<SubjectPermissions>> {
-        panic!("the local consumer must not use the legacy policy projection")
-    }
-    fn current_subject_policy(
-        &self,
-        workspace: &str,
-        subject: &str,
-    ) -> subjektiv::Result<Option<CurrentSubjectPolicy>> {
-        assert_eq!(workspace, self.workspace);
-        assert_eq!(subject, self.subject);
-        Ok(self.current.lock().unwrap().clone())
-    }
-}
 
 fn canonical_fixture() -> (ConsolidationRecoveryFixture, Arc<MutablePolicy>) {
     let mut provider = None;
     let fixture = ConsolidationRecoveryFixture::with_policy(&["candidate"], |catalog, subject| {
-        let source = Arc::new(MutablePolicy {
-            workspace: catalog.scope_id.clone(),
-            subject: subject.id.clone(),
-            current: Mutex::new(catalog.store.current_subject_policy(&subject.id).unwrap()),
-        });
-        let identity = catalog.store.database_identity().unwrap();
-        let preview = catalog
-            .store
-            .preview_permission_transfer(&identity)
-            .unwrap();
-        catalog
-            .store
-            .seal_permission_sources(&identity, "local-test-transfer", &preview.export_digest)
-            .unwrap();
-        catalog.store = catalog
-            .store
-            .clone()
-            .with_canonical_permission_source(source.clone());
-        provider = Some(source);
+        provider = Some(bind_canonical_policy(catalog, subject));
     });
     (fixture, provider.unwrap())
 }
@@ -535,18 +494,18 @@ struct HeldMemoryAdmission {
     resume: Mutex<mpsc::Receiver<()>>,
     actual: authority::LocalMemoryEffectAuthority,
 }
-impl subjektiv::effect_admission::MemoryEffectAuthority for HeldMemoryAdmission {
+impl subjektiv::effect_admission::SubjectEffectAuthority for HeldMemoryAdmission {
     fn enter<'a>(
         &'a self,
-        admission: &subjektiv::effect_admission::MemoryEffectAdmission<'_>,
-    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::MemoryEffectLease>> {
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
         self.entered.send(()).unwrap();
         self.resume
             .lock()
             .unwrap()
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
-        self.actual.enter(admission)
+        subjektiv::effect_admission::SubjectEffectAuthority::enter(&self.actual, admission)
     }
 }
 
@@ -573,7 +532,7 @@ fn memory_native_admission_revocation_prevents_memory_disposition_and_receipt_co
             .host
             .catalog
             .store
-            .with_memory_effect_authority(Arc::new(HeldMemoryAdmission {
+            .with_subject_effect_authority(Arc::new(HeldMemoryAdmission {
                 entered,
                 resume: Mutex::new(resumed),
                 actual: authority::LocalMemoryEffectAuthority {

@@ -212,7 +212,6 @@ fn current_key_allowed(
     if !operation.contains('.') {
         return Ok(assignment.is_none());
     }
-    let key = feature_permissions::PermissionKey::parse(operation).map_err(denied)?;
     authority.refresh_permission_registry()?;
     let registry = authority
         .permission_registry
@@ -1461,19 +1460,21 @@ pub(super) fn administration_actor(
         .ok_or_else(|| denied("Subject permission administration requires an authenticated owner"))
 }
 
-struct MemoryEffectAuthority {
+struct SubjectEffectAuthority {
     api: WorkspaceApi,
     worker: RuntimeWorkerRef,
     subject: String,
     operation: String,
     #[cfg(test)]
+    before_registry: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
     after_reservation: Option<Arc<dyn Fn() + Send + Sync>>,
 }
-impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthority {
+impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthority {
     fn enter<'a>(
         &'a self,
-        admission: &subjektiv::effect_admission::MemoryEffectAdmission<'_>,
-    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::MemoryEffectLease>> {
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
         let reject = |error: ApiError| match error.error {
             Error::WorkspacePermissionDenied(message) | Error::RepositoryConflict(message) => {
                 subjektiv::SubjektivError::AuthorizationDenied(message)
@@ -1484,13 +1485,21 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
         };
         // Admission order: Feature DB -> catalog registry -> Host writer. Resolve
         // through that already held transaction, never a recursive catalog writer.
+        #[cfg(test)]
+        if let Some(observe) = &self.before_registry {
+            observe();
+        }
+        #[cfg(test)]
+        if let Some(observe) = &self.api.subject_effect_admission_observer {
+            observe(&self.operation);
+        }
         let mut registry = self.api.permission_registry.write().map_err(|_| {
             subjektiv::SubjektivError::AuthorizationDenied("Feature registry is unavailable".into())
         })?;
         let catalog = Arc::new(
             self.api
                 .config_store
-                .memory_authority_reader()
+                .subject_authority_reader()
                 .map_err(|error| reject(error.into()))?,
         );
         #[cfg(test)]
@@ -1536,7 +1545,7 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
             &self.worker,
             |subject| {
                 if subject != self.subject {
-                    return Err(denied("Memory Job Subject changed"));
+                    return Err(denied("Subject Job Subject changed"));
                 }
                 Ok(Some(CurrentSubjectPolicy::Canonical(source.clone())))
             },
@@ -1549,7 +1558,7 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
                 .any(|permission| permission.covers(&requested))
             {
                 return Err(subjektiv::SubjektivError::AuthorizationDenied(
-                    "Memory operation is outside the live Job grant".into(),
+                    "Subject operation is outside the live Job grant".into(),
                 ));
             }
         } else {
@@ -1570,7 +1579,7 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
                         != format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", self.subject)
                 }) {
                     return Err(subjektiv::SubjektivError::AuthorizationDenied(
-                        "Memory Worker ownership changed".into(),
+                        "Subject effect Worker ownership changed".into(),
                     ));
                 }
             }
@@ -1579,7 +1588,7 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
                 .map_err(reject)?
             {
                 return Err(subjektiv::SubjektivError::AuthorizationDenied(
-                    "Current policy denies the Memory operation".into(),
+                    "Current policy denies the Subject operation".into(),
                 ));
             }
         }
@@ -1587,19 +1596,40 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
     }
 }
 
-pub(super) fn memory_effect_store(
+pub(super) fn subject_effect_store(
     api: &WorkspaceApi,
     store: &subjektiv::SubjektivStore,
     worker: &RuntimeWorkerRef,
     subject: &str,
     operation: &str,
 ) -> subjektiv::SubjektivStore {
-    store.with_memory_effect_authority(Arc::new(MemoryEffectAuthority {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
         api: api.clone(),
         worker: worker.clone(),
         subject: subject.into(),
         operation: operation.into(),
         #[cfg(test)]
+        before_registry: None,
+        #[cfg(test)]
+        after_reservation: None,
+    }))
+}
+
+#[cfg(test)]
+pub(super) fn memory_effect_store_before_registry(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> subjektiv::SubjektivStore {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+        before_registry: Some(observe),
         after_reservation: None,
     }))
 }
@@ -1613,11 +1643,12 @@ pub(super) fn memory_effect_store_after_reservation(
     operation: &str,
     observe: Arc<dyn Fn() + Send + Sync>,
 ) -> subjektiv::SubjektivStore {
-    store.with_memory_effect_authority(Arc::new(MemoryEffectAuthority {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
         api: api.clone(),
         worker: worker.clone(),
         subject: subject.into(),
         operation: operation.into(),
+        before_registry: None,
         after_reservation: Some(observe),
     }))
 }

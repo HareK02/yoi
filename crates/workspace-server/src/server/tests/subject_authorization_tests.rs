@@ -9,6 +9,10 @@ use super::*;
 mod chat_delegation_connected;
 #[path = "chat_tests.rs"]
 mod chat_tests;
+#[path = "journal_native_authority_tests.rs"]
+mod journal_native_authority;
+#[path = "native_lock_order_tests.rs"]
+mod native_lock_order;
 #[path = "session_registration_connected_tests.rs"]
 mod session_registration_connected;
 #[path = "subject_body_cleanup_connected_tests.rs"]
@@ -4963,7 +4967,7 @@ async fn memory_native_admission_reads_reserved_authority_while_host_writer_owns
         assert!(writer_result.is_ok(), "job={job_worker}: {writer_result:?}");
         assert!(result.is_ok(), "job={job_worker}: {result:?}");
         fixture.adopt_policy("{}", "{}").await;
-        let revoked = subject_authorization::memory_effect_store(
+        let revoked = subject_authorization::subject_effect_store(
             &fixture.api,
             &store,
             &worker,
@@ -5034,7 +5038,7 @@ async fn memory_native_effect_rechecks_prepared_authority_and_preserves_no_write
             "body" => fixture.release_source_lease(),
             _ => {}
         }
-        let effect_store = subject_authorization::memory_effect_store(
+        let effect_store = subject_authorization::subject_effect_store(
             &fixture.api,
             &store,
             &fixture.source,

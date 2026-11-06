@@ -2154,6 +2154,10 @@ pub struct WorkspaceApi {
     attachment_upload_grants: Arc<Mutex<HashMap<String, AttachmentUploadGrant>>>,
     #[cfg(test)]
     plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
+    #[cfg(test)]
+    journal_before_effect: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    #[cfg(test)]
+    subject_effect_admission_observer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -4961,6 +4965,10 @@ impl WorkspaceApi {
             attachment_upload_grants: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             plugin_https_transport: None,
+            #[cfg(test)]
+            journal_before_effect: None,
+            #[cfg(test)]
+            subject_effect_admission_observer: None,
         };
         // Restore the domain fence before this API can issue any Drive handle,
         // including blocked/failed deletions not scheduled for automatic recovery.
@@ -26557,7 +26565,7 @@ async fn scoped_subjektiv_memory_backend(
                     )?
                 }
             };
-            let effect_store = subject_authorization::memory_effect_store(
+            let effect_store = subject_authorization::subject_effect_store(
                 &api,
                 &store,
                 &source_worker,

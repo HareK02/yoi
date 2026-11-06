@@ -934,6 +934,9 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
 async fn subjektiv_job_rechecks_current_policy_and_preserves_provider_batch_ceiling() {
     let dir = tempfile::tempdir().unwrap();
     let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    // Observe current-policy intersection on a live attempt, independently of
+    // recovery retiring it after input-supply revocation. Recovery has its own tests.
+    let _recovery = api.backend_job_recovery.pause_steps_for_test().await;
     let store = open_subjektiv_store(&api).unwrap();
     let subject = store
         .create_subject(SubjectRole::new("live-job-policy").unwrap())

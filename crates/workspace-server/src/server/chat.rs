@@ -291,6 +291,37 @@ pub(super) async fn worker_operation(
     workspace: String,
     request: ChatWorkerRequest,
 ) -> ApiResult<ChatWorkerResponse> {
+    worker_operation_inner(
+        api,
+        context,
+        workspace,
+        request,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+// Explicitly scoped to this invocation: parallel tests and other Workspace APIs
+// cannot intercept an unrelated request's native admission.
+#[cfg(test)]
+pub(super) async fn worker_operation_before_feature(
+    api: WorkspaceApi,
+    context: ServerRequestContext,
+    workspace: String,
+    request: ChatWorkerRequest,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> ApiResult<ChatWorkerResponse> {
+    worker_operation_inner(api, context, workspace, request, Some(observe)).await
+}
+
+async fn worker_operation_inner(
+    api: WorkspaceApi,
+    context: ServerRequestContext,
+    workspace: String,
+    request: ChatWorkerRequest,
+    #[cfg(test)] before_feature: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> ApiResult<ChatWorkerResponse> {
     api.host_executors
         .feature()?
         .run(move || -> ApiResult<_> {
@@ -334,53 +365,62 @@ pub(super) async fn worker_operation(
                 .ok_or_else(|| {
                     Error::WorkspacePermissionDenied("Subject body ownership is absent".into())
                 })?;
-            // Pin declarations before Feature SQL, so a catalog refresh never
-            // waits for Server SQL while we hold Feature and wait for its writer.
-            let registry = api.permission_registry.read().map_err(|_| {
-                Error::WorkspacePermissionDenied("current Feature declarations unavailable".into())
-            })?;
-            // Same DB lock order as T-838 cutover: Feature native transaction ->
-            // Server body/current-policy transaction -> methods on that SAME Feature
-            // transaction. Never invoke a canonical provider inside Server SQL.
+            #[cfg(test)]
+            if let Some(observe) = before_feature {
+                observe();
+            }
+            // Match native Memory admission: Feature DB -> registry -> Host.
+            // Never pin the registry while waiting for the Feature connection;
+            // Memory already holds that connection when it requests registry write.
             store
                 .with_chat_transaction(&scope.subject_id, |chat| {
-                    let source = chat.policy_source().clone();
-                    Ok(api.config_store.with_current_subject_body_policy(
-                        &workspace,
-                        &scope.subject_id,
-                        &lease,
-                        &source,
-                        |policy| {
-                            Ok((|| -> ApiResult<_> {
-                                authorize_chat_policy(
-                                    &registry,
-                                    &workspace,
-                                    &scope.subject_id,
-                                    operation,
-                                    policy,
-                                )?;
-                                let response = match &request.operation {
-                                    ChatWorkerOperation::Read {
-                                        conversation_id,
-                                        query,
-                                    } => chat
-                                        .messages(conversation_id, query)
-                                        .map(|page| ChatWorkerResponse::Messages { page }),
-                                    ChatWorkerOperation::Send { request } => chat
-                                        .send(request)
-                                        .map(|message| ChatWorkerResponse::Sent { message }),
-                                }
-                                .map_err(domain)?;
-                                // Both policy and ownership stay fenced through commit;
-                                // replay is authorized before any saved result is read.
-                                chat.commit().map_err(domain)?;
-                                Ok(response)
-                            })())
-                        },
-                    ))
+                    Ok((|| -> ApiResult<_> {
+                        let registry = api.permission_registry.read().map_err(|_| {
+                            Error::WorkspacePermissionDenied(
+                                "current Feature declarations unavailable".into(),
+                            )
+                        })?;
+                        let source = chat.policy_source().clone();
+                        api.config_store
+                            .with_current_subject_body_policy(
+                                &workspace,
+                                &scope.subject_id,
+                                &lease,
+                                &source,
+                                |policy| {
+                                    Ok((|| -> ApiResult<_> {
+                                        authorize_chat_policy(
+                                            &registry,
+                                            &workspace,
+                                            &scope.subject_id,
+                                            operation,
+                                            policy,
+                                        )?;
+                                        let response = match &request.operation {
+                                            ChatWorkerOperation::Read {
+                                                conversation_id,
+                                                query,
+                                            } => chat
+                                                .messages(conversation_id, query)
+                                                .map(|page| ChatWorkerResponse::Messages { page }),
+                                            ChatWorkerOperation::Send { request } => {
+                                                chat.send(request).map(|message| {
+                                                    ChatWorkerResponse::Sent { message }
+                                                })
+                                            }
+                                        }
+                                        .map_err(domain)?;
+                                        // Both policy and ownership stay fenced through commit;
+                                        // replay is authorized before any saved result is read.
+                                        chat.commit().map_err(domain)?;
+                                        Ok(response)
+                                    })())
+                                },
+                            )
+                            .map_err(ApiError::from)?
+                    })())
                 })
                 .map_err(domain)?
-                .map_err(ApiError::from)?
         })
         .await
 }

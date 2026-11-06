@@ -271,7 +271,17 @@ pub(super) fn execute(
     // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
     authorize(api, worker, &grant.subject_id, job_operation(&request))?;
-    let store = store(api)?;
+    #[cfg(test)]
+    if let Some(observe) = &api.journal_before_effect {
+        observe(job_operation(&request));
+    }
+    let store = subject_authorization::subject_effect_store(
+        api,
+        &store(api)?,
+        worker,
+        &grant.subject_id,
+        job_operation(&request),
+    );
     let host = host(api, &store, &grant)?;
     let g = generation(&store, &host, &grant, &job, &attempt)?;
     let input = saved_input(&job.request, &grant)?;
@@ -317,7 +327,17 @@ pub(super) fn finish(
     // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
     authorize(api, worker, &grant.subject_id, "journal.finish")?;
-    let store = store(api)?;
+    #[cfg(test)]
+    if let Some(observe) = &api.journal_before_effect {
+        observe("journal.finish");
+    }
+    let store = subject_authorization::subject_effect_store(
+        api,
+        &store(api)?,
+        worker,
+        &grant.subject_id,
+        "journal.finish",
+    );
     let host = host(api, &store, &grant)?;
     let input = saved_input(&job.request, &grant)?;
     // prepare is an exact binding lookup too, including the saved completion of a closed generation.
