@@ -39,7 +39,7 @@ fn grant_journal_operations(store: &crate::subjektiv::SubjektivStore, subject: &
     use server_api::authorization::{
         PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
     };
-    let previous = store.subject_permissions(subject).unwrap();
+    let previous = store.current_subject_policy(subject).unwrap();
     store
         .set_subject_permissions(
             subject,
@@ -99,11 +99,13 @@ fn bind_fixture_session(
     store: &crate::subjektiv::SubjektivStore,
     attr: crate::subjektiv::SubjectSessionAttribution,
 ) -> JournalHostContext {
-    if store
-        .subject_permissions(&attr.subject_id)
-        .unwrap()
-        .is_none()
-    {
+    // This suite uses an explicit exact-Subject legacy fixture, not a scoped
+    // projection of the shared default. Preserve already configured legacy
+    // policies, including empty sources used by denial tests.
+    if !matches!(
+        store.subject_policy_source(&attr.subject_id).unwrap(),
+        Some(server_api::authorization::SubjectPolicySource::Legacy(_))
+    ) {
         grant_journal_operations(store, &attr.subject_id);
     }
     let binding = store

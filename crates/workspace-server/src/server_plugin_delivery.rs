@@ -128,6 +128,7 @@ async fn current_execution(
         .host()
         .map_err(failure)?
         .run(move || {
+            stage_api.refresh_plugin_permission_registry()?;
             subject_authorization::authorize(
                 &stage_api,
                 &stage_worker,

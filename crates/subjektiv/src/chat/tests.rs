@@ -644,7 +644,7 @@ fn policy(
     // Keep explicit expectations unchanged so replacement races still use their pinned CAS.
     let expected = expected.map(str::to_owned).unwrap_or_else(|| {
         store
-            .subject_permissions(subject)
+            .current_subject_policy(subject)
             .unwrap()
             .unwrap()
             .change_id
@@ -871,7 +871,7 @@ fn previous_schema_upgrade_preserves_policy_and_matches_fresh_database() {
     );
     assert_eq!(
         upgraded
-            .subject_permissions(&subject.id)
+            .current_subject_policy(&subject.id)
             .unwrap()
             .unwrap()
             .change_id,
@@ -1086,4 +1086,105 @@ fn failed_conversation_reference_migration_rolls_back_and_retries() {
         )
         .unwrap();
     assert_eq!(id, "existing");
+}
+
+#[test]
+fn chat_native_transaction_uses_shared_default_and_commits_before_host_fence_returns() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let subject = store.create_subject(role()).unwrap().id;
+    let c = create(&store, "alice", &subject, "create-native");
+    let input = store
+        .chat_append_user_message("alice", &c.id, &user("native-user", "hello"))
+        .unwrap();
+    let request = send(&c, "native-answer", Some(&input.id));
+    let answer = store
+        .with_chat_transaction(&subject, |chat| {
+            let ChatPolicySource::Local(Some(
+                server_api::authorization::SubjectPolicySource::Feature(policy),
+            )) = chat.policy_source()
+            else {
+                panic!("new Subject must have a real local Feature assignment");
+            };
+            assert_eq!(
+                policy.execution,
+                server_api::authorization::subject_default_permission_assignment()
+            );
+            assert!(policy.legacy_constraints.is_none());
+            let answer = chat.send(&request)?;
+            assert_eq!(chat.messages(&c.id, &Default::default())?.messages.len(), 2);
+            chat.commit()?;
+            assert!(matches!(
+                chat.send(&request),
+                Err(ChatError::AuthorizationChanged)
+            ));
+            Ok(answer)
+        })
+        .unwrap();
+    let (_manager2, _scope2, reopened) = open_store(temp.path(), "workspace-a");
+    assert_eq!(page(&reopened, &c).messages, vec![input, answer.clone()]);
+    let replay = reopened
+        .with_chat_transaction(&subject, |chat| {
+            let replay = chat.send(&request)?;
+            chat.commit()?;
+            Ok(replay)
+        })
+        .unwrap();
+    assert_eq!(replay, answer);
+    assert_eq!(page(&reopened, &c).messages.len(), 2);
+}
+
+#[test]
+fn chat_native_transaction_drops_uncommitted_effect_and_never_calls_canonical_provider() {
+    struct NoReentry;
+    impl crate::CanonicalPermissionSource for NoReentry {
+        fn subject_permissions(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> crate::Result<Option<server_api::authorization::SubjectPermissions>> {
+            panic!("chat guard must not recursively invoke canonical provider");
+        }
+        fn current_subject_policy(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> crate::Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
+            panic!("chat guard must use Host's fenced Server policy snapshot");
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let subject = store.create_subject(role()).unwrap().id;
+    let c = create(&store, "alice", &subject, "create-guarded");
+    store
+        .with_chat_transaction(&subject, |chat| {
+            chat.send(&send(&c, "rolled-back", None))?;
+            Ok(()) // Host error/forgotten commit cannot publish.
+        })
+        .unwrap();
+    assert!(page(&store, &c).messages.is_empty());
+    let identity = store.database_identity().unwrap();
+    let preview = store.preview_permission_transfer(&identity).unwrap();
+    store
+        .seal_permission_sources(&identity, "chat-transfer", &preview.export_digest)
+        .unwrap();
+    let store = store.with_canonical_permission_source(Arc::new(NoReentry));
+    store
+        .with_chat_transaction(&subject, |chat| {
+            assert!(matches!(chat.policy_source(), ChatPolicySource::Canonical));
+            // Component fixture models a Host which has already authorized in Server SQL.
+            chat.send(&send(&c, "canonical-answer", None))?;
+            chat.commit()
+        })
+        .unwrap();
+    assert_eq!(page(&store, &c).messages.len(), 1);
+    assert!(matches!(
+        store.chat_send_message_authorized(
+            &subject,
+            &send(&c, "canonical-answer", None),
+            "configuration:new"
+        ),
+        Err(ChatError::AuthorizationChanged)
+    ));
 }

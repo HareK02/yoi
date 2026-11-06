@@ -115,7 +115,7 @@ impl AdmissionFixture {
             serialization_key: Some(format!("subjektiv:{}", self.body.binding.subject_id)),
             limits: Default::default(),
         }, serde_json::to_value(LocalConsolidationGrant {
-            binding: self.body.binding.clone(), candidate_ids: vec![],
+            binding: self.body.binding.clone(), candidate_ids: vec![], operations: None,
         }).unwrap()).unwrap()
     }
     fn domain_path(&self) -> PathBuf {

@@ -503,26 +503,52 @@ async fn backend_control_grant_does_not_replace_exact_operation_use_permission()
             .is_some()
     );
     assert_backend_denied(&f, &f.source, &target, Some(StatusCode::FORBIDDEN)).await;
-    // Old collection/Feature permissions and another Workspace never authorize
-    // individual current Worker operations, even with a real target grant.
-    let mut wrong_workspace = control_permissions();
-    for permission in &mut wrong_workspace {
-        permission.resource = PermissionResource::WorkerOperation {
-            workspace_id: "another-workspace".into(),
-        };
-    }
+    // Old collection/Feature permissions never authorize individual current
+    // Worker operations, even with a real target grant.
     for mut permissions in [
         CONTROL_OPERATIONS
             .iter()
             .map(|(operation, _)| workspace_permission(operation))
             .collect(),
         vec![activation("worker")],
-        wrong_workspace,
     ] {
         permissions.push(workspace_permission("worker.create"));
         f.seed_saved_policy(permissions, vec![]);
         assert_backend_denied(&f, &f.source, &target, Some(StatusCode::FORBIDDEN)).await;
     }
+    // A foreign Workspace is rejected at the typed writer boundary, not seeded
+    // as locally issuable authority. The failed save must leave policy unchanged;
+    // foreign-resource requests must also fail against the live signed consumer.
+    let mut wrong_workspace = control_permissions();
+    for permission in &mut wrong_workspace {
+        permission.resource = PermissionResource::WorkerOperation {
+            workspace_id: "another-workspace".into(),
+        };
+    }
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
+    let rejected = store.set_subject_permissions(
+        &f.subject,
+        &SubjectPermissionsUpdate {
+            operation_id: "reject-foreign-worker-operations".into(),
+            expected_change_id: Some(previous.change_id.clone()),
+            execution: wrong_workspace.clone(),
+            delegation: vec![],
+        },
+    );
+    assert!(matches!(
+        rejected,
+        Err(crate::subjektiv::SubjektivError::AuthorizationDenied(_))
+    ));
+    assert_eq!(
+        store.subject_permissions(&f.subject).unwrap(),
+        Some(previous)
+    );
+    for permission in &wrong_workspace {
+        let (status, body) = f.check(&f.source, permission).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+    assert_backend_denied(&f, &f.source, &target, Some(StatusCode::FORBIDDEN)).await;
     f.assign(vec![operation_permission("worker.messaging")], vec![])
         .await;
     assert_eq!(

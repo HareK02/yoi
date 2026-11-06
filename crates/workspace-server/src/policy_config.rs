@@ -98,6 +98,30 @@ pub struct AssignmentSource {
 }
 
 impl AssignmentSource {
+    pub fn from_assignment(assignment: &PermissionAssignment) -> Self {
+        let mut result = Self {
+            revoked: assignment.revoked,
+            ..Default::default()
+        };
+        for reference in &assignment.grants {
+            match reference {
+                PermissionReference::Set(set) => result.sets.push(set.clone()),
+                PermissionReference::Namespace(namespace) => {
+                    result.namespaces.push(namespace.clone())
+                }
+            }
+        }
+        for reference in &assignment.exclusions {
+            match reference {
+                PermissionReference::Set(set) => result.exclude_sets.push(set.clone()),
+                PermissionReference::Namespace(namespace) => {
+                    result.exclude_namespaces.push(namespace.clone())
+                }
+            }
+        }
+        result
+    }
+
     pub fn assignment(&self) -> PermissionAssignment {
         let references = |sets: &[PermissionSetId], namespaces: &[NamespacePermissions]| {
             sets.iter()
@@ -334,6 +358,30 @@ pub fn migrate_subject(
 }
 
 impl AdoptedSubjectPolicy {
+    pub fn current(&self) -> server_api::authorization::CurrentSubjectPolicy {
+        server_api::authorization::CurrentSubjectPolicy {
+            change_id: self.change_id.clone(),
+            execution: self.source.execution.assignment(),
+            delegation: self.source.delegation.assignment(),
+            legacy_constraints: self.legacy_constraints.clone(),
+        }
+    }
+
+    pub fn from_current(
+        subject_id: &str,
+        current: &server_api::authorization::CurrentSubjectPolicy,
+    ) -> Self {
+        Self {
+            source: SubjectAssignmentSource {
+                subject_id: subject_id.into(),
+                execution: AssignmentSource::from_assignment(&current.execution),
+                delegation: AssignmentSource::from_assignment(&current.delegation),
+            },
+            change_id: current.change_id.clone(),
+            legacy_constraints: current.legacy_constraints.clone(),
+        }
+    }
+
     /// Read bridge for the old scoped-operation consumer. New payload-free
     /// consumers resolve `source` through the current Feature Host and also enforce
     /// retained domain constraints. This bridge cannot turn a key into an all-target

@@ -1021,6 +1021,19 @@ impl delivery_execution::WorkerExecutionBackend for DeliveryResponseLossBackend 
             result
         }
     }
+    fn termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<Option<delivery_execution::WorkerExecutionTermination>, String> {
+        self.inner.termination_receipt(worker)
+    }
+    fn reconcile_termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+        saved: &delivery_execution::WorkerExecutionTermination,
+    ) -> std::result::Result<Option<delivery_execution::WorkerExecutionTermination>, String> {
+        self.inner.reconcile_termination_receipt(worker, saved)
+    }
     fn dispatch_method(
         &self,
         worker: &worker_runtime::identity::WorkerRef,

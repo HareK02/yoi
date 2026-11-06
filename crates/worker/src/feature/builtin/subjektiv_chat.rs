@@ -5,6 +5,8 @@
 //! Current body ownership, conversation access and observed-input/idempotency checks
 //! remain Backend-owned; the model supplies neither sender nor Subject identity.
 
+pub(crate) mod permission_declaration;
+
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -58,6 +60,13 @@ impl SubjektivChatFeature {
 }
 
 impl FeatureModule for SubjektivChatFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin("subjektiv-chat", "Subject Conversation")
             .with_description("Explicit text-only public conversation read and send operations.")

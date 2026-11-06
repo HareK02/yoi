@@ -546,25 +546,34 @@ async fn chat_subject_owner_writer_fence_covers_feature_commit_and_rejects_other
     let other = rusqlite::Connection::open(db_path).unwrap();
     other.busy_timeout(std::time::Duration::ZERO).unwrap();
     let store = open_subjektiv_store(&f.api).unwrap();
-    let policy = store.subject_permissions(&f.subject).unwrap().unwrap();
     let request =
         serde_json::from_value(send(&c.id, "fenced-send", None)["request"].clone()).unwrap();
-    let message = f
-        .api
-        .config_store
-        .with_current_subject_body(TEST_WORKSPACE_ID, &f.subject, &lease, || {
-            // This independent Backend connection cannot release ownership between
-            // the current-owner observation and the real FeatureStorage commit.
-            let release = other.execute(
-                "DELETE FROM worker_singleton_owners WHERE workspace_id = ?1",
-                rusqlite::params![TEST_WORKSPACE_ID],
-            );
-            assert!(
-                matches!(release, Err(rusqlite::Error::SqliteFailure(error, _))
-            if error.code == rusqlite::ErrorCode::DatabaseBusy)
-            );
-            Ok(store
-                .chat_send_message_authorized(&f.subject, &request, &policy.change_id)
+    let message = store
+        .with_chat_transaction(&f.subject, |chat| {
+            let source = chat.policy_source().clone();
+            Ok(f.api
+                .config_store
+                .with_current_subject_body_policy(
+                    TEST_WORKSPACE_ID,
+                    &f.subject,
+                    &lease,
+                    &source,
+                    |_| {
+                        // Independent Server ownership mutation stays fenced until the
+                        // already-held Feature transaction commits, without reentry.
+                        let release = other.execute(
+                            "DELETE FROM worker_singleton_owners WHERE workspace_id = ?1",
+                            rusqlite::params![TEST_WORKSPACE_ID],
+                        );
+                        assert!(
+                            matches!(release, Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy)
+                        );
+                        let message = chat.send(&request).unwrap();
+                        chat.commit().unwrap();
+                        Ok(message)
+                    },
+                )
                 .unwrap())
         })
         .unwrap();
@@ -1316,25 +1325,19 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         .await["id"],
         subject
     );
-    let (status, managed) = account(
-        &f.api,
-        &f.owner,
-        "GET",
-        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{managed}");
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let created_policy = store.current_subject_policy(&subject).unwrap().unwrap();
     assert_eq!(
-        managed["permissions"],
-        serde_json::to_value(&initial).unwrap()
+        created_policy.execution,
+        server_api::authorization::subject_default_permission_assignment()
     );
-    assert_eq!(
-        initial.execution,
-        server_api::authorization::subject_conversation_permissions(TEST_WORKSPACE_ID, &subject)
-    );
-    assert!(initial.delegation.is_empty());
+    assert!(created_policy.delegation.grants.is_empty());
+    assert!(created_policy.legacy_constraints.is_none());
+    // Adopt that same shared default through T-838's only writer. No individual
+    // conversation/Ticket ID grant is appended before the real Controller runs.
+    adopt_chat_defaults(&f.api, &f.owner).await;
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
+    assert_eq!(initial.execution, created_policy.execution);
+    assert!(initial.legacy_constraints.is_none());
     let conversation = f
         .post(
             &conversations_path(),
@@ -1449,7 +1452,7 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         "Remember must reach real authorized SQLite staging, not just return a fixture receipt: {staged:?}"
     );
     assert_eq!(
-        store.subject_permissions(&subject).unwrap(),
+        store.current_subject_policy(&subject).unwrap(),
         Some(initial.clone()),
         "composition and memory operations never reissue policy"
     );
@@ -1606,7 +1609,8 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
             "initial self source must not cover foreign resources: {body}"
         );
     }
-    let revoked = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"), json!({"operation_id":"revoke-chat-defaults","expected_change_id":initial.change_id,"execution":[],"delegation":[]})).await;
+    adopt_chat_policy(&f.api, &f.owner, &subject, "{}").await;
+    let revoked = store.current_subject_policy(&subject).unwrap().unwrap();
     assert_eq!(
         f.post(
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"),
@@ -1653,17 +1657,9 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         restored["result"]["state"], "accepted",
         "required startup authorization must refuse revoked source: {restored}"
     );
-    let (status, managed) = account(
-        &f.api,
-        &f.owner,
-        "GET",
-        &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        managed["permissions"], revoked["permissions"],
+        store.current_subject_policy(&subject).unwrap(),
+        Some(revoked),
         "restore never reissues the initial policy"
     );
 }
@@ -1896,4 +1892,311 @@ async fn console_notify_ack(
     })
     .await
     .expect("Console Notify ACK deadline")
+}
+
+/// Use the existing single configuration writer. This is deliberately not a
+/// subject_permissions SQL seed or a second policy store. Conversation operations
+/// still cross the real signed HTTP/Controller boundary in ConnectedChat.
+pub(super) async fn adopt_chat_policy(
+    api: &WorkspaceApi,
+    owner: &str,
+    subject: &str,
+    execution: &str,
+) -> server_api::ConfigurationAdoptionReceipt {
+    adopt_chat_configuration(api, owner, Some((subject, execution))).await
+}
+
+pub(super) async fn adopt_chat_defaults(
+    api: &WorkspaceApi,
+    owner: &str,
+) -> server_api::ConfigurationAdoptionReceipt {
+    // No assignment edit: carry the persisted creation default through the
+    // normal migration, rather than granting anything after Subject creation.
+    adopt_chat_configuration(api, owner, None).await
+}
+
+async fn adopt_chat_configuration(
+    api: &WorkspaceApi,
+    owner: &str,
+    replacement: Option<(&str, &str)>,
+) -> server_api::ConfigurationAdoptionReceipt {
+    let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
+    catalog
+        .apis
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), api.clone());
+    catalog
+        .routers
+        .lock()
+        .await
+        .insert(TEST_WORKSPACE_ID.into(), build_router(api.clone()));
+    let app = workspace_server_router(catalog);
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/config/adoption");
+    let response = app
+        .clone()
+        .oneshot(human_request(owner, "GET", &path, None))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let source: server_api::ConfigurationSourceResponse = serde_json::from_slice(&bytes).unwrap();
+    let changes = replacement
+        .map(|(subject, execution)| {
+            let needle = format!("subject_id = {}", serde_json::to_string(subject).unwrap());
+            let matches: Vec<_> = source
+                .state
+                .snapshot
+                .entries
+                .iter()
+                .filter(|(path, entry)| {
+                    path.starts_with("permissions/") && entry.content.contains(&needle)
+                })
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "fixture Subject has one defining generated policy record"
+            );
+            let (policy_path, policy_file) = matches[0];
+            let position = policy_file.content.find(&needle).unwrap();
+            let start = policy_file.content[..position].rfind('{').unwrap();
+            let mut depth = 0usize;
+            let mut quoted = false;
+            let mut escaped = false;
+            let end = policy_file.content[start..]
+                .char_indices()
+                .find_map(|(offset, ch)| {
+                    if quoted {
+                        if escaped {
+                            escaped = false;
+                        } else if ch == '\\' {
+                            escaped = true;
+                        } else if ch == '"' {
+                            quoted = false;
+                        }
+                    } else {
+                        match ch {
+                            '"' => quoted = true,
+                            '{' => depth += 1,
+                            '}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    return Some(start + offset + 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    None
+                })
+                .expect("generated fixture policy record is balanced");
+            let mut content = policy_file.content.clone();
+            content.replace_range(
+                start..end,
+                &format!("{{ {needle}; execution = {execution}; delegation = {{}}; }}"),
+            );
+            server_api::ConfigTreeChange::Update {
+                path: policy_path.clone(),
+                expected_digest: policy_file.content_digest.clone(),
+                content,
+            }
+        })
+        .into_iter()
+        .collect();
+    let request = server_api::ConfigurationAdoptionRequest {
+        operation_id: Uuid::now_v7().to_string(),
+        expected_head: source.history_head,
+        expected_catalog_digest: source.catalog_digest,
+        expected_legacy_export: source.expected_legacy_export,
+        source: server_api::ConfigCommitRequest {
+            base_digest: source.state.snapshot.digest.clone(),
+            entrypoints: source.state.contract.entrypoints,
+            changes,
+        },
+    };
+    let response = app
+        .oneshot(human_request(
+            owner,
+            "POST",
+            &format!("{path}/commit"),
+            Some(serde_json::to_value(request).unwrap()),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let receipt: server_api::ConfigurationAdoptionReceipt = serde_json::from_slice(&bytes).unwrap();
+    assert!(receipt.source_stored && receipt.policy_committed);
+    receipt
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_canonical_shared_set_persists_read_send_and_revocation_denies_saved_replay() {
+    let f = Fixture::new().await;
+    f.adopt_policy(r#"{ sets = ["subject-default"]; }"#, "{}")
+        .await;
+    let c = conversation(&f, &f.subject, "canonical-chat").await;
+    let input = user(&f, &c.id, "canonical-user", "normal input").await;
+    let sent = send(&c.id, "canonical-send", Some(&input.message.id));
+    let (status, result) = worker_chat(&f, &f.source, sent.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        worker_chat(&f, &f.source, read(&c.id)).await.0,
+        StatusCode::OK
+    );
+    let store = open_subjektiv_store(&f.api).unwrap();
+    assert!(
+        store
+            .current_subject_policy(&f.subject)
+            .unwrap()
+            .unwrap()
+            .change_id
+            .starts_with("configuration:")
+    );
+    assert_eq!(page(&f, &c.id).await.messages.len(), 2);
+    f.adopt_policy(r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "chat"; keys = ["chat.send"]; }]; }"#, "{}").await;
+    assert_eq!(
+        worker_chat(&f, &f.source, sent.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        worker_chat(&f, &f.source, read(&c.id)).await.0,
+        StatusCode::OK
+    );
+    f.adopt_policy("{}", "{}").await;
+    for operation in [sent, read(&c.id)] {
+        assert_eq!(
+            worker_chat(&f, &f.source, operation).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(page(&f, &c.id).await.messages.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn chat_waiting_admission_rechecks_canonical_revocation_body_release_and_feature_disable() {
+    for boundary in ["policy", "body", "feature"] {
+        for is_read in [false, true] {
+            let f = Arc::new(Fixture::new().await);
+            f.adopt_policy(r#"{ sets = ["subject-default"]; }"#, "{}")
+                .await;
+            let c = conversation(&f, &f.subject, "waiting-chat").await;
+            let saved = send(&c.id, "saved-before-wait", None);
+            assert_eq!(
+                worker_chat(&f, &f.source, saved.clone()).await.0,
+                StatusCode::OK
+            );
+            let gate = subjektiv_journal::lifecycle_lock(&f.api, &f.subject).unwrap();
+            let held = gate.lock().unwrap();
+            let reached = crate::server::chat::observe_next_admission(&f.subject);
+            let pending = {
+                let f = f.clone();
+                let operation = if is_read { read(&c.id) } else { saved };
+                tokio::spawn(async move { worker_chat(&f, &f.source, operation).await })
+            };
+            tokio::task::spawn_blocking(move || {
+                reached
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("request reached the held lifecycle gate")
+            })
+            .await
+            .unwrap();
+            assert!(
+                !pending.is_finished(),
+                "request cannot pass the held admission gate"
+            );
+            match boundary {
+                "policy" => f.adopt_policy("{}", "{}").await,
+                "body" => f.release_source_lease(),
+                "feature" => f
+                    .api
+                    .permission_registry
+                    .write()
+                    .unwrap()
+                    .set_enabled(
+                        &worker::feature::FeatureId::builtin("subjektiv-chat"),
+                        false,
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            drop(held);
+            let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+                .await
+                .expect("no ABBA after admission resumes")
+                .unwrap();
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED | StatusCode::CONFLICT
+                ),
+                "{boundary} read={is_read}: {status} {body}"
+            );
+            assert_eq!(
+                page(&f, &c.id).await.messages.len(),
+                1,
+                "neither replay nor read may produce a new effect"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_legacy_scalar_activation_keeps_exact_subject_domain_and_never_implies_chat_keys() {
+    let f = Fixture::new().await;
+    let scalar = server_api::authorization::ScopedPermission {
+        operation: "memory".into(),
+        resource: server_api::authorization::PermissionResource::Feature,
+    };
+    f.seed_saved_policy(
+        vec![subject_permission(&f.subject, "chat.read"), scalar.clone()],
+        vec![],
+    );
+    let c = conversation(&f, &f.subject, "legacy-scalar-chat").await;
+    assert_eq!(
+        worker_chat(&f, &f.source, read(&c.id)).await.0,
+        StatusCode::OK,
+        "an unrelated retained scalar must not fail a valid exact chat grant"
+    );
+    assert_eq!(
+        worker_chat(&f, &f.source, send(&c.id, "scalar-send", None))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    f.seed_saved_policy(vec![scalar], vec![]);
+    assert_eq!(
+        worker_chat(&f, &f.source, read(&c.id)).await.0,
+        StatusCode::FORBIDDEN,
+        "scalar activation is not a dotted-key grant"
+    );
+    let other = open_subjektiv_store(&f.api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("other-domain").unwrap())
+        .unwrap()
+        .id;
+    f.seed_saved_policy(vec![subject_permission(&other, "chat.read")], vec![]);
+    assert_eq!(
+        worker_chat(&f, &f.source, read(&c.id)).await.0,
+        StatusCode::FORBIDDEN,
+        "an exact other-Subject resource is not silently expanded to current Subject"
+    );
+    assert!(page(&f, &c.id).await.messages.is_empty());
 }

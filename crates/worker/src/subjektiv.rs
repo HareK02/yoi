@@ -637,6 +637,15 @@ pub struct BackendJournalJobHost {
     client: Arc<dyn WorkspaceClient>,
     workspace_id: String,
 }
+#[async_trait::async_trait]
+impl crate::job::JobInputAuthority for BackendJournalJobHost {
+    async fn authorize_supply(&self) -> Result<(), String> {
+        self.client
+            .authorize_subject_operation("journal.job.input.supply")
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl BackendJournalJobHost {
     pub fn new(
         client: Arc<dyn WorkspaceClient>,
@@ -670,7 +679,8 @@ impl BackendJournalJobHost {
             features: crate::feature::FeatureRegistryBuilder::new()
                 .with_module(JournalJobToolsFeature::new(host.clone())),
             satisfied_requirements: vec![],
-            finalizer: Some(Arc::new(JournalJobFinalizer::new(host))),
+            finalizer: Some(Arc::new(JournalJobFinalizer::new(host.clone()))),
+            input_authority: Some(host),
         }
     }
     fn post<T: serde::de::DeserializeOwned>(

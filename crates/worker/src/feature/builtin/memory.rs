@@ -10,6 +10,8 @@
 //! Memory. User-managed behavior and generated Memory surfaces remain distinct; fetch/render
 //! failures do not mean "unset".
 
+pub(crate) mod permission_declaration;
+
 use crate::subjektiv::{SubjektivHostConnection, SubjektivHostError};
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
@@ -1489,6 +1491,13 @@ impl MemoryToolsFeature {
 }
 
 impl FeatureModule for MemoryToolsFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin("memory", "Memory")
             .with_description("Workspace Memory document, query, and staging tools.");

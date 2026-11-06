@@ -47,7 +47,7 @@ impl Fixture {
                     operation_id: format!("memory-journal-fixture-grant-{subject_id}"),
                     expected_change_id: Some(
                         store
-                            .subject_permissions(subject_id)
+                            .current_subject_policy(subject_id)
                             .unwrap()
                             .unwrap()
                             .change_id,
@@ -702,6 +702,23 @@ async fn memory_journal_router_ids_do_not_grant_cross_subject_reads_or_reconcili
         .create_subject(crate::subjektiv::SubjectRole::new("other").unwrap())
         .unwrap();
     let other_worker = Fixture::body_worker(&f.api, &other.id);
+    f.store
+        .set_subject_permissions(
+            &other.id,
+            &server_api::authorization::SubjectPermissionsUpdate {
+                operation_id: "other-subject-explicit-empty".into(),
+                expected_change_id: Some(
+                    f.store
+                        .current_subject_policy(&other.id)
+                        .unwrap()
+                        .unwrap()
+                        .change_id,
+                ),
+                execution: vec![],
+                delegation: vec![],
+            },
+        )
+        .unwrap();
     for granted in [false, true] {
         if granted {
             Fixture::grant_permissions(&f.store, &other.id);

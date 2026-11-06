@@ -27,13 +27,19 @@ pub(super) fn grant_memory_operations(api: &WorkspaceApi, subject: &str, operati
         PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
     };
     let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(subject).unwrap();
+    let previous = store
+        .subject_policy_source(subject)
+        .unwrap()
+        .map(|policy| match policy {
+            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
+            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
+        });
     store
         .set_subject_permissions(
             subject,
             &SubjectPermissionsUpdate {
                 operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: previous.map(|policy| policy.change_id),
+                expected_change_id: previous,
                 execution: operations
                     .iter()
                     .map(|operation| ScopedPermission {
@@ -1136,10 +1142,7 @@ async fn unset_subject_consolidation_denies_before_job_dispatch() {
     .await
     .unwrap_err();
     assert!(
-        error
-            .error
-            .to_string()
-            .contains("memory.consolidation.request"),
+        matches!(error.error, Error::WorkspacePermissionDenied(ref message) if message.contains("permissions are unset")),
         "{error:?}"
     );
     assert!(execution.take_inputs().is_empty());

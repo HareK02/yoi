@@ -523,8 +523,8 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         .unwrap();
     // Exercise creation-time authority through real recording and startup callbacks,
     // without a management grant or an execution/delegation policy replacement.
-    let initial_policy = store.subject_permissions(&subject.id).unwrap().unwrap();
-    assert!(initial_policy.delegation.is_empty());
+    let initial_policy = store.current_subject_policy(&subject.id).unwrap().unwrap();
+    assert!(initial_policy.delegation.grants.is_empty());
     let old = connected_create(&api, &subject.id, "connected-old-body").await;
     let old_attr = store
         .subject_session_attributions(&subject.id)
@@ -827,7 +827,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         before
     );
     assert_eq!(
-        store.subject_permissions(&subject.id).unwrap(),
+        store.current_subject_policy(&subject.id).unwrap(),
         Some(initial_policy),
         "recording and startup must not rewrite the initial policy"
     );
@@ -1768,7 +1768,7 @@ async fn connected_restore_fixture_with_pending_head(
         operation_id: "restore-host-auth-permissions".into(),
         expected_change_id: Some(
             store
-                .subject_permissions(&subject.id)
+                .current_subject_policy(&subject.id)
                 .unwrap()
                 .unwrap()
                 .change_id,

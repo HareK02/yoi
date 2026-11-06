@@ -2913,6 +2913,7 @@ impl From<feature_storage::FeatureStorageError> for Error {
 #[derive(Clone)]
 pub struct SqliteWorkspaceStore {
     conn: StoreConnection,
+    pub(crate) plugin_manifest_cache: Arc<crate::plugin_catalog::ArtifactManifestCache>,
     db_executor: crate::db_executor::DbExecutor,
 }
 
@@ -2932,6 +2933,7 @@ impl SqliteWorkspaceStore {
         )?;
         Ok(Self {
             conn: StoreConnection::Managed(database),
+            plugin_manifest_cache: Arc::default(),
             db_executor: crate::db_executor::DbExecutor::shared(),
         })
     }
@@ -2978,6 +2980,7 @@ impl SqliteWorkspaceStore {
         prepare_connection(&conn)?;
         Ok(Self {
             conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
+            plugin_manifest_cache: Arc::default(),
             db_executor,
         })
     }
@@ -4053,6 +4056,52 @@ impl SqliteWorkspaceStore {
         expected: &WorkerSingletonLease,
         publish: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |_| {
+            publish()
+        })
+    }
+
+    /// Current policy and singleton ownership stay fenced through the bounded
+    /// native Feature commit. The callback must not reenter either store.
+    pub(crate) fn with_current_subject_body_policy<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        source: &crate::subjektiv::chat::ChatPolicySource,
+        publish: impl FnOnce(&server_api::authorization::SubjectPolicySource) -> Result<T>,
+    ) -> Result<T> {
+        use crate::subjektiv::chat::ChatPolicySource;
+        use server_api::authorization::SubjectPolicySource;
+        self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |tx| {
+            let canonical = crate::config_adoption::canonical(tx, workspace_id)?;
+            let policy = match (canonical, source) {
+                (false, ChatPolicySource::Local(Some(policy))) => policy.clone(),
+                (true, ChatPolicySource::Canonical) => {
+                    let raw: Option<String> = tx.query_row(
+                        "SELECT policy_json FROM workspace_configuration_policies WHERE workspace_id=?1 AND subject_id=?2",
+                        params![workspace_id, subject_id], |row| row.get(0),
+                    ).optional()?;
+                    let adopted: crate::policy_config::AdoptedSubjectPolicy = serde_json::from_str(
+                        &raw.ok_or_else(|| Error::WorkspacePermissionDenied("Subject policy is unset".into()))?
+                    ).map_err(|error| Error::Store(format!("invalid adopted Subject policy: {error}")))?;
+                    SubjectPolicySource::Feature(adopted.current())
+                }
+                _ => return Err(Error::WorkspacePermissionDenied(
+                    "Subject policy is unset or authority location changed".into(),
+                )),
+            };
+            publish(&policy)
+        })
+    }
+
+    fn with_current_subject_body_transaction<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        publish: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let key = crate::subjektiv::subject_worker_singleton_key(subject_id)
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
         if expected.key != key {
@@ -4069,7 +4118,7 @@ impl SqliteWorkspaceStore {
                     "Subject body was released".into(),
                 ));
             }
-            publish()
+            publish(tx)
         })
     }
 

@@ -172,7 +172,7 @@ fn replace(
     let update = SubjectPermissionsUpdate {
         operation_id: id.into(),
         expected_change_id: store
-            .subject_permissions(subject)
+            .current_subject_policy(subject)
             .unwrap()
             .map(|source| source.change_id),
         execution,
@@ -1059,4 +1059,588 @@ fn adopted_source_remains_editable_and_canonical_reads_cannot_widen_or_revive_ol
         None
     );
     assert_eq!(legacy_records(&features), legacy_before);
+}
+
+/// This registered component path uses real creation receipts -> virtual source
+/// -> the production single adoption writer -> the canonical provider -> current
+/// Feature resolution. It is not an HTTP/Runtime acceptance test.
+fn enrollment_host() -> PermissionHost {
+    use feature_permissions::{
+        NamespacePermissions, PermissionReference, PermissionSetId, SetContribution,
+    };
+    let mut host = host();
+    for (namespace, keys) in [
+        ("chat", vec!["chat.send", "chat.read"]),
+        ("ticket", vec!["ticket.assignment.read", "ticket.read"]),
+    ] {
+        let feature = host
+            .register_feature(FeatureIdentity::parse(format!("fixture:{namespace}")).unwrap())
+            .unwrap();
+        let handle = host
+            .bind_namespace(&feature, NamespaceId::parse(namespace).unwrap())
+            .unwrap();
+        let keys: Vec<_> = keys
+            .into_iter()
+            .map(|key| PermissionKey::parse(key).unwrap())
+            .collect();
+        host.declare(
+            &handle,
+            NamespaceDeclaration {
+                permissions: keys
+                    .iter()
+                    .cloned()
+                    .map(|key| PermissionDefinition {
+                        key,
+                        description: String::new(),
+                        children: vec![],
+                    })
+                    .collect(),
+                sets: vec![SetContribution {
+                    set: PermissionSetId::parse(
+                        server_api::authorization::SUBJECT_DEFAULT_PERMISSION_SET,
+                    )
+                    .unwrap(),
+                    children: vec![PermissionReference::Namespace(NamespacePermissions {
+                        namespace: NamespaceId::parse(namespace).unwrap(),
+                        keys,
+                    })],
+                }],
+            },
+        )
+        .unwrap();
+    }
+    host
+}
+
+fn enroll(
+    server: &SqliteWorkspaceStore,
+    features: &FeatureFixture,
+    host: &PermissionHost,
+    subject: &str,
+) -> Result<ConfigurationAdoptionResult> {
+    server
+        .enroll_created_subject(WORKSPACE, OWNER, &features.store, subject, schema(), host)
+        .map(|result| result.expect("post-seal creation evidence"))
+}
+
+#[test]
+fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed_policy() {
+    let (root, server, features, _subjects) = fixture();
+    let host = enrollment_host();
+    let seed = migration(&server, &features, &host);
+    let migration_request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &migration_request).unwrap();
+    let created = features
+        .store
+        .create_subject_idempotent(
+            SubjectRole::new("new").unwrap(),
+            "behavior".into(),
+            "new-subject",
+        )
+        .unwrap();
+    assert!(
+        server
+            .adopted_subject_policy(WORKSPACE, &created.id)
+            .unwrap()
+            .is_none()
+    );
+    let before = server.configuration_current(WORKSPACE, OWNER).unwrap();
+    assert!(
+        server
+            .enroll_created_subject(
+                WORKSPACE,
+                "not-owner",
+                &features.store,
+                &created.id,
+                schema(),
+                &host
+            )
+            .is_err()
+    );
+    let adopted = enroll(&server, &features, &host, &created.id).unwrap();
+    assert!(adopted.source_stored && adopted.policy_committed);
+    let old_main = before
+        .state
+        .snapshot
+        .get(&path(MAIN_CONFIG_ENTRYPOINT))
+        .unwrap();
+    let new_main = adopted
+        .state
+        .snapshot
+        .get(&path(MAIN_CONFIG_ENTRYPOINT))
+        .unwrap();
+    assert_eq!(
+        adopted
+            .state
+            .snapshot
+            .get(&path("subject-enrollment-base.dcdl"))
+            .unwrap()
+            .content,
+        old_main.content
+    ); // comments/imports remain at the same virtual directory
+    for (path, entry) in &before.state.snapshot.entries {
+        if path.as_str() != MAIN_CONFIG_ENTRYPOINT {
+            assert_eq!(adopted.state.snapshot.get(path), Some(entry));
+        }
+    }
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+            store: server.clone(),
+            host: host.clone(),
+        }));
+    let policy = canonical
+        .current_subject_policy(&created.id)
+        .unwrap()
+        .unwrap();
+    assert!(policy.legacy_constraints.is_none());
+    assert_eq!(
+        policy.execution,
+        server_api::authorization::subject_default_permission_assignment()
+    );
+    let resolved = host.resolve(Some(&policy.execution));
+    for key in [
+        "chat.send",
+        "chat.read",
+        "ticket.assignment.read",
+        "ticket.read",
+    ] {
+        assert!(
+            resolved
+                .projection()
+                .allowed
+                .contains_key(&PermissionKey::parse(key).unwrap())
+        );
+    }
+    assert!(
+        host.resolve(Some(&policy.delegation))
+            .projection()
+            .allowed
+            .is_empty()
+    );
+    assert_eq!(
+        enroll(&server, &features, &host, &created.id).unwrap(),
+        adopted
+    );
+
+    let empty_edit = edit_request(
+        &server,
+        &host,
+        "empty-new",
+        vec![ConfigTreeChange::Update {
+            path: path(MAIN_CONFIG_ENTRYPOINT),
+            expected_digest: new_main.content_digest.clone(),
+            content: format!(
+                "{{ permissions = {{ subjects = [{{ subject_id = {}; execution = {{}}; delegation = {{}}; }}]; }}; }} as WorkspaceConfigSchema",
+                serde_json::to_string(&created.id).unwrap()
+            ),
+        }],
+    );
+    let empty_adoption = adopt_edit(&server, &features, &host, &empty_edit);
+    let empty_policy = canonical
+        .current_subject_policy(&created.id)
+        .unwrap()
+        .unwrap();
+    assert!(empty_policy.execution.grants.is_empty());
+    assert_eq!(
+        enroll(&server, &features, &host, &created.id).unwrap(),
+        adopted
+    );
+    assert_eq!(
+        canonical.current_subject_policy(&created.id).unwrap(),
+        Some(empty_policy)
+    );
+
+    // Remove explicitly using normal source editing/adoption, not an enrollment flag.
+    let removed_main = format!(
+        "{{ permissions = {{ remove_subjects = [{}]; }}; }} as WorkspaceConfigSchema",
+        serde_json::to_string(&created.id).unwrap()
+    );
+    let remove = edit_request(
+        &server,
+        &host,
+        "remove-new",
+        vec![ConfigTreeChange::Update {
+            path: path(MAIN_CONFIG_ENTRYPOINT),
+            expected_digest: empty_adoption
+                .state
+                .snapshot
+                .get(&path(MAIN_CONFIG_ENTRYPOINT))
+                .unwrap()
+                .content_digest
+                .clone(),
+            content: removed_main,
+        }],
+    );
+    adopt_edit(&server, &features, &host, &remove);
+    assert_eq!(canonical.current_subject_policy(&created.id).unwrap(), None);
+    let removed_head = server.configuration_head(WORKSPACE, OWNER).unwrap();
+    drop(canonical);
+    let identity = features.database.identity().clone();
+    features.close();
+    drop(server);
+    let server = self::server(root.path());
+    let features = FeatureFixture::open(&root.path().join("features"), Some(&identity));
+    let retried = features
+        .store
+        .create_subject_idempotent(
+            SubjectRole::new("new").unwrap(),
+            "behavior".into(),
+            "new-subject",
+        )
+        .unwrap();
+    assert_eq!(retried.id, created.id);
+    assert_eq!(
+        enroll(&server, &features, &host, &created.id).unwrap(),
+        adopted
+    ); // evidence only
+    assert!(
+        server
+            .adopted_subject_policy(WORKSPACE, &created.id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        server.configuration_head(WORKSPACE, OWNER).unwrap(),
+        removed_head
+    );
+}
+
+#[test]
+fn enrollment_failure_is_retryable_and_explicit_empty_or_removal_before_enrollment_wins() {
+    let (_root, server, features, _subjects) = fixture();
+    let host = enrollment_host();
+    let seed = migration(&server, &features, &host);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let created = features
+        .store
+        .create_subject(SubjectRole::new("new").unwrap())
+        .unwrap();
+    let before = server_records(&server);
+    server.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER fail_enrollment BEFORE INSERT ON workspace_configuration_receipts BEGIN SELECT RAISE(ABORT,'injected enrollment receipt failure'); END;")?; Ok(()) }).unwrap();
+    assert!(enroll(&server, &features, &host, &created.id).is_err());
+    assert_eq!(server_records(&server), before);
+    assert!(
+        features
+            .store
+            .subject_permission_enrollment(&created.id)
+            .unwrap()
+            .is_some()
+    );
+    server
+        .with_conn(|conn| {
+            conn.execute_batch("DROP TRIGGER fail_enrollment;")?;
+            Ok(())
+        })
+        .unwrap();
+    enroll(&server, &features, &host, &created.id).unwrap();
+
+    for remove in [false, true] {
+        let subject = features
+            .store
+            .create_subject(SubjectRole::new("explicit").unwrap())
+            .unwrap();
+        let current = server.configuration_current(WORKSPACE, OWNER).unwrap();
+        let main = current
+            .state
+            .snapshot
+            .get(&path(MAIN_CONFIG_ENTRYPOINT))
+            .unwrap();
+        let source = if remove {
+            format!(
+                "remove_subjects = [{}];",
+                serde_json::to_string(&subject.id).unwrap()
+            )
+        } else {
+            format!(
+                "subjects = [{{ subject_id = {}; execution = {{}}; delegation = {{}}; }}];",
+                serde_json::to_string(&subject.id).unwrap()
+            )
+        };
+        let edit = edit_request(
+            &server,
+            &host,
+            &format!("explicit-{remove}"),
+            vec![ConfigTreeChange::Update {
+                path: path(MAIN_CONFIG_ENTRYPOINT),
+                expected_digest: main.content_digest.clone(),
+                content: format!("{{ permissions = {{ {source} }}; }} as WorkspaceConfigSchema"),
+            }],
+        );
+        adopt_edit(&server, &features, &host, &edit);
+        let explicit = server
+            .adopted_subject_policy(WORKSPACE, &subject.id)
+            .unwrap();
+        let result = enroll(&server, &features, &host, &subject.id).unwrap();
+        assert_eq!(
+            server
+                .adopted_subject_policy(WORKSPACE, &subject.id)
+                .unwrap(),
+            explicit
+        );
+        assert_eq!(
+            result.state,
+            server.load_workspace_config(WORKSPACE).unwrap().unwrap()
+        );
+        if let Some(policy) = explicit {
+            assert!(
+                host.resolve(Some(&policy.current().execution))
+                    .projection()
+                    .allowed
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn preseal_feature_defaults_transfer_as_live_sets_not_legacy_copies() {
+    let (_root, server, features, _subjects) = fixture();
+    let host = enrollment_host();
+    let subject = features
+        .store
+        .create_subject(SubjectRole::new("preseal").unwrap())
+        .unwrap();
+    let original = features
+        .store
+        .current_subject_policy(&subject.id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        server
+            .enroll_created_subject(
+                WORKSPACE,
+                OWNER,
+                &features.store,
+                &subject.id,
+                schema(),
+                &host
+            )
+            .unwrap()
+            .is_none()
+    );
+    let seed = migration(&server, &features, &host);
+    assert_eq!(seed.policies[&subject.id].current(), original);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+            store: server,
+            host,
+        }));
+    assert_eq!(
+        canonical.current_subject_policy(&subject.id).unwrap(),
+        Some(original)
+    );
+    assert!(canonical.subject_permissions(&subject.id).is_err()); // no all-target legacy projection
+}
+
+#[test]
+fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scope_after_reopen() {
+    let (root, server, features, subjects) = fixture();
+    let host = enrollment_host();
+    let seed = migration(&server, &features, &host);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let created = features
+        .store
+        .create_subject(SubjectRole::new("Feature-grant fixture").unwrap())
+        .unwrap();
+    enroll(&server, &features, &host, &created.id).unwrap();
+    let state = server.configuration_current(WORKSPACE, OWNER).unwrap();
+    let main = state
+        .state
+        .snapshot
+        .get(&path(MAIN_CONFIG_ENTRYPOINT))
+        .unwrap();
+    let source = format!(
+        "{{ permissions = {{ subjects = [{{ subject_id = {}; execution = {{ namespaces = [{{ namespace = \"file\"; keys = [\"file.read.text\"]; }}]; }}; delegation = {{ namespaces = [{{ namespace = \"file\"; keys = [\"file.read.text\"]; }}]; }}; }}]; }}; }} as WorkspaceConfigSchema",
+        serde_json::to_string(&created.id).unwrap()
+    );
+    let edit = edit_request(
+        &server,
+        &host,
+        "grant-feature-delegation",
+        vec![ConfigTreeChange::Update {
+            path: path(MAIN_CONFIG_ENTRYPOINT),
+            expected_digest: main.content_digest.clone(),
+            content: source,
+        }],
+    );
+    adopt_edit(&server, &features, &host, &edit);
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+            store: server.clone(),
+            host: host.clone(),
+        }));
+    let current = canonical
+        .current_subject_policy(&created.id)
+        .unwrap()
+        .unwrap();
+    assert!(current.legacy_constraints.is_none());
+    assert!(canonical.subject_permissions(&created.id).is_err()); // never synthesize legacy all-target vectors
+    let bound = grant(&created.id, &current.change_id, "canonical-feature-child");
+    canonical
+        .bind_worker_execution_grant_with_host(&bound, &host)
+        .unwrap();
+    assert_eq!(
+        canonical
+            .worker_execution_grant("runtime", "canonical-feature-child")
+            .unwrap(),
+        Some(bound.clone())
+    );
+    // Migrated policy keeps its finite domain scope as a separate conjunct too.
+    let bounded = grant(
+        &subjects.limited,
+        &subjects.limited_source.change_id,
+        "canonical-limited-child-v2",
+    );
+    canonical
+        .bind_worker_execution_grant_with_host(&bounded, &host)
+        .unwrap();
+    let mut wider = bounded.clone();
+    wider.worker_id = "wider-canonical-limits".into();
+    wider.permissions[0].resource = PermissionResource::Workdir {
+        working_directory_id: "another-workdir".into(),
+        path: "only-this.txt".into(),
+        recursive: false,
+    };
+    assert!(
+        canonical
+            .bind_worker_execution_grant_with_host(&wider, &host)
+            .is_err()
+    );
+    let current = server.configuration_current(WORKSPACE, OWNER).unwrap();
+    let main = current
+        .state
+        .snapshot
+        .get(&path(MAIN_CONFIG_ENTRYPOINT))
+        .unwrap();
+    let revoke = edit_request(
+        &server,
+        &host,
+        "revoke-feature-delegation",
+        vec![ConfigTreeChange::Update {
+            path: path(MAIN_CONFIG_ENTRYPOINT),
+            expected_digest: main.content_digest.clone(),
+            content: format!(
+                "{{ permissions = {{ remove_subjects = [{}]; }}; }} as WorkspaceConfigSchema",
+                serde_json::to_string(&created.id).unwrap()
+            ),
+        }],
+    );
+    adopt_edit(&server, &features, &host, &revoke);
+    let mut late = bound.clone();
+    late.worker_id = "removed-source-child".into();
+    assert!(
+        canonical
+            .bind_worker_execution_grant_with_host(&late, &host)
+            .is_err()
+    );
+    canonical
+        .bind_worker_execution_grant_with_host(&bound, &host)
+        .unwrap(); // retained receipt only
+    assert!(
+        canonical
+            .current_subject_policy(&created.id)
+            .unwrap()
+            .is_none()
+    );
+    drop(canonical);
+    let identity = features.database.identity().clone();
+    features.close();
+    drop(server);
+    let server = self::server(root.path());
+    let features = FeatureFixture::open(&root.path().join("features"), Some(&identity));
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+            store: server,
+            host: host.clone(),
+        }));
+    canonical
+        .bind_worker_execution_grant_with_host(&bound, &host)
+        .unwrap();
+    assert!(
+        canonical
+            .bind_worker_execution_grant_with_host(&late, &host)
+            .is_err()
+    );
+    assert!(
+        canonical
+            .current_subject_policy(&created.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_unicode_subject_identity_migrates_through_virtual_source_and_reopen_without_corruption() {
+    let (root, server, features, _subjects) = fixture();
+    let host = enrollment_host();
+    let subject = "legacy-日本語😀";
+    // Historical data fixture: a real persisted Subject predating creation
+    // enrollment, rather than changing today's generated Subject ID contract.
+    let record = serde_json::json!({ "schema_version": 1, "id": subject, "role": "Unicode fixture", "behavior_md": "", "state": "active", "created_at": "1", "updated_at": "1" });
+    features.database.try_transaction::<_, SubjektivError>(|tx| {
+        tx.execute("INSERT INTO subjects(subject_id,role,behavior_md,state,record_json,created_at,updated_at) VALUES(?1,'Unicode fixture','','active',?2,'1','1')", rusqlite::params![subject, record.to_string()])?;
+        Ok(())
+    }).unwrap();
+    let (_, original) = replace(
+        &features.store,
+        subject,
+        "unicode-limited-source",
+        vec![limited("file.read")],
+        vec![limited("file.read.text")],
+    );
+    let seed = migration(&server, &features, &host);
+    assert_eq!(seed.policies[subject].source.subject_id, subject);
+    assert!(
+        seed.state
+            .snapshot
+            .entries
+            .values()
+            .any(|entry| entry.content_type == ConfigContentType::Text && entry.content == subject)
+    );
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    assert_eq!(
+        server
+            .adopted_subject_policy(WORKSPACE, subject)
+            .unwrap()
+            .unwrap()
+            .legacy_read(&host)
+            .unwrap(),
+        original
+    );
+    let identity = features.database.identity().clone();
+    features.close();
+    drop(server);
+    let server = self::server(root.path());
+    let features = FeatureFixture::open(&root.path().join("features"), Some(&identity));
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+            store: server.clone(),
+            host: host.clone(),
+        }));
+    let current = canonical.current_subject_policy(subject).unwrap().unwrap();
+    assert_eq!(current.change_id, original.change_id);
+    assert_eq!(current.legacy_constraints, Some(original.clone()));
+    let child = grant(subject, &current.change_id, "unicode-canonical-child");
+    canonical
+        .bind_worker_execution_grant_with_host(&child, &host)
+        .unwrap();
+    assert_eq!(
+        canonical.subject_permissions(subject).unwrap(),
+        Some(original)
+    );
 }

@@ -37,13 +37,31 @@ fn ensure_test_assignment_subject(api: &WorkspaceApi) -> String {
     {
         return subject.id;
     }
-    store
+    let subject = store
         .create_subject_with_behavior(
             crate::subjektiv::SubjectRole::new("assignment-fixture").unwrap(),
             "Handle only the assigned Ticket; distinguish delivery from processing.".into(),
         )
-        .unwrap()
-        .id
+        .unwrap();
+    // This legacy suite needs exact-Subject conversation grants before the real
+    // Runtime startup callbacks. Install the fixture explicitly, without reading
+    // shared Feature sets as scoped permissions or enrolling any Ticket IDs.
+    let current = store.current_subject_policy(&subject.id).unwrap().unwrap();
+    store
+        .set_subject_permissions(
+            &subject.id,
+            &server_api::authorization::SubjectPermissionsUpdate {
+                operation_id: format!("legacy-assignment-fixture-{}", subject.id),
+                expected_change_id: Some(current.change_id),
+                execution: server_api::authorization::subject_conversation_permissions(
+                    api.workspace_id(),
+                    &subject.id,
+                ),
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+    subject.id
 }
 
 fn test_assignment_principal(api: &WorkspaceApi) -> serde_json::Value {
@@ -75,41 +93,23 @@ fn grant_test_ticket_operations(
     ticket_id: &str,
     operations: &[&str],
 ) {
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-    };
+    use server_api::authorization::{PermissionResource, ScopedPermission};
     let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(subject_id).unwrap();
-    let mut execution = previous
-        .as_ref()
-        .map(|p| p.execution.clone())
-        .unwrap_or_default();
-    for operation in operations {
-        let grant = ScopedPermission {
-            operation: (*operation).into(),
-            resource: PermissionResource::Ticket {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                ticket_id: ticket_id.into(),
-            },
-        };
-        if !execution.contains(&grant) {
-            execution.push(grant);
-        }
-    }
-    if previous.as_ref().is_some_and(|p| p.execution == execution) {
-        return;
-    }
-    store
-        .set_subject_permissions(
-            subject_id,
-            &SubjectPermissionsUpdate {
-                operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: previous.as_ref().map(|p| p.change_id.clone()),
-                execution,
-                delegation: previous.map(|p| p.delegation).unwrap_or_default(),
-            },
-        )
-        .unwrap();
+    extend_legacy_assignment_fixture_permissions(
+        &store,
+        subject_id,
+        Uuid::now_v7().to_string(),
+        operations
+            .iter()
+            .map(|operation| ScopedPermission {
+                operation: (*operation).into(),
+                resource: PermissionResource::Ticket {
+                    workspace_id: api.workspace_id().into(),
+                    ticket_id: ticket_id.into(),
+                },
+            })
+            .collect(),
+    );
 }
 
 async fn create_test_assignment_body(
@@ -1530,7 +1530,7 @@ async fn subject_assignment_cached_send_rechecks_policy_after_runtime_target_loo
                     .unwrap();
                 let store = open_subjektiv_store(&revoking_api).unwrap();
                 let previous = store
-                    .subject_permissions(&revoking_subject)
+                    .current_subject_policy(&revoking_subject)
                     .unwrap()
                     .unwrap();
                 store

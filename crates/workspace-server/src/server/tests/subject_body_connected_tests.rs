@@ -223,12 +223,16 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
     let mut f = ConnectedBody::new().await;
     let subject = f.subject("body-new-subject").await;
     let store = open_subjektiv_store(&f.connected.api).unwrap();
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let created_policy = store.current_subject_policy(&subject).unwrap().unwrap();
     assert_eq!(
-        initial.execution,
-        server_api::authorization::subject_conversation_permissions(TEST_WORKSPACE_ID, &subject)
+        created_policy.execution,
+        server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(initial.delegation.is_empty());
+    assert!(created_policy.delegation.grants.is_empty());
+    assert!(created_policy.legacy_constraints.is_none());
+    super::chat_tests::adopt_chat_defaults(&f.connected.api, &f.connected.owner).await;
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
+    assert_eq!(initial.execution, created_policy.execution);
     assert!(f.read(&subject).await["current"].is_null());
 
     // Retention inputs are deliberately independent of Worker execution and of
@@ -467,7 +471,7 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
     // Reopen authority rather than treating an earlier model callback as durable evidence.
     let reopened = open_subjektiv_store(&f.connected.api).unwrap();
     assert_eq!(
-        reopened.subject_permissions(&subject).unwrap(),
+        reopened.current_subject_policy(&subject).unwrap(),
         Some(initial)
     );
     assert_eq!(
@@ -640,20 +644,13 @@ async fn body_distinct_concurrent_starts_keep_one_owner_and_reject_foreign_targe
 async fn body_start_and_restore_do_not_repair_missing_session_record_permission() {
     let f = ConnectedBody::new().await;
     let subject = f.subject("body-revoked-subject").await;
-    let path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions");
-    let initial = open_subjektiv_store(&f.connected.api)
+    super::chat_tests::adopt_chat_policy(&f.connected.api, &f.connected.owner, &subject,
+        r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#).await;
+    let revoked = open_subjektiv_store(&f.connected.api)
         .unwrap()
-        .subject_permissions(&subject)
+        .current_subject_policy(&subject)
         .unwrap()
         .unwrap();
-    let execution = initial
-        .execution
-        .iter()
-        .filter(|permission| permission.operation != "session.record")
-        .cloned()
-        .collect::<Vec<_>>();
-    let revoked = f.ok("POST", &path, json!({"operation_id":"body-remove-session-record",
-        "expected_change_id":initial.change_id,"execution":execution,"delegation":initial.delegation})).await;
     let (status, denied) = f
         .request(
             "POST",
@@ -671,8 +668,12 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
         "actionable missing-operation diagnostic: {denied}"
     );
     assert_eq!(
-        f.ok("GET", &path, Value::Null).await["permissions"],
-        revoked["permissions"]
+        open_subjektiv_store(&f.connected.api)
+            .unwrap()
+            .current_subject_policy(&subject)
+            .unwrap()
+            .unwrap(),
+        revoked
     );
     assert!(
         open_subjektiv_store(&f.connected.api)
@@ -691,20 +692,13 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
         .await;
     assert_eq!(started["disposition"], "accepted", "{started}");
     f.stop(&subject, "body-before-revoked-restore").await;
-    let path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions");
-    let policy = open_subjektiv_store(&f.connected.api)
+    super::chat_tests::adopt_chat_policy(&f.connected.api, &f.connected.owner, &subject,
+        r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#).await;
+    let revoked = open_subjektiv_store(&f.connected.api)
         .unwrap()
-        .subject_permissions(&subject)
+        .current_subject_policy(&subject)
         .unwrap()
         .unwrap();
-    let execution = policy
-        .execution
-        .iter()
-        .filter(|permission| permission.operation != "session.record")
-        .cloned()
-        .collect::<Vec<_>>();
-    let revoked = f.ok("POST", &path, json!({"operation_id":"body-revoke-before-restore",
-        "expected_change_id":policy.change_id,"execution":execution,"delegation":policy.delegation})).await;
     let observed = f.read(&subject).await;
     let request = intent("body-denied-restore", &observed);
     let denied = f.mutate(&subject, "/start", request.clone()).await;
@@ -712,8 +706,12 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
     let replay = f.mutate(&subject, "/start", request).await;
     assert_ne!(replay["disposition"], "accepted", "{replay}");
     assert_eq!(
-        f.ok("GET", &path, Value::Null).await["permissions"],
-        revoked["permissions"]
+        open_subjektiv_store(&f.connected.api)
+            .unwrap()
+            .current_subject_policy(&subject)
+            .unwrap()
+            .unwrap(),
+        revoked
     );
     assert_eq!(
         f.read(&subject).await["current"],
@@ -854,19 +852,9 @@ async fn denied_session_registration_releases_failed_body_and_allows_a_new_start
     let f = ConnectedBody::new().await;
     let subject = f.subject("failed-session-registration").await;
     let store = open_subjektiv_store(&f.connected.api).unwrap();
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
-    let permissions =
-        format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions");
-    f.ok(
-        "POST",
-        &permissions,
-        json!({
-            "operation_id":"deny-session-registration", "expected_change_id":initial.change_id,
-            "execution":[], "delegation":[],
-        }),
-    )
-    .await;
-    let denied = store.subject_permissions(&subject).unwrap().unwrap();
+    super::chat_tests::adopt_chat_policy(&f.connected.api, &f.connected.owner, &subject, "{}")
+        .await;
+    let denied = store.current_subject_policy(&subject).unwrap().unwrap();
     let request = absent_start("failed-body-start");
     let failed = f.mutate(&subject, "/start", request.clone()).await;
     assert_eq!(failed["disposition"], "rejected", "{failed}");
@@ -879,20 +867,18 @@ async fn denied_session_registration_releases_failed_body_and_allows_a_new_start
             .is_empty()
     );
     assert_eq!(
-        store.subject_permissions(&subject).unwrap().unwrap(),
+        store.current_subject_policy(&subject).unwrap().unwrap(),
         denied
     );
     // A terminal allocation retry must settle, never allocate a second Worker.
     let replay = f.mutate(&subject, "/start", request).await;
     assert_eq!(replay["disposition"], "rejected", "{replay}");
     assert_eq!(f.worker_count(), 0);
-    f.ok(
-        "POST",
-        &permissions,
-        json!({
-            "operation_id":"allow-session-registration", "expected_change_id":denied.change_id,
-            "execution":initial.execution, "delegation":initial.delegation,
-        }),
+    super::chat_tests::adopt_chat_policy(
+        &f.connected.api,
+        &f.connected.owner,
+        &subject,
+        r#"{ sets = ["subject-default"]; }"#,
     )
     .await;
     let started = f

@@ -307,7 +307,7 @@ async fn body_stop_and_outcome_reject_a_target_from_another_subject_before_runti
     let lease = f.reserve();
     let permissions = open_subjektiv_store(&f.api)
         .unwrap()
-        .subject_permissions(&f.subject)
+        .subject_policy_source(&f.subject)
         .unwrap();
     let other = open_subjektiv_store(&f.api)
         .unwrap()
@@ -338,7 +338,7 @@ async fn body_stop_and_outcome_reject_a_target_from_another_subject_before_runti
     assert_eq!(
         open_subjektiv_store(&f.api)
             .unwrap()
-            .subject_permissions(&f.subject)
+            .subject_policy_source(&f.subject)
             .unwrap(),
         permissions
     );

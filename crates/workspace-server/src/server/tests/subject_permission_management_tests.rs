@@ -21,6 +21,23 @@ impl ManagementFixture {
             .create_subject(crate::subjektiv::SubjectRole::new("permission-management").unwrap())
             .unwrap()
             .id;
+        // This suite exercises the retained pre-cutover scoped management API,
+        // not the new shared-set source/adoption surface.
+        let store = open_subjektiv_store(&api).unwrap();
+        store
+            .set_subject_permissions(
+                &subject,
+                &server_api::authorization::SubjectPermissionsUpdate {
+                    operation_id: "legacy-management-fixture".into(),
+                    expected_change_id: store
+                        .current_subject_policy(&subject)
+                        .unwrap()
+                        .map(|policy| policy.change_id),
+                    execution: vec![],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
         Self {
             api,
             owner,

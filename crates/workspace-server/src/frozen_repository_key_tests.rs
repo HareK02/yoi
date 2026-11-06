@@ -469,6 +469,7 @@ fn migrated_workdir_request_replays_and_retries_without_accepting_changed_displa
     // The service consumes current receipt columns; unrelated schemas are not this fixture.
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = SqliteWorkspaceStore {
+        plugin_manifest_cache: Arc::default(),
         db_executor: crate::db_executor::DbExecutor::shared(),
         conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     };
@@ -653,6 +654,7 @@ fn deleted_successful_workdir_archives_verbatim_history_without_authorizing_retr
     // The service consumes current receipt columns; unrelated schemas are not this fixture.
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
+        plugin_manifest_cache: Arc::default(),
         db_executor: crate::db_executor::DbExecutor::shared(),
         conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     });
@@ -1029,6 +1031,7 @@ fn migrated_ssh_mutations_replay_complete_old_input_without_reexecution_or_recei
     // The service consumes current receipt columns; unrelated schemas are not this fixture.
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
+        plugin_manifest_cache: Arc::default(),
         db_executor: crate::db_executor::DbExecutor::shared(),
         conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     });
@@ -1182,6 +1185,7 @@ fn deleted_legacy_receipt_does_not_bind_to_later_reused_key_ordinal() {
     // The service consumes current receipt columns; unrelated schemas are not this fixture.
     rename_saved_secret_receipt_counters(&conn).unwrap();
     let store = Arc::new(SqliteWorkspaceStore {
+        plugin_manifest_cache: Arc::default(),
         db_executor: crate::db_executor::DbExecutor::shared(),
         conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
     });

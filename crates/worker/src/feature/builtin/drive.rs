@@ -26,6 +26,8 @@
 //!
 //! [`wip`] owns native publication, [`backend`] request receipt checks, and delegation Drive blocking
 //! for internal children. Shared WIP references, permissions, and unknown outcomes follow [`crate::wip`].
+pub(crate) mod permission_declaration;
+
 pub mod backend;
 pub(crate) mod delegation;
 #[cfg(test)]
@@ -485,6 +487,13 @@ fn tool_error(error: DriveError) -> ToolError {
     }
 }
 impl FeatureModule for DriveFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID,"Workspace Drive").with_description("Explicit Backend-authorized Drive documents, images and artifact publication; no Workdir required").with_instruction(drive_instruction());
         for spec in SPECS {

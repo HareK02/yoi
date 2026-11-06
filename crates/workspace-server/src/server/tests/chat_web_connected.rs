@@ -133,6 +133,17 @@ async fn chat_web_connected_busy_unknown_replay_and_authorization_use_real_runti
     )
     .await;
     let subject = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"), json!({"operation_id":"browser-connected-subject","role":"Web connected companion","behavior_md":""})).await["id"].as_str().unwrap().to_owned();
+    adopt_chat_defaults(&f.api, &f.owner).await;
+    let policy = open_subjektiv_store(&f.api)
+        .unwrap()
+        .current_subject_policy(&subject)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        policy.execution,
+        server_api::authorization::subject_default_permission_assignment()
+    );
+    assert!(policy.legacy_constraints.is_none());
     let other_subject = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects"), json!({"operation_id":"browser-other-subject","role":"Other connected companion","behavior_md":""})).await["id"].as_str().unwrap().to_owned();
     let conversation = f.post(&conversations_path(), json!({"operation_id":format!("web-subject-conversation/v1/{subject}"),"subject_id":subject})).await;
     let c = conversation["id"].as_str().unwrap();

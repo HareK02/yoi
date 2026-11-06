@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 pub struct FeaturePermissionRegistrar<'a> {
     host: &'a mut PermissionHost,
     feature: FeatureHandle,
+    namespaces: &'a mut BTreeMap<NamespaceId, NamespaceHandle>,
 }
 
 impl FeaturePermissionRegistrar<'_> {
@@ -25,9 +26,12 @@ impl FeaturePermissionRegistrar<'_> {
         &mut self,
         namespace: NamespaceId,
     ) -> Result<NamespaceHandle, FeatureInstallError> {
-        self.host
-            .bind_namespace(&self.feature, namespace)
-            .map_err(invalid)
+        let handle = self
+            .host
+            .bind_namespace(&self.feature, namespace.clone())
+            .map_err(invalid)?;
+        self.namespaces.insert(namespace, handle.clone());
+        Ok(handle)
     }
 
     pub fn declare(
@@ -47,6 +51,7 @@ impl FeaturePermissionRegistrar<'_> {
 pub struct FeaturePermissionRegistry {
     host: PermissionHost,
     features: BTreeMap<FeatureId, FeatureHandle>,
+    namespaces: BTreeMap<FeatureId, BTreeMap<NamespaceId, NamespaceHandle>>,
 }
 
 fn invalid(error: impl std::fmt::Display) -> FeatureInstallError {
@@ -65,6 +70,7 @@ impl FeaturePermissionRegistry {
         let mut result = Self {
             host: PermissionHost::new(workspace),
             features: BTreeMap::new(),
+            namespaces: BTreeMap::new(),
         };
         for module in &builder.modules {
             result.register(module.as_ref())?;
@@ -76,16 +82,35 @@ impl FeaturePermissionRegistry {
         let id = module.descriptor().id;
         let identity = FeatureIdentity::parse(id.as_str()).map_err(invalid)?;
         let feature = self.host.register_feature(identity).map_err(invalid)?;
+        let mut namespaces = BTreeMap::new();
         module.declare_permissions(&mut FeaturePermissionRegistrar {
             host: &mut self.host,
             feature: feature.clone(),
+            namespaces: &mut namespaces,
         })?;
+        self.namespaces.insert(id.clone(), namespaces);
         self.features.insert(id, feature);
         Ok(())
     }
 
     pub fn host(&self) -> &PermissionHost {
         &self.host
+    }
+
+    pub fn into_host(self) -> PermissionHost {
+        self.host
+    }
+
+    /// Trusted Host lookup for injection into the registered Feature's operation
+    /// boundary. Do not expose this selector to Tool/WIP/request input. A callee
+    /// receives its own handle, never the caller's namespace or resolved grant.
+    /// The original authenticated principal must be rechecked by that callee.
+    pub fn namespace_handle(
+        &self,
+        feature: &FeatureId,
+        namespace: &NamespaceId,
+    ) -> Option<&NamespaceHandle> {
+        self.namespaces.get(feature)?.get(namespace)
     }
 
     /// Replace a declaration only through its already bound namespace handle.
@@ -118,6 +143,7 @@ impl FeaturePermissionRegistry {
             .ok_or_else(|| invalid("Feature is not registered"))?;
         self.host.remove_feature(handle).map_err(invalid)?;
         self.features.remove(feature);
+        self.namespaces.remove(feature);
         Ok(())
     }
 
@@ -132,21 +158,28 @@ impl FeaturePermissionRegistry {
         }
         let identity = FeatureIdentity::parse(id.as_str()).map_err(invalid)?;
         let feature = self.host.register_feature(identity).map_err(invalid)?;
+        let mut namespaces = BTreeMap::new();
         if let Err(error) = module.declare_permissions(&mut FeaturePermissionRegistrar {
             host: &mut self.host,
             feature: feature.clone(),
+            namespaces: &mut namespaces,
         }) {
             self.host.remove_feature(&feature).map_err(invalid)?;
             return Err(error);
         }
+        self.namespaces.insert(id.clone(), namespaces);
         self.features.insert(id, feature);
         Ok(())
     }
 }
 
+mod builtin;
+pub(crate) use builtin::{
+    BuiltinPermissionDeclaration, BuiltinPermissionFeature, BuiltinPermissionOperation,
+};
 #[cfg(test)]
 mod tests;
 
 #[path = "builtin/permission_catalog.rs"]
 mod builtin_catalog;
-pub use builtin_catalog::builtin_permission_host;
+pub use builtin_catalog::{builtin_permission_host, builtin_permission_registry};

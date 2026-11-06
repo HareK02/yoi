@@ -385,6 +385,23 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
         operation("worker.stop"),
         operation("worker.observe"),
     ]);
+    // This suite retains exact scoped delegation/provider limits. Explicitly
+    // select the pre-cutover source before exercising its public management API;
+    // never project the new shared-set default into all-target scoped grants.
+    store
+        .set_subject_permissions(
+            &subject,
+            &SubjectPermissionsUpdate {
+                operation_id: "legacy-public-messaging-fixture".into(),
+                expected_change_id: store
+                    .current_subject_policy(&subject)
+                    .unwrap()
+                    .map(|policy| policy.change_id),
+                execution: vec![],
+                delegation: vec![],
+            },
+        )
+        .unwrap();
     let (status, assigned) = response(api, human_request(&harness.owner,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"public-messaging-policy","expected_change_id":store.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":permissions.lock().unwrap().clone()})))).await;
     assert_eq!(status, StatusCode::OK, "{assigned}");
     let before = store.subject_permissions(&subject).unwrap().unwrap();

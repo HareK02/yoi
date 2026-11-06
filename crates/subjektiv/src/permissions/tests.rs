@@ -127,7 +127,7 @@ fn replacements_are_cas_fenced_replayable_and_never_restore_old_permissions() {
     {
         let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
         subject = store.create_subject(role()).unwrap().id;
-        let initial = store.subject_permissions(&subject).unwrap().unwrap();
+        let initial = store.current_subject_policy(&subject).unwrap().unwrap();
         first_update = update(
             "allow",
             Some(&initial.change_id),
@@ -199,7 +199,7 @@ fn failed_receipt_insert_rolls_back_source_history_and_projection() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let first = store
         .set_subject_permissions(
             &subject,
@@ -280,7 +280,7 @@ fn child_grants_are_immutable_bounded_and_do_not_create_subject_ownership() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
@@ -343,7 +343,7 @@ fn redelegation_requires_current_source_and_explicit_retained_parent_ceiling() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
@@ -395,7 +395,7 @@ fn journal_state_neither_authenticates_roots_nor_bypasses_retained_child_ceiling
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
@@ -444,7 +444,7 @@ fn retained_origins_reject_cycles_foreign_subjects_and_stale_parent_sources() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
@@ -466,7 +466,7 @@ fn retained_origins_reject_cycles_foreign_subjects_and_stale_parent_sources() {
         Err(SubjektivError::AuthorizationDenied(_))
     ));
     let other = store.create_subject(role()).unwrap().id;
-    let other_initial = store.subject_permissions(&other).unwrap().unwrap();
+    let other_initial = store.current_subject_policy(&other).unwrap().unwrap();
     let other_source = store
         .set_subject_permissions(
             &other,
@@ -502,7 +502,7 @@ fn failed_grant_insert_leaves_no_binding_and_can_retry_same_grant() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
@@ -648,7 +648,7 @@ fn subject_grant_listing_is_scoped_retained_ordered_and_fails_on_overflow() {
             .unwrap()
             .is_empty()
     );
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let source = store
         .set_subject_permissions(
             &subject,
@@ -659,7 +659,7 @@ fn subject_grant_listing_is_scoped_retained_ordered_and_fails_on_overflow() {
             ),
         )
         .unwrap();
-    let other_initial = store.subject_permissions(&other).unwrap().unwrap();
+    let other_initial = store.current_subject_policy(&other).unwrap().unwrap();
     let other_source = store
         .set_subject_permissions(
             &other,
@@ -765,7 +765,7 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let replacement = update(
         "allow",
         Some(&initial.change_id),
@@ -798,12 +798,17 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
             .is_none()
     );
     let fresh = store.create_subject(role()).unwrap().id;
-    let fresh_source = store.subject_permissions(&fresh).unwrap().unwrap();
+    let fresh_source = store.current_subject_policy(&fresh).unwrap().unwrap();
     assert_eq!(
-        fresh_source.execution,
-        server_api::authorization::subject_conversation_permissions("workspace-a", &fresh)
+        fresh_source.execution.grants,
+        vec![feature_permissions::PermissionReference::Set(
+            feature_permissions::PermissionSetId::parse(
+                server_api::authorization::SUBJECT_DEFAULT_PERMISSION_SET
+            )
+            .unwrap()
+        )]
     );
-    assert!(fresh_source.delegation.is_empty());
+    assert!(fresh_source.delegation.grants.is_empty());
     assert!(
         store
             .record_session_attribution(
@@ -815,5 +820,48 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
         store
             .claim_journal_writer(&fresh, "runtime", "body")
             .is_err()
+    );
+}
+
+#[test]
+fn scalar_legacy_operations_are_a_typed_source_not_a_failed_feature_parse_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let subject;
+    let source;
+    {
+        let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+        subject = store.create_subject(role()).unwrap().id;
+        let initial = store.current_subject_policy(&subject).unwrap().unwrap();
+        source = store
+            .set_subject_permissions(
+                &subject,
+                &SubjectPermissionsUpdate {
+                    operation_id: "legacy-scalar".into(),
+                    expected_change_id: Some(initial.change_id),
+                    execution: vec![ScopedPermission {
+                        operation: "mcp".into(),
+                        resource: PermissionResource::Workspace {
+                            workspace_id: "workspace-a".into(),
+                        },
+                    }],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.subject_policy_source(&subject).unwrap(),
+            Some(SubjectPolicySource::Legacy(source.clone()))
+        );
+        assert_eq!(
+            store.subject_permissions(&subject).unwrap(),
+            Some(source.clone())
+        );
+        // It is retained and diagnostic, never normalized to a new namespace/key.
+        assert!(store.current_subject_policy(&subject).is_err());
+    }
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    assert_eq!(
+        store.subject_policy_source(&subject).unwrap(),
+        Some(SubjectPolicySource::Legacy(source))
     );
 }

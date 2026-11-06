@@ -141,6 +141,7 @@ impl LocalSubjectHost {
                     refusal.get_or_insert_with(|| "consolidation_admission_deadline_exceeded: original reservation deadline elapsed before dispatch".into());
                 }
                 if refusal.is_none() {
+                    self.authorize_current("memory.consolidation.supply")?;
                     match jobs.start_reserved_granted(observed, deadline) {
                         Ok(()) => return Ok(true),
                         Err(JobServiceError::Configuration(cause)) => {

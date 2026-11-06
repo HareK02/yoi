@@ -780,6 +780,22 @@ async fn connected_chat_delegation(scenario: Scenario) {
         ];
         foreign = Some((other_subject, other_ticket));
     }
+    // Keep the scoped Ticket/Workdir and child ceilings this legacy suite tests.
+    // The explicit fixture source is separate from new Subject shared-set defaults.
+    store
+        .set_subject_permissions(
+            &subject,
+            &SubjectPermissionsUpdate {
+                operation_id: "legacy-chat-delegation-fixture".into(),
+                expected_change_id: store
+                    .current_subject_policy(&subject)
+                    .unwrap()
+                    .map(|policy| policy.change_id),
+                execution: vec![],
+                delegation: vec![],
+            },
+        )
+        .unwrap();
     account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"chat-policy","expected_change_id":store.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":delegation}))).await;
     let original_policy = store.subject_permissions(&subject).unwrap().unwrap();
     for (name, target) in [("conversation-a", true), ("conversation-b", false)] {

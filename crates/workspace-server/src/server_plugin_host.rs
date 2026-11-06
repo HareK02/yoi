@@ -251,7 +251,7 @@ async fn check_tools(
                     },
                 )
                 .map_err(|e| e.error)?;
-                api.config_store.with_immediate_transaction(|tx| {
+                let admitted = api.config_store.with_immediate_transaction(|tx| {
                     policy::authorize(
                         tx,
                         &workspace,
@@ -261,7 +261,9 @@ async fn check_tools(
                         &tools,
                         &operation,
                     )
-                })
+                })?;
+                api.authorize_plugin_entry(&worker, &admitted, &tools, None)?;
+                Ok(admitted)
             })
         })
         .await

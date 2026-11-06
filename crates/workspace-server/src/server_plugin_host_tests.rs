@@ -383,7 +383,13 @@ impl Fixture {
 
 fn set_policy(api: &WorkspaceApi, subject: &str, installation: &str, granted: bool) {
     let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(subject).unwrap();
+    let previous = store
+        .subject_policy_source(subject)
+        .unwrap()
+        .map(|policy| match policy {
+            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
+            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
+        });
     let execution = if granted {
         [
             "plugin.admit",
@@ -410,7 +416,7 @@ fn set_policy(api: &WorkspaceApi, subject: &str, installation: &str, granted: bo
             subject,
             &SubjectPermissionsUpdate {
                 operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: previous.map(|p| p.change_id),
+                expected_change_id: previous,
                 execution,
                 delegation: vec![],
             },

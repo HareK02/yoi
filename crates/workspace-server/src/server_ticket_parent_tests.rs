@@ -330,7 +330,7 @@ async fn parent_reparent_requires_existing_record_and_remove_grants_on_actual_en
         },
     };
     let set_raw = |permissions: Vec<ScopedPermission>| {
-        let previous = store.subject_permissions(&subject.id).unwrap();
+        let previous = store.current_subject_policy(&subject.id).unwrap();
         store
             .set_subject_permissions(
                 &subject.id,

@@ -78,7 +78,7 @@ mod configuration_adoption_http_integration {
             let legacy_update = SubjectPermissionsUpdate {
                 operation_id: "adoption-http-existing-policy".into(),
                 expected_change_id: legacy
-                    .subject_permissions(&subject)
+                    .current_subject_policy(&subject)
                     .unwrap()
                     .map(|policy| policy.change_id),
                 execution: vec![workspace_permission("ticket.query")],
@@ -266,6 +266,75 @@ mod configuration_adoption_http_integration {
                 Err(crate::subjektiv::SubjektivError::PermissionAuthoritySealed),
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn permission_management_uses_owner_and_atomic_source_catalog_resolution() {
+        let f = Fixture::new().await;
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/permission-catalog");
+        for (token, expected) in [
+            (&f.owner, StatusCode::OK),
+            (&f.foreign, StatusCode::FORBIDDEN),
+        ] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(&path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, _) = f.call(request).await;
+            assert_eq!(status, expected);
+        }
+        let stored = f.adopt_draft("permission-resolution-source").await;
+        let source = f.source().await;
+        assert!(source.source_stored);
+        assert_eq!(
+            source.history_head.as_deref(),
+            Some(stored.history_head.as_str())
+        );
+        let registry = f.api.permission_registry.read().unwrap();
+        assert_eq!(source.catalog, registry.host().catalog());
+        assert_eq!(
+            source.catalog_digest,
+            crate::config_adoption::catalog_digest(registry.host()).unwrap()
+        );
+        for policy in source.policies {
+            let current = f
+                .api
+                .config_store
+                .adopted_subject_policy(TEST_WORKSPACE_ID, &policy.subject_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(policy.change_id, current.change_id);
+            assert_eq!(policy.execution, current.source.execution.assignment());
+            assert_eq!(
+                policy.execution_resolution,
+                *registry
+                    .host()
+                    .resolve(Some(&policy.execution))
+                    .projection()
+            );
+            assert_eq!(
+                policy.delegation_resolution,
+                *registry
+                    .host()
+                    .resolve(Some(&policy.delegation))
+                    .projection()
+            );
+        }
+        drop(registry);
+        let assignment = assignment("ticket.read");
+        let body = json!({"assignment": assignment});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/w/{TEST_WORKSPACE_ID}/permissions/validate"))
+            .header("authorization", format!("Bearer {}", f.owner))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, resolution) = f.call(request).await;
+        assert_eq!(status, StatusCode::OK, "{resolution}");
+        assert!(resolution["allowed"].get("ticket.read").is_some());
     }
 
     fn core_request(request: &Adoption) -> crate::config_adoption::ConfigurationAdoptionRequest {

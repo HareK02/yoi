@@ -2,6 +2,8 @@
 //! routing. No output is indexable; committed result entries directly address immutable files.
 //! Root namespace knowledge grants nothing: every publication and read checks the current view.
 
+pub(crate) mod permission_declaration;
+
 use crate::{
     file_operation::{self, Contract},
     permission::permission_action_for,

@@ -1121,6 +1121,13 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
             AxumPath(ScopedWorkspacePath {
                 workspace_id: WORKSPACE.into(),
             }),
+            Extension(RequestActor {
+                user_id: "fixture-user".into(),
+                account_id: format!("account-{WORKSPACE}"),
+                handle: "fixture-user".into(),
+                display_name: "Fixture user".into(),
+                auth_method: ActorAuthMethod::BrowserSession,
+            }),
             Json(server_api::SubjektivSubjectCreateRequest {
                 operation_id: format!("create-network-subject-{kind}"),
                 role: "network subject".into(),
@@ -1144,7 +1151,7 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
                         expected_change_id: Some(
                             open_subjektiv_store(&fixture.api)
                                 .unwrap()
-                                .subject_permissions(&subject.id)
+                                .current_subject_policy(&subject.id)
                                 .unwrap()
                                 .unwrap()
                                 .change_id,

@@ -46,7 +46,7 @@ async fn check_service(
                     )
                     .map_err(|e| e.error)?;
                 }
-                api.config_store.with_immediate_transaction(|tx| {
+                let admitted = api.config_store.with_immediate_transaction(|tx| {
                     policy::authorize_service(
                         tx,
                         &workspace,
@@ -56,7 +56,9 @@ async fn check_service(
                         &name,
                         &operation,
                     )
-                })
+                })?;
+                api.authorize_plugin_entry(&worker, &admitted, &[], Some(&name))?;
+                Ok(admitted)
             })
         })
         .await

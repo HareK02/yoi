@@ -8,6 +8,31 @@ use std::sync::Arc;
 /// Implementations must resolve the exact Workspace/Subject pair and propagate failures.
 /// Calls are synchronous under the FeatureDatabase guard; do not reenter this store.
 pub trait CanonicalPermissionSource: Send + Sync {
+    fn subject_policy_source(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+    ) -> Result<Option<server_api::authorization::SubjectPolicySource>> {
+        self.subject_permissions(workspace_id, subject_id)
+            .map(|source| source.map(server_api::authorization::SubjectPolicySource::Legacy))
+    }
+
+    fn current_subject_policy(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+    ) -> Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
+        self.subject_policy_source(workspace_id, subject_id)?
+            .map(|source| match source {
+                server_api::authorization::SubjectPolicySource::Feature(source) => Ok(source),
+                server_api::authorization::SubjectPolicySource::Legacy(source) => {
+                    server_api::authorization::CurrentSubjectPolicy::from_legacy(source)
+                }
+            })
+            .transpose()
+            .map_err(SubjektivError::InvalidRecord)
+    }
+
     fn subject_permissions(
         &self,
         workspace_id: &str,
@@ -51,6 +76,8 @@ pub struct PermissionSourceExport {
     pub subject_id: String,
     /// `None` is unset; `Some` with empty vectors is an explicit revocation.
     pub permissions: Option<SubjectPermissions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_policy: Option<server_api::authorization::CurrentSubjectPolicy>,
 }
 
 /// Complete, Subject-ID-sorted policy snapshot. History and grants stay in the old database.
@@ -386,9 +413,18 @@ fn export_in_connection(
         validate_authorization_identifier(&subject_id).map_err(SubjektivError::InvalidRecord)?;
         let change: Option<String> = row.get(1)?;
         let raw: Option<String> = row.get(2)?;
-        let permissions: Option<SubjectPermissions> =
+        let source: Option<StoredSubjectPolicy> =
             raw.map(|raw| serde_json::from_str(&raw)).transpose()?;
-        if permissions.as_ref().map(|source| &source.change_id) != change.as_ref() {
+        let (permissions, feature_policy) = match source {
+            Some(StoredSubjectPolicy::Legacy(source)) => (Some(source), None),
+            Some(StoredSubjectPolicy::Feature(source)) => (None, Some(source)),
+            None => (None, None),
+        };
+        let source_change = permissions
+            .as_ref()
+            .map(|source| &source.change_id)
+            .or_else(|| feature_policy.as_ref().map(|source| &source.change_id));
+        if source_change != change.as_ref() {
             return Err(SubjektivError::PermissionTransferConflict);
         }
         if let Some(source) = &permissions {
@@ -400,6 +436,7 @@ fn export_in_connection(
         sources.push(PermissionSourceExport {
             subject_id,
             permissions,
+            feature_policy,
         });
     }
     let export_digest = Sha256::digest(serde_json::to_vec(&(1_u32, &identity, &sources))?)

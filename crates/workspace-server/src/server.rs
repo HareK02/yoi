@@ -63,6 +63,8 @@ mod plugin_runtime;
 pub use plugin_delivery::InProcessPluginArtifactSource;
 #[path = "server_configuration_adoption.rs"]
 mod configuration_adoption;
+#[path = "server_feature_permission_api.rs"]
+mod feature_permission_api;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2118,6 +2120,7 @@ pub struct WorkspaceApi {
     signing_identities: WorkspaceSigningIdentityService,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
+    permission_registry: Arc<RwLock<worker::feature::permissions::FeaturePermissionRegistry>>,
     feature_storage: crate::WorkspaceFeatureStorage,
     drive_host: Arc<crate::workspace_drive_host::WorkspaceDriveHost>,
     subjektiv_registration: crate::RegisteredFeature,
@@ -4904,7 +4907,13 @@ impl WorkspaceApi {
                 .run(move || host.adopt_legacy_storage(&scope, &catalog))
                 .await?;
         }
+        let feature_permissions = worker::feature::permissions::builtin_permission_registry(
+            feature_permissions::WorkspaceId::parse(config.workspace_id.clone())
+                .map_err(Error::InvalidInput)?,
+        )
+        .map_err(|error| Error::Config(error.to_string()))?;
         let mut api = Self {
+            permission_registry: Arc::new(RwLock::new(feature_permissions)),
             host_executors,
             drive_host,
             config_store,
@@ -6299,7 +6308,8 @@ impl WorkspaceApi {
                 }
                 validate_ticket_start_dispatch(self, assignment)?;
                 if request.resolved_execution_grant.is_some()
-                    && subject_authorization::worker_permissions(self, &reserved_worker)?.is_none()
+                    && subject_authorization::has_subject_authority(self, &reserved_worker)?
+                        == false
                 {
                     return Err(Error::WorkspacePermissionDenied(
                         "Ticket execution grant disappeared before Runtime dispatch".into(),
@@ -6315,6 +6325,21 @@ impl WorkspaceApi {
                     worker_id,
                     &reservation_fingerprint,
                     "ticket_start_authority",
+                    None,
+                    &compensation_context,
+                    &reserved_attachments,
+                );
+                return Err(ApiError::with_diagnostics(error.error, diagnostics));
+            }
+        }
+        if let Some(grant) = request.resolved_execution_grant.as_ref() {
+            if let Err(error) = subject_authorization::revalidate_execution_grant(self, grant) {
+                let diagnostics = compensate_failed_workspace_worker_create(
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    "subject_delegation_authority",
                     None,
                     &compensation_context,
                     &reserved_attachments,
@@ -10110,16 +10135,21 @@ impl server_api::ServerApi for ServerApiContractService {
             .run(move || -> ApiResult<_> {
                 let store = open_subjektiv_store(&mutation_api)?;
                 let before = store
-                    .subject_permissions(&mutation_subject)
-                    .map_err(subjektiv_store_error)?;
-                let was_current = before.as_ref().map(|policy| &policy.change_id)
-                    == request.expected_change_id.as_ref();
+                    .subject_policy_source(&mutation_subject)
+                    .map_err(subjektiv_store_error)?
+                    .map(|policy| match policy {
+                        server_api::authorization::SubjectPolicySource::Feature(policy) => {
+                            policy.change_id
+                        }
+                        server_api::authorization::SubjectPolicySource::Legacy(policy) => {
+                            policy.change_id
+                        }
+                    });
+                let was_current = before.as_ref() == request.expected_change_id.as_ref();
                 let permissions = store
                     .set_managed_subject_permissions(&mutation_subject, &request)
                     .map_err(subjektiv_store_error)?;
-                let changed = was_current
-                    && before.as_ref().map(|source| &source.change_id)
-                        != Some(&permissions.change_id);
+                let changed = was_current && before.as_ref() != Some(&permissions.change_id);
                 Ok((permissions, changed))
             })
             .await
@@ -10137,13 +10167,18 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn subjektiv_subject_create(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::SubjektivSubjectCreateRequest,
     ) -> std::result::Result<server_api::SubjektivSubjectResponse, server_api::RepositoryApiError>
     {
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(ApiError::into_repository_api_error)?
+            .clone();
         scoped_create_subjektiv_subject(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
             Json(request),
         )
         .await
@@ -17777,12 +17812,11 @@ fn ticket_start_delegation(
     }) = source
     {
         if agent_key.is_empty()
-            && subject_authorization::worker_permissions(
+            && subject_authorization::has_subject_authority(
                 api,
                 &RuntimeWorkerRef::new(runtime_id, worker_id),
             )
             .map_err(|error| error.error)?
-            .is_some()
         {
             return Err(Error::WorkspacePermissionDenied(
                 "Ticket execution initiation requires the current assigned Subject body; a delegated Worker cannot impersonate it".into(),
@@ -17835,9 +17869,8 @@ fn ticket_spawn_delegation(
         if let Some(worker) = worker.as_ref() {
             api.store
                 .require_current_worker_singleton_owner(&api.config.workspace_id, worker)?;
-            if subject_authorization::worker_permissions(api, worker)
+            if subject_authorization::has_subject_authority(api, worker)
                 .map_err(|error| error.error)?
-                .is_some()
             {
                 let (_, source) = authenticated_assignment_source(api, headers, context)?;
                 return ticket_start_delegation(api, Some(&source), observed_assignment_id);
@@ -24068,6 +24101,7 @@ const SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE: &str = "subjektiv-memory-consolida
 struct HostExecutors {
     host: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
     cleanup: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
+    feature: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
 }
 
 impl HostExecutors {
@@ -24097,6 +24131,11 @@ impl HostExecutors {
     fn cleanup(&self) -> Result<crate::db_executor::DbExecutor> {
         Self::lane(&self.cleanup)
     }
+    // Protected Feature callbacks can wait on domain admission, but must leave
+    // both policy SQL and a Host awaiting Runtime callbacks free to progress.
+    fn feature(&self) -> Result<crate::db_executor::DbExecutor> {
+        Self::lane(&self.feature)
+    }
 }
 
 /// Poll mixed lifecycle workflows on finite Host ownership using the original Tokio handle,
@@ -24125,11 +24164,13 @@ fn open_legacy_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv
 }
 
 fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
-    let host = worker::feature::permissions::builtin_permission_host(
-        feature_permissions::WorkspaceId::parse(api.config.workspace_id.clone())
-            .map_err(|error| Error::InvalidInput(error.to_string()))?,
-    )
-    .map_err(|error| Error::Config(error.to_string()))?;
+    api.refresh_plugin_permission_registry()?;
+    let host = api
+        .permission_registry
+        .read()
+        .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?
+        .host()
+        .clone();
     Ok(
         open_legacy_subjektiv_store(api)?.with_canonical_permission_source(Arc::new(
             crate::config_adoption::CanonicalConfigurationSource {
@@ -24521,25 +24562,40 @@ fn subjektiv_subject_response(
 async fn scoped_create_subjektiv_subject(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
     Json(request): Json<server_api::SubjektivSubjectCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<server_api::SubjektivSubjectResponse>)> {
-    api.host_executors
-        .host()?
-        .run(move || {
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            let role = crate::subjektiv::SubjectRole::new(request.role)
-                .map_err(|error| Error::InvalidInput(error.to_string()))?;
-            crate::subjektiv::validate_subject_behavior(&request.behavior_md)
-                .map_err(|error| Error::InvalidInput(error.to_string()))?;
-            let subject = open_subjektiv_store(&api)?
-                .create_subject_idempotent(role, request.behavior_md, &request.operation_id)
-                .map_err(subjektiv_store_error)?;
-            Ok((
-                StatusCode::CREATED,
-                Json(subjektiv_subject_response(&api, subject)?),
-            ))
-        })
-        .await
+    let executor = api.host_executors.host()?;
+    run_host_workflow(executor, async move {
+        require_workspace_owner(&api, &path.workspace_id, &actor, "Subject creation").await?;
+        validate_workspace_scope(&api, &path.workspace_id)?;
+        let role = crate::subjektiv::SubjectRole::new(request.role)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        crate::subjektiv::validate_subject_behavior(&request.behavior_md)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        let subjects = open_subjektiv_store(&api)?;
+        let subject = subjects
+            .create_subject_idempotent(role, request.behavior_md, &request.operation_id)
+            .map_err(subjektiv_store_error)?;
+        let registry = api
+            .permission_registry
+            .read()
+            .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?;
+        api.config_store.enroll_created_subject(
+            &path.workspace_id,
+            &actor.account_id,
+            &subjects,
+            &subject.id,
+            api.config_schema_registry.compose()?,
+            registry.host(),
+        )?;
+        drop(registry);
+        Ok((
+            StatusCode::CREATED,
+            Json(subjektiv_subject_response(&api, subject)?),
+        ))
+    })
+    .await
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40041,13 +40097,24 @@ mod tests {
         }
         fn assign(api: &WorkspaceApi, subject: &str, resources: Vec<PermissionResource>) {
             let store = open_subjektiv_store(api).unwrap();
-            let previous = store.subject_permissions(subject).unwrap();
+            let previous =
+                store
+                    .subject_policy_source(subject)
+                    .unwrap()
+                    .map(|policy| match policy {
+                        server_api::authorization::SubjectPolicySource::Feature(policy) => {
+                            policy.change_id
+                        }
+                        server_api::authorization::SubjectPolicySource::Legacy(policy) => {
+                            policy.change_id
+                        }
+                    });
             store
                 .set_subject_permissions(
                     subject,
                     &SubjectPermissionsUpdate {
                         operation_id: Uuid::now_v7().to_string(),
-                        expected_change_id: previous.map(|policy| policy.change_id),
+                        expected_change_id: previous,
                         execution: resources
                             .into_iter()
                             .map(|resource| ScopedPermission {
@@ -40072,6 +40139,7 @@ mod tests {
                 .create_subject(crate::subjektiv::SubjectRole::new("notification-source").unwrap())
                 .unwrap()
                 .id;
+            assign(&api, &subject, vec![]);
             let mut workers = Vec::new();
             for attached in [true, false] {
                 let Json(created) = create_workspace_worker(
@@ -48560,6 +48628,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
+            Extension(test_owner_actor()),
             Json(server_api::SubjektivSubjectCreateRequest {
                 operation_id: format!("create-subject-{}", uuid::Uuid::now_v7()),
                 role: "companion".to_string(),
@@ -48624,6 +48693,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
+            Extension(test_owner_actor()),
             Json(server_api::SubjektivSubjectCreateRequest {
                 operation_id: format!("create-subject-{}", uuid::Uuid::now_v7()),
                 role: "reviewer".to_string(),
@@ -49122,7 +49192,7 @@ mod tests {
                 serde_json::to_vec(&body).unwrap(),
             )
         };
-        let initial = store.subject_permissions(&subject.id).unwrap().unwrap();
+        let initial = store.current_subject_policy(&subject.id).unwrap().unwrap();
         store
             .set_subject_permissions(
                 &subject.id,
@@ -49163,7 +49233,7 @@ mod tests {
                             resource: subject_resource.clone(),
                         },
                         ScopedPermission {
-                            operation: "worker.session.read".into(),
+                            operation: "subworker.observe".into(),
                             resource: child_resource.clone(),
                         },
                     ],
@@ -49174,7 +49244,7 @@ mod tests {
         for (body, expected) in [
             (subject_request.clone(), subject_resource),
             (
-                json!({"operation":"worker.session.read", "target":{"kind":"sub_worker", "name":"not-started-child"}}),
+                json!({"operation":"subworker.observe", "target":{"kind":"sub_worker", "name":"not-started-child"}}),
                 child_resource,
             ),
         ] {
@@ -49190,7 +49260,7 @@ mod tests {
         // A different child name cannot inherit this grant. Caller-provided Subject
         // identities are rejected at the wire boundary, not used as selectors.
         for body in [
-            json!({"operation":"worker.session.read", "target":{"kind":"sub_worker", "name":"other-child"}}),
+            json!({"operation":"subworker.observe", "target":{"kind":"sub_worker", "name":"other-child"}}),
             json!({"operation":"memory.resident.supply", "target":{"kind":"subject", "subject_id":"other-subject"}}),
         ] {
             let response = build_router(api.clone())
@@ -49287,7 +49357,7 @@ mod tests {
                     operation_id: "staging-scope-fixture".into(),
                     expected_change_id: open_subjektiv_store(&api)
                         .unwrap()
-                        .subject_permissions(&subject.id)
+                        .current_subject_policy(&subject.id)
                         .unwrap()
                         .map(|p| p.change_id),
                     execution,
@@ -51698,13 +51768,15 @@ mod tests {
                 hook();
             }
             let release = self.subject_release.lock().unwrap();
-            if release.as_ref().is_some_and(|(_, state)| {
-                matches!(
-                    state,
-                    runtime_api::SubjectReleaseState::Reserved
-                        | runtime_api::SubjectReleaseState::Disconnected
-                )
-            }) {
+            if !matches!(method, protocol::Method::Shutdown { .. })
+                && release.as_ref().is_some_and(|(_, state)| {
+                    matches!(
+                        state,
+                        runtime_api::SubjectReleaseState::Reserved
+                            | runtime_api::SubjectReleaseState::Disconnected
+                    )
+                })
+            {
                 return Err(Self::unavailable());
             }
             // Drive the actual mock receiver synchronously; no method is routed
@@ -52178,6 +52250,8 @@ mod tests {
                 }
             });
             let bound_execution = Arc::downgrade(&execution);
+            let stopping_execution = bound_execution.clone();
+            let stop_owner = self.clone();
             let method_tx = execution.method_tx.clone();
             Ok(worker_runtime::execution::WorkerProtocolTransport::new(
                 worker_ref.clone(),
@@ -52196,7 +52270,25 @@ mod tests {
                         Ok(())
                     }
                 }),
-            ))
+            )
+            .with_stop_dispatch(Arc::new(move |request| {
+                let Some(captured) = stopping_execution.upgrade() else {
+                    return DeterministicWorkerExecution::unavailable();
+                };
+                let current = stop_owner
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .get(&request.worker_ref)
+                    .cloned();
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &captured))
+                {
+                    return DeterministicWorkerExecution::unavailable();
+                }
+                stop_owner.stop_worker_operation(request)
+            })))
         }
 
         fn worker_snapshot(
@@ -52286,6 +52378,12 @@ mod tests {
                     "No fixture execution or matching stop receipt",
                 );
             };
+            let shutdown_command_id = 1;
+            if let Err(result) = execution.dispatch(protocol::Method::Shutdown {
+                command: protocol::WorkerCommandEnvelope::new(shutdown_command_id),
+            }) {
+                return result;
+            }
             let mut result = self.stop_worker(&request.worker_ref);
             // This fixture has no real Controller/Features. Join its actual echo
             // threads before attesting its explicitly substituted execution boundary.
@@ -52313,7 +52411,7 @@ mod tests {
                 worker_ref: request.worker_ref.clone(),
                 stop_operation_id: request.operation_id,
                 execution_id: execution.execution_id,
-                shutdown_command_id: Some(1),
+                shutdown_command_id: Some(shutdown_command_id),
                 submissions,
                 feature_failures: Vec::new(),
             };
@@ -59960,6 +60058,9 @@ mod tests {
 
     include!("server_assignment_test_support.rs");
     include!("server_assignment_attention_tests.rs");
+    mod shared_subject_permissions_tests {
+        include!("server_shared_subject_permissions_tests.rs");
+    }
     mod subject_notification_recovery_tests {
         include!("server_subject_notification_recovery_tests.rs");
     }

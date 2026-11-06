@@ -6,6 +6,8 @@ use super::*;
 
 #[path = "admission_tests.rs"]
 mod admission_tests;
+#[path = "authority_tests.rs"]
+mod authority_tests;
 
 struct ConsolidationRecoveryFixture {
     body: SubjectConnection,
@@ -29,9 +31,17 @@ impl ConsolidationRecoveryFixture {
     }
 
     fn with_candidates(candidate_ids: &[&str]) -> Self {
+        Self::with_policy(candidate_ids, |_, _| {})
+    }
+
+    fn with_policy(
+        candidate_ids: &[&str],
+        configure: impl FnOnce(&mut StandaloneSubjects, &SubjectRecord),
+    ) -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let catalog = StandaloneSubjects::open(temp.path().join("state")).unwrap();
+        let mut catalog = StandaloneSubjects::open(temp.path().join("state")).unwrap();
         let subject = catalog.create("recovery-owner", None).unwrap();
+        configure(&mut catalog, &subject);
         let body = catalog
             .connect(&subject.id, protocol::WorkerId::now_v7())
             .unwrap();
@@ -64,6 +74,7 @@ impl ConsolidationRecoveryFixture {
         let grant = LocalConsolidationGrant {
             binding: body.binding.clone(),
             candidate_ids: candidate_ids.iter().map(|id| (*id).to_owned()).collect(),
+            operations: None,
         };
         let request = job::JobRequest {
             job_id: "consolidation-recovery".into(),
@@ -1122,6 +1133,7 @@ fn consolidation_operation_policy_is_attempt_bound_and_does_not_inherit_body_rig
         grant: LocalConsolidationGrant {
             binding: body.binding.clone(),
             candidate_ids: vec![],
+            operations: None,
         },
         job_id: "job-1".into(),
         attempt_id: "attempt-1".into(),

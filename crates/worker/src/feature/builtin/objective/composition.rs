@@ -40,6 +40,13 @@ pub(crate) struct ObjectiveFeature {
 }
 
 impl FeatureModule for ObjectiveFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        super::permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin("objective", "Objective")
             .with_description("Resolved Objective enablement publishes Tools and, in WIP mode, native projection; no separate instruction contribution")

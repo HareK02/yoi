@@ -549,6 +549,23 @@ async fn public_two_subject_ticket_spawn_notify_edit_result_retry_and_fences() {
             ticket_permission(&ticket, "ticket.read"),
             ticket_permission(&ticket, "ticket.implementation_result.read"),
         ]);
+        // This legacy consumer suite keeps exact Ticket and Workdir domains.
+        // Select an explicit empty scoped source by current-policy CAS before
+        // the real owner API assigns only the narrowly listed permissions.
+        subjects
+            .set_subject_permissions(
+                &subject,
+                &SubjectPermissionsUpdate {
+                    operation_id: format!("legacy-public-{label}-fixture"),
+                    expected_change_id: subjects
+                        .current_subject_policy(&subject)
+                        .unwrap()
+                        .map(|policy| policy.change_id),
+                    execution: vec![],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
         let (status, policy) = harness.human(reqwest::Method::POST,
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
             json!({"operation_id":format!("public-{label}-policy"),"expected_change_id":subjects.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":delegation})).await;

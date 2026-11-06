@@ -26,6 +26,7 @@ impl SqliteWorkspaceStore {
         configure_sqlite(&conn)?;
         Ok(Self {
             conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
+            plugin_manifest_cache: Arc::default(),
             db_executor: crate::db_executor::DbExecutor::new(
                 crate::db_executor::DbExecutorLimits::default(),
             )?,
@@ -57,6 +58,7 @@ impl SqliteWorkspaceStore {
         configure_sqlite(&conn)?;
         Ok(Self {
             conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
+            plugin_manifest_cache: Arc::default(),
             db_executor: crate::db_executor::DbExecutor::new(
                 crate::db_executor::DbExecutorLimits::default(),
             )?,

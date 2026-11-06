@@ -17,6 +17,8 @@
 //! logic. Query/detail uses canonical references and bounded bodies/events, omitting internal
 //! storage IDs from output.
 
+pub(crate) mod permission_declaration;
+
 pub(crate) mod composition;
 #[cfg(test)]
 mod result_tests;

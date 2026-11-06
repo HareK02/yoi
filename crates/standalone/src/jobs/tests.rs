@@ -129,6 +129,7 @@ impl JobDomainProvider for RecordingDomainProvider {
         }
         self.0.lock().unwrap().push((snapshot.clone(), fence));
         Ok(worker::job::JobFeatureGrant {
+            input_authority: None,
             satisfied_requirements: vec!["feature.subjektiv"],
             ..Default::default()
         })
@@ -205,6 +206,7 @@ impl JobDomainProvider for ControlledShutdown {
         _: Arc<dyn JobAttemptFence>,
     ) -> Result<worker::job::JobFeatureGrant, JobServiceError> {
         Ok(worker::job::JobFeatureGrant {
+            input_authority: None,
             features: worker::feature::FeatureRegistryBuilder::new().with_module(self.clone()),
             satisfied_requirements: vec!["feature.subjektiv"],
             ..Default::default()

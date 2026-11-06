@@ -40,6 +40,8 @@
 //! defaults and business validation belong to the shared domain executor. Refresh v1 observations
 //! to obtain v2 contracts; never reinterpret or automatically replay an old mutation.
 
+pub(crate) mod permission_declaration;
+
 mod assignment_public;
 mod assignment_tracking;
 mod native;
@@ -856,6 +858,13 @@ impl TicketFeature {
 }
 
 impl FeatureModule for TicketFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
             .with_description(FEATURE_DESCRIPTION)

@@ -3,7 +3,7 @@
 
 import type { ConfigCommitRequest, WorkspaceConfigTreeResponse } from "./legacy-server-api.ts";
 import type { ScopedPermission, SubjectPermissions } from "./memory-api.ts";
-import type { PermissionAssignment, PermissionCatalog } from "./feature-permissions.generated.ts";
+import type { PermissionAssignment, PermissionCatalog, PermissionResolution } from "./feature-permissions.generated.ts";
 
 export type ConfigurationAdoptionRequest = { operation_id: string, expected_head: string | null, expected_catalog_digest: string, expected_legacy_export: string | null, source: ConfigCommitRequest, };
 
@@ -12,6 +12,11 @@ export type RuntimePolicyApplication = "next_current_policy_check";
 export type ConfigurationAdoptionReceipt = { workspace_id: string, operation_id: string, history_head: string, state: WorkspaceConfigTreeResponse, source_stored: boolean, policy_committed: boolean, runtime_application: RuntimePolicyApplication, };
 
 export type ConfigurationSubjectPolicy = { subject_id: string, change_id: string, execution: PermissionAssignment, delegation: PermissionAssignment,
+/**
+ * Key resolution computed with this response's catalog and policy snapshot.
+ * These explanations are not permission to bypass current domain checks.
+ */
+execution_resolution: PermissionResolution, delegation_resolution: PermissionResolution,
 /**
  * Exact retained domain restrictions, not editable payloads on permission keys.
  */

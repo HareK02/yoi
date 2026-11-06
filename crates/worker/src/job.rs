@@ -149,14 +149,56 @@ pub struct PreparedInternalJob {
     finalizer: Option<Arc<dyn JobResultFinalizer>>,
 }
 
-/// Explicit Host-supplied domain modules and the Profile requirements they satisfy.
-/// Profile names never issue this grant. The Host must bind all module operations to
-/// the immutable request/attempt and fence them on cancellation, timeout and shutdown.
+/// Host-bound authority for protected immutable Job input. Preparation is not a
+/// supply decision: this boundary runs immediately before every provider dispatch,
+/// including compaction and clones used by result finalizers.
+#[async_trait::async_trait]
+pub trait JobInputAuthority: Send + Sync {
+    async fn authorize_supply(&self) -> Result<(), String>;
+}
+
+struct AuthorizedJobClient {
+    inner: Box<dyn LlmClient>,
+    authority: Arc<dyn JobInputAuthority>,
+}
+#[async_trait::async_trait]
+impl LlmClient for AuthorizedJobClient {
+    fn clone_boxed(&self) -> Box<dyn LlmClient> {
+        Box::new(Self {
+            inner: self.inner.clone_boxed(),
+            authority: self.authority.clone(),
+        })
+    }
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> Result<agen::llm_client::ResponseStream, agen::llm_client::ClientError> {
+        self.authority
+            .authorize_supply()
+            .await
+            .map_err(agen::llm_client::ClientError::Config)?;
+        self.inner.stream(request).await
+    }
+    fn tool_call_completion_support(&self) -> agen::llm_client::ToolCallCompletionSupport {
+        self.inner.tool_call_completion_support()
+    }
+    fn validate_config(
+        &self,
+        config: &agen::llm_client::RequestConfig,
+    ) -> Vec<agen::llm_client::ConfigWarning> {
+        self.inner.validate_config(config)
+    }
+}
+
+/// Explicit Host-supplied modules, input authority and satisfied Profile requirements.
+/// Profile names never issue this grant. The Host binds operations to the immutable
+/// request/attempt and fences them on cancellation, timeout and shutdown.
 #[derive(Default)]
 pub struct JobFeatureGrant {
     pub features: FeatureRegistryBuilder,
     pub satisfied_requirements: Vec<&'static str>,
     pub finalizer: Option<Arc<dyn JobResultFinalizer>>,
+    pub input_authority: Option<Arc<dyn JobInputAuthority>>,
 }
 
 pub fn prepare_job_with_grant(
@@ -256,6 +298,13 @@ fn prepare_job_from_registry_with_grant(
     let client = match client {
         Some(client) => client,
         None => crate::model_client::build_client_from_config(&model_config)?,
+    };
+    let client: Box<dyn LlmClient> = match grant.input_authority {
+        Some(authority) => Box::new(AuthorizedJobClient {
+            inner: client,
+            authority,
+        }),
+        None => client,
     };
     Ok(PreparedInternalJob {
         request: request.clone(),

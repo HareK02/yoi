@@ -19,6 +19,7 @@
 //! and surface repair use shared-domain CAS/receipts.
 
 mod admission;
+mod authority;
 use admission::{ConsolidationAdmission, schedule_job};
 mod journal;
 pub(crate) use journal::prepare_worker_deletion;
@@ -76,6 +77,7 @@ pub struct StandaloneSubjects {
     memory_language: String,
     manager: FeatureStorage,
     store: SubjektivStore,
+    permissions: Mutex<worker::feature::permissions::FeaturePermissionRegistry>,
 }
 
 impl StandaloneSubjects {
@@ -155,6 +157,11 @@ impl StandaloneSubjects {
         let registration = SubjektivStore::register(&scope)?;
         let store = SubjektivStore::open(&scope, &registration)?;
         protect_tree(&db_root)?;
+        let permissions = worker::feature::permissions::builtin_permission_registry(
+            ::feature_permissions::WorkspaceId::parse(scope_id.clone())
+                .map_err(SubjectError::InvalidScope)?,
+        )
+        .map_err(|error| SubjectError::InvalidScope(error.to_string()))?;
         Ok(Self {
             state_root,
             root,
@@ -162,6 +169,7 @@ impl StandaloneSubjects {
             memory_language,
             manager,
             store,
+            permissions: Mutex::new(permissions),
         })
     }
 
@@ -578,6 +586,18 @@ impl LocalSubjectHost {
                     error,
                 )
             })?;
+        self.registration_policy()
+    }
+    fn registration_policy(&self) -> Result<(), SubjektivHostError> {
+        self.check_current_policy("session.record")
+            .map_err(|error| {
+                let cause = if matches!(error, SubjektivHostError::PermissionDenied(_)) {
+                    SessionRegistrationCause::denied(SessionPrincipal::Subject)
+                } else {
+                    SessionRegistrationCause::outcome_unknown()
+                };
+                SubjektivHostError::session_registration(cause, error)
+            })?;
         Ok(())
     }
     fn attribution(
@@ -590,6 +610,7 @@ impl LocalSubjectHost {
         if let Some(checkpoint) = self.registration_before_attribution.lock().unwrap().take() {
             checkpoint();
         }
+        self.registration_policy()?;
         let store = &self.catalog.store;
         if let Some(record) = store
             .session_attribution(&context.session_id)
@@ -604,6 +625,7 @@ impl LocalSubjectHost {
                     source: None,
                 });
             }
+            self.registration_policy()?;
             store
                 .bind_journal_session(&self.writer, record.clone())
                 .map_err(registration_journal_error)?;
@@ -624,6 +646,7 @@ impl LocalSubjectHost {
             &context.session_id,
         )
         .map_err(registration_domain_error)?;
+        self.registration_policy()?;
         let record = store
             .record_session_attribution(record)
             .map_err(registration_domain_error)?;
@@ -1300,6 +1323,25 @@ impl LocalSubjectHost {
         Ok(())
     }
 }
+fn memory_operation_name(operation: &SubjektivMemoryBackendOperation) -> &'static str {
+    use SubjektivMemoryBackendOperation::*;
+    match operation {
+        ResidentSummary(_) | ResidentContext(_) => "memory.resident.read",
+        Query(_) => "memory.query",
+        Read(_) => "memory.read",
+        ListChanges(_) => "memory.changes.list",
+        ValidateProposal(_) => "memory.proposal.validate",
+        ReceiptStatus(_) => "memory.receipt.read",
+        StageExplicit(_) => "memory.staging.write",
+        ListCandidates(_) => "memory.staging.list",
+        ReadCandidate(_) => "memory.staging.read",
+        DecideCandidate(_) => "memory.candidate.decide",
+        PrepareSurface(_) => "memory.surface.prepare",
+        PublishSurface(_) => "memory.surface.publish",
+        FailSurface(_) => "memory.surface.fail",
+    }
+}
+
 impl SubjektivHost for LocalSubjectHost {
     fn authorize_operation(
         &self,
@@ -1314,30 +1356,21 @@ impl SubjektivHost for LocalSubjectHost {
         } else {
             self.body(context)?;
         }
-        match operation {
-            "session.record"
-            | "memory.resident.read"
-            | "memory.resident.supply"
-            | "memory.surface.supply"
-            | "memory.query"
-            | "memory.read"
-            | "memory.changes.list"
-            | "memory.proposal.validate"
-            | "memory.receipt.read"
-            | "memory.staging.write"
-            | "memory.extract.read"
-            | "memory.extract.supply"
-            | "memory.extract.commit"
-            | "memory.consolidation.request"
-            | "journal.startup.read"
-            | "journal.startup.supply"
-            | "journal.compaction.read"
-            | "journal.compaction.supply"
-            | "journal.recording.request" => Ok(()),
-            _ => Err(SubjektivHostError::PermissionDenied(format!(
-                "operation `{operation}` is not granted by the local Subject body capability"
-            ))),
+        if matches!(
+            operation,
+            "memory.staging.list"
+                | "memory.staging.read"
+                | "memory.candidate.decide"
+                | "memory.surface.prepare"
+                | "memory.surface.publish"
+                | "memory.surface.fail"
+        ) || journal::JOURNAL_OPERATIONS.contains(&operation)
+        {
+            return Err(SubjektivHostError::PermissionDenied(
+                "operation requires a limited Job, not the Subject body".into(),
+            ));
         }
+        self.authorize_current(operation)
     }
 
     fn memory_journal(
@@ -1345,13 +1378,25 @@ impl SubjektivHost for LocalSubjectHost {
         context: &SubjektivHostContext,
         request: subjektiv::journal::memory_links::MemoryJournalRequest,
     ) -> Result<subjektiv::journal::memory_links::MemoryJournalResponse, SubjektivHostError> {
-        self.body(context)?;
+        use subjektiv::journal::memory_links::MemoryJournalRequest;
+        let operation = match &request {
+            MemoryJournalRequest::Reconcile { .. } | MemoryJournalRequest::ReconcilePage { .. } => {
+                "journal.memory.links.reconcile"
+            }
+            MemoryJournalRequest::Links { .. } | MemoryJournalRequest::LinksPage { .. } => {
+                "journal.memory.links.read"
+            }
+            MemoryJournalRequest::Read { .. } => "journal.memory.read",
+            MemoryJournalRequest::Related { .. } => "journal.memory.related.read",
+        };
+        self.authorize_operation(context, operation)?;
         let reader = subjektiv::journal::JournalHostContext::validated_reader(
             &self.catalog.store,
             &self.binding.subject_id,
         )
         .map_err(journal::journal_error)?;
-        self.catalog
+        let response = self
+            .catalog
             .store
             .execute_memory_journal_with_source_presence(&reader, request, |session| {
                 crate::subjektiv_sessions::original_session_presence(
@@ -1362,7 +1407,9 @@ impl SubjektivHost for LocalSubjectHost {
                     session,
                 )
             })
-            .map_err(journal::journal_error)
+            .map_err(journal::journal_error)?;
+        self.authorize_operation(context, operation)?;
+        Ok(response)
     }
     fn journal_startup_granted(&self) -> bool {
         self.live.load(Ordering::Acquire)
@@ -1371,7 +1418,7 @@ impl SubjektivHost for LocalSubjectHost {
         &self,
         context: &SubjektivHostContext,
     ) -> Result<subjektiv::journal::startup::JournalStartupSnapshot, SubjektivHostError> {
-        self.body(context)?;
+        self.authorize_operation(context, "journal.startup.read")?;
         let reader = subjektiv::journal::JournalHostContext::validated_reader(
             &self.catalog.store,
             &self.binding.subject_id,
@@ -1382,10 +1429,13 @@ impl SubjektivHost for LocalSubjectHost {
             .store
             .journal_predecessor_session(&self.writer)
             .map_err(journal::journal_error)?;
-        self.catalog
+        let snapshot = self
+            .catalog
             .store
             .journal_startup_snapshot(&reader, predecessor.as_deref())
-            .map_err(journal::journal_error)
+            .map_err(journal::journal_error)?;
+        self.authorize_operation(context, "journal.startup.read")?;
+        Ok(snapshot)
     }
     fn journal_compaction_granted(&self) -> bool {
         self.live.load(Ordering::Acquire)
@@ -1394,7 +1444,7 @@ impl SubjektivHost for LocalSubjectHost {
         &self,
         context: &SubjektivHostContext,
     ) -> Result<subjektiv::journal::startup::JournalStartupSnapshot, SubjektivHostError> {
-        self.body(context)?;
+        self.authorize_operation(context, "journal.compaction.read")?;
         let attribution = self
             .catalog
             .store
@@ -1420,10 +1470,13 @@ impl SubjektivHost for LocalSubjectHost {
                 "compaction writer lifetime mismatch".into(),
             ));
         }
-        self.catalog
+        let snapshot = self
+            .catalog
             .store
             .journal_compaction_snapshot(&host)
-            .map_err(journal::journal_error)
+            .map_err(journal::journal_error)?;
+        self.authorize_operation(context, "journal.compaction.read")?;
+        Ok(snapshot)
     }
     fn journal_recording_granted(&self) -> bool {
         self.live.load(Ordering::Acquire)
@@ -1433,6 +1486,7 @@ impl SubjektivHost for LocalSubjectHost {
         context: &SubjektivHostContext,
         _reason: subjektiv::journal::transport::JournalRecordingReason,
     ) -> Result<subjektiv::journal::transport::JournalRecordingResponse, SubjektivHostError> {
+        self.authorize_operation(context, "journal.recording.request")?;
         let admitted = self.admit_journal(context)?;
         self.wake_journals();
         Ok(if admitted {
@@ -1451,7 +1505,8 @@ impl SubjektivHost for LocalSubjectHost {
         context: &SubjektivHostContext,
         mut operation: SubjektivMemoryBackendOperation,
     ) -> Result<SubjektivMemoryBackendResponse, SubjektivHostError> {
-        self.body(context)?;
+        let operation_name = memory_operation_name(&operation);
+        self.authorize_operation(context, operation_name)?;
         let attribution =
             if let SubjektivMemoryBackendOperation::StageExplicit(input) = &mut operation {
                 if input.session_id != context.session_id {
@@ -1475,27 +1530,39 @@ impl SubjektivHost for LocalSubjectHost {
             attribution,
         )
         .map_err(operation_error)?;
-        subjektiv::api::execute(&self.catalog.store, &authority, operation).map_err(operation_error)
+        self.authorize_operation(context, operation_name)?;
+        let response = subjektiv::api::execute(&self.catalog.store, &authority, operation)
+            .map_err(operation_error)?;
+        self.authorize_operation(context, operation_name)?;
+        Ok(response)
     }
     fn session(
         &self,
         context: &SubjektivHostContext,
         operation: SubjektivSessionBackendOperation,
     ) -> Result<SubjektivSessionBackendResponse, SubjektivHostError> {
-        self.body(context)?;
-        crate::subjektiv_sessions::execute(
+        let operation_name = match &operation {
+            SubjektivSessionBackendOperation::List(_) => "session.list",
+            SubjektivSessionBackendOperation::Search(_) => "session.search",
+            SubjektivSessionBackendOperation::Read(_) => "session.read",
+        };
+        self.authorize_operation(context, operation_name)?;
+        let response = crate::subjektiv_sessions::execute(
             &self.catalog.state_root,
             &self.binding.scope_id,
             &self.binding.subject_id,
             &self.catalog.store,
             operation,
-        )
+        )?;
+        self.authorize_operation(context, operation_name)?;
+        Ok(response)
     }
     fn stage_candidate(
         &self,
         context: &SubjektivHostContext,
         mut operation: memory::backend::MemoryStageCandidateOperation,
     ) -> Result<SubjektivStageCandidateResponse, SubjektivHostError> {
+        self.authorize_operation(context, "memory.extract.commit")?;
         let attribution = self.attribution(context, false)?;
         self.validate_evidence(
             &context.session_id,
@@ -1521,6 +1588,7 @@ impl SubjektivHost for LocalSubjectHost {
             operation.evidence,
             operation.source_refs,
         );
+        self.authorize_operation(context, "memory.extract.commit")?;
         let (staged, _) = self
             .catalog
             .store
@@ -1551,7 +1619,7 @@ impl SubjektivHost for LocalSubjectHost {
         context: &SubjektivHostContext,
         operation: memory::backend::MemoryConsolidateStagingOperation,
     ) -> Result<memory::backend::MemoryConsolidationOutput, SubjektivHostError> {
-        self.body(context)?;
+        self.authorize_operation(context, "memory.consolidation.request")?;
         let jobs = self.jobs()?;
         if let Some(pending) = jobs
             .pending()
@@ -1610,6 +1678,7 @@ impl SubjektivHost for LocalSubjectHost {
         let grant = LocalConsolidationGrant {
             binding: self.binding.clone(),
             candidate_ids: ids,
+            operations: Some(self.freeze_operations(CONSOLIDATION_OPERATIONS)?),
         };
         let request=job::JobRequest {
             job_id:format!("subjektiv-consolidation:{}",uuid::Uuid::now_v7()),purpose:"subjektiv_consolidation".into(),
@@ -1632,11 +1701,27 @@ impl SubjektivHost for LocalSubjectHost {
     }
 }
 
+const CONSOLIDATION_OPERATIONS: &[&str] = &[
+    "memory.consolidation.supply",
+    "memory.query",
+    "memory.read",
+    "memory.changes.list",
+    "memory.staging.list",
+    "memory.staging.read",
+    "memory.candidate.decide",
+    "memory.surface.prepare",
+    "memory.surface.supply",
+    "memory.surface.publish",
+    "memory.surface.fail",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalConsolidationGrant {
     binding: StandaloneSubjectBinding,
     candidate_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operations: Option<Vec<String>>,
 }
 struct LocalDomainProvider(std::sync::Weak<LocalSubjectHost>);
 impl crate::jobs::JobDomainProvider for LocalDomainProvider {
@@ -1660,6 +1745,8 @@ impl crate::jobs::JobDomainProvider for LocalDomainProvider {
             return journal::grant(host, snapshot, fence)
                 .map_err(crate::jobs::JobServiceError::Configuration);
         }
+        host.authorize_current("memory.consolidation.supply")
+            .map_err(|error| crate::jobs::JobServiceError::Configuration(error.to_string()))?;
         host.ensure_consolidation_live()
             .map_err(ConsolidationRecoveryError::into_service)?;
         let grant = host
@@ -1687,6 +1774,7 @@ impl crate::jobs::JobDomainProvider for LocalDomainProvider {
         Ok(worker::job::JobFeatureGrant {
             features: worker::feature::FeatureRegistryBuilder::new().with_module(feature),
             satisfied_requirements: vec!["feature.subjektiv"],
+            input_authority: Some(adapter.clone()),
             finalizer: Some(Arc::new(LocalConsolidationFinalizer {
                 adapter,
                 connection,
@@ -1714,6 +1802,22 @@ impl LocalConsolidationHost {
         ))
     }
 }
+#[async_trait::async_trait]
+impl worker::job::JobInputAuthority for LocalConsolidationHost {
+    async fn authorize_supply(&self) -> Result<(), String> {
+        let _effects = self.fence.enter()?;
+        let attempt = format!("job:{}", self.attempt_id);
+        self.authorize_operation(
+            &SubjektivHostContext {
+                worker_id: attempt.clone(),
+                session_id: attempt,
+            },
+            "memory.consolidation.supply",
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
 impl SubjektivHost for LocalConsolidationHost {
     fn authorize_operation(
         &self,
@@ -1727,23 +1831,20 @@ impl SubjektivHost for LocalConsolidationHost {
                 "context is not bound to this local consolidation attempt".into(),
             ));
         }
-        // The Host-issued batch/attempt grant is independent of body permission.
-        // Domain operations still enforce candidate membership and saved receipts.
-        match operation {
-            "memory.query"
-            | "memory.read"
-            | "memory.changes.list"
-            | "memory.staging.list"
-            | "memory.staging.read"
-            | "memory.candidate.decide"
-            | "memory.surface.prepare"
-            | "memory.surface.supply"
-            | "memory.surface.publish"
-            | "memory.surface.fail" => Ok(()),
-            _ => Err(SubjektivHostError::PermissionDenied(format!(
+        // Missing operations are the finite operation grant issued by the old
+        // Host, not a shared-set reference. Explicit empty stays empty.
+        if !CONSOLIDATION_OPERATIONS.contains(&operation)
+            || self
+                .grant
+                .operations
+                .as_ref()
+                .is_some_and(|keys| !keys.iter().any(|key| key == operation))
+        {
+            return Err(SubjektivHostError::PermissionDenied(format!(
                 "operation `{operation}` is not granted by the local consolidation attempt"
-            ))),
+            )));
         }
+        self.host.authorize_current(operation)
     }
 
     fn settings(&self) -> SubjektivHostSettings {
@@ -1754,14 +1855,15 @@ impl SubjektivHost for LocalConsolidationHost {
     }
     fn memory(
         &self,
-        _context: &SubjektivHostContext,
+        context: &SubjektivHostContext,
         operation: SubjektivMemoryBackendOperation,
     ) -> Result<SubjektivMemoryBackendResponse, SubjektivHostError> {
         let _effects = self
             .fence
             .enter()
             .map_err(SubjektivHostError::Unavailable)?;
-        self.host.ensure_live()?;
+        let operation_name = memory_operation_name(&operation);
+        self.authorize_operation(context, operation_name)?;
         let authority = subjektiv::api::HostOperationContext::validated_consolidation(
             &self.host.catalog.store,
             &self.grant.binding.subject_id,
@@ -1772,8 +1874,10 @@ impl SubjektivHost for LocalConsolidationHost {
             }),
         )
         .map_err(operation_error)?;
-        subjektiv::api::execute(&self.host.catalog.store, &authority, operation)
-            .map_err(operation_error)
+        let response = subjektiv::api::execute(&self.host.catalog.store, &authority, operation)
+            .map_err(operation_error)?;
+        self.authorize_operation(context, operation_name)?;
+        Ok(response)
     }
     fn session(
         &self,

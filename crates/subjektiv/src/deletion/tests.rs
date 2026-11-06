@@ -230,12 +230,13 @@ fn deletion_identity_conflicts_are_scope_wide_but_do_not_cross_workspaces() {
     assert_eq!(store.list_memories(&b).unwrap().len(), 1);
     let fresh = store.create_subject(role()).unwrap().id;
     assert!(store.list_memories(&fresh).unwrap().is_empty());
-    let fresh_source = store.subject_permissions(&fresh).unwrap().unwrap();
+    let fresh_source = store.current_subject_policy(&fresh).unwrap().unwrap();
     assert_eq!(
         fresh_source.execution,
-        server_api::authorization::subject_conversation_permissions(store.scope_id(), &fresh)
+        server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(fresh_source.delegation.is_empty());
+    assert!(fresh_source.delegation.grants.is_empty());
+    assert!(fresh_source.legacy_constraints.is_none());
 }
 
 #[test]

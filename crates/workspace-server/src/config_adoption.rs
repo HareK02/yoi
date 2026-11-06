@@ -125,6 +125,33 @@ pub(crate) struct CanonicalConfigurationSource {
 }
 
 impl subjektiv::CanonicalPermissionSource for CanonicalConfigurationSource {
+    fn subject_policy_source(
+        &self,
+        workspace: &str,
+        subject: &str,
+    ) -> subjektiv::Result<Option<server_api::authorization::SubjectPolicySource>> {
+        self.current_subject_policy(workspace, subject)
+            .map(|source| source.map(server_api::authorization::SubjectPolicySource::Feature))
+    }
+
+    fn current_subject_policy(
+        &self,
+        workspace: &str,
+        subject: &str,
+    ) -> subjektiv::Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
+        if self.host.catalog().workspace.as_str() != workspace {
+            return Err(subjektiv::SubjektivError::PermissionTransferConflict);
+        }
+        self.store
+            .adopted_subject_policy(workspace, subject)
+            .map(|policy| policy.map(|policy| policy.current()))
+            .map_err(|error| {
+                subjektiv::SubjektivError::InvalidRecord(format!(
+                    "canonical policy unavailable: {error}"
+                ))
+            })
+    }
+
     fn subject_permissions(
         &self,
         workspace: &str,
@@ -304,6 +331,102 @@ fn changed_subjects(
 }
 
 impl SqliteWorkspaceStore {
+    /// Complete a just-created Subject's post-seal enrollment through the *same*
+    /// source adoption writer used by owner edits. Call only from authenticated
+    /// creation/retry, never from permission reads, launch, restore or migration.
+    /// `account` is the authenticated Workspace owner, `schema` the application's
+    /// composed config_schema_registry and `host` its current registered catalog.
+    ///
+    /// Feature creation commits independently. A failure leaves durable enrollment
+    /// evidence and no permission: retry creation with its original request, then
+    /// call this again. The stable Server adoption receipt consumes enrollment once;
+    /// historical replay never edits today's source or revives a removed policy.
+    /// No new database, policy mirror, migration writer or path-based authority.
+    pub(crate) fn enroll_created_subject(
+        &self,
+        workspace: &str,
+        account: &str,
+        legacy: &subjektiv::SubjektivStore,
+        subject: &str,
+        schema: WorkspaceConfigSchemaBundle,
+        host: &PermissionHost,
+    ) -> Result<Option<ConfigurationAdoptionResult>> {
+        // Authenticate before looking at Feature metadata or enrollment evidence.
+        self.configuration_current(workspace, account)?;
+        if legacy.scope_id() != workspace || host.catalog().workspace.as_str() != workspace {
+            return Err(Error::WorkspaceIdMismatch);
+        }
+        let enrollment = legacy
+            .subject_permission_enrollment(subject)
+            .map_err(|error| Error::Store(format!("Subject enrollment: {error}")))?;
+        let Some(enrollment) = enrollment else {
+            return Ok(None);
+        };
+        let operation = format!("subject-enrollment:{subject}");
+        let identity = legacy
+            .database_identity()
+            .map_err(|error| Error::Store(format!("Subject enrollment identity: {error}")))?;
+        legacy.with_permission_authority_guard(&identity, |authority| {
+            // Holds Feature lifecycle/deletion fence before entering Server storage.
+            authority.require_subject(subject)?;
+            Ok((|| {
+                // Read-only receipt lookup precedes current-source checks. It is
+                // historical evidence, not a request to apply the saved assignment.
+                if let Some(saved) = self.configuration_adoption_result(workspace, account, &operation)? {
+                    return Ok(Some(saved));
+                }
+                let current = self.configuration_current(workspace, account)?;
+                if !current.canonical {
+                    return Err(conflict("Subject creation is sealed but the configuration transfer is not adopted; reconcile that transfer first"));
+                }
+                let contract = config_source::ToolchainContract::with_schema_bundle(
+                    current.state.contract.schema_version,
+                    current.state.contract.entrypoints.clone(),
+                    current.state.contract.import_policy_version,
+                    schema.clone(),
+                );
+                let evaluated = config_source::SnapshotEnvironment::new(current.state.snapshot.clone())
+                    .evaluate_contract(&contract)
+                    .map_err(|error| Error::InvalidInput(format!("Subject enrollment source: {error:?}")))?;
+                let source = policy_config::source(&evaluated)?;
+                // An explicit owner decision always wins. Consume the enrollment
+                // with a no-op ordinary adoption so a later deletion cannot make
+                // this creation receipt an unconsumed default issuance request.
+                let changes = if current.policies.contains_key(subject)
+                    || source.subjects.iter().any(|item| item.subject_id == subject)
+                    || source.remove_subjects.iter().any(|item| item == subject) {
+                    vec![]
+                } else {
+                    let server_api::authorization::SubjectPolicySource::Feature(policy) = &enrollment else {
+                        return Err(Error::InvalidInput("legacy creation enrollment needs explicit source configuration; no default was issued".into()));
+                    };
+                    let assignment = AdoptedSubjectPolicy::from_current(subject, policy);
+                    let editing = WorkspaceConfigState { contract: contract.clone(), ..current.state.clone() };
+                    crate::configuration_migration::enrollment_changes(&editing, &assignment.source)?
+                };
+                let request = ConfigurationAdoptionRequest {
+                    operation_id: operation,
+                    expected_head: current.history_head,
+                    expected_catalog_digest: catalog_digest(host)?,
+                    expected_legacy_export: None,
+                    source: ConfigCommitRequest {
+                        base_digest: current.state.snapshot.digest,
+                        changes,
+                        entrypoints: contract.entrypoints,
+                    },
+                };
+                self.adopt_configuration(workspace, account, &request, schema, host, None,
+                    |id| authority.require_subject(id).map_err(|error| Error::Store(format!("Subject enrollment reference: {error}"))),
+                    |_| Err(conflict("Subject enrollment must never migrate permission authority")),
+                ).map(Some)
+            })())
+        }).map_err(|error| Error::Store(format!("Subject enrollment guard: {error}")))?
+    }
+
+    pub(crate) fn configuration_policy_is_canonical(&self, workspace: &str) -> Result<bool> {
+        self.with_conn(|connection| canonical(connection, workspace))
+    }
+
     pub(crate) fn configuration_current(
         &self,
         workspace: &str,

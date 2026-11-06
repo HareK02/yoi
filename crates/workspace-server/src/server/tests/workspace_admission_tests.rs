@@ -828,7 +828,7 @@ async fn create_and_restore_session_callbacks_finish_while_deletion_start_waits(
                 operation_id: "session-callback-grant".into(),
                 expected_change_id: Some(
                     subjektiv
-                        .subject_permissions(&subject.id)
+                        .current_subject_policy(&subject.id)
                         .unwrap()
                         .unwrap()
                         .change_id,

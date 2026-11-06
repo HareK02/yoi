@@ -27,7 +27,7 @@ fn replace(
     let update = SubjectPermissionsUpdate {
         operation_id: operation.into(),
         expected_change_id: store
-            .subject_permissions(subject)
+            .current_subject_policy(subject)
             .unwrap()
             .map(|source| source.change_id),
         execution: vec![],
@@ -437,8 +437,11 @@ fn sealed_reads_and_new_grants_use_only_exact_injected_source_and_creation_does_
     store.database.try_with_connection::<_, SubjektivError>(|connection| {
         for id in [&created.id, &non_idempotent.id] {
             let raw: String = connection.query_row("SELECT permission_enrollment_json FROM subject_creation_receipts WHERE subject_id=?1", [id], |row| row.get(0))?;
-            let enrollment: SubjectPermissions = serde_json::from_str(&raw)?;
-            assert!(!enrollment.execution.is_empty());
+            let enrollment: SubjectPolicySource = serde_json::from_str(&raw)?;
+            let SubjectPolicySource::Feature(enrollment) = enrollment else {
+                panic!("new enrollment must reference Feature-owned sets");
+            };
+            assert!(!enrollment.execution.grants.is_empty());
             assert!(source_in_connection(connection, id)?.is_none());
         }
         Ok(())
@@ -623,7 +626,7 @@ fn concurrent_old_writer_and_seal_serialize_instead_of_accepting_a_changed_expor
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap().id;
-    let initial = store.subject_permissions(&subject).unwrap().unwrap();
+    let initial = store.current_subject_policy(&subject).unwrap().unwrap();
     let identity = store.database_identity().unwrap();
     let preview = store.preview_permission_transfer(&identity).unwrap();
     let barrier = Arc::new(Barrier::new(2));
