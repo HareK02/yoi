@@ -99,25 +99,6 @@
       "maxLength": 128,
       "minLength": 1
     },
-    "Diagnostic": {
-      "type": "object",
-      "properties": {
-        "code": {
-          "type": "string",
-          "maxLength": 128,
-          "minLength": 1
-        },
-        "explanation": {
-          "type": "string",
-          "maxLength": 2048,
-          "minLength": 1
-        }
-      },
-      "required": [
-        "code",
-        "explanation"
-      ]
-    },
     "FailureContext": {
       "description": "Common metadata is untrusted after deserialization. No audience label confers trust.",
       "type": "object",
@@ -143,7 +124,7 @@
         "diagnostics": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/Diagnostic"
+            "$ref": "#/$defs/FailureDiagnostic"
           },
           "maxItems": 8
         },
@@ -163,6 +144,25 @@
         "causes",
         "diagnostics",
         "supplementary_omitted"
+      ]
+    },
+    "FailureDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "explanation": {
+          "type": "string",
+          "maxLength": 2048,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "code",
+        "explanation"
       ]
     },
     "OperationContext": {
