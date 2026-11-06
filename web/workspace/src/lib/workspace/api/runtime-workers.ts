@@ -30,7 +30,10 @@ import { FAILURE_LIMITS } from "#lib/generated/error-contract.ts";
 import { failureString } from "#lib/workspace/failure/receive.ts";
 import { parseRuntimeControl } from "#lib/workspace/failure/runtime-control.ts";
 import type { RuntimeControlEvidence } from "#lib/workspace/failure/runtime-control.ts";
-import { parseWorkerSummary } from "#lib/workspace/api/workers.ts";
+import {
+  parseWorkerRemovalObservation,
+  parseWorkerSummary,
+} from "#lib/workspace/api/workers.ts";
 
 const MAX_STRING_BYTES = 4_096;
 const MAX_CANDIDATES = 1_000;
@@ -674,12 +677,20 @@ function executionResult(
   path: string,
 ): RuntimeCleanupExecutionResult {
   const item = object(value, path);
-  exactKeys(item, ["target_id", "action", "status", "message"], [], path);
+  exactKeys(
+    item,
+    ["target_id", "action", "status", "message"],
+    ["removal"],
+    path,
+  );
   return {
     target_id: boundedString(item.target_id, `${path}.target_id`),
     action: targetKind(item.action, `${path}.action`),
     status: boundedString(item.status, `${path}.status`),
     message: boundedString(item.message, `${path}.message`, true),
+    removal: item.removal == null
+      ? item.removal as null | undefined
+      : parseWorkerRemovalObservation(item.removal, `${path}.removal`),
   };
 }
 

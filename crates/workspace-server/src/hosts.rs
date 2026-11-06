@@ -76,7 +76,8 @@ use worker_runtime::interaction::{
 use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, RuntimeStatus};
 use worker_runtime::profile_archive::ProfileSourceArchive;
 use worker_runtime::retention::{
-    WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
+    WorkerRemovalFreeze, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
+    WorkerRetentionInventory,
 };
 use worker_runtime::ssh_host_key_probe::{
     SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SshHostKeyProbeRequest,
@@ -90,6 +91,35 @@ const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_RUNTIME_PING_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_REMOTE_RUNTIME_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+fn session_recording_capture_transport_budget() -> Result<usize, RuntimeDiagnostic> {
+    // Capture budgets include slice metadata/escaping, but exclude the normal
+    // endpoint's availability enum. Measure that wrapper from the actual wire
+    // DTO rather than reserving an arbitrary number of bytes. The generated
+    // Axum/reqwest contract serializes this DTO directly, with no other envelope.
+    let slice = session_store::capture::RecordingCaptureSlice {
+        capture: session_store::capture::CaptureDto {
+            version: 1,
+            session_id: String::new(),
+            segment_id: String::new(),
+            view_entry_count: 0,
+            entries: Vec::new(),
+        },
+        next: None,
+    };
+    let encode_error = |_| {
+        diagnostic(
+            "recording_capture_transport_budget_failed",
+            HostDiagnosticSeverity::Error,
+            "could not measure recording capture response envelope",
+        )
+    };
+    let slice_bytes = serde_json::to_vec(&slice).map_err(encode_error)?.len();
+    let response = runtime_api::SessionRecordingCaptureAvailability::Captured { slice };
+    let response_bytes = serde_json::to_vec(&response).map_err(encode_error)?.len();
+    Ok(MAX_REMOTE_RUNTIME_RESPONSE_BYTES - (response_bytes - slice_bytes))
+}
+
 // Runtime creation can spend up to 60s bootstrapping; durable Submit
 // acceptance is acknowledged before the potentially long run preparation.
 const REMOTE_WORKER_CREATE_TIMEOUT: Duration = Duration::from_secs(80);
@@ -417,6 +447,7 @@ pub(crate) fn workspace_worker_summary(
     workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
 ) -> server_api::WorkerSummary {
     server_api::WorkerSummary {
+        removal: None,
         restore_observation_token: summary.restore_observation_token,
         runtime_id: summary.worker.runtime_id,
         worker_id: summary.worker.worker_id,
@@ -1435,6 +1466,29 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         Err(format!(
             "runtime does not implement retention execution for '{}'",
             request.worker_id
+        ))
+    }
+
+    fn freeze_worker_removal(
+        &self,
+        _request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_removal_freeze_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support operation-bound Worker removal freeze",
+        ))
+    }
+
+    fn capture_worker_removal_session(
+        &self,
+        _worker_id: &str,
+        _request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_removal_capture_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support frozen Worker removal recording capture",
         ))
     }
 
@@ -2549,6 +2603,62 @@ impl RuntimeRegistry {
                 runtime_id: worker.runtime_id.clone(),
                 code: "worker_retention_execution_failed".to_string(),
                 message,
+            })
+    }
+
+    pub fn freeze_worker_removal(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        if request.worker_id.to_string() != worker.worker_id
+            || request.source_runtime_id != worker.runtime_id
+        {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_removal_target_mismatch".into(),
+                message: "removal request Runtime/Worker identity does not match target".into(),
+            });
+        }
+        let expected = request.clone();
+        let freeze = self
+            .runtime(&worker.runtime_id)?
+            .freeze_worker_removal(request)
+            .map_err(|cause| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: cause.code,
+                message: cause.message,
+            })?;
+        if freeze.operation_id != expected.operation_id
+            || freeze.input_fingerprint != expected.input_fingerprint
+            || freeze.workspace_id != expected.workspace_id
+            || freeze.source_runtime_id != expected.source_runtime_id
+            || freeze.worker_id != expected.worker_id
+        {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_removal_freeze_identity_mismatch".into(),
+                message: "Runtime removal freeze does not match the exact retention request".into(),
+            });
+        }
+        Ok(freeze)
+    }
+
+    pub fn capture_worker_removal_session(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        self.runtime(&worker.runtime_id)?
+            .capture_worker_removal_session(&worker.worker_id, request)
+            .map_err(|cause| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: cause.code,
+                message: cause.message,
             })
     }
 
@@ -3759,6 +3869,58 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         self.runtime
             .execute_worker_retention(&request)
             .map_err(|error| error.to_string())
+    }
+
+    fn freeze_worker_removal(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id || request.source_runtime_id != self.runtime_id
+        {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal request does not match embedded Runtime/Workspace",
+            ));
+        }
+        let scope = RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend");
+        self.runtime
+            .freeze_worker_removal_scoped(&scope, &request)
+            .map_err(|error| embedded_runtime_diagnostic(&error))
+    }
+
+    fn capture_worker_removal_session(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal capture Workspace does not match embedded Runtime",
+            ));
+        }
+        let worker_id = EmbeddedWorkerId::parse(worker_id).ok_or_else(|| {
+            diagnostic(
+                "embedded_worker_id_invalid",
+                HostDiagnosticSeverity::Error,
+                "invalid Worker identity for removal capture",
+            )
+        })?;
+        let scope = RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend");
+        self.runtime
+            .capture_worker_removal_session_scoped(
+                &scope,
+                &request.operation_id,
+                worker_id,
+                request.session_id,
+                request.active_segment_id,
+                request.start,
+                request.max_entries,
+                request.max_serialized_bytes,
+            )
+            .map_err(|error| embedded_runtime_diagnostic(&error))
     }
 
     fn worker_session(
@@ -5103,6 +5265,36 @@ impl RemoteWorkerRuntime {
             })
     }
 
+    fn run_runtime_api_with_diagnostic<T, F, Fut>(
+        &self,
+        timeout: Duration,
+        response_body_limit: usize,
+        operation: F,
+        map_error: fn(
+            &str,
+            runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+        ) -> RuntimeDiagnostic,
+    ) -> Result<T, RuntimeDiagnostic>
+    where
+        T: Send + 'static,
+        F: FnOnce(runtime_api::RuntimeApiClient<RemoteRuntimeApiAuthorizer>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    T,
+                    runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+                >,
+            > + Send
+            + 'static,
+    {
+        self.run_runtime_api_typed(timeout, response_body_limit, operation)
+            .map_err(|error| match error {
+                RemoteRuntimeApiError::ClientSetup(diagnostic) => diagnostic,
+                RemoteRuntimeApiError::Client(error) => map_error(&self.runtime_id, error),
+            })
+    }
+
     // Execute through the existing generated client and bounds, retaining its typed error
     // until the control adapter has classified it. Other operations keep the legacy helper.
     fn run_runtime_api_typed<T, F, Fut>(
@@ -6418,6 +6610,60 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         .map_err(|diagnostic| diagnostic.message)
     }
 
+    fn freeze_worker_removal(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id || request.source_runtime_id != self.runtime_id
+        {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal request does not match remote Runtime/Workspace",
+            ));
+        }
+        let worker_id = request.worker_id.to_string();
+        let request = runtime_contract_convert(request)?;
+        self.run_runtime_api_with_diagnostic(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.freeze_worker_removal(worker_id, request).await },
+            runtime_removal_api_diagnostic,
+        )
+    }
+
+    fn capture_worker_removal_session(
+        &self,
+        worker_id: &str,
+        mut request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal capture Workspace does not match remote Runtime",
+            ));
+        }
+        // The generated endpoint returns RecordingCaptureSlice directly as JSON,
+        // without an availability wrapper. Its budget already includes all slice
+        // metadata and JSON escaping, so the entire response-body limit is usable.
+        // The caller separately constrains its durable Job input envelope.
+        request.max_serialized_bytes = request
+            .max_serialized_bytes
+            .min(MAX_REMOTE_RUNTIME_RESPONSE_BYTES);
+        let worker_id = worker_id.to_string();
+        self.run_runtime_api_with_diagnostic(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .capture_worker_removal_session(worker_id, request)
+                    .await
+            },
+            runtime_removal_api_diagnostic,
+        )
+    }
+
     fn worker_session(
         &self,
         workspace_id: &str,
@@ -6564,8 +6810,11 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
 
     fn session_recording_capture(
         &self,
-        request: runtime_api::SessionRecordingCaptureRequest,
+        mut request: runtime_api::SessionRecordingCaptureRequest,
     ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        request.max_serialized_bytes = request
+            .max_serialized_bytes
+            .min(session_recording_capture_transport_budget().map_err(|cause| cause.message)?);
         self.run_runtime_api(
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
@@ -7307,6 +7556,24 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             HostDiagnosticSeverity::Warning,
             workdir_diagnostic.message.clone(),
         ),
+        EmbeddedRuntimeError::RecordingSourceUnavailable { .. } => diagnostic(
+            "source_unavailable",
+            HostDiagnosticSeverity::Warning,
+            "Complete recording sources are unavailable; original input remains retained"
+                .to_string(),
+        ),
+        EmbeddedRuntimeError::RecordingOwnershipUnknown { .. } => diagnostic(
+            "ownership_unknown",
+            HostDiagnosticSeverity::Warning,
+            "Complete recording source ownership is unconfirmed; original input remains retained"
+                .to_string(),
+        ),
+        EmbeddedRuntimeError::RecordingExecutionUnconfirmed { .. } => diagnostic(
+            "execution_unconfirmed",
+            HostDiagnosticSeverity::Warning,
+            "Original execution quiescence is unconfirmed; original input remains retained"
+                .to_string(),
+        ),
         EmbeddedRuntimeError::InvalidRequest(_)
         | EmbeddedRuntimeError::WorkspaceOwnerMismatch { .. }
         | EmbeddedRuntimeError::ConfigBundleMissing { .. }
@@ -7504,6 +7771,35 @@ where
                 error.to_string(),
             )
         })
+}
+
+fn runtime_removal_api_diagnostic(
+    runtime_id: &str,
+    error: runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> RuntimeDiagnostic {
+    // Removal holds must retain the domain cause even when its HTTP status is
+    // authorization-related. Reuse sanitization/transport classification, not
+    // the older display-oriented collapse of all 401/403 domain codes.
+    let domain_code = match &error {
+        runtime_api::client_support::ClientError::Public { error, .. } => {
+            use protocol::control_failure::RuntimeControlCause as C;
+            Some(match error.control_cause() {
+                Some(C::RecordingSourceUnavailable) => "source_unavailable".to_owned(),
+                Some(C::RecordingOwnershipUnknown) => "ownership_unknown".to_owned(),
+                Some(C::RecordingExecutionUnconfirmed) => "execution_unconfirmed".to_owned(),
+                // Keep the bounded legacy domain code only when no typed owner
+                // cause was received. Never classify from prose or HTTP status.
+                Some(cause) => cause.reason().to_owned(),
+                None => error.error.code.clone(),
+            })
+        }
+        _ => None,
+    };
+    let mut cause = runtime_api_diagnostic(runtime_id, error);
+    if let Some(code) = domain_code {
+        cause.code = code;
+    }
+    cause
 }
 
 fn runtime_api_diagnostic(
@@ -8565,6 +8861,37 @@ mod tests {
         assert!(!diagnostic.message.contains("/private/runtime"));
         assert!(!diagnostic.message.contains("sensitive-value"));
         assert!(diagnostic.message.chars().count() < 600);
+    }
+
+    #[test]
+    fn worker_removal_embedded_causes_match_http_codes_without_source_details() {
+        let cases = [
+            (
+                EmbeddedRuntimeError::RecordingSourceUnavailable {
+                    message: "/private/source raw-body".into(),
+                },
+                "source_unavailable",
+            ),
+            (
+                EmbeddedRuntimeError::RecordingOwnershipUnknown {
+                    message: "/private/source raw-body".into(),
+                },
+                "ownership_unknown",
+            ),
+            (
+                EmbeddedRuntimeError::RecordingExecutionUnconfirmed {
+                    message: "/private/source raw-body".into(),
+                },
+                "execution_unconfirmed",
+            ),
+        ];
+        for (error, code) in cases {
+            let diagnostic = embedded_runtime_diagnostic(&error);
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.severity, HostDiagnosticSeverity::Warning);
+            assert!(!diagnostic.message.contains("/private/source"));
+            assert!(!diagnostic.message.contains("raw-body"));
+        }
     }
 
     #[test]
@@ -10727,6 +11054,279 @@ mod tests {
         server.join().expect("mock remote server finished");
     }
 
+    fn removal_request(runtime_id: &str, worker_id: &str) -> WorkerRetentionExecutionRequest {
+        WorkerRetentionExecutionRequest {
+            operation_id: "remove-op-original".into(),
+            input_fingerprint: "original-fingerprint".into(),
+            archive_id: Some("original-archive".into()),
+            workspace_id: "workspace-test".into(),
+            source_runtime_id: runtime_id.into(),
+            worker_id: EmbeddedWorkerId::parse(worker_id).unwrap(),
+            source_created_at: "2026-01-01T00:00:00Z".into(),
+            removed_at: "2026-01-02T00:00:00Z".into(),
+            effective_profile: Some("builtin:coder".into()),
+            retention_class: Some("recording".into()),
+            policy_id: "original-policy".into(),
+            session_disposition: worker_runtime::retention::SessionDisposition::Archive,
+            diagnostics_disposition: worker_runtime::retention::DiagnosticsDisposition::Retain,
+        }
+    }
+
+    fn removal_capture_request() -> runtime_api::WorkerRemovalSessionCaptureRequest {
+        runtime_api::WorkerRemovalSessionCaptureRequest {
+            workspace_id: "workspace-test".into(),
+            operation_id: "remove-op-original".into(),
+            session_id: session_store::SessionId::new_v4(),
+            active_segment_id: Some(session_store::SegmentId::new_v4()),
+            start: session_store::capture::RecordingPosition {
+                canonical_order: 17,
+                byte_offset: 23,
+            },
+            max_entries: 31,
+            max_serialized_bytes: 128 * 1024,
+        }
+    }
+
+    #[test]
+    fn worker_removal_defaults_fail_closed_and_registry_preserves_cause_codes() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let registry = RuntimeRegistry::new(vec![Arc::new(FixtureRuntime::with_worker(
+            "runtime-a",
+            "host-a",
+            &worker_id,
+            "stopped",
+        ))]);
+        let worker = RuntimeWorkerRef::new("runtime-a", &worker_id);
+        let error = registry
+            .freeze_worker_removal(&worker, removal_request("runtime-a", &worker_id))
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "worker_removal_freeze_unsupported")
+        );
+        let error = registry
+            .capture_worker_removal_session(&worker, removal_capture_request())
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "worker_removal_capture_unsupported")
+        );
+    }
+
+    #[test]
+    fn worker_removal_registry_rejects_request_target_mismatch_before_dispatch() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("runtime-a", &worker_id);
+        let registry = RuntimeRegistry::new(Vec::new());
+        for request in [
+            removal_request("runtime-b", &worker_id),
+            removal_request("runtime-a", &EmbeddedWorkerId::now_v7().to_string()),
+        ] {
+            let error = registry
+                .freeze_worker_removal(&worker, request)
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+                if code == "worker_removal_target_mismatch")
+            );
+        }
+    }
+
+    fn removal_remote_registry(
+        responses: Vec<MockResponse>,
+    ) -> (RuntimeRegistry, thread::JoinHandle<()>) {
+        let (base_url, server) = serve_mock_http(responses);
+        let runtime = RemoteWorkerRuntime::new(
+            RemoteRuntimeConfig::new(
+                "remote:removal",
+                "Removal transport",
+                base_url,
+                Some("secret-token".into()),
+            ),
+            "workspace-test".into(),
+            "http://127.0.0.1:8787".into(),
+        )
+        .unwrap();
+        (RuntimeRegistry::new(vec![Arc::new(runtime)]), server)
+    }
+
+    #[test]
+    fn worker_removal_remote_exact_requests_preserve_domain_and_resource_causes() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+        let request = removal_request("remote:removal", &worker_id);
+        let mut capture = removal_capture_request();
+        capture.max_serialized_bytes = usize::MAX;
+        let mut transmitted = capture.clone();
+        transmitted.max_serialized_bytes = MAX_REMOTE_RUNTIME_RESPONSE_BYTES;
+        let freeze_path = format!("/v1/workers/{worker_id}/retention/freeze");
+        let capture_path = format!("/v1/workers/{worker_id}/retention/capture");
+        for path in [&freeze_path, &capture_path] {
+            assert_eq!(workspace_runtime_operation("POST", path), "workers:delete");
+        }
+        let (registry, server) = removal_remote_registry(vec![
+            MockResponse {
+                request_body: Some(serde_json::to_value(&request).unwrap()),
+                ..mock_response("POST", freeze_path, true, 409,
+                    json!({"error":{"code":"removal_operation_conflict","message":"different saved request"}}).to_string())
+            },
+            MockResponse {
+                request_body: Some(serde_json::to_value(&transmitted).unwrap()),
+                ..mock_response("POST", capture_path, true, 403,
+                    json!({"error":{"code":"removal_source_revoked","message":"source unavailable"}}).to_string())
+            },
+        ]);
+        let error = registry
+            .freeze_worker_removal(&worker, request)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "removal_operation_conflict")
+        );
+        let error = registry
+            .capture_worker_removal_session(&worker, capture)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "removal_source_revoked")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_removal_remote_problem_causes_keep_the_shared_removal_classification() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        for (cause, code) in [
+            (C::RecordingSourceUnavailable, "source_unavailable"),
+            (C::RecordingOwnershipUnknown, "ownership_unknown"),
+            (C::RecordingExecutionUnconfirmed, "execution_unconfirmed"),
+        ] {
+            let worker_id = EmbeddedWorkerId::now_v7().to_string();
+            let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+            let problem = runtime_api::control_failure::control_problem(cause).unwrap();
+            let mut response = mock_response(
+                "POST",
+                format!("/v1/workers/{worker_id}/retention/freeze"),
+                true,
+                problem.status,
+                String::from_utf8(problem.body.to_vec()).unwrap(),
+            );
+            response.content_type = problem.content_type;
+            let (registry, server) = removal_remote_registry(vec![response]);
+            let error = registry
+                .freeze_worker_removal(&worker, removal_request("remote:removal", &worker_id))
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code: actual, .. } if actual == code)
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn worker_removal_remote_oversized_freeze_is_a_resource_error_not_empty_success() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+        let request = removal_request("remote:removal", &worker_id);
+        let freeze = WorkerRemovalFreeze {
+            operation_id: request.operation_id.clone(),
+            input_fingerprint: request.input_fingerprint.clone(),
+            workspace_id: request.workspace_id.clone(),
+            source_runtime_id: request.source_runtime_id.clone(),
+            worker_id: request.worker_id,
+            members: vec![runtime_api::WorkerRemovalSessionMember {
+                session_id: session_store::SessionId::new_v4(),
+                active_segment_id: Some(session_store::SegmentId::new_v4()),
+                materialized: true,
+                end: Default::default(),
+                descriptors: Vec::new(),
+            }],
+        };
+        // Inflate metadata at the wire boundary only; this test does not attest
+        // a Runtime source enumeration or actual Worker quiescence.
+        let mut value = serde_json::to_value(freeze).unwrap();
+        value["input_fingerprint"] =
+            serde_json::Value::String("x".repeat(MAX_REMOTE_RUNTIME_RESPONSE_BYTES));
+        let (registry, server) = removal_remote_registry(vec![mock_response(
+            "POST",
+            format!("/v1/workers/{worker_id}/retention/freeze"),
+            true,
+            200,
+            value.to_string(),
+        )]);
+        let error = registry
+            .freeze_worker_removal(&worker, request)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "remote_runtime_response_too_large")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_removal_normal_capture_caps_slice_after_measuring_wire_wrapper() {
+        let worker_id = EmbeddedWorkerId::now_v7();
+        let mut request = runtime_api::SessionRecordingCaptureRequest {
+            workspace_id: "workspace-test".into(),
+            source: runtime_api::SessionPublicSource::Retained { worker_id },
+            expected_session_id: session_store::SessionId::new_v4().to_string(),
+            start: Default::default(),
+            max_entries: 1,
+            max_serialized_bytes: usize::MAX,
+        };
+        let mut capped = request.clone();
+        capped.max_serialized_bytes = session_recording_capture_transport_budget().unwrap();
+        let responses = [capped.clone(), {
+            request.max_serialized_bytes = 128 * 1024;
+            request.clone()
+        }].into_iter().map(|expected| MockResponse {
+            request_body: Some(serde_json::to_value(expected).unwrap()),
+            ..mock_response("POST", "/v1/session-public/recording-capture", true, 200,
+                json!({"availability":"unavailable","reason":"resource_limit","message":"fixture hold"}).to_string())
+        }).collect();
+        let (registry, server) = removal_remote_registry(responses);
+        capped.max_serialized_bytes = usize::MAX;
+        for input in [capped, request] {
+            assert!(matches!(
+                registry
+                    .session_recording_capture("remote:removal", input)
+                    .unwrap(),
+                runtime_api::SessionRecordingCaptureAvailability::Unavailable {
+                    reason: runtime_api::SessionPublicUnavailableReason::ResourceLimit,
+                    ..
+                }
+            ));
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recording_capture_transport_budget_measures_availability_wrapper_not_job_input() {
+        let budget = session_recording_capture_transport_budget().unwrap();
+        let slice = session_store::capture::RecordingCaptureSlice {
+            capture: session_store::capture::CaptureDto {
+                version: 1,
+                session_id: "日本語\\\"\n".repeat(10000),
+                segment_id: "segment".into(),
+                view_entry_count: u64::MAX,
+                entries: Vec::new(),
+            },
+            next: Some(session_store::capture::RecordingPosition {
+                canonical_order: u64::MAX,
+                byte_offset: u64::MAX,
+            }),
+        };
+        let slice_bytes = serde_json::to_vec(&slice).unwrap().len();
+        let response = runtime_api::SessionRecordingCaptureAvailability::Captured { slice };
+        let response_bytes = serde_json::to_vec(&response).unwrap().len();
+        assert_eq!(
+            budget + response_bytes - slice_bytes,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES
+        );
+        assert!(budget > 128 * 1024);
+    }
+
     #[derive(Clone)]
     struct MockResponse {
         method: &'static str,
@@ -10735,6 +11335,7 @@ mod tests {
         status: u16,
         content_type: &'static str,
         body: String,
+        request_body: Option<serde_json::Value>,
     }
 
     fn mock_response(
@@ -10751,6 +11352,7 @@ mod tests {
             status,
             content_type: "application/json",
             body,
+            request_body: None,
         }
     }
 
@@ -10766,11 +11368,21 @@ mod tests {
                     .unwrap();
                 let mut buffer = [0_u8; 8192];
                 let read = stream.read(&mut buffer).unwrap();
-                let mut request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let mut request = buffer[..read].to_vec();
+                let body_start = loop {
+                    if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break offset + 4;
+                    }
+                    assert!(request.len() < 65536, "oversized mock request headers");
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0, "incomplete mock request headers");
+                    request.extend_from_slice(&buffer[..read]);
+                };
+                let headers = std::str::from_utf8(&request[..body_start]).unwrap();
                 for (alias, actual) in &session_aliases {
                     expected.path = expected.path.replace(alias, actual);
                 }
-                let first_line = request.lines().next().unwrap_or_default();
+                let first_line = headers.lines().next().unwrap_or_default();
                 let expected_line = format!("{} {} ", expected.method, expected.path);
                 assert!(
                     first_line.starts_with(&expected_line),
@@ -10778,39 +11390,47 @@ mod tests {
                 );
                 if expected.require_auth {
                     assert!(
-                        request
+                        headers
                             .to_ascii_lowercase()
                             .contains("authorization: bearer secret-token"),
-                        "authorization header missing from request: {request}"
+                        "authorization header missing from request: {headers}"
                     );
                 }
-                if let Ok(mut opened) = serde_json::from_str::<
-                    workdir::http::OpenWorkdirSessionResponse,
-                >(&expected.body)
-                {
-                    let body_start = request.find("\r\n\r\n").unwrap() + 4;
-                    let length: usize = request[..body_start]
+                let opened = serde_json::from_str::<workdir::http::OpenWorkdirSessionResponse>(
+                    &expected.body,
+                )
+                .ok();
+                if expected.request_body.is_some() || opened.is_some() {
+                    let content_length = headers
                         .lines()
                         .find_map(|line| {
                             let (name, value) = line.split_once(':')?;
                             name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse().unwrap())
+                                .then(|| value.trim().parse::<usize>().unwrap())
                         })
-                        .unwrap();
-                    assert!(length <= buffer.len());
-                    while request.len() - body_start < length {
+                        .expect("JSON request content length");
+                    let mut body = request[body_start..].to_vec();
+                    while body.len() < content_length {
                         let read = stream.read(&mut buffer).unwrap();
-                        assert_ne!(read, 0, "incomplete session open request");
-                        request.push_str(std::str::from_utf8(&buffer[..read]).unwrap());
+                        assert_ne!(read, 0, "incomplete JSON request body");
+                        body.extend_from_slice(&buffer[..read]);
                     }
-                    let open: OpenWorkdirSessionRequest =
-                        serde_json::from_str(&request[body_start..]).unwrap();
-                    session_aliases.push((
-                        opened.session_id.as_str().to_owned(),
-                        open.session_id.as_str().to_owned(),
-                    ));
-                    opened.session_id = open.session_id;
-                    expected.body = serde_json::to_string(&opened).unwrap();
+                    if let Some(expected_body) = expected.request_body {
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                            expected_body
+                        );
+                    }
+                    if let Some(mut opened) = opened {
+                        let open: OpenWorkdirSessionRequest =
+                            serde_json::from_slice(&body).unwrap();
+                        session_aliases.push((
+                            opened.session_id.as_str().to_owned(),
+                            open.session_id.as_str().to_owned(),
+                        ));
+                        opened.session_id = open.session_id;
+                        expected.body = serde_json::to_string(&opened).unwrap();
+                    }
                 }
                 let status_text = match expected.status {
                     200 => "OK",
@@ -10825,7 +11445,17 @@ mod tests {
                     expected.body.len(),
                     expected.body
                 );
-                stream.write_all(response.as_bytes()).unwrap();
+                if let Err(error) = stream.write_all(response.as_bytes()) {
+                    assert!(
+                        expected.body.len() > MAX_REMOTE_RUNTIME_RESPONSE_BYTES
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            ),
+                        "unexpected mock response write failure: {error}",
+                    );
+                }
             }
         });
         (base_url, handle)

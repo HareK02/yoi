@@ -1,5 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import WorkerRemovalStatus from '#lib/workspace/workers/WorkerRemovalStatus.svelte';
+  import { workerDeletionOutcome, deletionNotice } from '#lib/workspace/workers/worker-removal.ts';
   import WorkerDriveGrants from '#lib/workspace/drive-grants/WorkerDriveGrants.svelte';
   import { canRestoreWorker, createRestoreRequest, restoreWorkspaceWorker, restoreNotice, restoreErrorNotice, type RestoreRequest } from '#lib/workspace/sidebar/worker-actions.ts';
   import { workspaceWorkersStore, refreshWorkspaceWorkers } from '#lib/workspace/sidebar/worker-subscription.ts';
@@ -225,9 +227,9 @@
       if (!response.ok) throw new Error(errorMessage(payload, response.statusText));
       const execution = parseRuntimeCleanupExecution(payload);
       const result = execution.results.find((entry) => entry.target_id === candidate.target_id);
-      if (!result || result.status !== 'deleted') {
-        throw new Error(result?.message ?? 'Runtime did not delete the selected Worker');
-      }
+      const outcome = workerDeletionOutcome(result);
+      const notice = deletionNotice(outcome);
+      pushWorkspaceAlert(notice.level, notice.message, { title: notice.title });
       await refreshWorkspaceWorkers(scope.workspaceId);
       if (!scope.isCurrent()) return;
       await refreshCleanupPlan(worker.runtime_id, scope);
@@ -320,7 +322,10 @@
               </td>
               <td><code>{worker.runtime_id}</code></td>
               <td>{workerProfile(worker)}</td>
-              <td>{workerStatus(worker)}</td>
+              <td>
+                {workerStatus(worker)}
+                {#if worker.removal}<WorkerRemovalStatus removal={worker.removal} />{/if}
+              </td>
               <td><span class="pill {worker.pinned ? 'success' : 'muted'}">{worker.retention_state ?? 'normal'}</span></td>
               <td>{workerDirectory(worker)}</td>
               <td>

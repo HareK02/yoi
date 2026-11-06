@@ -6,4 +6,5 @@
 
 Command dispatch, connection selection, and Workspace bootstrap are binary-internal. The library exposes:
 
+- [`config_cli`] — editable Workspace source checkouts and exact-request recovery; the Server owns validation, policy resolution and adoption.
 - [`workdir_share`] — sharing existing Workdirs.

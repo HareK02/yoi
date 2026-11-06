@@ -2,6 +2,7 @@
 
 pub mod backend_api;
 mod backend_auth;
+pub mod backend_configuration;
 pub mod backend_runtime;
 pub mod backend_workspace;
 mod client;

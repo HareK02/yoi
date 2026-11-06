@@ -2432,7 +2432,6 @@ struct EmptyTurnRollbackSnapshot {
     history_len: usize,
     user_segments_len: usize,
     entries_written: usize,
-    sink_len: usize,
     pending_attachments: Vec<SystemItem>,
     usage_history_len: usize,
     ai_activity_count: usize,
@@ -6497,7 +6496,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             history_len: self.session.history().len(),
             user_segments_len: self.user_segments.len(),
             entries_written: self.segment_state.entries_written(),
-            sink_len: self.sink.len(),
             pending_attachments,
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
@@ -6536,6 +6534,35 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
         snapshot: EmptyTurnRollbackSnapshot,
     ) -> Result<(), StoreError> {
         let _admission = self.segment_state.mutation_authority.enter()?;
+        // Admission can persist new work after the turn snapshot. Serialize with
+        // those appends and replace history plus the current recovery checkpoint
+        // atomically; truncating first would lose accepted work on save failure.
+        let segment_state = self.segment_state.clone();
+        let _append_guard = segment_state
+            .append_lock
+            .lock()
+            .expect("segment append lock poisoned");
+        let loc = segment_state.location();
+        let mut replacement = self.store.read_all(loc.session_id, loc.segment_id)?;
+        replacement.truncate(snapshot.entries_written);
+        let pending = pending_activation_extension(
+            &self
+                .session
+                .pending_activations
+                .lock()
+                .expect("pending activation state poisoned"),
+        );
+        replacement.push(LogEntry::Extension {
+            ts: segment_log::now_millis(),
+            domain: pending.domain,
+            payload: pending.payload,
+        });
+        replacement.push(self.protected_input_checkpoint());
+        self.store
+            .create_segment(loc.session_id, loc.segment_id, &replacement)?;
+        segment_state.set_entries_written(replacement.len());
+        self.sink.replace_silent(replacement);
+
         self.session.history_mut().truncate(snapshot.history_len);
 
         self.last_run_interrupted = snapshot.last_run_interrupted;
@@ -6556,12 +6583,6 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             .truncate(snapshot.usage_history_len);
         let _ = self.usage_tracker.drain();
         let _ = self.metrics_tracker.drain();
-        let loc = self.segment_state.location();
-        self.store
-            .truncate(loc.session_id, loc.segment_id, snapshot.entries_written)?;
-        self.segment_state
-            .set_entries_written(snapshot.entries_written);
-        self.sink.truncate_silent(snapshot.sink_len);
         Ok(())
     }
 
@@ -13182,6 +13203,398 @@ status: 200,
         fn clone_boxed(&self) -> Box<dyn LlmClient> {
             Box::new(self.clone())
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct EmptyTurnBlockedClient {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmClient for EmptyTurnBlockedClient {
+        async fn stream(
+            &self,
+            _request: agen::llm_client::Request,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<
+                                agen::llm_client::event::Event,
+                                agen::llm_client::ClientError,
+                            >,
+                        > + Send,
+                >,
+            >,
+            agen::llm_client::ClientError,
+        > {
+            self.entered.notify_one();
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn assert_empty_turn_admissions(entries: &[LogEntry], expected: &serde_json::Value) {
+        let state = segment_log::collect_state(entries);
+        let mut restored = WorkerSession::new(SessionId::now_v7(), Vec::new());
+        restored.restore_pending_activations(&state.extensions);
+        let pending = restored.pending_activations.lock().unwrap();
+        assert_eq!(serde_json::to_value(&*pending).unwrap(), *expected);
+        assert_eq!(pending.pending.len(), 1);
+        assert_eq!(
+            pending
+                .receipts
+                .iter()
+                .filter(|receipt| receipt.submission_request_id == "queued-request")
+                .count(),
+            1
+        );
+        assert_eq!(
+            pending.pending[0].input,
+            vec![Segment::text("queued original 雪")]
+        );
+        assert_eq!(pending.pending_notifications.len(), 1);
+        assert_eq!(pending.notification_receipts.len(), 1);
+        assert_eq!(
+            pending.pending_notifications[0].message,
+            "queued notification 雪"
+        );
+    }
+
+    fn accept_empty_turn_admissions<St: Store + Clone>(
+        pending: &PendingSubmissionHandle<St>,
+    ) -> serde_json::Value {
+        let provenance = WorkerHistoryProvenance::Provided {
+            producer: "empty-turn-admission-test".into(),
+        };
+        let accepted = pending
+            .accept_from_source(
+                "queued-request".into(),
+                vec![Segment::text("queued original 雪")],
+                "test-source".into(),
+                provenance.clone(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            accepted.disposition,
+            protocol::SubmissionDisposition::Queued
+        );
+        assert!(
+            pending
+                .accept_notification_from_source(
+                    "queued-notification".into(),
+                    "queued notification 雪".into(),
+                    "test-source".into(),
+                    provenance,
+                )
+                .unwrap()
+        );
+        serde_json::to_value(&*pending.state.lock().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_turn_cancel_preserves_admissions_after_store_reopen() {
+        // Failure before replacement must keep the whole old file and live
+        // mirrors, not a truncated prefix awaiting a checkpoint append.
+        for replacement_fault in [0, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = FailRunTerminalStore {
+                inner: session_store::FsStore::new(dir.path()).unwrap(),
+                fail_run_terminal: Arc::new(AtomicBool::new(false)),
+                invocation_failure: Arc::new(AtomicUsize::new(0)),
+            };
+            let client = EmptyTurnBlockedClient::default();
+            let mut worker = Worker::new(
+                minimal_manifest(),
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client.clone()),
+                store.clone(),
+                WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::None,
+                Scope::empty(),
+            )
+            .await
+            .unwrap();
+            worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
+            let pending = worker.pending_submission_handle();
+            let cancel = worker.engine().cancel_sender();
+            let loc = worker.segment_state.location();
+            let (result, (expected, before)) =
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(worker.run_text("empty turn to roll back"), async {
+                        client.entered.notified().await;
+                        let expected = accept_empty_turn_admissions(&pending);
+                        let before = store.read_all(loc.session_id, loc.segment_id).unwrap();
+                        store
+                            .invocation_failure
+                            .store(replacement_fault, Ordering::SeqCst);
+                        cancel.send(()).await.unwrap();
+                        (expected, before)
+                    })
+                })
+                .await
+                .expect("empty turn must cancel within deadline");
+            let entries = store.read_all(loc.session_id, loc.segment_id).unwrap();
+            if replacement_fault == 0 {
+                assert_eq!(result.unwrap(), WorkerRunResult::RolledBack);
+                assert!(!entries.iter().any(|entry| matches!(
+                    entry,
+                    LogEntry::AnnotatedUserInput { .. } | LogEntry::Invoke { .. }
+                )));
+                assert!(
+                    !worker
+                        .session
+                        .history()
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.item.as_text() == Some("empty turn to roll back"))
+                );
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    serde_json::to_value(&entries).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                assert!(
+                    worker
+                        .session
+                        .history()
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.item.as_text() == Some("empty turn to roll back"))
+                );
+            }
+            assert_eq!(worker.segment_state.entries_written(), entries.len());
+            assert_eq!(
+                serde_json::to_value(worker.sink.subscribe_with_snapshot().0).unwrap(),
+                serde_json::to_value(&entries).unwrap()
+            );
+            assert_empty_turn_admissions(&entries, &expected);
+            drop(worker);
+            drop(pending);
+            drop(store);
+            let reopened = session_store::FsStore::new(dir.path()).unwrap();
+            let entries = reopened.read_all(loc.session_id, loc.segment_id).unwrap();
+            assert_empty_turn_admissions(&entries, &expected);
+            let state = segment_log::collect_state(&entries);
+            let mut restored = WorkerSession::new(loc.session_id, Vec::new());
+            restored.restore_pending_activations(&state.extensions);
+            let replay = PendingSubmissionHandle {
+                state: restored.pending_activations,
+                writer: LogWriterHandle {
+                    store: reopened,
+                    state: SegmentState::new(loc.session_id, loc.segment_id, entries.len()),
+                    sink: SegmentLogSink::with_initial(entries.clone()),
+                    in_flight: None,
+                },
+            };
+            assert_eq!(accept_empty_turn_admissions_replay(&replay), expected);
+        }
+    }
+
+    fn accept_empty_turn_admissions_replay<St: Store + Clone>(
+        pending: &PendingSubmissionHandle<St>,
+    ) -> serde_json::Value {
+        let before = pending.writer.state.entries_written();
+        let accepted = pending
+            .accept_from_source(
+                "queued-request".into(),
+                vec![Segment::text("queued original 雪")],
+                "test-source".into(),
+                WorkerHistoryProvenance::LegacyUnknown,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            accepted.disposition,
+            protocol::SubmissionDisposition::Queued
+        );
+        assert!(
+            !pending
+                .accept_notification_from_source(
+                    "queued-notification".into(),
+                    "queued notification 雪".into(),
+                    "test-source".into(),
+                    WorkerHistoryProvenance::LegacyUnknown,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            pending.writer.state.entries_written(),
+            before,
+            "replay must not append"
+        );
+        serde_json::to_value(&*pending.state.lock().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn empty_turn_shutdown_preserves_current_queue_after_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let store = session_store::CombinedStore::new(
+            session_store::FsStore::new(&sessions).unwrap(),
+            session_store::FsWorkerStore::new(dir.path().join("workers")).unwrap(),
+        );
+        let client = EmptyTurnBlockedClient::default();
+        let worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client.clone()),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        let loc = worker.segment_state.location();
+        let pending = worker.pending_submission_handle();
+        let (handle, shutdown, task) =
+            crate::controller::WorkerController::spawn_owned(worker, &dir.path().join("runtime"))
+                .await
+                .unwrap();
+        let expected = tokio::time::timeout(Duration::from_secs(5), async {
+            handle
+                .send(protocol::Method::submit_text(
+                    "active-request",
+                    "empty stopped turn",
+                ))
+                .await
+                .unwrap();
+            client.entered.notified().await;
+            let expected = accept_empty_turn_admissions(&pending);
+            handle
+                .send(protocol::Method::Shutdown {
+                    command: protocol::WorkerCommandEnvelope::new(1),
+                })
+                .await
+                .unwrap();
+            assert!(shutdown.await.unwrap().feature_failures.is_empty());
+            task.await.unwrap();
+            expected
+        })
+        .await
+        .expect("Controller must shut down within deadline");
+        let entries = store.read_all(loc.session_id, loc.segment_id).unwrap();
+        assert_empty_turn_admissions(&entries, &expected);
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            LogEntry::AnnotatedUserInput { .. } | LogEntry::Invoke { .. }
+        )));
+        drop(handle);
+        drop(pending);
+        drop(store);
+        let reopened = session_store::FsStore::new(sessions).unwrap();
+        assert_empty_turn_admissions(
+            &reopened.read_all(loc.session_id, loc.segment_id).unwrap(),
+            &expected,
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_turn_direct_cancel_and_pause_still_remove_only_unmaterialized_input() {
+        for pause in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = session_store::FsStore::new(dir.path()).unwrap();
+            let client = EmptyTurnBlockedClient::default();
+            let mut worker = Worker::new(
+                minimal_manifest(),
+                Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(client.clone()),
+                store.clone(),
+                WorkerWorkspaceContext::no_workspace(),
+                WorkerFilesystemAuthority::None,
+                Scope::empty(),
+            )
+            .await
+            .unwrap();
+            worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
+            worker.materialize_durable_session_head().await.unwrap();
+            let loc = worker.segment_state.location();
+            let before = store.read_all(loc.session_id, loc.segment_id).unwrap();
+            let signal = if pause {
+                worker.engine().pause_sender()
+            } else {
+                worker.engine().cancel_sender()
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(worker.run_text("remove only this empty turn"), async {
+                    client.entered.notified().await;
+                    signal.send(()).await.unwrap();
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap(), WorkerRunResult::RolledBack);
+            let after = store.read_all(loc.session_id, loc.segment_id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&after[..before.len()]).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(
+                restore_history_entries(loc.session_id, loc.segment_id, &before).unwrap(),
+                worker.session.history().entries()
+            );
+            assert!(!after.iter().any(|entry| matches!(
+                entry,
+                LogEntry::Invoke { .. } | LogEntry::AnnotatedUserInput { .. }
+            )));
+            drop(worker);
+            drop(store);
+            let reopened = session_store::FsStore::new(dir.path()).unwrap();
+            let entries = reopened.read_all(loc.session_id, loc.segment_id).unwrap();
+            assert_eq!(
+                restore_history_entries(loc.session_id, loc.segment_id, &entries).unwrap(),
+                restore_history_entries(loc.session_id, loc.segment_id, &before).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_turn_rollback_retains_invocation_start_after_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = session_store::FsStore::new(dir.path()).unwrap();
+        let mut worker = Worker::new(
+            minimal_manifest(),
+            Engine::<_, Mutable, SessionHistoryMetadata>::new_annotated(NoopClient),
+            store.clone(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            Scope::empty(),
+        )
+        .await
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        install_recovery_invocation(&mut worker, calls.clone());
+        worker.materialize_durable_session_head().await.unwrap();
+        let snapshot = worker.capture_empty_turn_rollback_snapshot();
+        // Exercise the rollback primitive with a genuine persisted handler start,
+        // not a fabricated receipt or a claim that concurrent handlers can run.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                worker.execute_feature_invocations(&[recovery_invocation("incomplete")])
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let expected =
+            serde_json::to_value(&*worker.session.pending_activations.lock().unwrap()).unwrap();
+        let loc = worker.segment_state.location();
+        worker.rollback_empty_turn(snapshot).unwrap();
+        drop(worker);
+        drop(store);
+        let reopened = session_store::FsStore::new(dir.path()).unwrap();
+        let entries = reopened.read_all(loc.session_id, loc.segment_id).unwrap();
+        let state = segment_log::collect_state(&entries);
+        let mut restored = WorkerSession::new(loc.session_id, Vec::new());
+        restored.restore_pending_activations(&state.extensions);
+        let pending = restored.pending_activations.lock().unwrap();
+        assert_eq!(serde_json::to_value(&*pending).unwrap(), expected);
+        assert_eq!(pending.invocation_receipts.len(), 1);
+        assert!(pending.invocation_receipts[0].result.is_none());
     }
 
     #[derive(Clone, Copy, Debug)]

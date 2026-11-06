@@ -75,6 +75,13 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     let rows = super::workspace_schema_migration_history(conn)?;
     let tail = failure_tail(conn, current, &rows)?;
     verify_failure_shape(conn, current, tail)?;
+    let journal = tail == FailureTail::Journal || current >= 127;
+    if super::column_exists(conn, "worker_removal_operations", "journal_removal_json")? != journal {
+        return Err(invalid("Journal removal receipt/shape mismatch"));
+    }
+    if journal {
+        verify_journal_removal_shape(conn)?;
+    }
     if current < 124 {
         return verify_history_records(conn, current, &rows);
     }
@@ -119,6 +126,12 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
 
 fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
     verify_raw_capture_shape(conn, current, rows)?;
+    if current < 124
+        && super::current_schema_version(conn)? < 124
+        && super::column_exists(conn, "worker_removal_operations", "journal_removal_json")?
+    {
+        return Err(invalid("Journal removal scope before receipt 124"));
+    }
     if current == 123 {
         verify_execution_shape(conn)?;
         super::backend_job_upgrade::verify(conn)?;
@@ -312,6 +325,7 @@ fn tail_migration_name(version: i64) -> Result<&'static str> {
 enum FailureTail {
     Canonical,
     Retained,
+    Journal,
 }
 impl FailureTail {
     fn migrations(self) -> Vec<(i64, &'static str)> {
@@ -324,23 +338,44 @@ impl FailureTail {
                 (124, super::WORKER_CREATE_FAILURE_MIGRATION_NAME),
                 (125, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
                 (126, super::SERVICE_OUTCOME_MIGRATION_NAME),
+                (127, super::journal_removal_store::MIGRATION_NAME),
             ],
             Self::Retained => vec![
                 (124, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
                 (125, super::SERVICE_OUTCOME_MIGRATION_NAME),
                 (126, super::RETAINED_STARTUP_MIGRATION_NAME),
+                (127, super::journal_removal_store::MIGRATION_NAME),
+            ],
+            Self::Journal => vec![
+                (124, super::journal_removal_store::MIGRATION_NAME),
+                (127, super::journal_removal_store::RETAINED_BRIDGE_NAME),
             ],
         });
         tail
     }
     fn startup(self, current: i64) -> bool {
-        current >= if self == Self::Canonical { 124 } else { 126 }
+        current
+            >= match self {
+                Self::Canonical => 124,
+                Self::Retained => 126,
+                Self::Journal => 127,
+            }
     }
     fn jobs(self, current: i64) -> bool {
-        current >= if self == Self::Canonical { 125 } else { 124 }
+        current
+            >= match self {
+                Self::Canonical => 125,
+                Self::Retained => 124,
+                Self::Journal => 127,
+            }
     }
     fn service(self, current: i64) -> bool {
-        current >= if self == Self::Canonical { 126 } else { 125 }
+        current
+            >= match self {
+                Self::Canonical => 126,
+                Self::Retained => 125,
+                Self::Journal => 127,
+            }
     }
 }
 
@@ -356,6 +391,7 @@ fn failure_tail(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Resu
         .find(|row| row.0 == 124 && row.1 != super::SCHEMA_BASELINE_NAME)
     {
         return match name.as_str() {
+            super::journal_removal_store::MIGRATION_NAME => Ok(FailureTail::Journal),
             super::WORKER_CREATE_FAILURE_MIGRATION_NAME => Ok(FailureTail::Canonical),
             super::backend_job_recovery_store::CAUSE_MIGRATION_NAME => Ok(FailureTail::Retained),
             _ => Err(invalid("unrecognized schema-124 identity")),
@@ -365,6 +401,14 @@ fn failure_tail(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Resu
         .first()
         .ok_or_else(|| invalid("missing failure baseline"))?
         .0;
+    // The independently published Journal-124 baseline lacks all failure extensions.
+    // Its complete shape and immutable receipt prefix are verified by the caller.
+    if baseline == 124
+        && !rows.iter().any(|row| (125..=126).contains(&row.0))
+        && super::column_exists(conn, "worker_removal_operations", "journal_removal_json")?
+    {
+        return Ok(FailureTail::Journal);
+    }
     // A retained baseline after completion is identified by its 126 receipt.
     if baseline < 126
         && rows
@@ -386,6 +430,17 @@ fn failure_tail(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Resu
         return Ok(FailureTail::Retained);
     }
     Ok(FailureTail::Canonical)
+}
+
+pub(super) fn verify_retained_journal_history(conn: &Connection) -> Result<()> {
+    let current = super::current_schema_version(conn)?;
+    let rows = super::workspace_schema_migration_history(conn)?;
+    if current != 124 || failure_tail(conn, current, &rows)? != FailureTail::Journal {
+        return Err(invalid(
+            "Journal bridge requires the published Journal-124 history",
+        ));
+    }
+    verify_history(conn, current)
 }
 
 // Compare tokenized complete table/index/trigger programs, not a substring that
@@ -721,6 +776,60 @@ fn legacy_shape(conn: &Connection) -> Result<Shape> {
     Ok(shape)
 }
 
+/// Validate the exact extension independently before interpreting predecessor
+/// receipts. Reference SQL runs only in a private DB, never on adopted data.
+fn journal_removal_extension() -> Result<(Shape, Vec<String>)> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch("CREATE TABLE worker_removal_operations(operation_id TEXT,plan_id TEXT,input_fingerprint TEXT,workspace_id TEXT,runtime_id TEXT,worker_id TEXT,state TEXT);")?;
+    reference.execute_batch(super::journal_removal_store::SCHEMA_SQL)?;
+    let mut shape = snapshot(&reference)?;
+    let table = shape
+        .remove("worker_removal_operations")
+        .ok_or_else(|| invalid("missing Journal reference table"))?;
+    let column = declaration(&table.2, "word:journal_removal_json")?;
+    Ok((shape, column))
+}
+
+fn declaration(tokens: &[String], name: &str) -> Result<Vec<String>> {
+    let start = tokens
+        .iter()
+        .position(|token| token == name)
+        .ok_or_else(|| invalid("missing Journal removal declaration"))?;
+    let mut depth = 0usize;
+    for i in start..tokens.len() {
+        match tokens[i].as_str() {
+            "(" => depth += 1,
+            ")" if depth == 0 => return Ok(tokens[start..i].to_vec()),
+            ")" => depth -= 1,
+            "," if depth == 0 => return Ok(tokens[start..i].to_vec()),
+            _ => {}
+        }
+    }
+    Err(invalid("unterminated Journal removal declaration"))
+}
+
+fn verify_journal_removal_shape(conn: &Connection) -> Result<()> {
+    let (expected, column) = journal_removal_extension()?;
+    let actual = snapshot(conn)?;
+    if expected
+        .iter()
+        .any(|(name, object)| actual.get(name) != Some(object))
+    {
+        return Err(invalid(
+            "Journal removal index/trigger receipt-shape mismatch",
+        ));
+    }
+    let table = actual
+        .get("worker_removal_operations")
+        .ok_or_else(|| invalid("missing removal table"))?;
+    if declaration(&table.2, "word:journal_removal_json")? != column {
+        return Err(invalid(
+            "Journal removal column/CHECK receipt-shape mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
     let current = super::current_schema_version(conn)?;
     if current < 123 {
@@ -773,6 +882,20 @@ fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
                     "{column} TEXT CHECK({column} IS NULL OR length(CAST({column} AS BLOB))<=32768)"
                 ),
             )?;
+        }
+    }
+    if super::column_exists(conn, "worker_removal_operations", "journal_removal_json")? {
+        let (extension, column) = journal_removal_extension()?;
+        shape.extend(extension);
+        if let Some((_, _, tokens)) = shape.get_mut("worker_removal_operations") {
+            let start = tokens
+                .iter()
+                .position(|token| token == "(")
+                .ok_or_else(|| invalid("missing removal declarations"))?;
+            let mut addition = column;
+            addition.push(",".into());
+            tokens.splice(start + 1..start + 1, addition);
+            *tokens = declarations(tokens.clone())?;
         }
     }
     Ok(shape)
@@ -1105,9 +1228,11 @@ fn declarations(tokens: Vec<String>) -> Result<Vec<String>> {
         if depth == 0 {
             fields.sort();
             let mut result = tokens[..=start].to_vec();
-            for field in fields {
+            for (index, field) in fields.into_iter().enumerate() {
+                if index != 0 {
+                    result.push(",".into());
+                }
                 result.extend(field);
-                result.push(",".into());
             }
             result.extend_from_slice(&tokens[i..]);
             return Ok(result);
@@ -1222,13 +1347,13 @@ mod failure_format_tests {
                 let history = store::workspace_schema_migration_history(&conn).unwrap();
                 let plan = published_plan(&conn, current).unwrap().unwrap();
                 assert_eq!(plan.current_schema_version, current);
-                assert_eq!(plan.target_schema_version, 126);
+                assert_eq!(plan.target_schema_version, store::LATEST_SCHEMA_VERSION);
                 assert_eq!(
                     plan.migrations
                         .iter()
                         .map(|step| (step.version, step.name.as_str()))
                         .collect::<Vec<_>>(),
-                    ((current + 1)..=126)
+                    ((current + 1)..=store::LATEST_SCHEMA_VERSION)
                         .map(|version| (version, tail_migration_name(version).unwrap()))
                         .collect::<Vec<_>>()
                 );
@@ -1432,15 +1557,15 @@ mod failure_format_tests {
         drop(conn);
         let plan = store::SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 50);
-        assert_eq!(plan.target_schema_version, 126);
+        assert_eq!(plan.target_schema_version, store::LATEST_SCHEMA_VERSION);
         assert_eq!(
             plan.migrations
                 .iter()
                 .rev()
-                .take(3)
+                .take(4)
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![126, 125, 124]
+            vec![127, 126, 125, 124]
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(snapshot(&conn).unwrap(), shape, "dry-run changed DDL");
@@ -1455,7 +1580,7 @@ mod failure_format_tests {
             plan
         );
         let conn = Connection::open(&path).unwrap();
-        verify_history(&conn, 126).unwrap();
+        verify_history(&conn, store::LATEST_SCHEMA_VERSION).unwrap();
         assert_eq!(values(&conn, &identity_columns), identities);
         let history = store::workspace_schema_migration_history(&conn).unwrap();
         assert_eq!(
@@ -1463,11 +1588,12 @@ mod failure_format_tests {
             Some(&(50, store::SCHEMA_BASELINE_NAME.to_owned()))
         );
         assert_eq!(
-            &history[history.len() - 3..],
+            &history[history.len() - 4..],
             &[
                 (124, tail_migration_name(124).unwrap().to_owned()),
                 (125, tail_migration_name(125).unwrap().to_owned()),
                 (126, tail_migration_name(126).unwrap().to_owned()),
+                (127, tail_migration_name(127).unwrap().to_owned()),
             ]
         );
         let upgraded_shape = snapshot(&conn).unwrap();

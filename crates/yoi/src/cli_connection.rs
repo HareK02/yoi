@@ -29,6 +29,7 @@ pub(crate) enum CliCommand {
     WorkerCleanup,
     Ticket,
     Objective,
+    Config,
     Plugin,
     PluginCatalog,
     Mcp,
@@ -50,6 +51,7 @@ impl CliCommand {
             CliCommand::WorkerCleanup => "yoi worker management",
             CliCommand::Ticket => "yoi ticket",
             CliCommand::Objective => "yoi objective",
+            CliCommand::Config => "yoi config",
             CliCommand::Plugin => "yoi plugin authoring",
             CliCommand::PluginCatalog => "yoi plugin catalog",
             CliCommand::Mcp => "yoi mcp",
@@ -67,7 +69,9 @@ impl CliCommand {
             | CliCommand::Panel
             | CliCommand::Ticket
             | CliCommand::Objective => CliConnectionRequirement::ConnectionAware,
-            CliCommand::Login | CliCommand::PluginCatalog => CliConnectionRequirement::BackendOnly,
+            CliCommand::Login | CliCommand::PluginCatalog | CliCommand::Config => {
+                CliConnectionRequirement::BackendOnly
+            }
             CliCommand::Keys
             | CliCommand::SetupModel
             | CliCommand::Serve

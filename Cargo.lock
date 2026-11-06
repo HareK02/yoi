@@ -7495,6 +7495,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "client",
+ "feature-permissions",
+ "fs4",
  "futures",
  "manifest",
  "project-record",
