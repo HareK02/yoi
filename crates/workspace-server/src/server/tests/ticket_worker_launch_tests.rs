@@ -199,6 +199,21 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         self.execution.dispatch_input(worker, input)
     }
 
+    fn stop_worker_operation(
+        &self,
+        request: worker_runtime::execution::WorkerExecutionStopRequest,
+    ) -> WorkerExecutionResult {
+        self.execution.stop_worker_operation(request)
+    }
+
+    fn termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<Option<worker_runtime::execution::WorkerExecutionTermination>, String>
+    {
+        self.execution.termination_receipt(worker)
+    }
+
     fn stop_worker(&self, worker: &worker_runtime::identity::WorkerRef) -> WorkerExecutionResult {
         self.execution.stop_worker(worker)
     }

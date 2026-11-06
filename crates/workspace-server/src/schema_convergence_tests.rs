@@ -57,7 +57,20 @@ mod schema_convergence {
         }
         let mut rows: Vec<_> = tables
             .into_iter()
-            .map(|table| stored_fixture_rows(conn, table))
+            .map(|table| {
+                let mut rows = stored_fixture_rows(conn, table);
+                if table == "backend_job_attempts"
+                    && !column_exists(conn, table, "allocation_precluded_at").unwrap()
+                {
+                    assert!(current_schema_version(conn).unwrap() < 123);
+                    // Schema 123 appends this proof column but must not mint proof
+                    // for a retained attempt, even one already marked Completed.
+                    for row in &mut rows {
+                        row.push(rusqlite::types::Value::Null);
+                    }
+                }
+                rows
+            })
             .collect();
         // A Passkey-branch Job gains only input_disposition; all old columns must
         // remain byte-for-byte equal, including body, digest and result receipts.
@@ -132,6 +145,14 @@ mod schema_convergence {
                             version: 113,
                             name: "Ticket work-decomposition parent links".into(),
                         },
+                        WorkspaceSchemaMigrationStep {
+                            version: 122,
+                            name: crate::config_adoption::MIGRATION_NAME.into(),
+                        },
+                        WorkspaceSchemaMigrationStep {
+                            version: 123,
+                            name: backend_job_upgrade::MIGRATION_NAME.into(),
+                        },
                     ]
                 );
                 assert_eq!(
@@ -156,6 +177,8 @@ mod schema_convergence {
                     expected.push((111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()));
                     expected.push((112, "Ticket Service outbox and fenced consumers".into()));
                     expected.push((113, "Ticket work-decomposition parent links".into()));
+                    expected.push((122, crate::config_adoption::MIGRATION_NAME.into()));
+                    expected.push((123, backend_job_upgrade::MIGRATION_NAME.into()));
                     assert_eq!(workspace_schema_migration_history(conn)?, expected);
                     for table in ["passkey_credentials", "passkey_metadata", "passkey_addition_receipts", "backend_jobs", "backend_job_attempts"] {
                         assert_eq!(state_contract_schema_signature(conn, table), fresh.with_conn(|c| Ok(state_contract_schema_signature(c, table)))?, "{table}");

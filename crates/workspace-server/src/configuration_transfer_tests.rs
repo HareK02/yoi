@@ -835,6 +835,119 @@ fn server_failure_after_seal_rolls_back_and_reopen_resumes_only_the_exact_full_r
     assert_eq!(legacy_records(&features), legacy_before);
 }
 
+#[test]
+fn workspace_purge_removes_adopted_authority_without_reopening_sealed_legacy_writers() {
+    use crate::workspace_deletion::WorkspaceDeletionStore;
+
+    let (root, db, features, subjects) = fixture();
+    let host = host();
+    let seed = migration(&db, &features, &host);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&db, &features, &host, &seed, &request).unwrap();
+    let legacy_before = legacy_records(&features);
+    let identity = features.store.database_identity().unwrap();
+    let physical_identity = features.database.identity().clone();
+    let sealed = features
+        .store
+        .permission_transfer_receipt(&identity)
+        .unwrap()
+        .unwrap();
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+            store: db.clone(),
+            host: self::host(),
+        }));
+    assert_eq!(
+        canonical.subject_permissions(&subjects.limited).unwrap(),
+        Some(subjects.limited_source.clone())
+    );
+    assert!(
+        db.workspace_deletion_preflight("not-the-owner", WORKSPACE)
+            .is_err()
+    );
+    db.with_conn(|conn| {
+        conn.execute("INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('retained-other',?1,'Other','active','1','1')", [OWNER])?;
+        Ok(())
+    }).unwrap();
+    let preflight = db.workspace_deletion_preflight(OWNER, WORKSPACE).unwrap();
+    let operation = db
+        .reserve_workspace_deletion(
+            OWNER,
+            WORKSPACE,
+            &server_api::WorkspaceDeletionRequest {
+                operation_id: "purge-adopted-authority".into(),
+                expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                confirmation: "Transfer".into(),
+            },
+        )
+        .unwrap()
+        .operation;
+    db.finalize_workspace_deletion(&operation.operation_id)
+        .unwrap();
+    db.with_conn(|conn| {
+        for table in [
+            "workspace_configuration_authorities",
+            "workspace_configuration_policies",
+            "workspace_configuration_receipts",
+        ] {
+            let count: i64 = conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id=?1"),
+                [WORKSPACE],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 0, "purged authority must not survive in {table}");
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(canonical.subject_permissions(&subjects.limited).is_err());
+    assert!(matches!(
+        features
+            .store
+            .set_subject_permissions(&subjects.limited, &subjects.exact_legacy_update),
+        Err(SubjektivError::PermissionAuthoritySealed)
+    ));
+    assert!(matches!(
+        features
+            .store
+            .with_permission_authority_guard(&identity, |authority| authority.require_unsealed()),
+        Err(SubjektivError::PermissionAuthoritySealed)
+    ));
+    assert_eq!(legacy_records(&features), legacy_before);
+    drop(canonical);
+    drop(db);
+    features.close();
+
+    let db = server(root.path());
+    let features = FeatureFixture::open(&root.path().join("features"), Some(&physical_identity));
+    assert_eq!(
+        features
+            .store
+            .permission_transfer_receipt(&identity)
+            .unwrap(),
+        Some(sealed)
+    );
+    assert!(
+        db.adopted_subject_policy(WORKSPACE, &subjects.limited)
+            .is_err()
+    );
+    assert!(matches!(
+        features
+            .store
+            .set_subject_permissions(&subjects.limited, &subjects.exact_legacy_update),
+        Err(SubjektivError::PermissionAuthoritySealed)
+    ));
+    assert!(matches!(
+        features
+            .store
+            .with_permission_authority_guard(&identity, |authority| authority.require_unsealed()),
+        Err(SubjektivError::PermissionAuthoritySealed)
+    ));
+    assert_eq!(legacy_records(&features), legacy_before);
+}
+
 fn edit_request(
     server: &SqliteWorkspaceStore,
     host: &PermissionHost,

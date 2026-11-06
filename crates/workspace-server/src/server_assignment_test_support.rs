@@ -372,6 +372,80 @@ async fn remove_test_assignment_body(api: &WorkspaceApi, worker: &RuntimeWorkerR
     assert_eq!(removed.status, StatusCode::OK.as_u16(), "{}", removed.body);
 }
 
+#[tokio::test]
+async fn assignment_disconnect_after_restore_keeps_shutdown_and_old_protocol_fenced() {
+    use worker_runtime::execution::WorkerExecutionBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = assignment_test_api_with_recording_backend(dir.path()).await;
+    let started = start_attention_test_orchestrator(&api).await;
+    let worker = RuntimeWorkerRef::new(
+        EMBEDDED_WORKER_RUNTIME_ID,
+        started.worker.unwrap().worker_id,
+    );
+    let worker_ref = worker_runtime::identity::WorkerRef::new(
+        worker_runtime::identity::WorkerId::parse(&worker.worker_id).unwrap(),
+    );
+    let old = execution
+        .clone()
+        .attach_worker_protocol(&worker_ref)
+        .unwrap();
+    let stopped = api
+        .runtime
+        .stop_worker(&worker, WorkerLifecycleRequest::default())
+        .unwrap();
+    assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+    let first = api.runtime.backend_job_termination(&worker).unwrap().unwrap();
+    assert!(old.validate().is_err());
+
+    execution.accept_restores();
+    let restored = start_attention_test_orchestrator(&api).await;
+    assert_eq!(restored.disposition, "restored");
+    assert_eq!(restored.worker.unwrap().worker_id, worker.worker_id);
+    let current = execution
+        .clone()
+        .attach_worker_protocol(&worker_ref)
+        .unwrap();
+    current.validate().unwrap();
+    assert!(old.validate().is_err());
+    let submit = || protocol::Method::Submit {
+        submission_request_id: "disconnected-body-input".into(),
+        input: vec![],
+    };
+    assert!(old.dispatch(submit()).is_err());
+
+    let disconnected = subjektiv_journal::release_subject(
+        &api,
+        serde_json::from_value(json!({
+            "worker": worker, "operation_id": "disconnect-restored-body",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        disconnected.state,
+        runtime_api::SubjectReleaseState::Disconnected
+    );
+    current.validate().unwrap();
+    assert!(current.dispatch(submit()).is_err());
+    let stopped = api
+        .runtime
+        .stop_worker(&worker, WorkerLifecycleRequest::default())
+        .unwrap();
+    assert_eq!(
+        stopped.state,
+        InternalWorkerOperationState::Accepted,
+        "{:?}",
+        stopped.diagnostics
+    );
+    let second = api.runtime.backend_job_termination(&worker).unwrap().unwrap();
+    assert_ne!(first.execution_id, second.execution_id);
+    assert!(second.confirms_scope_shutdown(&worker_ref, second.stop_operation_id));
+    assert!(current.validate().is_err());
+    assert!(current.dispatch(submit()).is_err());
+    assert!(old.dispatch(submit()).is_err());
+}
+
 impl DeterministicExecutionBackend {
     fn release_assignment_controller(
         &self,
@@ -427,7 +501,8 @@ impl DeterministicExecutionBackend {
                 }) {
                     return Err("Subject disconnect has no exact receiver reservation".into());
                 }
-                execution.method_rx.lock().unwrap().take();
+                // Disconnect fences new mutations in dispatch; it is not Stop.
+                // Keep the receiver alive for canonical Shutdown and scope drain.
                 S::Disconnected
             }
         };

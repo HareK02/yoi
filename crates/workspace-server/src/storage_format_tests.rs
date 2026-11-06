@@ -184,7 +184,7 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
         if name == "__yoi_schema_migrations" {
             continue;
         }
-        let columns = super::super::table_columns(conn, &name)
+        let mut columns = super::super::table_columns(conn, &name)
             .unwrap()
             .into_iter()
             .filter(|column| {
@@ -192,8 +192,15 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
                     || !["state", "failure_category", "failure_detail"].contains(&column.as_str())
             })
             .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(",");
+            .collect::<Vec<_>>();
+        if name == "backend_job_attempts"
+            && !super::super::column_exists(conn, &name, "allocation_precluded_at").unwrap()
+        {
+            assert!(super::super::current_schema_version(conn).unwrap() < 123);
+            // Migration adds no allocation/termination proof for retained attempts.
+            columns.push("NULL AS allocation_precluded_at".into());
+        }
+        let columns = columns.join(",");
         let mut statement = conn
             .prepare(&format!("SELECT {columns} FROM \"{name}\""))
             .unwrap();

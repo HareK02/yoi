@@ -70078,10 +70078,15 @@ mod tests {
                 },
             );
             assert_embedded_protocol_closed(&mut old).await;
-            assert_eq!(
-                execution.protocol_methods().len(),
-                1,
-                "delayed A method reached B"
+            assert!(
+                matches!(
+                    execution.protocol_methods().as_slice(),
+                    [
+                        (_, protocol::Method::ListCompletions { .. }),
+                        (_, protocol::Method::Shutdown { .. })
+                    ]
+                ),
+                "only A's completion and the actual stop may reach the execution"
             );
             assert_eq!(
                 runtime.worker_detail(&worker_ref).unwrap().status,
@@ -70198,10 +70203,16 @@ mod tests {
                 },
             );
             assert_embedded_protocol_ws_closed(&mut old).await;
-            assert_eq!(
-                execution.protocol_methods().len(),
-                2,
-                "delayed A method reached B"
+            assert!(
+                matches!(
+                    execution.protocol_methods().as_slice(),
+                    [
+                        (_, protocol::Method::SubmitTracked { .. }),
+                        (_, protocol::Method::ListCompletions { .. }),
+                        (_, protocol::Method::Shutdown { .. })
+                    ]
+                ),
+                "only A's submit/completion and the actual stop may reach the execution"
             );
             assert_eq!(
                 runtime.worker_detail(&worker_ref).unwrap().status,
@@ -70495,14 +70506,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(event, protocol::Event::TextDelta { text } if text == "execution-b"));
-        let delivered: Vec<_> = execution
-            .protocol_methods()
+        let methods = execution.protocol_methods();
+        assert!(matches!(
+            methods.as_slice(),
+            [
+                (_, protocol::Method::ListCompletions { .. }),
+                (_, protocol::Method::Shutdown { .. }),
+                (_, protocol::Method::ListCompletions { .. })
+            ]
+        ));
+        let delivered: Vec<_> = methods
             .into_iter()
-            .map(|(worker, method)| {
-                let protocol::Method::ListCompletions { request_id, .. } = method else {
-                    panic!("expected completion method");
-                };
-                (worker, request_id.unwrap())
+            .filter_map(|(worker, method)| match method {
+                protocol::Method::ListCompletions { request_id, .. } => {
+                    Some((worker, request_id.unwrap()))
+                }
+                protocol::Method::Shutdown { .. } => None,
+                _ => unreachable!("method sequence was checked above"),
             })
             .collect();
         assert_eq!(

@@ -2026,10 +2026,18 @@
   {
     "path": "crates/workspace-server/src/legacy_evidence_column_tests.rs",
     "kind": "rejection_test",
-    "reason": "移行後・現行出力から旧key/column/tableが消失したことを具体的な綴りで検証する負のassertion。削除すると旧名の再出力/残存を検出できなくなる。関連する保存境界: schema-88 artifact fixtureは旧source列に元由来情報を保存してschema-89 upgrade後も値が保たれることを検証する。現行列に置換すると実在した旧列を改名する移行での値保持を証明できない。",
+    "reason": "現行Job列とschema object名に旧綴りを再出力しないことを検証する負のassertion。旧raw evidenceの2表だけを別の完全schema比較で保持し、他の現行schemaへ例外を拡張しない。",
     "lines": [
       {
-        "sha256": "564de34f3f1ffc45547581c8c6031e1408177ba2ca604022204778bc8d8a7b0c",
+        "sha256": "88497ec47bcfdc60232f20e19ee8618bb3b54f391e262140483c2de0e250086e",
+        "count": 1
+      },
+      {
+        "sha256": "4d66b790fe7fe947defe9f93b0e53eab2c5627e009bbd8c1dff5ff41b72b30d7",
+        "count": 1
+      },
+      {
+        "sha256": "540bc6c11d517d87f4d4c62b2e68966b40a66d46113c19623f1a1e93111442c9",
         "count": 1
       }
     ]
@@ -2037,10 +2045,14 @@
   {
     "path": "crates/workspace-server/src/legacy_evidence_column_tests.rs",
     "kind": "saved_data",
-    "reason": "schema-88 artifact fixtureは旧source列に元由来情報を保存してschema-89 upgrade後も値が保たれることを検証する。現行列に置換すると実在した旧列を改名する移行での値保持を証明できない。",
+    "reason": "schema-88 artifactの実在した旧source列に保存された由来情報の値保持を検証する。加えてschema-123のraw pre-content evidence 2表は保存当時のinput列名を意図的に保持するため、その完全schemaと旧綴りの存在を検証する。現行Job表は別assertionで新綴りだけを要求する。",
     "lines": [
       {
         "sha256": "b9648425b02b56c6649eaaddd3a029ee4602ec8c48cf74de1d7b0d25860282ee",
+        "count": 1
+      },
+      {
+        "sha256": "9d886578dd1766c62a542ccd9e975c1e6220c16fddb58bc806bfa2950fcb8284",
         "count": 1
       }
     ]

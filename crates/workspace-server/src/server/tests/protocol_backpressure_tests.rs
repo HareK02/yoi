@@ -318,7 +318,10 @@ async fn browser_method_queue_overflow_fails_fast_and_does_not_pin_session_clean
     .expect("full method queue pinned Stop's session cleanup")
     .unwrap();
     assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
-    assert!(execution.protocol_methods().is_empty());
+    assert!(matches!(
+        execution.protocol_methods().as_slice(),
+        [(_, protocol::Method::Shutdown { .. })]
+    ));
     for index in 1..WORKER_PROTOCOL_METHOD_CAPACITY {
         assert!(matches!(
             receiver.try_recv().unwrap(),

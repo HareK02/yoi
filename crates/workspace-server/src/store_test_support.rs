@@ -166,7 +166,11 @@ fn api_fixture_databases_isolate_writes_and_reopen_persisted_rows() {
         let handles: Vec<_> = ["first", "second"]
             .into_iter()
             .map(|name| {
-                let path = temp.path().join(format!("{name}.db"));
+                // A Server's native catalog belongs to its directory, not a
+                // filename. Independent Servers need distinct ownership roots.
+                let root = temp.path().join(name);
+                std::fs::create_dir(&root).unwrap();
+                let path = root.join("server.db");
                 scope.spawn(move || {
                     let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
                     store.with_conn(|conn| {

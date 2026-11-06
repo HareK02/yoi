@@ -19501,7 +19501,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
-            (83..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            (83..=113).chain([122, 123]).collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let assignment = store
@@ -20421,6 +20421,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:111, name:"Typed Plugin Ticket extension data and atomic mutation receipts".into()},
                 WorkspaceSchemaMigrationStep {version:112, name:"Ticket Service outbox and fenced consumers".into()},
                 WorkspaceSchemaMigrationStep {version:113, name:"Ticket work-decomposition parent links".into()},
+                WorkspaceSchemaMigrationStep {version:122, name:crate::config_adoption::MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:123, name:backend_job_upgrade::MIGRATION_NAME.into()},
             ]
         );
 
@@ -20544,6 +20546,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (111, "Typed Plugin Ticket extension data and atomic mutation receipts".to_string()),
 (112, "Ticket Service outbox and fenced consumers".to_string()),
 (113, "Ticket work-decomposition parent links".to_string()),
+(122, crate::config_adoption::MIGRATION_NAME.to_string()),
+(123, backend_job_upgrade::MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -20885,6 +20889,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
         migrate_workspace_runtime_bindings_v50_to_v51(&conn).unwrap();
+        let history = workspace_schema_migration_history(&conn).unwrap();
         drop(conn);
 
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
@@ -20894,7 +20899,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (52..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            (52..=113).chain([122, 123]).collect::<Vec<_>>()
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -20902,9 +20907,17 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
+        let expected_history: Vec<_> = history
+            .into_iter()
+            .chain(
+                plan.migrations
+                    .iter()
+                    .map(|step| (step.version, step.name.clone())),
+            )
+            .collect();
         assert_eq!(
-            workspace_schema_migration_history(&conn).unwrap().len(),
-            (LATEST_SCHEMA_VERSION - 50 + 1) as usize
+            workspace_schema_migration_history(&conn).unwrap(),
+            expected_history
         );
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
@@ -23796,7 +23809,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            ((version + 1)..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            ((version + 1)..=113).chain([122, 123]).collect::<Vec<_>>()
         );
         drop(conn);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -23831,7 +23844,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (110, "Worker Plugin launch selection associations".into()),
                          (111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()),
                          (112, "Ticket Service outbox and fenced consumers".into()),
-                         (113, "Ticket work-decomposition parent links".into())]);
+                         (113, "Ticket work-decomposition parent links".into()),
+                         (122, crate::config_adoption::MIGRATION_NAME.into()),
+                         (123, backend_job_upgrade::MIGRATION_NAME.into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -25861,12 +25876,29 @@ INSERT INTO worker_registry (
         )
         .unwrap();
 
+        let history = workspace_schema_migration_history(&conn).unwrap();
+        let schema = fixture_query_rows(
+            &conn,
+            "SELECT type,name,sql FROM sqlite_schema ORDER BY type,name",
+        );
         let error = apply_migrations(&conn).unwrap_err().to_string();
         assert!(
-            error.contains(&format!("schema version {future_version} is newer")),
+            error.contains("Server storage format: unknown baseline or current version"),
             "{error}"
         );
-        assert!(error.contains("refusing to serve"), "{error}");
+        assert!(
+            error.contains(&format!("({future_version}, \"future\")")),
+            "{error}"
+        );
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap(), history);
+        assert_eq!(current_schema_version(&conn).unwrap(), future_version);
+        assert_eq!(
+            fixture_query_rows(
+                &conn,
+                "SELECT type,name,sql FROM sqlite_schema ORDER BY type,name",
+            ),
+            schema
+        );
     }
 
     #[test]
