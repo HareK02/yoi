@@ -1741,6 +1741,187 @@ mod tests {
         }
     }
 
+    // Frozen inputs were exported from the published owner, not reconstructed by
+    // the current registry. They must remain independent when the canonical tail moves.
+    #[test]
+    fn published_journal_histories_preserve_frozen_intents_through_owner_preflight_and_reopen() {
+        use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
+        use rusqlite::types::Value;
+        type SavedTable = (String, Vec<String>, Vec<Vec<Value>>);
+        fn quoted(name: &str) -> String {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        }
+        fn rows(
+            conn: &Connection,
+            table: &str,
+            columns: &[String],
+        ) -> crate::Result<Vec<Vec<Value>>> {
+            let fields = columns
+                .iter()
+                .map(|name| quoted(name))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = conn.prepare(&format!(
+                "SELECT {fields} FROM {} ORDER BY {fields}",
+                quoted(table)
+            ))?;
+            Ok(statement
+                .query_map([], |row| (0..columns.len()).map(|i| row.get(i)).collect())?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+        fn snapshot(conn: &Connection) -> crate::Result<Vec<SavedTable>> {
+            let tables = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")?
+                .query_map([], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            tables
+                .into_iter()
+                .map(|table| {
+                    let columns = conn
+                        .prepare(&format!("PRAGMA table_info({})", quoted(&table)))?
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let data = rows(conn, &table, &columns)?;
+                    Ok((table, columns, data))
+                })
+                .collect()
+        }
+        fn assert_preserved(conn: &Connection, saved: &[SavedTable]) -> crate::Result<()> {
+            for (table, columns, before) in saved {
+                let after = rows(conn, table, columns)?;
+                if table == "__yoi_schema_migrations" {
+                    assert!(
+                        after.starts_with(before),
+                        "the complete old ledger, including applied_at, must remain a prefix"
+                    );
+                } else {
+                    assert_eq!(&after, before, "old columns and values changed in {table}");
+                }
+            }
+            Ok(())
+        }
+        fn journal_ddl(conn: &Connection) -> crate::Result<Vec<(String, String)>> {
+            Ok(conn.prepare("SELECT name,sql FROM sqlite_schema WHERE tbl_name='worker_removal_operations' AND sql IS NOT NULL ORDER BY name")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+        for frozen in [
+            include_str!("fixtures/published_journal124_ordered.sql"),
+            include_str!("fixtures/published_journal124_fresh.sql"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("server.sqlite");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(frozen).unwrap();
+            conn.execute_batch(include_str!("fixtures/published_journal124_values.sql"))
+                .unwrap();
+            let (operation_id, metadata): (String, String) = conn
+                .query_row(
+                    "SELECT operation_id,journal_removal_json FROM worker_removal_operations",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            let expected: crate::store::JournalRemovalMetadata =
+                serde_json::from_str(&metadata).unwrap();
+            assert_eq!(expected.phase, Phase::AwaitingEffectsEnd);
+            assert_eq!(expected.cause, Some(Cause::ExecutionUnconfirmed));
+            let before = snapshot(&conn).unwrap();
+            let ddl = journal_ddl(&conn).unwrap();
+            drop(conn);
+            // Dry-run executes the owning migration path on its private copy.
+            SqliteWorkspaceStore::migration_plan(&path).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            assert_preserved(&conn, &before).unwrap();
+            assert_eq!(journal_ddl(&conn).unwrap(), ddl);
+            drop(conn);
+            SqliteWorkspaceStore::migrate_database(&path).unwrap();
+            for _ in 0..2 {
+                let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+                reopened.with_conn(|conn| {
+                    assert_preserved(conn, &before)?;
+                    assert_eq!(journal_ddl(conn)?, ddl);
+                    assert!(conn.execute("UPDATE worker_removal_operations SET journal_removal_json=json_set(journal_removal_json,'$.binding.writer_binding_id','replacement') WHERE operation_id=?1", [&operation_id]).is_err());
+                    assert!(conn.execute("UPDATE worker_removal_operations SET journal_removal_json=json_set(journal_removal_json,'$.phase','invalid') WHERE operation_id=?1", [&operation_id]).is_err());
+                    assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_,u64>(0))?, 0);
+                    Ok(())
+                }).unwrap();
+                let prepared = reopened
+                    .recover_worker_removal_execution("w", &req().worker)
+                    .unwrap()
+                    .unwrap();
+                let progress = reopened.get_journal_removal(&prepared).unwrap().unwrap();
+                assert_eq!(progress.operation_id, operation_id);
+                assert_eq!(progress.metadata, expected);
+                assert!(
+                    reopened
+                        .freeze_journal_removal(&prepared, &progress, &[])
+                        .is_err()
+                );
+                assert_eq!(
+                    reopened
+                        .get_backend_job("w", "after-retirement")
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    crate::backend_job::BackendJobState::Pending
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn published_journal_histories_reject_missing_identity_guard_without_repairing_input() {
+        for frozen in [
+            include_str!("fixtures/published_journal124_ordered.sql"),
+            include_str!("fixtures/published_journal124_fresh.sql"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("server.sqlite");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(frozen).unwrap();
+            conn.execute_batch(include_str!("fixtures/published_journal124_values.sql"))
+                .unwrap();
+            // Corrupt only this private negative fixture, never an adopted database.
+            conn.execute_batch("DROP TRIGGER worker_removal_journal_immutable;")
+                .unwrap();
+            let metadata: String = conn
+                .query_row(
+                    "SELECT journal_removal_json FROM worker_removal_operations",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let history = |conn: &Connection| {
+                conn.prepare(
+                    "SELECT version,name,applied_at FROM __yoi_schema_migrations ORDER BY version",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            let before = history(&conn);
+            assert!(SqliteWorkspaceStore::migration_plan(&path).is_err());
+            assert!(SqliteWorkspaceStore::open_for_test(&path).is_err());
+            assert_eq!(history(&conn), before);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT journal_removal_json FROM worker_removal_operations",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                metadata
+            );
+            assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name='worker_removal_journal_immutable'", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
+        }
+    }
+
     #[test]
     fn journal_removal_metadata_reopens_and_cas_fences_same_operation() {
         use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
