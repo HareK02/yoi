@@ -308,6 +308,56 @@ pub(super) fn attest_delivery(
     .map_err(domain)
 }
 
+/// The exact Runtime receipt can race a normal finish before its Backend POST.
+/// Reconcile that completion and active delivery under one lifecycle gate. The
+/// saved completion is an outcome, never execution-end or writer-release proof.
+pub(super) fn recover_delivery(
+    api: &WorkspaceApi,
+    reservation: &BackendJobReservation,
+) -> Result<()> {
+    use crate::backend_job_host_effects::JobHostOwner;
+    let Some(grant) = &reservation.job.request.grants.subjektiv_journal else {
+        return Ok(());
+    };
+    let gate = lifecycle_lock(api, &grant.subject_id)?;
+    let guard = gate
+        .lock()
+        .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    let current_job = api
+        .store
+        .get_backend_job(api.workspace_id(), &reservation.job.request.job_id)?
+        .ok_or_else(|| Error::Store("Journal delivery Job missing".into()))?;
+    let current_attempt = api
+        .store
+        .get_backend_job_attempt(
+            api.workspace_id(),
+            &current_job.request.job_id,
+            &reservation.attempt.attempt_id,
+        )?
+        .ok_or_else(|| Error::Store("Journal delivery attempt missing".into()))?;
+    if current_job.current_attempt != reservation.attempt.attempt
+        || current_job.input_digest != reservation.job.input_digest
+        || current_job.intent_fingerprint != reservation.job.intent_fingerprint
+        || JobHostOwner::try_from(&current_attempt)?
+            != JobHostOwner::try_from(&reservation.attempt)?
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "Journal delivery receipt owner changed".into(),
+        ));
+    }
+    if current_attempt.state.terminal() {
+        return Ok(());
+    }
+    if current_attempt.state != BackendJobAttemptState::Dispatched
+        || current_job.request != reservation.job.request
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "Journal delivery input or dispatch binding changed".into(),
+        ));
+    }
+    reconcile_attempt_under_gate(api, &current_job, &current_attempt, true, guard)
+}
+
 pub(super) fn finish(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -2578,6 +2628,22 @@ pub(super) fn reconcile_attempt(
     let guard = gate
         .lock()
         .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
+    reconcile_attempt_under_gate(api, job, attempt, false, guard)
+}
+
+fn reconcile_attempt_under_gate(
+    api: &WorkspaceApi,
+    job: &BackendJobRecord,
+    attempt: &BackendJobAttemptRecord,
+    attest_received_input: bool,
+    guard: std::sync::MutexGuard<'_, ()>,
+) -> Result<()> {
+    let grant = job
+        .request
+        .grants
+        .subjektiv_journal
+        .as_ref()
+        .ok_or_else(|| Error::InvalidInput("Journal recovery requires a grant".into()))?;
     // Reread rather than letting a delayed callback settle an old owner or resurrect
     // erased/retired input. The Store repeats this full CAS when saving completion.
     let current_job = api
@@ -2763,6 +2829,17 @@ pub(super) fn reconcile_attempt(
             Err(JournalError::Conflict(_)) => {}
             Err(error) => return Err(domain(error)),
         }
+    }
+    if attest_received_input {
+        return attest_delivery(
+            api,
+            &BackendJobReservation {
+                job: job.clone(),
+                attempt: attempt.clone(),
+                replayed: true,
+                resource_reused: false,
+            },
+        );
     }
     if attempt.state == BackendJobAttemptState::Reserved {
         // The generic reserved-attempt owner can still dispatch this exact saved input.

@@ -3680,6 +3680,26 @@ impl RuntimeExecutionTaskScope {
         Ok(())
     }
 
+    fn retain_shutdown_report(
+        &self,
+        report: worker::controller::ControllerShutdownReport,
+    ) -> Result<(), String> {
+        *self
+            .shutdown_report
+            .lock()
+            .map_err(|_| "Controller shutdown report lock is poisoned".to_string())? = Some(
+            report
+                .feature_failures
+                .into_iter()
+                .map(|failure| crate::execution::WorkerFeatureShutdownFailure {
+                    category: failure.category,
+                    diagnostic: failure.diagnostic,
+                })
+                .collect(),
+        );
+        Ok(())
+    }
+
     async fn confirm_shutdown_and_join(
         &self,
         shutdown: &Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
@@ -3690,23 +3710,12 @@ impl RuntimeExecutionTaskScope {
                 .lock()
                 .map_err(|_| "execution task registry lock is poisoned".to_string())?,
         );
-        let confirmation = {
+        let mut confirmation = {
             let mut guard = shutdown.lock().await;
             if let Some(receiver) = guard.as_mut() {
                 match tokio::time::timeout(Duration::from_secs(5), receiver).await {
                     Ok(Ok(report)) => {
-                        *self.shutdown_report.lock().map_err(|_| {
-                            "Controller shutdown report lock is poisoned".to_string()
-                        })? = Some(
-                            report
-                                .feature_failures
-                                .into_iter()
-                                .map(|failure| crate::execution::WorkerFeatureShutdownFailure {
-                                    category: failure.category,
-                                    diagnostic: failure.diagnostic,
-                                })
-                                .collect(),
-                        );
+                        self.retain_shutdown_report(report)?;
                         guard.take();
                         Ok(())
                     }
@@ -3730,6 +3739,30 @@ impl RuntimeExecutionTaskScope {
         // Drain bridges/relays even after an abnormal completion, while keeping
         // the failed completion and all timed-out handles in their owning scope.
         self.join().await?;
+        if confirmation.is_err() {
+            // Feature/child cleanup can finish after the report wait expires but
+            // during the existing task joins. Reobserve this exact receiver without
+            // another wait; joined handles alone never substitute for its report.
+            let mut guard = shutdown.lock().await;
+            if let Some(receiver) = guard.as_mut() {
+                match receiver.try_recv() {
+                    Ok(report) => {
+                        self.retain_shutdown_report(report)?;
+                        guard.take();
+                        confirmation = Ok(());
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        let message =
+                            "Worker shutdown completion channel closed; cleanup is unproven"
+                                .to_string();
+                        self.retain_completion_failure(message.clone())?;
+                        guard.take();
+                        confirmation = Err(message);
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
+        }
         confirmation?;
         match self
             .shutdown_report
@@ -11207,6 +11240,157 @@ mod tests {
                 failure.diagnostic
             );
         }
+    }
+
+    // Isolate Runtime's report/join ordering with a gated task and its actual
+    // completion channel. This does not attest a real Controller's Feature cleanup;
+    // the connected removal suite supplies that integration boundary.
+    async fn report_during_scope_join(
+        feature_failures: Option<Vec<worker::hook::HookError>>,
+    ) -> (RuntimeExecutionTaskScope, Result<(), String>) {
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async move {
+            waiting.await.unwrap();
+            if let Some(feature_failures) = feature_failures {
+                report_tx
+                    .send(worker::controller::ControllerShutdownReport { feature_failures })
+                    .unwrap();
+            }
+        }));
+        let owned = scope.tasks.lock().unwrap()[0].clone();
+        let shutdown = Arc::new(tokio::sync::Mutex::new(Some(report_rx)));
+        let stopping_scope = scope.clone();
+        let stopping_receiver = shutdown.clone();
+        let stopping = tokio::spawn(async move {
+            stopping_scope
+                .confirm_shutdown_and_join(&stopping_receiver)
+                .await
+        });
+        while shutdown.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        // Advance precisely past the first report wait, not the separate join
+        // deadline. The task is still genuinely owned and cannot finish yet.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        while owned.completion.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!stopping.is_finished());
+        assert!(scope.shutdown_report.lock().unwrap().is_none());
+        release.send(()).unwrap();
+        (scope, stopping.await.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_report_arriving_during_join_is_consumed_before_stop_classification() {
+        let (scope, result) = report_during_scope_join(Some(Vec::new())).await;
+        result.unwrap();
+        assert!(scope.tasks.lock().unwrap().is_empty());
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        assert!(
+            scope
+                .termination(&worker_ref, operation_id)
+                .unwrap()
+                .confirms_scope_shutdown(&worker_ref, operation_id)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_report_arriving_during_join_preserves_feature_failure() {
+        let failure = worker::hook::HookError::new(
+            worker::hook::HookErrorCategory::Timeout,
+            "Feature cleanup did not complete",
+        );
+        let (scope, result) = report_during_scope_join(Some(vec![failure.clone()])).await;
+        assert!(result.unwrap_err().contains("Feature shutdown failures"));
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        let termination = scope.termination(&worker_ref, operation_id).unwrap();
+        assert!(!termination.confirms_scope_shutdown(&worker_ref, operation_id));
+        assert_eq!(termination.feature_failures[0].category, failure.category);
+        assert_eq!(
+            termination.feature_failures[0].diagnostic,
+            failure.diagnostic
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_channel_closing_during_join_retains_unproven_completion() {
+        let (scope, result) = report_during_scope_join(None).await;
+        assert!(result.unwrap_err().contains("completion channel closed"));
+        assert_eq!(scope.tasks.lock().unwrap().len(), 1);
+        assert!(
+            scope
+                .termination(
+                    &WorkerRef::new(WorkerId::now_v7()),
+                    crate::execution::WorkerLifecycleOperationId::new(),
+                )
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joined_scope_with_unreceived_report_stays_unconfirmed_until_same_receiver_delivers() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async {}));
+        let shutdown = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let error = scope
+            .confirm_shutdown_and_join(&shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.contains("shutdown confirmation timed out"), "{error}");
+        assert!(scope.tasks.lock().unwrap().is_empty());
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        assert!(scope.termination(&worker_ref, operation_id).is_none());
+        assert!(shutdown.lock().await.is_some());
+        sender
+            .send(worker::controller::ControllerShutdownReport {
+                feature_failures: Vec::new(),
+            })
+            .unwrap();
+        scope.confirm_shutdown_and_join(&shutdown).await.unwrap();
+        assert!(
+            scope
+                .termination(&worker_ref, operation_id)
+                .unwrap()
+                .confirms_scope_shutdown(&worker_ref, operation_id)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn received_shutdown_report_does_not_release_unjoined_execution_task() {
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async move {
+            waiting.await.unwrap();
+        }));
+        let owned = scope.tasks.lock().unwrap()[0].clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(worker::controller::ControllerShutdownReport {
+                feature_failures: Vec::new(),
+            })
+            .unwrap();
+        let shutdown = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let error = scope
+            .confirm_shutdown_and_join(&shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.contains("controller task did not stop"), "{error}");
+        assert!(Arc::ptr_eq(&scope.tasks.lock().unwrap()[0], &owned));
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        assert!(scope.termination(&worker_ref, operation_id).is_none());
+        release.send(()).unwrap();
+        scope.confirm_shutdown_and_join(&shutdown).await.unwrap();
+        assert!(
+            scope
+                .termination(&worker_ref, operation_id)
+                .unwrap()
+                .confirms_scope_shutdown(&worker_ref, operation_id)
+        );
     }
 
     #[tokio::test]

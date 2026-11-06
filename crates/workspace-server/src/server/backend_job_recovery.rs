@@ -44,6 +44,8 @@ pub(super) struct RecoveryOwners {
     pub(super) cleanup_after_claim: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     #[cfg(test)]
     pub(super) cleanup_claimed_writer: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) before_recovered_input_attestation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl RecoveryOwners {
@@ -1314,7 +1316,17 @@ impl WorkspaceApi {
                 );
                 match receipt {
                     Ok(result) if receipt_matches(&attempt, &result) => {
-                        subjektiv_journal::attest_delivery(
+                        #[cfg(test)]
+                        if let Some(gate) = self
+                            .backend_job_recovery
+                            .before_recovered_input_attestation
+                            .lock()
+                            .unwrap()
+                            .take()
+                        {
+                            gate();
+                        }
+                        subjektiv_journal::recover_delivery(
                             self,
                             &BackendJobReservation {
                                 job,

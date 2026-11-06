@@ -6102,6 +6102,396 @@ async fn explicit_erasure_reclaims_over_100_historical_body_inputs_and_waits_for
     assert!(subjektiv_journal::execute(&f.api, worker, JournalJobRequest::ReadState).is_err());
 }
 
+mod recovered_input_attestation {
+    //! Component regression: RuntimeFixture uses the actual embedded Runtime, Journal
+    //! store and Backend recovery runner. Controller execution/tool-result posting is
+    //! a deterministic fixture boundary, not external-model or OS-shutdown proof.
+    use super::*;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(20);
+
+    // Release both cuts and join fixture recovery even when a regression assertion
+    // panics. Stopping this owner is test teardown, never execution-fence evidence.
+    struct RecoveryGuard {
+        api: WorkspaceApi,
+        cleanup: Arc<tokio::sync::Semaphore>,
+        release: Option<Sender<()>>,
+    }
+
+    impl RecoveryGuard {
+        fn install(api: &WorkspaceApi) -> Self {
+            let cleanup = Arc::new(tokio::sync::Semaphore::new(0));
+            *api.backend_job_recovery
+                .cleanup_before_claim
+                .lock()
+                .unwrap() = Some(cleanup.clone());
+            Self {
+                api: api.clone(),
+                cleanup,
+                release: None,
+            }
+        }
+
+        fn pause_before_attestation(&mut self) -> Receiver<()> {
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            self.release = Some(release_tx);
+            *self
+                .api
+                .backend_job_recovery
+                .before_recovered_input_attestation
+                .lock()
+                .unwrap() = Some(Box::new(move || {
+                entered_tx.send(()).expect("recovery receipt cut observed");
+                release_rx
+                    .recv_timeout(DEADLINE)
+                    .expect("test released recovered-input attestation");
+            }));
+            entered_rx
+        }
+
+        fn release_attestation(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for RecoveryGuard {
+        fn drop(&mut self) {
+            self.release_attestation();
+            self.cleanup.add_permits(1);
+            let api = self.api.clone();
+            let runtime = tokio::runtime::Handle::current();
+            // These tests use a multithread Runtime. Enter it from a separate
+            // thread so Drop can await teardown on both normal and unwind paths.
+            let stopped = std::thread::spawn(move || {
+                runtime.block_on(async {
+                    tokio::time::timeout(DEADLINE, api.stop_backend_job_recovery()).await
+                })
+            })
+            .join();
+            if !std::thread::panicking() {
+                assert!(
+                    matches!(stopped, Ok(Ok(()))),
+                    "recovered-input fixture recovery did not quiesce within 20s"
+                );
+            }
+        }
+    }
+
+    async fn dispatched_fixture() -> (RuntimeFixture, BackendJobReservation, RecoveryGuard) {
+        let f = RuntimeFixture::new().await;
+        let guard = RecoveryGuard::install(&f.api);
+        tokio::time::timeout(DEADLINE, f.api.stop_backend_job_recovery())
+            .await
+            .expect("initial fixture recovery did not quiesce within 20s");
+        // Pausing ownership does not prevent normal dispatch or its initial
+        // trusted delivery attestation. Do not resume a competing owner yet.
+        let dispatched = f.dispatch_input();
+        assert_eq!(dispatched.attempt.state, BackendJobAttemptState::Dispatched);
+        let inputs = f.execution.take_inputs();
+        assert_eq!(inputs.len(), 1, "exactly one initial Runtime submission");
+        assert_eq!(
+            inputs[0].1,
+            f.request
+                .worker_input(&dispatched.attempt.attempt_id)
+                .unwrap()
+        );
+        (f, dispatched, guard)
+    }
+
+    fn saved_completion(
+        f: &RuntimeFixture,
+        generation: &JournalGeneration,
+    ) -> (bool, Option<JournalJobCompletion>) {
+        let (active, completion): (bool, Option<String>) = f
+            .api
+            .feature_storage
+            .open(&f.api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                Ok(connection.query_row(
+                    "SELECT active,completion_json FROM journal_generations
+                     WHERE id=?1 AND job_id=?2 AND attempt_id=?3",
+                    rusqlite::params![
+                        generation.id,
+                        generation.job.job_id,
+                        generation.job.attempt_id
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap();
+        (
+            active,
+            completion.map(|value| serde_json::from_str(&value).unwrap()),
+        )
+    }
+
+    fn assert_no_execution_or_cleanup_proof(f: &RuntimeFixture, attempt: &BackendJobAttemptRecord) {
+        assert!(
+            !f.api
+                .store
+                .has_backend_job_execution_fence(TEST_WORKSPACE_ID, attempt)
+                .unwrap(),
+            "Journal finish is not an execution fence"
+        );
+        assert!(
+            f.api
+                .require_backend_job_attempt_effects_ended(attempt)
+                .is_err(),
+            "Journal completion cannot attest execution/Host termination"
+        );
+        assert!(attempt.worker_cleanup_completed_at.is_none());
+        assert!(session_root(f.dir.path(), attempt.worker.as_ref().unwrap()).exists());
+        assert_eq!(
+            current_journal_job(f).input_disposition,
+            crate::backend_job::JobInputDisposition::Available
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovered_input_receipt_after_journal_finish_preserves_same_attempt_completion() {
+        let (f, dispatched, mut guard) = dispatched_fixture().await;
+        let worker = dispatched.attempt.worker.as_ref().unwrap();
+        let generation = f
+            .store
+            .active_journal_generation(&f.host, &f.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation.job.attempt_id, dispatched.attempt.attempt_id);
+        assert_eq!(saved_completion(&f, &generation), (true, None));
+        let digest = f.request.input_digest().unwrap();
+        let frozen_input = f.request.input.clone();
+        let entered = guard.pause_before_attestation();
+        f.api.backend_job_recovery.resume_after_test_pause();
+        f.api.own_backend_job_recovery(&dispatched.attempt);
+        entered
+            .recv_timeout(DEADLINE)
+            .expect("actual recovery runner did not reach matching Runtime receipt cut");
+
+        // The actual owner has reconciled acceptance but has not yet re-attested.
+        // Model the Controller's finish Tool here, deliberately omitting Backend
+        // result posting so this closed generation still has a Dispatched attempt.
+        f.checkpoint(worker);
+        let completion = subjektiv_journal::finish(&f.api, worker).unwrap();
+        assert_eq!(completion.generation_id, generation.id);
+        assert_eq!(completion.process_order, 1);
+        assert_eq!(completion.process_byte, 0);
+        assert_eq!(
+            saved_completion(&f, &generation),
+            (false, Some(completion.clone())),
+            "real finish atomically closed this exact generation and saved completion"
+        );
+        assert!(
+            f.store
+                .active_journal_generation(&f.host, &f.id)
+                .unwrap()
+                .is_none()
+        );
+        let pending = current_journal_job(&f);
+        let accepted = current_journal_attempt(&f, &dispatched.attempt.attempt_id);
+        assert_eq!(pending.state, BackendJobState::Pending);
+        assert_eq!(pending.current_attempt, dispatched.attempt.attempt);
+        assert_eq!(pending.input_digest, digest);
+        assert_eq!(accepted.state, BackendJobAttemptState::Dispatched);
+        assert!(pending.result.is_none());
+        assert!(accepted.result.is_none());
+        assert_eq!(accepted.worker, dispatched.attempt.worker);
+        assert_eq!(accepted.runtime_run_id, dispatched.attempt.runtime_run_id);
+        assert_eq!(accepted.input_digest, digest);
+        assert_eq!(
+            pending.load_executable_request().unwrap().input,
+            frozen_input
+        );
+        assert_no_execution_or_cleanup_proof(&f, &accepted);
+
+        guard.release_attestation();
+        let completed = tokio::time::timeout(DEADLINE, async {
+            loop {
+                let job = current_journal_job(&f);
+                if job.state != BackendJobState::Pending {
+                    return job;
+                }
+                // Observation only: the channel ordered the race. This bounded
+                // poll neither drives recovery nor synchronizes the finish cut.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let job = current_journal_job(&f);
+            let attempt = current_journal_attempt(&f, &accepted.attempt_id);
+            panic!(
+                "recovery did not settle within 20s: job={:?}, attempt={:?}",
+                (job.state, &job.failure_category, &job.failure_detail),
+                (
+                    attempt.state,
+                    &attempt.failure_category,
+                    &attempt.failure_detail
+                )
+            )
+        });
+        assert_eq!(
+            completed.state,
+            BackendJobState::Completed,
+            "matching recovered input must recognize saved finish, not fail re-attesting a closed generation: {:?}",
+            (
+                completed.state,
+                &completed.failure_category,
+                &completed.failure_detail
+            )
+        );
+        assert_eq!(completed.request.job_id, f.request.job_id);
+        assert_eq!(completed.current_attempt, accepted.attempt);
+        assert_eq!(completed.input_digest, digest);
+        assert_eq!(
+            completed.load_executable_request().unwrap().input,
+            frozen_input
+        );
+        assert_eq!(
+            completed.result,
+            Some(serde_json::to_value(&completion).unwrap())
+        );
+        let terminal = current_journal_attempt(&f, &accepted.attempt_id);
+        assert_eq!(terminal.state, BackendJobAttemptState::Completed);
+        assert_eq!(terminal.worker, accepted.worker);
+        assert_eq!(terminal.runtime_run_id, accepted.runtime_run_id);
+        assert_eq!(terminal.input_digest, digest);
+        assert_eq!(terminal.result, completed.result);
+        assert_eq!(
+            terminal.worker_cleanup_state,
+            Some(BackendJobWorkerCleanupState::Pending),
+            "canonical cleanup is still held before claim"
+        );
+        assert_no_execution_or_cleanup_proof(&f, &terminal);
+        assert_eq!(saved_completion(&f, &generation), (false, Some(completion)));
+        assert_eq!(
+            f.store
+                .retained_journal_generation(&f.host, &f.id, &generation.job)
+                .unwrap(),
+            Some(generation)
+        );
+        assert_eq!(
+            f.api
+                .store
+                .list_backend_job_attempts(TEST_WORKSPACE_ID, &f.request.job_id)
+                .unwrap()
+                .len(),
+            1,
+            "recovery must not allocate another attempt"
+        );
+        assert!(
+            f.execution.take_inputs().is_empty(),
+            "receipt reconciliation must not submit Runtime input again"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn active_generation_delivery_replay_accepts_exact_input_and_rejects_mismatched_digest() {
+        let (f, dispatched, guard) = dispatched_fixture().await;
+        let generation = f
+            .store
+            .active_journal_generation(&f.host, &f.id)
+            .unwrap()
+            .unwrap();
+        let assert_unchanged = || {
+            assert_eq!(saved_completion(&f, &generation), (true, None));
+            let job = current_journal_job(&f);
+            assert_eq!(job.state, BackendJobState::Pending);
+            assert_eq!(job.current_attempt, dispatched.attempt.attempt);
+            assert_eq!(job.input_digest, dispatched.job.input_digest);
+            assert_eq!(job.intent_fingerprint, dispatched.job.intent_fingerprint);
+            // Never Debug the body-bearing request or complete Job record.
+            assert!(job.request == dispatched.job.request);
+            assert!(job.result.is_none());
+            let attempt = current_journal_attempt(&f, &dispatched.attempt.attempt_id);
+            assert_eq!(attempt.state, BackendJobAttemptState::Dispatched);
+            assert_eq!(attempt.input_digest, dispatched.attempt.input_digest);
+            assert_eq!(attempt.runtime_run_id, dispatched.attempt.runtime_run_id);
+            assert_eq!(attempt.worker, dispatched.attempt.worker);
+            assert!(attempt.result.is_none());
+            assert_no_execution_or_cleanup_proof(&f, &attempt);
+            assert!(f.execution.take_inputs().is_empty());
+        };
+        assert_unchanged();
+        subjektiv_journal::attest_delivery(&f.api, &dispatched)
+            .expect("exact delivery can be re-attested before finish");
+        subjektiv_journal::recover_delivery(&f.api, &dispatched)
+            .expect("exact active delivery can be recovered before finish");
+        assert_unchanged();
+
+        let mut wrong_digest = dispatched.clone();
+        wrong_digest.attempt.input_digest = "0".repeat(64);
+        assert_ne!(
+            wrong_digest.attempt.input_digest,
+            dispatched.attempt.input_digest
+        );
+        assert!(subjektiv_journal::attest_delivery(&f.api, &wrong_digest).is_err());
+        assert_unchanged();
+
+        let mut wrong_ranges = dispatched.clone();
+        wrong_ranges
+            .job
+            .request
+            .grants
+            .subjektiv_journal
+            .as_mut()
+            .unwrap()
+            .selected_ranges[0]
+            .bytes
+            .start += 1;
+        let mut wrong_input = dispatched.clone();
+        wrong_input.job.request.input["selected_ranges"] = serde_json::json!([]);
+        let mut wrong_run = dispatched.clone();
+        wrong_run.attempt.runtime_run_id = Some("different-recovery-run".into());
+        assert_ne!(
+            wrong_run.attempt.runtime_run_id,
+            dispatched.attempt.runtime_run_id
+        );
+        let mut wrong_worker = dispatched.clone();
+        wrong_worker.attempt.worker = Some(f.source.clone());
+        assert_ne!(wrong_worker.attempt.worker, dispatched.attempt.worker);
+
+        for (label, mismatched) in [
+            ("attempt input digest", wrong_digest),
+            ("grant selected ranges", wrong_ranges),
+            ("request input without new fingerprints", wrong_input),
+            ("Runtime run identity", wrong_run),
+            ("Worker binding", wrong_worker),
+        ] {
+            // Mutating a supplied reservation must not update its fingerprints or
+            // let recovery substitute the canonical input for a mismatched one.
+            assert_eq!(mismatched.job.input_digest, dispatched.job.input_digest);
+            assert_eq!(
+                mismatched.job.intent_fingerprint,
+                dispatched.job.intent_fingerprint
+            );
+            assert!(
+                subjektiv_journal::recover_delivery(&f.api, &mismatched).is_err(),
+                "recovery must reject mismatched {label}"
+            );
+            assert_unchanged();
+        }
+
+        // Rejected replays must neither disturb exact delivery nor finish it.
+        subjektiv_journal::attest_delivery(&f.api, &dispatched).unwrap();
+        subjektiv_journal::recover_delivery(&f.api, &dispatched).unwrap();
+        subjektiv_journal::execute(
+            &f.api,
+            dispatched.attempt.worker.as_ref().unwrap(),
+            JournalJobRequest::ReadState,
+        )
+        .expect("original delivery remains usable after mismatched replays");
+        assert_unchanged();
+        drop(guard);
+    }
+}
+
 mod lifecycle_barrier {
     use super::*;
     use std::sync::mpsc::{self, Receiver, Sender};

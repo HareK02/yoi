@@ -19,6 +19,7 @@ use tokio::sync::watch;
 enum ModelAction {
     Hold,
     Record,
+    RecordFirstPrefix,
     PartialThenHold,
     Fail,
 }
@@ -205,12 +206,13 @@ impl LlmClient for RemovalModel {
                 .find_map(|text| text.lines().find_map(|line| line.strip_prefix("job_id: ")))
                 .unwrap()
                 .to_owned();
-            {
+            let first_prefix = {
                 let mut inputs = self.inputs.lock().unwrap();
                 if !inputs.iter().any(|(id, _)| *id == job) {
-                    inputs.push((job, input.clone()));
+                    inputs.push((job.clone(), input.clone()));
                 }
-            }
+                inputs.first().is_some_and(|(id, _)| *id == job)
+            };
             let attempt = request
                 .items
                 .iter()
@@ -235,7 +237,9 @@ impl LlmClient for RemovalModel {
                 let current = *action.borrow_and_update();
                 if current == ModelAction::PartialThenHold && checkpoint_returned {
                     self.partial_checkpoint.notify_one();
-                } else if current != ModelAction::Hold {
+                } else if current != ModelAction::Hold
+                    && (current != ModelAction::RecordFirstPrefix || first_prefix)
+                {
                     break;
                 }
                 action.changed().await.unwrap();
@@ -736,16 +740,24 @@ impl RemovalFixture {
         })
         .await
         .unwrap_or_else(|_| {
-            let jobs = self.api()
+            let progress = self.api().config_store.get_journal_removal(&self.prepared()).unwrap();
+            let mut sessions = vec![self.attr.session_id.clone()];
+            if let Some(members) = progress.as_ref().and_then(|progress| progress.metadata.members.as_ref()) {
+                sessions.extend(members.iter().map(|member| member.session_id.clone()));
+            }
+            sessions.sort();
+            sessions.dedup();
+            let jobs = sessions.iter().flat_map(|session| self.api()
                 .store
-                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &self.attr.session_id, None, 100)
-                .unwrap();
+                .list_backend_journal_jobs(TEST_WORKSPACE_ID, session, None, 100)
+                .unwrap()).collect::<Vec<_>>();
             // Never Debug a Job record: its immutable request contains source bodies.
             let states = jobs.iter().map(|job| (
                 &job.request.job_id,
                 &job.state,
                 job.current_attempt,
                 &job.failure_category,
+                &job.failure_detail,
                 &job.input_disposition,
             )).collect::<Vec<_>>();
             let attempts = jobs.iter().map(|job| {
@@ -763,8 +775,9 @@ impl RemovalFixture {
                 ))
             }).collect::<Vec<_>>();
             panic!(
-                "autonomous removal stalled: plan={:?}; job_states={states:?}; attempts={attempts:?}",
+                "autonomous removal stalled: plan={:?}; progress={:?}; job_states={states:?}; attempts={attempts:?}",
                 self.prepared(),
+                progress.as_ref().map(|progress| (&progress.metadata.phase, &progress.metadata.cause)),
             )
         });
         assert!(self.api().runtime.worker(&self.source).is_err());
@@ -1141,6 +1154,50 @@ async fn unnotified_multisession_multisegment_utf8_history_chains_bounded_jobs_w
             .canonical_order,
         3,
         "the active prefix plus detached originals excludes repeated stable history"
+    );
+    let (first_job_id, first_input) = f.model.inputs.lock().unwrap()[0].clone();
+    let selected = first_input.selected_ranges.last().unwrap();
+    assert!(
+        selected.bytes.end < selected.source.total_bytes,
+        "the first completed Job must still leave a frozen member suffix"
+    );
+    f.model.set(ModelAction::RecordFirstPrefix);
+    let first_done = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let job = f
+                .api()
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &first_job_id)
+                .unwrap()
+                .unwrap();
+            if job.state != BackendJobState::Pending {
+                break job;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("first bounded Journal prefix completes while later Jobs are gated");
+    assert_eq!(
+        first_done.state,
+        BackendJobState::Completed,
+        "first prefix failure: {:?}",
+        (&first_done.failure_category, &first_done.failure_detail)
+    );
+    f.assert_held();
+    let prefix_progress = f
+        .api()
+        .config_store
+        .get_journal_removal(&prepared)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !matches!(
+            prefix_progress.metadata.phase,
+            crate::store::JournalRemovalPhase::Released
+                | crate::store::JournalRemovalPhase::Completed
+        ),
+        "one successful bounded prefix cannot release the all-member writer"
     );
     f.model.set(ModelAction::Record);
     f.wait_removed().await;
@@ -1993,25 +2050,12 @@ async fn pending_original_model_and_accepted_queue_are_not_stopped_or_discarded_
     .await
     .unwrap()
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !f
-            .api()
-            .runtime
-            .worker(&f.source)
-            .unwrap()
-            .state
-            .eq_ignore_ascii_case("stopped")
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap_or_else(|error| {
-        panic!(
-            "Stop projection did not settle: {error}; result={stop_result:?}; current={:?}",
-            f.api().runtime.worker(&f.source)
-        )
-    });
+    assert_eq!(
+        stop_result.state,
+        crate::hosts::InternalWorkerOperationState::Accepted,
+        "Stop must confirm actual shutdown before removal, not merely return an HTTP result: {stop_result:?}"
+    );
+    assert_eq!(f.api().runtime.worker(&f.source).unwrap().state, "stopped");
     let response = f.remove().await;
     assert_eq!(
         response.status,
