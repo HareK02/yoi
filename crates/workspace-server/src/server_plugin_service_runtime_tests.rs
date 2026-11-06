@@ -292,6 +292,7 @@ mod service_connection {
                 &request,
                 PluginHostRequest::Service {
                     request: PluginServiceRequest::Complete {
+                        failure: None,
                         result: PluginServiceEventResult::Ack,
                         ..
                     }
@@ -739,6 +740,7 @@ mod service_connection {
                 request(
                     owner.as_ref(),
                     PluginServiceRequest::Complete {
+                        failure: None,
                         lease: lease.clone(),
                         event_id: event.into(),
                         result: PluginServiceEventResult::Ack,
@@ -1154,6 +1156,7 @@ mod service_connection {
             request(
                 parent.as_ref(),
                 PluginServiceRequest::Complete {
+                        failure: None,
                     lease: parent_lease.clone(),
                     event_id: parent_event.event_id,
                     result: PluginServiceEventResult::Ack,
@@ -1274,6 +1277,7 @@ mod service_connection {
                 request(
                     owners[0].as_ref(),
                     PluginServiceRequest::Complete {
+                        failure: None,
                         lease: lease.clone(),
                         event_id: deletion,
                         result: PluginServiceEventResult::Ack

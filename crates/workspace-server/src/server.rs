@@ -5052,7 +5052,15 @@ impl WorkspaceApi {
             .get_backend_job(self.workspace_id(), &request.job_id)?
             .is_none()
         {
-            self.resolve_backend_job_profile(request)?;
+            self.resolve_backend_job_profile(request).map_err(|error| {
+                let cause = crate::backend_job::operation_failure_cause(
+                    &error,
+                    crate::backend_job::BackgroundJobCause::DispatchFailed,
+                );
+                // No reservation exists yet. Preserve rejection without inventing a
+                // durable attempt or changing the existing admission boundary.
+                crate::backend_job::record_operation_failure(error, cause, |_| Ok(()))
+            })?;
         }
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let reservation = {
@@ -5216,14 +5224,25 @@ impl WorkspaceApi {
             match self.backend_job_spawn_request(&reservation.job, &reservation.attempt) {
                 Ok(request) => request,
                 Err(error) => {
-                    self.finish_backend_job_attempt(
-                        &request.job_id,
-                        &reservation.attempt.attempt_id,
-                        BackendJobAttemptState::Failed,
-                        "profile_requirements",
-                        &error.to_string(),
-                    )?;
-                    return Err(error);
+                    let cause = crate::backend_job::operation_failure_cause(
+                        &error,
+                        crate::backend_job::BackgroundJobCause::DispatchFailed,
+                    );
+                    let detail = error.to_string();
+                    return Err(crate::backend_job::record_operation_failure(
+                        error,
+                        cause,
+                        |cause| {
+                            self.finish_backend_job_attempt_with_cause(
+                                &request.job_id,
+                                &reservation.attempt.attempt_id,
+                                BackendJobAttemptState::Failed,
+                                "profile_requirements",
+                                &detail,
+                                cause,
+                            )
+                        },
+                    ));
                 }
             };
         let worker_input = request.worker_input(&reservation.attempt.attempt_id)?;
@@ -5231,50 +5250,87 @@ impl WorkspaceApi {
             Ok(spawned) => spawned,
             Err(error) => {
                 let detail = error.error.to_string();
-                if matches!(
+                let cause = if error
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.startup.is_some())
+                {
+                    crate::backend_job::diagnostic_failure_cause(
+                        &error.diagnostics,
+                        crate::backend_job::BackgroundJobCause::DispatchFailed,
+                    )
+                } else if let Some(cause) = error.session_registration_cause.as_ref() {
+                    (|| {
+                        let facts = error_contract::FailureFacts::new(cause.clone())?;
+                        crate::backend_job::BackgroundFailure::from_projected(
+                            &error_contract::project_failure::<error_contract::Storage, _>(
+                                &facts,
+                                &(),
+                            )?,
+                        )
+                    })()
+                } else {
+                    crate::backend_job::operation_failure_cause(
+                        &error.error,
+                        crate::backend_job::BackgroundJobCause::DispatchFailed,
+                    )
+                };
+                let rejected = matches!(
                     &error.error,
                     Error::UnknownRuntime(_)
                         | Error::InvalidInput(_)
                         | Error::WorkspacePermissionDenied(_)
-                ) {
-                    self.finish_backend_job_attempt(
-                        &request.job_id,
-                        &reservation.attempt.attempt_id,
-                        BackendJobAttemptState::Failed,
-                        "dispatch_rejected",
-                        &detail,
-                    )?;
-                    return Err(error.error);
-                }
-                self.retain_backend_job_recovery(
-                    &reservation.attempt,
-                    "allocation_response_lost",
-                    &detail,
-                    "Read the same allocation receipt; never allocate a replacement Worker",
-                )?;
-                return Err(error.error);
+                );
+                return Err(crate::backend_job::record_operation_failure(
+                    error.error,
+                    cause,
+                    |cause| {
+                        if rejected {
+                            self.finish_backend_job_attempt_with_cause(
+                                &request.job_id,
+                                &reservation.attempt.attempt_id,
+                                BackendJobAttemptState::Failed,
+                                "dispatch_rejected",
+                                &detail,
+                                cause,
+                            )
+                        } else {
+                            self.retain_backend_job_recovery_with_cause(
+                            &reservation.attempt, "allocation_response_lost", &detail,
+                            "Read the same allocation receipt; never allocate a replacement Worker", cause,
+                        )
+                        }
+                    },
+                ));
             }
         };
         let worker = match (spawned.state, spawned.worker) {
             (InternalWorkerOperationState::Accepted, Some(worker)) => worker,
             _ => {
-                let detail = spawned
-                    .diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.message.as_str())
-                    .unwrap_or("embedded Runtime rejected Backend Job Worker dispatch");
-                self.finish_backend_job_attempt(
-                    &request.job_id,
-                    &reservation.attempt.attempt_id,
-                    BackendJobAttemptState::Failed,
-                    "dispatch_rejected",
-                    detail,
-                )?;
-                return Err(Error::RuntimeOperationFailed {
+                let cause = crate::backend_job::diagnostic_failure_cause(
+                    &spawned.diagnostics,
+                    crate::backend_job::BackgroundJobCause::DispatchFailed,
+                );
+                let detail = "Runtime did not accept Backend Job Worker dispatch";
+                let primary = Error::RuntimeOperationFailed {
                     runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                     code: "backend_job_dispatch_rejected".to_string(),
                     message: detail.to_string(),
-                });
+                };
+                return Err(crate::backend_job::record_operation_failure(
+                    primary,
+                    cause,
+                    |cause| {
+                        self.finish_backend_job_attempt_with_cause(
+                            &request.job_id,
+                            &reservation.attempt.attempt_id,
+                            BackendJobAttemptState::Failed,
+                            "dispatch_rejected",
+                            detail,
+                            cause,
+                        )
+                    },
+                ));
             }
         };
         let bound_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
@@ -5461,13 +5517,46 @@ impl WorkspaceApi {
         failure_category: &str,
         failure_detail: &str,
     ) -> Result<BackendJobAttemptRecord> {
-        self.store.finish_backend_job_attempt(
+        let cause = crate::backend_job::BackgroundJobCause::ExecutionFailed
+            .storage()
+            .map_err(Error::BackendJobCauseProjection)?;
+        self.finish_backend_job_attempt_with_cause(
+            job_id,
+            attempt_id,
+            state,
+            failure_category,
+            failure_detail,
+            Some(&cause),
+        )
+    }
+
+    fn finish_backend_job_attempt_with_cause(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        state: BackendJobAttemptState,
+        failure_category: &str,
+        failure_detail: &str,
+        cause: Option<&crate::backend_job::BackgroundFailure>,
+    ) -> Result<BackendJobAttemptRecord> {
+        let retained =
+            self.store
+                .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)?;
+        let cause = crate::backend_job::prefer_retained_startup_cause(
+            retained
+                .as_ref()
+                .and_then(|attempt| attempt.failure_cause.as_ref()),
+            cause,
+        )
+        .map_err(Error::BackendJobCauseProjection)?;
+        self.store.finish_backend_job_attempt_with_cause(
             &self.config.workspace_id,
             job_id,
             attempt_id,
             state,
             failure_category,
             failure_detail,
+            cause.as_ref(),
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )?;
         let current = self
@@ -5588,38 +5677,43 @@ impl WorkspaceApi {
             Error::Store("claimed Backend Job Worker cleanup lost its binding".to_string())
         })?;
 
-        let record_failure = |category: &str, detail: &str| -> Result<()> {
-            self.store.finish_backend_job_worker_cleanup_owned(
-                &self.config.workspace_id,
-                &history,
-                &attempt,
-                BackendJobWorkerCleanupState::Failed,
-                Some(category),
-                Some(detail),
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )?;
+        let record_failure = |category: &str,
+                              detail: &str,
+                              cause: Option<&crate::backend_job::BackgroundFailure>|
+         -> Result<()> {
+            self.store
+                .finish_backend_job_worker_cleanup_owned_with_cause(
+                    &self.config.workspace_id,
+                    &history,
+                    &attempt,
+                    BackendJobWorkerCleanupState::Failed,
+                    Some(category),
+                    Some(detail),
+                    cause,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
             Ok(())
         };
         let fail = |category: &str, detail: String| -> Result<()> {
-            record_failure(category, &detail)?;
-            Err(Error::RuntimeOperationFailed {
+            let primary = Error::RuntimeOperationFailed {
                 runtime_id: worker.runtime_id.clone(),
                 code: category.to_string(),
-                message: detail,
-            })
+                message: detail.clone(),
+            };
+            Err(crate::backend_job::record_operation_failure(
+                primary,
+                crate::backend_job::BackgroundJobCause::CleanupFailed.storage(),
+                |cause| record_failure(category, &detail, cause),
+            ))
         };
         let fail_with_error = |category: &str, error: Error| -> Result<()> {
-            if let Err(diagnostic) = record_failure(category, &error.to_string()) {
-                tracing::warn!(%error, %diagnostic, "Cleanup failure diagnosis was not confirmed");
-                // Keep transient storage ownership even when a definitive operation
-                // failure could not be diagnosed durably. Neither error proves cleanup.
-                if !backend_job_recovery::transient_storage(&error)
-                    && backend_job_recovery::transient_storage(&diagnostic)
-                {
-                    return Err(diagnostic);
-                }
-            }
-            Err(error)
+            let cause = crate::backend_job::worker_cleanup_failure_cause(&error);
+            let detail = error.to_string();
+            Err(crate::backend_job::record_operation_failure(
+                error,
+                cause,
+                |cause| record_failure(category, &detail, cause),
+            ))
         };
         let complete = || -> Result<()> {
             self.require_backend_job_attempt_effects_ended(&attempt)?;
@@ -5655,15 +5749,17 @@ impl WorkspaceApi {
                     subjektiv_journal::close(self, &job.request, &attempt)?;
                 }
             }
-            self.store.finish_backend_job_worker_cleanup_owned(
-                &self.config.workspace_id,
-                &history,
-                &attempt,
-                BackendJobWorkerCleanupState::Completed,
-                None,
-                None,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )?;
+            self.store
+                .finish_backend_job_worker_cleanup_owned_with_cause(
+                    &self.config.workspace_id,
+                    &history,
+                    &attempt,
+                    BackendJobWorkerCleanupState::Completed,
+                    None,
+                    None,
+                    None,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
             self.finish_backend_job_cleanup_retirement(job_id, attempt_id)
         };
 
@@ -5688,7 +5784,12 @@ impl WorkspaceApi {
                         runtime_diagnostics_message(&result.diagnostics),
                     );
                 }
-                Err(error) => return fail("backend_job_cleanup_stop_unconfirmed", error.message()),
+                Err(error) => {
+                    return fail_with_error(
+                        "backend_job_cleanup_stop_unconfirmed",
+                        error.into_error(),
+                    );
+                }
             }
             if let Err(error) = self.fence_backend_job_effects(&attempt, drain).await {
                 return fail_with_error("backend_job_cleanup_effects_unconfirmed", error);
@@ -5822,14 +5923,23 @@ impl WorkspaceApi {
             {
                 let detail = error.to_string();
                 if attempt.state == BackendJobAttemptState::Dispatched {
-                    self.finish_backend_job_attempt(
-                        &submission.job_id,
-                        &submission.attempt_id,
-                        BackendJobAttemptState::Failed,
-                        "invalid_result",
-                        &detail,
-                    )?;
+                    let cause = crate::backend_job::operation_failure_cause(
+                        &error,
+                        crate::backend_job::BackgroundJobCause::ExecutionFailed,
+                    );
+                    let failure =
+                        crate::backend_job::record_operation_failure(error, cause, |cause| {
+                            self.finish_backend_job_attempt_with_cause(
+                                &submission.job_id,
+                                &submission.attempt_id,
+                                BackendJobAttemptState::Failed,
+                                "invalid_result",
+                                &detail,
+                                cause,
+                            )
+                        });
                     self.drain_reserved_backend_jobs();
+                    return Err(failure);
                 }
                 return Err(error);
             }
@@ -8528,21 +8638,10 @@ fn worker_spawn_result_to_api(
     })
 }
 
-fn worker_input_result_to_api(
-    mut result: WorkerInputResult,
-) -> server_api::RuntimeWorkerInputResult {
-    // The existing wire result has no disposition field. Keep uncertain delivery
-    // distinguishable without collapsing it into a definite refusal or replaying input.
-    if result.disposition == WorkerInputDisposition::Unknown {
-        result.diagnostics.push(RuntimeDiagnostic {
-            startup: None,
-            code: "worker_input_outcome_unknown".into(),
-            severity: HostDiagnosticSeverity::Warning,
-            message: "Worker input delivery outcome is unknown; inspect the current session before retrying".into(),
-        });
-    }
+fn worker_input_result_to_api(result: WorkerInputResult) -> server_api::RuntimeWorkerInputResult {
     server_api::RuntimeWorkerInputResult {
         state: result.state.into(),
+        disposition: result.disposition,
         runtime_id: result.worker.runtime_id,
         worker_id: result.worker.worker_id,
         diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
@@ -21680,6 +21779,7 @@ fn ticket_notification_delivery_error_category(
         Err(RuntimeRegistryError::UnknownWorker { .. }) => Some("unknown_worker"),
         Err(
             RuntimeRegistryError::WorkdirSessionOpenFailed { .. }
+            | RuntimeRegistryError::RuntimeControlFailed { .. }
             | RuntimeRegistryError::RuntimeOperationFailed { .. },
         ) => Some("runtime_operation_failed"),
     }
@@ -30169,6 +30269,7 @@ fn workdir_runtime_failure_code(error: &RuntimeRegistryError) -> String {
             "workdir_session_open_failed".to_string()
         }
         RuntimeRegistryError::RuntimeOperationFailed { code, .. } => code.clone(),
+        RuntimeRegistryError::RuntimeControlFailed { cause, .. } => cause.reason().to_string(),
         RuntimeRegistryError::InvalidIdentifier { .. } => "invalid_runtime".to_string(),
         RuntimeRegistryError::UnknownWorker { .. } => "runtime_workdir_lookup_failed".to_string(),
     }
@@ -30812,6 +30913,18 @@ fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static st
             let category =
                 workdir_cleanup_diagnostic_category(code).unwrap_or("provider_unavailable");
             (category, category != "unsupported_target")
+        }
+        RuntimeRegistryError::RuntimeControlFailed { cause, .. } => {
+            use protocol::control_failure::RuntimeControlCause as C;
+            match cause {
+                C::WorkerMissing
+                | C::InvalidWorkerIdentifier
+                | C::InvalidRequest
+                | C::WorkspaceBindingMismatch
+                | C::AuthorizationFailed
+                | C::RequestEncodingFailed => ("authority_invalid", false),
+                _ => ("provider_unavailable", true),
+            }
         }
         RuntimeRegistryError::InvalidIdentifier { .. }
         | RuntimeRegistryError::UnknownHost(_)
@@ -39768,6 +39881,27 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::RuntimeOperationFailed { code, .. } if code == "skill_not_found" => {
             StatusCode::NOT_FOUND
         }
+        Error::RuntimeControlFailed { cause, .. } => {
+            use protocol::control_failure::RuntimeControlCause as C;
+            match cause {
+                C::WorkerMissing => StatusCode::NOT_FOUND,
+                C::InvalidWorkerIdentifier | C::InvalidRequest | C::RequestEncodingFailed => {
+                    StatusCode::BAD_REQUEST
+                }
+                C::RestoreObservationStale
+                | C::RestoreObservationConflict
+                | C::RestoreAdmissionBusy
+                | C::StopObservationConflict
+                | C::StopRequestConflict
+                | C::StopAdmissionBusy
+                | C::ExecutionRejected => StatusCode::CONFLICT,
+                C::RuntimeStopped | C::PersistenceOutcomeUnknown | C::ConfigurationUnavailable => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                C::TimedOut => StatusCode::GATEWAY_TIMEOUT,
+                _ => StatusCode::BAD_GATEWAY,
+            }
+        }
         Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
         Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
             StatusCode::NOT_FOUND
@@ -42988,15 +43122,16 @@ mod tests {
         }
 
         fn worker(&self, worker_id: &str) -> crate::hosts::WorkerLookupResult {
-            crate::hosts::WorkerLookupResult {
-                worker: self
-                    .workers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .iter()
-                    .find(|worker| worker.worker.worker_id == worker_id)
-                    .cloned(),
-                diagnostics: Vec::new(),
+            match self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|worker| worker.worker.worker_id == worker_id)
+                .cloned()
+            {
+                Some(worker) => crate::hosts::WorkerLookupResult::found(worker),
+                None => crate::hosts::WorkerLookupResult::missing(),
             }
         }
 
@@ -43147,7 +43282,10 @@ mod tests {
             ),
             RuntimeDiagnostic,
         > {
-            if self.worker(worker_id).worker.is_none() {
+            if !matches!(
+                self.worker(worker_id).outcome,
+                crate::hosts::WorkerLookupOutcome::Found { .. }
+            ) {
                 return Ok((
                     Some(InternalWorkerRestoreResult {
                         state: server_api::WorkerRestoreState::Rejected,
@@ -43169,7 +43307,10 @@ mod tests {
             if let Some(callback) = &self.lifecycle_callback {
                 callback(worker_id);
             }
-            let worker = self.worker(worker_id).worker;
+            let worker = self
+                .worker(worker_id)
+                .into_worker(Self::RUNTIME_ID, worker_id)
+                .ok();
             InternalWorkerRestoreResult {
                 state: if let Some(outcome) = self.next_restore_outcome.lock().unwrap().take() {
                     outcome
@@ -43190,7 +43331,10 @@ mod tests {
         ) -> crate::hosts::WorkerWorkspaceApiResult {
             crate::hosts::WorkerWorkspaceApiResult {
                 state: InternalWorkerOperationState::Accepted,
-                worker: self.worker(worker_id).worker,
+                worker: self
+                    .worker(worker_id)
+                    .into_worker(Self::RUNTIME_ID, worker_id)
+                    .ok(),
                 diagnostics: Vec::new(),
             }
         }
@@ -43206,7 +43350,10 @@ mod tests {
                 .insert(worker_id.to_string(), attachments);
             crate::hosts::WorkerWorkspaceApiResult {
                 state: InternalWorkerOperationState::Accepted,
-                worker: self.worker(worker_id).worker,
+                worker: self
+                    .worker(worker_id)
+                    .into_worker(Self::RUNTIME_ID, worker_id)
+                    .ok(),
                 diagnostics: Vec::new(),
             }
         }
@@ -51804,6 +51951,8 @@ mod tests {
         >,
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
+        typed_spawn_failure:
+            std::sync::Mutex<Option<worker_runtime::execution::WorkerExecutionResult>>,
         subject_delete_failure: std::sync::Mutex<Option<String>>,
         recovery_failure: std::sync::Mutex<Option<String>>,
         recovery_requests: std::sync::Mutex<Vec<runtime_api::SubjectCreateRecoveryRequest>>,
@@ -51854,6 +52003,7 @@ mod tests {
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
+                typed_spawn_failure: std::sync::Mutex::new(None),
                 subject_delete_failure: std::sync::Mutex::new(None),
                 recovery_failure: std::sync::Mutex::new(None),
                 recovery_requests: std::sync::Mutex::new(Vec::new()),
@@ -52018,6 +52168,9 @@ mod tests {
             &self,
             request: worker_runtime::execution::WorkerExecutionSpawnRequest,
         ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            if let Some(result) = self.typed_spawn_failure.lock().unwrap().take() {
+                return worker_runtime::execution::WorkerExecutionSpawnResult::Errored(result);
+            }
             if let Some(message) = self.spawn_failure.lock().unwrap().take() {
                 return worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
                     worker_runtime::execution::WorkerExecutionResult::errored(
@@ -53425,6 +53578,299 @@ mod tests {
         assert!(failed.is_err());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(execution.take_inputs().is_empty());
+    }
+
+    fn cause_job_request(id: &str) -> BackendJobRequest {
+        BackendJobRequest {
+            job_id: id.into(),
+            purpose: "typed_cause_contract".into(),
+            input_ref: format!("test://cause/{id}"),
+            input: serde_json::json!({"frozen": true}),
+            instruction: "Return the structured result".into(),
+            profile: "builtin:backend-job".into(),
+            grants: Default::default(),
+            serialization_key: None,
+            source_worker: None,
+            notification_target: None,
+            limits: Default::default(),
+        }
+    }
+
+    fn cause_startup_result() -> worker_runtime::execution::WorkerExecutionResult {
+        use protocol::session_failure::{
+            SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
+        };
+        use worker_runtime::execution::{
+            WorkerExecutionOperation, WorkerExecutionOutcome, WorkerExecutionResult,
+        };
+        let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn);
+        result.outcome = WorkerExecutionOutcome::Errored;
+        result.startup_failure = Some(
+            session_registration_attachment(SessionRegistrationCause::denied(
+                SessionPrincipal::Subject,
+            ))
+            .unwrap(),
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_spawn_retains_startup_primary_in_terminal_save_and_reopen() {
+        use protocol::session_failure::SessionRegistrationCause;
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        *execution.typed_spawn_failure.lock().unwrap() = Some(cause_startup_result());
+        let request = cause_job_request("startup-primary");
+        let error = api.dispatch_backend_job(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::BackendJobFailure {
+                failure_cause: Some(_),
+                ..
+            }
+        ));
+        api.stop_backend_job_recovery().await;
+        let id = crate::backend_job::attempt_id(&request.job_id, 1);
+        let attempt = api
+            .store
+            .get_backend_job_attempt(api.workspace_id(), &request.job_id, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert!(matches!(
+            attempt
+                .failure_cause
+                .as_ref()
+                .unwrap()
+                .decode::<SessionRegistrationCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ));
+        assert_eq!(attempt.attempt, 1);
+        assert!(attempt.allocation_precluded_at.is_none());
+        assert!(execution.take_inputs().is_empty());
+        let reopened = SqliteWorkspaceStore::open_api_fixture(&api.config.database_path).unwrap();
+        let reloaded = reopened
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.failure_cause, attempt.failure_cause);
+        assert_eq!(reloaded.state, BackendJobState::Failed);
+        assert_eq!(reloaded.current_attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_spawn_save_failure_keeps_primary_and_recording_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        *execution.typed_spawn_failure.lock().unwrap() = Some(cause_startup_result());
+        api.config_store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER fail_cause_save BEFORE UPDATE OF failure_cause ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'injected recording failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        let request = cause_job_request("startup-save-failed");
+        let error = api.dispatch_backend_job(&request).unwrap_err();
+        match error {
+            Error::BackendJobFailure {
+                primary,
+                failure_cause: Some(cause),
+                recording,
+            } => {
+                assert!(!matches!(primary.as_ref(), Error::Sqlite(_)));
+                assert!(
+                    recording
+                        .iter()
+                        .any(|error| matches!(error, Error::Sqlite(_)))
+                );
+                assert!(matches!(
+                    crate::backend_job::StoredFailure::from_storage(cause.as_storage_str().into())
+                        .decode::<protocol::session_failure::SessionRegistrationCause>(),
+                    error_contract::DecodeFailure::Known(_)
+                ));
+            }
+            error => panic!("missing separate startup/save observations: {error:?}"),
+        }
+        api.stop_backend_job_recovery().await;
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                api.workspace_id(),
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Dispatching);
+        assert!(
+            attempt.failure_cause.is_none(),
+            "failed save is not durable evidence"
+        );
+        assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_profile_rejection_records_dispatch_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let mut request = cause_job_request("profile-rejected");
+        request.profile = "builtin:missing-job-profile".into();
+        // Existing durable intent can outlive its configured profile. New intent
+        // rejection still occurs before reservation and must not invent a Job.
+        api.store
+            .reserve_backend_job(
+                api.workspace_id(),
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(api.dispatch_backend_job(&request).is_err());
+        api.stop_backend_job_recovery().await;
+        let job = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, BackendJobState::Failed);
+        let projected = job
+            .failure_cause
+            .unwrap()
+            .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+            .unwrap();
+        assert_eq!(
+            *projected.details(),
+            crate::backend_job::BackgroundJobCause::DispatchFailed
+        );
+        assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_input_rejection_records_attempt_and_job_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        execution
+            .reject_input_definitively
+            .store(true, Ordering::SeqCst);
+        let request = cause_job_request("input-rejected-cause");
+        assert!(api.dispatch_backend_job(&request).is_err());
+        api.stop_backend_job_recovery().await;
+        let job = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                api.workspace_id(),
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, BackendJobState::Failed);
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(job.failure_cause, attempt.failure_cause);
+        assert_eq!(
+            *attempt
+                .failure_cause
+                .unwrap()
+                .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+                .unwrap()
+                .details(),
+            crate::backend_job::BackgroundJobCause::InputFailed
+        );
+        assert_eq!(attempt.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_unconfirmed_input_keeps_attempt_and_never_resubmits() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        execution.reject_inputs("injected unconfirmed input operation");
+        let request = cause_job_request("input-unconfirmed-cause");
+        assert!(api.dispatch_backend_job(&request).is_err());
+        api.stop_backend_job_recovery().await;
+        let job = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                api.workspace_id(),
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, BackendJobState::Pending);
+        assert_eq!(attempt.state, BackendJobAttemptState::Dispatched);
+        assert!(attempt.failure_cause.is_some());
+        assert_eq!(attempt.attempt, 1);
+        assert!(
+            api.submit_initial_backend_job_input(
+                &job,
+                &attempt,
+                request.worker_input(&attempt.attempt_id).unwrap()
+            )
+            .is_err()
+        );
+        let current = api
+            .store
+            .get_backend_job_attempt(api.workspace_id(), &request.job_id, &attempt.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.worker, attempt.worker);
+        assert_eq!(current.runtime_run_id, attempt.runtime_run_id);
+        assert_eq!(current.state, BackendJobAttemptState::Dispatched);
+        assert_eq!(
+            execution.take_inputs().len(),
+            1,
+            "same receipt lookup must never repeat Submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_deadline_records_cause_without_replacement_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let mut request = cause_job_request("deadline-cause");
+        request.limits.timeout_seconds = 1;
+        let reservation = api.dispatch_backend_job(&request).unwrap();
+        let attempt = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let attempt = api
+                    .store
+                    .get_backend_job_attempt(
+                        api.workspace_id(),
+                        &request.job_id,
+                        &reservation.attempt.attempt_id,
+                    )
+                    .unwrap()
+                    .unwrap();
+                if attempt.state.terminal() {
+                    break attempt;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        api.stop_backend_job_recovery().await;
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(attempt.worker, reservation.attempt.worker);
+        assert_eq!(attempt.runtime_run_id, reservation.attempt.runtime_run_id);
+        assert_eq!(attempt.attempt, 1);
+        assert_eq!(
+            *attempt
+                .failure_cause
+                .unwrap()
+                .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+                .unwrap()
+                .details(),
+            crate::backend_job::BackgroundJobCause::DeadlineExceeded
+        );
+        assert_eq!(execution.take_inputs().len(), 1);
     }
 
     mod backend_job_tests;

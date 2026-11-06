@@ -24,6 +24,7 @@ config-source.workspace = true
 content-history.workspace = true
 content-history-store.workspace = true
 content-history-adapters.workspace = true
+error-contract.workspace = true
 feature-permissions.workspace = true
 feature-storage.workspace = true
 workspace-drive.workspace = true

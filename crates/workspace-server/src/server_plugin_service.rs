@@ -359,6 +359,7 @@ pub(super) async fn execute(
             lease,
             event_id,
             result,
+            failure,
         } => {
             checked_consumer(
                 api.clone(),
@@ -373,7 +374,15 @@ pub(super) async fn execute(
                 .db_executor()
                 .run(move || {
                     config.with_immediate_transaction(|tx| {
-                        store::complete(tx, &workspace, &lease, &event_id, &result, now_ms())
+                        store::complete_with_failure(
+                            tx,
+                            &workspace,
+                            &lease,
+                            &event_id,
+                            &result,
+                            failure.as_ref(),
+                            now_ms(),
+                        )
                     })
                 })
                 .await

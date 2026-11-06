@@ -124,6 +124,11 @@ pub enum Error {
     InvalidRuntimeIdentifier { kind: String, value: String },
     #[error("worker name is reserved for a dedicated Workspace service: {0}")]
     ReservedWorkerName(String),
+    #[error("{}", cause.explanation())]
+    RuntimeControlFailed {
+        runtime_id: String,
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
     #[error("runtime `{runtime_id}` operation failed ({code}): {message}")]
     RuntimeOperationFailed {
         runtime_id: String,
@@ -203,6 +208,18 @@ pub enum Error {
     DbExecutorUnavailable,
     #[error("DB operation outcome unknown; do not automatically retry")]
     DbOperationOutcomeUnknown,
+    /// Observed operation failure and independent projection/save failures. Neither
+    /// recording failure nor this wrapper is proof of a durable Job transition.
+    /// Display is deliberately static; authenticated consumers inspect typed fields.
+    #[error("Backend Job operation failed; recording evidence is separate")]
+    BackendJobFailure {
+        #[source]
+        primary: std::sync::Arc<Error>,
+        failure_cause: Option<backend_job::BackgroundFailure>,
+        recording: Vec<Error>,
+    },
+    #[error("Backend Job cause projection failed")]
+    BackendJobCauseProjection(#[source] error_contract::ContractError),
     #[error("store error: {0}")]
     Store(String),
 }

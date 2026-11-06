@@ -989,6 +989,7 @@ fn map_tool_error(error: ToolError) -> WipOperationError {
         ToolError::InvalidArgument(message) => {
             failure(ProtocolErrorCode::InvalidArguments, message)
         }
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, .. } => {

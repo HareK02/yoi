@@ -245,7 +245,7 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), JobStoreError> {
                 }
                 migrate(&tx)?;
             }
-            6 | 7 => {}
+            6..=8 => {}
             SCHEMA_VERSION => {}
             other => return Err(JobStoreError::UnsupportedSchema(other)),
         }
@@ -258,6 +258,11 @@ pub(super) fn initialize(conn: &mut Connection) -> Result<(), JobStoreError> {
             // Extend the existing refusal evidence to explicit domain admissions.
             // No Job is cut over, reissued or retroactively declared unstarted.
             tx.execute_batch(GRANTED_START_REJECTION_SCHEMA)?;
+        }
+        if version <= 8 {
+            // Reader-first nullable evidence only: no legacy prose classification,
+            // cutover, execution reissue, or change to result/cleanup receipts.
+            tx.execute_batch(super::failure::SCHEMA)?;
         }
         if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
             return Err(JobStoreError::Corrupt(

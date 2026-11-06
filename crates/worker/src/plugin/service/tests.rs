@@ -70,6 +70,7 @@ impl Fixture {
             parked_consumer: Mutex::new(None),
             unconfirmed_indeterminate: Mutex::new(None),
             prepared_start: AtomicBool::new(false),
+            observations: Mutex::new(ServiceDriverObservations::default()),
         })
     }
 }
@@ -125,6 +126,7 @@ enum CompleteResponse {
     Lost,
     Unexpected,
     ConfirmIndeterminate,
+    Confirm,
 }
 
 #[derive(Default)]
@@ -143,6 +145,8 @@ struct Owner {
     deny_log: AtomicBool,
     deny_release: AtomicBool,
     deny_publish: AtomicBool,
+    deny_event_publish: AtomicBool,
+    unknown_send: AtomicBool,
     log_entered: Semaphore,
 }
 
@@ -156,6 +160,8 @@ impl Owner {
             deny_log: AtomicBool::new(false),
             deny_release: AtomicBool::new(false),
             deny_publish: AtomicBool::new(false),
+            deny_event_publish: AtomicBool::new(false),
+            unknown_send: AtomicBool::new(false),
             log_entered: Semaphore::new(0),
         })
     }
@@ -177,6 +183,7 @@ impl Owner {
             attempt: 1,
             current_event_id: Some("event".into()),
             lease_active: state.lease.is_some(),
+            last_outcome: None,
         }
     }
 }
@@ -270,10 +277,25 @@ impl PluginHostOwner for Owner {
                 lease,
                 event_id,
                 result,
+                failure: _,
             } => {
                 let mut state = self.state.lock().unwrap();
                 assert_eq!(state.lease.as_ref(), Some(&lease));
                 assert_eq!(event_id, "event");
+                if matches!(self.complete_response, CompleteResponse::Confirm) {
+                    state.pause = match result {
+                        PluginServiceEventResult::Indeterminate => {
+                            Some(PluginServicePauseReason::Indeterminate)
+                        }
+                        PluginServiceEventResult::Reject => {
+                            Some(PluginServicePauseReason::Rejected)
+                        }
+                        _ => None,
+                    };
+                    return Ok(PluginHostResponse::Service {
+                        response: PluginServiceResponse::Completed,
+                    });
+                }
                 assert_eq!(
                     result,
                     match self.complete_response {
@@ -288,7 +310,9 @@ impl PluginHostOwner for Owner {
                 match self.complete_response {
                     CompleteResponse::Lost => return Err(unavailable()),
                     CompleteResponse::Unexpected => PluginServiceResponse::Idle,
-                    CompleteResponse::ConfirmIndeterminate => PluginServiceResponse::Completed,
+                    CompleteResponse::ConfirmIndeterminate | CompleteResponse::Confirm => {
+                        PluginServiceResponse::Completed
+                    }
                 }
             }
             PluginServiceRequest::Release { lease } => {
@@ -309,8 +333,16 @@ impl PluginHostOwner for Owner {
             PluginServiceRequest::Host { lease, request } => {
                 assert_eq!(self.state.lock().unwrap().lease.as_ref(), Some(&lease));
                 let response = match *request {
-                    PluginInvocationRequest::Authorize { invocation_id, .. } => {
+                    PluginInvocationRequest::Authorize {
+                        invocation_id,
+                        operation,
+                    } => {
                         assert_eq!(invocation_id, "invocation");
+                        if operation == PluginHostOperation::Publish
+                            && self.deny_event_publish.load(Ordering::SeqCst)
+                        {
+                            return Err(unavailable());
+                        }
                         PluginInvocationResponse::Authorized
                     }
                     PluginInvocationRequest::ResolveTicket { ticket_ref, .. } => {
@@ -347,6 +379,11 @@ impl PluginHostOwner for Owner {
                         }
                     }
                     PluginInvocationRequest::Open { .. } => PluginInvocationResponse::Opened,
+                    PluginInvocationRequest::Send { .. }
+                        if self.unknown_send.load(Ordering::SeqCst) =>
+                    {
+                        return Err(unavailable());
+                    }
                     PluginInvocationRequest::Send { .. } => PluginInvocationResponse::Response {
                         response: PluginHttpResponse {
                             status: 200,
@@ -370,6 +407,169 @@ async fn run(driver: &Arc<ServiceDriver>, context: &BackgroundTaskContext) {
         .run(context.clone(), BackgroundTaskCancellation::default())
         .await
         .expect("a parked observer must remain a successful HostReady run");
+}
+
+fn completed(
+    owner: &Owner,
+) -> (
+    PluginServiceEventResult,
+    Option<PluginServiceFailureAttachment>,
+) {
+    owner
+        .requests()
+        .into_iter()
+        .rev()
+        .find_map(|request| match request {
+            PluginServiceRequest::Complete {
+                result, failure, ..
+            } => Some((result, failure)),
+            _ => None,
+        })
+        .expect("production driver must report Complete")
+}
+fn failure_cause(attachment: &PluginServiceFailureAttachment) -> PluginServiceFailure {
+    match attachment.decode() {
+        error_contract::DecodeFailure::Known(received) => *received.facts().cause(),
+        _ => panic!("expected bounded typed Service failure"),
+    }
+}
+
+#[tokio::test]
+async fn real_driver_nonterminal_retry_and_accepted_execution_failure_retain_cause() {
+    let fixture = Fixture::new();
+    let context = context().await;
+    // The existing guest's oversized retry is an executor InvalidOutput, not a
+    // proposed retry delay. The driver still uses its original fixed policy.
+    let owner = Owner::new("selected", CompleteResponse::Confirm);
+    let mut driver = fixture.driver(owner.clone());
+    Arc::get_mut(&mut driver).unwrap().config = r#"{"mode":"oversize-retry"}"#.into();
+    run(&driver, &context).await;
+    run(&driver, &context).await;
+    let (result, attachment) = completed(&owner);
+    assert_eq!(
+        result,
+        PluginServiceEventResult::RetryAfter { delay_ms: 1_000 }
+    );
+    assert_eq!(
+        failure_cause(&attachment.unwrap()),
+        PluginServiceFailure::Invocation {
+            reason: PluginServiceExecutionFailure::InvalidOutput,
+        }
+    );
+    assert!(owner.diagnostics().pause_reason.is_none());
+    assert!(driver.parked_consumer.lock().unwrap().is_none());
+    let observations = driver.observations();
+    assert_eq!(observations.event_id.as_deref(), Some("event"));
+    assert_eq!(observations.invocation_id.as_deref(), Some("invocation"));
+    assert_eq!(observations.attempt, Some(1));
+    assert_eq!(observations.result, Some(result));
+    assert_eq!(
+        observations.invocation_cause,
+        Some(PluginServiceFailure::Invocation {
+            reason: PluginServiceExecutionFailure::InvalidOutput
+        })
+    );
+    assert!(!observations.attachment_unavailable);
+    assert!(observations.completion.is_none());
+    driver.stopped(context.clone()).await.unwrap();
+
+    // A live publish check fails AFTER the real guest's effects were observed.
+    // Accepted execution failure is neither not-started nor unknown-effect.
+    let owner = Owner::new("selected", CompleteResponse::Confirm);
+    let driver = fixture.driver(owner.clone());
+    run(&driver, &context).await;
+    owner.deny_event_publish.store(true, Ordering::SeqCst);
+    run(&driver, &context).await;
+    let (result, attachment) = completed(&owner);
+    assert_eq!(
+        result,
+        PluginServiceEventResult::RetryAfter { delay_ms: 1_000 }
+    );
+    assert_eq!(
+        failure_cause(&attachment.unwrap()),
+        PluginServiceFailure::Invocation {
+            reason: PluginServiceExecutionFailure::HostUnavailable,
+        }
+    );
+    assert_eq!(owner.requests().iter().filter(|r| matches!(r,
+        PluginServiceRequest::Host { request, .. } if matches!(request.as_ref(), PluginInvocationRequest::Send { .. })
+    )).count(), 1);
+    assert!(driver.observations().completion.is_none());
+    driver.stopped(context).await.unwrap();
+}
+
+#[tokio::test]
+async fn real_driver_guest_ack_cannot_hide_indeterminate_effect_or_trigger_replay() {
+    let fixture = Fixture::new();
+    let context = context().await;
+    let owner = Owner::new("selected", CompleteResponse::Confirm);
+    let mut driver = fixture.driver(owner.clone());
+    Arc::get_mut(&mut driver).unwrap().config = r#"{"mode":"swallow-unknown"}"#.into();
+    run(&driver, &context).await;
+    owner.unknown_send.store(true, Ordering::SeqCst);
+    run(&driver, &context).await;
+    let (result, attachment) = completed(&owner);
+    assert_eq!(result, PluginServiceEventResult::Indeterminate);
+    assert_eq!(
+        failure_cause(&attachment.unwrap()),
+        PluginServiceFailure::EffectIndeterminate
+    );
+    // Next poll observes owner pause; later runs only read Diagnostics.
+    run(&driver, &context).await;
+    let before = owner.requests().len();
+    run(&driver, &context).await;
+    assert_eq!(
+        &owner.requests()[before..],
+        &[PluginServiceRequest::Diagnostics {
+            consumer_id: owner.consumer()
+        }]
+    );
+    assert_eq!(owner.requests().iter().filter(|r| matches!(r,
+        PluginServiceRequest::Host { request, .. } if matches!(request.as_ref(), PluginInvocationRequest::Send { .. })
+    )).count(), 1);
+}
+
+#[tokio::test]
+async fn real_driver_completion_uncertainty_and_cleanup_failures_do_not_replace_ack() {
+    let fixture = Fixture::new();
+    let context = context().await;
+    let owner = Owner::new("selected", CompleteResponse::Lost);
+    let driver = fixture.driver(owner.clone());
+    run(&driver, &context).await;
+    owner.deny_log.store(true, Ordering::SeqCst);
+    owner.deny_release.store(true, Ordering::SeqCst);
+    run(&driver, &context).await;
+    let (result, attachment) = completed(&owner);
+    assert_eq!(result, PluginServiceEventResult::Ack);
+    assert!(
+        attachment.is_none(),
+        "cleanup/save failures must not become execution failures"
+    );
+    let observations = driver.observations();
+    assert_eq!(observations.result, Some(PluginServiceEventResult::Ack));
+    assert!(observations.invocation_failure.is_none());
+    assert_eq!(
+        observations.completion,
+        Some(PluginServiceFailure::CompletionUnconfirmed)
+    );
+    assert!(matches!(
+        observations.stop,
+        Some(PluginServiceFailure::Stop { .. })
+    ));
+    assert_eq!(
+        observations.release,
+        Some(PluginServiceFailure::ReleaseUnconfirmed)
+    );
+    assert!(driver.lease.lock().unwrap().is_some());
+    owner.deny_release.store(false, Ordering::SeqCst);
+    driver.stopped(context).await.unwrap();
+    let observations = driver.observations();
+    assert!(observations.release.is_none());
+    assert!(
+        observations.stop.is_some(),
+        "confirmed release must not erase the stop failure"
+    );
+    assert_eq!(observations.result, Some(PluginServiceEventResult::Ack));
 }
 
 #[tokio::test]

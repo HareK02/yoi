@@ -1379,13 +1379,10 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
     assert_eq!(receipt.claim_state, "pending");
     assert!(receipt.assignment_id.is_none());
     let original_worker = receipt.worker.clone().unwrap();
-    assert!(
-        fixture
-            .runtime
-            .worker(&original_worker.worker_id)
-            .worker
-            .is_some()
-    );
+    assert!(matches!(
+        fixture.runtime.worker(&original_worker.worker_id).outcome,
+        crate::hosts::WorkerLookupOutcome::Found { .. }
+    ));
     assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
 
     browser_ticket_backend(&fixture.api)
@@ -1438,13 +1435,10 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
             .is_none()
     );
     assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
-    assert!(
-        fixture
-            .runtime
-            .worker(&original_worker.worker_id)
-            .worker
-            .is_some()
-    );
+    assert!(matches!(
+        fixture.runtime.worker(&original_worker.worker_id).outcome,
+        crate::hosts::WorkerLookupOutcome::Found { .. }
+    ));
     assert_eq!(
         fixture
             .api

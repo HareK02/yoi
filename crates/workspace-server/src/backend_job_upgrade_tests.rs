@@ -1496,10 +1496,18 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
         &conn,
         "SELECT version,name FROM __yoi_schema_migrations ORDER BY version",
     );
+    let latest = store_owner::MIGRATIONS.last().unwrap();
     assert_eq!(
         receipts.last().unwrap(),
-        &vec![Value::Integer(123), Value::Text(MIGRATION_NAME.into())]
+        &vec![
+            Value::Integer(latest.version),
+            Value::Text(latest.name.into())
+        ]
     );
+    assert!(receipts.contains(&vec![
+        Value::Integer(123),
+        Value::Text(MIGRATION_NAME.into())
+    ]));
     assert_eq!(original, pre_content_values(&conn, true));
     assert!(conn.execute_batch("INSERT INTO backend_job_pre_content_history SELECT * FROM backend_job_pre_content_history LIMIT 1").is_err());
 }

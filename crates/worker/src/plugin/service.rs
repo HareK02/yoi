@@ -1,7 +1,9 @@
 //! Bounded outbox pumps run in the existing Feature task registry. Consumer and
 //! effect truth stays with the owner; this module retains only an active lease.
+mod failure;
 #[cfg(test)]
 mod tests;
+use failure::{ServiceDriverObservations, event_outcome, execution_reason};
 
 use super::*;
 use crate::feature::background::{
@@ -32,6 +34,9 @@ pub(super) struct ServiceDriver {
     // Unconfirmed control commit, not permission to replay an external effect.
     unconfirmed_indeterminate: Mutex<Option<String>>,
     prepared_start: std::sync::atomic::AtomicBool,
+    // Bounded latest observations, not a second state machine. Save uncertainty
+    // and cleanup never replace the event disposition or authorize execution.
+    observations: Mutex<ServiceDriverObservations>,
 }
 impl ServiceDriver {
     pub fn new(
@@ -58,7 +63,14 @@ impl ServiceDriver {
             parked_consumer: Mutex::new(None),
             unconfirmed_indeterminate: Mutex::new(None),
             prepared_start: std::sync::atomic::AtomicBool::new(false),
+            observations: Mutex::new(ServiceDriverObservations::default()),
         }
+    }
+    pub(super) fn observations(&self) -> ServiceDriverObservations {
+        self.observations
+            .lock()
+            .expect("Service observations lock")
+            .clone()
     }
     fn lifecycle_host(&self) -> Arc<LifecycleHost> {
         Arc::new(LifecycleHost {
@@ -139,8 +151,16 @@ impl ServiceDriver {
             _ => false,
         };
         if !released {
+            self.observations
+                .lock()
+                .expect("Service observations lock")
+                .release = Some(PluginServiceFailure::ReleaseUnconfirmed);
             return Err(dependency());
         }
+        self.observations
+            .lock()
+            .expect("Service observations lock")
+            .release = None;
         let mut retained = self.lease.lock().expect("Service lease lock");
         if retained.as_ref() == Some(&lease) {
             *retained = None;
@@ -233,10 +253,17 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                                 lease,
                                 event_id,
                                 result: PluginServiceEventResult::Indeterminate,
+                                // Preserve the original execution cause when retained;
+                                // the owner supplies EffectIndeterminate if absent.
+                                failure: self.observations().invocation_failure,
                             })
                             .await,
                             Ok(PluginServiceResponse::Completed)
                         ) {
+                            self.observations
+                                .lock()
+                                .expect("Service observations lock")
+                                .completion = None;
                             *self
                                 .unconfirmed_indeterminate
                                 .lock()
@@ -318,9 +345,13 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                 });
                 let token = CancellationToken::new();
                 let host = Arc::new(
-                    OwnerHost::begin(owner, self.context(invocation_id, token.clone()), consumer)
-                        .await
-                        .map_err(|_| dependency())?,
+                    OwnerHost::begin(
+                        owner,
+                        self.context(invocation_id.clone(), token.clone()),
+                        consumer,
+                    )
+                    .await
+                    .map_err(|_| dependency())?,
                 );
                 let call = self.executor.service_event(
                     &self.compiled,
@@ -335,14 +366,26 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                     result = &mut call => result,
                     _ = cancellation.cancelled() => { token.cancel(); call.await },
                 };
-                let result = if matches!(output.effect, errors::EffectObservation::Indeterminate) {
-                    PluginServiceEventResult::Indeterminate
-                } else {
-                    match output.outcome {
-                        Ok(ServiceOutput::Event(result)) => result,
-                        _ => PluginServiceEventResult::RetryAfter { delay_ms: 1_000 },
-                    }
-                };
+                let (result, cause) = event_outcome(&output);
+                // Presentation failure cannot alter the observed domain result.
+                // Retain the typed cause locally and mark inability to attach;
+                // never substitute an encoder error for guest execution failure.
+                let failure =
+                    cause.and_then(|cause| PluginServiceFailureAttachment::from_cause(cause).ok());
+                {
+                    let mut observations =
+                        self.observations.lock().expect("Service observations lock");
+                    *observations = ServiceDriverObservations {
+                        event_id: Some(envelope.event_id.clone()),
+                        invocation_id: Some(invocation_id),
+                        attempt: Some(envelope.attempt),
+                        result: Some(result.clone()),
+                        invocation_cause: cause,
+                        attachment_unavailable: cause.is_some() && failure.is_none(),
+                        invocation_failure: failure.clone(),
+                        ..ServiceDriverObservations::default()
+                    };
+                }
                 context.generation_fence.ensure_current()?;
                 // Guest return is not ack. Only this fenced owner transaction
                 // commits a cursor; transport uncertainty leaves it for recovery.
@@ -351,11 +394,16 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                     self.request(PluginServiceRequest::Complete {
                         lease: lease.clone(),
                         event_id: envelope.event_id.clone(),
-                        result
+                        result,
+                        failure,
                     })
                     .await,
                     Ok(PluginServiceResponse::Completed)
                 ) {
+                    self.observations
+                        .lock()
+                        .expect("Service observations lock")
+                        .completion = Some(PluginServiceFailure::CompletionUnconfirmed);
                     // The cursor/pause transaction may have committed even if its
                     // reply was lost. Keep the read-only observer alive instead
                     // of permanently deactivating this HostReady registration.
@@ -407,7 +455,16 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                     "Host task stopped",
                 )
                 .await;
-            !matches!(output.outcome, Ok(ServiceOutput::Stopped))
+            let reason = match &output.outcome {
+                Err(error) => Some(execution_reason(error)),
+                Ok(ServiceOutput::Stopped) => None,
+                Ok(_) => Some(PluginServiceExecutionFailure::UnexpectedOutput),
+            };
+            self.observations
+                .lock()
+                .expect("Service observations lock")
+                .stop = reason.map(|reason| PluginServiceFailure::Stop { reason });
+            reason.is_some()
         } else {
             false
         };

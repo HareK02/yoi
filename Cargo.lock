@@ -4764,6 +4764,7 @@ name = "server-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "error-contract",
  "feature-permissions",
  "memory",
  "merge-request",
@@ -5613,9 +5614,11 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "async-trait",
+ "error-contract",
  "filetime",
  "fs-operation",
  "html5ever",
+ "jsonschema",
  "manifest",
  "markup5ever_rcdom",
  "pdf-extract",

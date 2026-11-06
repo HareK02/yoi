@@ -1,6 +1,13 @@
 //! Parallel tool execution tests
 //!
 //! Verify that Engine executes multiple tools in parallel.
+//!
+//! The `execution_failures` suite connects registered tools, both dispatch modes,
+//! history commit, and the next model request using the shared deterministic LLM
+//! client. Its failure output is a provider fixture: public domain projection and
+//! real SessionStore persistence belong to worker's `failure_results` integration
+//! target. Run with `cargo test -p agen --test parallel_execution_test execution_failures`;
+//! no live service or timing-based synchronization is required by that suite.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3606,4 +3613,398 @@ async fn turn_end_pause_deadline_reclaims_started_sibling_while_post_policy_is_p
             .count(),
         2
     );
+}
+
+mod execution_failures {
+    use super::*;
+    use agen::tool::ToolOutputLimits;
+
+    const CALL: &str = "failure_call";
+    const NAME: &str = "control_failure";
+    const EXPLANATION: &str =
+        "Worker input could not be observed because the Runtime connection closed.";
+
+    fn call_and_result_count(history: &History) -> (usize, usize) {
+        let calls = history
+            .items()
+            .filter(|item| {
+                matches!(item,
+            Item::ToolCall { call_id, .. } if call_id == CALL)
+            })
+            .count();
+        let results = history
+            .items()
+            .filter(|item| {
+                matches!(item,
+            Item::ToolResult { call_id, .. } if call_id == CALL)
+            })
+            .count();
+        (calls, results)
+    }
+
+    #[derive(Clone)]
+    struct FailureTool {
+        output: ToolOutput,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FailureTool {
+        fn new(boundary: &str, state: &str, explanation: &str) -> Self {
+            // Agen deliberately does not depend on a domain or the tools adapter.
+            // This provider fixture exercises lossless propagation, not projection.
+            let content = serde_json::json!({
+                "boundary": boundary,
+                "failure": {
+                    "code": "runtime_control",
+                    "explanation": explanation,
+                    "details": {"operation": "input", "cause": "transport"}
+                },
+                "result": {"request_id": "request-1", "state": state}
+            })
+            .to_string();
+            Self {
+                output: ToolOutput {
+                    summary: explanation.to_owned(),
+                    content: Some(content),
+                    attachments: Vec::new(),
+                },
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            let tool = self.clone();
+            Arc::new(move || {
+                (
+                    ToolMeta::new(NAME).input_schema(serde_json::json!({"type": "object"})),
+                    Arc::new(tool.clone()) as Arc<dyn Tool>,
+                )
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailureTool {
+        async fn execute(&self, _: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::ExecutionFailure(self.output.clone()))
+        }
+    }
+
+    fn completed() -> Vec<Event> {
+        vec![
+            Event::text_delta(0, "done"),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ]
+    }
+
+    fn call_response(name: &str, arguments: &str) -> Vec<Event> {
+        vec![
+            Event::tool_use_start(0, CALL, name),
+            Event::tool_input_delta(0, arguments),
+            Event::tool_use_stop(0),
+            Event::Status(StatusEvent {
+                status: ResponseStatus::Completed,
+            }),
+        ]
+    }
+
+    fn client(name: &str, arguments: &str) -> MockLlmClient {
+        MockLlmClient::with_responses(vec![call_response(name, arguments), completed()])
+            .with_completion_support(ToolCallCompletionSupport::PerBlock)
+    }
+
+    fn result_item<'a>(items: impl IntoIterator<Item = &'a Item>) -> &'a Item {
+        let mut results = items
+            .into_iter()
+            .filter(|item| matches!(item, Item::ToolResult { call_id, .. } if call_id == CALL));
+        let item = results
+            .next()
+            .expect("terminal result for the registered call");
+        assert!(results.next().is_none(), "exactly one terminal result");
+        item
+    }
+
+    fn assert_failure(item: &Item, tool: &FailureTool, details_present: bool) {
+        let Item::ToolResult {
+            summary,
+            content,
+            disposition,
+            is_error,
+            attachments,
+            ..
+        } = item
+        else {
+            panic!("expected tool result");
+        };
+        assert_eq!(*disposition, ToolResultDisposition::Error);
+        assert!(
+            *is_error,
+            "decoding a failure report is not execution success"
+        );
+        assert!(summary.starts_with(&tool.output.summary));
+        assert!(attachments.is_empty());
+        if details_present {
+            assert_eq!(summary, &tool.output.summary);
+            assert_eq!(content, &tool.output.content);
+            let report: serde_json::Value =
+                serde_json::from_str(content.as_ref().unwrap()).unwrap();
+            assert_eq!(report["failure"]["explanation"], tool.output.summary);
+            assert_eq!(report["failure"]["details"]["cause"], "transport");
+            assert_eq!(report["failure"]["details"]["operation"], "input");
+            assert_eq!(report["result"]["request_id"], "request-1");
+        } else {
+            assert!(
+                content.is_none(),
+                "oversized error details must be absent, never partial JSON"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_failure_survives_history_next_request_and_restart_without_reexecution() {
+        for mode in [
+            ToolCallDispatchMode::AfterResponse,
+            ToolCallDispatchMode::OnToolCallComplete,
+        ] {
+            let tool = FailureTool::new("execution", "rejected", EXPLANATION);
+            let client = client(NAME, "{}");
+            let probe = client.clone();
+            let mut engine = Engine::new(client);
+            engine.set_tool_call_dispatch_mode(mode);
+            engine.register_tool(tool.definition());
+            let committed = Arc::new(Mutex::new(Vec::new()));
+            let commit_probe = committed.clone();
+            engine.on_history_append(move |item| {
+                if matches!(item, Item::ToolResult { .. }) {
+                    commit_probe.lock().unwrap().push(item.clone());
+                }
+                Ok(())
+            });
+            let published = Arc::new(AtomicUsize::new(0));
+            let publish_probe = published.clone();
+            let commit_probe = committed.clone();
+            let expected = tool.output.clone();
+            engine.on_tool_result(move |result| {
+                assert_eq!(
+                    commit_probe.lock().unwrap().len(),
+                    1,
+                    "commit before publication"
+                );
+                assert_eq!(result.summary, expected.summary);
+                assert_eq!(result.content, expected.content);
+                assert_eq!(result.disposition, ToolResultDisposition::Error);
+                assert!(result.is_error);
+                publish_probe.fetch_add(1, Ordering::SeqCst);
+            });
+            let mut history = History::new();
+            let output = engine.run(&mut history, "send input").await;
+            assert!(matches!(output.result, EngineRunExit::Finished));
+            assert_eq!(call_and_result_count(&history), (1, 1));
+            assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(published.load(Ordering::SeqCst), 1);
+            let durable = result_item(history.items());
+            assert_failure(durable, &tool, true);
+            assert_eq!(&committed.lock().unwrap()[0], durable);
+            let requests = probe.requests();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(result_item(&requests[1].items), durable);
+            // This is Engine history reconstruction, not a claim of DB persistence.
+            let mut restored_history: History =
+                serde_json::from_str(&serde_json::to_string(&history).unwrap()).unwrap();
+            let restored_client = MockLlmClient::new(completed());
+            let restored_probe = restored_client.clone();
+            let mut restored = Engine::new(restored_client);
+            restored.set_tool_call_dispatch_mode(mode);
+            restored.register_tool(tool.definition());
+            let output = restored.resume(&mut restored_history).await;
+            assert!(matches!(output.result, EngineRunExit::Finished));
+            let requests = restored_probe.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(result_item(&requests[0].items), durable);
+            assert_eq!(call_and_result_count(&restored_history), (1, 1));
+            assert_eq!(
+                tool.calls.load(Ordering::SeqCst),
+                1,
+                "terminal failure is not pending work"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_content_limit_is_atomic_and_counts_encoded_utf8_bytes() {
+        let explanation = "Runtime closed: \"入力\"\n\\connection\u{0001}";
+        let tool = FailureTool::new("execution", "rejected", explanation);
+        let content = tool.output.content.as_ref().unwrap();
+        let bytes = content.len();
+        assert!(
+            bytes > content.chars().count(),
+            "fixture distinguishes bytes from characters"
+        );
+        assert!(content.contains("\\n") && content.contains("\\u0001"));
+        for mode in [
+            ToolCallDispatchMode::AfterResponse,
+            ToolCallDispatchMode::OnToolCallComplete,
+        ] {
+            for limit in [0, 1, content.chars().count(), bytes - 1, bytes, bytes + 1] {
+                let client = client(NAME, "{}");
+                let probe = client.clone();
+                let mut engine = Engine::new(client);
+                engine.set_tool_call_dispatch_mode(mode);
+                engine.set_tool_output_limits(Some(ToolOutputLimits {
+                    default_max_bytes: limit,
+                    per_tool: Default::default(),
+                }));
+                engine.register_tool(tool.definition());
+                let mut history = History::new();
+                let output = engine.run(&mut history, "send input").await;
+                assert!(matches!(output.result, EngineRunExit::Finished));
+                assert_eq!(call_and_result_count(&history), (1, 1));
+                let durable = result_item(history.items());
+                assert_failure(durable, &tool, limit >= bytes);
+                let requests = probe.requests();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(result_item(&requests[1].items), durable);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_failure_preserves_unknown_and_dispatched_domain_states_without_retry() {
+        for mode in [
+            ToolCallDispatchMode::AfterResponse,
+            ToolCallDispatchMode::OnToolCallComplete,
+        ] {
+            for state in ["unknown", "dispatched"] {
+                for explanation in [
+                    EXPLANATION,
+                    "Input observation is unavailable; acceptance is unconfirmed.",
+                ] {
+                    let tool = FailureTool::new("observation", state, explanation);
+                    let client = client(NAME, "{}");
+                    let probe = client.clone();
+                    let mut engine = Engine::new(client);
+                    engine.set_tool_call_dispatch_mode(mode);
+                    engine.register_tool(tool.definition());
+                    let mut history = History::new();
+                    let output = engine.run(&mut history, "send input").await;
+                    assert!(matches!(output.result, EngineRunExit::Finished));
+                    let durable = result_item(history.items());
+                    assert_failure(durable, &tool, true);
+                    let Item::ToolResult {
+                        content: Some(content),
+                        ..
+                    } = durable
+                    else {
+                        unreachable!()
+                    };
+                    let report: serde_json::Value = serde_json::from_str(content).unwrap();
+                    assert_eq!(report["boundary"], "observation");
+                    assert_eq!(report["result"]["state"], state);
+                    assert_eq!(tool.calls.load(Ordering::SeqCst), 1);
+                    let requests = probe.requests();
+                    assert_eq!(requests.len(), 2);
+                    assert_eq!(result_item(&requests[1].items), durable);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_and_argument_errors_do_not_execute_or_manufacture_domain_failure_details() {
+        for mode in [
+            ToolCallDispatchMode::AfterResponse,
+            ToolCallDispatchMode::OnToolCallComplete,
+        ] {
+            for (name, arguments) in [("not_registered", "{}"), (NAME, "{invalid")] {
+                let tool = FailureTool::new("execution", "rejected", EXPLANATION);
+                let client = client(name, arguments);
+                let probe = client.clone();
+                let mut engine = Engine::new(client);
+                engine.set_tool_call_dispatch_mode(mode);
+                engine.register_tool(tool.definition());
+                let mut history = History::new();
+                let output = engine.run(&mut history, "send input").await;
+                assert!(matches!(output.result, EngineRunExit::Finished));
+                assert_eq!(tool.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(call_and_result_count(&history), (1, 1));
+                let durable = result_item(history.items());
+                let Item::ToolResult {
+                    disposition,
+                    is_error,
+                    summary,
+                    content,
+                    ..
+                } = durable
+                else {
+                    unreachable!()
+                };
+                assert_eq!(*disposition, ToolResultDisposition::Error);
+                assert!(*is_error);
+                assert!(!summary.contains(EXPLANATION));
+                assert!(
+                    content.is_none(),
+                    "dispatch failure has no fabricated domain result"
+                );
+                let requests = probe.requests();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(result_item(&requests[1].items), durable);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_result_commit_rejection_prevents_callback_and_next_model_publication() {
+        for mode in [
+            ToolCallDispatchMode::AfterResponse,
+            ToolCallDispatchMode::OnToolCallComplete,
+        ] {
+            let tool = FailureTool::new("execution", "rejected", EXPLANATION);
+            let client = client(NAME, "{}");
+            let probe = client.clone();
+            let mut engine = Engine::new(client);
+            engine.set_tool_call_dispatch_mode(mode);
+            engine.register_tool(tool.definition());
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let attempt_probe = attempts.clone();
+            engine.on_history_append(move |item| {
+                if matches!(item, Item::ToolResult { .. }) {
+                    attempt_probe.fetch_add(1, Ordering::SeqCst);
+                    return Err("injected failure-result storage rejection".to_owned());
+                }
+                Ok(())
+            });
+            let published = Arc::new(AtomicUsize::new(0));
+            let publish_probe = published.clone();
+            engine.on_tool_result(move |_| {
+                publish_probe.fetch_add(1, Ordering::SeqCst);
+            });
+            let mut history = History::new();
+            let output = engine.run(&mut history, "send input").await;
+            assert!(matches!(
+                output.result,
+                EngineRunExit::Interrupted(RunInterruptionReason::Unexpected(
+                    EngineError::HistoryAppend(_)
+                ))
+            ));
+            assert_eq!(
+                tool.calls.load(Ordering::SeqCst),
+                1,
+                "storage failure must not replay the effect"
+            );
+            assert!(
+                attempts.load(Ordering::SeqCst) >= 1,
+                "fault reached the result commit boundary"
+            );
+            assert_eq!(call_and_result_count(&history), (1, 0));
+            assert_eq!(published.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                probe.requests().len(),
+                1,
+                "uncommitted result cannot reach another model request"
+            );
+        }
+    }
 }

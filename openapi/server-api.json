@@ -10485,6 +10485,17 @@
               "null"
             ]
           },
+          "last_outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PluginServiceOutcomeDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Last owner-committed invocation observation, not a retry or recovery grant."
+          },
           "lease_active": {
             "type": "boolean"
           },
@@ -10575,6 +10586,167 @@
           }
         ]
       },
+      "PluginServiceExecutionFailure": {
+        "enum": [
+          "artifact",
+          "unsupported_component",
+          "invalid_input",
+          "invalid_output",
+          "cancelled",
+          "deadline",
+          "host_denied",
+          "host_invalid_input",
+          "host_not_found",
+          "host_conflict",
+          "host_unsupported",
+          "host_quota_exceeded",
+          "host_deadline_exceeded",
+          "host_cancelled",
+          "host_unavailable",
+          "host_indeterminate",
+          "host_receipt_expired",
+          "guest",
+          "trap",
+          "unexpected_output",
+          "guest_retry",
+          "guest_rejected"
+        ],
+        "type": "string"
+      },
+      "PluginServiceFailure": {
+        "description": "Closed Service-owned cause vocabulary. No guest code/message, source chain,\nresource identity, path or credential is admitted into this type.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "invocation",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/PluginServiceExecutionFailure"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "effect_indeterminate",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Observation of the Complete boundary, NOT proof that its transaction failed.",
+            "properties": {
+              "kind": {
+                "const": "completion_unconfirmed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "stop",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/PluginServiceExecutionFailure"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "release_unconfirmed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginServiceFailureAttachment": {
+        "description": "Minimal storage attachment, distinct from startup metadata. Only a Storage\nprojection can construct writer bytes. Deserialize alone grants no disclosure.",
+        "type": "string"
+      },
+      "PluginServiceFailureDiagnostic": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "cause": {
+                "$ref": "#/components/schemas/PluginServiceFailure"
+              },
+              "explanation": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "known",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "cause",
+              "explanation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "corrupt",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "PluginServiceLease": {
         "additionalProperties": false,
         "properties": {
@@ -10617,6 +10789,78 @@
           "subscriptions"
         ],
         "type": "object"
+      },
+      "PluginServiceOutcomeDiagnostic": {
+        "description": "Existing invocation identity/outcome with a subordinate optional cause. No\nlease credential is stored here and none of these fields authorizes replay.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "attempt": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "event_id": {
+                "type": "string"
+              },
+              "failure": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/PluginServiceFailureDiagnostic"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "invocation_id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "known",
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/PluginServiceEventResult"
+              }
+            },
+            "required": [
+              "kind",
+              "event_id",
+              "invocation_id",
+              "attempt",
+              "result"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "corrupt",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "PluginServicePauseReason": {
         "enum": [
@@ -10816,6 +11060,17 @@
             "properties": {
               "event_id": {
                 "type": "string"
+              },
+              "failure": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/PluginServiceFailureAttachment"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "description": "Optional reader-first cause attachment. Never changes the disposition."
               },
               "kind": {
                 "const": "complete",
@@ -13398,6 +13653,10 @@
               "$ref": "#/components/schemas/Diagnostic"
             },
             "type": "array"
+          },
+          "disposition": {
+            "$ref": "#/components/schemas/WorkerInputDisposition",
+            "default": "unknown"
           },
           "runtime_id": {
             "type": "string"
@@ -20445,6 +20704,15 @@
         ],
         "type": "object"
       },
+      "WorkerInputDisposition": {
+        "description": "Input acceptance is not model processing or completion. Missing legacy evidence is unknown.",
+        "enum": [
+          "accepted",
+          "rejected",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "WorkerLaunchFeatureConnectionOptions": {
         "additionalProperties": false,
         "properties": {
@@ -23363,7 +23631,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:894ccff36a463bec91b635956924114aa0db87d8b3f815230d6e8395511d2f6e"
+    "x-yoi-source-digest": "sha256:b0f5bc9c3e07b536335ef6ad93a5b4be8151b910a4a6c6cefc586c33be29734c"
   },
   "openapi": "3.1.0",
   "paths": {

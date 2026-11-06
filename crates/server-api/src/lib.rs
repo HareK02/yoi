@@ -9803,10 +9803,23 @@ pub struct RuntimeWorkerInputRequest {
     pub segments: Option<Vec<protocol::Segment>>,
 }
 
+/// Input acceptance is not model processing or completion. Missing legacy evidence is unknown.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerInputDisposition {
+    Accepted,
+    Rejected,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerInputResult {
     pub state: WorkerOperationState,
+    #[serde(default)]
+    pub disposition: WorkerInputDisposition,
     pub runtime_id: String,
     pub worker_id: String,
     #[serde(default)]

@@ -10,6 +10,7 @@ agen.workspace = true
 client.workspace = true
 fs4.workspace = true
 feature-storage.workspace = true
+error-contract.workspace = true
 subjektiv.workspace = true
 memory.workspace = true
 server-api.workspace = true

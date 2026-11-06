@@ -721,6 +721,7 @@ fn map_merge_request_tool_error(error: ToolError, _mutating: bool) -> WipOperati
         ToolError::InvalidArgument(message) => {
             merge_request_protocol_failure(ProtocolErrorCode::InvalidArguments, message)
         }
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, message } => merge_request_protocol_failure(

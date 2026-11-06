@@ -2642,6 +2642,7 @@ fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
             ProtocolErrorCode::InvalidArguments,
             format!("Ticket domain rejection: {message}"),
         ),
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, message } => protocol_failure(

@@ -191,6 +191,15 @@ fn receipt_matches(
 
 fn transient_subjektiv_storage(error: &Error) -> bool {
     match error {
+        Error::BackendJobFailure {
+            primary, recording, ..
+        } => {
+            // A failed recording transaction retains its own Workspace probe path;
+            // it does not turn the primary Feature operation into a DB failure.
+            !recording.iter().any(workspace_storage_failure)
+                && (transient_subjektiv_storage(primary)
+                    || recording.iter().any(transient_subjektiv_storage))
+        }
         Error::SubjektivStorage(FeatureStorageError::Sqlite(rusqlite::Error::SqliteFailure(
             error,
             _,
@@ -213,7 +222,22 @@ pub(super) fn transient_storage(error: &Error) -> bool {
     transient_subjektiv_storage(error) || workspace_storage_failure(error)
 }
 
+fn cleanup_runtime_failure(error: &Error) -> bool {
+    match error {
+        Error::BackendJobFailure { primary, .. } => cleanup_runtime_failure(primary),
+        Error::RuntimeOperationFailed { .. } | Error::RuntimeControlFailed { .. } => true,
+        _ => false,
+    }
+}
+
 fn workspace_storage_failure(error: &Error) -> bool {
+    if let Error::BackendJobFailure {
+        primary, recording, ..
+    } = error
+    {
+        return workspace_storage_failure(primary)
+            || recording.iter().any(workspace_storage_failure);
+    }
     matches!(error, Error::Sqlite(rusqlite::Error::SqliteFailure(error, _))
         if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
             | rusqlite::ErrorCode::SystemIoFailure | rusqlite::ErrorCode::DiskFull
@@ -324,12 +348,32 @@ impl WorkspaceApi {
         detail: &str,
         next: &str,
     ) -> Result<BackendJobAttemptRecord> {
-        self.store.record_backend_job_reconciliation(
+        let cause = crate::backend_job::BackgroundJobCause::ReconciliationRequired
+            .storage()
+            .map_err(Error::BackendJobCauseProjection)?;
+        self.retain_backend_job_recovery_with_cause(attempt, category, detail, next, Some(&cause))
+    }
+
+    pub(super) fn retain_backend_job_recovery_with_cause(
+        &self,
+        attempt: &BackendJobAttemptRecord,
+        category: &str,
+        detail: &str,
+        next: &str,
+        cause: Option<&crate::backend_job::BackgroundFailure>,
+    ) -> Result<BackendJobAttemptRecord> {
+        let cause = crate::backend_job::prefer_retained_startup_cause(
+            attempt.failure_cause.as_ref(),
+            cause,
+        )
+        .map_err(Error::BackendJobCauseProjection)?;
+        self.store.record_backend_job_reconciliation_with_cause(
             self.workspace_id(),
             attempt,
             category,
             detail,
             next,
+            cause.as_ref(),
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )
     }
@@ -349,17 +393,53 @@ impl WorkspaceApi {
             .backend_job_recovery
             .claim_initial_submission(&JobHostOwner::try_from(attempt)?)?
         {
-            let receipt = self
-                .runtime
-                .reconcile_worker_input(worker, request)
-                .map_err(RuntimeRegistryError::into_error)?;
-            return if receipt_matches(attempt, &receipt) {
-                Ok(())
-            } else {
-                Err(Error::RepositoryConflict(
-                    "Previously attempted Job input requires exact receipt reconciliation".into(),
-                ))
+            let receipt = self.runtime.reconcile_worker_input(worker, request);
+            if receipt
+                .as_ref()
+                .is_ok_and(|receipt| receipt_matches(attempt, receipt))
+            {
+                return Ok(());
+            }
+            let (primary, cause) = match receipt {
+                Err(error) => {
+                    let primary = error.into_error();
+                    let cause = crate::backend_job::operation_failure_cause(
+                        &primary,
+                        crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                    );
+                    (primary, cause)
+                }
+                Ok(receipt) => (
+                    Error::RepositoryConflict(
+                        "Previously attempted Job input requires exact receipt reconciliation"
+                            .into(),
+                    ),
+                    crate::backend_job::diagnostic_failure_cause(
+                        &receipt.diagnostics,
+                        crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                    ),
+                ),
             };
+            let detail = primary.to_string();
+            return Err(crate::backend_job::record_operation_failure(
+                primary,
+                cause,
+                |cause| {
+                    let current = self
+                        .store
+                        .get_backend_job_attempt(
+                            self.workspace_id(),
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                        )?
+                        .ok_or_else(|| Error::Store("Job receipt owner disappeared".into()))?;
+                    if !current.state.terminal() {
+                        self.retain_backend_job_recovery_with_cause(&current, "submission_receipt_unconfirmed", &detail,
+                        "Read exact Runtime submission and domain receipts; never resubmit non-idempotent input", cause)?;
+                    }
+                    Ok(())
+                },
+            ));
         }
         let dispatched = self.runtime.send_input(worker, request.clone());
         if let Ok(result) = &dispatched {
@@ -367,18 +447,30 @@ impl WorkspaceApi {
                 return Ok(());
             }
             if result.worker == *worker && result.disposition == WorkerInputDisposition::Rejected {
-                self.finish_backend_job_attempt(
-                    &attempt.job_id,
-                    &attempt.attempt_id,
-                    BackendJobAttemptState::Failed,
-                    "input_rejected",
-                    &runtime_diagnostics_message(&result.diagnostics),
-                )?;
-                return Err(Error::RuntimeOperationFailed {
+                let detail = runtime_diagnostics_message(&result.diagnostics);
+                let cause = crate::backend_job::diagnostic_failure_cause(
+                    &result.diagnostics,
+                    crate::backend_job::BackgroundJobCause::InputFailed,
+                );
+                let primary = Error::RuntimeOperationFailed {
                     runtime_id: worker.runtime_id.clone(),
                     code: "backend_job_input_rejected".into(),
                     message: "Runtime definitively rejected Job input".into(),
-                });
+                };
+                return Err(crate::backend_job::record_operation_failure(
+                    primary,
+                    cause,
+                    |cause| {
+                        self.finish_backend_job_attempt_with_cause(
+                            &attempt.job_id,
+                            &attempt.attempt_id,
+                            BackendJobAttemptState::Failed,
+                            "input_rejected",
+                            &detail,
+                            cause,
+                        )
+                    },
+                ));
             }
         }
         // Lost/mismatched acknowledgements require read-only receipt lookup, never Submit replay.
@@ -389,27 +481,54 @@ impl WorkspaceApi {
         {
             return Ok(());
         }
-        let detail = match dispatched {
-            Err(error) => error.message(),
-            Ok(result) => runtime_diagnostics_message(&result.diagnostics),
+        let (primary, cause, detail) = match dispatched {
+            Err(error) => {
+                let detail = error.message();
+                let primary = error.into_error();
+                let cause = crate::backend_job::operation_failure_cause(
+                    &primary,
+                    crate::backend_job::BackgroundJobCause::InputFailed,
+                );
+                (primary, cause, detail)
+            }
+            Ok(result) => {
+                let detail = runtime_diagnostics_message(&result.diagnostics);
+                let cause = crate::backend_job::diagnostic_failure_cause(
+                    &result.diagnostics,
+                    crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                );
+                (
+                    Error::RuntimeOperationFailed {
+                        runtime_id: worker.runtime_id.clone(),
+                        code: "backend_job_submission_receipt_unconfirmed".into(),
+                        message: detail.clone(),
+                    },
+                    cause,
+                    detail,
+                )
+            }
         };
-        let current = self
-            .store
-            .get_backend_job_attempt(
-                self.workspace_id(),
-                &job.request.job_id,
-                &attempt.attempt_id,
-            )?
-            .ok_or_else(|| Error::Store("Job input owner disappeared".into()))?;
-        if !current.state.terminal() {
-            self.retain_backend_job_recovery(&current, "submission_receipt_unconfirmed", &detail,
-                "Read exact Runtime submission and domain receipts; never resubmit non-idempotent input")?;
-        }
-        Err(Error::RuntimeOperationFailed {
-            runtime_id: worker.runtime_id.clone(),
-            code: "backend_job_submission_receipt_unconfirmed".into(),
-            message: detail,
-        })
+        Err(crate::backend_job::record_operation_failure(
+            primary,
+            cause,
+            |cause| {
+                let current = self
+                    .store
+                    .get_backend_job_attempt(
+                        self.workspace_id(),
+                        &job.request.job_id,
+                        &attempt.attempt_id,
+                    )?
+                    .ok_or_else(|| Error::Store("Job input owner disappeared".into()))?;
+                if !current.state.terminal() {
+                    self.retain_backend_job_recovery_with_cause(
+                    &current, "submission_receipt_unconfirmed", &detail,
+                    "Read exact Runtime submission and domain receipts; never resubmit non-idempotent input", cause,
+                )?;
+                }
+                Ok(())
+            },
+        ))
     }
 
     pub(super) fn own_backend_job_recovery(&self, attempt: &BackendJobAttemptRecord) {
@@ -547,18 +666,16 @@ impl WorkspaceApi {
                     let drain = match preflight {
                         Ok(drain) => drain,
                         Err(error) => {
-                            api.store.record_backend_job_cleanup_preflight_failure(
-                                api.workspace_id(),
-                                &history,
-                                observed,
-                                &format!(
-                                    "Host admission close/fence failed: {error}; execution and Host termination remain unconfirmed. Retain result/input and reconcile the original admission resource; never create replacement evidence."
-                                ),
-                                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                            )?;
-                            // Neither a saved diagnosis nor failure to save it is
-                            // success. Storage errors still reach retry/probe ownership.
-                            return Err(error);
+                            let detail = format!(
+                                "Host admission close/fence failed: {error}; execution and Host termination remain unconfirmed. Retain result/input and reconcile the original admission resource; never create replacement evidence."
+                            );
+                            return Err(crate::backend_job::record_operation_failure(error,
+                                crate::backend_job::BackgroundJobCause::CleanupAdmissionUnconfirmed.storage(), |cause| {
+                                    api.store.record_backend_job_cleanup_preflight_failure_with_cause(
+                                        api.workspace_id(), &history, observed, &detail, cause,
+                                        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                                    )
+                                }));
                         }
                     };
                     let current = api
@@ -632,34 +749,36 @@ impl WorkspaceApi {
                         api.cleanup_backend_job_attempt_worker(attempt, &removal_owner, &drain)
                             .await
                     });
-                    if let Err(error) = &result
-                        && transient_subjektiv_storage(error)
-                    {
-                        let history = api.store.list_backend_job_attempts(api.workspace_id(), &owner.job_id)?;
-                        let current = history.iter().find(|attempt| attempt.attempt_id == owner.attempt_id)
-                            .ok_or_else(|| Error::Store("Feature cleanup owner disappeared".into()))?;
-                        if JobHostOwner::try_from(current)? != JobHostOwner::try_from(&owner)?
-                            || !current.state.terminal()
-                        {
-                            return Err(Error::RepositoryConflict("Feature cleanup diagnostic owner changed".into()));
+                    match result {
+                        Err(error) if transient_subjektiv_storage(&error) => {
+                            let cause = crate::backend_job::worker_cleanup_failure_cause(&error);
+                            let detail = format!("{error}; original cleanup owner retains input and canonical child; reconcile the same Feature operation after backoff, never infer termination or resubmit input");
+                            Err(crate::backend_job::record_operation_failure(error, cause, |cause| {
+                                let history = api.store.list_backend_job_attempts(api.workspace_id(), &owner.job_id)?;
+                                let current = history.iter().find(|attempt| attempt.attempt_id == owner.attempt_id)
+                                    .ok_or_else(|| Error::Store("Feature cleanup owner disappeared".into()))?;
+                                if JobHostOwner::try_from(current)? != JobHostOwner::try_from(&owner)?
+                                    || !current.state.terminal()
+                                {
+                                    return Err(Error::RepositoryConflict("Feature cleanup diagnostic owner changed".into()));
+                                }
+                                api.store.finish_backend_job_worker_cleanup_owned_with_cause(
+                                    api.workspace_id(), &history, current,
+                                    BackendJobWorkerCleanupState::Failed,
+                                    Some("backend_job_cleanup_feature_storage_unavailable"), Some(&detail), cause,
+                                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                                )
+                            }))
                         }
-                        api.store.finish_backend_job_worker_cleanup_owned(
-                            api.workspace_id(), &history, current,
-                            BackendJobWorkerCleanupState::Failed,
-                            Some("backend_job_cleanup_feature_storage_unavailable"),
-                            Some(&format!("{error}; original cleanup owner retains input and canonical child; reconcile the same Feature operation after backoff, never infer termination or resubmit input")),
-                            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                        )?;
+                        result => result,
                     }
-                    result
                 })
                 .await;
             #[cfg(test)]
             if failures >= 5
-                && result.as_ref().is_err_and(|error| {
-                    transient_storage(error)
-                        || matches!(error, Error::RuntimeOperationFailed { .. })
-                })
+                && result
+                    .as_ref()
+                    .is_err_and(|error| transient_storage(error) || cleanup_runtime_failure(error))
             {
                 self.backend_job_recovery
                     .cleanup_storage_settlement
@@ -669,8 +788,7 @@ impl WorkspaceApi {
                 Ok(()) => return Ok(()),
                 Err(error)
                     if failures < 5
-                        && (transient_storage(&error)
-                            || matches!(error, Error::RuntimeOperationFailed { .. })) =>
+                        && (transient_storage(&error) || cleanup_runtime_failure(&error)) =>
                 {
                     self.backend_job_recovery
                         .pause(Duration::from_millis(100 << failures))
@@ -744,8 +862,9 @@ impl WorkspaceApi {
         let mut domain_failures = 0usize;
         let deadline = chrono::DateTime::parse_from_rfc3339(&expected.deadline_at)
             .map_err(|error| Error::Store(error.to_string()))?;
-        let mut definitive_failure: Option<String> = None;
-        let mut domain_failure: Option<String> = None;
+        let mut definitive_failure: Option<(Arc<Error>, crate::backend_job::BackgroundJobCause)> =
+            None;
+        let mut domain_failure: Option<Arc<Error>> = None;
         loop {
             if self.backend_job_recovery.stopping.load(Ordering::Acquire) {
                 return Ok(());
@@ -753,8 +872,9 @@ impl WorkspaceApi {
             if Utc::now() >= deadline
                 && let Some(error) = domain_failure.take()
             {
-                definitive_failure = Some(format!(
-                    "Original attempt deadline exceeded during exact Feature operation reconciliation: {error}; execution and Host termination remain unconfirmed"
+                definitive_failure = Some((
+                    error,
+                    crate::backend_job::BackgroundJobCause::DeadlineExceeded,
                 ));
             }
             let api = self.clone();
@@ -768,21 +888,26 @@ impl WorkspaceApi {
                 .host_executors
                 .host()?
                 .run(move || {
-                    if let Some(detail) = failure {
-                        api.fail_backend_job_recovery(&owner, &detail)
+                    if let Some((primary, fallback)) = failure {
+                        api.fail_backend_job_recovery(&owner, &primary, fallback)
                     } else {
-                        let result = api.recover_backend_job_step(&owner);
-                        if let Err(error) = &result
-                            && transient_subjektiv_storage(error)
-                        {
-                            let current = api.store.get_backend_job_attempt(api.workspace_id(),
-                                &owner.job_id, &owner.attempt_id)?
-                                .ok_or_else(|| Error::Store("Domain reconciliation owner disappeared".into()))?;
-                            api.retain_backend_job_recovery(&current, "domain_storage_unavailable",
-                                &error.to_string(),
-                                "Reconcile the same Feature operation and receipt until the original attempt deadline; do not resubmit or probe another database")?;
+                        match api.recover_backend_job_step(&owner) {
+                            Err(error) if transient_subjektiv_storage(&error) => {
+                                let cause = crate::backend_job::operation_failure_cause(
+                                    &error, crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                                );
+                                let detail = error.to_string();
+                                Err(crate::backend_job::record_operation_failure(error, cause, |cause| {
+                                    let current = api.store.get_backend_job_attempt(api.workspace_id(),
+                                        &owner.job_id, &owner.attempt_id)?
+                                        .ok_or_else(|| Error::Store("Domain reconciliation owner disappeared".into()))?;
+                                    api.retain_backend_job_recovery_with_cause(&current, "domain_storage_unavailable",
+                                        &detail,
+                                        "Reconcile the same Feature operation and receipt until the original attempt deadline; do not resubmit or probe another database", cause)
+                                }))
+                            }
+                            result => result,
                         }
-                        result
                     }
                 })
                 .await;
@@ -796,7 +921,7 @@ impl WorkspaceApi {
                         .await;
                 }
                 Err(error) if transient_subjektiv_storage(&error) => {
-                    domain_failure = Some(error.to_string());
+                    domain_failure = Some(Arc::new(error));
                     if Utc::now() >= deadline {
                         continue;
                     }
@@ -862,7 +987,10 @@ impl WorkspaceApi {
                     }
                 }
                 Err(error) if definitive_failure.is_none() => {
-                    definitive_failure = Some(error.to_string());
+                    definitive_failure = Some((
+                        Arc::new(error),
+                        crate::backend_job::BackgroundJobCause::ExecutionFailed,
+                    ));
                 }
                 Err(error) => return Err(error),
             }
@@ -872,7 +1000,8 @@ impl WorkspaceApi {
     fn fail_backend_job_recovery(
         &self,
         owner: &BackendJobAttemptRecord,
-        detail: &str,
+        primary: &Arc<Error>,
+        fallback: crate::backend_job::BackgroundJobCause,
     ) -> Result<bool> {
         let current = self
             .store
@@ -891,13 +1020,26 @@ impl WorkspaceApi {
             return Ok(true);
         }
         if !current.state.terminal() {
-            self.finish_backend_job_attempt(
-                &owner.job_id,
-                &owner.attempt_id,
-                BackendJobAttemptState::Failed,
-                "recovery_cannot_continue",
-                detail,
-            )?;
+            let cause = crate::backend_job::operation_failure_cause(primary, fallback);
+            let detail = primary.to_string();
+            let error = crate::backend_job::record_retained_operation_failure(
+                primary.clone(),
+                cause,
+                |cause| {
+                    self.finish_backend_job_attempt_with_cause(
+                        &owner.job_id,
+                        &owner.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "recovery_cannot_continue",
+                        &detail,
+                        cause,
+                    )
+                },
+            );
+            if matches!(&error, Error::BackendJobFailure { recording, .. } if !recording.is_empty())
+            {
+                return Err(error);
+            }
         }
         self.schedule_backend_job_worker_cleanup(&current);
         Ok(true)
@@ -922,6 +1064,37 @@ impl WorkspaceApi {
             Err(Error::RepositoryConflict(
                 "Job storage probe owner changed".into(),
             ))
+        }
+    }
+
+    fn finish_backend_job_deadline(
+        &self,
+        attempt: &BackendJobAttemptRecord,
+        detail: &str,
+    ) -> Result<()> {
+        let primary = Error::RuntimeOperationFailed {
+            runtime_id: crate::backend_job::BACKEND_JOB_RUNTIME_ID.into(),
+            code: "backend_job_deadline_exceeded".into(),
+            message: detail.into(),
+        };
+        let error = crate::backend_job::record_operation_failure(
+            primary,
+            crate::backend_job::BackgroundJobCause::DeadlineExceeded.storage(),
+            |cause| {
+                self.finish_backend_job_attempt_with_cause(
+                    &attempt.job_id,
+                    &attempt.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "timeout",
+                    detail,
+                    cause,
+                )
+            },
+        );
+        if matches!(&error, Error::BackendJobFailure { recording, .. } if recording.is_empty()) {
+            Ok(())
+        } else {
+            Err(error)
         }
     }
 
@@ -962,13 +1135,21 @@ impl WorkspaceApi {
                         .unwrap_or_else(|p| p.into_inner())
                         .remove(&attempt.attempt_id);
                     if !attempt.state.terminal() {
-                        self.finish_backend_job_attempt(
-                            &attempt.job_id,
-                            &attempt.attempt_id,
-                            BackendJobAttemptState::Failed,
-                            "retained_result_rejected",
-                            &error.to_string(),
-                        )?;
+                        let detail = error.to_string();
+                        let cause = crate::backend_job::operation_failure_cause(
+                            &error,
+                            crate::backend_job::BackgroundJobCause::ExecutionFailed,
+                        );
+                        crate::backend_job::record_failure_observation(error, cause, |cause| {
+                            self.finish_backend_job_attempt_with_cause(
+                                &attempt.job_id,
+                                &attempt.attempt_id,
+                                BackendJobAttemptState::Failed,
+                                "retained_result_rejected",
+                                &detail,
+                                cause,
+                            )
+                        })?;
                     }
                     return Ok(false);
                 }
@@ -989,8 +1170,7 @@ impl WorkspaceApi {
             let deadline = chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
                 .map_err(|error| Error::Store(error.to_string()))?;
             if Utc::now() >= deadline {
-                self.finish_backend_job_attempt(&attempt.job_id, &attempt.attempt_id,
-                    BackendJobAttemptState::Failed, "timeout",
+                self.finish_backend_job_deadline(&attempt,
                     "Original attempt deadline exceeded before dispatch; no execution termination is inferred")?;
                 return Ok(false);
             }
@@ -1021,8 +1201,15 @@ impl WorkspaceApi {
                 }
                 // Incomplete generation/missing termination evidence is not a
                 // rejected dispatch or permission to reselect Journal input.
-                self.retain_backend_job_recovery(&attempt, "journal_receipt_reconciliation",
-                    &error.to_string(), "Read retained generation/checkpoints and exact execution fences until deadline")?;
+                let detail = error.to_string();
+                let cause = crate::backend_job::operation_failure_cause(
+                    &error,
+                    crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                );
+                crate::backend_job::record_failure_observation(error, cause, |cause| {
+                    self.retain_backend_job_recovery_with_cause(&attempt, "journal_receipt_reconciliation",
+                        &detail, "Read retained generation/checkpoints and exact execution fences until deadline", cause)
+                })?;
             }
             attempt = self
                 .store
@@ -1070,8 +1257,7 @@ impl WorkspaceApi {
         let deadline = chrono::DateTime::parse_from_rfc3339(&attempt.deadline_at)
             .map_err(|error| Error::Store(error.to_string()))?;
         if Utc::now() >= deadline {
-            self.finish_backend_job_attempt(&attempt.job_id, &attempt.attempt_id,
-                BackendJobAttemptState::Failed, "timeout",
+            self.finish_backend_job_deadline(&attempt,
                 "Attempt deadline exceeded while reconciling exact Runtime/domain receipts; termination and Host cleanup remain independent")?;
             return Ok(false);
         }
@@ -1126,13 +1312,32 @@ impl WorkspaceApi {
                         )?;
                     }
                     Ok(result) => {
-                        self.retain_backend_job_recovery(&attempt, "submission_receipt_unconfirmed",
-                            &runtime_diagnostics_message(&result.diagnostics),
-                            "Read same submission/domain receipts until deadline; never blindly repeat input")?;
+                        let detail = runtime_diagnostics_message(&result.diagnostics);
+                        let cause = crate::backend_job::diagnostic_failure_cause(
+                            &result.diagnostics,
+                            crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                        );
+                        let primary = Error::RuntimeOperationFailed {
+                            runtime_id: worker.runtime_id.clone(),
+                            code: "submission_receipt_unconfirmed".into(),
+                            message: "Exact Runtime submission receipt is unconfirmed".into(),
+                        };
+                        crate::backend_job::record_failure_observation(primary, cause, |cause| {
+                            self.retain_backend_job_recovery_with_cause(&attempt, "submission_receipt_unconfirmed", &detail,
+                                "Read same submission/domain receipts until deadline; never blindly repeat input", cause)
+                        })?;
                     }
                     Err(error) => {
-                        self.retain_backend_job_recovery(&attempt, "submission_receipt_unavailable", &error.message(),
-                            "Read same submission/domain receipts until deadline; keep execution and input owned")?;
+                        let detail = error.message();
+                        let primary = error.into_error();
+                        let cause = crate::backend_job::operation_failure_cause(
+                            &primary,
+                            crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                        );
+                        crate::backend_job::record_failure_observation(primary, cause, |cause| {
+                            self.retain_backend_job_recovery_with_cause(&attempt, "submission_receipt_unavailable", &detail,
+                                "Read same submission/domain receipts until deadline; keep execution and input owned", cause)
+                        })?;
                     }
                 }
             }
@@ -1195,11 +1400,17 @@ impl WorkspaceApi {
             self.config_store
                 .lookup_backend_job_allocation(self.workspace_id(), job, attempt)?;
         let Some((allocation, runtime_id)) = allocation else {
-            self.retain_backend_job_recovery(
-                attempt,
-                "allocation_receipt_unconfirmed",
-                "Original create reservation is not yet available",
-                "Read the original reservation until deadline; never allocate a replacement",
+            let primary = Error::RepositoryConflict(
+                "Original create reservation is not yet available".into(),
+            );
+            crate::backend_job::record_failure_observation(
+                primary,
+                crate::backend_job::BackgroundJobCause::ReconciliationRequired.storage(),
+                |cause| {
+                    self.retain_backend_job_recovery_with_cause(attempt, "allocation_receipt_unconfirmed",
+                        "Original create reservation is not yet available",
+                        "Read the original reservation until deadline; never allocate a replacement", cause)
+                },
             )?;
             return Ok(());
         };
@@ -1250,12 +1461,31 @@ impl WorkspaceApi {
                 })?;
             }
             outcome => {
-                let detail = match outcome {
-                    Err(error) => error.message(),
-                    _ => "No exact Runtime Job creation receipt available".into(),
+                let (primary, detail) = match outcome {
+                    Err(error) => {
+                        let detail = error.message();
+                        (error.into_error(), detail)
+                    }
+                    _ => {
+                        let detail = "No exact Runtime Job creation receipt available".to_string();
+                        (
+                            Error::RuntimeOperationFailed {
+                                runtime_id: worker.runtime_id.clone(),
+                                code: "allocation_receipt_unconfirmed".into(),
+                                message: detail.clone(),
+                            },
+                            detail,
+                        )
+                    }
                 };
-                self.retain_backend_job_recovery(attempt, "allocation_receipt_unconfirmed", &detail,
-                    "Read original allocation receipt until attempt deadline; do not allocate a replacement")?;
+                let cause = crate::backend_job::operation_failure_cause(
+                    &primary,
+                    crate::backend_job::BackgroundJobCause::ReconciliationRequired,
+                );
+                crate::backend_job::record_failure_observation(primary, cause, |cause| {
+                    self.retain_backend_job_recovery_with_cause(attempt, "allocation_receipt_unconfirmed", &detail,
+                        "Read original allocation receipt until attempt deadline; do not allocate a replacement", cause)
+                })?;
             }
         }
         Ok(())
@@ -1397,6 +1627,55 @@ impl WorkspaceApi {
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cause_classification_tests {
+    use super::*;
+
+    #[test]
+    fn recording_storage_failure_uses_workspace_probe_without_replacing_feature_primary() {
+        let primary = Error::SubjektivStorage(FeatureStorageError::Io(std::io::Error::other(
+            "original feature operation",
+        )));
+        let error = crate::backend_job::record_operation_failure::<()>(
+            primary,
+            crate::backend_job::BackgroundJobCause::ReconciliationRequired.storage(),
+            |_| Err(Error::DbOperationOutcomeUnknown),
+        );
+        assert!(workspace_storage_failure(&error));
+        assert!(transient_storage(&error));
+        assert!(
+            !transient_subjektiv_storage(&error),
+            "Workspace save failure must not be treated as Feature settlement"
+        );
+        assert!(matches!(error, Error::BackendJobFailure { primary, .. }
+            if matches!(primary.as_ref(), Error::SubjektivStorage(_))));
+    }
+
+    #[test]
+    fn saved_feature_failure_and_runtime_cleanup_keep_existing_retry_classification() {
+        let error = crate::backend_job::record_operation_failure(
+            Error::SubjektivStorage(FeatureStorageError::Io(std::io::Error::other(
+                "original feature operation",
+            ))),
+            crate::backend_job::BackgroundJobCause::CleanupFailed.storage(),
+            |_| Ok(()),
+        );
+        assert!(transient_subjektiv_storage(&error));
+        assert!(!workspace_storage_failure(&error));
+        let error = crate::backend_job::record_operation_failure(
+            Error::RuntimeOperationFailed {
+                runtime_id: "runtime".into(),
+                code: "unconfirmed".into(),
+                message: "Stop unconfirmed".into(),
+            },
+            crate::backend_job::BackgroundJobCause::CleanupFailed.storage(),
+            |_| Ok(()),
+        );
+        assert!(cleanup_runtime_failure(&error));
+        assert!(!transient_storage(&error));
     }
 }
 

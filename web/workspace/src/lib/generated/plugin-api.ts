@@ -23,9 +23,23 @@ export type PluginGrantMetadata = { "kind": "logging" } | { "kind": "https", slo
 
 export type PluginServiceMetadata = { name: string, subscriptions: Array<string>, };
 
+export type PluginServiceEventResult = { "kind": "ack" } | { "kind": "retry_after", delay_ms: number, } | { "kind": "reject" } | { "kind": "indeterminate" };
+
 export type PluginServicePauseReason = "rejected" | "attempts_exhausted" | "queue_full" | "retention_gap" | "indeterminate" | "authorization";
 
-export type PluginServiceDiagnostics = { consumer_id: string, pause_reason: PluginServicePauseReason | null, queued: number, attempt: number, current_event_id: string | null, lease_active: boolean, };
+export type PluginServiceFailure = { "kind": "invocation", reason: PluginServiceExecutionFailure, } | { "kind": "effect_indeterminate" } | { "kind": "completion_unconfirmed" } | { "kind": "stop", reason: PluginServiceExecutionFailure, } | { "kind": "release_unconfirmed" };
+
+export type PluginServiceExecutionFailure = "artifact" | "unsupported_component" | "invalid_input" | "invalid_output" | "cancelled" | "deadline" | "host_denied" | "host_invalid_input" | "host_not_found" | "host_conflict" | "host_unsupported" | "host_quota_exceeded" | "host_deadline_exceeded" | "host_cancelled" | "host_unavailable" | "host_indeterminate" | "host_receipt_expired" | "guest" | "trap" | "unexpected_output" | "guest_retry" | "guest_rejected";
+
+export type PluginServiceFailureDiagnostic = { "kind": "known", cause: PluginServiceFailure, explanation: string, } | { "kind": "unsupported" } | { "kind": "corrupt" };
+
+export type PluginServiceOutcomeDiagnostic = { "kind": "known", event_id: string, invocation_id: string, attempt: number, result: PluginServiceEventResult, failure: PluginServiceFailureDiagnostic | null, } | { "kind": "unsupported" } | { "kind": "corrupt" };
+
+export type PluginServiceDiagnostics = { consumer_id: string, pause_reason: PluginServicePauseReason | null, queued: number, attempt: number, current_event_id: string | null, lease_active: boolean,
+/**
+ * Last owner-committed invocation observation, not a retry or recovery grant.
+ */
+last_outcome?: PluginServiceOutcomeDiagnostic | null, };
 
 export type PluginServiceRecoveryAction = { "kind": "resume" } | { "kind": "skip", event_id: string, } | { "kind": "accept_gap" };
 
