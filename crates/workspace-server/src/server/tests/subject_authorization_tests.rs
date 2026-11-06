@@ -11,6 +11,8 @@ mod chat_delegation_connected;
 mod chat_tests;
 #[path = "journal_native_authority_tests.rs"]
 mod journal_native_authority;
+#[path = "memory_native_authority_tests.rs"]
+mod memory_native_authority;
 #[path = "native_lock_order_tests.rs"]
 mod native_lock_order;
 #[path = "session_registration_connected_tests.rs"]
@@ -5009,6 +5011,7 @@ async fn memory_native_admission_reads_reserved_authority_while_host_writer_owns
             })
         });
         let owned_rx = Mutex::new(owned_rx);
+        let first_admission = std::sync::Once::new();
         let effect_store = subject_authorization::memory_effect_store_after_reservation(
             &fixture.api,
             &store,
@@ -5016,12 +5019,16 @@ async fn memory_native_admission_reads_reserved_authority_while_host_writer_owns
             &fixture.subject,
             "memory.surface.prepare",
             Arc::new(move || {
-                reserve_tx.send(()).unwrap();
-                owned_rx
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .unwrap();
+                // Force the writer overlap for the mutation only. Its returned
+                // resident surface now performs a separate protected admission.
+                first_admission.call_once(|| {
+                    reserve_tx.send(()).unwrap();
+                    owned_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                });
             }),
         );
         let result = subjektiv::api::execute(

@@ -1492,7 +1492,7 @@ struct SubjectEffectAuthority {
     worker: RuntimeWorkerRef,
     subject: String,
     operation: String,
-    runtime_source: Option<crate::worker_source::VerifiedRuntimeRequestSource>,
+    runtime_source: Option<server_api::ServerRuntimeSource>,
     #[cfg(test)]
     before_registry: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -1641,6 +1641,7 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
     }
 }
 
+#[cfg(test)]
 pub(super) fn subject_effect_store(
     api: &WorkspaceApi,
     store: &subjektiv::SubjektivStore,
@@ -1661,15 +1662,15 @@ pub(super) fn subject_effect_store(
     }))
 }
 
-/// Signed callers retain the original proof's binding; internal recovery uses
-/// subject_effect_store instead and must not synthesize a proof from live trust.
+/// Retain the binding from the authenticated request projection, never a fresh
+/// trust lookup. Trusted internal/non-request stores do not fabricate this source.
 pub(super) fn authenticated_subject_effect_store(
     api: &WorkspaceApi,
     store: &subjektiv::SubjektivStore,
     worker: &RuntimeWorkerRef,
     subject: &str,
     operation: &str,
-    source: &crate::worker_source::VerifiedRuntimeRequestSource,
+    source: &server_api::ServerRuntimeSource,
 ) -> subjektiv::SubjektivStore {
     store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
         api: api.clone(),

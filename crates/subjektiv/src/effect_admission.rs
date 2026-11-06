@@ -85,6 +85,19 @@ impl SubjektivStore {
             .try_transaction_admitted(|connection| self.admit_effect(connection), operation)
     }
 
+    /// Signed Memory reads retain the same native authority as mutations while
+    /// reading protected data. Unbound repository/recovery reads stay unchanged.
+    pub(crate) fn memory_connection<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        if self.effect_authority.is_some() {
+            self.memory_transaction(|connection| read(connection))
+        } else {
+            self.database.try_with_connection(read)
+        }
+    }
+
     pub(crate) fn journal_transaction<T>(
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> journal::JournalResult<T>,

@@ -845,7 +845,7 @@ impl SubjektivStore {
     /// Content/state/provenance changes issue new change IDs, preventing equality even in ABA returns to prior content.
     /// Saves no redundant Subject counter; staging alone does not change this fingerprint.
     pub fn memory_fingerprint(&self, subject_id: &str) -> Result<String> {
-        self.database.try_transaction(|tx| {
+        self.memory_transaction(|tx| {
             require_subject(tx, subject_id)?;
             memory_fingerprint_in_connection(tx, subject_id)
         })
@@ -1154,7 +1154,7 @@ impl SubjektivStore {
         subject_id: &str,
         candidate_id: &str,
     ) -> Result<Option<SubjectStagingRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
@@ -1174,7 +1174,7 @@ impl SubjektivStore {
         subject_id: &str,
         limit: usize,
     ) -> Result<Vec<SubjectStagingRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let mut statement = connection.prepare(
                 "SELECT s.record_json
@@ -1197,7 +1197,7 @@ impl SubjektivStore {
     }
 
     pub fn pending_staging_backlog(&self, subject_id: &str) -> Result<(usize, u64)> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let (count, bytes) = connection.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(LENGTH(s.record_json)), 0)
@@ -1454,7 +1454,7 @@ impl SubjektivStore {
         subject_id: &str,
         candidate_id: &str,
     ) -> Result<Option<StagingResolution>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
@@ -1469,7 +1469,7 @@ impl SubjektivStore {
     }
 
     pub fn memory(&self, subject_id: &str, memory_id: &str) -> Result<Option<MemoryRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
@@ -1489,7 +1489,7 @@ impl SubjektivStore {
         memory_id: &str,
         change_id: String,
     ) -> Result<Option<MemoryRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
@@ -1508,7 +1508,7 @@ impl SubjektivStore {
     pub fn scoped_memory(&self, subject_id: &str, memory_id: &str) -> Result<MemoryRecord> {
         validate_label("subject id", subject_id)?;
         validate_label("Memory id", memory_id)?;
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             scoped_memory_in_connection(connection, subject_id, memory_id)
         })
@@ -1530,7 +1530,7 @@ impl SubjektivStore {
                 "Memory change must be a nonempty change identity".into(),
             ));
         }
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             scoped_memory_in_connection(connection, subject_id, memory_id)?;
             let raw = connection
@@ -1549,7 +1549,7 @@ impl SubjektivStore {
     /// most-recently-updated order.
     pub fn list_memories(&self, subject_id: &str) -> Result<Vec<MemoryRecord>> {
         validate_label("subject id", subject_id)?;
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let mut statement = connection.prepare(
                 "SELECT record_json FROM memory_records
@@ -1572,7 +1572,7 @@ impl SubjektivStore {
         subject_id: &str,
         memory_id: &str,
     ) -> Result<Vec<MemoryRecord>> {
-        self.database.try_transaction(|tx| {
+        self.memory_transaction(|tx| {
             require_subject(tx, subject_id)?;
             let mut record = scoped_memory_in_connection(tx, subject_id, memory_id)?;
             let mut seen = HashSet::new();
@@ -1655,7 +1655,7 @@ impl SubjektivStore {
         job_id: &str,
         attempt_id: &str,
     ) -> Result<()> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let current_fingerprint = memory_fingerprint_in_connection(connection, subject_id)?;
             let generation_change = require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
@@ -1683,7 +1683,7 @@ impl SubjektivStore {
         job_id: &str,
         attempt_id: &str,
     ) -> Result<()> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
             Ok(())
         })
@@ -1818,7 +1818,7 @@ impl SubjektivStore {
     /// Ready with an empty body is a normal empty result, distinct from ungenerated/stale/failed.
     /// Returns availability separately so an absent injected body implies neither absent committed Memory nor successful generation.
     pub fn resident_surface(&self, subject_id: &str) -> Result<ResidentSurface> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             let subject = require_subject_in_connection(connection, subject_id)?;
             resident_surface_in_connection(connection, &subject)
         })
@@ -1826,7 +1826,7 @@ impl SubjektivStore {
 
     /// Returns independent behavior and the generated Memory surface as observations from the same SQLite transaction.
     pub fn resident_context(&self, subject_id: &str) -> Result<SubjectResidentContext> {
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             let subject = require_subject(transaction, subject_id)?;
             let surface = resident_surface_in_connection(transaction, &subject)?;
             Ok(SubjectResidentContext { subject, surface })
@@ -1885,7 +1885,7 @@ impl SubjektivStore {
         subject_id: &str,
         snapshot_id: &str,
     ) -> Result<Option<SurfaceSnapshot>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(

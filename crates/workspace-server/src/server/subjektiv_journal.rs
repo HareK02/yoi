@@ -277,7 +277,16 @@ impl JournalCaller<'_> {
         let store = store(api)?;
         Ok(match self {
             Self::Signed(source) => subject_authorization::authenticated_subject_effect_store(
-                api, &store, worker, subject, operation, source,
+                api,
+                &store,
+                worker,
+                subject,
+                operation,
+                &server_api::ServerRuntimeSource {
+                    runtime_id: source.runtime_id.clone(),
+                    worker_id: source.worker_id.clone(),
+                    authentication_binding_id: source.authentication_binding_id.clone(),
+                },
             ),
             #[cfg(test)]
             Self::Internal => {

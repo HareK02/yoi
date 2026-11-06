@@ -130,14 +130,19 @@ fn stage(store: &crate::subjektiv::SubjektivStore, subject: &str, id: &str) {
         .stage_candidate(SubjectStagingRecord::attach(subject, record))
         .unwrap();
 }
-fn context(worker: &RuntimeWorkerRef) -> server_api::ServerRequestContext {
+fn context(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> server_api::ServerRequestContext {
+    let binding = api
+        .config_store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &worker.runtime_id)
+        .unwrap()
+        .unwrap();
     server_api::ServerRequestContext {
         actor: None,
         worker_source: None,
         runtime_source: Some(server_api::ServerRuntimeSource {
             runtime_id: worker.runtime_id.clone(),
             worker_id: Some(worker.worker_id.clone()),
-            authentication_binding_id: "fixture-binding".into(),
+            authentication_binding_id: binding.binding_id,
         }),
         origin: None,
         transport_headers: vec![],
@@ -153,7 +158,7 @@ async fn op(
         AxumPath(ScopedWorkspacePath {
             workspace_id: TEST_WORKSPACE_ID.into(),
         }),
-        context(worker),
+        context(&api, worker),
         Json(server_api::SubjektivMemoryBackendRequest { operation }),
     )
     .await
@@ -215,14 +220,14 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
             .is_none()
     );
     assert_eq!(
-        subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(worker))
+        subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, worker))
             .unwrap()
             .0,
         subject.id
     );
-    assert!(subjektiv_subject_scope(&api, "foreign", &context(worker)).is_err());
+    assert!(subjektiv_subject_scope(&api, "foreign", &context(&api, worker)).is_err());
     let ordinary = spawn_ticket_check_source(&api, "not-a-consolidator");
-    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&ordinary)).is_err());
+    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, &ordinary)).is_err());
     // A premature result cannot generate a surface or complete unresolved work.
     assert!(
         op(
@@ -329,7 +334,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
             .unwrap()
             .is_some()
     );
-    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(worker)).is_err());
+    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, worker)).is_err());
     wait_for_backend_job_worker_cleanup(
         &api,
         &job.request.job_id,

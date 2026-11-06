@@ -2160,6 +2160,8 @@ pub struct WorkspaceApi {
     #[cfg(test)]
     journal_before_effect: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     #[cfg(test)]
+    memory_before_effect: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    #[cfg(test)]
     subject_effect_admission_observer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
@@ -5009,6 +5011,8 @@ impl WorkspaceApi {
             plugin_https_transport: None,
             #[cfg(test)]
             journal_before_effect: None,
+            #[cfg(test)]
+            memory_before_effect: None,
             #[cfg(test)]
             subject_effect_admission_observer: None,
         };
@@ -25284,14 +25288,24 @@ async fn stage_subjektiv_candidate_before_native(
             );
             let record = crate::subjektiv::SubjectStagingRecord::attach(&subject_id, record);
             before_native();
+            #[cfg(test)]
+            if let Some(observe) = &api.memory_before_effect {
+                observe("memory.staging.write");
+            }
             let store = open_subjektiv_store(&api)?;
             let worker = RuntimeWorkerRef::new(&attribution.runtime_id, &attribution.worker_id);
-            let effect_store = subject_authorization::subject_effect_store(
+            let source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Memory staging requires an authenticated Runtime source".into(),
+                )
+            })?;
+            let effect_store = subject_authorization::authenticated_subject_effect_store(
                 &api,
                 &store,
                 &worker,
                 &subject_id,
                 "memory.staging.write",
+                source,
             );
             let (staged, _) = effect_store
                 .stage_candidate_with_attribution(record, attribution)
@@ -26930,12 +26944,22 @@ async fn scoped_subjektiv_memory_backend(
                     )?
                 }
             };
-            let effect_store = subject_authorization::subject_effect_store(
+            #[cfg(test)]
+            if let Some(observe) = &api.memory_before_effect {
+                observe(operation_name);
+            }
+            let source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Memory operations require an authenticated Runtime source".into(),
+                )
+            })?;
+            let effect_store = subject_authorization::authenticated_subject_effect_store(
                 &api,
                 &store,
                 &source_worker,
                 &subject_id,
                 operation_name,
+                source,
             );
             let response =
                 subjektiv::api::execute(&effect_store, &host_context, request.operation)?;
@@ -50194,11 +50218,17 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        seed_test_delivery_binding(&api);
         let context = server_api::ServerRequestContext {
             actor: None,
             worker_source: None,
             runtime_source: Some(server_api::ServerRuntimeSource {
-                authentication_binding_id: "fixture-binding".into(),
+                authentication_binding_id: api
+                    .config_store
+                    .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &created.runtime_id)
+                    .unwrap()
+                    .unwrap()
+                    .binding_id,
                 runtime_id: created.runtime_id.clone(),
                 worker_id: Some(created.worker_id.clone()),
             }),

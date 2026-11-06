@@ -190,6 +190,7 @@ async fn memory_chat_schedule(remove_chat: bool) {
     let (admitted, memory_admitted) = std::sync::mpsc::channel();
     let (consumer_at_wait, wait_for_consumer) = std::sync::mpsc::channel();
     let wait_for_consumer = Mutex::new(wait_for_consumer);
+    let first_admission = std::sync::Once::new();
     let effect_store = subject_authorization::memory_effect_store_before_registry(
         &f.api,
         &store,
@@ -199,12 +200,16 @@ async fn memory_chat_schedule(remove_chat: bool) {
         Arc::new(move || {
             // This runs AFTER the real native Feature transaction is acquired,
             // BEFORE Memory requests registry write or a Host reservation.
-            admitted.send(()).unwrap();
-            wait_for_consumer
-                .lock()
-                .unwrap()
-                .recv_timeout(PHASE_BOUND)
-                .expect("production chat must reach its Feature wait edge");
+            // Hold the first mutation; its later protected resident read has
+            // its own admission and must not repeat this one-shot schedule.
+            first_admission.call_once(|| {
+                admitted.send(()).unwrap();
+                wait_for_consumer
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(PHASE_BOUND)
+                    .expect("production chat must reach its Feature wait edge");
+            });
         }),
     );
     let (memory_finished, memory_result) = tokio::sync::oneshot::channel();
@@ -426,6 +431,7 @@ async fn memory_authority_schedule(consumer: AuthorityConsumer) {
     let (admitted, memory_admitted) = std::sync::mpsc::channel();
     let (consumer_at_wait, wait_for_consumer) = std::sync::mpsc::channel();
     let wait_for_consumer = Mutex::new(wait_for_consumer);
+    let first_admission = std::sync::Once::new();
     let effect_store = subject_authorization::memory_effect_store_before_registry(
         &f.api,
         &store,
@@ -434,12 +440,16 @@ async fn memory_authority_schedule(consumer: AuthorityConsumer) {
         "memory.surface.prepare",
         Arc::new(move || {
             // Actual native Feature connection + IMMEDIATE transaction are held.
-            admitted.send(()).unwrap();
-            wait_for_consumer
-                .lock()
-                .unwrap()
-                .recv_timeout(PHASE_BOUND)
-                .expect("binding/enrollment must reach its Feature wait edge");
+            // A later protected surface read is admitted too; only the first
+            // mutation is the forced consumer/Feature wait edge in this test.
+            first_admission.call_once(|| {
+                admitted.send(()).unwrap();
+                wait_for_consumer
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(PHASE_BOUND)
+                    .expect("binding/enrollment must reach its Feature wait edge");
+            });
         }),
     );
     let (memory_finished, memory_result) = std::sync::mpsc::channel();
