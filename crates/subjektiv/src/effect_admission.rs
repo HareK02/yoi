@@ -27,6 +27,24 @@ impl MemoryEffectAdmission<'_> {
         self.store
             .current_policy_in_connection(self.connection, subject)
     }
+
+    /// Use the Host source bound to this admission's authority reservation. The
+    /// store's ordinary provider may reenter a connection held by a waiting writer.
+    pub fn current_policy_with_canonical_source(
+        &self,
+        subject: &str,
+        canonical_source: Arc<dyn CanonicalPermissionSource>,
+    ) -> Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
+        let store = self
+            .store
+            .clone()
+            .with_canonical_permission_source(canonical_source);
+        MemoryEffectAdmission {
+            store: &store,
+            connection: self.connection,
+        }
+        .current_policy(subject)
+    }
     pub fn writer_active(&self, binding: &journal::JournalWriterBinding) -> Result<bool> {
         require_active_subject(self.connection, &binding.subject_id)?;
         Ok(self.connection.query_row("SELECT EXISTS(SELECT 1 FROM journal_writer_bindings WHERE binding_id=?1 AND subject_id=?2 AND runtime_id=?3 AND worker_id=?4 AND active=1)", params![binding.binding_id,binding.subject_id,binding.runtime_id,binding.worker_id], |row| row.get(0))?)

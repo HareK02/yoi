@@ -1169,6 +1169,9 @@ async fn subject_consolidation_request_without_supply_denies_before_model_input(
     let source = memory_job_source(&api, &subject.id).await;
     stage(&store, &subject.id, "not-supplied");
     grant_memory_operations(&api, &subject.id, &["memory.consolidation.request"]);
+    // Observe the synchronous supply refusal before the independent recovery
+    // owner retires its still-unallocated reservation, then verify recovery too.
+    let recovery = api.backend_job_recovery.pause_steps_for_test().await;
     let error = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
@@ -1198,6 +1201,48 @@ async fn subject_consolidation_request_without_supply_denies_before_model_input(
     assert_eq!(
         saved.request.input["candidate_ids"],
         serde_json::json!(["not-supplied"])
+    );
+    assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
+    drop(recovery);
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let current = api
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &saved.request.job_id)
+                .unwrap()
+                .unwrap();
+            if current.state == BackendJobState::Failed {
+                break current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("supply refusal must also settle through independent recovery");
+    assert_eq!(
+        failed.request, saved.request,
+        "recovery must not replace frozen input"
+    );
+    let attempts = api
+        .store
+        .list_backend_job_attempts(TEST_WORKSPACE_ID, &saved.request.job_id)
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].state, BackendJobAttemptState::Failed);
+    assert!(
+        attempts[0].worker.is_none(),
+        "recovery cannot allocate without input supply"
+    );
+    assert!(execution.take_inputs().is_empty());
+    assert!(
+        api.store
+            .find_active_backend_job_for_resource(
+                TEST_WORKSPACE_ID,
+                &crate::backend_job::subjektiv_serialization_key(&subject.id),
+            )
+            .unwrap()
+            .is_none(),
+        "the retired reservation is no longer active"
     );
     assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
 }

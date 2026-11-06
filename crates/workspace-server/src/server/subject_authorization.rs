@@ -1466,6 +1466,8 @@ struct MemoryEffectAuthority {
     worker: RuntimeWorkerRef,
     subject: String,
     operation: String,
+    #[cfg(test)]
+    after_reservation: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthority {
     fn enter<'a>(
@@ -1485,27 +1487,43 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
         let mut registry = self.api.permission_registry.write().map_err(|_| {
             subjektiv::SubjektivError::AuthorizationDenied("Feature registry is unavailable".into())
         })?;
-        let fence = self.api.config_store.memory_authority_fence()?;
-        let authority = WorkerAuthorityView::from(&self.api);
-        fence
-            .with_connection(|connection| {
-                self.api
-                    .config_store
-                    .sync_plugin_permission_registry_in_connection(
-                        connection,
-                        &authority.plugin_artifact_root,
-                        self.api.workspace_id(),
-                        &mut registry,
-                    )
+        let catalog = Arc::new(
+            self.api
+                .config_store
+                .memory_authority_reader()
+                .map_err(|error| reject(error.into()))?,
+        );
+        #[cfg(test)]
+        if let Some(observe) = &self.after_reservation {
+            observe();
+        }
+        // All Host reads, including the canonical provider and nested Job/owner
+        // checks, must share the reserved connection rather than the ordinary one.
+        let mut api = self.api.clone();
+        api.config_store = catalog.clone();
+        api.store = catalog.clone();
+        let authority = WorkerAuthorityView::from(&api);
+        catalog
+            .with_conn(|connection| {
+                catalog.sync_plugin_permission_registry_in_connection(
+                    connection,
+                    &authority.plugin_artifact_root,
+                    api.workspace_id(),
+                    &mut registry,
+                )
             })
-            .map_err(|error| {
-                subjektiv::SubjektivError::Storage(feature_storage::FeatureStorageError::operation(
-                    error.to_string(),
-                ))
+            .map_err(|error| reject(error.into()))?;
+        let source = admission
+            .current_policy_with_canonical_source(
+                &self.subject,
+                Arc::new(crate::config_adoption::CanonicalConfigurationSource {
+                    store: catalog.as_ref().clone(),
+                    host: registry.host().clone(),
+                }),
+            )?
+            .ok_or_else(|| {
+                subjektiv::SubjektivError::AuthorizationDenied("Subject policy is unset".into())
             })?;
-        let source = admission.current_policy(&self.subject)?.ok_or_else(|| {
-            subjektiv::SubjektivError::AuthorizationDenied("Subject policy is unset".into())
-        })?;
         let requested = ScopedPermission {
             operation: self.operation.clone(),
             resource: PermissionResource::Subject {
@@ -1514,7 +1532,7 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
             },
         };
         let permissions = job_permissions_with_policy(
-            &self.api,
+            &api,
             &self.worker,
             |subject| {
                 if subject != self.subject {
@@ -1535,17 +1553,15 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
                 ));
             }
         } else {
-            let authority = WorkerAuthorityView::from(&self.api);
             if authority
                 .current_body_subject(&self.worker)
                 .map_err(reject)?
                 .as_deref()
                 != Some(self.subject.as_str())
             {
-                let owner = self
-                    .api
+                let owner = api
                     .store
-                    .require_current_worker_singleton_owner(self.api.workspace_id(), &self.worker)
+                    .require_current_worker_singleton_owner(api.workspace_id(), &self.worker)
                     .map_err(|error| {
                         subjektiv::SubjektivError::AuthorizationDenied(error.to_string())
                     })?;
@@ -1567,7 +1583,7 @@ impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthorit
                 ));
             }
         }
-        Ok(Box::new((fence, registry)))
+        Ok(Box::new((catalog, registry)))
     }
 }
 
@@ -1583,5 +1599,25 @@ pub(super) fn memory_effect_store(
         worker: worker.clone(),
         subject: subject.into(),
         operation: operation.into(),
+        #[cfg(test)]
+        after_reservation: None,
+    }))
+}
+
+#[cfg(test)]
+pub(super) fn memory_effect_store_after_reservation(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> subjektiv::SubjektivStore {
+    store.with_memory_effect_authority(Arc::new(MemoryEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+        after_reservation: Some(observe),
     }))
 }

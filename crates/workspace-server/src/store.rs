@@ -2901,6 +2901,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
 #[derive(Clone)]
 enum StoreConnection {
     Managed(feature_storage::FeatureDatabase),
+    AuthorityReader(Arc<Mutex<feature_storage::DatabaseWriterFence>>),
     Fixture(Arc<Mutex<Connection>>),
 }
 
@@ -3038,23 +3039,40 @@ impl SqliteWorkspaceStore {
                     "Drive requires a managed Server catalog".into(),
                 ))
             }
+            StoreConnection::AuthorityReader(_) => Err(Error::Store(
+                "reserved authority readers cannot issue Drive authority".into(),
+            )),
         }
     }
 
-    pub(crate) fn memory_authority_fence(
-        &self,
-    ) -> feature_storage::Result<feature_storage::DatabaseWriterFence> {
-        match &self.conn {
-            StoreConnection::Managed(database) => database.writer_fence(),
-            StoreConnection::Fixture(_) => Err(feature_storage::FeatureStorageError::operation(
-                "Memory effect authority requires a managed Host catalog",
-            )),
-        }
+    /// Reserve Host authority and route every nested read through that transaction.
+    /// Using the ordinary connection could deadlock against a writer that holds its
+    /// mutex while waiting for this reservation. Clones retain the reservation, not
+    /// the ordinary connection; native query-only mode rejects accidental effects.
+    pub(crate) fn memory_authority_reader(&self) -> Result<Self> {
+        let fence = match &self.conn {
+            StoreConnection::Managed(database) => database.writer_fence()?,
+            StoreConnection::Fixture(_) | StoreConnection::AuthorityReader(_) => {
+                return Err(Error::Store(
+                    "Memory effect authority requires a managed Host catalog".into(),
+                ));
+            }
+        };
+        fence.with_connection(|connection| connection.pragma_update(None, "query_only", true))?;
+        Ok(Self {
+            conn: StoreConnection::AuthorityReader(Arc::new(Mutex::new(fence))),
+            plugin_manifest_cache: self.plugin_manifest_cache.clone(),
+            db_executor: self.db_executor.clone(),
+        })
     }
 
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         match &self.conn {
             StoreConnection::Managed(database) => database.try_with_connection(f),
+            StoreConnection::AuthorityReader(fence) => fence
+                .lock()
+                .map_err(|_| Error::Store("authority reader lock poisoned".into()))?
+                .with_connection(f),
             StoreConnection::Fixture(connection) => {
                 let conn = connection
                     .lock()
@@ -3070,6 +3088,9 @@ impl SqliteWorkspaceStore {
     ) -> Result<T> {
         match &self.conn {
             StoreConnection::Managed(database) => database.try_with_connection_mut(f),
+            StoreConnection::AuthorityReader(_) => Err(Error::Store(
+                "reserved authority readers cannot enter a write transaction".into(),
+            )),
             StoreConnection::Fixture(connection) => {
                 let mut conn = connection
                     .lock()
@@ -17747,6 +17768,55 @@ mod tests {
     include!("implementation_result_tests.rs");
     include!("store_workspace_config_tests.rs");
     include!("plugin_plan/launch_migration_tests.rs");
+
+    #[test]
+    fn reserved_authority_reader_rejects_writes_and_retains_fence_until_last_clone_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let reader = store.memory_authority_reader().unwrap();
+        assert!(
+            reader
+                .with_conn(|connection| {
+                    connection.execute_batch("CREATE TABLE unauthorized_effect(value TEXT)")?;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(reader.with_conn_mut(|_| Ok(())).is_err());
+        assert!(reader.drive_authority(&path).is_err());
+        assert!(reader.memory_authority_reader().is_err());
+        let clone = reader.clone();
+        drop(reader);
+        clone
+            .with_conn(|connection| {
+                assert_eq!(
+                    connection.query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name='unauthorized_effect'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let error = writer.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        drop(clone);
+        writer.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert!(
+            SqliteWorkspaceStore::in_memory_for_test()
+                .unwrap()
+                .memory_authority_reader()
+                .is_err()
+        );
+    }
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
         store.with_conn(|c| {

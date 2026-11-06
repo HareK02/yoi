@@ -4859,6 +4859,152 @@ async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_r
     assert_eq!(saved.request.source_worker.as_ref(), Some(&f.source));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_native_admission_reads_reserved_authority_while_host_writer_owns_shared_connection()
+{
+    // Real native Feature admission and Host writer reservation, canonical policy,
+    // singleton/Job checks and persisted Memory effect. Only Runtime execution is
+    // held. The observer does not authorize or replace any production check.
+    for job_worker in [false, true] {
+        let fixture = Fixture::new().await;
+        fixture
+            .adopt_policy(r#"{ sets = ["memory"]; }"#, "{}")
+            .await;
+        let worker = if job_worker {
+            fixture
+                .api
+                .runtime
+                .register_or_replace(HeldAuthorizationJobRuntime(
+                    WorkdirlessFixtureRuntime::default(),
+                    worker_runtime::Runtime::new_memory(),
+                ));
+            let output = subjektiv_job::dispatch(
+                &fixture.api,
+                &fixture.subject,
+                Some(fixture.source.clone()),
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(output.status, "started");
+            let job = fixture
+                .api
+                .store
+                .find_active_backend_job_for_resource(
+                    TEST_WORKSPACE_ID,
+                    &crate::backend_job::subjektiv_serialization_key(&fixture.subject),
+                )
+                .unwrap()
+                .unwrap();
+            fixture
+                .api
+                .store
+                .get_backend_job_attempt(
+                    TEST_WORKSPACE_ID,
+                    &job.request.job_id,
+                    &crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt),
+                )
+                .unwrap()
+                .unwrap()
+                .worker
+                .unwrap()
+        } else {
+            fixture.source.clone()
+        };
+        let store = open_subjektiv_store(&fixture.api).unwrap();
+        let context = subjektiv::api::HostOperationContext::validated_consolidation(
+            &store,
+            &fixture.subject,
+            Some(vec![]),
+            None,
+        )
+        .unwrap();
+        let (reserve_tx, reserve_rx) = std::sync::mpsc::sync_channel(0);
+        let (owned_tx, owned_rx) = std::sync::mpsc::sync_channel(0);
+        let ordinary = fixture.api.config_store.clone();
+        let writer = std::thread::spawn(move || {
+            reserve_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            ordinary.with_conn(|connection| {
+                // The original connection mutex is held before reauthorization
+                // proceeds. Its real native writer waits behind Memory's fence.
+                owned_tx.send(()).unwrap();
+                connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK")?;
+                Ok(())
+            })
+        });
+        let owned_rx = Mutex::new(owned_rx);
+        let effect_store = subject_authorization::memory_effect_store_after_reservation(
+            &fixture.api,
+            &store,
+            &worker,
+            &fixture.subject,
+            "memory.surface.prepare",
+            Arc::new(move || {
+                reserve_tx.send(()).unwrap();
+                owned_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }),
+        );
+        let result = subjektiv::api::execute(
+            &effect_store,
+            &context,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                serde_json::from_value(json!({})).unwrap(),
+            ),
+        );
+        // Join before assertions so the waiting writer is recovered even on an
+        // effect error. An ordinary-connection reentry makes this writer BUSY.
+        let writer_result = writer.join().unwrap();
+        assert!(writer_result.is_ok(), "job={job_worker}: {writer_result:?}");
+        assert!(result.is_ok(), "job={job_worker}: {result:?}");
+        fixture.adopt_policy("{}", "{}").await;
+        let revoked = subject_authorization::memory_effect_store(
+            &fixture.api,
+            &store,
+            &worker,
+            &fixture.subject,
+            "memory.surface.prepare",
+        );
+        let result = subjektiv::api::execute(
+            &revoked,
+            &context,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                serde_json::from_value(json!({})).unwrap(),
+            ),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(subjektiv::api::OperationError::PermissionDenied(_))
+            ),
+            "current revocation must deny another effect: job={job_worker}: {result:?}"
+        );
+        fixture
+            .api
+            .feature_storage
+            .open(&fixture.api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT count(*) FROM surface_generation_runs WHERE subject_id=?1",
+                    [&fixture.subject],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    count, 1,
+                    "only the admitted effect persists: job={job_worker}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn memory_native_effect_rechecks_prepared_authority_and_preserves_no_write_on_revocation() {
     // Native admission component: actual owner adoption, Worker singleton,
