@@ -11,6 +11,22 @@
 - [`WorkerSessionSubscription`]: 公開Worker WebSocketの初期full Snapshot照合と停止確認。モデル呼出しは行わない。
 - `tests/auth_passkeys/native_migration.rs`・`browser/native_passkey_migration.ts`: 実Backend／本番shell／Chromium native CTAP2の旧鍵移行。fixture境界・未確認範囲・明示選択コマンドはmoduleに置く。通常suiteやsoftware authenticatorの成功で代替しない。
 
+## Backend単独の設定CLI製品E2E
+
+```sh
+cargo test -p yoi-e2e --features e2e --test configuration_cli -- --nocapture
+```
+
+通常featureの`yoi` argvから実loopback `yoi-server`と隔離した永続DBまでを、
+`WorkerE2eEnvironment`で接続する。保存credential、source編集、検証・差分・preview・
+push、新規ディレクトリへの再pull、無変更採用、Backend再起動、nonowner拒否と
+help/入力の終了値を確認する。認証済みnonownerは公開host CLIで作成し、hosting管理権が
+Workspace所有権を付与しないことも確認する。
+
+Runtimeやmodelは起動しない。scripted transportやoffline fixtureの試験ではなく、
+実TCP・製品processの試験である。binary hash、上限付きcommand結果、回収証拠は
+harnessの環境別artifactへ保存する。送信結果不明・結果照合の故障注入はこのtargetでは扱わない。
+
 ## 固定Workerの段階起動
 
 1. 提供fixtureを所有crateの型で検証し、`FixtureSource`で原本hashを記録する。各環境の一時領域へcopyする。fixtureが未提供・不適合なら失敗とし、代替Workerを生成しない。
