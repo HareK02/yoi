@@ -40,6 +40,7 @@ mod subjektiv_memory_journal;
 mod workdir_authorization;
 mod worker_operations;
 mod worker_protocol;
+mod worker_startup;
 pub(crate) use worker_operations::{
     WorkerOperationContext, WorkspaceWorker, WorkspaceWorkerMethodSender,
 };
@@ -5996,6 +5997,23 @@ impl WorkspaceApi {
         }
     }
 
+    /// Read retained creation evidence for this Workspace without changing lifecycle
+    /// state. Trusted internal callers must enforce their current authority before
+    /// redisclosure; a saved record never supplies visibility or retry permission.
+    pub fn worker_create_failure(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<runtime_api::startup::DecodeStoredWorkerCreateFailure>> {
+        let worker_id = WorkerId::parse(&worker.worker_id)
+            .ok_or_else(|| Error::InvalidInput("invalid Worker identity".into()))?;
+        self.config_store
+            .worker_create_failure(self.workspace_id(), &worker.runtime_id, worker_id)
+            .map(|encoded| {
+                encoded
+                    .map(|value| runtime_api::startup::decode_stored_worker_create_failure(&value))
+            })
+    }
+
     fn spawn_workspace_worker(
         &self,
         runtime_id: &str,
@@ -6012,7 +6030,46 @@ impl WorkspaceApi {
     ) -> ApiResult<WorkerSpawnResult> {
         let assignment = request.ticket_assignment.clone();
         let mut dispatched = false;
-        let mut result = self.spawn_workspace_worker_inner(runtime_id, request, &mut dispatched);
+        let mut reserved_worker = None;
+        let mut result = self.spawn_workspace_worker_inner(
+            runtime_id,
+            request,
+            &mut dispatched,
+            &mut reserved_worker,
+        );
+        if let Some(worker) = reserved_worker.as_ref() {
+            result = result
+                .map(|mut result| {
+                    if let Some(failure) = result.failure.take() {
+                        result.failure = Some(worker_startup::persist(self, worker, failure));
+                    }
+                    result
+                })
+                .map_err(|mut error| {
+                    error.error = match error.error {
+                        Error::WorkerCreateFailed { failure, source } => {
+                            Error::WorkerCreateFailed {
+                                failure: Box::new(worker_startup::persist(self, worker, *failure)),
+                                source,
+                            }
+                        }
+                        source if dispatched => {
+                            // Dispatch is not proof of acceptance or execution.
+                            let failure = worker_startup::persist(
+                                self,
+                                worker,
+                                worker_startup::unknown_result(),
+                            );
+                            Error::WorkerCreateFailed {
+                                failure: Box::new(failure),
+                                source: Some(Box::new(source)),
+                            }
+                        }
+                        source => source,
+                    };
+                    error
+                });
+        }
         // Only a newly inserted durable receipt proves there was no earlier
         // dispatch. A local rejection on replay says nothing about a prior
         // unknown outcome; keep its fence until absence is confirmed.
@@ -6040,6 +6097,7 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
         dispatched: &mut bool,
+        reserved_identity: &mut Option<RuntimeWorkerRef>,
     ) -> ApiResult<WorkerSpawnResult> {
         if let Some(singleton_key) = request.singleton_key.as_deref() {
             crate::store::validate_worker_singleton_key(singleton_key)?;
@@ -6192,6 +6250,7 @@ impl WorkspaceApi {
                 .worker(&reserved_worker)
                 .unwrap_or_else(|_| worker_summary_from_registry(&record));
             return Ok(WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Accepted,
                 worker: Some(summary),
                 acceptance_evidence: vec![crate::hosts::WorkerSpawnAcceptanceEvidence {
@@ -6230,6 +6289,7 @@ impl WorkspaceApi {
         };
         request.resolved_memory_settings = Some(reservation.memory_settings);
         let reservation_fingerprint = create_binding.create_fingerprint.clone();
+        *reserved_identity = Some(reserved_worker.clone());
         let lifecycle_assignment = request.ticket_assignment.clone();
         let compensation_context = WorkerSpawnCompensationContext {
             assignment: lifecycle_assignment.as_ref(),
@@ -6372,19 +6432,35 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
         };
+        if result.state == InternalWorkerOperationState::Accepted && result.worker.is_none() {
+            // A malformed success is not conclusive evidence about the reserved Worker.
+            result.state = InternalWorkerOperationState::Unknown;
+        }
+        if result.state != InternalWorkerOperationState::Accepted && result.failure.is_none() {
+            result.failure = Some(if result.state == InternalWorkerOperationState::Unknown {
+                worker_startup::unknown_result()
+            } else {
+                worker_startup::local_rejection()
+            });
+        }
+        if let Some(failure) = result.failure.take() {
+            result.failure = Some(worker_startup::correlate(failure, &reserved_worker));
+        }
         let Some(worker) = result.worker.as_mut() else {
-            result
-                .diagnostics
-                .extend(compensate_failed_workspace_worker_create(
-                    self,
-                    runtime_id,
-                    worker_id,
-                    &reservation_fingerprint,
-                    "runtime_spawn_rejected",
-                    None,
-                    &compensation_context,
-                    &reserved_attachments,
-                ));
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
+                self,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                "runtime_spawn_failure",
+                None,
+                &compensation_context,
+                &reserved_attachments,
+            );
+            if let Some(failure) = result.failure.take() {
+                result.failure = Some(worker_startup::compensated(failure, compensation));
+            }
+            result.diagnostics.extend(diagnostics);
             return Ok(result);
         };
         // Runtime metadata is display-only. The lease returned by the same DB transaction that
@@ -6437,21 +6513,26 @@ impl WorkspaceApi {
         {
             Ok(replacement) => replacement,
             Err(error) => {
-                let diagnostics = compensate_failed_workspace_worker_create(
-                    self,
-                    runtime_id,
-                    worker_id,
-                    &reservation_fingerprint,
-                    "workspace_api_transport",
-                    Some(worker),
-                    &compensation_context,
-                    &reserved_attachments,
-                );
-                return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
+                let (diagnostics, compensation) =
+                    compensate_failed_workspace_worker_create_observed(
+                        self,
+                        runtime_id,
+                        worker_id,
+                        &reservation_fingerprint,
+                        "workspace_api_transport",
+                        Some(worker),
+                        &compensation_context,
+                        &reserved_attachments,
+                    );
+                return Err(worker_startup::finalize_error(
+                    ApiError::with_diagnostics(error.into_error(), diagnostics),
+                    WorkerSpawnFinalizeStage::WorkspaceApiBinding,
+                    compensation,
+                ));
             }
         };
         if replacement.state != InternalWorkerOperationState::Accepted {
-            let diagnostics = compensate_failed_workspace_worker_create(
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
                 self,
                 runtime_id,
                 worker_id,
@@ -6461,23 +6542,27 @@ impl WorkspaceApi {
                 &compensation_context,
                 &reserved_attachments,
             );
-            return Err(ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: runtime_id.to_string(),
-                    code: "worker_workspace_api_replace_failed".to_string(),
-                    message: replacement
-                        .diagnostics
-                        .first()
-                        .map(|diagnostic| diagnostic.message.clone())
-                        .unwrap_or_else(|| {
-                            "Runtime rejected Workspace API replacement after spawn".to_string()
-                        }),
-                },
-                diagnostics,
+            return Err(worker_startup::finalize_error(
+                ApiError::with_diagnostics(
+                    Error::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code: "worker_workspace_api_replace_failed".to_string(),
+                        message: replacement
+                            .diagnostics
+                            .first()
+                            .map(|diagnostic| diagnostic.message.clone())
+                            .unwrap_or_else(|| {
+                                "Runtime rejected Workspace API replacement after spawn".to_string()
+                            }),
+                    },
+                    diagnostics,
+                ),
+                WorkerSpawnFinalizeStage::WorkspaceApiBinding,
+                compensation,
             ));
         }
         if let Err(error) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id) {
-            let diagnostics = compensate_failed_workspace_worker_create(
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
                 self,
                 runtime_id,
                 worker_id,
@@ -6487,7 +6572,11 @@ impl WorkspaceApi {
                 &compensation_context,
                 &reserved_attachments,
             );
-            return Err(api_error_with_additional_diagnostics(error, diagnostics));
+            return Err(worker_startup::finalize_error(
+                api_error_with_additional_diagnostics(error, diagnostics),
+                WorkerSpawnFinalizeStage::WorkerIdentity,
+                compensation,
+            ));
         }
         let registry_result = record_worker_summary(
             self,
@@ -6556,7 +6645,7 @@ impl WorkspaceApi {
             .config_store
             .complete_worker_create_reservation(&self.config.workspace_id, worker_id)
         {
-            let diagnostics = compensate_failed_workspace_worker_create(
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
                 self,
                 runtime_id,
                 worker_id,
@@ -6566,9 +6655,10 @@ impl WorkspaceApi {
                 &compensation_context,
                 &reserved_attachments,
             );
-            return Err(ApiError::with_diagnostics(
-                Error::Config(error.to_string()),
-                diagnostics,
+            return Err(worker_startup::finalize_error(
+                ApiError::with_diagnostics(Error::Config(error.to_string()), diagnostics),
+                WorkerSpawnFinalizeStage::CreateReservation,
+                compensation,
             ));
         }
         if let Err(error) = subjektiv_journal::reconcile_created_worker(self, &worker_ref) {
@@ -10762,8 +10852,10 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         context: server_api::ServerRequestContext,
         request: server_api::CreateWorkspaceWorkerRequest,
-    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::BrowserCreateWorkerResponse,
+        server_api::WorkerCreateApiError,
+    > {
         create_workspace_worker_authenticated(
             self.workspace_api()?.clone(),
             contract_request_headers(&context)?,
@@ -10773,7 +10865,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_worker_create_api_error)
     }
 
     async fn workspace_orchestrator_status(
@@ -10869,8 +10961,10 @@ impl server_api::ServerApi for ServerApiContractService {
         context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::CreateWorkspaceWorkerRequest,
-    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::BrowserCreateWorkerResponse,
+        server_api::WorkerCreateApiError,
+    > {
         spawn_known_worker_authenticated(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -10880,7 +10974,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_worker_create_api_error)
     }
 
     async fn worker_control_input(
@@ -11048,8 +11142,10 @@ impl server_api::ServerApi for ServerApiContractService {
         context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::CreateWorkspaceWorkerRequest,
-    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::BrowserCreateWorkerResponse,
+        server_api::WorkerCreateApiError,
+    > {
         validate_workspace_scope(self.workspace_api()?, &workspace_id)
             .map_err(|error| ApiError::from(error).into_repository_api_error())?;
         create_workspace_worker_authenticated(
@@ -11061,7 +11157,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_worker_create_api_error)
     }
 
     async fn workspace_worker_detail(
@@ -15015,6 +15111,15 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
         .and_then(|source| source.token_id_hash.clone());
     let response = next.run(request).await;
     let status = response.status();
+    if let Some(error) = response
+        .extensions()
+        .get::<Arc<server_api::WorkerCreateApiError>>()
+    {
+        if let Some(failure) = error.failure() {
+            worker_startup::observe_http(failure, status);
+            return response;
+        }
+    }
 
     let is_api = uri.path().starts_with("/api/")
         || canonical_ticket_operation_workspace_id(uri.path()).is_some();
@@ -15024,6 +15129,12 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
             .extensions()
             .get::<Arc<server_api::RepositoryApiError>>()
             .map(|error| ApiErrorLog::from_repository_error(error))
+            .or_else(|| {
+                response
+                    .extensions()
+                    .get::<Arc<server_api::WorkerCreateApiError>>()
+                    .map(|error| ApiErrorLog::from_repository_error(error.legacy()))
+            })
             .or_else(|| {
                 response
                     .extensions()
@@ -21673,6 +21784,7 @@ fn ticket_notification_delivery_error_category(
             InternalWorkerOperationState::Accepted => None,
             InternalWorkerOperationState::Rejected => Some("runtime_rejected"),
             InternalWorkerOperationState::Unsupported => Some("runtime_unsupported"),
+            InternalWorkerOperationState::Unknown => Some("runtime_outcome_unknown"),
         },
         Err(RuntimeRegistryError::InvalidIdentifier { .. }) => Some("invalid_identifier"),
         Err(RuntimeRegistryError::UnknownRuntime(_)) => Some("unknown_runtime"),
@@ -34894,6 +35006,7 @@ fn record_browser_worker_spawn(
     if result.state != InternalWorkerOperationState::Accepted {
         return Err(worker_create_not_accepted_error(
             requested_runtime_id.clone(),
+            result.failure,
             result.diagnostics,
         ));
     }
@@ -34912,20 +35025,24 @@ fn browser_worker_response_from_summary(
     diagnostics: Vec<RuntimeDiagnostic>,
     assignment: Option<&WorkerTicketAssignmentRequest>,
 ) -> ApiResult<BrowserCreateWorkerResponse> {
-    let worker_record = match record_worker_summary(
-        api,
-        &worker,
-        display_name.as_str(),
-        worker.profile.clone(),
-        WorkerRegistryDisplayNamePolicy::UseProvided,
-    ) {
-        Ok(record) => record,
-        Err(error) => return Err(error.into()),
-    };
     let compensation = WorkerSpawnCompensationContext {
         assignment,
         spawned_workdir_ids: &[],
     };
+    let worker_record = finalize_worker_spawn_stage(
+        api,
+        &worker,
+        &compensation,
+        WorkerSpawnFinalizeStage::WorkerRegistry,
+        record_worker_summary(
+            api,
+            &worker,
+            display_name.as_str(),
+            worker.profile.clone(),
+            WorkerRegistryDisplayNamePolicy::UseProvided,
+        )
+        .map_err(ApiError::from),
+    )?;
     if let Some(assignment) = assignment {
         if let Err(error) = api.store.bind_ticket_assignment_operation_worker(
             &api.config.workspace_id,
@@ -35594,25 +35711,15 @@ async fn list_runtime_workers(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerSpawnFinalizeStage {
+    WorkerIdentity,
+    WorkspaceApiBinding,
+    CreateReservation,
     WorkerRegistry,
     TicketAssignmentBind,
     TicketAssignmentCurrent,
     TicketStateAccept,
     WorkdirRegistry,
     WorkdirAttachment,
-}
-
-impl WorkerSpawnFinalizeStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::WorkerRegistry => "worker_registry",
-            Self::TicketAssignmentBind => "ticket_assignment_bind",
-            Self::TicketAssignmentCurrent => "ticket_assignment_current",
-            Self::TicketStateAccept => "ticket_state_accept",
-            Self::WorkdirRegistry => "workdir_registry",
-            Self::WorkdirAttachment => "workdir_attachment",
-        }
-    }
 }
 
 struct WorkerSpawnCompensationContext<'a> {
@@ -35630,52 +35737,19 @@ fn finalize_worker_spawn_stage<T>(
     let Err(source) = result else {
         return result;
     };
-    let source_message = sanitize_backend_error(&source.error.to_string());
-    let operation_id = context
-        .assignment
-        .map(|assignment| assignment.operation_id.as_str())
-        .unwrap_or("none");
-    let mut diagnostics = vec![RuntimeDiagnostic {
-        startup: None,
-        code: format!("worker_spawn_finalize_{}_failed", stage.as_str()),
-        severity: HostDiagnosticSeverity::Error,
-        message: format!(
-            "Worker spawn finalize failed at stage `{}` for Runtime Worker {}:{} (operation `{operation_id}`): {source_message}",
-            stage.as_str(),
-            worker.worker.runtime_id,
-            worker.worker.worker_id
-        ),
-    }];
-    diagnostics.extend(source.diagnostics);
-    let compensation_errors = compensate_failed_worker_spawn(api, worker, context);
-    let compensation_failed = !compensation_errors.is_empty();
-    diagnostics.extend(compensation_errors);
-    if !compensation_failed {
-        diagnostics.push(RuntimeDiagnostic {
-            startup: None,
-            code: "worker_spawn_compensated".to_string(),
-            severity: HostDiagnosticSeverity::Info,
-            message: format!(
-                "Removed Runtime Worker {}:{} and rolled back Backend spawn state",
-                worker.worker.runtime_id, worker.worker.worker_id
-            ),
-        });
-    }
-    let compensation = if compensation_failed {
-        "compensation left residual state; inspect diagnostics"
-    } else {
-        "compensation completed"
-    };
+    let (compensation_diagnostics, compensation) =
+        compensate_failed_worker_spawn_observed(api, worker, context);
+    let failure = worker_startup::persist(
+        api,
+        &worker.worker,
+        worker_startup::finalize_failure(&source, stage, compensation),
+    );
+    let mut diagnostics = source.diagnostics;
+    diagnostics.extend(compensation_diagnostics);
     Err(ApiError::with_diagnostics(
-        Error::RuntimeOperationFailed {
-            runtime_id: worker.worker.runtime_id.clone(),
-            code: format!("worker_spawn_finalize_{}_failed", stage.as_str()),
-            message: format!(
-                "Worker spawn finalize failed at stage `{}` for Runtime Worker {}:{} (operation `{operation_id}`): {source_message}; {compensation}",
-                stage.as_str(),
-                worker.worker.runtime_id,
-                worker.worker.worker_id
-            ),
+        Error::WorkerCreateFailed {
+            failure: Box::new(failure),
+            source: Some(Box::new(source.error)),
         },
         diagnostics,
     ))
@@ -35687,16 +35761,14 @@ fn write_workspace_worker_create_failure(
     phase: &str,
     diagnostics: &[RuntimeDiagnostic],
 ) {
-    tracing::error!(
+    tracing::warn!(
         target: "yoi::worker_create",
-        event = "worker_create_failed",
+        event = "worker_create_compensation",
         component = "workspace_server",
-        runtime_id,
-        worker_id = %worker_id,
+        correlation = %worker_startup::correlation(runtime_id, &worker_id.to_string()),
         phase,
-        cleanup_succeeded = diagnostics.is_empty(),
-        cleanup_diagnostics = ?diagnostics,
-        "Worker creation failed"
+        cleanup_completed = diagnostics.is_empty(),
+        "Worker creation compensation observed"
     );
 }
 
@@ -35771,6 +35843,32 @@ fn compensate_failed_workspace_worker_create(
     context: &WorkerSpawnCompensationContext<'_>,
     attachment_reservations: &[(String, String, String, workdir::WorkdirSessionCapabilities)],
 ) -> Vec<RuntimeDiagnostic> {
+    compensate_failed_workspace_worker_create_observed(
+        api,
+        runtime_id,
+        reservation_worker_id,
+        create_fingerprint,
+        failure_phase,
+        worker,
+        context,
+        attachment_reservations,
+    )
+    .0
+}
+
+fn compensate_failed_workspace_worker_create_observed(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    reservation_worker_id: WorkerId,
+    create_fingerprint: &str,
+    failure_phase: &str,
+    worker: Option<&InternalWorkerSummary>,
+    context: &WorkerSpawnCompensationContext<'_>,
+    attachment_reservations: &[(String, String, String, workdir::WorkdirSessionCapabilities)],
+) -> (
+    Vec<RuntimeDiagnostic>,
+    runtime_api::startup::CompensationOutcome,
+) {
     let mut diagnostics = Vec::new();
     let reserved_worker_ref =
         RuntimeWorkerRef::new(runtime_id.to_string(), reservation_worker_id.to_string());
@@ -35840,18 +35938,31 @@ fn compensate_failed_workspace_worker_create(
         failure_phase,
         &diagnostics,
     );
-    diagnostics
+    let outcome = if !reserved_worker_absent {
+        runtime_api::startup::CompensationOutcome::Unknown
+    } else if diagnostics.is_empty() {
+        runtime_api::startup::CompensationOutcome::Completed
+    } else {
+        runtime_api::startup::CompensationOutcome::Residual
+    };
+    (diagnostics, outcome)
 }
 
-fn compensate_failed_worker_spawn(
+fn compensate_failed_worker_spawn_observed(
     api: &WorkspaceApi,
     worker: &InternalWorkerSummary,
     context: &WorkerSpawnCompensationContext<'_>,
-) -> Vec<RuntimeDiagnostic> {
+) -> (
+    Vec<RuntimeDiagnostic>,
+    runtime_api::startup::CompensationOutcome,
+) {
     let (runtime_deleted, mut diagnostics) =
         WorkerRemovalService::new(api).delete_spawn_compensation_runtime_worker(&worker.worker);
     if !runtime_deleted {
-        return diagnostics;
+        return (
+            diagnostics,
+            runtime_api::startup::CompensationOutcome::Unknown,
+        );
     }
     diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
         api,
@@ -35872,7 +35983,12 @@ fn compensate_failed_worker_spawn(
             ),
         ));
     }
-    diagnostics
+    let outcome = if diagnostics.is_empty() {
+        runtime_api::startup::CompensationOutcome::Completed
+    } else {
+        runtime_api::startup::CompensationOutcome::Residual
+    };
+    (diagnostics, outcome)
 }
 
 fn finalize_spawn_compensation_after_worker_delete(
@@ -36148,6 +36264,7 @@ async fn create_runtime_worker_authenticated_on_host(
     {
         accept_queued_ticket_after_worker_spawn(&api, assignment)?;
         return Ok(Json(worker_spawn_result_to_api(WorkerSpawnResult {
+            failure: None,
             state: InternalWorkerOperationState::Accepted,
             worker: Some(worker),
             acceptance_evidence: Vec::new(),
@@ -39159,19 +39276,15 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 fn worker_create_not_accepted_error(
-    runtime_id: String,
-    mut diagnostics: Vec<RuntimeDiagnostic>,
+    _runtime_id: String,
+    failure: Option<runtime_api::startup::WorkerCreateFailure>,
+    diagnostics: Vec<RuntimeDiagnostic>,
 ) -> ApiError {
-    diagnostics.push(settings_diagnostic(
-        "workspace_worker_create_not_accepted",
-        HostDiagnosticSeverity::Error,
-        "Runtime did not accept worker creation; see diagnostics for sanitized Runtime compatibility details.",
-    ));
+    let failure = failure.unwrap_or_else(worker_startup::local_rejection);
     ApiError::with_diagnostics(
-        Error::RuntimeOperationFailed {
-            runtime_id,
-            code: "workspace_worker_create_failed".to_string(),
-            message: "Runtime did not accept worker creation".to_string(),
+        Error::WorkerCreateFailed {
+            failure: Box::new(failure),
+            source: None,
         },
         diagnostics,
     )
@@ -39666,6 +39779,18 @@ fn subjektiv_diagnostic_code(message: &str) -> Option<&'static str> {
 }
 
 impl ApiError {
+    fn into_worker_create_api_error(self) -> server_api::WorkerCreateApiError {
+        match self.error {
+            Error::WorkerCreateFailed { failure, .. } => server_api::WorkerCreateApiError::startup(
+                *failure,
+                &protocol::session_failure::SessionFailureVisibility {
+                    can_view_cause: true,
+                },
+            ),
+            _ => self.into_repository_api_error().into(),
+        }
+    }
+
     fn with_diagnostics(error: Error, diagnostics: Vec<RuntimeDiagnostic>) -> Self {
         Self {
             error,
@@ -39852,6 +39977,13 @@ fn api_error_response_message(error: &Error) -> String {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if matches!(&self.error, Error::WorkerCreateFailed { .. }) {
+            let error = self.into_worker_create_api_error();
+            return api_macros::axum::http_error_response(
+                api_macros::axum::status(api_macros::HttpError::status_code(&error)),
+                error,
+            );
+        }
         let status = api_error_status(&self.error);
         let response_message = api_error_response_message(&self.error);
         let log = ApiErrorLog {
@@ -39953,6 +40085,7 @@ mod tests {
     mod protocol_backpressure_tests;
     mod restore_workdir_tests;
     mod restored_parent_control_tests;
+    mod startup_result_tests;
     mod subject_authorization_tests;
     mod subject_deletion_tests;
     mod notification_source_authorization_tests {
@@ -43038,6 +43171,7 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             ) {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -43069,6 +43203,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(worker.clone());
             WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Accepted,
                 worker: Some(worker),
                 acceptance_evidence: Vec::new(),
@@ -47164,7 +47299,18 @@ mod tests {
             guarded_spawn_payload(&fixture, "guarded-runtime-rejection"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(
+            response.into_body(),
+            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["yoi_failure"]["domain"], "worker_startup");
+        assert_eq!(body["yoi_failure"]["reason"], "failed");
+        assert_eq!(body["yoi_startup"]["operation"]["acceptance"], "rejected");
         assert_eq!(fixture.runtime.spawn_requests().len(), 1);
         assert_guarded_spawn_rolled_back(&fixture);
     }
@@ -47191,7 +47337,17 @@ mod tests {
             guarded_spawn_payload(&fixture, "guarded-post-create-failure"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(
+            response.into_body(),
+            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["yoi_startup"]["operation"]["acceptance"], "accepted");
+        assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
         assert_eq!(fixture.runtime.spawn_requests().len(), 1);
         assert_guarded_spawn_rolled_back(&fixture);
     }
@@ -61792,7 +61948,7 @@ mod tests {
         sync_worker_observation(&api, &summary).unwrap();
         let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
         let _ = subscriber.take_snapshot();
-        let diagnostics = compensate_failed_worker_spawn(
+        let (diagnostics, _) = compensate_failed_worker_spawn_observed(
             &api,
             &summary,
             &WorkerSpawnCompensationContext {
@@ -68042,24 +68198,32 @@ mod tests {
         );
 
         let response = worker_create_not_accepted_error(
-            "unsupported-runtime".to_string(),
+            "unsupported-runtime".into(),
+            None,
             vec![settings_diagnostic(
                 "remote_runtime_unsupported",
                 HostDiagnosticSeverity::Warning,
-                "Remote Runtime provisioning is unsupported by this v0 worker launch path.",
+                "TEST_ONLY_DIAGNOSTIC_TEXT",
             )],
         )
         .into_response();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(
+            response.into_body(),
+            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
+        )
+        .await
+        .unwrap();
         let response: Value = serde_json::from_slice(&bytes).unwrap();
-        let diagnostics = response["diagnostics"].as_array().unwrap();
-        assert!(diagnostics.len() >= 2);
+        assert_eq!(response["yoi_failure"]["domain"], "worker_startup");
+        assert!(response.get("diagnostics").is_none());
         assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| { diagnostic["code"] == "workspace_worker_create_not_accepted" })
+            !response
+                .to_string()
+                .contains("workspace_worker_create_not_accepted")
         );
+        assert!(!response.to_string().contains("TEST_ONLY_DIAGNOSTIC_TEXT"));
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains("http://"));
     }

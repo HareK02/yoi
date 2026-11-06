@@ -2326,6 +2326,7 @@ impl IntoResponse for RuntimeHttpWorkdirError {
 
 #[derive(Debug)]
 struct RuntimeHttpRestError {
+    create_failure: Option<runtime_api::startup::WorkerCreateFailure>,
     status: StatusCode,
     code: String,
     message: String,
@@ -2339,12 +2340,21 @@ impl RuntimeHttpRestError {
             code: code.into(),
             message: message.into(),
             startup: None,
+            create_failure: None,
         }
     }
 
     fn runtime(error: RuntimeError) -> Self {
         let status = status_for_runtime_error(&error);
         let code = code_for_runtime_error(&error);
+        let create_failure = match &error {
+            RuntimeError::WorkerExecutionRejected { result, .. } => {
+                crate::execution::startup_create_failure(result)
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        };
         let startup = match &error {
             RuntimeError::WorkerExecutionRejected { result, .. } => startup_transfer(result),
             _ => None,
@@ -2359,6 +2369,7 @@ impl RuntimeHttpRestError {
             code,
             message,
             startup,
+            create_failure,
         }
     }
 
@@ -2391,6 +2402,13 @@ impl RuntimeHttpRestError {
 
 impl IntoResponse for RuntimeHttpRestError {
     fn into_response(self) -> Response {
+        if let Some(failure) = self.create_failure {
+            return runtime_api::server_support::http_error_response(
+                self.status,
+                runtime_api::RuntimeApiError::new(self.status.as_u16(), self.code, self.message)
+                    .with_create_failure(failure),
+            );
+        }
         let body = RuntimeHttpErrorResponse {
             error: RuntimeHttpErrorDetail {
                 code: self.code,

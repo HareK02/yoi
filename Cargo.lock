@@ -199,6 +199,7 @@ dependencies = [
  "api-macros-impl",
  "axum",
  "bytes",
+ "error-contract",
  "futures",
  "oas3",
  "reqwest",
@@ -4325,9 +4326,11 @@ name = "runtime-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "error-contract",
  "manifest",
  "plugin-plan",
  "protocol",
+ "schemars",
  "serde",
  "serde_json",
  "session-store",
@@ -4764,6 +4767,7 @@ name = "server-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "error-contract",
  "feature-permissions",
  "memory",
  "merge-request",

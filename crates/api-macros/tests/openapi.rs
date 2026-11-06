@@ -3,7 +3,7 @@
 
 use api_macros::{
     BinaryBody, api,
-    openapi::{OpenApiInfo, OpenApiSchema},
+    openapi::{OpenApiBuilder, OpenApiInfo, OpenApiSchema},
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -464,4 +464,155 @@ fn file_export_writes_the_canonical_document() {
     let written = std::fs::read_to_string(&path).expect("read export");
     std::fs::remove_file(path).expect("remove export");
     assert_eq!(written, document.to_json().expect("canonical JSON"));
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ProblemOrLegacy {
+    Legacy { code: String },
+    Problem { status: u16, detail: String },
+}
+impl JsonSchema for ProblemOrLegacy {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ProblemOrLegacy".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // The owner explicitly attests disjoint closed object shapes instead of admitting anyOf.
+        schemars::json_schema!({ "oneOf": [
+            { "type": "object", "required": ["code"], "additionalProperties": false,
+              "properties": { "code": { "type": "string" } } },
+            { "type": "object", "required": ["status", "detail"], "additionalProperties": false,
+              "properties": { "status": { "type": "integer", "format": "uint16" }, "detail": { "type": "string" } } }
+        ] })
+    }
+}
+impl OpenApiSchema for ProblemOrLegacy {}
+
+#[api(openapi)]
+pub trait ErrorMediaApi {
+    #[post(
+        "/create",
+        error_status = 403,
+        additional_error_statuses = [409, 504],
+        additional_error_content_types = ["Application/Problem+JSON"]
+    )]
+    async fn create(&self) -> Result<Widget, ProblemOrLegacy>;
+
+    #[get("/legacy", error_status = 422)]
+    async fn legacy(&self) -> Result<Widget, PublicError>;
+}
+
+#[test]
+fn additional_error_media_share_the_declared_schema_for_every_error_status_only() {
+    use api_macros::{ApiContract, Operation};
+    let document = error_media_api_openapi(OpenApiInfo {
+        title: "Error media",
+        version: "1",
+        source_digest: "fixture:error-media",
+    })
+    .unwrap();
+    let value = document.as_value();
+    let responses = &value["paths"]["/create"]["post"]["responses"];
+    for status in ["403", "409", "504"] {
+        let content = responses[status]["content"].as_object().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            content["application/json"]["schema"],
+            json!({ "$ref": "#/components/schemas/ProblemOrLegacy" })
+        );
+        assert_eq!(
+            content["application/problem+json"],
+            content["application/json"]
+        );
+    }
+    assert_eq!(responses["200"]["content"].as_object().unwrap().len(), 1);
+    assert!(
+        responses["200"]["content"]
+            .get("application/problem+json")
+            .is_none()
+    );
+    assert_eq!(
+        value["paths"]["/legacy"]["get"]["responses"]["422"]["content"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(value["components"]["schemas"]["ProblemOrLegacy"]["oneOf"].is_array());
+    let parsed = oas3::from_json(&document.to_json().unwrap()).unwrap();
+    assert_eq!(parsed.validate_version().unwrap().major, 3);
+
+    let operation = error_media_api_operations::Create::METADATA;
+    assert_eq!(
+        operation
+            .error_responses
+            .iter()
+            .map(|response| response.status)
+            .collect::<Vec<_>>(),
+        [403, 409, 504]
+    );
+    for response in operation.error_responses {
+        assert_eq!(
+            response.content_types,
+            ["application/json", "application/problem+json"]
+        );
+    }
+    assert_eq!(
+        operation.success_responses[0].content_types,
+        ["application/json"]
+    );
+    let legacy = ErrorMediaApiMetadata::OPERATIONS
+        .iter()
+        .find(|operation| operation.path == "/legacy")
+        .unwrap();
+    assert_eq!(
+        legacy.error_responses[0].content_types,
+        ["application/json"]
+    );
+}
+
+#[derive(JsonSchema)]
+pub struct MediaSpecificError;
+impl OpenApiSchema for MediaSpecificError {
+    fn response_schema(
+        builder: &mut OpenApiBuilder,
+        content_type: &str,
+    ) -> Result<Value, api_macros::openapi::OpenApiError> {
+        match content_type {
+            "application/json" => builder.schema_ref::<PublicError>(),
+            "application/problem+json" => builder.schema_ref::<ProblemOrLegacy>(),
+            _ => unreachable!("only declared media are selected"),
+        }
+    }
+}
+
+#[api(openapi)]
+pub trait MediaSpecificApi {
+    #[post("/media", error_status = 409, additional_error_content_types = ["application/problem+json"])]
+    async fn create(&self) -> Result<Widget, MediaSpecificError>;
+}
+
+#[test]
+fn explicitly_different_error_representations_register_their_actual_schema_closures() {
+    let document = media_specific_api_openapi(OpenApiInfo {
+        title: "Media-specific",
+        version: "1",
+        source_digest: "fixture:media-specific",
+    })
+    .unwrap();
+    let value = document.as_value();
+    let content = &value["paths"]["/media"]["post"]["responses"]["409"]["content"];
+    assert_eq!(
+        content["application/json"]["schema"],
+        json!({"$ref":"#/components/schemas/PublicError"})
+    );
+    assert_eq!(
+        content["application/problem+json"]["schema"],
+        json!({"$ref":"#/components/schemas/ProblemOrLegacy"})
+    );
+    assert!(value["components"]["schemas"]["MediaSpecificError"].is_null());
+    oas3::from_json(&document.to_json().unwrap())
+        .unwrap()
+        .validate_version()
+        .unwrap();
 }

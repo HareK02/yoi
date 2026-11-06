@@ -12,6 +12,7 @@ use worker_runtime::execution::{
 // published Profile projection; leave Worker creation/control to the real Runtime.
 #[derive(Default)]
 struct LaunchExecutionBackend {
+    fail_stop: std::sync::atomic::AtomicBool,
     execution: DeterministicExecutionBackend,
     provider_close_gate: Mutex<Option<Arc<super::workdir_session_close_tests::ProviderCloseGate>>>,
     bundles: Mutex<std::collections::HashMap<String, worker_runtime::config_bundle::ConfigBundle>>,
@@ -199,7 +200,33 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         self.execution.dispatch_input(worker, input)
     }
 
+    fn termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<Option<worker_runtime::execution::WorkerExecutionTermination>, String>
+    {
+        self.execution.termination_receipt(worker)
+    }
+
+    fn stop_worker_operation(
+        &self,
+        request: worker_runtime::execution::WorkerExecutionStopRequest,
+    ) -> WorkerExecutionResult {
+        if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.stop_worker(&request.worker_ref);
+        }
+        // Preserve the fixture's actual joined execution and operation-bound
+        // termination receipt; an accepted legacy stop alone is not that evidence.
+        self.execution.stop_worker_operation(request)
+    }
+
     fn stop_worker(&self, worker: &worker_runtime::identity::WorkerRef) -> WorkerExecutionResult {
+        if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return WorkerExecutionResult::errored(
+                worker_runtime::execution::WorkerExecutionOperation::Stop,
+                "TEST_ONLY_PRIVATE_STOP_CREDENTIAL /private/path",
+            );
+        }
         self.execution.stop_worker(worker)
     }
 }
@@ -1151,10 +1178,19 @@ async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_an
         .unwrap();
     let payload = fixture.payload(&ticket_id, "compensated-worker", "builtin:companion", false);
     let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["yoi_failure"]["domain"], "startup_boundary");
+    assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
+    let operation = &body["yoi_startup"]["operation"];
+    assert_eq!(operation["acceptance"], "accepted");
+    assert_eq!(operation["execution"], "accepted");
+    assert_eq!(operation["finalize"]["stage"], "ticket_assignment_bind");
+    assert_eq!(operation["finalize"]["compensation"], "completed");
+    assert!(body["detail"].as_str().unwrap().contains("finalization"));
     assert!(
-        body["message"].as_str().unwrap().contains("compensat"),
-        "{body}"
+        !body
+            .to_string()
+            .contains("injected Worker assignment failure")
     );
     let creates = fixture
         .backend
@@ -1311,6 +1347,7 @@ impl crate::hosts::WorkspaceWorkerRuntime for LostSpawnResponseRuntime {
         assert_eq!(result.state, InternalWorkerOperationState::Accepted);
         assert!(result.worker.is_some());
         WorkerSpawnResult {
+            failure: None,
             state: InternalWorkerOperationState::Rejected,
             worker: None,
             acceptance_evidence: Vec::new(),
@@ -1828,4 +1865,82 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
             },
         )
         .unwrap();
+}
+
+// Real Runtime creation and SQLite finalization fail independently; only Stop is
+// injected. Reconciliation must retain the create reservation while absence is unknown.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_creation_finalize_and_failed_stop_retain_unknown_compensation_and_reservation() {
+    let fixture = LaunchFixture::new(false).await;
+    let ticket_id = fixture.ticket();
+    rusqlite::Connection::open(&fixture.api.config.database_path).unwrap().execute_batch(
+        "CREATE TRIGGER fail_startup_finalize BEFORE INSERT ON ticket_current_worker_assignments WHEN NEW.role='worker' BEGIN SELECT RAISE(ABORT, 'TEST_ONLY_PRIVATE_DB_CREDENTIAL'); END;"
+    ).unwrap();
+    fixture
+        .backend
+        .fail_stop
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = fixture
+        .post(
+            TEST_WORKSPACE_ID,
+            fixture.payload(
+                &ticket_id,
+                "unknown-compensation",
+                "builtin:companion",
+                false,
+            ),
+        )
+        .await;
+    fixture
+        .backend
+        .fail_stop
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
+    let operation = &body["yoi_startup"]["operation"];
+    assert_eq!(operation["acceptance"], "accepted");
+    assert_eq!(operation["execution"], "accepted");
+    assert_eq!(operation["finalize"]["compensation"], "unknown");
+    assert!(
+        operation["correlation"]
+            .as_str()
+            .unwrap()
+            .starts_with("worker-")
+    );
+    for secret in [
+        "TEST_ONLY_PRIVATE_STOP_CREDENTIAL",
+        "/private/path",
+        "TEST_ONLY_PRIVATE_DB_CREDENTIAL",
+    ] {
+        assert!(!body.to_string().contains(secret), "{body}");
+    }
+    assert_eq!(
+        fixture
+            .api
+            .authority
+            .ticket(&ticket_id)
+            .unwrap()
+            .state
+            .as_str(),
+        "open"
+    );
+    let created = fixture.backend.creates.lock().unwrap();
+    let created: Vec<_> = created
+        .iter()
+        .filter(|request| request.display_name.as_deref() == Some("Explicit Ticket Worker"))
+        .collect();
+    assert_eq!(created.len(), 1);
+    let worker_id = created[0].worker_id.to_string();
+    let reserved: i64 = fixture.api.config_store.with_conn(|conn| conn.query_row(
+        "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='reserved'",
+        rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0),
+    ).map_err(Error::from)).unwrap();
+    // A reservation may already be completed by Runtime admission, but it must
+    // remain present (never released as absent) until Runtime absence is confirmed.
+    let retained: i64 = fixture.api.config_store.with_conn(|conn| conn.query_row(
+        "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+        rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0),
+    ).map_err(Error::from)).unwrap();
+    assert_eq!(retained, 1);
+    assert!(reserved <= retained);
 }

@@ -8,3 +8,4 @@ HTTP contract for Worker Runtime management. Owns REST DTOs and generated client
 - [`WorkerRestoreRequest`] / [`WorkerRestoreCoordinationRequest`] — Restore intent and Backend preparation contracts
 - [`LogicalWorkdirAttachment`] — Logical Workdir attachments determined by Workspace
 - [`BackendJobExecutionBinding`] — Job/attempt execution identity fixed by the Host
+- [`startup`] — projected startup Problem Details, independent operation observations and bounded receiver normalization

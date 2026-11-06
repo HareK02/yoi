@@ -1,0 +1,58 @@
+{
+  "detail": "Worker creation could not complete Session registration: Subject is not authorized for required operation session.record. Creation acceptance and execution outcome are reported separately.",
+  "instance": "/workers/create/fixture-812",
+  "status": 409,
+  "title": "Operation conflict",
+  "type": "urn:yoi:problem:conflict",
+  "yoi_failure": {
+    "category": "authorization",
+    "context": {
+      "causes": [],
+      "correlation": null,
+      "diagnostics": [],
+      "operations": [],
+      "supplementary_omitted": false
+    },
+    "details": {
+      "principal": "subject",
+      "reason": "permission_denied",
+      "required_operation": "session.record"
+    },
+    "details_version": 1,
+    "domain": "session_registration",
+    "explanation": "Worker creation could not complete Session registration: Subject is not authorized for required operation session.record. Creation acceptance and execution outcome are reported separately.",
+    "reason": "permission_denied",
+    "required_extensions": [],
+    "version": 1
+  },
+  "yoi_startup": {
+    "io_kind": "permission_denied",
+    "operation": {
+      "acceptance": "rejected",
+      "backend_compensation": null,
+      "correlation": "startup-fixture-812",
+      "execution": "rejected",
+      "finalize": null
+    },
+    "persistence": "outcome_unknown",
+    "resources": {
+      "cleanup": {
+        "failed": "workdir"
+      },
+      "durable_effects_possible": true,
+      "resources": "worker_startup"
+    },
+    "secondary": [
+      {
+        "failure": "workdir",
+        "kind": "cleanup"
+      },
+      {
+        "kind": "persistence",
+        "outcome": "outcome_unknown",
+        "phase": "metadata_save"
+      }
+    ],
+    "version": 1
+  }
+}

@@ -628,6 +628,10 @@ fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSpawnResult {
+    /// Typed failure for internal consumers, independent of diagnostic prose.
+    /// HTTP publication requires a fresh audience projection, not serialization here.
+    #[serde(skip)]
+    pub failure: Option<runtime_api::startup::WorkerCreateFailure>,
     pub state: InternalWorkerOperationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<InternalWorkerSummary>,
@@ -672,6 +676,8 @@ fn required_worker_workspace_api(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InternalWorkerOperationState {
+    /// The boundary did not observe a conclusive operation result.
+    Unknown,
     Accepted,
     Unsupported,
     Rejected,
@@ -680,6 +686,7 @@ pub enum InternalWorkerOperationState {
 impl From<InternalWorkerOperationState> for server_api::WorkerOperationState {
     fn from(state: InternalWorkerOperationState) -> Self {
         match state {
+            InternalWorkerOperationState::Unknown => Self::Unknown,
             InternalWorkerOperationState::Accepted => Self::Accepted,
             InternalWorkerOperationState::Unsupported => Self::Unsupported,
             InternalWorkerOperationState::Rejected => Self::Rejected,
@@ -1137,6 +1144,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         request: WorkerSpawnRequest,
     ) -> WorkerSpawnResult {
         WorkerSpawnResult {
+            failure: None,
             state: InternalWorkerOperationState::Unsupported,
             worker: None,
             acceptance_evidence: Vec::new(),
@@ -3210,6 +3218,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         {
             diagnostics.push(embedded_workdir_unsupported_diagnostic());
             return WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
@@ -3226,6 +3235,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 "Embedded backend Runtime is transportless; use run_accepted/create acceptance for backend-internal Workers".to_string(),
             ));
             return WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
@@ -3251,6 +3261,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     error,
                 ));
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -3263,6 +3274,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -3285,6 +3297,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .create_worker_scoped(&workspace_scope, create_request)
         {
             Ok(detail) => WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(detail)),
                 acceptance_evidence: vec![
@@ -3303,9 +3316,22 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics,
             },
             Err(err) => {
+                let failure = match &err {
+                    EmbeddedRuntimeError::WorkerExecutionRejected { result, .. } => {
+                        worker_runtime::execution::startup_create_failure(result)
+                            .ok()
+                            .flatten()
+                    }
+                    _ => None,
+                };
                 diagnostics.push(embedded_runtime_diagnostic(&err));
+                let state = failure.as_ref().map_or(
+                    InternalWorkerOperationState::Rejected,
+                    startup_failure_operation_state,
+                );
                 WorkerSpawnResult {
-                    state: InternalWorkerOperationState::Rejected,
+                    failure,
+                    state,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics,
@@ -5750,6 +5776,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             WorkerSpawnAcceptanceRequirement::SocketReady
         ) {
             return WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
@@ -5765,6 +5792,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(archive) => archive,
             Err(error) => {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -5783,6 +5811,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(workspace_api) => workspace_api,
             Err(diagnostic) => {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -5802,6 +5831,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(create) => create,
             Err(diagnostic) => {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -5809,30 +5839,70 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 };
             }
         };
-        match self
-            .run_runtime_api(
-                REMOTE_WORKER_CREATE_TIMEOUT,
-                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
-                move |client| async move { client.create_worker(create).await },
-            )
-            .and_then(|value| {
-                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
-            }) {
-            Ok(response) => WorkerSpawnResult {
-                state: InternalWorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response)),
-                acceptance_evidence: vec![WorkerSpawnAcceptanceEvidence {
-                    kind: "remote_runtime_worker_created".to_string(),
-                    detail: "worker-runtime REST create endpoint accepted the Worker".to_string(),
-                }],
-                diagnostics: Vec::new(),
-            },
-            Err(diagnostic) => WorkerSpawnResult {
-                state: InternalWorkerOperationState::Rejected,
-                worker: None,
-                acceptance_evidence: Vec::new(),
-                diagnostics: vec![diagnostic],
-            },
+        let client = match self.runtime_api_client(
+            REMOTE_WORKER_CREATE_TIMEOUT,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+        ) {
+            Ok(client) => client,
+            Err(diagnostic) => {
+                return WorkerSpawnResult {
+                    failure: None,
+                    state: InternalWorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics: vec![diagnostic],
+                };
+            }
+        };
+        let received = run_blocking_http(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| {
+                    runtime_api::client_support::ClientError::failure(
+                        runtime_api::client_support::ClientFailure::Transport,
+                    )
+                })?
+                .block_on(client.create_worker(create))
+        });
+        match received {
+            Ok(response) => {
+                match runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(
+                    response.worker,
+                ) {
+                    Ok(worker) => WorkerSpawnResult {
+                        failure: None,
+                        state: InternalWorkerOperationState::Accepted,
+                        worker: Some(self.map_worker_detail(worker)),
+                        acceptance_evidence: vec![WorkerSpawnAcceptanceEvidence {
+                            kind: "remote_runtime_worker_created".into(),
+                            detail: "Runtime create returned a Worker summary".into(),
+                        }],
+                        diagnostics: Vec::new(),
+                    },
+                    Err(diagnostic) => WorkerSpawnResult {
+                        failure: Some(startup_observation_failure(
+                            runtime_api::startup::StartupBoundaryReason::Decode,
+                        )),
+                        state: InternalWorkerOperationState::Unknown,
+                        worker: None,
+                        acceptance_evidence: Vec::new(),
+                        diagnostics: vec![diagnostic],
+                    },
+                }
+            }
+            Err(error) => {
+                let failure = runtime_create_client_failure(&error);
+                let state = startup_failure_operation_state(&failure);
+                let diagnostic = runtime_api_diagnostic(&self.runtime_id, error);
+                WorkerSpawnResult {
+                    failure: Some(failure),
+                    state,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics: vec![diagnostic],
+                }
+            }
         }
     }
 
@@ -7367,6 +7437,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
 
 pub fn placeholder_spawn_response(host_id: impl Into<String>) -> WorkerSpawnResult {
     WorkerSpawnResult {
+        failure: None,
         state: InternalWorkerOperationState::Unsupported,
         worker: Some(placeholder_worker(host_id)),
         acceptance_evidence: Vec::new(),
@@ -8811,7 +8882,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_spawn_execution_failure_is_rejected_and_not_input_capable() {
+    fn embedded_runtime_spawn_execution_error_preserves_unknown_acceptance_and_no_input() {
         let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
             "local:test",
             Arc::new(FailingSpawnBackend),
@@ -8820,7 +8891,16 @@ mod tests {
         let mut request = embedded_spawn_request();
         request.requested_worker_name = Some("friendly-name".into());
         let spawned = runtime.spawn_worker(test_create_binding(), request);
-        assert_eq!(spawned.state, InternalWorkerOperationState::Rejected);
+        assert_eq!(spawned.state, InternalWorkerOperationState::Unknown);
+        let operation = spawned.failure.as_ref().unwrap().operation();
+        assert_eq!(
+            operation.acceptance,
+            runtime_api::startup::CreationAcceptance::Unknown
+        );
+        assert_eq!(
+            operation.execution,
+            runtime_api::startup::ExecutionOutcome::Errored
+        );
         assert!(spawned.acceptance_evidence.is_empty());
         assert_eq!(spawned.diagnostics.len(), 1);
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
@@ -9975,5 +10055,69 @@ mod tests {
             },
             "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" }
         })
+    }
+}
+
+/// A local observation failure is not a received execution failure. Its operation
+/// facts remain unknown even if HTTP or compatibility diagnostics say "rejected".
+fn startup_failure_operation_state(
+    failure: &runtime_api::startup::WorkerCreateFailure,
+) -> InternalWorkerOperationState {
+    use runtime_api::startup::{CreationAcceptance, ExecutionOutcome};
+    if failure.operation().acceptance == CreationAcceptance::Unknown {
+        InternalWorkerOperationState::Unknown
+    } else if failure.operation().execution == ExecutionOutcome::Unsupported {
+        InternalWorkerOperationState::Unsupported
+    } else {
+        InternalWorkerOperationState::Rejected
+    }
+}
+
+fn startup_observation_failure(
+    reason: runtime_api::startup::StartupBoundaryReason,
+) -> runtime_api::startup::WorkerCreateFailure {
+    use runtime_api::startup::*;
+    WorkerCreateFailure::from_cause(
+        StartupCause::Boundary(StartupBoundaryCause { reason }),
+        StartupOperationFacts {
+            acceptance: CreationAcceptance::Unknown,
+            execution: ExecutionOutcome::Unknown,
+            finalize: None,
+            correlation: None,
+            backend_compensation: None,
+        },
+    )
+    .expect("fixed enum-only observation fits the startup boundary")
+}
+
+fn runtime_create_client_failure(
+    error: &runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> runtime_api::startup::WorkerCreateFailure {
+    use runtime_api::client_support::{ClientError, ClientFailure};
+    use runtime_api::startup::StartupBoundaryReason;
+    match error {
+        ClientError::Public { error, .. } => error
+            .create_failure()
+            .cloned()
+            .unwrap_or_else(|| startup_observation_failure(StartupBoundaryReason::InvalidResponse)),
+        ClientError::Failure(failure) => startup_observation_failure(match failure {
+            ClientFailure::Timeout => StartupBoundaryReason::Timeout,
+            ClientFailure::ResponseTooLarge { .. } => StartupBoundaryReason::TooLarge,
+            ClientFailure::Decode { .. } | ClientFailure::ErrorResponseDecode { .. } => {
+                StartupBoundaryReason::Decode
+            }
+            ClientFailure::UnsupportedErrorResponse { .. } => {
+                StartupBoundaryReason::UnsupportedVersion
+            }
+            ClientFailure::UnexpectedStatus { .. }
+            | ClientFailure::MissingResponseHeader { .. }
+            | ClientFailure::DuplicateResponseHeader { .. }
+            | ClientFailure::InvalidResponseHeader { .. }
+            | ClientFailure::UnexpectedBody => StartupBoundaryReason::InvalidResponse,
+            ClientFailure::Authorization
+            | ClientFailure::RequestEncoding
+            | ClientFailure::Connect
+            | ClientFailure::Transport => StartupBoundaryReason::Transport,
+        }),
     }
 }

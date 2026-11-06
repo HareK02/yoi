@@ -644,6 +644,41 @@
         ],
         "type": "string"
       },
+      "Category": {
+        "enum": [
+          "authorization",
+          "invalid_input",
+          "conflict",
+          "dependency",
+          "internal",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "CausalLink": {
+        "description": "Only explicit causal references belong here. Cleanup/audit failures stay in domain results.",
+        "properties": {
+          "correlation": {
+            "$ref": "#/components/schemas/CorrelationRef"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "reason",
+          "correlation"
+        ],
+        "type": "object"
+      },
       "ChatConversation": {
         "additionalProperties": false,
         "properties": {
@@ -1388,6 +1423,14 @@
         ],
         "type": "object"
       },
+      "CompensationOutcome": {
+        "enum": [
+          "completed",
+          "residual",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "CompiledFlowDefinition": {
         "additionalProperties": false,
         "properties": {
@@ -1860,6 +1903,12 @@
         },
         "type": "object"
       },
+      "CorrelationRef": {
+        "description": "Correlation is deliberately a distinct field/type from operation identity.",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
       "CreateRemoteRuntimeRequest": {
         "additionalProperties": false,
         "properties": {
@@ -2065,6 +2114,14 @@
           "operation_id"
         ],
         "type": "object"
+      },
+      "CreationAcceptance": {
+        "enum": [
+          "rejected",
+          "accepted",
+          "unknown"
+        ],
+        "type": "string"
       },
       "DefaultIntakeReadyBodyRequest": {
         "additionalProperties": false,
@@ -3218,6 +3275,17 @@
         ],
         "type": "object"
       },
+      "ExecutionOutcome": {
+        "enum": [
+          "accepted",
+          "busy",
+          "rejected",
+          "errored",
+          "unsupported",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "ExtensibleTicketStatus": {
         "oneOf": [
           {
@@ -3451,6 +3519,72 @@
         },
         "type": "object"
       },
+      "FailureContext": {
+        "description": "Common metadata is untrusted after deserialization. No audience label confers trust.",
+        "properties": {
+          "causes": {
+            "description": "Ordered immediate-to-root chain, at most four references; never recursive payloads.",
+            "items": {
+              "$ref": "#/components/schemas/CausalLink"
+            },
+            "maxItems": 4,
+            "type": "array"
+          },
+          "correlation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorrelationRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/FailureDiagnostic"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/OperationContext"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "supplementary_omitted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operations",
+          "causes",
+          "diagnostics",
+          "supplementary_omitted"
+        ],
+        "type": "object"
+      },
+      "FailureDiagnostic": {
+        "properties": {
+          "code": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "explanation"
+        ],
+        "type": "object"
+      },
       "FeatureInvocation": {
         "properties": {
           "arguments": {
@@ -3542,6 +3676,39 @@
             "type": "string"
           }
         ]
+      },
+      "FinalizeFacts": {
+        "additionalProperties": false,
+        "properties": {
+          "compensation": {
+            "$ref": "#/components/schemas/CompensationOutcome"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/FinalizeStage"
+          }
+        },
+        "required": [
+          "stage",
+          "compensation"
+        ],
+        "type": "object"
+      },
+      "FinalizeStage": {
+        "enum": [
+          "worker_identity",
+          "workspace_api_binding",
+          "create_reservation",
+          "worker_registry",
+          "workdir_attachment",
+          "workdir_registry",
+          "ticket_assignment_bind",
+          "ticket_assignment_current",
+          "ticket_state_accept",
+          "session_registration",
+          "initial_input",
+          "publication"
+        ],
+        "type": "string"
       },
       "FindingSeverity": {
         "enum": [
@@ -6931,6 +7098,34 @@
           "summary",
           "linked_tickets",
           "record_source"
+        ],
+        "type": "object"
+      },
+      "OperationContext": {
+        "properties": {
+          "operation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_ref": {
+            "description": "A reference, not an idempotency/retry grant. Disclosure remains domain-owned.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stage": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "stage"
         ],
         "type": "object"
       },
@@ -13099,6 +13294,42 @@
         ],
         "type": "object"
       },
+      "RuntimeStartupCause": {
+        "additionalProperties": false,
+        "description": "Safe local Runtime cause when no more specific domain attachment was supplied.\nThe primary cause is selected where the failure occurs, not parsed from its diagnostic.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/RuntimeStartupReason"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/StartupStage"
+          }
+        },
+        "required": [
+          "stage",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "RuntimeStartupReason": {
+        "description": "Coarse local causes do not claim a domain authorization verdict.",
+        "enum": [
+          "startup_failed",
+          "segment_empty",
+          "system_prompt_missing",
+          "metadata_pending",
+          "metadata_missing",
+          "metadata_inactive",
+          "manifest_missing",
+          "allocation_failed",
+          "session_read_failed",
+          "metadata_read_failed",
+          "provider_failed",
+          "attribution_failed",
+          "feature_failed"
+        ],
+        "type": "string"
+      },
       "RuntimeSummary": {
         "properties": {
           "arch": {
@@ -14325,6 +14556,52 @@
         "minimum": 0,
         "type": "integer"
       },
+      "SessionOperation": {
+        "enum": [
+          "session.record"
+        ],
+        "type": "string"
+      },
+      "SessionPrincipal": {
+        "enum": [
+          "operator",
+          "subject",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "SessionRegistrationCause": {
+        "additionalProperties": false,
+        "description": "No account/session identifiers, paths, or free-form diagnostics are retained.",
+        "properties": {
+          "principal": {
+            "$ref": "#/components/schemas/SessionPrincipal"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SessionRegistrationReason"
+          },
+          "required_operation": {
+            "$ref": "#/components/schemas/SessionOperation"
+          }
+        },
+        "required": [
+          "reason",
+          "principal",
+          "required_operation"
+        ],
+        "type": "object"
+      },
+      "SessionRegistrationReason": {
+        "enum": [
+          "permission_denied",
+          "attribution_missing",
+          "binding_mismatch",
+          "transport",
+          "outcome_unknown",
+          "invalid_response"
+        ],
+        "type": "string"
+      },
       "SetCookieHeader": {
         "description": "Sensitive `Set-Cookie` response header value.\n\nFormatting is available only for transport encoding; `Debug` always redacts the value.",
         "type": "string"
@@ -14810,8 +15087,566 @@
         ],
         "type": "object"
       },
+      "StartupBoundaryCause": {
+        "additionalProperties": false,
+        "description": "An observation at the receiving/finalizing boundary, not a reported Runtime\nexecution result. It deliberately cannot hold raw transport or error text.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/StartupBoundaryReason"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "StartupBoundaryReason": {
+        "enum": [
+          "timeout",
+          "transport",
+          "decode",
+          "invalid_response",
+          "too_large",
+          "unsupported_version",
+          "unsupported_reason",
+          "finalize_failed"
+        ],
+        "type": "string"
+      },
+      "StartupCleanup": {
+        "oneOf": [
+          {
+            "enum": [
+              "not_needed",
+              "required",
+              "confirmed"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "failed": {
+                "$ref": "#/components/schemas/StartupCleanupFailure"
+              }
+            },
+            "required": [
+              "failed"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "StartupCleanupFailure": {
+        "enum": [
+          "ownership",
+          "workdir",
+          "artifacts",
+          "allocation",
+          "feature",
+          "unsupported"
+        ],
+        "type": "string"
+      },
+      "StartupCorrelation": {
+        "description": "Opaque, caller-selected lookup token, not an operation identity or capability.\nNo whitespace, URI/path/query syntax or control characters are accepted.",
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._-]+$",
+        "type": "string"
+      },
       "StartupFailureAttachment": {
         "description": "A bounded, projected envelope at the Worker/Runtime or metadata boundary.\nNo constructor accepts Display text, arbitrary JSON fields, or an unprojected error.",
+        "type": "string"
+      },
+      "StartupFailurePhase": {
+        "oneOf": [
+          {
+            "enum": [
+              "cleanup",
+              "runtime_record_delete",
+              "runtime_snapshot_save",
+              "runtime_removal_publish",
+              "metadata_save"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "runtime_reconciliation_record_save",
+            "description": "Retaining create reconciliation observations in the canonical Worker record.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_reconciliation_publish",
+            "description": "Publishing a retained record to Runtime subscribers; not a durable write.",
+            "type": "string"
+          }
+        ]
+      },
+      "StartupIoKind": {
+        "description": "Path-free IO classification. Nonportable OS details remain at the resource owner.",
+        "enum": [
+          "not_found",
+          "permission_denied",
+          "already_exists",
+          "invalid_input",
+          "invalid_data",
+          "interrupted",
+          "timed_out",
+          "would_block",
+          "unexpected_eof",
+          "other"
+        ],
+        "type": "string"
+      },
+      "StartupOperationFacts": {
+        "additionalProperties": false,
+        "description": "Explicit owner observations. There is deliberately no Default and no conversion\nfrom HTTP status, retry hints, resource facts or failure reason into these fields.",
+        "properties": {
+          "acceptance": {
+            "$ref": "#/components/schemas/CreationAcceptance"
+          },
+          "backend_compensation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompensationOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Backend compensation can occur before/without finalization; never infer\nthis observation from Runtime cleanup, resources or finalize compensation."
+          },
+          "correlation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupCorrelation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ExecutionOutcome"
+          },
+          "finalize": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinalizeFacts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "acceptance",
+          "execution"
+        ],
+        "type": "object"
+      },
+      "StartupPersistenceOutcome": {
+        "description": "Persisted is evidence only for this attachment/record write, not execution completion.",
+        "enum": [
+          "persisted",
+          "not_saved",
+          "conflict",
+          "outcome_unknown"
+        ],
+        "type": "string"
+      },
+      "StartupProblemDetails": {
+        "description": "Public generator/reader DTO. Deserialization does not grant disclosure authority.",
+        "properties": {
+          "detail": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "instance": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 599,
+            "minimum": 400,
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "yoi_failure": {
+            "oneOf": [
+              {
+                "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+                "properties": {
+                  "category": {
+                    "$ref": "#/components/schemas/Category"
+                  },
+                  "context": {
+                    "$ref": "#/components/schemas/FailureContext"
+                  },
+                  "details": {
+                    "$ref": "#/components/schemas/SessionRegistrationCause"
+                  },
+                  "details_version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "domain": {
+                    "const": "session_registration",
+                    "type": "string"
+                  },
+                  "explanation": {
+                    "maxLength": 2048,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "reason": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "required_extensions": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "required_extensions",
+                  "domain",
+                  "reason",
+                  "category",
+                  "details_version",
+                  "details",
+                  "explanation",
+                  "context"
+                ],
+                "type": "object"
+              },
+              {
+                "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+                "properties": {
+                  "category": {
+                    "$ref": "#/components/schemas/Category"
+                  },
+                  "context": {
+                    "$ref": "#/components/schemas/FailureContext"
+                  },
+                  "details": {
+                    "$ref": "#/components/schemas/RuntimeStartupCause"
+                  },
+                  "details_version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "domain": {
+                    "const": "worker_startup",
+                    "type": "string"
+                  },
+                  "explanation": {
+                    "maxLength": 2048,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "reason": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "required_extensions": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "required_extensions",
+                  "domain",
+                  "reason",
+                  "category",
+                  "details_version",
+                  "details",
+                  "explanation",
+                  "context"
+                ],
+                "type": "object"
+              },
+              {
+                "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+                "properties": {
+                  "category": {
+                    "$ref": "#/components/schemas/Category"
+                  },
+                  "context": {
+                    "$ref": "#/components/schemas/FailureContext"
+                  },
+                  "details": {
+                    "$ref": "#/components/schemas/StartupBoundaryCause"
+                  },
+                  "details_version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "domain": {
+                    "const": "startup_boundary",
+                    "type": "string"
+                  },
+                  "explanation": {
+                    "maxLength": 2048,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "reason": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "required_extensions": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "required_extensions",
+                  "domain",
+                  "reason",
+                  "category",
+                  "details_version",
+                  "details",
+                  "explanation",
+                  "context"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "yoi_startup": {
+            "$ref": "#/components/schemas/StartupProblemFacts"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "instance",
+          "yoi_failure",
+          "yoi_startup"
+        ],
+        "type": "object"
+      },
+      "StartupProblemFacts": {
+        "additionalProperties": false,
+        "description": "The extension contains only typed allowlisted observations; never the attachment.",
+        "properties": {
+          "backend_result_persistence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupPersistenceOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Backend-owned result write only; never evidence of Session metadata persistence."
+          },
+          "io_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupIoKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation": {
+            "$ref": "#/components/schemas/StartupOperationFacts"
+          },
+          "persistence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupPersistenceOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session metadata persistence, independent of the Backend reservation result."
+          },
+          "resources": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupResourceFacts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "secondary": {
+            "items": {
+              "$ref": "#/components/schemas/StartupSecondaryFailure"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "maximum": 1,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "operation",
+          "secondary"
+        ],
+        "type": "object"
+      },
+      "StartupResourceFacts": {
+        "properties": {
+          "cleanup": {
+            "$ref": "#/components/schemas/StartupCleanup"
+          },
+          "durable_effects_possible": {
+            "type": "boolean"
+          },
+          "resources": {
+            "$ref": "#/components/schemas/StartupResources"
+          }
+        },
+        "required": [
+          "resources",
+          "cleanup",
+          "durable_effects_possible"
+        ],
+        "type": "object"
+      },
+      "StartupResources": {
+        "description": "Independent resource observations from the existing execution owner. These diagnostics\nnever promote a result to RolledBack or authorize replay; the backend disposition does.",
+        "enum": [
+          "none",
+          "worker_startup",
+          "unproven"
+        ],
+        "type": "string"
+      },
+      "StartupSecondaryFailure": {
+        "description": "A separate secondary fact, not a replacement primary cause or a causal-chain link.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "projection_unavailable",
+                "type": "string"
+              },
+              "phase": {
+                "$ref": "#/components/schemas/StartupFailurePhase"
+              }
+            },
+            "required": [
+              "kind",
+              "phase"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/StartupCleanupFailure"
+              },
+              "kind": {
+                "const": "cleanup",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "failure"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "persistence",
+                "type": "string"
+              },
+              "outcome": {
+                "$ref": "#/components/schemas/StartupPersistenceOutcome"
+              },
+              "phase": {
+                "$ref": "#/components/schemas/StartupFailurePhase"
+              }
+            },
+            "required": [
+              "kind",
+              "phase",
+              "outcome"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "StartupStage": {
+        "description": "Owner-selected startup stage; independent of resource cleanup disposition.",
+        "enum": [
+          "preflight",
+          "metadata",
+          "reconstruction",
+          "recovery",
+          "binding",
+          "feature",
+          "activation_effects",
+          "controller"
+        ],
         "type": "string"
       },
       "SubjectBodyApiError": {
@@ -20793,6 +21628,7 @@
       },
       "WorkerOperationState": {
         "enum": [
+          "unknown",
           "accepted",
           "unsupported",
           "rejected"
@@ -23363,7 +24199,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:894ccff36a463bec91b635956924114aa0db87d8b3f815230d6e8395511d2f6e"
+    "x-yoi-source-digest": "sha256:afde3903f29b9087390b69f9761a935cd5004c4dab17ce684f4149c4abae89c4"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -48730,6 +49566,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -48739,6 +49580,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -48750,6 +49596,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -48759,6 +49610,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -48770,6 +49626,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -48779,6 +49640,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -48790,6 +49656,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -48799,6 +49670,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -49947,6 +50823,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -49956,6 +50837,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -49967,6 +50853,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -49976,6 +50867,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -49987,6 +50883,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -49996,6 +50897,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -50007,6 +50913,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -50016,6 +50927,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },

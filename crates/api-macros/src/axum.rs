@@ -96,6 +96,34 @@ pub fn error_response<T: Serialize + Send + Sync + 'static>(
     response
 }
 
+/// Apply the optional public encoding hook, retaining the original server-local error.
+///
+/// Invalid hook metadata fails closed with an empty 500 response and no typed extension.
+/// A hook failure must not expose a potentially private legacy serialization.
+pub fn http_error_response<T: crate::HttpError + Serialize + Send + Sync + 'static>(
+    status: StatusCode,
+    error: T,
+) -> Response {
+    let Some(encoded) = error.custom_response() else {
+        return error_response(status, error);
+    };
+    let Ok(status) = StatusCode::from_u16(encoded.status) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(content_type) = axum::http::HeaderValue::from_str(encoded.content_type) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if !(status.is_client_error() || status.is_server_error()) || content_type.is_empty() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let mut response = (status, encoded.body.into_bytes()).into_response();
+    response
+        .headers_mut()
+        .insert(axum::http::header::CONTENT_TYPE, content_type);
+    response.extensions_mut().insert(std::sync::Arc::new(error));
+    response
+}
+
 /// Emit an exact binary response with the contract status and octet-stream content type.
 pub fn binary_response(status: StatusCode, value: crate::BinaryBody) -> Response {
     (

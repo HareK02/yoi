@@ -2745,24 +2745,53 @@ pub(super) struct ConnectedWorkerHarness {
     _dir: tempfile::TempDir,
 }
 impl ConnectedWorkerHarness {
-    pub(super) async fn human(
+    /// Exercise the authenticated Browser TCP/HTTP boundary without discarding
+    /// media type or rewriting its body. Bound both elapsed time and streamed bytes;
+    /// redirects/retries must not turn a failed create response into another POST.
+    pub(super) async fn human_raw(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Value,
-    ) -> (StatusCode, Value) {
-        let response = reqwest::Client::builder()
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
+        let mut response = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .unwrap()
-            .request(method.clone(), format!("{}{path}", self.backend_url))
+            .request(method, format!("{}{path}", self.backend_url))
             .bearer_auth(&self.owner)
             .json(&body)
             .send()
             .await
             .unwrap();
         let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
-        let bytes = response.bytes().await.unwrap();
+        let headers = response.headers().clone();
+        assert!(
+            response
+                .content_length()
+                .is_none_or(|len| len <= RESPONSE_LIMIT as u64)
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            assert!(
+                chunk.len() <= RESPONSE_LIMIT - bytes.len(),
+                "Browser response exceeds test limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        (status, headers, bytes)
+    }
+
+    pub(super) async fn human(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let (status, _, bytes) = self.human_raw(method.clone(), path, body).await;
         let body = if status == StatusCode::NO_CONTENT {
             assert!(bytes.is_empty(), "{method} {path}: HTTP204 must be empty");
             Value::Null
@@ -2970,20 +2999,36 @@ impl ConnectedWorkerHarness {
                         }
                         let (parts, body) = response.into_parts();
                         let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                        let content_type = parts
+                            .headers
+                            .get(axum::http::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("");
                         let body: Value = serde_json::from_slice(&bytes).unwrap();
-                        if let Some(startup) = body["error"].get("startup").filter(|v| !v.is_null())
+                        let message = if content_type == runtime_api::startup::PROBLEM_CONTENT_TYPE
                         {
-                            startup_failures.lock().unwrap().push(
-                                serde_json::from_value(startup.clone())
-                                    .expect("RuntimeHTTP structured startup failure"),
-                            );
-                        }
-                        errors.lock().unwrap().push(
+                            use runtime_api::startup::{
+                                DecodeStartupProblem, StartupBoundary, decode_startup_problem,
+                            };
+                            let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+                                &bytes,
+                                parts.status.as_u16(),
+                                content_type,
+                                StartupBoundary::Runtime,
+                            ) else {
+                                panic!("RuntimeHTTP must emit a valid typed startup Problem");
+                            };
+                            startup_failures
+                                .lock()
+                                .unwrap()
+                                .push(failure.startup().clone());
+                            body["detail"].as_str().expect("Problem detail")
+                        } else {
                             body["error"]["message"]
                                 .as_str()
                                 .unwrap_or("unknown fixture error")
-                                .to_owned(),
-                        );
+                        };
+                        errors.lock().unwrap().push(message.to_owned());
                         Response::from_parts(parts, Body::from(bytes))
                     }
                 },

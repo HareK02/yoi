@@ -76,6 +76,26 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
 
 fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
     verify_raw_capture_shape(conn, current, rows)?;
+    if current == 124 {
+        super::verify_worker_create_failure_schema(conn)?;
+        if rows == [(124, super::SCHEMA_BASELINE_NAME.to_owned())] {
+            verify_execution_shape(conn)?;
+            super::backend_job_upgrade::verify(conn)?;
+            verify_configuration_shape(conn)?;
+            require_shape(conn, Stage::Base)?;
+            return verify_103_features(conn, current, rows);
+        }
+        if rows.last().map(|(version, name)| (*version, name.as_str()))
+            != Some((124, super::WORKER_CREATE_FAILURE_MIGRATION_NAME))
+        {
+            return Err(invalid("unrecognized Worker creation result receipt"));
+        }
+        let prefix = &rows[..rows.len() - 1];
+        if prefix.last().map(|row| row.0) != Some(123) {
+            return Err(invalid("missing Worker creation result predecessor"));
+        }
+        return verify_history_records(conn, 123, prefix);
+    }
     if current == 123 {
         verify_execution_shape(conn)?;
         super::backend_job_upgrade::verify(conn)?;
@@ -236,10 +256,11 @@ pub(super) fn published_plan(
     verify_history(conn, current)?;
     Ok(Some(super::WorkspaceSchemaMigrationPlan {
         current_schema_version: current,
-        target_schema_version: 123,
+        target_schema_version: 124,
         migrations: [
             (122, crate::config_adoption::MIGRATION_NAME),
             (123, super::backend_job_upgrade::MIGRATION_NAME),
+            (124, super::WORKER_CREATE_FAILURE_MIGRATION_NAME),
         ]
         .into_iter()
         .filter(|(version, _)| *version > current)
@@ -465,7 +486,7 @@ fn legacy_shape(conn: &Connection) -> Result<Shape> {
 }
 
 fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
-    if super::current_schema_version(conn)? != 123 {
+    if super::current_schema_version(conn)? < 123 {
         return Ok(shape);
     }
     for table in ["backend_jobs", "backend_job_attempts"] {
