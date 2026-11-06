@@ -16,6 +16,11 @@ import {
   stopSidebarWorker,
 } from "../../src/lib/workspace/sidebar/worker-actions.ts";
 import type { Worker } from "../../src/lib/workspace/sidebar/types.ts";
+import {
+  deletionNotice,
+  workerDeletionOutcome,
+} from "../../src/lib/workspace/workers/worker-removal.ts";
+import { parseRuntimeCleanupExecution } from "../../src/lib/workspace/api/runtime-workers.ts";
 
 function assert(
   condition: unknown,
@@ -428,6 +433,93 @@ Deno.test("Restore bounds the response before decoding and retains uncertain out
   }
   assertEquals(restoreErrorNotice(caught).title, "Worker observation changed");
   assertEquals(restoreErrorNotice(caught).retry, false);
+});
+
+Deno.test("sidebar Delete accepts HTTP 202 but retains the Worker and saved operation", async () => {
+  for (const state of ["waiting", "held"] as const) {
+    const plan = {
+      workspace_id: "team",
+      runtime_id: worker.runtime_id,
+      generated_at: "2026-01-01T00:00:00Z",
+      digest: "saved-digest",
+      workers: [{
+        target_id: "target",
+        action: "worker_delete",
+        worker_id: worker.worker_id,
+        runtime_id: worker.runtime_id,
+        runtime_worker_id: worker.worker_id,
+        reason: "stopped",
+        blocking_reason: null,
+        pinned: false,
+        retention_state: "stopped",
+        linked_workdir_ids: [],
+        running_linked: false,
+      }],
+      workdirs: [],
+      diagnostics: [],
+    };
+    const removal = {
+      operation_id: "original-removal-operation",
+      state,
+      phase: "recording" as const,
+      cause: state === "held" ? "job_failed" as const : "job_pending" as const,
+    };
+    const receipt = {
+      workspace_id: "team",
+      runtime_id: worker.runtime_id,
+      executed_at: "2026-01-01T00:00:01Z",
+      results: [{
+        target_id: "target",
+        action: "worker_delete",
+        status: "accepted",
+        message: "",
+        removal,
+      }],
+      plan_after: plan,
+      diagnostics: [],
+    };
+    const requests: string[] = [];
+    const fetchFn = ((input: RequestInfo | URL) => {
+      requests.push(String(input));
+      return Promise.resolve(
+        Response.json(requests.length === 1 ? plan : receipt, {
+          status: requests.length === 1 ? 200 : 202,
+        }),
+      );
+    }) as typeof fetch;
+    const outcome = await deleteSidebarWorker("team", {
+      ...worker,
+      state: "stopped",
+    }, fetchFn);
+    assertEquals(outcome, { removed: false, removal });
+    assertEquals(requests.length, 2); // No polling or retrying mutations.
+    const notice = deletionNotice(outcome);
+    assertEquals(notice.title, "Worker removal accepted");
+    assert(notice.message.includes(state));
+    assert(notice.message.includes("Removal operation"));
+    assert(notice.message.includes("Worker retained, not deleted"));
+    assertEquals(
+      parseRuntimeCleanupExecution(receipt).results[0].removal,
+      removal,
+    );
+    // An observation must never be promoted by a status string alone.
+    assertEquals(
+      workerDeletionOutcome({
+        ...parseRuntimeCleanupExecution(receipt).results[0],
+        status: "deleted",
+      }).removed,
+      false,
+    );
+  }
+  assertEquals(
+    workerDeletionOutcome({
+      target_id: "t",
+      action: "worker_delete",
+      status: "deleted",
+      message: "",
+    }),
+    { removed: true },
+  );
 });
 
 Deno.test("Restore and Stop HTTP failures display the typed primary cause, not legacy bodies or supplemental order", async () => {

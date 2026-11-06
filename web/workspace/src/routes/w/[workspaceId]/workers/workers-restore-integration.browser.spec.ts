@@ -19,6 +19,10 @@ import {
 import { disposeWorkspaceWorkersStore } from "#lib/workspace/sidebar/worker-subscription.ts";
 import WorkersNavSection from "#lib/workspace/sidebar/WorkersNavSection.svelte";
 import WorkersPage from "./PageContent.svelte";
+import {
+  controlProblem,
+  controlProblemResponse,
+} from "#lib/workspace/failure/runtime-control.test-fixtures.ts";
 
 const transport = vi.hoisted(() => ({
   listener: null as null | { onFrame(frame: SubscriptionFrame): void },
@@ -274,11 +278,18 @@ test("separate entrances remain independent while Runtime conflict triggers shar
   unsubscribe();
 });
 
-test.each(["http", "malformed"] as const)(
+test.each(["http", "malformed", "typed_http"] as const)(
   "%s Restore response never produces success in either entrance",
   async (failure) => {
     handleRestore = async () =>
-      failure === "http"
+      failure === "typed_http"
+        ? controlProblemResponse(
+          controlProblem(
+            "restore_admission_busy",
+            "Owner is handling another lifecycle operation.",
+          ),
+        )
+        : failure === "http"
         ? Response.json({ message: "forbidden restore" }, { status: 403 })
         : Response.json({
           workspace_id: workspaceId,
@@ -295,10 +306,15 @@ test.each(["http", "malformed"] as const)(
     await fireEvent.click(pageRestore());
     await waitFor(() =>
       expect(JSON.stringify(alerts)).toContain(
-        failure === "http" ? "forbidden restore" : "outcome unknown",
+        failure === "http"
+          ? "supported failure response"
+          : failure === "typed_http"
+          ? "Owner is handling another lifecycle operation."
+          : "outcome unknown",
       )
     );
     expect(JSON.stringify(alerts)).not.toContain("Worker restored");
+    expect(JSON.stringify(alerts)).not.toContain("forbidden restore");
     expect(screen.getByRole("cell", { name: "stopped" })).toBeTruthy();
     // The sidebar is a second explicit entrance, not an automatic retry.
     await fireEvent.click(await sidebarRestore());

@@ -18,6 +18,10 @@ import type {
   WorkerListResponse,
   WorkerStateSnapshot,
   WorkerSummary,
+  WorkerRemovalObservation,
+  WorkerRemovalState,
+  WorkerRemovalPhase,
+  WorkerRemovalCause,
   WorkerWorkdirAttachmentSummary,
   WorkerWorkspaceSummary,
   WorkingDirectoryRepositoryOption,
@@ -351,6 +355,40 @@ export type ParsedWorkerListResponse = Omit<WorkerListResponse, "items"> & {
   items: ParsedWorkerSummary[];
 };
 
+const REMOVAL_STATES: readonly WorkerRemovalState[] = ["waiting", "held"];
+const REMOVAL_PHASES: readonly WorkerRemovalPhase[] = [
+  "awaiting_quiescence", "recording", "awaiting_effects_end", "released", "completed",
+];
+const REMOVAL_CAUSES: readonly WorkerRemovalCause[] = [
+  "recording_disabled", "source_unavailable", "ownership_unknown", "job_pending", "job_failed",
+  "execution_unconfirmed", "storage_unavailable",
+];
+
+function removalEnum<T extends string>(value: unknown, values: readonly T[], label: string): T {
+  if (typeof value !== "string" || !values.includes(value as T)) {
+    throw new Error(`${label} is invalid`);
+  }
+  return value as T;
+}
+
+export function parseWorkerRemovalObservation(
+  value: unknown,
+  label = "Worker removal",
+): WorkerRemovalObservation {
+  const item = record(value, label);
+  exact(item, ["operation_id", "state", "phase", "cause"], label);
+  const operation_id = string(item.operation_id, `${label}.operation_id`);
+  if (!operation_id || new TextEncoder().encode(operation_id).byteLength > 4096) {
+    throw new Error(`${label}.operation_id is invalid`);
+  }
+  return {
+    operation_id,
+    state: removalEnum(item.state, REMOVAL_STATES, `${label}.state`),
+    phase: removalEnum(item.phase, REMOVAL_PHASES, `${label}.phase`),
+    cause: optional(item.cause, `${label}.cause`, (value, path) => removalEnum(value, REMOVAL_CAUSES, path)),
+  };
+}
+
 export function parseWorkerSummary(
   value: unknown,
   label = "Worker summary",
@@ -377,6 +415,7 @@ export function parseWorkerSummary(
       "state",
       "worker_state",
       "restore_observation_token",
+      "removal",
       "last_seen_at",
       "pinned",
       "retention_state",
@@ -418,6 +457,7 @@ export function parseWorkerSummary(
     availability,
     state: string(item.state, `${label}.state`),
     worker_state: workerState,
+    removal: optional(item.removal, `${label}.removal`, parseWorkerRemovalObservation),
     restore_observation_token: optional(
       item.restore_observation_token,
       `${label}.restore_observation_token`,

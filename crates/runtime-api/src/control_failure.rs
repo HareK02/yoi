@@ -31,9 +31,12 @@ impl ApiBoundary<RuntimeControlCause> for ControlBoundary {
             | C::StoreUnavailable
             | C::StateUnavailable
             | C::ClientSetupFailed => S::Internal,
-            C::PersistenceOutcomeUnknown | C::TransportFailed | C::ResultUnavailable => {
-                S::Unavailable
-            }
+            C::PersistenceOutcomeUnknown
+            | C::TransportFailed
+            | C::ResultUnavailable
+            | C::RecordingSourceUnavailable
+            | C::RecordingOwnershipUnknown
+            | C::RecordingExecutionUnconfirmed => S::Unavailable,
             C::TimedOut => S::GatewayTimeout,
             C::WorkingDirectoryFailed
             | C::ConnectionFailed

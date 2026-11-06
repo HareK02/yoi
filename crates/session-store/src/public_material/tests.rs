@@ -2502,3 +2502,201 @@ fn recording_catalog_errors_do_not_invoke_callback_or_relax_resource_and_identit
         }
     }
 }
+
+#[test]
+fn removal_union_preserves_active_prefix_and_appends_abandoned_branch_once() {
+    use crate::capture::*;
+    let temp = tempfile::tempdir().unwrap();
+    for worker_layout in [false, true] {
+        let root = temp
+            .path()
+            .join(if worker_layout { "worker" } else { "fs" });
+        let retention = crate::retention::SessionRetentionStore::new(root.join("control"));
+        let session = crate::new_session_id();
+        let parent = crate::new_segment_id();
+        let active = crate::new_segment_id();
+        let original = message("union-original", LoggedRole::User, "shared original");
+        let records = [
+            seed(session, vec![original.clone()]),
+            LogEntry::TurnEnd {
+                ts: 2,
+                turn_count: 1,
+            },
+            output("union-abandoned", "retained old branch"),
+        ];
+        let mut fork = seed(session, vec![original]);
+        if let LogEntry::AnnotatedSegmentStart { forked_from, .. } = &mut fork {
+            *forked_from = Some(SegmentOrigin {
+                segment_id: parent,
+                at_turn_index: 1,
+            });
+        }
+        let store: Box<dyn Store> = if worker_layout {
+            Box::new(WorkerSessionStore::new_with_retention(&root, retention.clone()).unwrap())
+        } else {
+            Box::new(FsStore::new_with_retention(&root, retention.clone()).unwrap())
+        };
+        store.create_segment(session, parent, &records).unwrap();
+        store
+            .create_segment(
+                session,
+                active,
+                &[fork, output("union-active", "current branch")],
+            )
+            .unwrap();
+        let guard = retention.lock_live(session).unwrap();
+        let (prefix, union) = if worker_layout {
+            (
+                recording_catalog_worker_guarded(
+                    &root,
+                    session,
+                    active,
+                    Default::default(),
+                    &guard,
+                    |d| d.to_vec(),
+                )
+                .unwrap(),
+                recording_union_catalog_worker_guarded(
+                    &root,
+                    session,
+                    active,
+                    Default::default(),
+                    &guard,
+                )
+                .unwrap(),
+            )
+        } else {
+            (
+                recording_catalog_fs_guarded(
+                    &root,
+                    session,
+                    active,
+                    Default::default(),
+                    &guard,
+                    |d| d.to_vec(),
+                )
+                .unwrap(),
+                recording_union_catalog_fs_guarded(
+                    &root,
+                    session,
+                    active,
+                    Default::default(),
+                    &guard,
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(&union[..prefix.len()], &prefix);
+        assert_eq!(union.len(), 3);
+        assert_eq!(union[2].identity.entry_ref, "Eunion-abandoned");
+        assert_eq!(
+            union.iter().map(|d| d.canonical_order).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let slice = if worker_layout {
+            capture_recording_union_worker_guarded(
+                &root,
+                session,
+                active,
+                Default::default(),
+                &union,
+                Default::default(),
+                10,
+                128 * 1024,
+                &guard,
+            )
+            .unwrap()
+        } else {
+            capture_recording_union_fs_guarded(
+                &root,
+                session,
+                active,
+                Default::default(),
+                &union,
+                Default::default(),
+                10,
+                128 * 1024,
+                &guard,
+            )
+            .unwrap()
+        };
+        assert_eq!(slice.capture.entries.len(), 3);
+        assert!(slice.next.is_none());
+        assert!(
+            serde_json::to_string(&slice)
+                .unwrap()
+                .contains("retained old branch")
+        );
+        let mut conflicting = union.clone();
+        conflicting[0].sha256 = "mismatched".into();
+        let error = if worker_layout {
+            capture_recording_union_worker_guarded(
+                &root,
+                session,
+                active,
+                Default::default(),
+                &conflicting,
+                Default::default(),
+                10,
+                128 * 1024,
+                &guard,
+            )
+        } else {
+            capture_recording_union_fs_guarded(
+                &root,
+                session,
+                active,
+                Default::default(),
+                &conflicting,
+                Default::default(),
+                10,
+                128 * 1024,
+                &guard,
+            )
+        }
+        .unwrap_err();
+        assert!(matches!(error, PublicMaterialError::Changed));
+    }
+}
+
+#[test]
+fn retained_producer_selection_updates_the_canonical_binding_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = crate::worker_sources::WorkerSessionSources::new(
+        dir.path(),
+        crate::worker_sources::WorkerSessionOwner {
+            workspace_id: "workspace".into(),
+            worker_id: crate::new_session_id().to_string(),
+        },
+    )
+    .unwrap();
+    let retention = crate::retention::SessionRetentionStore::new(dir.path().join("control"));
+    let store = FsStore::new_runtime_owned(owner.clone(), retention.clone()).unwrap();
+    let session = crate::new_session_id();
+    let first = crate::new_segment_id();
+    let second = crate::new_segment_id();
+    store
+        .create_segment(session, first, &[seed(session, vec![])])
+        .unwrap();
+    store
+        .create_segment(session, second, &[seed(session, vec![])])
+        .unwrap();
+    store
+        .select_recording_active_segment(session, second)
+        .unwrap();
+    drop(store);
+    let reopened = FsStore::new_runtime_owned(owner.clone(), retention).unwrap();
+    assert_eq!(
+        owner.retained_bindings().unwrap()[0].active_segment_id,
+        second
+    );
+    assert!(
+        reopened
+            .select_recording_active_segment(session, crate::new_segment_id())
+            .is_err()
+    );
+    assert_eq!(
+        owner.retained_bindings().unwrap()[0].active_segment_id,
+        second
+    );
+}

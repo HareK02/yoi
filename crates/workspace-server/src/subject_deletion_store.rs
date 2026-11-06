@@ -1459,6 +1459,7 @@ mod tests {
                     source_worker_id: request.worker_id,
                     source_session_id: "old-session".into(),
                     source_active_segment_id: None,
+                    retained_sessions: vec![],
                     segment_ids: vec![],
                     source_created_at: request.source_created_at.clone(),
                     removed_at: request.removed_at.clone(),
@@ -1816,7 +1817,7 @@ mod tests {
             // Simulate inconsistent retained evidence. A different valid new
             // receipt must not silently replace the immutable snapshotted one.
             c.execute("UPDATE worker_removal_operations SET state='failed' WHERE operation_id=?1",[&old])?;
-            c.execute("INSERT INTO worker_removal_operations SELECT 'replacement','replacement',input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,NULL,blockers_json,'succeeded',reason,failure_category,created_at,updated_at FROM worker_removal_operations WHERE operation_id=?1",[&old])?;
+            c.execute("INSERT INTO worker_removal_operations (operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,archive_id,blockers_json,state,reason,failure_category,created_at,updated_at) SELECT 'replacement','replacement',input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,archive_retention_seconds,diagnostics_disposition,diagnostics_retention_seconds,NULL,blockers_json,'succeeded',reason,failure_category,created_at,updated_at FROM worker_removal_operations WHERE operation_id=?1",[&old])?;
             Ok(())
         }).unwrap();
         s.erase_subject_deleted_jobs("w", "subject", "delete")

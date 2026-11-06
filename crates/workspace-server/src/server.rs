@@ -2363,7 +2363,10 @@ impl WorkerRemovalService {
         })
     }
 
-    async fn execute_cleanup_removal(&self, candidate: &CleanupWorkerCandidate) -> ApiResult<()> {
+    async fn execute_cleanup_removal(
+        &self,
+        candidate: &CleanupWorkerCandidate,
+    ) -> ApiResult<server_api::WorkerRemoveResponse> {
         let target = RuntimeWorkerRef::new(
             candidate.runtime_id.clone(),
             candidate.runtime_worker_id.clone(),
@@ -2386,14 +2389,19 @@ impl WorkerRemovalService {
                     message.as_str(),
                 )
             })?;
-        if response.status != StatusCode::OK.as_u16() {
+        if !(200..300).contains(&response.status) {
             return Err(cleanup_api_error(
                 candidate.runtime_id.as_str(),
                 "workspace_cleanup_worker_removal_rejected",
                 response.body.as_str(),
             ));
         }
-        Ok(())
+        serde_json::from_str(&response.body).map_err(|error| {
+            Error::Store(format!(
+                "Worker removal returned an invalid typed result: {error}"
+            ))
+            .into()
+        })
     }
 
     fn delete_spawn_compensation_runtime_worker(
@@ -2584,6 +2592,14 @@ impl WorkerRemovalService {
             match runtime.execute_worker_retention(target, prepared.runtime_request.clone()) {
                 Ok(result) => result,
                 Err(error) => {
+                    if let Err(save_error) = self.store.fail_worker_removal(
+                        &self.workspace_id,
+                        &prepared.plan.operation_id,
+                        &prepared.plan.input_fingerprint,
+                        "runtime_retention_failed",
+                    ) {
+                        return WorkerRemovalFailure::retention_response(save_error);
+                    }
                     return Ok(runtime_retention_failure_response(
                         target,
                         &prepared.plan.operation_id,
@@ -2622,7 +2638,17 @@ impl WorkerRemovalService {
                 subjektiv_journal::after_worker_removal(self, &result);
                 Ok(worker_remove_success_response(target))
             }
-            Err(error) => WorkerRemovalFailure::retention_response(error),
+            Err(error) => {
+                if let Err(save_error) = self.store.fail_worker_removal(
+                    &self.workspace_id,
+                    &prepared.plan.operation_id,
+                    &prepared.plan.input_fingerprint,
+                    "metadata_commit_failed",
+                ) {
+                    return WorkerRemovalFailure::retention_response(save_error);
+                }
+                WorkerRemovalFailure::retention_response(error)
+            }
         }
     }
 
@@ -2891,6 +2917,12 @@ impl WorkerRemovalService {
                     )
                     .map_err(WorkerRemovalFailure::from)?;
             }
+            if let Some(waiting) =
+                subjektiv_journal::advance_worker_removal(self, runtime, target, &prepared)
+                    .map_err(WorkerRemovalFailure::from)?
+            {
+                return Ok(waiting);
+            }
             if close_worker_workdir_sessions(&self.workdir_sessions, &target)
                 .await
                 .is_err()
@@ -3021,6 +3053,12 @@ impl WorkerRemovalService {
                     &prepared.plan.operation_id,
                 )
                 .map_err(WorkerRemovalFailure::from)?;
+        }
+        if let Some(waiting) =
+            subjektiv_journal::advance_worker_removal(self, runtime, target, &prepared)
+                .map_err(WorkerRemovalFailure::from)?
+        {
+            return Ok(waiting);
         }
         if close_worker_workdir_sessions(&self.workdir_sessions, &target)
             .await
@@ -32271,19 +32309,23 @@ async fn execute_runtime_cleanup_with_context(
             ));
         }
         parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
-        WorkspaceWorker::resolve_async(api, &worker.runtime_id, &worker.worker_id)
+        let removal = WorkspaceWorker::resolve_async(api, &worker.runtime_id, &worker.worker_id)
             .await?
             .delete_from_plan(context, candidate)
             .await?;
-        api.workdir_session_locks
-            .lock()
-            .expect("Workdir session lock registry poisoned")
-            .remove(&worker);
+        if removal.removed {
+            api.workdir_session_locks
+                .lock()
+                .expect("Workdir session lock registry poisoned")
+                .remove(&worker);
+        }
         results.push(RuntimeCleanupExecutionResult {
             target_id: candidate.target_id.clone(),
             action: candidate.action.clone(),
-            status: "deleted".to_string(),
-            message: "Worker deleted from Runtime and Backend registry".to_string(),
+            status: if removal.removed { "deleted" } else if removal.state == Some(server_api::WorkerRemovalState::Held) { "held" } else { "waiting" }.into(),
+            message: if removal.removed { "Worker deleted from Runtime and Backend registry" }
+                else { "Removal intent retained; original history and writer remain until Journal completion is confirmed" }.into(),
+            removal: removal.observation(),
         });
     }
 
@@ -32305,6 +32347,7 @@ async fn execute_runtime_cleanup_with_context(
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
                     status: "retained".to_string(),
+                    removal: None,
                     message:
                         "Dirty or unknown Workdir was retained; forced deletion is not supported"
                             .to_string(),
@@ -32345,6 +32388,7 @@ async fn execute_runtime_cleanup_with_context(
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
                     status: status.to_string(),
+                    removal: None,
                     message: removal.failure_category.as_deref().map_or_else(
                         || message.to_string(),
                         |category| {
@@ -37555,11 +37599,10 @@ fn project_workspace_worker_with_attachments(
                 summary.worker.worker_id
             ))
         })?;
-    Ok(workspace_worker_summary(
-        summary,
-        resource_key,
-        workdir_attachments,
-    ))
+    let removal = subjektiv_journal::removal_observation(api, &summary.worker)?;
+    let mut projected = workspace_worker_summary(summary, resource_key, workdir_attachments);
+    projected.removal = removal;
+    Ok(projected)
 }
 
 fn project_observed_workspace_workers(
@@ -67504,6 +67547,7 @@ mod tests {
         ) -> server_api::WorkerSummary {
             server_api::WorkerSummary {
                 restore_observation_token: None,
+                removal: None,
                 runtime_id: "runtime-test".to_string(),
                 worker_id: worker_id.to_string(),
                 resource_key: key.to_string(),
@@ -67599,6 +67643,7 @@ mod tests {
         let discovered = workspace_worker_discovery_page(
             vec![server_api::WorkerSummary {
                 restore_observation_token: None,
+                removal: None,
                 runtime_id: target.runtime_id.clone(),
                 worker_id: target.worker_id.clone(),
                 resource_key: "W-2".to_string(),

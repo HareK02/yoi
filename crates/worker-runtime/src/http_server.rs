@@ -2521,7 +2521,10 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
-        | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
+        | RuntimeError::WorkerExecutionRejected { .. }
+        | RuntimeError::RecordingSourceUnavailable { .. }
+        | RuntimeError::RecordingOwnershipUnknown { .. }
+        | RuntimeError::RecordingExecutionUnconfirmed { .. } => StatusCode::CONFLICT,
         RuntimeError::WorkspaceOwnerMismatch { .. } => StatusCode::FORBIDDEN,
         RuntimeError::LimitTooLarge { .. }
         | RuntimeError::InvalidRequest(_)
@@ -2541,6 +2544,9 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
 
 fn code_for_runtime_error(error: &RuntimeError) -> String {
     match error {
+        RuntimeError::RecordingSourceUnavailable { .. } => "source_unavailable".to_string(),
+        RuntimeError::RecordingOwnershipUnknown { .. } => "ownership_unknown".to_string(),
+        RuntimeError::RecordingExecutionUnconfirmed { .. } => "execution_unconfirmed".to_string(),
         RuntimeError::RuntimeStopped => "runtime_stopped".to_string(),
         RuntimeError::RestoreObservationStale { .. } => "restore_observation_stale".to_string(),
         RuntimeError::RestoreObservationConflict { .. } => {
@@ -2627,6 +2633,46 @@ mod tests {
     use runtime_api::WorkerRestoreState;
     use sha2::Digest as _;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn recording_holds_preserve_problem_causes_without_private_source_details() {
+        for (error, code) in [
+            (
+                RuntimeError::RecordingSourceUnavailable {
+                    message: "source detail".into(),
+                },
+                "recording_source_unavailable",
+            ),
+            (
+                RuntimeError::RecordingOwnershipUnknown {
+                    message: "owner detail".into(),
+                },
+                "recording_ownership_unknown",
+            ),
+            (
+                RuntimeError::RecordingExecutionUnconfirmed {
+                    message: "execution detail".into(),
+                },
+                "recording_execution_unconfirmed",
+            ),
+        ] {
+            let response = RuntimeHttpRestError::runtime(error).into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for private in ["source detail", "owner detail", "execution detail"] {
+                assert!(!text.contains(private));
+            }
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["yoi_failure"]["domain"], "runtime_control");
+            assert_eq!(body["yoi_failure"]["reason"], code);
+            assert_eq!(body["yoi_failure"]["details"], code);
+        }
+    }
 
     #[derive(Clone)]
     struct TestRuntimeAuthorizer(String);
@@ -3253,6 +3299,15 @@ mod tests {
 
     #[test]
     fn retention_routes_require_worker_delete_permission() {
+        for suffix in ["freeze", "capture"] {
+            assert_eq!(
+                required_runtime_permission(
+                    &Method::POST,
+                    &format!("/v1/workers/worker-1/retention/{suffix}")
+                ),
+                Some("workers:delete")
+            );
+        }
         assert_eq!(
             required_runtime_permission(&Method::GET, "/v1/workers/worker-1/retention/inventory",),
             Some("workers:delete")

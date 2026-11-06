@@ -114,19 +114,24 @@ fn lifecycle_verification_never_provisions_or_adopts_optional_storage() {
     let (manager, registration) = registered(&root);
     let scoped = manager.scope(SCOPE).unwrap();
     scoped.verify_owned_if_present(&registration).unwrap();
+    assert_identity_error(scoped.existing_identity(&registration));
     assert!(!root.exists());
     let path = legacy(&root, SCOPE);
     assert_identity_error(scoped.verify_owned_if_present(&registration));
+    assert_identity_error(scoped.existing_identity(&registration));
     assert!(!has_identity(&Connection::open(&path).unwrap()));
     let database = scoped
         .adopt_existing(&registration, REQUEST, EVIDENCE, validate_legacy)
         .unwrap();
     let identity = database.identity().clone();
+    assert_eq!(scoped.existing_identity(&registration).unwrap(), identity);
     scoped.verify_owned_if_present(&registration).unwrap();
     assert_eq!(values(&database), vec!["preserved"]);
     drop(database);
     fs::remove_file(&path).unwrap();
     assert!(matches!(scoped.verify_owned_if_present(&registration),
+        Err(FeatureStorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
+    assert!(matches!(scoped.existing_identity(&registration),
         Err(FeatureStorageError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound));
     assert!(!path.exists());
     assert!(matches!(scoped.open_existing(&registration, &identity),

@@ -1513,6 +1513,13 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
     );
     assert_eq!(receipts, expected_receipts);
     assert_eq!(
+        receipts
+            .iter()
+            .find(|row| row[0] == Value::Integer(123))
+            .unwrap(),
+        &vec![Value::Integer(123), Value::Text(MIGRATION_NAME.into())]
+    );
+    assert_eq!(
         store_owner::current_schema_version(&conn).unwrap(),
         store_owner::LATEST_SCHEMA_VERSION
     );

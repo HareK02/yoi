@@ -954,6 +954,29 @@ impl ScopedFeatureStorage {
         self.manager.open(&self.scope_id, registration)
     }
 
+    /// Observes the current completed ownership identity without provisioning or
+    /// adoption. Consumers can bind a new intent to this value, then pass it to
+    /// `open_existing` on every resume; a replacement between the calls is rejected.
+    pub fn existing_identity(&self, registration: &RegisteredFeature) -> Result<DatabaseIdentity> {
+        self.manager.check_registration(registration)?;
+        if !self.manager.inner.root.join(".owner.sqlite").is_file() {
+            return Err(FeatureStorageError::Identity(
+                "expected ownership record is missing".into(),
+            ));
+        }
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(false)?;
+        let binding = lifecycle
+            .lookup(&self.scope_id, &registration.feature_id)?
+            .ok_or_else(|| FeatureStorageError::Identity("no completed ownership record".into()))?;
+        let path = self
+            .manager
+            .feature_dir(&self.scope_id)
+            .join(format!("{}.sqlite", registration.feature_id));
+        binding.check_file(&path)?;
+        Ok(binding.identity)
+    }
+
     /// Opens only an already-owned DB. Missing files and unfinished adoption
     /// never become requests to create a replacement.
     pub fn open_existing(

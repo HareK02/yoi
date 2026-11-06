@@ -2394,5 +2394,39 @@
         "count": 1
       }
     ]
+  },
+  {
+    "path": "crates/workspace-server/src/fixtures/published_journal124_fresh.sql",
+    "kind": "saved_data",
+    "reason": "公開Journal124の実fresh ownerから凍結した私有migration入力。schema85以前Jobを保持するpre-content captureの原列/immutable triggerを保存契約のまま残す。現行状態/CASの命名へ再導入せず、baseline系列の非書換え・認識・bridge試験だけに使用する。",
+    "lines": [
+      {
+        "sha256": "b80515c50a007075bcde4268cd5362d4f03e8e1b768b3f5d7d9400b408252de1",
+        "count": 2
+      },
+      {
+        "sha256": "3476b390e729656e898805367f93d86368a1660d7fc59142f588767470eb6b4f",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/fixtures/published_journal124_ordered.sql",
+    "kind": "saved_data",
+    "reason": "公開Journal124の実ordered runnerから凍結した私有migration入力。旧schema74のreceipt名・applied_atと、schema85以前Jobを保持するpre-content captureの原列/immutable triggerをそのまま残す。現行状態/CASの命名へ再導入せず、保存履歴の非書換え・認識・bridge試験だけに使用する。",
+    "lines": [
+      {
+        "sha256": "29818564b231e23edce72db65b69a81201ed330db4da7b65bd2aeef068955569",
+        "count": 1
+      },
+      {
+        "sha256": "b80515c50a007075bcde4268cd5362d4f03e8e1b768b3f5d7d9400b408252de1",
+        "count": 2
+      },
+      {
+        "sha256": "3476b390e729656e898805367f93d86368a1660d7fc59142f588767470eb6b4f",
+        "count": 1
+      }
+    ]
   }
 ]

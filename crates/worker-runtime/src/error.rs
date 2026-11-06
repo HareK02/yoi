@@ -90,6 +90,15 @@ pub enum RuntimeError {
         requester_server_id: String,
     },
 
+    #[error("recording source unavailable: {message}")]
+    RecordingSourceUnavailable { message: String },
+
+    #[error("recording ownership unknown: {message}")]
+    RecordingOwnershipUnknown { message: String },
+
+    #[error("recording execution unconfirmed: {message}")]
+    RecordingExecutionUnconfirmed { message: String },
+
     #[error(transparent)]
     WorkingDirectory(#[from] WorkingDirectoryDiagnostic),
 
@@ -221,6 +230,9 @@ impl RuntimeError {
             E::RuntimeStoreAlreadyOpen { .. } | E::StoreMissing { .. } | E::StoreCorrupt { .. } => {
                 C::StoreUnavailable
             }
+            E::RecordingSourceUnavailable { .. } => C::RecordingSourceUnavailable,
+            E::RecordingOwnershipUnknown { .. } => C::RecordingOwnershipUnknown,
+            E::RecordingExecutionUnconfirmed { .. } => C::RecordingExecutionUnconfirmed,
             E::StatePoisoned => C::StateUnavailable,
         }
     }

@@ -5,7 +5,7 @@
 //! original canonical identity while streaming and return only the requested bounded fragment.
 
 use super::*;
-use session_store::capture::{CaptureDto, CaptureLimits};
+use session_store::capture::{CaptureBody, CaptureDto, CaptureLimits, RecordingCaptureSlice};
 use sha2::{Digest, Sha256};
 
 /// A Job owns only this bounded original-body prefix. The initial content condition binds
@@ -25,9 +25,20 @@ pub struct JournalInput {
 }
 
 impl JournalInput {
-    /// Capture callback runs once for this immutable Job, never once per page. Fitting uses
-    /// only that captured value and measures the complete serialized input, including the
+    /// Candidate slice ceiling for admission before a Journal exists. This is the Job input
+    /// contract, not a text-byte allowance or a guarantee that the eventual input fits.
+    /// Capture metadata/continuation are charged by the reader; [`Self::build`] additionally
+    /// charges the actual Journal header and duplicated ranges. The transport owner must
+    /// separately bound its outer availability/response envelope.
+    pub const fn capture_budget() -> usize {
+        job::MAX_JOB_INPUT_BYTES
+    }
+
+    /// Capture callback runs once for this immutable Job, never once per page. Its budget is
+    /// for the whole `RecordingCaptureSlice`, not just `CaptureDto` or canonical text. Fitting
+    /// uses only that captured value and measures the complete serialized input, including the
     /// initial Journal condition and ranges duplicated beside the capture's descriptors.
+    /// A shortened input must be followed from its saved checkpoint, not the reader's `next`.
     pub fn build(
         store: &SubjektivStore,
         host: &JournalHostContext,
@@ -58,10 +69,23 @@ impl JournalInput {
                 entries: Vec::new(),
             },
         };
-        let envelope = serde_json::to_vec(&input)?.len();
-        // Capture once at a fixed storage boundary. Any adjustment for the Journal envelope
-        // below operates on this value only, never by making another live capture request.
-        let budget = job::MAX_JOB_INPUT_BYTES.saturating_sub(envelope);
+        // The fixed Job envelope excludes the capture placeholder. A slice wraps the capture
+        // with `next`; even `null` occupies bytes. Use that minimum wrapper here, leaving the
+        // reader to charge the actual continuation. Duplicated ranges depend on the returned
+        // descriptors and are fitted below, not guessed from a text/metadata ratio.
+        let capture_bytes = serde_json::to_vec(&input.capture)?.len();
+        let envelope = serde_json::to_vec(&input)?.len() - capture_bytes;
+        let slice_envelope = serde_json::to_vec(&RecordingCaptureSlice {
+            capture: input.capture.clone(),
+            next: None,
+        })?
+        .len()
+            - capture_bytes;
+        let budget = job::MAX_JOB_INPUT_BYTES
+            .checked_sub(envelope)
+            .and_then(|remaining| remaining.checked_add(slice_envelope))
+            .ok_or_else(|| invalid("Journal envelope exceeds Job input limit"))?
+            .min(Self::capture_budget());
         input.capture = capture_once(journal.process_order, journal.process_byte, budget)?;
         // Capture runs outside SQLite; a delayed callback cannot deliver deleted content.
         store
@@ -69,6 +93,9 @@ impl JournalInput {
             .try_with_connection(|tx| super::store::check_host(store, tx, host, true))?;
         input.selected_ranges = capture_ranges(&input.capture)?;
         if input.selected_ranges.is_empty() {
+            if serde_json::to_vec(&input)?.len() > job::MAX_JOB_INPUT_BYTES {
+                return Err(invalid("empty Journal input exceeds Job input limit"));
+            }
             return Ok(input);
         }
         input.fit()?;
@@ -77,32 +104,74 @@ impl JournalInput {
     }
 
     fn fit(&mut self) -> JournalResult<()> {
+        if self.selected_ranges.len() <= MAX_JOURNAL_RANGES
+            && serde_json::to_vec(self)?.len() <= job::MAX_JOB_INPUT_BYTES
+        {
+            return Ok(());
+        }
         let original = self.capture.clone();
-        let first = self
-            .selected_ranges
-            .first()
-            .ok_or_else(|| invalid("empty recording selection"))?;
-        let start = session_store::capture::RecordingPosition {
-            canonical_order: first.source.order,
-            byte_offset: first.bytes.start,
-        };
-        let mut budget = serde_json::to_vec(&original)?.len();
-        loop {
-            let bytes = serde_json::to_vec(self)?.len();
-            if bytes <= job::MAX_JOB_INPUT_BYTES {
-                return Ok(());
+        let ranges = self.selected_ranges.clone();
+        let mut high = original
+            .entries
+            .iter()
+            .take(MAX_JOURNAL_RANGES)
+            .try_fold(0usize, |total, entry| match &entry.body {
+                CaptureBody::CanonicalPublic { text, .. } => total.checked_add(text.len()),
+                _ => None,
+            })
+            .ok_or_else(|| invalid("recording input length overflow"))?;
+        let mut low = 0;
+        // Search canonical prefix length, not a CaptureDto budget: a later entry's metadata
+        // may be larger than all earlier bodies. Subtracting that excess from a slice budget
+        // can falsely reject an earlier prefix that fits. Serialized prefix size is monotone
+        // even across scalar/entry boundaries, including decimal range-end growth.
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            self.select_prefix(&original, &ranges, mid);
+            if serde_json::to_vec(self)?.len() <= job::MAX_JOB_INPUT_BYTES {
+                low = mid;
+            } else {
+                high = mid - 1;
             }
-            budget = budget
-                .checked_sub(bytes - job::MAX_JOB_INPUT_BYTES)
-                .ok_or_else(|| invalid("Journal envelope cannot fit source bytes"))?;
-            self.capture = original
-                .recording_slice(start, MAX_JOURNAL_RANGES, budget)
-                .map_err(|e| invalid(&e.to_string()))?
-                .capture;
-            self.selected_ranges = capture_ranges(&self.capture)?;
-            if self.selected_ranges.is_empty() {
-                return Err(invalid("Journal envelope cannot fit one source scalar"));
+        }
+        self.select_prefix(&original, &ranges, low);
+        if self.selected_ranges.is_empty() {
+            return Err(invalid("Journal envelope cannot fit one source scalar"));
+        }
+        Ok(())
+    }
+
+    fn select_prefix(
+        &mut self,
+        original: &CaptureDto,
+        ranges: &[JournalSourceRange],
+        mut bytes: usize,
+    ) {
+        self.capture.entries.clear();
+        self.selected_ranges.clear();
+        for (entry, range) in original.entries.iter().zip(ranges).take(MAX_JOURNAL_RANGES) {
+            let CaptureBody::CanonicalPublic { text, .. } = &entry.body else {
+                unreachable!("capture_ranges checked the body representation");
+            };
+            let mut end = bytes.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
             }
+            if end == 0 {
+                break;
+            }
+            let mut selected = entry.clone();
+            if let CaptureBody::CanonicalPublic { text, .. } = &mut selected.body {
+                text.truncate(end);
+            }
+            let mut range = range.clone();
+            range.bytes.end = range.bytes.start + end as u64;
+            self.capture.entries.push(selected);
+            self.selected_ranges.push(range);
+            if end < text.len() {
+                break;
+            }
+            bytes -= end;
         }
     }
 

@@ -137,7 +137,18 @@ pub(crate) mod backend_job_upgrade;
 mod storage_formats;
 pub use backend_job_recovery_store::BackendJobReconciliation;
 
-const LATEST_SCHEMA_VERSION: i64 = 126;
+#[path = "journal_removal_store.rs"]
+mod journal_removal_store;
+pub use journal_removal_store::{
+    FrozenJournalRemovalMember, JournalRemovalBinding, JournalRemovalCause, JournalRemovalMetadata,
+    JournalRemovalPhase, JournalRemovalProgress, PendingWorkerRemovalIntent,
+};
+pub(crate) use journal_removal_store::{
+    complete as complete_journal_removal,
+    record_physical_failure as record_journal_removal_physical_failure,
+};
+
+const LATEST_SCHEMA_VERSION: i64 = 127;
 const WORKER_CREATE_FAILURE_MIGRATION_NAME: &str =
     "Worker create coordinator returned startup failure";
 pub(crate) const WORKER_CREATE_FAILURE_MAX_BYTES: usize = 32 * 1024;
@@ -540,6 +551,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 126,
         name: SERVICE_OUTCOME_MIGRATION_NAME,
         apply: migrate_plugin_service_outcomes_v125_to_v126,
+    },
+    Migration {
+        version: 127,
+        name: journal_removal_store::MIGRATION_NAME,
+        apply: journal_removal_store::migrate_to_v127,
     },
 ];
 
@@ -1689,6 +1705,70 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     > {
         let _ = (workspace_id, worker);
         Ok(None)
+    }
+    fn get_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+    ) -> Result<Option<JournalRemovalProgress>> {
+        let _ = prepared;
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn init_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        binding: &JournalRemovalBinding,
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (prepared, binding);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn freeze_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        members: &[FrozenJournalRemovalMember],
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (prepared, expected, members);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn update_journal_removal_progress(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        phase: JournalRemovalPhase,
+        cause: Option<JournalRemovalCause>,
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (prepared, expected, phase, cause);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn list_pending_worker_removal_intents(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PendingWorkerRemovalIntent>> {
+        let _ = (workspace_id, after_operation_id, limit);
+        Err(Error::InvalidInput(
+            "Worker removal continuation persistence unavailable".into(),
+        ))
+    }
+    fn list_pending_journal_removals(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalRemovalProgress>> {
+        let _ = (workspace_id, after_operation_id, limit);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
     }
     fn fail_worker_removal(
         &self,
@@ -6736,6 +6816,64 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         SqliteWorkspaceStore::recover_worker_removal_execution(self, workspace_id, worker)
     }
 
+    fn get_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+    ) -> Result<Option<JournalRemovalProgress>> {
+        SqliteWorkspaceStore::get_journal_removal(self, prepared)
+    }
+    fn init_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        binding: &JournalRemovalBinding,
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::init_journal_removal(self, prepared, binding)
+    }
+    fn freeze_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        members: &[FrozenJournalRemovalMember],
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::freeze_journal_removal(self, prepared, expected, members)
+    }
+    fn update_journal_removal_progress(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        phase: JournalRemovalPhase,
+        cause: Option<JournalRemovalCause>,
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::update_journal_removal_progress(
+            self, prepared, expected, phase, cause,
+        )
+    }
+    fn list_pending_worker_removal_intents(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PendingWorkerRemovalIntent>> {
+        SqliteWorkspaceStore::list_pending_worker_removal_intents(
+            self,
+            workspace_id,
+            after_operation_id,
+            limit,
+        )
+    }
+    fn list_pending_journal_removals(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalRemovalProgress>> {
+        SqliteWorkspaceStore::list_pending_journal_removals(
+            self,
+            workspace_id,
+            after_operation_id,
+            limit,
+        )
+    }
     fn fail_worker_removal(
         &self,
         workspace_id: &str,
@@ -16664,6 +16802,11 @@ fn migrate_worker_create_failure_to_v124(conn: &Connection) -> Result<()> {
 // not aliases for, Startup-124 / Job-125 / Service-126.
 const RETAINED_FAILURE_MIGRATIONS: &[Migration] = &[
     Migration {
+        version: 127,
+        name: journal_removal_store::RETAINED_BRIDGE_NAME,
+        apply: journal_removal_store::migrate_retained_to_v127,
+    },
+    Migration {
         version: 125,
         name: SERVICE_OUTCOME_MIGRATION_NAME,
         apply: migrate_retained_service_outcomes_to_v125,
@@ -16893,6 +17036,7 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     verify_worker_create_failure_schema(conn)?;
     conn.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
     conn.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
+    conn.execute_batch(journal_removal_store::SCHEMA_SQL)?;
     Ok(())
 }
 
