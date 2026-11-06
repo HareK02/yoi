@@ -498,161 +498,19 @@ impl Runtime {
         scope: &RuntimeWorkspaceScope,
         request: runtime_api::SubjectReleaseRequest,
     ) -> Result<runtime_api::SubjectReleaseResponse, RuntimeError> {
-        use runtime_api::SubjectReleaseAction as Action;
-        if request.workspace_id != scope.workspace_id
-            || request.binding_id.trim().is_empty()
-            || request.operation_id.trim().is_empty()
-            || request.binding_id.len() > 512
-            || request.operation_id.len() > 512
+        #[cfg(feature = "fs-store")]
         {
-            return Err(RuntimeError::InvalidRequest(
-                "invalid Subject release identity".into(),
-            ));
+            self.subject_release_with_sources(scope, request)
         }
-        let worker_ref = WorkerRef::new(request.worker_id);
-        let lease = self.worker_operation_lock(request.worker_id)?;
-        let _operation = lease.lock().map_err(|_| RuntimeError::StatePoisoned)?;
-        self.ensure_worker_in_workspace(scope, &worker_ref)?;
-        let backend = {
-            let state = self.lock()?;
-            state.ensure_running()?;
-            let worker = state.worker(&worker_ref)?;
-            if worker.has_pending_lifecycle_operation() {
-                return Err(RuntimeError::InvalidRequest(
-                    "Subject lifecycle is unresolved".into(),
-                ));
-            }
-            if let Some((saved, _)) = state
-                .subject_release_operations
-                .get(&(request.worker_id, request.operation_id.clone()))
-            {
-                if saved.operation_id != request.operation_id
-                    || saved.binding_id != request.binding_id
-                    || saved.workspace_id != request.workspace_id
-                {
-                    return Err(RuntimeError::InvalidRequest(
-                        "different Subject release is retained".into(),
-                    ));
-                }
-            } else if request.action != Action::Reserve {
-                return Err(RuntimeError::InvalidRequest(
-                    "Subject reservation is absent or lost; retain occupancy".into(),
-                ));
-            } else {
-                state.ensure_subject_not_reserved(&worker_ref, false)?;
-            }
-            state.execution_backend.clone().ok_or_else(|| {
-                RuntimeError::RecordingExecutionUnconfirmed {
-                    message: "actual Controller reservation is unavailable".into(),
-                }
-            })?
-        };
-        let key = (request.worker_id, request.operation_id.clone());
-        let cancelled = {
-            let mut state = self.lock()?;
-            let cancelled = state
-                .subject_release_operations
-                .get(&key)
-                .is_some_and(|(_, saved)| *saved == runtime_api::SubjectReleaseState::Cancelled);
-            if cancelled && request.action != Action::Cancel {
-                return Err(RuntimeError::InvalidRequest(
-                    "cancelled release cannot be rearmed; use a new operation".into(),
-                ));
-            }
-            if !state.subject_release_operations.contains_key(&key) {
-                // Admission intent survives restart but is not Controller-held proof.
-                state.subject_release_operations.insert(
-                    key.clone(),
-                    (request.clone(), runtime_api::SubjectReleaseState::Reserved),
-                );
-            }
-            state.persist_runtime_snapshot()?;
-            cancelled
-        };
-        // Cancellation must not let a resumed Controller race the publication fence.
-        // Reserve acquires this lock only AFTER the Controller ACK, so its final
-        // persistence can complete before the producer-exclusive inventory read.
-        let mut owner = if request.action == Action::Cancel {
-            self.subject_release_source_owner(&request)?
-        } else {
-            None
-        };
-        let mut publication = owner
-            .as_ref()
-            .map(|owner| owner.lock_exclusive())
-            .transpose()
-            .map_err(|error| RuntimeError::RecordingSourceUnavailable {
-                message: error.to_string(),
-            })?;
-        if cancelled {
-            if let Some(owner) = &owner {
-                self.cancel_subject_release_publication(owner, &request)?;
-            }
-            return Ok(runtime_api::SubjectReleaseResponse {
-                operation_id: request.operation_id,
-                binding_id: request.binding_id,
-                state: runtime_api::SubjectReleaseState::Cancelled,
-                recording_scope: None,
-            });
-        }
-        let mut response = backend
-            .subject_release(&request)
-            .map_err(|message| RuntimeError::RecordingExecutionUnconfirmed { message })?;
-        if response.binding_id != request.binding_id
-            || response.operation_id != request.operation_id
-            || !matches!(
-                (request.action, response.state),
-                (
-                    Action::Reserve,
-                    runtime_api::SubjectReleaseState::Reserved
-                        | runtime_api::SubjectReleaseState::Disconnected
-                ) | (
-                    Action::Disconnect,
-                    runtime_api::SubjectReleaseState::Disconnected
-                ) | (Action::Cancel, runtime_api::SubjectReleaseState::Cancelled)
-            )
+        #[cfg(not(feature = "fs-store"))]
         {
-            return Err(RuntimeError::RecordingExecutionUnconfirmed {
-                message: "Subject release acknowledgment mismatch".into(),
-            });
+            let _ = (scope, request);
+            // Without producer-owned sources no complete recording scope can be proven.
+            // Reject before reserving a Controller or publishing a release intention.
+            Err(RuntimeError::RecordingSourceUnavailable {
+                message: "Subject release requires producer-owned filesystem sources".into(),
+            })
         }
-        response.recording_scope = if request.action != Action::Cancel {
-            owner = self.subject_release_source_owner(&request)?;
-            let owner = owner
-                .as_ref()
-                .ok_or_else(|| RuntimeError::RecordingSourceUnavailable {
-                    message:
-                        "Subject release recording scope requires producer-owned filesystem sources"
-                            .into(),
-                })?;
-            publication = Some(owner.lock_exclusive().map_err(|error| {
-                RuntimeError::RecordingSourceUnavailable {
-                    message: error.to_string(),
-                }
-            })?);
-            Some(self.subject_release_recording_scope(owner, &request)?)
-        } else {
-            None
-        };
-        {
-            let mut state = self.lock()?;
-            let before = state
-                .subject_release_operations
-                .insert(key.clone(), (request.clone(), response.state));
-            if let Err(error) = state.persist_runtime_snapshot() {
-                if let Some(before) = before {
-                    state.subject_release_operations.insert(key, before);
-                }
-                return Err(error);
-            }
-        }
-        if response.state == runtime_api::SubjectReleaseState::Cancelled {
-            if let Some(owner) = &owner {
-                self.cancel_subject_release_publication(owner, &request)?;
-            }
-        }
-        drop(publication);
-        Ok(response)
     }
 
     fn reserve_workdir_use<'a>(
@@ -8825,6 +8683,43 @@ fn subscription_worker_state(status: WorkerStatus) -> SubscriptionWorkerState {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "fs-store"))]
+    #[test]
+    fn subject_release_without_filesystem_sources_rejects_before_reservation() {
+        let runtime = Runtime::new_memory();
+        let worker = WorkerId::now_v7();
+        let scope = RuntimeWorkspaceScope::new("release-without-sources", "server");
+        for action in [
+            runtime_api::SubjectReleaseAction::Reserve,
+            runtime_api::SubjectReleaseAction::Disconnect,
+            runtime_api::SubjectReleaseAction::Cancel,
+        ] {
+            let error = runtime
+                .subject_release_scoped(
+                    &scope,
+                    runtime_api::SubjectReleaseRequest {
+                        workspace_id: "release-without-sources".into(),
+                        worker_id: worker,
+                        binding_id: "binding".into(),
+                        operation_id: "release".into(),
+                        action,
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RuntimeError::RecordingSourceUnavailable { .. }
+            ));
+            assert!(
+                runtime
+                    .lock()
+                    .unwrap()
+                    .subject_release_operations
+                    .is_empty()
+            );
+        }
+    }
+
     #[cfg(feature = "restore-checkpoints")]
     mod restore_checkpoint_tests {
         include!("runtime/restore_checkpoint_tests.rs");
