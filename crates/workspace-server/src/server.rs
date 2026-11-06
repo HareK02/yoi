@@ -35096,12 +35096,15 @@ fn browser_worker_response_for_committed_summary(
     let workspace_id = api.workspace_id().to_string();
     let resource_key = api
         .store
-        .worker_resource_key(&workspace_id, &worker.worker)?
-        .ok_or_else(|| {
-            Error::Store(format!(
-                "Workspace Worker `{worker_id}` has no resource key after registration"
-            ))
-        })?;
+        .worker_resource_key(&workspace_id, &worker.worker)
+        .and_then(|key| {
+            key.ok_or_else(|| {
+                Error::Store(format!(
+                    "Workspace Worker `{worker_id}` has no resource key after registration"
+                ))
+            })
+        })
+        .map_err(|error| worker_startup::publication_error(api, &worker.worker, error.into()))?;
     let worker = worker_launch_worker_summary(worker);
     let console_href = browser_worker_console_href(&workspace_id, &resource_key);
     Ok(BrowserCreateWorkerResponse {

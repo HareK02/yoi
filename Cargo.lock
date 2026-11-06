@@ -4334,6 +4334,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session-store",
+ "sha2 0.11.0",
  "tokio",
  "workdir",
 ]

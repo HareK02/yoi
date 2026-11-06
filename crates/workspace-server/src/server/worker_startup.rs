@@ -109,6 +109,60 @@ pub(super) fn finalize_failure(
     .expect("locally constructed finalization facts fit the shared boundary budget")
 }
 
+/// Publication failure cannot undo committed creation or authorize reexecution.
+/// Keep the Worker and its assignment: `Residual` describes deliberate retention,
+/// not attempted rollback; Backend compensation remains unattempted (`None`).
+/// The original store error stays internal while the independent reservation sink
+/// retains only the typed result and a path-free correlation.
+pub(super) fn publication_error(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    source: ApiError,
+) -> ApiError {
+    use protocol::startup_failure::{StartupCleanup, StartupResourceFacts, StartupResources};
+    use runtime_api::startup::{
+        CompensationOutcome, FinalizeFacts, FinalizeStage, StartupBoundaryCause,
+        StartupBoundaryReason,
+    };
+
+    let operation = StartupOperationFacts {
+        acceptance: CreationAcceptance::Accepted,
+        execution: ExecutionOutcome::Accepted,
+        finalize: Some(FinalizeFacts {
+            stage: FinalizeStage::Publication,
+            compensation: CompensationOutcome::Residual,
+        }),
+        backend_compensation: None,
+        correlation: None,
+    };
+    let failure = match &source.error {
+        Error::WorkerCreateFailed { failure, .. } => failure.as_ref().clone(),
+        _ => WorkerCreateFailure::from_cause(
+            StartupCause::Boundary(StartupBoundaryCause {
+                reason: StartupBoundaryReason::FinalizeFailed,
+            }),
+            operation.clone(),
+        )
+        .expect("enum-only publication cause fits the boundary budget"),
+    };
+    let (mut startup, _) = failure.into_parts();
+    startup.resources = Some(StartupResourceFacts {
+        resources: StartupResources::WorkerStartup,
+        cleanup: StartupCleanup::NotNeeded,
+        durable_effects_possible: true,
+    });
+    let failure = WorkerCreateFailure::new(startup, operation)
+        .expect("locally constructed publication facts fit the shared boundary budget");
+    let failure = persist(api, worker, failure);
+    ApiError::with_diagnostics(
+        Error::WorkerCreateFailed {
+            failure: Box::new(failure),
+            source: Some(Box::new(source.error)),
+        },
+        source.diagnostics,
+    )
+}
+
 pub(super) fn unknown_result() -> WorkerCreateFailure {
     WorkerCreateFailure::from_cause(
         StartupCause::Boundary(runtime_api::startup::StartupBoundaryCause {
@@ -196,17 +250,9 @@ pub(super) fn persist(
 }
 
 pub(super) fn correlation(runtime_id: &str, worker_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hash = Sha256::new();
-    hash.update(runtime_id.as_bytes());
-    hash.update([0]);
-    hash.update(worker_id.as_bytes());
-    let digest = hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("worker-{digest}")
+    runtime_api::startup::StartupCorrelation::for_worker(runtime_id, worker_id)
+        .as_str()
+        .to_owned()
 }
 
 /// Only the HTTP result boundary records the primary failure. Context wrappers,

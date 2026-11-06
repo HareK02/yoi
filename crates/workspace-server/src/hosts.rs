@@ -3316,14 +3316,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics,
             },
             Err(err) => {
-                let failure = match &err {
-                    EmbeddedRuntimeError::WorkerExecutionRejected { result, .. } => {
-                        worker_runtime::execution::startup_create_failure(result)
-                            .ok()
-                            .flatten()
-                    }
-                    _ => None,
-                };
+                let failure = err.create_failure();
                 diagnostics.push(embedded_runtime_diagnostic(&err));
                 let state = failure.as_ref().map_or(
                     InternalWorkerOperationState::Rejected,
@@ -6954,6 +6947,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
                 message,
             ),
         ),
+        EmbeddedRuntimeError::WorkerCreateFailed { failure, .. } => diagnostic(
+            "embedded_worker_create_failed",
+            HostDiagnosticSeverity::Warning,
+            worker::startup_failure::internal_startup_failure_summary(&failure.startup().primary),
+        ),
         EmbeddedRuntimeError::WorkerExecutionRejected {
             operation,
             outcome,
@@ -7035,6 +7033,9 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
                 io_kind: result.startup_io_kind,
             })
         });
+    }
+    if let EmbeddedRuntimeError::WorkerCreateFailed { failure, .. } = error {
+        projection.startup = internal_startup_transfer(failure.startup().clone());
     }
     projection
 }
@@ -8904,10 +8905,9 @@ mod tests {
         assert!(spawned.acceptance_evidence.is_empty());
         assert_eq!(spawned.diagnostics.len(), 1);
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "embedded_worker_execution_rejected"
-                && diagnostic
-                    .message
-                    .contains("provider setup failed at [redacted]")
+            diagnostic.code == "embedded_worker_create_failed"
+                && diagnostic.startup.is_some()
+                && !diagnostic.message.contains("provider setup failed")
                 && !diagnostic.message.contains("/tmp/secret-provider-config")
                 && !diagnostic.message.contains("secret-value")
                 && !diagnostic.message.contains("session-42")
@@ -10064,7 +10064,9 @@ fn startup_failure_operation_state(
     failure: &runtime_api::startup::WorkerCreateFailure,
 ) -> InternalWorkerOperationState {
     use runtime_api::startup::{CreationAcceptance, ExecutionOutcome};
-    if failure.operation().acceptance == CreationAcceptance::Unknown {
+    if failure.operation().acceptance == CreationAcceptance::Unknown
+        || failure.operation().execution == ExecutionOutcome::Unknown
+    {
         InternalWorkerOperationState::Unknown
     } else if failure.operation().execution == ExecutionOutcome::Unsupported {
         InternalWorkerOperationState::Unsupported

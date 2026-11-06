@@ -12,6 +12,7 @@ plugin-plan = { path = "../plugin-plan" }
 protocol = { workspace = true, features = ["json-schema"] }
 error-contract = { workspace = true, features = ["json-schema"] }
 schemars.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 session-store.workspace = true
 serde = { workspace = true, features = ["derive"] }

@@ -1476,6 +1476,21 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
     let dir = tempfile::tempdir().unwrap();
     let conn = legacy_fixture_to_85(&dir.path().join("prefixes.sqlite"), 85);
     let original = pre_content_values(&conn, false);
+    let mut expected_receipts = rows(
+        &conn,
+        "SELECT version,name FROM __yoi_schema_migrations ORDER BY version",
+    );
+    expected_receipts.extend(
+        store_owner::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version > 85)
+            .map(|migration| {
+                vec![
+                    Value::Integer(migration.version),
+                    Value::Text(migration.name.into()),
+                ]
+            }),
+    );
     for migration in store_owner::MIGRATIONS
         .iter()
         .filter(|migration| migration.version >= 86 && migration.version <= 122)
@@ -1496,10 +1511,13 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
         &conn,
         "SELECT version,name FROM __yoi_schema_migrations ORDER BY version",
     );
+    assert_eq!(receipts, expected_receipts);
     assert_eq!(
-        receipts.last().unwrap(),
-        &vec![Value::Integer(123), Value::Text(MIGRATION_NAME.into())]
+        store_owner::current_schema_version(&conn).unwrap(),
+        store_owner::LATEST_SCHEMA_VERSION
     );
+    super::super::storage_formats::verify_history(&conn, store_owner::LATEST_SCHEMA_VERSION)
+        .unwrap();
     assert_eq!(original, pre_content_values(&conn, true));
     assert!(conn.execute_batch("INSERT INTO backend_job_pre_content_history SELECT * FROM backend_job_pre_content_history LIMIT 1").is_err());
 }

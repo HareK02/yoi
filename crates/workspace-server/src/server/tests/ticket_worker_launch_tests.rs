@@ -12,6 +12,7 @@ use worker_runtime::execution::{
 // published Profile projection; leave Worker creation/control to the real Runtime.
 #[derive(Default)]
 struct LaunchExecutionBackend {
+    lose_initial_ack: std::sync::atomic::AtomicBool,
     fail_stop: std::sync::atomic::AtomicBool,
     execution: DeterministicExecutionBackend,
     provider_close_gate: Mutex<Option<Arc<super::workdir_session_close_tests::ProviderCloseGate>>>,
@@ -197,7 +198,16 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
             .lock()
             .unwrap()
             .push((worker.clone(), input.clone()));
-        self.execution.dispatch_input(worker, input)
+        let mut result = self.execution.dispatch_input(worker, input);
+        if self
+            .lose_initial_ack
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Lose only the response acknowledgement, after the real fixture
+            // execution committed its durable receipt. Never redispatch it.
+            result.submission = None;
+        }
+        result
     }
 
     fn termination_receipt(
@@ -1158,6 +1168,90 @@ async fn read_only_ticket_targets_allow_extra_external_grants_without_widening_c
         request.resolved_workdir_attachments[0].capabilities,
         workdir::WorkdirSessionCapabilities::READ_ONLY
     );
+}
+
+/// Production create owner and Backend adapters share the same executor; only
+/// its response acknowledgement and cleanup boundary are fault-injected.
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_input_ack_loss_preserves_creation_facts_across_embedded_and_remote() {
+    use runtime_api::startup::*;
+    for failed_cleanup in [false, true] {
+        let mut observed = Vec::new();
+        for remote in [false, true] {
+            let fixture = LaunchFixture::new(remote).await;
+            let ticket = fixture.ticket();
+            let payload = fixture.payload(&ticket, "lost-initial-ack", "builtin:companion", false);
+            fixture
+                .backend
+                .lose_initial_ack
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            fixture
+                .backend
+                .fail_stop
+                .store(failed_cleanup, std::sync::atomic::Ordering::SeqCst);
+            let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+                &serde_json::to_vec(&body).unwrap(),
+                status.as_u16(),
+                PROBLEM_CONTENT_TYPE,
+                StartupBoundary::Browser,
+            ) else {
+                panic!("must retain typed creation facts: {body}");
+            };
+            assert_eq!(failure.operation().acceptance, CreationAcceptance::Accepted);
+            assert_eq!(failure.operation().execution, ExecutionOutcome::Unknown);
+            let finalize = failure.operation().finalize.unwrap();
+            assert_eq!(finalize.stage, FinalizeStage::InitialInput);
+            assert_eq!(
+                finalize.compensation,
+                if failed_cleanup {
+                    CompensationOutcome::Unknown
+                } else {
+                    CompensationOutcome::Completed
+                }
+            );
+            assert_eq!(body["yoi_failure"]["reason"], "invalid_response");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("TEST_ONLY_PRIVATE_STOP_CREDENTIAL")
+            );
+            let creates = fixture.backend.creates.lock().unwrap().clone();
+            assert_eq!(creates.len(), 1);
+            let worker_id = creates[0].worker_id.to_string();
+            let worker = RuntimeWorkerRef::new(&fixture.runtime_id, &worker_id);
+            let Some(DecodeStoredWorkerCreateFailure::Known(saved)) =
+                fixture.api.worker_create_failure(&worker).unwrap()
+            else {
+                panic!("retain queryable create result");
+            };
+            assert_eq!(saved.public_facts(), failure.public_facts());
+            assert_eq!(
+                fixture.backend.submits_for(&worker_id).len(),
+                1,
+                "observation failure never redispatches"
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .execution
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .any(|worker| worker.worker_id.to_string() == worker_id),
+                failed_cleanup
+            );
+            let mut facts = failure.public_facts();
+            facts.operation.correlation = None;
+            observed.push((status, body["yoi_failure"]["reason"].clone(), facts));
+        }
+        assert_eq!(
+            observed[0], observed[1],
+            "same owner facts through Embedded and Remote"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

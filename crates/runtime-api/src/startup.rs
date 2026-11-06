@@ -658,6 +658,22 @@ pub struct StartupCorrelation(
 );
 
 impl StartupCorrelation {
+    /// A shared path-free lookup token for an owner-bound Runtime/Worker pair.
+    /// This is not the create fingerprint, operation key, or replay authority.
+    pub fn for_worker(runtime_id: &str, worker_id: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(runtime_id.as_bytes());
+        hash.update([0]);
+        hash.update(worker_id.as_bytes());
+        let digest = hash
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Self(format!("worker-{digest}"))
+    }
+
     pub fn new(value: impl Into<String>) -> Result<Self, ContractError> {
         let value = value.into();
         if value.is_empty()

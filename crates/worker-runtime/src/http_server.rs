@@ -2347,14 +2347,7 @@ impl RuntimeHttpRestError {
     fn runtime(error: RuntimeError) -> Self {
         let status = status_for_runtime_error(&error);
         let code = code_for_runtime_error(&error);
-        let create_failure = match &error {
-            RuntimeError::WorkerExecutionRejected { result, .. } => {
-                crate::execution::startup_create_failure(result)
-                    .ok()
-                    .flatten()
-            }
-            _ => None,
-        };
+        let create_failure = error.create_failure();
         let startup = match &error {
             RuntimeError::WorkerExecutionRejected { result, .. } => startup_transfer(result),
             _ => None,
@@ -2440,6 +2433,7 @@ fn startup_transfer(
 
 fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
     match error {
+        RuntimeError::WorkerCreateFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
@@ -2549,6 +2543,7 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::ExecutionBackendUnavailable { .. } => {
             "execution_backend_unavailable".to_string()
         }
+        RuntimeError::WorkerCreateFailed { .. } => "worker_create_failed".to_string(),
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected".to_string(),
         RuntimeError::WorkspaceOwnerMismatch { .. } => "workspace_owner_mismatch".to_string(),
         RuntimeError::LimitTooLarge { .. } => "limit_too_large".to_string(),

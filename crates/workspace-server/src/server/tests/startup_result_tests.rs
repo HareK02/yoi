@@ -1,8 +1,9 @@
-//! Backend result fixture: real SQLite reservation -> coordinator helper -> typed
-//! read -> public ApiError response -> HTTP middleware observation. Only the route's
-//! startup producer is supplied by the fixture; this does not test authorization,
-//! Session callbacks, Runtime startup or the Browser creation route. Those belong
-//! to session_registration_connected_tests. Runs in the ordinary server lib suite;
+//! Backend result fixtures use real SQLite reservations, coordinator helpers, typed
+//! reads, public ApiError responses and HTTP middleware observation. Publication
+//! faults enter the production committed-summary response helper with a fixture
+//! Runtime Worker; only the earlier Runtime startup is substituted. These cases do
+//! not claim creation-route authorization or Session callback coverage (see
+//! session_registration_connected_tests). Runs in the ordinary server lib suite;
 //! each case owns its tempdir/DB and subscriber, with no external services.
 
 use super::*;
@@ -82,6 +83,10 @@ fn assert_semantics(actual: &WorkerCreateFailure, expected: &WorkerCreateFailure
 }
 
 fn reserve(api: &WorkspaceApi) -> RuntimeWorkerRef {
+    reserve_for_runtime(api, EMBEDDED_WORKER_RUNTIME_ID)
+}
+
+fn reserve_for_runtime(api: &WorkspaceApi, runtime_id: &str) -> RuntimeWorkerRef {
     let settings = api
         .config_store
         .get_workspace_memory_settings(TEST_WORKSPACE_ID)
@@ -90,7 +95,7 @@ fn reserve(api: &WorkspaceApi) -> RuntimeWorkerRef {
         .config_store
         .reserve_worker_create(
             TEST_WORKSPACE_ID,
-            EMBEDDED_WORKER_RUNTIME_ID,
+            runtime_id,
             "manual:startup-result-fixture",
             "sha256:startup-result-fixture",
             None,
@@ -98,7 +103,7 @@ fn reserve(api: &WorkspaceApi) -> RuntimeWorkerRef {
         )
         .unwrap();
     RuntimeWorkerRef {
-        runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+        runtime_id: runtime_id.into(),
         worker_id: reservation.worker_id.to_string(),
     }
 }
@@ -123,6 +128,9 @@ fn lifecycle_snapshot(api: &WorkspaceApi) -> Vec<Vec<rusqlite::types::Value>> {
             format!("SELECT {columns} FROM worker_create_reservations ORDER BY workspace_id,allocation_key"),
             "SELECT * FROM workspace_resource_keys ORDER BY workspace_id,resource_kind,resource_id".into(),
             "SELECT * FROM worker_singleton_owners ORDER BY workspace_id,singleton_key".into(),
+            "SELECT * FROM worker_registry ORDER BY workspace_id,runtime_id,worker_id".into(),
+            "SELECT * FROM ticket_worker_assignments ORDER BY workspace_id,ticket_id,assignment_id".into(),
+            "SELECT * FROM ticket_assignment_operations ORDER BY workspace_id,operation_id".into(),
         ];
         let mut snapshot = Vec::new();
         for query in queries {
@@ -453,6 +461,290 @@ async fn context_and_public_projection_are_silent_until_explicit_http_observatio
     let events = capture.events();
     assert_eq!(events.len(), 1);
     assert_log(&events[0], &expected, StatusCode::CONFLICT);
+}
+
+async fn assert_publication_fault_retains_committed_worker(query_failure: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    // Freeze unrelated observation writes before deliberately damaging the DB.
+    api.worker_projection.shutdown_async().await;
+    api.store.db_executor().drain().await.unwrap();
+    register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
+    let stops = Arc::new(AtomicUsize::new(0));
+    let stop_count = stops.clone();
+    let runtime = WorkdirlessFixtureRuntime {
+        stop_callback: Some(Arc::new(move || {
+            stop_count.fetch_add(1, Ordering::SeqCst);
+        })),
+        ..Default::default()
+    };
+    api.runtime.register_or_replace(runtime.clone());
+    let worker = reserve_for_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID);
+    let spawned = crate::hosts::WorkspaceWorkerRuntime::spawn_worker(
+        &runtime,
+        WorkerCreateBinding {
+            plugin_execution: None,
+            worker_id: WorkerId::parse(&worker.worker_id).unwrap(),
+            create_fingerprint: "sha256:startup-result-fixture".into(),
+        },
+        WorkerSpawnRequest {
+            intent: WorkerSpawnIntent::WorkspaceCompanion,
+            requested_worker_name: Some("Publication fixture".into()),
+            singleton_key: None,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
+            },
+            profile: ProfileSelector::Builtin("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: Vec::new(),
+            workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachment_requests: Vec::new(),
+            resolved_workdir_attachments: Vec::new(),
+            resolved_config_bundle: None,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: Vec::new(),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
+            resolved_control_operation: None,
+            resolved_execution_grant: None,
+        },
+    );
+    assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);
+    let summary = spawned.worker.unwrap();
+    assert_eq!(summary.worker, worker);
+    let record = record_worker_summary(
+        &api,
+        &summary,
+        &summary.display_name,
+        summary.profile.clone(),
+        WorkerRegistryDisplayNamePolicy::UseProvided,
+    )
+    .unwrap();
+    api.config_store
+        .complete_worker_create_reservation(
+            TEST_WORKSPACE_ID,
+            WorkerId::parse(&worker.worker_id).unwrap(),
+        )
+        .unwrap();
+    let ticket = browser_ticket_backend(&api)
+        .unwrap()
+        .create(ticket::NewTicket::new("Publication retains assignment"))
+        .unwrap();
+    let assignment = TicketWorkerAssignmentRecord {
+        workspace_id: TEST_WORKSPACE_ID.into(),
+        ticket_id: ticket.id.clone(),
+        assignment_id: "publication-assignment".into(),
+        worker: worker.clone(),
+        assigned_by: "test-user".into(),
+        assigned_at: TEST_CREATED_AT.into(),
+    };
+    api.store
+        .set_current_ticket_worker_assignment(
+            &assignment,
+            None,
+            "publication-assignment-event",
+            "publication-assignment-operation",
+            false,
+        )
+        .unwrap();
+    // Establish a working publication read first; the fault changes only that
+    // final read, not reservation persistence or an earlier caller-identity check.
+    let key = api
+        .store
+        .worker_resource_key(TEST_WORKSPACE_ID, &worker)
+        .unwrap()
+        .unwrap();
+    api.config_store
+        .with_conn(|conn| {
+            if query_failure {
+                conn.execute_batch(
+                    "ALTER TABLE workspace_resource_keys RENAME COLUMN resource_key TO \"sqlite-secret\";",
+                )?;
+            } else {
+                let deleted = conn.execute(
+                    "DELETE FROM workspace_resource_keys WHERE workspace_id=?1 AND resource_kind='worker' AND resource_key=?2",
+                    rusqlite::params![TEST_WORKSPACE_ID, key],
+                )?;
+                assert_eq!(deleted, 1);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let before = lifecycle_snapshot(&api);
+    let capture = Capture::default();
+    let route_api = api.clone();
+    let app = Router::new()
+        .route(
+            "/api/startup-result-fixture",
+            axum::routing::get(move || {
+                let api = route_api.clone();
+                let summary = summary.clone();
+                async move {
+                    let error = browser_worker_response_for_committed_summary(
+                        &api,
+                        summary,
+                        "Publication fixture".into(),
+                        Vec::new(),
+                    )
+                    .unwrap_err();
+                    let Error::WorkerCreateFailed { source, .. } = &error.error else {
+                        panic!("final publication read must return a typed result: {error:?}");
+                    };
+                    let source = source
+                        .as_deref()
+                        .expect("keep the actual read error internal");
+                    if query_failure {
+                        assert!(matches!(source, Error::Sqlite(_)), "{source:?}");
+                    } else {
+                        assert!(matches!(source, Error::Store(_)), "{source:?}");
+                        assert!(source.to_string().contains("no resource key"));
+                    }
+                    error.into_response()
+                }
+            }),
+        )
+        .layer(middleware::from_fn(log_failed_api_response));
+    let (status, problem, public) = public_result(app)
+        .with_subscriber(subscriber(capture.clone()))
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        primary_cause(&public),
+        StartupCause::Boundary(runtime_api::startup::StartupBoundaryCause {
+            reason: runtime_api::startup::StartupBoundaryReason::FinalizeFailed,
+        })
+    );
+    assert_eq!(public.operation().acceptance, CreationAcceptance::Accepted);
+    assert_eq!(public.operation().execution, ExecutionOutcome::Accepted);
+    assert_eq!(
+        public.operation().finalize,
+        Some(FinalizeFacts {
+            stage: FinalizeStage::Publication,
+            compensation: CompensationOutcome::Residual,
+        })
+    );
+    assert_eq!(public.operation().backend_compensation, None);
+    assert_eq!(
+        public.startup().resources,
+        Some(protocol::startup_failure::StartupResourceFacts {
+            resources: protocol::startup_failure::StartupResources::WorkerStartup,
+            cleanup: protocol::startup_failure::StartupCleanup::NotNeeded,
+            durable_effects_possible: true,
+        })
+    );
+    assert_eq!(
+        public.backend_result_persistence(),
+        Some(StartupPersistenceOutcome::Persisted)
+    );
+    assert_eq!(
+        public.operation().correlation.as_ref().unwrap().as_str(),
+        worker_startup::correlation(&worker.runtime_id, &worker.worker_id)
+    );
+    assert!(
+        problem["instance"]
+            .as_str()
+            .unwrap()
+            .ends_with(public.operation().correlation.as_ref().unwrap().as_str())
+    );
+    assert_semantics(&retained(&api, &worker), &public);
+    let events = capture.events();
+    assert_eq!(events.len(), 1, "one primary HTTP event: {events:?}");
+    let event = &events[0];
+    assert_eq!(event["target"], "yoi::worker_startup");
+    assert_eq!(event["event"], "worker_create_result");
+    assert_eq!(event["domain"], "startup_boundary");
+    assert_eq!(event["reason"], "finalize_failed");
+    assert_eq!(event["acceptance"], "Accepted");
+    assert_eq!(event["execution"], "Accepted");
+    assert_eq!(
+        event["finalize"],
+        format!("{:?}", public.operation().finalize)
+    );
+    assert_eq!(event["backend_compensation"], "None");
+    assert_eq!(event["backend_result_persistence"], "Some(Persisted)");
+    assert_eq!(
+        event["resources"],
+        format!("{:?}", public.startup().resources)
+    );
+    assert_eq!(event["status"], status.as_u16());
+    assert_eq!(
+        event["correlation"],
+        problem["yoi_startup"]["operation"]["correlation"]
+    );
+    let exposed = format!("{problem} {events:?}");
+    for internal in [
+        worker.worker_id.as_str(),
+        "no such column",
+        "no resource key",
+        "workspace_resource_keys",
+        dir.path().to_str().unwrap(),
+    ] {
+        assert!(
+            !exposed.contains(internal),
+            "internal source leaked: {exposed}"
+        );
+    }
+    assert_eq!(lifecycle_snapshot(&api), before);
+    assert_eq!(
+        api.store
+            .get_worker_registry(TEST_WORKSPACE_ID, &worker)
+            .unwrap(),
+        Some(record)
+    );
+    assert_eq!(
+        api.store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &ticket.id)
+            .unwrap(),
+        Some(assignment)
+    );
+    assert_eq!(stops.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.spawn_requests().len(), 1, "no reexecution");
+    assert_eq!(
+        runtime.workers.lock().unwrap().len(),
+        1,
+        "no Runtime deletion"
+    );
+}
+
+#[tokio::test]
+async fn publication_sqlite_read_failure_retains_committed_worker_and_typed_result() {
+    assert_publication_fault_retains_committed_worker(true).await;
+}
+
+#[tokio::test]
+async fn publication_missing_resource_key_retains_committed_worker_and_typed_result() {
+    assert_publication_fault_retains_committed_worker(false).await;
+}
+
+#[tokio::test]
+async fn publication_error_preserves_existing_primary_without_claiming_compensation() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = test_api(dir.path()).await;
+    let worker = reserve(&api);
+    let original = failure_fixture(CompensationOutcome::Completed);
+    let error = worker_startup::publication_error(&api, &worker, api_error(original.clone()));
+    let Error::WorkerCreateFailed { failure, source } = &error.error else {
+        panic!("publication must retain a typed startup result");
+    };
+    assert!(matches!(
+        source.as_deref(),
+        Some(Error::WorkerCreateFailed { .. })
+    ));
+    assert_eq!(failure.startup().primary, original.startup().primary);
+    assert_eq!(failure.startup().secondary, original.startup().secondary);
+    assert_eq!(
+        failure.startup().persistence,
+        original.startup().persistence
+    );
+    assert_eq!(failure.operation().acceptance, CreationAcceptance::Accepted);
+    assert_eq!(failure.operation().execution, ExecutionOutcome::Accepted);
+    assert_eq!(failure.operation().backend_compensation, None);
+    assert_eq!(
+        failure.operation().finalize.as_ref().unwrap().stage,
+        FinalizeStage::Publication
+    );
+    assert_semantics(&retained(&api, &worker), failure);
 }
 
 #[derive(Clone)]
