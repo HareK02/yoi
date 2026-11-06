@@ -678,7 +678,6 @@ fn dispatch_with_capture(
     let _gate = gate
         .lock()
         .map_err(|_| Error::Store("Journal lifecycle lock poisoned".into()))?;
-    authorize_source(api, &attribution, "journal.recording.request")?;
     let store = store(api)?;
     if store
         .journal_worker_was_released(
@@ -692,6 +691,7 @@ fn dispatch_with_capture(
         // transfer the removed body's write capability to its successor.
         return Ok(());
     }
+    authorize_source(api, &attribution, "journal.recording.request")?;
     let host =
         JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
     if let Some(g) = store
@@ -1692,6 +1692,19 @@ pub(super) fn recover(api: &WorkspaceApi) -> Result<()> {
                         }) {
                             tracing::warn!(%error,session_id=%attr.session_id,"Erased Session physical cleanup remains recoverable");
                         }
+                        continue;
+                    }
+                    // Historical released bodies retain their input and checkpoints, but
+                    // are not current execution candidates. Attempt cleanup above remains
+                    // independent of the successor's authority and recording admission.
+                    if store
+                        .journal_worker_was_released(
+                            &attr.subject_id,
+                            &attr.runtime_id,
+                            &attr.worker_id,
+                        )
+                        .map_err(domain)?
+                    {
                         continue;
                     }
                     // Recovery only consumes saved Job input and domain receipts. A missed

@@ -903,7 +903,16 @@ pub(in crate::server) fn resume_removals(api: &WorkspaceApi) -> Result<()> {
             after.as_deref(),
             100,
         )?;
-        for progress in &page {
+        for intent in &page {
+            let progress = match &intent.preparation {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::warn!(operation_id=%intent.operation_id,
+                        runtime_id=%intent.worker.runtime_id, worker_id=%intent.worker.worker_id,
+                        %error, "Journal removal intent remains held; continuing independent intents");
+                    continue;
+                }
+            };
             // Recovery runs from the cycle-free dispatch snapshot, whose own
             // journal_dispatch_owner is empty. Retain this invocation's owner
             // until the continuation returns rather than upgrading an absent weak link.
@@ -932,8 +941,6 @@ pub(in crate::server) fn resume_removals(api: &WorkspaceApi) -> Result<()> {
         if page.len() < 100 {
             return Ok(());
         }
-        after = page
-            .last()
-            .map(|progress| progress.plan.operation_id.clone());
+        after = page.last().map(|intent| intent.operation_id.clone());
     }
 }

@@ -2226,7 +2226,10 @@ mod tests {
         let authority: &dyn ControlPlaneStore = &store;
         let first = authority
             .list_pending_worker_removal_intents("w", None, 2)
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|intent| intent.preparation.unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(first, expected[..2]);
         let second = authority
             .list_pending_worker_removal_intents(
@@ -2234,7 +2237,10 @@ mod tests {
                 Some(&first.last().unwrap().plan.operation_id),
                 2,
             )
-            .unwrap();
+            .unwrap()
+            .into_iter()
+            .map(|intent| intent.preparation.unwrap())
+            .collect::<Vec<_>>();
         assert_eq!(second, expected[2..]);
         assert!(
             authority
@@ -2286,7 +2292,10 @@ mod tests {
         assert_eq!(
             reopened
                 .list_pending_worker_removal_intents("w", None, 100)
-                .unwrap(),
+                .unwrap()
+                .into_iter()
+                .map(|intent| intent.preparation.unwrap())
+                .collect::<Vec<_>>(),
             expected
         );
         let row = &expected[0];
@@ -2307,6 +2316,65 @@ mod tests {
     }
 
     #[test]
+    fn journal_removal_pending_intent_cursor_advances_past_held_rows_to_independent_plans() {
+        let store = setup();
+        let mut plans = ["first", "second", "third"].map(|name| {
+            let (request, inventory) =
+                subject_removal_source(&store, name, Some(&format!("subjektiv:{name}")));
+            let plan = store.plan_worker_removal(&request, &inventory).unwrap();
+            (request, inventory, plan)
+        });
+        plans.sort_by(|a, b| a.2.operation_id.cmp(&b.2.operation_id));
+        for (request, _, _) in &plans[..2] {
+            let mut registry = store
+                .get_worker_registry("w", &request.worker)
+                .unwrap()
+                .unwrap();
+            registry.updated_at = "changed".into();
+            store.upsert_worker_registry(&registry).unwrap();
+        }
+        let replacement = store.plan_worker_removal(&plans[1].0, &plans[1].1).unwrap();
+        let mut expected = plans
+            .iter()
+            .map(|(_, _, plan)| plan.operation_id.clone())
+            .collect::<Vec<_>>();
+        expected.push(replacement.operation_id);
+        expected.sort();
+        let mut seen = Vec::new();
+        let mut valid = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store
+                .list_pending_worker_removal_intents("w", after.as_deref(), 1)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert_eq!(page.len(), 1);
+            for intent in &page {
+                seen.push(intent.operation_id.clone());
+                match &intent.preparation {
+                    Ok(prepared) => valid.push(prepared.plan.operation_id.clone()),
+                    Err(_) => assert_ne!(intent.worker, plans[2].0.worker),
+                }
+            }
+            after = page.last().map(|intent| intent.operation_id.clone());
+        }
+        assert_eq!(
+            seen, expected,
+            "held rows occupy pages and must retain the discovery cursor"
+        );
+        assert_eq!(valid, [plans[2].2.operation_id.clone()]);
+        assert!(
+            store
+                .list_pending_worker_removal_intents("w", None, 1)
+                .unwrap()[0]
+                .preparation
+                .is_err()
+        );
+    }
+
+    #[test]
     fn journal_removal_pending_intents_reject_stale_or_ambiguous_pre_init_plans() {
         let store = setup();
         let (request, inventory) =
@@ -2316,6 +2384,9 @@ mod tests {
             store
                 .list_pending_worker_removal_intents("w", None, 100)
                 .unwrap()[0]
+                .preparation
+                .as_ref()
+                .unwrap()
                 .plan
                 .operation_id,
             first.operation_id
@@ -2329,6 +2400,9 @@ mod tests {
         assert!(
             store
                 .list_pending_worker_removal_intents("w", None, 100)
+                .unwrap()
+                .remove(0)
+                .preparation
                 .unwrap_err()
                 .to_string()
                 .contains("stale")
@@ -2338,6 +2412,9 @@ mod tests {
         assert!(
             store
                 .list_pending_worker_removal_intents("w", None, 100)
+                .unwrap()
+                .remove(0)
+                .preparation
                 .unwrap_err()
                 .to_string()
                 .contains("Ambiguous")

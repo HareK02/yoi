@@ -438,6 +438,26 @@ impl RemovalFixture {
         let subject = store
             .create_subject(crate::subjektiv::SubjectRole::new("remove-full-history").unwrap())
             .unwrap();
+        let source = Self::create_body(&api, &subject.id, live).await;
+        if !live {
+            Self::stop_body(&api, &source).await;
+        }
+        let attr = store
+            .subject_session_attributions(&subject.id)
+            .unwrap()
+            .into_iter()
+            .find(|attr| attr.worker_id == source.worker_id)
+            .unwrap();
+        Self {
+            _dir: dir,
+            api: Some(api),
+            server: Some(server),
+            model,
+            source,
+            attr,
+        }
+    }
+    async fn create_body(api: &WorkspaceApi, subject_id: &str, live: bool) -> RuntimeWorkerRef {
         let Json(created) = scoped_create_workspace_worker(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
@@ -460,7 +480,7 @@ impl RemovalFixture {
                 workdir_attachments: vec![],
                 feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
                     subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                        subject_id: subject.id.clone(),
+                        subject_id: subject_id.into(),
                     }),
                 },
                 control_operation_id: None,
@@ -469,34 +489,20 @@ impl RemovalFixture {
         )
         .await
         .unwrap();
-        let source = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
-        if !live {
-            let runtime = api.runtime.clone();
-            let stopped = source.clone();
-            tokio::task::spawn_blocking(move || {
-                runtime.stop_worker(&stopped, WorkerLifecycleRequest::default())
-            })
-            .await
-            .unwrap()
-            .unwrap();
-            let summary = api.runtime.worker(&source).unwrap();
-            assert_eq!(summary.state, "stopped");
-            sync_worker_observation(&api, &summary).unwrap();
-        }
-        let attr = store
-            .subject_session_attributions(&subject.id)
-            .unwrap()
-            .into_iter()
-            .find(|attr| attr.worker_id == source.worker_id)
-            .unwrap();
-        Self {
-            _dir: dir,
-            api: Some(api),
-            server: Some(server),
-            model,
-            source,
-            attr,
-        }
+        RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+    }
+    async fn stop_body(api: &WorkspaceApi, source: &RuntimeWorkerRef) {
+        let runtime = api.runtime.clone();
+        let stopped = source.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.stop_worker(&stopped, WorkerLifecycleRequest::default())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let summary = api.runtime.worker(source).unwrap();
+        assert_eq!(summary.state, "stopped");
+        sync_worker_observation(api, &summary).unwrap();
     }
     fn root(&self) -> PathBuf {
         self.api()
@@ -791,6 +797,196 @@ impl RemovalFixture {
         self.api = Some(api);
         self.server = Some(server);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn recovery_holds_stale_or_ambiguous_intents_without_blocking_independent_removal() {
+    for ambiguous in [false, true] {
+        let f = RemovalFixture::new().await;
+        f.seed_active(vec![RemovalFixture::history(
+            "independent",
+            "saved before notification",
+        )]);
+        let subjects = open_subjektiv_store(f.api()).unwrap();
+        let subject_a = subjects
+            .create_subject(crate::subjektiv::SubjectRole::new("held-independent-body").unwrap())
+            .unwrap();
+        let a = RemovalFixture::create_body(f.api(), &subject_a.id, false).await;
+        RemovalFixture::stop_body(f.api(), &a).await;
+        let plan = |worker: &RuntimeWorkerRef| {
+            let inventory = f.api().runtime.worker_retention_inventory(worker).unwrap();
+            f.api()
+                .config_store
+                .plan_worker_removal(
+                    &crate::retention::WorkerRemovalPlanRequest {
+                        workspace_id: TEST_WORKSPACE_ID.into(),
+                        worker: worker.clone(),
+                        reason: "saved removal intent before Journal initialization".into(),
+                        journal_erasure: None,
+                    },
+                    &inventory,
+                )
+                .unwrap()
+        };
+        let first_a = plan(&a);
+        let mut registry = f
+            .api()
+            .store
+            .get_worker_registry(TEST_WORKSPACE_ID, &a)
+            .unwrap()
+            .unwrap();
+        registry.updated_at = "changed-after-plan".into();
+        f.api().store.upsert_worker_registry(&registry).unwrap();
+        if ambiguous {
+            assert_ne!(plan(&a).operation_id, first_a.operation_id);
+        }
+        let b = plan(&f.source);
+        let a_rows = || {
+            f.api().config_store.with_conn(|conn| {
+                conn.prepare("SELECT operation_id,state,journal_removal_json FROM worker_removal_operations WHERE worker_id=?1 ORDER BY operation_id")?
+                    .query_map([&a.worker_id], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,Option<String>>(2)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>().map_err(crate::Error::from)
+            }).unwrap()
+        };
+        let held_before = a_rows();
+        assert!(
+            held_before
+                .iter()
+                .all(|(_, state, metadata)| state == "planned" && metadata.is_none())
+        );
+        f.model.set(ModelAction::Record);
+        // Same startup/reconnect entry as production, not a second Remove request.
+        subjektiv_journal::recover(f.api()).unwrap();
+        f.wait_removed().await;
+        assert_eq!(f.prepared().plan.operation_id, b.operation_id);
+        assert_eq!(
+            a_rows(),
+            held_before,
+            "held intent must not execute or be rewritten"
+        );
+        assert!(f.api().runtime.worker(&a).is_ok());
+        assert!(
+            f.api()
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, &a)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !subjects
+                .journal_worker_was_released(&subject_a.id, &a.runtime_id, &a.worker_id)
+                .unwrap()
+        );
+        assert!(
+            f.api()
+                .config
+                .embedded_runtime_store_root
+                .join("workers")
+                .join(&a.worker_id)
+                .join("session")
+                .exists()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn removed_body_history_is_not_reauthorized_on_reconnect_with_active_successor() {
+    let f = RemovalFixture::new().await;
+    f.seed_active(vec![RemovalFixture::history(
+        "historical",
+        "retained original",
+    )]);
+    f.model.set(ModelAction::Record);
+    assert_eq!(f.remove().await.status, StatusCode::ACCEPTED.as_u16());
+    f.wait_removed().await;
+    let successor = RemovalFixture::create_body(f.api(), &f.attr.subject_id, false).await;
+    assert_eq!(
+        f.api()
+            .store
+            .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &successor)
+            .unwrap()
+            .unwrap()
+            .worker,
+        successor
+    );
+    assert!(
+        f.api()
+            .store
+            .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &f.source)
+            .is_err()
+    );
+    let store = open_subjektiv_store(f.api()).unwrap();
+    let host =
+        subjektiv::journal::JournalHostContext::validated_session(&store, f.attr.clone()).unwrap();
+    let journal = store.journal_for_session(&host).unwrap().unwrap();
+    let before_state = store.read_journal(&host, &journal).unwrap();
+    let before_jobs = serde_json::to_value(
+        f.api()
+            .store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+            .unwrap(),
+    )
+    .unwrap();
+    let before_inputs = f.model.attempt_inputs.lock().unwrap().len();
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let output = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || Captured(output.clone()))
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        for _ in 0..2 {
+            subjektiv_journal::recover(f.api()).unwrap();
+        }
+    });
+    let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logs.contains("retained Journal prefix recovery blocked"),
+        "historical body was treated as a live dispatch candidate"
+    );
+    assert_eq!(store.read_journal(&host, &journal).unwrap(), before_state);
+    assert_eq!(
+        serde_json::to_value(
+            f.api()
+                .store
+                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.attr.session_id, None, 100)
+                .unwrap()
+        )
+        .unwrap(),
+        before_jobs
+    );
+    assert_eq!(f.model.attempt_inputs.lock().unwrap().len(), before_inputs);
+    assert!(
+        store
+            .journal_worker_was_released(
+                &f.attr.subject_id,
+                &f.source.runtime_id,
+                &f.source.worker_id
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .session_attribution(&f.attr.session_id)
+            .unwrap()
+            .unwrap(),
+        f.attr
+    );
+    assert!(f.api().runtime.worker(&f.source).is_err());
+    assert!(f.api().runtime.worker(&successor).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

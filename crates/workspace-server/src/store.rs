@@ -141,7 +141,7 @@ pub use backend_job_recovery_store::BackendJobReconciliation;
 mod journal_removal_store;
 pub use journal_removal_store::{
     FrozenJournalRemovalMember, JournalRemovalBinding, JournalRemovalCause, JournalRemovalMetadata,
-    JournalRemovalPhase, JournalRemovalProgress,
+    JournalRemovalPhase, JournalRemovalProgress, PendingWorkerRemovalIntent,
 };
 pub(crate) use journal_removal_store::{
     complete as complete_journal_removal,
@@ -1732,7 +1732,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         after_operation_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<crate::retention::PreparedWorkerRemoval>> {
+    ) -> Result<Vec<PendingWorkerRemovalIntent>> {
         let _ = (workspace_id, after_operation_id, limit);
         Err(Error::InvalidInput(
             "Worker removal continuation persistence unavailable".into(),
@@ -6632,7 +6632,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         after_operation_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<crate::retention::PreparedWorkerRemoval>> {
+    ) -> Result<Vec<PendingWorkerRemovalIntent>> {
         SqliteWorkspaceStore::list_pending_worker_removal_intents(
             self,
             workspace_id,

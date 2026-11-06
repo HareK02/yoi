@@ -35,6 +35,15 @@ WHEN OLD.journal_removal_json IS NOT NULL AND (
 BEGIN SELECT RAISE(ABORT,'Journal removal identity is immutable'); END;
 "#;
 
+/// One observed intent, including a held recovery error. Keeping the original row
+/// identity lets discovery advance its cursor without authorizing an ambiguous owner.
+#[derive(Debug)]
+pub struct PendingWorkerRemovalIntent {
+    pub operation_id: String,
+    pub worker: RuntimeWorkerRef,
+    pub preparation: Result<PreparedWorkerRemoval>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenJournalRemovalMember {
@@ -366,7 +375,7 @@ impl SqliteWorkspaceStore {
         workspace_id: &str,
         after_operation_id: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<PreparedWorkerRemoval>> {
+    ) -> Result<Vec<PendingWorkerRemovalIntent>> {
         if !(1..=100).contains(&limit) {
             return Err(invalid("Worker removal page limit must be 1..=100"));
         }
@@ -392,26 +401,33 @@ impl SqliteWorkspaceStore {
                     RuntimeWorkerRef { runtime_id: row.get(2)?, worker_id: row.get(3)? }, row.get::<_,u64>(4)?))
             })?.collect::<rusqlite::Result<Vec<_>>>().map_err(Error::from)
         })?;
-        candidates
+        Ok(candidates
             .into_iter()
             .map(|(operation_id, fingerprint, worker, count)| {
-                if count != 1 {
-                    return Err(invalid("Ambiguous pending Worker removal intents"));
+                let preparation = (|| {
+                    if count != 1 {
+                        return Err(invalid("Ambiguous pending Worker removal intents"));
+                    }
+                    let prepared = self
+                        .recover_worker_removal_execution(workspace_id, &worker)
+                        .map_err(|_| invalid("Pending Worker removal intent cannot be recovered"))?
+                        .ok_or_else(|| invalid("Pending Worker removal intent is stale"))?;
+                    if prepared.plan.operation_id != operation_id
+                        || prepared.plan.input_fingerprint != fingerprint
+                    {
+                        return Err(invalid(
+                            "Pending Worker removal intent differs from canonical recovery",
+                        ));
+                    }
+                    Ok(prepared)
+                })();
+                PendingWorkerRemovalIntent {
+                    operation_id,
+                    worker,
+                    preparation,
                 }
-                let prepared = self
-                    .recover_worker_removal_execution(workspace_id, &worker)
-                    .map_err(|_| invalid("Pending Worker removal intent cannot be recovered"))?
-                    .ok_or_else(|| invalid("Pending Worker removal intent is stale"))?;
-                if prepared.plan.operation_id != operation_id
-                    || prepared.plan.input_fingerprint != fingerprint
-                {
-                    return Err(invalid(
-                        "Pending Worker removal intent differs from canonical recovery",
-                    ));
-                }
-                Ok(prepared)
             })
-            .collect()
+            .collect())
     }
 
     pub fn list_pending_journal_removals(
