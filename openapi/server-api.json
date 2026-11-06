@@ -24199,7 +24199,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:afde3903f29b9087390b69f9761a935cd5004c4dab17ce684f4149c4abae89c4"
+    "x-yoi-source-digest": "sha256:2dad54b31293643566259ea555e11c46effce33aab9f30c8a861a46303024bad"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -49679,6 +49679,21 @@
               }
             },
             "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
+              }
+            },
+            "description": "Error response"
           }
         },
         "security": [
@@ -50923,6 +50938,21 @@
             "description": "Error response"
           },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartupProblemDetails"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
             "content": {
               "application/json": {
                 "schema": {

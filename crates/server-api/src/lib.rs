@@ -1909,8 +1909,9 @@ pub trait ServerApi {
         "/api/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1976,7 +1977,8 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/worker-control/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        client_error_hook = true,
         openapi = false,
     )]
     async fn worker_control_spawn(
@@ -2101,8 +2103,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
