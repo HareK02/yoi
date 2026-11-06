@@ -155,6 +155,7 @@ impl FeatureInvocationHandler for FakeFeature {
                 "limit-message" => "x".repeat(4096),
                 _ => "prepared".into(),
             },
+            failure: None,
             context: Some(match value.as_str() {
                 "large-context" => "é".repeat(8193),
                 "limit-context" => "x".repeat(16384),

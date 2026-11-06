@@ -430,13 +430,15 @@ async fn checkout_wip_provider_validator_rejects_same_content_inode_substitution
             },
         )
         .await;
-    assert!(matches!(
-        out,
-        Err(WipOperationError::Protocol(ProtocolError {
-            code: ProtocolErrorCode::ValidatorMismatch,
-            ..
-        }))
-    ));
+    let Err(WipOperationError::ProtocolWithFailure { error, failure }) = out else {
+        panic!("stale provider validator must retain its rejection and cause")
+    };
+    assert_eq!(error.code, ProtocolErrorCode::ValidatorMismatch);
+    let report: serde_json::Value =
+        serde_json::from_str(failure.content.as_deref().unwrap()).unwrap();
+    assert_eq!(report["failure"]["details"]["classification"], "conflict");
+    assert_eq!(report["result"]["conflict_code"], "checkout_stale");
+    assert_eq!(report["result"]["error_class"], "structured_conflict");
     assert_eq!(
         std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "same"

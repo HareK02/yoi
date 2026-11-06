@@ -2544,6 +2544,62 @@
         ],
         "type": "string"
       },
+      "DriveFailureDetails": {
+        "additionalProperties": false,
+        "description": "The entire wire allowlist. No opaque diagnostic or arbitrary JSON fields.",
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/DriveFailureOperation"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/DriveFailureReason"
+          }
+        },
+        "required": [
+          "operation",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "DriveFailureOperation": {
+        "description": "Operation kind only: no arguments, physical identity or request identity.",
+        "enum": [
+          "open",
+          "attach_workspace_authority",
+          "check_authorized",
+          "root",
+          "metadata",
+          "list",
+          "request_status",
+          "create_folder",
+          "create_file",
+          "update",
+          "relocate",
+          "delete",
+          "read",
+          "read_text",
+          "search",
+          "collect",
+          "fence",
+          "purge"
+        ],
+        "type": "string"
+      },
+      "DriveFailureReason": {
+        "description": "Safe meanings observed from the actual top-level storage error variants.\nThese are not transport failure reasons or an operation disposition.",
+        "enum": [
+          "invalid",
+          "not_found",
+          "conflict",
+          "denied",
+          "fenced",
+          "storage_failure",
+          "metadata_failure",
+          "blob_failure",
+          "encoding_failure"
+        ],
+        "type": "string"
+      },
       "DriveGrantCreateRequest": {
         "additionalProperties": false,
         "properties": {
@@ -2661,6 +2717,57 @@
           "created_at"
         ],
         "type": "object"
+      },
+      "DriveHttpFailureDetails": {
+        "additionalProperties": false,
+        "properties": {
+          "classification": {
+            "$ref": "#/components/schemas/DriveFailureClassification"
+          },
+          "code": {
+            "$ref": "#/components/schemas/DriveApiErrorCode"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/DriveHttpOperation"
+          },
+          "storage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DriveFailureDetails"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present only for a real storage-domain source after current cause visibility checks."
+          }
+        },
+        "required": [
+          "operation",
+          "code",
+          "classification"
+        ],
+        "type": "object"
+      },
+      "DriveHttpOperation": {
+        "enum": [
+          "request",
+          "root",
+          "capabilities",
+          "metadata",
+          "list",
+          "search",
+          "read_text",
+          "read_chunk",
+          "download",
+          "mutate",
+          "upload",
+          "request_status",
+          "grant_create",
+          "grant_revoke",
+          "grant_list"
+        ],
+        "type": "string"
       },
       "DriveListQuery": {
         "additionalProperties": false,
@@ -3314,6 +3421,16 @@
       "ExternalWorkdirGrantResponse": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_failures": {
+            "items": {
+              "$ref": "#/components/schemas/StartupFailureAttachment"
+            },
+            "type": "array"
+          },
+          "cleanup_state": {
+            "description": "Cleanup observations do not revise the grant's committed authority fence.",
+            "type": "string"
+          },
           "display_name": {
             "type": "string"
           },
@@ -3357,7 +3474,9 @@
           "display_name",
           "permissions",
           "generation",
-          "status"
+          "status",
+          "cleanup_state",
+          "cleanup_failures"
         ],
         "type": "object"
       },
@@ -3558,7 +3677,67 @@
         ],
         "type": "object"
       },
-      "FailureEnvelope": {
+      "FailureEnvelope_DriveHttpFailureDetails": {
+        "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/Category"
+          },
+          "context": {
+            "$ref": "#/components/schemas/FailureContext"
+          },
+          "details": {
+            "$ref": "#/components/schemas/DriveHttpFailureDetails"
+          },
+          "details_version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "required_extensions": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "required_extensions",
+          "domain",
+          "reason",
+          "category",
+          "details_version",
+          "details",
+          "explanation",
+          "context"
+        ],
+        "type": "object"
+      },
+      "FailureEnvelope_RepositoryAccessDetails": {
         "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
         "properties": {
           "category": {
@@ -3569,6 +3748,66 @@
           },
           "details": {
             "$ref": "#/components/schemas/RepositoryAccessDetails"
+          },
+          "details_version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "required_extensions": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "required_extensions",
+          "domain",
+          "reason",
+          "category",
+          "details_version",
+          "details",
+          "explanation",
+          "context"
+        ],
+        "type": "object"
+      },
+      "FailureEnvelope_WorkdirManagementFailure": {
+        "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/Category"
+          },
+          "context": {
+            "$ref": "#/components/schemas/FailureContext"
+          },
+          "details": {
+            "$ref": "#/components/schemas/WorkdirManagementFailure"
           },
           "details_version": {
             "format": "uint16",
@@ -11610,7 +11849,7 @@
         ],
         "type": "object"
       },
-      "ProblemDetails": {
+      "ProblemDetails_DriveHttpFailureDetails": {
         "description": "Untrusted wire DTO. Unknown RFC extensions are ignored; yoi_failure is mandatory here.",
         "properties": {
           "detail": {
@@ -11638,7 +11877,89 @@
             "type": "string"
           },
           "yoi_failure": {
-            "$ref": "#/components/schemas/FailureEnvelope"
+            "$ref": "#/components/schemas/FailureEnvelope_DriveHttpFailureDetails"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "instance",
+          "yoi_failure"
+        ],
+        "type": "object"
+      },
+      "ProblemDetails_RepositoryAccessDetails": {
+        "description": "Untrusted wire DTO. Unknown RFC extensions are ignored; yoi_failure is mandatory here.",
+        "properties": {
+          "detail": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "instance": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 599,
+            "minimum": 400,
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "yoi_failure": {
+            "$ref": "#/components/schemas/FailureEnvelope_RepositoryAccessDetails"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "instance",
+          "yoi_failure"
+        ],
+        "type": "object"
+      },
+      "ProblemDetails_WorkdirManagementFailure": {
+        "description": "Untrusted wire DTO. Unknown RFC extensions are ignored; yoi_failure is mandatory here.",
+        "properties": {
+          "detail": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "instance": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 599,
+            "minimum": 400,
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "yoi_failure": {
+            "$ref": "#/components/schemas/FailureEnvelope_WorkdirManagementFailure"
           }
         },
         "required": [
@@ -13743,6 +14064,13 @@
       "RuntimeWorkerLifecycleResult": {
         "additionalProperties": false,
         "properties": {
+          "cleanup_failures": {
+            "description": "Independent post-operation failures; they do not change the accepted Runtime result.",
+            "items": {
+              "$ref": "#/components/schemas/StartupFailureAttachment"
+            },
+            "type": "array"
+          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -20617,6 +20945,124 @@
         ],
         "type": "object"
       },
+      "WorkdirManagementFailure": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/WorkdirManagementOperation"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/WorkdirManagementReason"
+          }
+        },
+        "required": [
+          "operation",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "WorkdirManagementOperation": {
+        "enum": [
+          "create",
+          "list",
+          "detail",
+          "cleanup",
+          "repository_access",
+          "repository_ref",
+          "attach",
+          "detach",
+          "grant_create",
+          "grant_inspect",
+          "grant_revoke",
+          "grant_connect",
+          "grant_cleanup"
+        ],
+        "type": "string"
+      },
+      "WorkdirManagementReason": {
+        "enum": [
+          "embedded_worker_workdir_unsupported",
+          "external_workdir_legacy_permissions",
+          "workdir_attachment_registry_not_found",
+          "workdir_attachment_not_available",
+          "workdir_attachment_grant_bound_required",
+          "workdir_external_grant_unavailable",
+          "external_workdir_grant_state_outcome_unknown",
+          "external_workdir_grant_not_found",
+          "external_workdir_grant_creator_required",
+          "external_workdir_grant_display_name_invalid",
+          "external_workdir_grant_ttl_invalid",
+          "external_workdir_grant_provider_identity_invalid",
+          "external_workdir_grant_revoked",
+          "external_workdir_grant_expired",
+          "external_workdir_grant_audit_failed",
+          "external_workdir_grant_cleanup_persistence_failed",
+          "external_workdir_grant_cleanup_query_failed",
+          "external_workdir_grant_attachment_release_failed",
+          "external_workdir_grant_cleanup_outcome_unknown",
+          "workdir_attachment_conflict",
+          "workdir_occupied",
+          "working_directory_not_found",
+          "working_directory_not_active",
+          "working_directory_create_failed",
+          "working_directory_exists",
+          "working_directory_git_failed",
+          "working_directory_git_unavailable",
+          "working_directory_id_invalid",
+          "working_directory_list_failed",
+          "working_directory_materializer_unsupported",
+          "working_directory_record_invalid",
+          "working_directory_record_serialize_failed",
+          "working_directory_record_write_failed",
+          "working_directory_relative_cwd_escape_rejected",
+          "working_directory_relative_cwd_invalid",
+          "working_directory_relative_cwd_unavailable",
+          "working_directory_non_utf8_path",
+          "working_directory_root_unavailable",
+          "working_directory_remote_repository_access_invalid",
+          "working_directory_remote_repository_access_required",
+          "working_directory_remote_repository_host_trust_mismatch",
+          "working_directory_repository_access_binding_mismatch",
+          "working_directory_repository_access_expired",
+          "working_directory_repository_access_not_applicable",
+          "working_directory_repository_access_setup_failed",
+          "working_directory_repository_access_unavailable",
+          "working_directory_repository_agent_failed",
+          "working_directory_repository_agent_unavailable",
+          "working_directory_repository_limit_exceeded",
+          "working_directory_repository_materialization_authority_invalid",
+          "working_directory_repository_materialization_authority_required",
+          "working_directory_repository_plain_http_unsupported",
+          "working_directory_repository_provider_unsupported",
+          "working_directory_repository_selector_invalid",
+          "working_directory_repository_selector_unresolved",
+          "working_directory_repository_source_invalid",
+          "working_directory_repository_timeout",
+          "working_directory_repository_clone_failed",
+          "working_directory_repository_checkout_failed",
+          "working_directory_repository_policy_failed",
+          "working_directory_repository_access_denied",
+          "working_directory_repository_host_trust_failed",
+          "working_directory_repository_authentication_failed",
+          "working_directory_repository_connection_failed",
+          "working_directory_repository_not_found",
+          "repository_ref_not_found",
+          "repository_ref_provider_timeout",
+          "repository_ref_provider_unavailable",
+          "repository_ref_provider_auth_failed",
+          "repository_ref_response_invalid",
+          "repository_ref_selector_invalid",
+          "working_directory_cleanup_mount_present",
+          "working_directory_cleanup_mount_check_unavailable",
+          "working_directory_cleanup_permission_denied",
+          "working_directory_cleanup_resource_busy",
+          "working_directory_cleanup_storage_unavailable",
+          "working_directory_cleanup_ownership_unknown",
+          "working_directory_cleanup_changes_present",
+          "working_directory_cleanup_changes_unknown"
+        ],
+        "type": "string"
+      },
       "WorkerBusyState": {
         "oneOf": [
           {
@@ -21511,7 +21957,7 @@
         "properties": {
           "diagnostics": {
             "items": {
-              "$ref": "#/components/schemas/Diagnostic"
+              "$ref": "#/components/schemas/WorkingDirectoryManagementDiagnostic"
             },
             "type": "array"
           },
@@ -21538,7 +21984,7 @@
         "properties": {
           "diagnostics": {
             "items": {
-              "$ref": "#/components/schemas/Diagnostic"
+              "$ref": "#/components/schemas/WorkingDirectoryManagementDiagnostic"
             },
             "type": "array"
           },
@@ -21567,7 +22013,7 @@
         "properties": {
           "diagnostics": {
             "items": {
-              "$ref": "#/components/schemas/Diagnostic"
+              "$ref": "#/components/schemas/WorkingDirectoryManagementDiagnostic"
             },
             "type": "array"
           },
@@ -21585,6 +22031,37 @@
           "workspace_id",
           "items",
           "diagnostics"
+        ],
+        "type": "object"
+      },
+      "WorkingDirectoryManagementDiagnostic": {
+        "additionalProperties": false,
+        "description": "A management observation alongside an unchanged inventory/lookup result.\nOptional typed evidence is projected independently of severity and status.",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupFailureAttachment"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "severity": {
+            "$ref": "#/components/schemas/DiagnosticSeverity"
+          }
+        },
+        "required": [
+          "code",
+          "severity",
+          "message"
         ],
         "type": "object"
       },
@@ -23655,7 +24132,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:acfa327fc3dd7ce8588e30996a7806017815279911ad70dd3e662208aff170e1"
+    "x-yoi-source-digest": "sha256:0d1a0c115c408990d9a419706d2cba72c834e03203fb3778d82381430e8ecdec"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -28640,6 +29117,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28649,6 +29131,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28660,6 +29147,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28669,6 +29161,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28680,6 +29177,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28690,6 +29192,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28699,6 +29206,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28785,6 +29297,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28794,6 +29311,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28805,6 +29327,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28814,6 +29341,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28825,6 +29357,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28835,6 +29372,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28844,6 +29386,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28902,6 +29449,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28911,6 +29463,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28922,6 +29479,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28931,6 +29493,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -28942,6 +29509,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28952,6 +29524,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -28961,6 +29538,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29017,6 +29599,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29026,6 +29613,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29037,6 +29629,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29046,6 +29643,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29057,6 +29659,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29067,6 +29674,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29076,6 +29688,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29134,6 +29751,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29143,6 +29765,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29154,6 +29781,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29163,6 +29795,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29174,6 +29811,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29184,6 +29826,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29193,6 +29840,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29251,6 +29903,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29260,6 +29917,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29271,6 +29933,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29280,6 +29947,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29291,6 +29963,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29301,6 +29978,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29310,6 +29992,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29368,6 +30055,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29377,6 +30069,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29388,6 +30085,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29397,6 +30099,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29408,6 +30115,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29418,6 +30130,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29427,6 +30144,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29485,6 +30207,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29494,6 +30221,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29505,6 +30237,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29514,6 +30251,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29525,6 +30267,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29535,6 +30282,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29544,6 +30296,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29603,6 +30360,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29612,6 +30374,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29623,6 +30390,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29632,6 +30404,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29643,6 +30420,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29653,6 +30435,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29662,6 +30449,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29720,6 +30512,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29729,6 +30526,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29740,6 +30542,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29749,6 +30556,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29760,6 +30572,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29770,6 +30587,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29779,6 +30601,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29837,6 +30664,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29846,6 +30678,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29857,6 +30694,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29866,6 +30708,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29877,6 +30724,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29887,6 +30739,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29896,6 +30753,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29944,6 +30806,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29953,6 +30820,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29964,6 +30836,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29973,6 +30850,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -29984,6 +30866,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -29994,6 +30881,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30003,6 +30895,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -30061,6 +30958,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30070,6 +30972,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -30081,6 +30988,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30090,6 +31002,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -30101,6 +31018,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30111,6 +31033,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30120,6 +31047,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -30189,6 +31121,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30198,6 +31135,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -30209,6 +31151,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30218,6 +31165,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -30229,6 +31181,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30239,6 +31196,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+                }
               }
             },
             "description": "Error response"
@@ -30248,6 +31210,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/DriveApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
                 }
               }
             },
@@ -30306,6 +31273,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30315,6 +31287,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -30326,6 +31303,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30335,6 +31317,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -30346,6 +31333,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30355,6 +31347,41 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -30413,6 +31440,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30422,6 +31454,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -30433,6 +31470,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30442,6 +31484,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -30453,6 +31500,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30462,6 +31514,41 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -30518,6 +31605,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30527,6 +31619,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -30538,6 +31635,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30548,6 +31650,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -30557,6 +31664,41 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39572,6 +40714,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39581,6 +40728,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39592,6 +40744,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39601,6 +40758,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39612,6 +40774,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39622,6 +40789,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39631,6 +40803,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39707,6 +40884,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39716,6 +40898,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39727,6 +40914,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39736,6 +40928,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39747,6 +40944,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39756,6 +40958,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39767,6 +40974,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39776,6 +40988,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39854,6 +41071,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39863,6 +41085,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39874,6 +41101,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39883,6 +41115,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39894,6 +41131,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39903,6 +41145,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39914,6 +41161,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39923,6 +41175,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -39989,6 +41246,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -39998,6 +41260,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -40009,6 +41276,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -40018,6 +41290,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -40029,6 +41306,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -40039,6 +41321,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -40048,6 +41335,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -40570,7 +41862,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40585,7 +41877,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40600,7 +41892,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40615,7 +41907,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40630,7 +41922,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40682,7 +41974,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40697,7 +41989,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40712,7 +42004,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40727,7 +42019,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40742,7 +42034,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40802,7 +42094,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40817,7 +42109,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40832,7 +42124,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40847,7 +42139,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40862,7 +42154,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40877,7 +42169,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40939,7 +42231,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40954,7 +42246,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40969,7 +42261,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40984,7 +42276,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -40999,7 +42291,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41014,7 +42306,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41079,7 +42371,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41094,7 +42386,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41109,7 +42401,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41124,7 +42416,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41139,7 +42431,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41154,7 +42446,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41214,7 +42506,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41229,7 +42521,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41244,7 +42536,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41259,7 +42551,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41274,7 +42566,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41336,7 +42628,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41351,7 +42643,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41366,7 +42658,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41381,7 +42673,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41396,7 +42688,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41468,7 +42760,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41483,7 +42775,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41498,7 +42790,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41513,7 +42805,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41528,7 +42820,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41543,7 +42835,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41595,7 +42887,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41610,7 +42902,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41625,7 +42917,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41640,7 +42932,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41655,7 +42947,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41725,7 +43017,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41740,7 +43032,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41755,7 +43047,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41770,7 +43062,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41785,7 +43077,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41800,7 +43092,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41865,7 +43157,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41880,7 +43172,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41895,7 +43187,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41910,7 +43202,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41925,7 +43217,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -41940,7 +43232,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -42000,7 +43292,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -42015,7 +43307,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -42030,7 +43322,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -42045,7 +43337,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -42060,7 +43352,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_RepositoryAccessDetails"
                 }
               }
             },
@@ -49693,6 +50985,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49702,6 +50999,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49713,6 +51015,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49722,6 +51029,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49733,6 +51045,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49743,6 +51060,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49752,6 +51074,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49818,6 +51145,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49827,6 +51159,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49838,6 +51175,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49847,6 +51189,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49858,6 +51205,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49867,6 +51219,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49878,6 +51235,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49887,6 +51249,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49955,6 +51322,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49964,6 +51336,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49975,6 +51352,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -49984,6 +51366,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -49995,6 +51382,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -50004,6 +51396,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -50015,6 +51412,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -50024,6 +51426,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -50080,6 +51487,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -50089,6 +51501,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -50100,6 +51517,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -50109,6 +51531,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },
@@ -50120,6 +51547,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -50130,6 +51562,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
+                }
               }
             },
             "description": "Error response"
@@ -50139,6 +51576,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_WorkdirManagementFailure"
                 }
               }
             },

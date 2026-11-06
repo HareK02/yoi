@@ -34,6 +34,7 @@ use crate::{
 pub enum WorkdirFailureOperation {
     SessionOpen,
     SessionClose,
+    AttachmentProjection,
     AuthorizeScope,
     ScopeRulesOverlap,
     CheckoutSearch,
@@ -58,6 +59,7 @@ impl WorkdirFailureOperation {
         match self {
             Self::SessionOpen => "session opening",
             Self::SessionClose => "session closing",
+            Self::AttachmentProjection => "attachment projection",
             Self::AuthorizeScope => "scope authorization",
             Self::ScopeRulesOverlap => "scope comparison",
             Self::CheckoutSearch => "checkout search",
@@ -82,6 +84,7 @@ impl WorkdirFailureOperation {
         match self {
             Self::SessionOpen => "session_open",
             Self::SessionClose => "session_close",
+            Self::AttachmentProjection => "attachment_projection",
             Self::AuthorizeScope => "authorize_scope",
             Self::ScopeRulesOverlap => "scope_rules_overlap",
             Self::CheckoutSearch => "checkout_search",
@@ -155,7 +158,7 @@ impl WorkdirFailureDetails {
         let impact = match self.classification {
             WorkdirTransportErrorCode::OutcomeUnknown | WorkdirTransportErrorCode::Transport => {
                 format!(
-                    "Workdir {} result could not be confirmed",
+                    "Workdir {} result could not be confirmed; effects may have occurred; inspect current state before considering a retry; do not automatically resend",
                     self.operation.description()
                 )
             }
@@ -348,6 +351,7 @@ fn failure_explanation(reason: WorkdirFailureReason) -> &'static str {
         Reason::HttpTransfer => "the Workdir response transfer failed",
         Reason::HttpResponseInvalid => "the Workdir provider returned an invalid response",
         Reason::HttpResponseTooLarge => "the Workdir provider response exceeded its size limit",
+        Reason::ReadLimitExceeded => "the file exceeds the caller’s configured binary read limit",
         Reason::OperationResultMismatch => {
             "the Workdir response did not match the requested operation"
         }
@@ -372,6 +376,12 @@ fn failure_explanation(reason: WorkdirFailureReason) -> &'static str {
         Reason::WorkingDirectoryNotActive => "the Workdir is not active",
         Reason::WorkingDirectoryRecordInvalid => "the stored Workdir record is invalid",
         Reason::WorkingDirectoryAccessUnavailable => "access to the Workdir is unavailable",
+        Reason::SessionRegistryUnavailable => {
+            "the Workdir session registry is unavailable; session closing is not confirmed"
+        }
+        Reason::AttachmentProjectionUnavailable => {
+            "the Worker stop was accepted, but its Workdir attachment projection could not be updated"
+        }
     }
 }
 

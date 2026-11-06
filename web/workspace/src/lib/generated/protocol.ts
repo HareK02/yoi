@@ -2,6 +2,8 @@
 // Do not edit by hand. Rust DTO authority lives in `crates/protocol`.
 // Large integer fields are JSON numbers on the wire and are emitted as TypeScript `number`.
 
+export type RuntimeControlCause = "runtime_missing" | "worker_missing" | "invalid_worker_identifier" | "runtime_stopped" | "execution_unavailable" | "execution_failed" | "execution_rejected" | "restore_observation_stale" | "restore_observation_conflict" | "restore_admission_busy" | "stop_observation_conflict" | "stop_request_conflict" | "stop_admission_busy" | "create_request_conflict" | "invalid_request" | "workspace_binding_mismatch" | "configuration_unavailable" | "working_directory_failed" | "persistence_failed" | "persistence_outcome_unknown" | "store_unavailable" | "state_unavailable" | "authorization_failed" | "connection_failed" | "transport_failed" | "timed_out" | "request_encoding_failed" | "client_setup_failed" | "response_too_large" | "invalid_response" | "result_unavailable" | "unsupported_operation" | "remote_rejected";
+
 export type StartupFailureAttachment = string;
 
 export type StoredStartupFailureAttachment = StartupFailureAttachment;
@@ -75,6 +77,11 @@ name: string, arguments: Array<InvocationArgumentValue>, };
 export type FeatureInvocationStatus = "succeeded" | "failed" | "outcome_unknown";
 
 export type FeatureInvocationResult = { invocation_id: string, identity: FeatureInvocationIdentity, status: FeatureInvocationStatus, message: string,
+/**
+ * Optional projected cause, separate from successful preparation context and
+ * the operation outcome. Redisclosure requires current domain authority.
+ */
+failure?: StartupFailureAttachment | null,
 /**
  * Bounded model-visible context produced by the handler. Credentials and
  * executable implementation details must not be included.

@@ -203,7 +203,7 @@ fn scope(workspace: &str) -> ScopeKey {
         target: "configuration".into(),
     }
 }
-fn require_owner(
+pub(crate) fn require_owner(
     conn: &Connection,
     workspace: &str,
     account: &str,
@@ -281,7 +281,7 @@ fn policies(conn: &Connection, workspace: &str) -> Result<BTreeMap<String, Adopt
     Ok(result)
 }
 
-fn receipt(
+pub(crate) fn receipt(
     conn: &Connection,
     workspace: &str,
     operation: &str,

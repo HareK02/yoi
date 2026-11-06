@@ -140,6 +140,7 @@ async fn production_invalid_and_foreign_references_are_mapped_without_parsing_me
 #[tokio::test]
 async fn codec_artifact_reread_rechecks_current_visibility_after_actual_client_denial() {
     let client = Client::new(vec![WorkspaceResponse {
+        content_type: None,
         status: 403,
         body: serde_json::to_string(&DriveApiError {
             code: DriveApiErrorCode::Denied,

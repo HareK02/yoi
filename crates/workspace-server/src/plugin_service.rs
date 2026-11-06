@@ -7,6 +7,8 @@ use server_api::*;
 use sha2::{Digest, Sha256};
 
 pub const SCHEMA_SQL: &str = include_str!("plugin_service_schema.sql");
+pub const FAILURE_MIGRATION_SQL: &str =
+    "ALTER TABLE plugin_service_consumers ADD COLUMN last_outcome_json TEXT;";
 pub const LEASE_MS: i64 = 60_000;
 pub const MAX_QUEUE: u32 = 256;
 pub const MAX_ATTEMPTS: u32 = 5;

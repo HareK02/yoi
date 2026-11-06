@@ -80,7 +80,7 @@ impl WorkspaceClient for TicketRouterClient {
                     "response lost after commit; outcome unknown".into(),
                 ));
             }
-            Ok(WorkspaceResponse { status, body })
+            Ok(WorkspaceResponse { content_type: None, status, body })
         })
     }
 }

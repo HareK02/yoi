@@ -216,6 +216,7 @@ mod tests {
         fn response(&self, call: Call) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.calls.lock().unwrap().push(call);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 202,
                 body: "forwarded".into(),
             })
@@ -226,6 +227,7 @@ mod tests {
         ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
             self.calls.lock().unwrap().push(call);
             Ok(WorkspaceBinaryResponse {
+                content_type: Some("application/octet-stream".into()),
                 status: 206,
                 body: vec![0, 255],
             })
@@ -384,6 +386,7 @@ mod tests {
         let bytes = binary(WorkspaceRequestMethod::Put, "/api/w/ws/files/content");
         let timeout = Duration::from_millis(37);
         let expected = WorkspaceResponse {
+            content_type: None,
             status: 202,
             body: "forwarded".into(),
         };
@@ -395,6 +398,7 @@ mod tests {
             expected
         );
         let expected_bytes = WorkspaceBinaryResponse {
+            content_type: Some("application/octet-stream".into()),
             status: 206,
             body: vec![0, 255],
         };

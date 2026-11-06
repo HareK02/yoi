@@ -15,12 +15,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigurationFailureOperation {
     Source,
     Preview,
     Adopt,
     Reconcile,
+    Publication,
 }
 
 impl ConfigurationFailureOperation {
@@ -30,6 +32,7 @@ impl ConfigurationFailureOperation {
             Self::Preview => "preview",
             Self::Adopt => "adopt",
             Self::Reconcile => "reconcile",
+            Self::Publication => "publication",
         }
     }
 
@@ -39,12 +42,14 @@ impl ConfigurationFailureOperation {
             Self::Preview => "change preview",
             Self::Adopt => "source and policy adoption",
             Self::Reconcile => "adoption result reconciliation",
+            Self::Publication => "post-adoption publication observation",
         }
     }
 }
 
 /// Observed causes only. These do not grant retries or establish an adoption result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigurationFailureReason {
     InvalidPath,
@@ -70,6 +75,8 @@ pub enum ConfigurationFailureReason {
     WorkspaceInactive,
     WorkspaceDraining,
     RequestIdentityConflict,
+    PublicationDispatchUnavailable,
+    PublicationProjectionUnavailable,
 }
 
 impl ConfigurationFailureReason {
@@ -98,6 +105,8 @@ impl ConfigurationFailureReason {
             Self::WorkspaceInactive => "workspace_inactive",
             Self::WorkspaceDraining => "workspace_draining",
             Self::RequestIdentityConflict => "request_identity_conflict",
+            Self::PublicationDispatchUnavailable => "publication_dispatch_unavailable",
+            Self::PublicationProjectionUnavailable => "publication_projection_unavailable",
         }
     }
 
@@ -112,6 +121,9 @@ impl ConfigurationFailureReason {
             | Self::WorkspaceInactive
             | Self::WorkspaceDraining
             | Self::RequestIdentityConflict => Category::Conflict,
+            Self::PublicationDispatchUnavailable | Self::PublicationProjectionUnavailable => {
+                Category::Internal
+            }
             Self::DuplicateSchemaProvider
             | Self::DuplicateSchemaNamespace
             | Self::InvalidSchemaContribution => Category::Internal,
@@ -171,6 +183,12 @@ impl ConfigurationFailureReason {
             Self::OwnerRequired => "configuration management requires the current Workspace owner",
             Self::WorkspaceInactive => "the Workspace is not active for configuration management",
             Self::WorkspaceDraining => "Workspace deletion is draining configuration requests",
+            Self::PublicationDispatchUnavailable => {
+                "the configuration was adopted, but the Host did not admit Runtime publication"
+            }
+            Self::PublicationProjectionUnavailable => {
+                "the configuration was adopted, but its Runtime prompt projection could not be resolved"
+            }
             Self::RequestIdentityConflict => {
                 "the configuration operation identity is already bound to a different request"
             }
@@ -180,6 +198,7 @@ impl ConfigurationFailureReason {
 
 /// The complete wire allowlist. No path, import, identifier or diagnostic is a field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ConfigurationFailureDetails {
     pub operation: ConfigurationFailureOperation,

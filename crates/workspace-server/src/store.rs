@@ -137,7 +137,13 @@ pub(crate) mod backend_job_upgrade;
 mod storage_formats;
 pub use backend_job_recovery_store::BackendJobReconciliation;
 
-const LATEST_SCHEMA_VERSION: i64 = 123;
+const LATEST_SCHEMA_VERSION: i64 = 128;
+const WORKER_CREATE_FAILURE_MIGRATION_NAME: &str =
+    "Worker create coordinator returned startup failure";
+pub(crate) const WORKER_CREATE_FAILURE_MAX_BYTES: usize = 32 * 1024;
+const SERVICE_OUTCOME_MIGRATION_NAME: &str = "Plugin Service retained outcomes and causes";
+const RETAINED_STARTUP_MIGRATION_NAME: &str =
+    "Worker create coordinator returned startup failure after retained Job and Service causes";
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -519,6 +525,31 @@ const MIGRATIONS: &[Migration] = &[
         version: 123,
         name: backend_job_upgrade::MIGRATION_NAME,
         apply: migrate_backend_job_execution_to_v123,
+    },
+    Migration {
+        version: 124,
+        name: WORKER_CREATE_FAILURE_MIGRATION_NAME,
+        apply: migrate_worker_create_failure_to_v124,
+    },
+    Migration {
+        version: 125,
+        name: backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+        apply: migrate_backend_job_causes_v124_to_v125,
+    },
+    Migration {
+        version: 126,
+        name: SERVICE_OUTCOME_MIGRATION_NAME,
+        apply: migrate_plugin_service_outcomes_v125_to_v126,
+    },
+    Migration {
+        version: 127,
+        name: crate::config_publication::MIGRATION_NAME,
+        apply: migrate_configuration_publication_to_v127,
+    },
+    Migration {
+        version: 128,
+        name: crate::external_workdir_connection_observations::MIGRATION_NAME,
+        apply: migrate_external_workdir_connection_observations_to_v128,
     },
 ];
 
@@ -2772,6 +2803,84 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
     ) -> Result<Vec<ExternalWorkdirGrantRecord>>;
+    fn external_workdir_cleanup_observation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<(String, Vec<protocol::background_failure::StoredFailure>)>;
+    fn external_workdir_cleanup_operation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupOperation>>;
+    fn external_workdir_cleanup_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupIntent>>;
+    fn append_external_workdir_cleanup_intent_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupIntent,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupIntent>;
+    fn external_workdir_cleanup_has_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<bool>;
+    fn begin_external_workdir_cleanup_operation(
+        &self,
+        request: &crate::grant_cleanup_operation::CleanupRequest,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::CleanupAdmission>;
+    fn validate_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+    ) -> Result<()>;
+    fn confirm_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn mark_external_workdir_cleanup_runtime_dispatched(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn record_external_workdir_cleanup_runtime_observation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        status: crate::hosts::RuntimeOperationStatus,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn settle_external_workdir_cleanup_operation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        observation: Option<&runtime_api::WorkerWorkdirAttachmentsOperationObservation>,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn append_external_workdir_cleanup_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn record_external_workdir_connection_observation(
+        &self,
+        grant: &ExternalWorkdirGrantRecord,
+        connection_generation: u64,
+        reason: server_api::ExternalWorkdirConnectionClosedReason,
+        failures: Option<&str>,
+        now: &str,
+    ) -> Result<bool>;
+    fn external_workdir_connection_observations(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Vec<crate::external_workdir_connection_observations::ConnectionObservation>>;
     fn activate_external_workdir_grant(
         &self,
         workspace_id: &str,
@@ -11461,6 +11570,158 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn external_workdir_cleanup_observation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<(String, Vec<protocol::background_failure::StoredFailure>)> {
+        self.with_conn(|conn| {
+            let (state, raw): (String, Option<String>) = conn.query_row(
+                "SELECT cleanup_state, cleanup_error FROM external_workdir_grants WHERE workspace_id = ?1 AND grant_id = ?2",
+                params![workspace_id, grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            // Older rows contain only a fixed category, not a structured cause.
+            // Keep their cleanup state; never reconstruct evidence from that text.
+            let failures = raw.as_deref()
+                .map(crate::grant_cleanup_operation::diagnostic_failures)
+                .unwrap_or_default();
+            Ok((state, failures))
+        })
+    }
+
+    fn external_workdir_cleanup_operation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupOperation>> {
+        self.with_conn(|conn| crate::grant_cleanup_operation::read(conn, workspace_id, grant_id))
+    }
+    fn external_workdir_cleanup_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupIntent>> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::read_intent(conn, workspace_id, grant_id)
+        })
+    }
+    fn append_external_workdir_cleanup_intent_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupIntent,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupIntent> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::append_intent_failures(conn, expected, failures, now)
+        })
+    }
+    fn external_workdir_cleanup_has_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::has_intent(conn, workspace_id, grant_id)
+        })
+    }
+    fn begin_external_workdir_cleanup_operation(
+        &self,
+        request: &crate::grant_cleanup_operation::CleanupRequest,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::CleanupAdmission> {
+        self.with_conn_mut(|conn| {
+            crate::grant_cleanup_operation::begin(conn, request, failures, now)
+        })
+    }
+    fn validate_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+    ) -> Result<()> {
+        self.with_conn(|conn| crate::grant_cleanup_operation::validate_release(conn, expected))
+    }
+    fn confirm_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| crate::grant_cleanup_operation::confirm_release(conn, expected, now))
+    }
+    fn mark_external_workdir_cleanup_runtime_dispatched(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::mark_runtime_dispatched(conn, expected, now)
+        })
+    }
+    fn record_external_workdir_cleanup_runtime_observation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        status: crate::hosts::RuntimeOperationStatus,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::record_runtime_observation(
+                conn, expected, status, failures, now,
+            )
+        })
+    }
+
+    fn settle_external_workdir_cleanup_operation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        observation: Option<&runtime_api::WorkerWorkdirAttachmentsOperationObservation>,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::settle(conn, expected, observation, now)
+        })
+    }
+    fn append_external_workdir_cleanup_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::append_failures(conn, expected, failures, now)
+        })
+    }
+
+    fn record_external_workdir_connection_observation(
+        &self,
+        grant: &ExternalWorkdirGrantRecord,
+        connection_generation: u64,
+        reason: server_api::ExternalWorkdirConnectionClosedReason,
+        failures: Option<&str>,
+        now: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            crate::external_workdir_connection_observations::record(
+                conn,
+                grant,
+                connection_generation,
+                reason,
+                failures,
+                now,
+            )
+        })
+    }
+
+    fn external_workdir_connection_observations(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Vec<crate::external_workdir_connection_observations::ConnectionObservation>> {
+        self.with_conn(|conn| {
+            crate::external_workdir_connection_observations::read(conn, workspace_id, grant_id)
+        })
+    }
+
     fn activate_external_workdir_grant(
         &self,
         workspace_id: &str,
@@ -11469,8 +11730,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         generation: u64,
         updated_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 r#"UPDATE external_workdir_grants
                    SET generation = ?4, status = 'online', updated_at = ?5
                    WHERE workspace_id = ?1 AND grant_id = ?2 AND provider_instance_id = ?3
@@ -11486,11 +11748,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             if changed > 0 {
-                conn.execute(
+                tx.execute(
                     "UPDATE workdir_registry SET materialization_status = 'present', updated_at = ?3 WHERE workspace_id = ?1 AND external_grant_id = ?2",
                     params![workspace_id, grant_id, updated_at],
                 )?;
             }
+            tx.commit()?;
             Ok(changed > 0)
         })
     }
@@ -11504,8 +11767,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         status: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 r#"UPDATE external_workdir_grants
                    SET status = ?5, updated_at = ?6,
                        cleanup_state = CASE WHEN ?5 IN ('revoked', 'expired') THEN 'pending' ELSE cleanup_state END,
@@ -11523,7 +11787,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             if changed > 0 {
-                conn.execute(
+                if matches!(status, "revoked" | "expired") {
+                    crate::grant_cleanup_operation::install_fresh_fence_intent(&tx, workspace_id, grant_id, updated_at)?;
+                }
+                tx.execute(
                     "UPDATE workdir_registry SET materialization_status = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND external_grant_id = ?2",
                     params![
                         workspace_id,
@@ -11533,6 +11800,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     ],
                 )?;
             }
+            tx.commit()?;
             Ok(changed > 0)
         })
     }
@@ -11544,14 +11812,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<String>> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE external_workdir_grants
-                 SET status = 'expired', updated_at = ?2, cleanup_state = 'pending',
-                     cleanup_error = NULL, cleanup_updated_at = ?2
-                 WHERE workspace_id = ?1 AND status IN ('pending', 'online', 'offline')
-                   AND expires_at IS NOT NULL AND expires_at <= ?2",
-                params![workspace_id, now],
-            )?;
+            let newly_expired = {
+                let mut statement = tx.prepare(
+                    "UPDATE external_workdir_grants
+                     SET status='expired',updated_at=?2,cleanup_state='pending',cleanup_error=NULL,cleanup_updated_at=?2
+                     WHERE workspace_id=?1 AND status IN ('pending','online','offline') AND expires_at IS NOT NULL AND expires_at<=?2
+                     RETURNING grant_id",
+                )?;
+                statement.query_map(params![workspace_id,now], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for grant in newly_expired {
+                crate::grant_cleanup_operation::install_fresh_fence_intent(&tx, workspace_id, &grant, now)?;
+            }
             tx.execute(
                 "UPDATE external_workdir_grants SET status = 'offline', updated_at = ?2
                  WHERE workspace_id = ?1 AND status = 'online'
@@ -11599,15 +11871,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             ));
         }
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let existing: Option<Option<String>> = tx.query_row(
+                "SELECT cleanup_error FROM external_workdir_grants WHERE workspace_id=?1 AND grant_id=?2",
+                params![workspace_id, grant_id], |row| row.get(0),
+            ).optional()?;
+            let Some(existing) = existing else { return Ok(false); };
+            if !crate::grant_cleanup_operation::legacy_observation_only(existing.as_deref()) {
+                return Err(Error::WorkdirAttachmentConflict(
+                    "External cleanup operation requires conditional settlement".into(),
+                ));
+            }
+            let changed = tx.execute(
                 "UPDATE external_workdir_grants
                  SET cleanup_state = ?3, cleanup_error = ?4, cleanup_updated_at = ?5
                  WHERE workspace_id = ?1 AND grant_id = ?2
                    AND status IN ('revoked', 'expired')",
                 params![workspace_id, grant_id, state, error, updated_at],
-            )
-            .map(|changed| changed > 0)
-            .map_err(Error::from)
+            )?;
+            tx.commit()?;
+            Ok(changed > 0)
         })
     }
 
@@ -12325,20 +12608,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
-                   FROM worker_workdir_links
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
-                   ORDER BY linked_at DESC"#,
-            )?;
-            let rows = stmt.query_map(
-                params![workspace_id, worker.runtime_id, worker.worker_id],
-                read_worker_workdir_link_record,
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)
-        })
+        self.with_conn(|conn| list_worker_workdir_links_on(conn, workspace_id, worker))
     }
 
     fn list_workdir_worker_links(
@@ -12367,20 +12637,43 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         workdir_id: &str,
     ) -> Result<Option<WorkerWorkdirLinkRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
-                   FROM worker_workdir_links
-                   WHERE workspace_id = ?1 AND workdir_id = ?2
-                   ORDER BY linked_at DESC, rowid DESC
-                   LIMIT 1"#,
-                params![workspace_id, workdir_id],
-                read_worker_workdir_link_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
+        self.with_conn(|conn| latest_workdir_worker_link_on(conn, workspace_id, workdir_id))
     }
+}
+
+pub(crate) fn list_worker_workdir_links_on(
+    conn: &Connection,
+    workspace_id: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<Vec<WorkerWorkdirLinkRecord>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+           FROM worker_workdir_links
+           WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
+           ORDER BY linked_at DESC"#,
+    )?;
+    let rows = stmt.query_map(
+        params![workspace_id, worker.runtime_id, worker.worker_id],
+        read_worker_workdir_link_record,
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
+}
+
+pub(crate) fn latest_workdir_worker_link_on(
+    conn: &Connection,
+    workspace_id: &str,
+    workdir_id: &str,
+) -> Result<Option<WorkerWorkdirLinkRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+           FROM worker_workdir_links
+           WHERE workspace_id = ?1 AND workdir_id = ?2
+           ORDER BY linked_at DESC, rowid DESC
+           LIMIT 1"#,
+        params![workspace_id, workdir_id],
+        read_worker_workdir_link_record,
+    ).optional().map_err(Error::from)
 }
 
 fn flow_source_name(path: &str) -> Result<String> {
@@ -16388,6 +16681,127 @@ fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn verify_worker_create_failure_schema(conn: &Connection) -> Result<()> {
+    storage_formats::verify_startup_shape(conn)
+}
+
+fn migrate_worker_create_failure_to_v124(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 123 {
+        return Err(Error::Store(
+            "Worker create failure migration requires schema 123".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 123)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(124,?1)",
+        [WORKER_CREATE_FAILURE_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+// Retain the two actually published source receipts. They are alternatives to,
+// not aliases for, Startup-124 / Job-125 / Service-126.
+const RETAINED_FAILURE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 125,
+        name: SERVICE_OUTCOME_MIGRATION_NAME,
+        apply: migrate_retained_service_outcomes_to_v125,
+    },
+    Migration {
+        version: 126,
+        name: RETAINED_STARTUP_MIGRATION_NAME,
+        apply: migrate_retained_startup_to_v126,
+    },
+];
+
+fn migrate_failure_extension(
+    conn: &Connection,
+    previous: i64,
+    version: i64,
+    name: &str,
+    sql: &str,
+) -> Result<()> {
+    if current_schema_version(conn)? != previous {
+        return Err(Error::Store(format!(
+            "failure migration requires schema {previous}"
+        )));
+    }
+    storage_formats::verify_history(conn, previous)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(sql)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+        params![version, name],
+    )?;
+    storage_formats::verify_history(&tx, version)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_backend_job_causes_v124_to_v125(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        124,
+        125,
+        backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+        backend_job_recovery_store::CAUSE_SCHEMA,
+    )
+}
+
+fn migrate_plugin_service_outcomes_v125_to_v126(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        125,
+        126,
+        SERVICE_OUTCOME_MIGRATION_NAME,
+        crate::plugin_service::FAILURE_MIGRATION_SQL,
+    )
+}
+
+fn migrate_configuration_publication_to_v127(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        126,
+        127,
+        crate::config_publication::MIGRATION_NAME,
+        crate::config_publication::SCHEMA,
+    )
+}
+
+fn migrate_external_workdir_connection_observations_to_v128(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        127,
+        128,
+        crate::external_workdir_connection_observations::MIGRATION_NAME,
+        crate::external_workdir_connection_observations::SCHEMA,
+    )
+}
+
+fn migrate_retained_service_outcomes_to_v125(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        124,
+        125,
+        SERVICE_OUTCOME_MIGRATION_NAME,
+        crate::plugin_service::FAILURE_MIGRATION_SQL,
+    )
+}
+
+fn migrate_retained_startup_to_v126(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        125,
+        126,
+        RETAINED_STARTUP_MIGRATION_NAME,
+        include_str!("worker_create_failure_schema.sql"),
+    )
+}
+
 fn migrate_backend_job_execution_to_v123(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 122 {
         return Err(Error::Store(
@@ -16458,6 +16872,7 @@ fn migrate_ticket_parents_v112_to_v113(conn: &Connection) -> Result<()> {
 fn verify_plugin_service_schema(conn: &Connection) -> Result<()> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
+    expected.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
     let mut stmt = expected
         .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")?;
     for entry in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
@@ -16537,6 +16952,12 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
     backend_job_upgrade::install_fresh(conn)?;
+    conn.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(conn)?;
+    conn.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
+    conn.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
+    conn.execute_batch(crate::config_publication::SCHEMA)?;
+    conn.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
     Ok(())
 }
 
@@ -16574,11 +16995,14 @@ fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure_from_sql(
-        conn,
-        &backend_job_upgrade::retained_checks(include_str!("latest_schema.sql")),
-        true,
-    )?;
+    // The pre-124 reference composition must not already contain the column
+    // added by migration 124. Fresh latest creation installs it after this prefix.
+    let retained_schema = backend_job_upgrade::retained_checks(include_str!("latest_schema.sql"))
+        .replace(
+            "            startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR\n                (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),\n",
+            "",
+        );
+    create_workspace_schema_structure_from_sql(conn, &retained_schema, true)?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
     conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
@@ -17617,7 +18041,8 @@ fn apply_migrations_with_secret_source(
         for step in &plan.migrations {
             let migration = MIGRATIONS
                 .iter()
-                .find(|migration| migration.version == step.version)
+                .chain(RETAINED_FAILURE_MIGRATIONS.iter())
+                .find(|migration| migration.version == step.version && migration.name == step.name)
                 .ok_or_else(|| {
                     Error::Store(format!(
                         "migration implementation for schema version {} is missing",
@@ -17671,6 +18096,10 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 #[path = "storage_owner_tests.rs"]
 mod storage_owner_tests;
+
+#[cfg(test)]
+#[path = "combined_failure_migration_tests.rs"]
+mod combined_failure_migration_tests;
 
 #[cfg(test)]
 #[path = "store_test_support.rs"]
@@ -18412,18 +18841,29 @@ mod tests {
                 .map_err(Error::from)
             })
             .unwrap();
-        assert_eq!(cleanup_after_fence, ("pending".to_string(), None));
+        assert_eq!(cleanup_after_fence.0, "pending");
+        assert!(cleanup_after_fence.1.is_some());
+        let intent = store
+            .external_workdir_cleanup_intent("workspace-a", "grant-a")
+            .unwrap()
+            .unwrap();
+        assert!(intent.failures().is_empty());
         assert!(
             store
-                .update_external_workdir_cleanup_state(
-                    "workspace-a",
-                    "grant-a",
-                    "retry_required",
-                    Some("attachment_release_failed"),
-                    "2026-01-01T00:00:08Z",
-                )
+                .external_workdir_cleanup_operation("workspace-a", "grant-a")
                 .unwrap()
+                .is_none()
         );
+        assert!(matches!(
+            store.update_external_workdir_cleanup_state(
+                "workspace-a",
+                "grant-a",
+                "retry_required",
+                Some("attachment_release_failed"),
+                "2026-01-01T00:00:08Z",
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
         let cleanup_retry = store
             .with_conn(|conn| {
                 conn.query_row(
@@ -18434,13 +18874,7 @@ mod tests {
                 .map_err(Error::from)
             })
             .unwrap();
-        assert_eq!(
-            cleanup_retry,
-            (
-                "retry_required".to_string(),
-                Some("attachment_release_failed".to_string())
-            )
-        );
+        assert_eq!(cleanup_retry, cleanup_after_fence);
         assert!(
             !store
                 .activate_external_workdir_grant(
@@ -18451,6 +18885,642 @@ mod tests {
                     "2026-01-01T00:00:08Z",
                 )
                 .unwrap()
+        );
+    }
+
+    // Store component coverage: real schema, grant fencing, link lifetimes and
+    // transactions. SQL only seeds identity and injects competing writes/faults;
+    // these tests do not claim Runtime or session-close integration coverage.
+    struct CleanupStoreFixture {
+        store: SqliteWorkspaceStore,
+        request: crate::grant_cleanup_operation::CleanupRequest,
+        link: WorkerWorkdirLinkRecord,
+    }
+
+    impl CleanupStoreFixture {
+        fn new() -> Self {
+            let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
+            store.with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
+                     VALUES('cleanup-owner','user','cleanup-owner','Owner','1','1');
+                     INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+                     VALUES('cleanup-ws','cleanup-owner','Cleanup','active','1','1');
+                     INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at)
+                     VALUES('cleanup-ws','runtime-a','00000000-0000-7000-8000-000000000001','Worker','normal','1','1');",
+                )?;
+                Ok(())
+            }).unwrap();
+            for (grant_id, workdir_id) in [("grant-a", "external-a"), ("grant-b", "external-b")] {
+                store
+                    .create_external_workdir_grant(
+                        &ExternalWorkdirGrantRecord {
+                            grant_id: grant_id.into(),
+                            workspace_id: "cleanup-ws".into(),
+                            workdir_id: workdir_id.into(),
+                            provider_instance_id: "provider-a".into(),
+                            display_name: "External".into(),
+                            permissions: "read_write".into(),
+                            created_by: "cleanup-owner".into(),
+                            created_at: "1".into(),
+                            expires_at: None,
+                            generation: 1,
+                            status: "pending".into(),
+                            updated_at: "1".into(),
+                        },
+                        &WorkdirRegistryRecord {
+                            workspace_id: "cleanup-ws".into(),
+                            workdir_id: workdir_id.into(),
+                            display_name: None,
+                            source: WorkdirRegistrySource::ExternalGrant {
+                                grant_id: grant_id.into(),
+                            },
+                            creation_selector: None,
+                            creation_ref: None,
+                            creation_tree: None,
+                            current_selector: None,
+                            current_ref: None,
+                            current_tree: None,
+                            observed_at_epoch_seconds: None,
+                            materialization_status: "pending".into(),
+                            cleanliness: "unknown".into(),
+                            created_at: "1".into(),
+                            updated_at: "1".into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let link = store
+                .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                    workspace_id: "cleanup-ws".into(),
+                    worker: RuntimeWorkerRef::new(
+                        "runtime-a",
+                        "00000000-0000-7000-8000-000000000001",
+                    ),
+                    workdir_id: "external-a".into(),
+                    alias: "external".into(),
+                    capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+                    linked_at: "2".into(),
+                    unlinked_at: None,
+                    connection_id: String::new(),
+                })
+                .unwrap();
+            assert!(
+                store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-a",
+                        "provider-a",
+                        1,
+                        "revoked",
+                        "3",
+                    )
+                    .unwrap()
+            );
+            let request = crate::grant_cleanup_operation::CleanupRequest {
+                operation_id: "cleanup-operation".into(),
+                workspace_id: "cleanup-ws".into(),
+                grant_id: "grant-a".into(),
+                provider_instance_id: "provider-a".into(),
+                grant_generation: 1,
+                working_directory_id: "external-a".into(),
+                target: Some(crate::grant_cleanup_operation::CleanupRuntimeTarget {
+                    worker: link.worker.clone(),
+                    connection_id: link.connection_id.clone(),
+                    alias: link.alias.clone(),
+                    expected_generation: "runtime-generation-before".into(),
+                    logical_workdir_attachments: Vec::new(),
+                }),
+            };
+            Self {
+                store,
+                request,
+                link,
+            }
+        }
+
+        fn admit(&self) -> crate::grant_cleanup_operation::LoadedCleanupOperation {
+            match self
+                .store
+                .begin_external_workdir_cleanup_operation(&self.request, &[], "4")
+                .unwrap()
+            {
+                crate::grant_cleanup_operation::CleanupAdmission::Admitted(owner) => owner,
+                crate::grant_cleanup_operation::CleanupAdmission::Existing(_) => {
+                    panic!("already admitted")
+                }
+            }
+        }
+
+        fn snapshot(&self) -> (String, Option<String>, Option<String>) {
+            self.store.with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT cleanup_state,cleanup_error,cleanup_updated_at FROM external_workdir_grants
+                     WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            }).unwrap()
+        }
+
+        fn detach(&self) {
+            self.store
+                .detach_worker_workdir_connection(
+                    &self.link.workspace_id,
+                    &self.link.worker,
+                    &self.link.alias,
+                    &self.link.connection_id,
+                    "5",
+                )
+                .unwrap();
+        }
+    }
+
+    fn cleanup_store_failure(
+        reason: workdir::management_failure::WorkdirManagementReason,
+    ) -> protocol::background_failure::BackgroundFailure {
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementVisibility,
+        };
+        let facts = error_contract::FailureFacts::new(WorkdirManagementFailure {
+            operation: WorkdirManagementOperation::GrantRevoke,
+            reason,
+        })
+        .unwrap();
+        let projected = error_contract::project_failure::<error_contract::Storage, _>(
+            &facts,
+            &WorkdirManagementVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+        protocol::background_failure::BackgroundFailure::from_projected(&projected).unwrap()
+    }
+
+    #[test]
+    fn external_workdir_cleanup_intent_exact_preimage_rejects_stale_appends() {
+        use protocol::background_failure::StoredFailure;
+        use workdir::management_failure::WorkdirManagementReason as Reason;
+        let fixture = CleanupStoreFixture::new();
+        let intent = fixture
+            .store
+            .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+            .unwrap()
+            .unwrap();
+        let failure = cleanup_store_failure(Reason::GrantAuditFailed);
+        let saved = fixture
+            .store
+            .append_external_workdir_cleanup_intent_failures(
+                &intent,
+                std::slice::from_ref(&failure),
+                "same-time",
+            )
+            .unwrap();
+        let snapshot = fixture.snapshot();
+        assert!(matches!(
+            fixture
+                .store
+                .append_external_workdir_cleanup_intent_failures(
+                    &intent,
+                    std::slice::from_ref(&failure),
+                    "same-time",
+                ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(fixture.snapshot(), snapshot);
+        assert_eq!(
+            saved.failures(),
+            vec![StoredFailure::from_storage(failure.as_storage_str().into())]
+        );
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+                .unwrap()
+                .unwrap()
+                .failures(),
+            saved.failures()
+        );
+        assert_eq!(snapshot.0, "pending");
+        assert!(
+            fixture
+                .store
+                .external_workdir_cleanup_operation("cleanup-ws", "grant-a")
+                .unwrap()
+                .is_none()
+        );
+        let debug = format!("{saved:?}");
+        assert!(!debug.contains("cleanup-ws"));
+        assert!(!debug.contains(failure.as_storage_str()));
+
+        // Semantic equality is not an exact committed preimage.
+        fixture.store.with_conn(|conn| {
+            conn.execute("UPDATE external_workdir_grants SET cleanup_error=cleanup_error || ' ' WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'", [])?;
+            Ok(())
+        }).unwrap();
+        let reformatted = fixture.snapshot();
+        assert!(matches!(
+            fixture
+                .store
+                .append_external_workdir_cleanup_intent_failures(&saved, &[failure], "same-time",),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(fixture.snapshot(), reformatted);
+        assert!(
+            fixture
+                .store
+                .external_workdir_cleanup_intent("other-workspace", "grant-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn external_workdir_cleanup_intent_failures_survive_begin_without_dispatch_authority() {
+        use protocol::background_failure::StoredFailure;
+        use workdir::management_failure::WorkdirManagementReason as Reason;
+        let fixture = CleanupStoreFixture::new();
+        let intent = fixture
+            .store
+            .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+            .unwrap()
+            .unwrap();
+        let audit = cleanup_store_failure(Reason::GrantAuditFailed);
+        let generation = cleanup_store_failure(Reason::GrantAttachmentReleaseFailed);
+        let intent = fixture
+            .store
+            .append_external_workdir_cleanup_intent_failures(
+                &intent,
+                std::slice::from_ref(&audit),
+                "4",
+            )
+            .unwrap();
+        let owner = match fixture
+            .store
+            .begin_external_workdir_cleanup_operation(
+                &fixture.request,
+                std::slice::from_ref(&generation),
+                "4",
+            )
+            .unwrap()
+        {
+            crate::grant_cleanup_operation::CleanupAdmission::Admitted(owner) => owner,
+            _ => panic!("fresh intent must admit once"),
+        };
+        assert_eq!(
+            owner.operation().failures(),
+            vec![
+                StoredFailure::from_storage(audit.as_storage_str().into()),
+                StoredFailure::from_storage(generation.as_storage_str().into()),
+            ]
+        );
+        assert!(!owner.operation().release_confirmed);
+        assert!(!owner.operation().runtime_dispatched);
+        assert_eq!(owner.operation().runtime_status, None);
+        assert!(!owner.operation().settled);
+        let snapshot = fixture.snapshot();
+        assert!(matches!(
+            fixture
+                .store
+                .append_external_workdir_cleanup_intent_failures(&intent, &[audit], "4",),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(fixture.snapshot(), snapshot);
+        assert!(
+            fixture
+                .store
+                .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_observation("cleanup-ws", "grant-a")
+                .unwrap()
+                .1,
+            owner.operation().failures()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_operation("cleanup-ws", "grant-a")
+                .unwrap()
+                .unwrap()
+                .operation(),
+            owner.operation()
+        );
+    }
+
+    #[test]
+    fn external_workdir_cleanup_intent_rejects_changed_grant_binding() {
+        for change in [
+            "provider_instance_id='provider-b'",
+            "generation=2",
+            "status='offline'",
+        ] {
+            let fixture = CleanupStoreFixture::new();
+            let intent = fixture
+                .store
+                .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+                .unwrap()
+                .unwrap();
+            fixture.store.with_conn(|conn| {
+                conn.execute(&format!("UPDATE external_workdir_grants SET {change} WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'"), [])?;
+                Ok(())
+            }).unwrap();
+            let snapshot = fixture.snapshot();
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .append_external_workdir_cleanup_intent_failures(
+                        &intent,
+                        &[cleanup_store_failure(
+                            workdir::management_failure::WorkdirManagementReason::GrantAuditFailed
+                        )],
+                        "4",
+                    ),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .external_workdir_cleanup_intent("cleanup-ws", "grant-a"),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_release_rejects_detached_alias_and_connection_aba() {
+        for change in ["detached", "reused_alias", "reconnected"] {
+            let fixture = CleanupStoreFixture::new();
+            let owner = fixture.admit();
+            fixture
+                .store
+                .validate_external_workdir_cleanup_release(&owner)
+                .unwrap();
+            fixture.detach();
+            if change != "detached" {
+                let mut replacement = fixture.link.clone();
+                replacement.linked_at = "6".into();
+                if change == "reused_alias" {
+                    replacement.workdir_id = "external-b".into();
+                }
+                let replacement = fixture.store.attach_worker_workdir(&replacement).unwrap();
+                assert_ne!(replacement.connection_id, fixture.link.connection_id);
+            }
+            let snapshot = fixture.snapshot();
+            let links = fixture
+                .store
+                .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                .unwrap();
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .validate_external_workdir_cleanup_release(&owner),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .confirm_external_workdir_cleanup_release(&owner, "7"),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+            assert_eq!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap(),
+                links
+            );
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_release_rejects_stale_preimage_and_grant_binding() {
+        for change in [
+            "provider_instance_id='provider-b'",
+            "generation=2",
+            "status='offline'",
+            "diagnostic_append",
+        ] {
+            let fixture = CleanupStoreFixture::new();
+            let owner = fixture.admit();
+            if change == "diagnostic_append" {
+                fixture
+                    .store
+                    .append_external_workdir_cleanup_failures(
+                        &owner,
+                        &[cleanup_store_failure(
+                            workdir::management_failure::WorkdirManagementReason::GrantAuditFailed,
+                        )],
+                        "5",
+                    )
+                    .unwrap();
+            } else {
+                fixture.store.with_conn(|conn| {
+                    conn.execute(&format!("UPDATE external_workdir_grants SET {change} WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'"), [])?;
+                    Ok(())
+                }).unwrap();
+            }
+            let snapshot = fixture.snapshot();
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .validate_external_workdir_cleanup_release(&owner),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .confirm_external_workdir_cleanup_release(&owner, "6"),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+            assert_eq!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap(),
+                vec![fixture.link]
+            );
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_release_confirmation_rolls_back_and_rejects_zero_unlinks() {
+        for trigger in [
+            "CREATE TEMP TRIGGER cleanup_fail BEFORE UPDATE OF cleanup_error ON external_workdir_grants BEGIN SELECT RAISE(FAIL,'injected cleanup persistence failure'); END;",
+            "CREATE TEMP TRIGGER cleanup_fail BEFORE UPDATE OF unlinked_at ON worker_workdir_links BEGIN SELECT RAISE(IGNORE); END;",
+        ] {
+            let fixture = CleanupStoreFixture::new();
+            let owner = fixture.admit();
+            fixture
+                .store
+                .validate_external_workdir_cleanup_release(&owner)
+                .unwrap();
+            let snapshot = fixture.snapshot();
+            fixture
+                .store
+                .with_conn(|conn| {
+                    conn.execute_batch(trigger)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .confirm_external_workdir_cleanup_release(&owner, "5")
+                    .is_err()
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+            assert_eq!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap(),
+                vec![fixture.link.clone()]
+            );
+            fixture
+                .store
+                .with_conn(|conn| {
+                    conn.execute_batch("DROP TRIGGER cleanup_fail;")?;
+                    Ok(())
+                })
+                .unwrap();
+            let released = fixture
+                .store
+                .confirm_external_workdir_cleanup_release(&owner, "6")
+                .unwrap();
+            assert!(released.operation().release_confirmed);
+            assert!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .external_workdir_cleanup_operation("cleanup-ws", "grant-a")
+                    .unwrap()
+                    .unwrap()
+                    .operation(),
+                released.operation()
+            );
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_released_operation_keeps_diagnostics_replay_and_receipt_settlement()
+    {
+        use crate::hosts::RuntimeOperationStatus;
+        let fixture = CleanupStoreFixture::new();
+        let owner = fixture.admit();
+        let released = fixture
+            .store
+            .confirm_external_workdir_cleanup_release(&owner, "5")
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .validate_external_workdir_cleanup_release(&released)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                .unwrap()
+                .is_empty()
+        );
+        let saved = fixture
+            .store
+            .append_external_workdir_cleanup_failures(
+                &released,
+                &[cleanup_store_failure(
+                    workdir::management_failure::WorkdirManagementReason::GrantAuditFailed,
+                )],
+                "6",
+            )
+            .unwrap();
+        let replay = match fixture
+            .store
+            .begin_external_workdir_cleanup_operation(&fixture.request, &[], "7")
+            .unwrap()
+        {
+            crate::grant_cleanup_operation::CleanupAdmission::Existing(owner) => owner,
+            _ => panic!("release replay must not admit a new owner"),
+        };
+        assert_eq!(replay.operation(), saved.operation());
+        assert!(replay.operation().release_confirmed);
+        let dispatched = fixture
+            .store
+            .mark_external_workdir_cleanup_runtime_dispatched(&replay, "8")
+            .unwrap();
+        let observed = fixture
+            .store
+            .record_external_workdir_cleanup_runtime_observation(
+                &dispatched,
+                RuntimeOperationStatus::Unknown,
+                &[],
+                "9",
+            )
+            .unwrap();
+        let worker_ref = runtime_api::WorkerRef {
+            worker_id: fixture.link.worker.worker_id.parse().unwrap(),
+        };
+        let request = fixture.request.runtime_request().unwrap();
+        let proof = runtime_api::WorkerWorkdirAttachmentsOperationObservation {
+            worker_ref: worker_ref.clone(),
+            request: request.clone(),
+            result: runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Receipt {
+                receipt: runtime_api::WorkerWorkdirAttachmentsOperationReceipt {
+                    worker_ref,
+                    request,
+                    resulting_generation: "runtime-generation-after".into(),
+                },
+            },
+            current_generation: Some("runtime-generation-after".into()),
+        };
+        let settled = fixture
+            .store
+            .settle_external_workdir_cleanup_operation(&observed, Some(&proof), "10")
+            .unwrap();
+        assert!(settled.operation().settled);
+        assert_eq!(
+            settled.operation().runtime_status,
+            Some(RuntimeOperationStatus::Unknown)
+        );
+        assert_eq!(settled.operation().failures(), saved.operation().failures());
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_observation("cleanup-ws", "grant-a")
+                .unwrap(),
+            ("completed".into(), saved.operation().failures())
         );
     }
 

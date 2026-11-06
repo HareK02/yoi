@@ -7,16 +7,16 @@
 use super::*;
 use rusqlite::params;
 use server_api::{
-    DriveApiError, DriveApiErrorCode, DriveGrantCreateRequest, DriveGrantListQuery,
-    DriveGrantListResponse, DriveGrantResponse, ServerRequestContext,
+    DriveApiErrorCode, DriveGrantCreateRequest, DriveGrantListQuery, DriveGrantListResponse,
+    DriveGrantResponse, DriveHttpApiError, ServerRequestContext,
 };
 
-type DriveResult<T> = std::result::Result<T, DriveApiError>;
-fn fail(code: DriveApiErrorCode) -> DriveApiError {
-    DriveApiError::new(code)
+type DriveResult<T> = std::result::Result<T, DriveHttpApiError>;
+fn fail(code: DriveApiErrorCode) -> DriveHttpApiError {
+    DriveHttpApiError::new(code)
 }
 
-pub(super) fn pre_error(error: impl Into<ApiError>) -> DriveApiError {
+pub(super) fn pre_error(error: impl Into<ApiError>) -> DriveHttpApiError {
     let error = error.into();
     fail(match api_error_status(&error.error).as_u16() {
         401 | 403 => DriveApiErrorCode::Denied,
@@ -27,7 +27,7 @@ pub(super) fn pre_error(error: impl Into<ApiError>) -> DriveApiError {
         _ => DriveApiErrorCode::Invalid,
     })
 }
-fn mutation_error(error: Error) -> DriveApiError {
+fn mutation_error(error: Error) -> DriveHttpApiError {
     if matches!(
         error,
         Error::Sqlite(_) | Error::Store(_) | Error::DbOperationOutcomeUnknown

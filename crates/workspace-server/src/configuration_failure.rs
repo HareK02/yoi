@@ -37,7 +37,7 @@ fn tree_reason(source: &ConfigTreeError) -> ConfigurationFailureReason {
 pub struct ConfigurationFailure {
     details: ConfigurationFailureDetails,
     #[source]
-    source: Option<ConfigTreeError>,
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
 impl ConfigurationFailure {
@@ -58,7 +58,20 @@ impl ConfigurationFailure {
                 operation,
                 reason: tree_reason(&source),
             },
-            source: Some(source),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    pub(crate) fn from_publication(
+        reason: ConfigurationFailureReason,
+        source: crate::Error,
+    ) -> Self {
+        Self {
+            details: ConfigurationFailureDetails {
+                operation: ConfigurationFailureOperation::Publication,
+                reason,
+            },
+            source: Some(Box::new(source)),
         }
     }
 
@@ -72,7 +85,7 @@ impl ConfigurationFailure {
     }
 
     pub fn source_error(&self) -> Option<&ConfigTreeError> {
-        self.source.as_ref()
+        self.source.as_ref()?.downcast_ref()
     }
 }
 

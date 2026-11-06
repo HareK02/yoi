@@ -4,6 +4,7 @@
   import { readBoundedJson, workspaceApiPath } from '#lib/workspace/api/http.ts';
   import {
     parseWorkingDirectoryCreateResponse,
+    workdirManagementResponseError,
     validateWorkingDirectoryCreateRequest,
   } from '#lib/workspace/api/workdirs.ts';
   import {
@@ -285,7 +286,8 @@
         },
       );
       if (!response.ok) {
-        submitError = await responseDisplayError(response, 'workdir create failed');
+        const error = await workdirManagementResponseError(response, 'create');
+        submitError = { message: error.message, diagnostics: [] };
         return;
       }
       const payload = parseWorkingDirectoryCreateResponse(await response.json());

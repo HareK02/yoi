@@ -58,7 +58,7 @@ pub(crate) async fn execute_glob(
     target: crate::search_target::SearchTarget,
     path: WorkdirPath,
     pattern: String,
-) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+) -> Result<crate::checkout::CheckoutToolOutput, crate::WorkdirToolError> {
     tracing::debug!(%pattern, %path, "Glob");
     let result = target
         .glob(GlobRequest {

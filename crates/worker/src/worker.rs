@@ -678,6 +678,9 @@ pub struct WorkspaceBinaryRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBinaryResponse {
     pub status: u16,
+    /// Received media type, with the same absent/invalid semantics as JSON transport.
+    /// Binary failures may be Problem Details; body shape never supplies metadata.
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -699,6 +702,9 @@ pub enum WorkspaceRequestMethod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceResponse {
     pub status: u16,
+    /// Media type of this body. Raw HTTP clients retain the received header;
+    /// absent or invalid metadata must not be inferred from JSON contents.
+    pub content_type: Option<String>,
     pub body: String,
 }
 
@@ -1633,10 +1639,27 @@ fn execute_test_workspace_http(
         .send()
         .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
     let status = response.status().as_u16();
+    let mut values = response
+        .headers()
+        .get_all(reqwest::header::CONTENT_TYPE)
+        .iter();
+    let content_type = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let content_type = if values.next().is_none() {
+        content_type
+    } else {
+        None
+    };
     let body = response
         .text()
         .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
-    Ok(WorkspaceResponse { status, body })
+    Ok(WorkspaceResponse {
+        content_type,
+        status,
+        body,
+    })
 }
 
 #[derive(Debug)]
@@ -1751,6 +1774,7 @@ mod operation_authorization_tests {
     async fn authorization_is_bounded_live_and_contains_no_caller_identity() {
         let client = BoundClient {
             response: Mutex::new(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             }),
@@ -1763,6 +1787,7 @@ mod operation_authorization_tests {
             .authorize_operation("ticket.create", &resource)
             .unwrap();
         *client.response.lock().unwrap() = WorkspaceResponse {
+            content_type: None,
             status: 403,
             body: r#"{"message":"permission revoked","diagnostics":[{"message":"private"}]}"#
                 .into(),
@@ -1800,6 +1825,7 @@ mod operation_authorization_tests {
             ] {
                 let client = BoundClient {
                     response: Mutex::new(WorkspaceResponse {
+                        content_type: None,
                         status,
                         body: body.into(),
                     }),
@@ -1832,6 +1858,7 @@ mod operation_authorization_tests {
         };
         let client = BoundClient {
             response: Mutex::new(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope":granted}).to_string(),
             }),
@@ -1844,6 +1871,7 @@ mod operation_authorization_tests {
             Some(granted)
         );
         *client.response.lock().unwrap() = WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::json!({"scope":{"kind":"workspace","workspace_id":"workspace/test"}})
                 .to_string(),
@@ -1864,6 +1892,7 @@ mod operation_authorization_tests {
         };
         let inner = Arc::new(BoundClient {
             response: Mutex::new(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope":scope}).to_string(),
             }),
@@ -1903,6 +1932,7 @@ mod operation_authorization_tests {
             "only the bounded authorization query reaches the Host"
         );
         *inner.response.lock().unwrap() = WorkspaceResponse {
+            content_type: None,
             status: 403,
             body: "{}".into(),
         };
@@ -1921,7 +1951,11 @@ mod operation_authorization_tests {
             " ".repeat(16 * 1024 + 1),
         ] {
             let client = BoundClient {
-                response: Mutex::new(WorkspaceResponse { status: 200, body }),
+                response: Mutex::new(WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body,
+                }),
                 requests: Default::default(),
             };
             assert!(
@@ -1961,6 +1995,7 @@ mod reviewer_client_tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().expect("recording lock").push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             })
@@ -2022,6 +2057,7 @@ mod reviewer_client_tests {
         ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push((request, None));
             Ok(WorkspaceBinaryResponse {
+                content_type: None,
                 status: 200,
                 body: vec![0, 255],
             })
@@ -2033,6 +2069,7 @@ mod reviewer_client_tests {
         ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push((request, Some(timeout)));
             Ok(WorkspaceBinaryResponse {
+                content_type: None,
                 status: 200,
                 body: vec![0, 255],
             })
@@ -6887,6 +6924,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 identity: invocation.identity.clone(),
                 status,
                 message,
+                failure: None,
                 context: None,
             };
             let handle = self.pending_submission_handle();
@@ -6924,13 +6962,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         "invocation id was already used with a different payload".into(),
                     )
                 } else {
-                    let replay = receipt.result.clone().unwrap_or_else(|| {
+                    let mut replay = receipt.result.clone().unwrap_or_else(|| {
                         failed(
                             FeatureInvocationStatus::OutcomeUnknown,
                             "a durable invocation start has no result; do not retry automatically"
                                 .into(),
                         )
                     });
+                    self.feature_invocations
+                        .redisclose_failure(invocation, &mut replay);
                     if replay.status == FeatureInvocationStatus::Succeeded {
                         // Recorded success is reusable context, not authority to
                         // resurrect a removed capability or revoked argument
@@ -6944,7 +6984,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     }
                 }
             } else if let Err(error) = self.feature_invocations.validate(invocation) {
-                failed(FeatureInvocationStatus::Failed, error.message)
+                let mut result = failed(FeatureInvocationStatus::Failed, error.message);
+                result.failure = error.failure;
+                result
             } else {
                 let started = {
                     let _append = handle
@@ -6977,14 +7019,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 } else {
                     match self.feature_invocations.invoke(invocation).await {
                         Ok(result) => result,
-                        Err(error) => failed(
-                            if error.outcome_unknown {
-                                FeatureInvocationStatus::OutcomeUnknown
-                            } else {
-                                FeatureInvocationStatus::Failed
-                            },
-                            error.message,
-                        ),
+                        Err(error) => {
+                            let mut result = failed(
+                                if error.outcome_unknown {
+                                    FeatureInvocationStatus::OutcomeUnknown
+                                } else {
+                                    FeatureInvocationStatus::Failed
+                                },
+                                error.message,
+                            );
+                            result.failure = error.failure;
+                            result
+                        }
                     }
                 }
             };
@@ -12345,7 +12391,8 @@ mod build_summary_prompt_tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             if request.path.ends_with("/authorization/check") {
                 return Ok(WorkspaceResponse {
-                    status: 200,
+                    content_type: None,
+status: 200,
                     body: serde_json::json!({"scope": {"kind":"workspace", "workspace_id":"workspace-test"}}).to_string(),
                 });
             }
@@ -12357,6 +12404,7 @@ mod build_summary_prompt_tests {
             ));
             self.load_count.fetch_add(1, Ordering::SeqCst);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&server_api::MemoryBackendResponse(
                     memory::backend::MemoryBackendHttpResponse::Ok {
@@ -12422,7 +12470,8 @@ mod build_summary_prompt_tests {
                     "memory.resident.read" | "memory.resident.supply"
                 ));
                 return Ok(WorkspaceResponse {
-                    status: 200,
+                    content_type: None,
+status: 200,
                     body: serde_json::json!({"scope": {"kind":"subject", "workspace_id":"workspace-test", "subject_id":"subject-fixture"}}).to_string(),
                 });
             }
@@ -12434,6 +12483,7 @@ mod build_summary_prompt_tests {
             ));
             self.load_count.fetch_add(1, Ordering::SeqCst);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(
                     &server_api::SubjektivMemoryBackendResponse::ResidentContext(
@@ -12781,6 +12831,7 @@ mod build_summary_prompt_tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             if request.path.ends_with("/authorization/check") {
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: "{}".into(),
                 });
@@ -12819,6 +12870,7 @@ mod build_summary_prompt_tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             if request.path.ends_with("/authorization/check") {
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: "{}".into(),
                 });
@@ -12852,6 +12904,7 @@ mod build_summary_prompt_tests {
                 definition,
             };
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&source).unwrap(),
             })
@@ -13207,6 +13260,7 @@ mod build_summary_prompt_tests {
                     "connection closed after request send".to_string(),
                 )),
                 AttributionOutcome::Unauthorized => Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 401,
                     body: serde_json::to_string(&server_api::RepositoryApiError::new(
                         401,
@@ -13217,6 +13271,7 @@ mod build_summary_prompt_tests {
                     .unwrap(),
                 }),
                 AttributionOutcome::Rejected => Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 403,
                     body: serde_json::to_string(
                         &server_api::RepositoryApiError::new(
@@ -13240,6 +13295,7 @@ mod build_summary_prompt_tests {
                     let input: server_api::SubjektivRecordSessionRequest =
                         serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                     Ok(WorkspaceResponse {
+                        content_type: None,
                         status: 200,
                         body: serde_json::to_string(&server_api::SubjektivRecordSessionResponse {
                             subject_id: "subject-test".to_string(),
@@ -19265,6 +19321,7 @@ permission = "write"
                 identity: invocation.identity.clone(),
                 status: protocol::FeatureInvocationStatus::Succeeded,
                 message: "done".into(),
+                failure: None,
                 context: Some("prepared recovery context".into()),
             })
         }
@@ -20066,6 +20123,7 @@ permission = "write"
                 identity: invocation.identity.clone(),
                 status: protocol::FeatureInvocationStatus::Succeeded,
                 message: "done".into(),
+                failure: None,
                 context: None,
             })
             .unwrap();
@@ -20077,6 +20135,7 @@ permission = "write"
                 identity: invocation.identity.clone(),
                 status: protocol::FeatureInvocationStatus::Succeeded,
                 message: "done".into(),
+                failure: None,
                 context: Some("x".repeat(16385)),
             })
             .unwrap();
@@ -21156,6 +21215,7 @@ permission = "write"
             self.requests.lock().unwrap().push(request);
             match *self.response_status.lock().unwrap() {
                 Some(status) => Ok(WorkspaceResponse {
+                    content_type: None,
                     status,
                     body: if status == 200 {
                         r#"{"scope":null}"#.into()
@@ -21442,6 +21502,7 @@ permission = "write"
                         }
                     );
                     return Ok(WorkspaceResponse {
+                        content_type: None,
                         status: self.status.load(Ordering::SeqCst) as u16,
                         body: if self.status.load(Ordering::SeqCst) == 200 {
                             serde_json::json!({"scope": input.resource}).to_string()
@@ -22039,6 +22100,7 @@ permission = "write"
                         .push(input.operation.clone());
                     let allowed = self.allowed.lock().unwrap().contains(&input.operation);
                     return Ok(WorkspaceResponse {
+                        content_type: None,
                         status: if allowed { 200 } else { 403 },
                         body: if allowed {
                             serde_json::json!({"scope": {"kind":"subject", "workspace_id":"workspace-test", "subject_id":"subject-fixture"}}).to_string()
@@ -22061,6 +22123,7 @@ permission = "write"
                     omitted: !startup || self.startup_protected,
                 };
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&snapshot).unwrap(),
                 })

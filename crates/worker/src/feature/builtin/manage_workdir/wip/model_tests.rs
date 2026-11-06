@@ -45,6 +45,7 @@ impl WorkspaceClient for ContentClient {
                 .contains("workdir.attachment.read")
         {
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 403,
                 body: "denied".into(),
             });
@@ -58,6 +59,7 @@ impl WorkspaceClient for ContentClient {
                 .push(request.clone());
             if self.content_denied.load(Ordering::SeqCst) {
                 return Ok(WorkspaceResponse {
+                    content_type: Some("application/json".into()),
                     status: 403,
                     body: serde_json::to_string(
                         &workdir::http::WorkdirTransportError::from_workdir_error(
@@ -126,6 +128,7 @@ impl WorkspaceClient for ContentClient {
                 || self.content_denied.load(Ordering::SeqCst)
             {
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 403,
                     body: "denied".into(),
                 });
@@ -189,6 +192,7 @@ impl WorkspaceClient for ContentClient {
 }
 fn reply(value: &impl serde::Serialize) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: serde_json::to_string(value).unwrap(),
     }

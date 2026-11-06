@@ -105,6 +105,7 @@ impl Model {
 
 fn response(body: Json) -> crate::worker::WorkspaceResponse {
     crate::worker::WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: body.to_string(),
     }
@@ -147,6 +148,7 @@ fn ticket_detail() -> crate::worker::WorkspaceResponse {
 
 fn error_response(status: u16) -> crate::worker::WorkspaceResponse {
     crate::worker::WorkspaceResponse {
+        content_type: None,
         status,
         body: "unavailable".into(),
     }

@@ -64,6 +64,7 @@ pub fn generated_protocol_types() -> String {
          // Large integer fields are JSON numbers on the wire and are emitted as TypeScript `number`.\n\n",
     );
 
+    push_decl::<crate::control_failure::RuntimeControlCause>(&cfg, &mut output);
     push_decl::<crate::startup_failure::StartupFailureAttachment>(&cfg, &mut output);
     push_decl::<crate::startup_failure::StoredStartupFailureAttachment>(&cfg, &mut output);
     push_decl::<crate::startup_failure::StartupStage>(&cfg, &mut output);

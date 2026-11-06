@@ -51,7 +51,7 @@ impl Fixture {
         path: &str,
         name: &str,
         arguments: Value,
-    ) -> Result<CheckoutToolOutput, ToolError> {
+    ) -> Result<CheckoutToolOutput, WorkdirToolError> {
         let (generation, validator) = self.observation(alias, path).await;
         execute_checkout_tool(
             self.router.clone(),
@@ -212,7 +212,7 @@ async fn list_with_provider(
     capabilities: workdir::WorkdirSessionCapabilities,
     result: workdir::CheckoutSearchResult,
     change_validator: bool,
-) -> Result<CheckoutToolOutput, ToolError> {
+) -> Result<CheckoutToolOutput, WorkdirToolError> {
     list_with_provider_after(capabilities, result, change_validator, None).await
 }
 
@@ -221,7 +221,7 @@ async fn list_with_provider_after(
     result: workdir::CheckoutSearchResult,
     change_validator: bool,
     after: Option<workdir::ListCursor>,
-) -> Result<CheckoutToolOutput, ToolError> {
+) -> Result<CheckoutToolOutput, WorkdirToolError> {
     let router = Arc::new(WorkdirSessionRouter::new());
     router
         .attach(
@@ -290,6 +290,8 @@ async fn checkout_list_uses_read_capability_and_checked_search_without_prefetch(
     .await
     .err()
     .unwrap();
+    let (error, failure) = error.into_parts();
+    assert!(failure.is_none());
     assert!(matches!(error, ToolError::InvalidArgument(_)));
     assert!(error.to_string().contains("Read"));
 }
@@ -405,11 +407,18 @@ async fn checkout_list_rejects_missing_or_mismatched_truncated_continuations() {
     }
 }
 
-fn assert_checkout_stale(error: ToolError) {
+fn assert_checkout_stale(error: impl Into<WorkdirToolError>) {
     assert_checkout_code(error, "checkout_stale");
 }
 
-fn assert_checkout_code(error: ToolError, expected: &str) {
+fn assert_checkout_code(error: impl Into<WorkdirToolError>, expected: &str) {
+    let (error, failure) = error.into().into_parts();
+    if let Some(failure) = failure {
+        let report: Value = serde_json::from_str(failure.content.as_ref().unwrap()).unwrap();
+        assert_eq!(report["result"]["error_class"], "structured_conflict");
+        assert_eq!(report["result"]["conflict_code"], expected);
+        assert_eq!(report["result"]["mutation"], "not_reported");
+    }
     match error {
         ToolError::StructuredConflict { code, .. } => assert_eq!(code, expected),
         other => panic!("expected {expected} structured conflict, got {other:?}"),
@@ -511,7 +520,9 @@ fn checkout_conflict_classification_preserves_normal_tools_and_unknown_outcomes(
     assert!(matches!(
         crate::file_target::checked_error(workdir::WorkdirError::OutcomeUnknown(
             "may have committed".into()
-        )),
+        ))
+        .into_parts()
+        .0,
         ToolError::ExecutionFailed(_)
     ));
 }
@@ -526,7 +537,7 @@ fn checkout_ambiguous_transport_and_operation_failures_remain_unknown() {
         WorkdirError::OperationFailed,
     ] {
         assert!(matches!(
-            crate::file_target::checked_error(error),
+            crate::file_target::checked_error(error).into_parts().0,
             ToolError::ExecutionFailed(_)
         ));
     }
@@ -828,6 +839,8 @@ async fn checkout_rejects_argument_overrides_and_escapes() {
             .await
             .err()
             .unwrap();
+        let (error, failure) = error.into_parts();
+        assert!(failure.is_none());
         assert!(
             matches!(error, ToolError::InvalidArgument(_)),
             "{name}: {error}"
@@ -1032,6 +1045,8 @@ async fn checkout_list_rejects_route_overrides_malformed_limits_and_nonchild_cur
             .await
             .err()
             .unwrap();
+        let (error, failure) = error.into_parts();
+        assert!(failure.is_none());
         assert!(
             matches!(error, ToolError::InvalidArgument(_)),
             "{arguments}: {error}"

@@ -9,6 +9,8 @@
 //! They use RAII temporary roots and existing image fixtures; command cases require the
 //! same local shell as the Bash suite and run in the normal `tools --test integration` target.
 
+mod common;
+use common::{workdir_failure, workdir_report};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -794,15 +796,25 @@ async fn scoped_tools_reject_parent_traversal_and_paths_outside_the_grant() {
         ),
     ] {
         let error = call_err(&fixture.reg.get(name), input).await;
-        let message = error.to_string();
-        assert!(
-            matches!(error, ToolError::InvalidArgument(_)),
-            "{name}: {message}"
+        let ToolError::ExecutionFailure(output) = error else {
+            panic!("{name}: missing Workdir cause report")
+        };
+        let report: serde_json::Value =
+            serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(report["failure"]["domain"], "workdir", "{name}");
+        assert_eq!(
+            report["result"]["error_class"], "invalid_argument",
+            "{name}"
         );
-        assert!(
-            message.contains("scope") || message.contains("path"),
-            "{name}: {message}"
-        );
+        assert_eq!(report["result"]["mutation"], "not_reported", "{name}");
+        // Search may reject absolute coordinates before delegated authorization;
+        // its invalid-request result must not be relabeled as a scope denial.
+        if name == "Read" {
+            assert_eq!(
+                report["failure"]["details"]["denial_reason"],
+                "delegated_scope_exceeded"
+            );
+        }
     }
     assert_eq!(
         std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
@@ -1196,12 +1208,11 @@ async fn external_view_image_rejects_truncated_and_cross_version_chunks() {
         mutate_after_first_binary_response: None,
     });
     let (_meta, tool) = view_image_tool(truncated)();
-    let error = call_err(&tool, json!({ "path": "image.png" }))
-        .await
-        .to_string();
-    assert!(
-        error.contains("truncated") || error.contains("partial"),
-        "{error}"
+    let error = call_err(&tool, json!({ "path": "image.png" })).await;
+    let report = workdir_failure(error, "transport", "execution_failed");
+    assert_eq!(
+        report["failure"]["details"]["failure_reason"],
+        "operation_result_mismatch"
     );
 
     let large = valid_gif_with_len(1024 * 1024 + 32);
@@ -1239,10 +1250,13 @@ async fn view_image_enforces_the_ten_mib_boundary_without_partial_attachments() 
 
     image.push(0);
     std::fs::write(dir.path().join("boundary.gif"), image).unwrap();
-    let error = call_err(&tool, json!({ "path": "boundary.gif" }))
-        .await
-        .to_string();
-    assert!(error.contains("10485760-byte limit"), "{error}");
+    let error = call_err(&tool, json!({ "path": "boundary.gif" })).await;
+    assert!(error.to_string().contains("binary read limit"));
+    let report = workdir_report(error, "invalid_request");
+    assert_eq!(
+        report["failure"]["details"]["failure_reason"],
+        "read_limit_exceeded"
+    );
 }
 
 #[tokio::test]

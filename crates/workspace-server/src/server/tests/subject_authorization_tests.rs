@@ -448,6 +448,7 @@ impl WorkspaceClient for RouterClient {
                 .await
                 .map_err(|e| WorkspaceClientError::Request(e.to_string()))?;
             Ok(WorkspaceResponse {
+                content_type: None,
                 status,
                 body: String::from_utf8(bytes.to_vec())
                     .map_err(|e| WorkspaceClientError::Request(e.to_string()))?,

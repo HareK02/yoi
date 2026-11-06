@@ -144,13 +144,22 @@ pub enum CleanupFailure {
 pub struct CleanupProviderFailure {
     pub failure_reason: Option<workdir::WorkdirFailureReason>,
     pub denial_reason: Option<workdir::WorkdirDenialReason>,
+    /// A status-neutral Tool projection for this cleanup only; not the command result.
+    pub cause: Option<agen::tool::ToolOutput>,
 }
 
-impl From<&workdir::WorkdirError> for CleanupProviderFailure {
-    fn from(error: &workdir::WorkdirError) -> Self {
+impl CleanupProviderFailure {
+    pub(crate) fn new(
+        operation: workdir::failure::WorkdirFailureOperation,
+        error: workdir::WorkdirError,
+    ) -> Self {
+        let failure_reason = error.failure_reason();
+        let denial_reason = error.denial_reason();
+        let (_, cause) = crate::WorkdirToolError::operation(operation, error).into_parts();
         Self {
-            failure_reason: error.failure_reason(),
-            denial_reason: error.denial_reason(),
+            failure_reason,
+            denial_reason,
+            cause,
         }
     }
 }

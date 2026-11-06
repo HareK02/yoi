@@ -128,6 +128,10 @@ fn stop_termination_real_join_survives_fs_reopen_rejects_replacement_and_legacy_
     // preserve status/observation but must not reconstruct shutdown from them.
     let mut legacy = document;
     legacy["schema_version"] = serde_json::json!(15);
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("workdir_attachments_guard");
     legacy["restore_guard"]
         .as_object_mut()
         .unwrap()

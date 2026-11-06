@@ -637,7 +637,7 @@ impl WorkspaceWorker {
             }
             // Admission owns the exact pending stop before releasing the Subject
             // gate. Execution may call back into Session/Journal/Subject services.
-            let result = worker
+            let mut result = worker
                 .api
                 .runtime
                 .stop_worker(&worker.identity, request)
@@ -663,17 +663,28 @@ impl WorkspaceWorker {
             let _session = current_worker_session_lock(&worker.api, &worker.identity)
                 .lock_owned()
                 .await;
-            close_observed_worker_workdir_sessions(
+            if let Err(failure) = close_observed_worker_workdir_sessions(
                 &worker.api.workdir_sessions,
                 &observed_sessions,
             )
             .await
-            .map_err(|message| Error::RuntimeOperationFailed {
-                runtime_id: worker.identity.runtime_id.clone(),
-                code: "workdir_session_close_failed".into(),
-                message,
-            })?;
-            sync_linked_workdir_after_worker_stop(&worker.api, &worker.identity, &observed_links)?;
+            {
+                // Runtime already accepted Stop. Cleanup is independent evidence,
+                // not an outer failure or permission to issue another Stop.
+                result.cleanup_failures.extend(failure.details());
+                return Ok(result);
+            }
+            if let Err(error) = sync_linked_workdir_after_worker_stop(
+                &worker.api,
+                &worker.identity,
+                &observed_links,
+            ) {
+                let failure =
+                    crate::workdir_cleanup_failure::WorkdirCleanupFailure::AttachmentProjection(
+                        Box::new(error.error),
+                    );
+                result.cleanup_failures.extend(failure.details());
+            }
             Ok(result)
         })
         .await

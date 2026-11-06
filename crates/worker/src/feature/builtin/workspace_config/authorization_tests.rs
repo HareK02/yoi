@@ -46,6 +46,26 @@ fn provider_calls(client: &Router, suffix: &str) -> usize {
         .count()
 }
 
+fn assert_native_denial(error: &agen::tool::ToolError) {
+    let agen::tool::ToolError::ExecutionFailure(output) = error else {
+        panic!("native scoped denial must retain its cause")
+    };
+    let report: Json = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(report["result"]["code"], "PermissionDenied");
+    let error_contract::DecodeFailure::Known(cause) =
+        error_contract::decode_failure::<failure::ConfigFailureDetails>(
+            &serde_json::to_vec(&report["failure"]).unwrap(),
+            error_contract::Budget::new(65536, 65536),
+        )
+    else {
+        panic!("native scoped denial cause missing")
+    };
+    assert_eq!(
+        cause.facts().cause().reason,
+        failure::ConfigFailureReason::AuthorizationDenied
+    );
+}
+
 #[tokio::test]
 async fn wip_scoped_read_returns_allowed_content_denies_other_path_and_rechecks_revocation() {
     let client = Router::new();
@@ -76,7 +96,7 @@ async fn wip_scoped_read_returns_allowed_content_denies_other_path_and_rechecks_
     let error = call(&runtime, &format!("{CONTENT_ROOT}/{B}"), "read", json!({}))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("PermissionDenied"), "{error}");
+    assert_native_denial(&error);
     assert!(!error.to_string().contains("model = deep"));
     assert_eq!(
         provider_calls(&client, "/read"),
@@ -101,7 +121,7 @@ async fn wip_scoped_read_returns_allowed_content_denies_other_path_and_rechecks_
     let error = call(&runtime, &format!("{CONTENT_ROOT}/{A}"), "read", json!({}))
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("PermissionDenied"), "{error}");
+    assert_native_denial(&error);
     assert_eq!(
         provider_calls(&client, "/read"),
         1,

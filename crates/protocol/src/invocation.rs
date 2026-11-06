@@ -339,6 +339,10 @@ pub struct FeatureInvocationResult {
     pub identity: FeatureInvocationIdentity,
     pub status: FeatureInvocationStatus,
     pub message: String,
+    /// Optional projected cause, separate from successful preparation context and
+    /// the operation outcome. Redisclosure requires current domain authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<crate::startup_failure::StartupFailureAttachment>,
     /// Bounded model-visible context produced by the handler. Credentials and
     /// executable implementation details must not be included.
     #[serde(default, skip_serializing_if = "Option::is_none")]

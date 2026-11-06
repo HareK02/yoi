@@ -4,6 +4,35 @@ use std::future::Future;
 
 const MANAGEMENT_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
+#[cfg(test)]
+mod attachment_control_tests {
+    use super::*;
+
+    #[test]
+    fn attachment_control_dto_does_not_retain_raw_storage_or_provider_text() {
+        for error in [
+            RuntimeError::StoreCommitOutcomeUnknown {
+                operation: "write Worker aggregate",
+                path: std::path::PathBuf::from("/private/runtime/worker.json"),
+                source: std::io::Error::other("private-provider-token"),
+            },
+            RuntimeError::InvalidRequest(
+                "private-provider-token /private/runtime/worker.json".into(),
+            ),
+        ] {
+            let cause = error.control_cause();
+            let dto = api_error(RuntimeHttpRestError::runtime_control(error));
+            assert_eq!(dto.error.code, cause.reason());
+            assert_eq!(dto.error.message, cause.explanation());
+            assert_eq!(dto.control_cause(), Some(cause));
+            assert!(dto.error.startup.is_none());
+            let serialized = serde_json::to_string(&dto).unwrap();
+            assert!(!serialized.contains("/private/runtime"));
+            assert!(!serialized.contains("private-provider-token"));
+        }
+    }
+}
+
 // Axum request extensions remain the authorization authority. The generated adapter deliberately
 // has no authentication model, so the verified extension is scoped across its service call.
 tokio::task_local! {
@@ -227,6 +256,9 @@ fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
     let mut response =
         runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message);
     response.error.startup = error.startup;
+    if let Some(cause) = error.control {
+        response = response.with_control(cause);
+    }
     response
 }
 
@@ -904,10 +936,83 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 .runtime
                 .replace_worker_workdir_attachments(&worker_ref, attachments),
         }
-        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(RuntimeHttpRestError::runtime_control)
         .map_err(api_error)?;
         let worker = response(worker)?;
         Ok(runtime_api::WorkerResponse { worker })
+    }
+
+    async fn observe_worker_workdir_attachments(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerWorkdirAttachmentsRequest,
+    ) -> Result<runtime_api::WorkerWorkdirAttachmentsObservation, runtime_api::RuntimeApiError>
+    {
+        let attachments = request(value.logical_workdir_attachments.clone())?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let result = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_state_scoped(&scope, &worker_ref, attachments),
+            None => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_state(&worker_ref, attachments),
+        }
+        .map_err(RuntimeHttpRestError::runtime_control)
+        .map_err(api_error)?;
+        // Preserve the caller's exact set ordering in the observation echo.
+        Ok(runtime_api::WorkerWorkdirAttachmentsObservation {
+            request: value,
+            ..result
+        })
+    }
+
+    async fn apply_worker_workdir_attachments_operation(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<runtime_api::WorkerWorkdirAttachmentsOperationReceipt, runtime_api::RuntimeApiError>
+    {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        match auth_workspace_scope(&self.state, auth_extension().as_ref()).map_err(api_error)? {
+            Some(scope) => self
+                .state
+                .runtime
+                .apply_worker_workdir_attachments_operation_scoped(&scope, &worker_ref, request),
+            None => self
+                .state
+                .runtime
+                .apply_worker_workdir_attachments_operation(&worker_ref, request),
+        }
+        .map_err(RuntimeHttpRestError::runtime_control)
+        .map_err(api_error)
+    }
+
+    async fn observe_worker_workdir_attachments_operation(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<
+        runtime_api::WorkerWorkdirAttachmentsOperationObservation,
+        runtime_api::RuntimeApiError,
+    > {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        match auth_workspace_scope(&self.state, auth_extension().as_ref()).map_err(api_error)? {
+            Some(scope) => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_operation_scoped(&scope, &worker_ref, request),
+            None => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_operation(&worker_ref, request),
+        }
+        .map_err(RuntimeHttpRestError::runtime_control)
+        .map_err(api_error)
     }
 
     async fn complete_worker_arguments(

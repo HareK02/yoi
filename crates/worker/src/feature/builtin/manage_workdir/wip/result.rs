@@ -122,6 +122,13 @@ pub(super) fn created(domain: Domain) -> TypeExpr {
     record(vec![
         field("item", true, item(domain)),
         field("runtime_id", true, TypeExpr::String),
+        field(
+            "diagnostics",
+            true,
+            TypeExpr::List {
+                items: Box::new(TypeExpr::Json),
+            },
+        ),
     ])
 }
 pub(super) fn attached() -> TypeExpr {

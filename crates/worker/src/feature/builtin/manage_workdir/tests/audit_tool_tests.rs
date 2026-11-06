@@ -119,10 +119,12 @@ async fn registered_read_audit_warning_retains_success_content_and_reopened_mode
 async fn registered_write_unknown_and_audit_warning_survive_reopen_without_second_write() {
     let client = Arc::new(RecordingWorkspaceClient::new(vec![
         WorkspaceResponse {
+            content_type: Some("application/json".into()),
             status: 404,
             body: json!({"code":"not_found", "message":"safe remote classification"}).to_string(),
         },
         WorkspaceResponse {
+            content_type: Some("application/json".into()),
             status: 500,
             body: json!({
                 "code":"outcome_unknown", "message":"private-provider-body",
@@ -159,9 +161,13 @@ async fn registered_write_unknown_and_audit_warning_survive_reopen_without_secon
     };
     assert!(summary.contains("outcome is unknown"));
     assert!(summary.contains("inspect effects before considering a retry"));
-    let (_, report) = content.rsplit_once("\n\nWorkdir audit report:\n").unwrap();
+    let (primary, report) = content.rsplit_once("\n\nWorkdir audit report:\n").unwrap();
+    let primary: serde_json::Value = serde_json::from_str(primary).unwrap();
+    assert_eq!(primary["failure"]["domain"], "workdir");
+    assert_eq!(primary["result"]["error_class"], "execution_failed");
+    assert_eq!(primary["result"]["mutation"], "outcome_unknown");
     let report: serde_json::Value = serde_json::from_str(report).unwrap();
-    assert_eq!(report["result"]["primary_error_class"], "execution_failed");
+    assert_eq!(report["result"]["primary_error_class"], "execution_failure");
     assert_eq!(
         report["result"]["audit_failures"][0]["operation_outcome"]["kind"],
         "unknown"

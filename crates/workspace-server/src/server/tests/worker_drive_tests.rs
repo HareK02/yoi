@@ -75,6 +75,11 @@ impl RouterClient {
                 .await
                 .map_err(|e| WorkspaceClientError::Request(e.to_string()))?;
             let status = response.status().as_u16();
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let body = to_bytes(response.into_body(), limit)
                 .await
                 .map_err(|e| WorkspaceClientError::Request(e.to_string()))?
@@ -99,7 +104,11 @@ impl RouterClient {
                     "upload reply lost after commit".into(),
                 ));
             }
-            Ok(WorkspaceBinaryResponse { status, body })
+            Ok(WorkspaceBinaryResponse {
+                content_type,
+                status,
+                body,
+            })
         })
     }
 }
@@ -124,6 +133,7 @@ impl WorkspaceClient for RouterClient {
             2 * 1024 * 1024,
         )?;
         Ok(WorkspaceResponse {
+            content_type: response.content_type,
             status: response.status,
             body: String::from_utf8(response.body)
                 .map_err(|e| WorkspaceClientError::Request(e.to_string()))?,
@@ -402,13 +412,37 @@ fn entry(created: &Value) -> Value {
 }
 fn denied(result: Result<ToolOutput, ToolError>) {
     let error = result.unwrap_err();
-    assert!(error.to_string().contains("denied"), "{error:?}");
+    let ToolError::ExecutionFailure(output) = error else {
+        panic!("expected Drive denial report")
+    };
+    let report = value(output);
+    assert!(
+        matches!(
+            report["failure"]["reason"].as_str(),
+            Some("denied" | "authorization_denied")
+        ),
+        "{report}"
+    );
+}
+fn invalid_argument(result: Result<ToolOutput, ToolError>) {
+    match result.unwrap_err() {
+        ToolError::InvalidArgument(_) => {}
+        ToolError::ExecutionFailure(output) => {
+            let report = value(output);
+            assert_eq!(report["result"]["error_class"], "invalid_argument");
+            assert_eq!(report["result"]["mutation"]["kind"], "not_reported");
+        }
+        error => panic!("expected invalid argument, got {error:?}"),
+    }
 }
 fn conflict(result: Result<ToolOutput, ToolError>) {
-    assert!(
-        matches!(result, Err(ToolError::StructuredConflict { ref code, .. }) if code == "drive_conflict"),
-        "{result:?}"
-    );
+    let ToolError::ExecutionFailure(output) = result.unwrap_err() else {
+        panic!("expected structured Drive failure report")
+    };
+    let report: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(report["result"]["error_class"], "structured_conflict");
+    assert_eq!(report["result"]["code"], "drive_conflict");
+    assert_eq!(report["result"]["mutation"]["kind"], "not_reported");
 }
 
 #[tokio::test]
@@ -937,10 +971,7 @@ async fn edit_requires_unique_old_string_unless_replace_all_is_explicit() {
             json!({"entry":id,"old_string":old,"new_string":"new"}),
         )
         .await;
-        assert!(
-            matches!(result, Err(ToolError::InvalidArgument(_))),
-            "{result:?}"
-        );
+        invalid_argument(result);
     }
     tool(
         &f.features[0],
@@ -1019,10 +1050,7 @@ async fn foreign_and_malformed_tool_refs_never_resolve_same_number_in_current_wo
             json!({"entry":{"workspace_id":TEST_WORKSPACE_ID,"node_id":node}}),
         )
         .await;
-        assert!(
-            matches!(result, Err(ToolError::InvalidArgument(_))),
-            "{result:?}"
-        );
+        invalid_argument(result);
     }
     assert_eq!(
         value(
@@ -1097,16 +1125,10 @@ async fn unsafe_names_and_oversized_text_cannot_publish_and_reads_truncate_at_ut
             json!({"parent":root,"name":name,"content":"bad"}),
         )
         .await;
-        assert!(
-            matches!(result, Err(ToolError::InvalidArgument(_))),
-            "name={name:?}: {result:?}"
-        );
+        invalid_argument(result);
     }
     let result = tool(&f.features[0], "DriveCreateText", json!({"parent":root,"name":"large.md","content":"a".repeat(server_api::DRIVE_TEXT_MAX_BYTES + 1)})).await;
-    assert!(
-        matches!(result, Err(ToolError::InvalidArgument(_))),
-        "{result:?}"
-    );
+    invalid_argument(result);
     assert!(
         value(tool(&f.features[0], "DriveList", json!({})).await.unwrap())["entries"]
             .as_array()
@@ -1132,10 +1154,7 @@ async fn unsafe_names_and_oversized_text_cannot_publish_and_reads_truncate_at_ut
             json!({"entry":id,"max_bytes":limit}),
         )
         .await;
-        assert!(
-            matches!(result, Err(ToolError::InvalidArgument(_))),
-            "{result:?}"
-        );
+        invalid_argument(result);
     }
 }
 
@@ -1307,10 +1326,7 @@ async fn list_and_search_pages_are_bounded_disjoint_and_cursors_follow_backend_s
         ("DriveSearch", json!({"query":"page","limit":129})),
     ] {
         let result = tool(&f.features[1], name, args).await;
-        assert!(
-            matches!(result, Err(ToolError::InvalidArgument(_))),
-            "{result:?}"
-        );
+        invalid_argument(result);
     }
 }
 
@@ -1476,13 +1492,22 @@ async fn workdir_import_rejects_unknown_alias_and_unreadable_or_nonlogical_sourc
         ("source", "public/oversized.bin".to_string()),
     ] {
         let result = tool(&importer, "DriveSaveWorkdir", json!({"target_workdir":alias,"path":path,"parent":root,"name":"rejected.bin","content_type":"application/octet-stream"})).await;
-        assert!(
-            matches!(
-                result,
-                Err(ToolError::ExecutionFailed(_)) | Err(ToolError::InvalidArgument(_))
-            ),
-            "alias={alias}, path={path}: {result:?}"
-        );
+        let error = result.unwrap_err();
+        match error {
+            ToolError::InvalidArgument(_) | ToolError::ExecutionFailed(_) => {}
+            ToolError::ExecutionFailure(output) => {
+                let report = value(output);
+                assert!(
+                    matches!(
+                        report["result"]["error_class"].as_str(),
+                        Some("execution_failed" | "invalid_argument")
+                    ),
+                    "{report}"
+                );
+                assert_eq!(report["result"]["mutation"]["kind"], "not_reported");
+            }
+            error => panic!("alias={alias}, path={path}: {error:?}"),
+        }
     }
     assert!(
         !f.clients[0]
@@ -2016,4 +2041,88 @@ async fn common_file_inspect_invoke_crosses_drive_and_checkout_without_transferr
         )["text"],
         "saved\n"
     );
+}
+
+#[tokio::test]
+async fn signed_drive_tool_retains_real_storage_cause_and_unknown_without_a_second_mutation() {
+    let f = Fixture::new(["read_write", "read_only"]).await;
+    let root = f.root(0).await;
+    let drive = f.api.drive().await.unwrap();
+    let fault = drive.with_authorizer(|connection, _| {
+        connection.execute_batch("CREATE TRIGGER fail_tool_receipt BEFORE INSERT ON drive_receipts BEGIN SELECT RAISE(ABORT, 'private SQL /host/provider token=secret'); END;")?;
+        Ok(())
+    });
+    tokio::task::spawn_blocking(move || fault.check_authorized(false))
+        .await
+        .unwrap()
+        .unwrap();
+    let error = tool(
+        &f.features[0],
+        "DriveCreateFolder",
+        json!({"parent":root,"name":"not-committed"}),
+    )
+    .await
+    .unwrap_err();
+    let ToolError::ExecutionFailure(output) = error else {
+        panic!("lost shared failure report")
+    };
+    let report: Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(report["failure"]["details"]["reason"], "outcome_unknown");
+    assert_eq!(
+        report["failure"]["details"]["server"]["classification"],
+        "unknown"
+    );
+    assert_eq!(
+        report["failure"]["details"]["server"]["storage"]["reason"],
+        "metadata_failure"
+    );
+    assert_eq!(report["result"]["mutation"]["kind"], "outcome_unknown");
+    assert!(
+        output.summary.contains("metadata database"),
+        "{}",
+        output.summary
+    );
+    assert!(output.summary.contains("do not resend"));
+    assert!(!output.summary.contains("private SQL"));
+    assert!(!report.to_string().contains("/host/provider"));
+    let id = report["result"]["mutation"]["request_id"].as_str().unwrap();
+    {
+        let requests = f.clients[0].requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path)| method == "POST" && path.ends_with("/drive/mutate"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, path)| path.ends_with(&format!("/requests/{id}")))
+                .count(),
+            1
+        );
+    }
+    let receipt = owner_call(
+        &f.api,
+        &f.owner,
+        "GET",
+        &format!("{}/requests/{id}", base()),
+        None,
+    )
+    .await;
+    assert_eq!(receipt["state"], "uncommitted");
+    let list = owner_call(
+        &f.api,
+        &f.owner,
+        "GET",
+        &format!(
+            "{}/list?entry_workspace_id={TEST_WORKSPACE_ID}&id={}",
+            base(),
+            root["node_id"].as_str().unwrap()
+        ),
+        None,
+    )
+    .await;
+    assert!(list["entries"].as_array().unwrap().is_empty());
 }

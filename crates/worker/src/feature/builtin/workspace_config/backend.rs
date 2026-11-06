@@ -504,9 +504,9 @@ impl WorkspaceConfigAttachmentBackend for WorkspaceConfigBackend {
             .await
             .map_err(|error| attach_error(error, &diagnostic))?;
         self.validate_attachment(&attachment, Operation::Attach, &diagnostic)
-            .map_err(|_| {
+            .map_err(|error| {
                 diagnostic.record(Stage::Attach, Reason::Identity, None);
-                ConfigAttachError::OutcomeUnknown
+                ConfigAttachError::Backend(Box::new(error.into_attach_completion_error()))
             })?;
         Ok(ConfigAttachment {
             connection_id: attachment.connection_id,
@@ -521,15 +521,7 @@ impl WorkspaceConfigAttachmentBackend for WorkspaceConfigBackend {
 
 fn attach_error(error: ConfigFailure, diagnostic: &Diagnostic) -> ConfigAttachError {
     diagnostic.record(Stage::Attach, Reason::AttachConversion, None);
-    match error.into_source() {
-        WipOperationError::OutcomeUnknown(_) => ConfigAttachError::OutcomeUnknown,
-        WipOperationError::Protocol(error) => match error.code {
-            ProtocolErrorCode::PermissionDenied => ConfigAttachError::Denied,
-            ProtocolErrorCode::InvalidArguments => ConfigAttachError::InvalidRequest,
-            _ => ConfigAttachError::Unavailable,
-        },
-        _ => ConfigAttachError::Unavailable,
-    }
+    ConfigAttachError::Backend(Box::new(error))
 }
 
 fn failed(

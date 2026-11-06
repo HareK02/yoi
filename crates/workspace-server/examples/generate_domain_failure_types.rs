@@ -37,40 +37,57 @@ fn rewrite_refs(value: &mut Value) {
     }
 }
 
-// These domains deliberately disclose only flat, closed enum fields. Refuse a
-// widened schema instead of silently allowing arbitrary provider text in Web.
-fn field_values(
-    schema: &Value,
-    schemas: &Map<String, Value>,
-) -> Result<Vec<Value>, Box<dyn Error>> {
+// Disclose only closed enums and closed objects composed from them. Refuse free
+// text or maps rather than silently widening the domain allowlist in Web.
+fn field_contract(schema: &Value, schemas: &Map<String, Value>) -> Result<Value, Box<dyn Error>> {
     if let Some(reference) = schema["$ref"].as_str() {
         let name = reference
             .strip_prefix("#/components/schemas/")
             .ok_or("unexpected schema reference")?;
-        return field_values(schemas.get(name).ok_or("missing enum schema")?, schemas);
+        return field_contract(schemas.get(name).ok_or("missing enum schema")?, schemas);
     }
     if let Some(values) = schema["enum"].as_array() {
         if values.iter().all(Value::is_string) {
-            return Ok(values.clone());
+            return Ok(json!(values));
         }
     }
     if schema["type"] == "null" {
-        return Ok(vec![Value::Null]);
+        return Ok(json!([null]));
     }
     if let Some(value) = schema["const"].as_str() {
-        return Ok(vec![Value::String(value.into())]);
+        return Ok(json!([value]));
     }
     if let Some(branches) = schema["anyOf"]
         .as_array()
         .or_else(|| schema["oneOf"].as_array())
     {
-        let mut values = Vec::new();
-        for branch in branches {
-            values.extend(field_values(branch, schemas)?);
-        }
-        return Ok(values);
+        let contracts: Vec<Value> = branches
+            .iter()
+            .map(|branch| field_contract(branch, schemas))
+            .collect::<Result<_, _>>()?;
+        return Ok(if contracts.iter().all(Value::is_array) {
+            Value::Array(
+                contracts
+                    .into_iter()
+                    .flat_map(|contract| contract.as_array().unwrap().clone())
+                    .collect(),
+            )
+        } else {
+            json!({"any_of": contracts})
+        });
     }
-    Err(format!("domain details are no longer a flat closed-enum allowlist: {schema}").into())
+    if schema["type"] == "object" && schema["additionalProperties"] == false {
+        let fields = schema["properties"]
+            .as_object()
+            .ok_or("closed object properties required")?
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), field_contract(value, schemas)?)))
+            .collect::<Result<Map<String, Value>, Box<dyn Error>>>()?;
+        return Ok(
+            json!({"fields":fields, "required":schema["required"].as_array().cloned().unwrap_or_default()}),
+        );
+    }
+    Err(format!("domain details are no longer a closed-enum allowlist: {schema}").into())
 }
 
 #[derive(Default)]
@@ -91,10 +108,14 @@ impl Artifacts {
         let root = schema.as_object_mut().ok_or("object schema required")?;
         root.remove("$schema");
         if let Some(Value::Object(definitions)) = root.remove("$defs") {
-            for (name, value) in definitions {
-                if let Some(old) = self.schemas.insert(name, value.clone()) {
+            for (name, mut value) in definitions {
+                // Root and referenced Schemars definitions differ only in title metadata.
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("title");
+                }
+                if let Some(old) = self.schemas.insert(name.clone(), value.clone()) {
                     if old != value {
-                        return Err("inconsistent shared schema name".into());
+                        return Err(format!("inconsistent shared schema name: {name}").into());
                     }
                 }
             }
@@ -111,12 +132,10 @@ impl Artifacts {
             .as_object()
             .ok_or("details properties required")?
         {
-            fields.insert(
-                key.clone(),
-                Value::Array(field_values(property, &self.schemas)?),
-            );
+            fields.insert(key.clone(), field_contract(property, &self.schemas)?);
         }
         let required = root["required"].clone();
+        root.remove("title");
         self.schemas.insert(name.clone(), schema);
         self.roots.insert(name);
         let first: T = serde_json::from_value(seed.clone())?;
@@ -172,6 +191,11 @@ fn generate() -> Result<String, Box<dyn Error>> {
         "reason",
         &["reason"],
     )?;
+    artifacts.register::<workdir::management_failure::WorkdirManagementFailure>(
+        json!({"operation":"create", "reason":"working_directory_create_failed"}),
+        "reason",
+        &["reason"],
+    )?;
     artifacts.register::<WorkdirFailureDetails>(json!({"operation":"read", "classification":"denied", "denial_reason":null, "failure_reason":null}), "classification", &["failure_reason", "denial_reason", "classification"])?;
     artifacts.register::<DriveFailureDetails>(
         json!({"operation":"read", "reason":"denied"}),
@@ -182,6 +206,11 @@ fn generate() -> Result<String, Box<dyn Error>> {
         json!({"operation":"source", "reason":"owner_required"}),
         "reason",
         &["reason"],
+    )?;
+    artifacts.register::<server_api::DriveHttpFailureDetails>(
+        json!({"operation":"metadata", "code":"not_found", "classification":"not_committed"}),
+        "code",
+        &["code"],
     )?;
     artifacts.register::<DriveClientFailureDetails>(
         json!({"operation":"read", "reason":"unavailable"}),

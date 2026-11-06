@@ -704,8 +704,19 @@ async fn committed_write_unknown(fault: WriteResponseFault) {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("outcome unknown"));
-    assert!(error.to_string().contains("do not retry automatically"));
+    let ToolError::ExecutionFailure(output) = &error else {
+        panic!("missing retained Workdir cause")
+    };
+    assert!(output.summary.contains("result unknown"));
+    assert!(output.summary.contains("do not automatically resend"));
+    let report: serde_json::Value =
+        serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(report["failure"]["domain"], "workdir");
+    assert_eq!(
+        report["failure"]["details"]["classification"],
+        "outcome_unknown"
+    );
+    assert_eq!(report["result"]["mutation"], "outcome_unknown");
     fixture.public_output(&error.to_string());
     assert_eq!(
         runtime.audit().last().unwrap().outcome,

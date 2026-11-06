@@ -7,6 +7,7 @@ import {
   restoreErrorNotice,
   restoreNotice,
   restoreWorkspaceWorker,
+  stopCleanupMessage,
   stopSidebarWorker,
 } from "../../src/lib/workspace/sidebar/worker-actions.ts";
 import type { Worker } from "../../src/lib/workspace/sidebar/types.ts";
@@ -108,6 +109,131 @@ Deno.test("sidebar Stop uses the workspace-scoped Worker lifecycle endpoint", as
   });
 });
 
+Deno.test("accepted Stop retains cleanup cause without turning its explanation into retry authority", async () => {
+  for (
+    const explanation of ["provider session closing failed", "different authorized explanation"]
+  ) {
+    let requests = 0;
+    const cleanup = JSON.stringify({
+      version: 1,
+      required_extensions: [],
+      domain: "workdir",
+      reason: "provider_unavailable",
+      category: "dependency",
+      details_version: 1,
+      details: {
+        operation: "session_close",
+        classification: "unavailable",
+        denial_reason: null,
+        failure_reason: "provider_unavailable",
+      },
+      explanation,
+      context: {
+        operations: [],
+        causes: [],
+        diagnostics: [],
+        correlation: null,
+        supplementary_omitted: false,
+      },
+    });
+    const fetchFn = (() => {
+      requests++;
+      return Promise.resolve(
+        jsonResponse({
+          state: "accepted",
+          runtime_id: worker.runtime_id,
+          worker_id: worker.worker_id,
+          diagnostics: [],
+          cleanup_failures: [cleanup],
+        }),
+      );
+    }) as typeof fetch;
+    const receipts = await stopSidebarWorker("team", worker, fetchFn);
+    assertEquals(receipts.length, 1);
+    const received = receipts[0];
+    assert(received.kind === "known");
+    assertEquals(received.failure.reason, "provider_unavailable");
+    assertEquals(received.failure.details, {
+      operation: "session_close",
+      classification: "unavailable",
+      denial_reason: null,
+      failure_reason: "provider_unavailable",
+    });
+    assert(stopCleanupMessage(receipts).includes(explanation));
+    assert(stopCleanupMessage(receipts).includes("Stop remains accepted"));
+    assert(stopCleanupMessage(receipts).includes("do not repeat Stop"));
+    assertEquals(requests, 1);
+  }
+});
+
+Deno.test("unreadable optional cleanup evidence preserves accepted Stop without exposing received bytes", async () => {
+  const future = JSON.stringify({
+    version: 2,
+    required_extensions: [],
+    domain: "future-domain",
+    reason: "future-reason",
+    category: "dependency",
+    details_version: 2,
+    details: {},
+    explanation: "provider-private /secret/path",
+    context: {
+      operations: [],
+      causes: [],
+      diagnostics: [],
+      correlation: null,
+      supplementary_omitted: false,
+    },
+  });
+  for (
+    const cleanup_failures of [
+      ["provider-private /secret/path"],
+      [future],
+      [{}],
+      null,
+      Array(65).fill("private"),
+    ]
+  ) {
+    let requests = 0;
+    const fetchFn = (() => {
+      requests++;
+      return Promise.resolve(
+        jsonResponse({
+          state: "accepted",
+          runtime_id: worker.runtime_id,
+          worker_id: worker.worker_id,
+          diagnostics: [],
+          cleanup_failures,
+        }),
+      );
+    }) as typeof fetch;
+    const receipts = await stopSidebarWorker("team", worker, fetchFn);
+    assert(receipts.length > 0);
+    assert(receipts.every((receipt) => receipt.kind !== "known"));
+    const message = stopCleanupMessage(receipts);
+    assert(message.includes("Stop remains accepted"));
+    assert(!message.includes("private"));
+    assert(!message.includes("/secret/path"));
+    assertEquals(requests, 1);
+  }
+});
+
+Deno.test("sidebar Stop rejects a response for another Worker without sending another mutation", async () => {
+  let requests = 0;
+  const fetchFn = (() => {
+    requests++;
+    return Promise.resolve(
+      jsonResponse({
+        state: "accepted",
+        runtime_id: "another-runtime",
+        worker_id: worker.worker_id,
+        diagnostics: [],
+      }),
+    );
+  }) as typeof fetch;
+  await assertRejects(() => stopSidebarWorker("team", worker, fetchFn), "identity does not match");
+  assertEquals(requests, 1);
+});
+
 Deno.test("sidebar Stop rejects non-accepted lifecycle responses", async () => {
   const fetchFn = (() =>
     Promise.resolve(
@@ -189,7 +315,6 @@ Deno.test("sidebar Delete executes the authoritative runtime cleanup plan", asyn
   ]);
   assertEquals(requests[1]?.init?.method, "POST");
   assertEquals(JSON.parse(String(requests[1]?.init?.body)), {
-
     expected_plan_digest: "digest-7",
     worker_target_ids: ["worker-target"],
     workdir_target_ids: [],

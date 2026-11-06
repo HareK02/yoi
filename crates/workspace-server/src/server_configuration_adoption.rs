@@ -17,10 +17,13 @@
 //! Callbacks must not reenter the Feature store or its canonical source provider.
 
 use super::*;
+#[path = "server_configuration_publication.rs"]
+mod publication;
 use crate::configuration_failure::{
     ConfigurationFailure, ConfigurationFailureOperation as FailureOperation,
     ConfigurationFailureReason as FailureReason,
 };
+use publication::{dispatch_publication, publication_to_api};
 
 use crate::config_adoption::{
     ConfigurationAdoptionRequest as AdoptionRequest, ConfigurationAdoptionResult as AdoptionResult,
@@ -49,7 +52,10 @@ pub(super) fn routes(service: WorkspaceServerApi) -> Router {
         .merge(server_api::configuration_adoption_api_axum::configuration_source(service.clone()))
         .merge(server_api::configuration_adoption_api_axum::configuration_preview(service.clone()))
         .merge(server_api::configuration_adoption_api_axum::configuration_adopt(service.clone()))
-        .merge(server_api::configuration_adoption_api_axum::configuration_reconcile(service))
+        .merge(
+            server_api::configuration_adoption_api_axum::configuration_reconcile(service.clone()),
+        )
+        .merge(server_api::configuration_adoption_api_axum::configuration_publication(service))
         .layer(middleware::from_fn_with_state(
             context_service,
             attach_server_request_context,
@@ -353,6 +359,37 @@ fn receipt_to_api(result: AdoptionResult) -> ConfigurationAdoptionReceipt {
 }
 
 impl ConfigurationAdoptionApi for WorkspaceServerApi {
+    async fn configuration_publication(
+        &self,
+        context: ServerRequestContext,
+        workspace_id: String,
+        operation_id: String,
+    ) -> std::result::Result<server_api::ConfigurationPublicationLookup, ConfigurationApiError>
+    {
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Publication,
+            move |api, account| {
+                server_api::authorization::validate_authorization_identifier(&operation_id)
+                    .map_err(Error::InvalidInput)?;
+                Ok(server_api::ConfigurationPublicationLookup {
+                    publication: api
+                        .config_store
+                        .configuration_publication(
+                            &api.config.workspace_id,
+                            &account,
+                            &operation_id,
+                        )?
+                        .map(publication_to_api)
+                        .transpose()?,
+                })
+            },
+        )
+        .await
+    }
+
     async fn configuration_source(
         &self,
         context: ServerRequestContext,
@@ -529,20 +566,15 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                 // publication. Dispatch transfers the admitted lifetime without
                 // keeping the SQL lane occupied by an external Runtime response.
                 // Exact historical receipt replay above must not publish old state.
-                let publication_api = api.clone();
-                let state = result.state.clone();
-                let _ = api.host_executors.host().and_then(|executor| {
-                    executor.dispatch(move || {
-                        if let Ok(projection) = publication_api
-                            .prompt_projection_cache
-                            .resolve(&publication_api.config.workspace_id, &state)
-                        {
-                            let _ = publication_api
-                                .runtime
-                                .observe_workspace_prompt_projection((*projection).clone());
-                        }
-                    })
-                });
+                let publication_identity = crate::config_publication::PublicationIdentity {
+                    request_fingerprint: request_fingerprint(
+                        &api.config.workspace_id,
+                        &account,
+                        &request,
+                    )?,
+                    receipt: result.clone(),
+                };
+                dispatch_publication(&api, account, publication_identity);
                 Ok(receipt_to_api(result))
             },
         )

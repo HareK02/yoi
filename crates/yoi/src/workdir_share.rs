@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use client::BackendApiClient;
+use error_contract::{FailureFacts, Tool, project_failure};
 use futures::{SinkExt, StreamExt};
+use server_api::client_support::{ClientError, ClientFailure};
 use server_api::{
     ExternalWorkdirGrantCreateRequest, ExternalWorkdirGrantResponse, ServerApiClient,
 };
@@ -19,7 +21,13 @@ use workdir::external::{
     ExternalWorkdirProviderMessage, ExternalWorkdirProviderRegistration,
     ExternalWorkdirServerFrame, ExternalWorkdirServerMessage,
 };
+use workdir::failure::{
+    WorkdirFailure, WorkdirFailureDetails, WorkdirFailureOperation, WorkdirFailureVisibility,
+};
 use workdir::http::{WorkdirTransportError, dispatch_workdir_session_operation};
+use workdir::management_failure::{
+    WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementVisibility,
+};
 use workdir::{
     BoundedReadLimits, ExternalWorkdirRoot, LocalWorkdirSession, Workdir, WorkdirSession,
 };
@@ -37,19 +45,335 @@ pub struct WorkdirShareOptions {
 
 const PROVIDER_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// CLI-local carriers: received errors, settlements and secondary failures are
+/// retained until the outer display boundary. None of these authorize replay.
+#[derive(Debug)]
+enum ShareCause {
+    Local(String),
+    Grant {
+        operation: WorkdirManagementOperation,
+        error: ClientError<server_api::WorkdirManagementApiError>,
+    },
+    Workdir(WorkdirFailure),
+    ProviderEnded(ProviderEnd),
+}
+
+#[derive(Debug)]
+struct ShareError {
+    cause: ShareCause,
+    secondary: Vec<ShareError>,
+}
+
+impl From<String> for ShareError {
+    fn from(message: String) -> Self {
+        Self {
+            cause: ShareCause::Local(message),
+            secondary: Vec::new(),
+        }
+    }
+}
+
+impl ShareError {
+    fn grant(
+        operation: WorkdirManagementOperation,
+        error: ClientError<server_api::WorkdirManagementApiError>,
+    ) -> Self {
+        Self {
+            cause: ShareCause::Grant { operation, error },
+            secondary: Vec::new(),
+        }
+    }
+
+    fn workdir(operation: WorkdirFailureOperation, error: workdir::WorkdirError) -> Self {
+        Self {
+            cause: ShareCause::Workdir(WorkdirFailure::new(operation, error)),
+            secondary: Vec::new(),
+        }
+    }
+
+    fn with_secondary(mut self, secondary: ShareError) -> Self {
+        self.secondary.push(secondary);
+        self
+    }
+
+    fn same_observation(&self, other: &Self) -> bool {
+        let same_cause = match (&self.cause, &other.cause) {
+            (ShareCause::ProviderEnded(a), ShareCause::ProviderEnded(b)) => a == b,
+            (ShareCause::Local(a), ShareCause::Local(b)) => a == b,
+            (ShareCause::Workdir(a), ShareCause::Workdir(b)) => a.details() == b.details(),
+            (
+                ShareCause::Grant {
+                    operation: a_op,
+                    error: a,
+                },
+                ShareCause::Grant {
+                    operation: b_op,
+                    error: b,
+                },
+            ) if a_op == b_op => match (a, b) {
+                (ClientError::Failure(a), ClientError::Failure(b)) => a == b,
+                (
+                    ClientError::Public {
+                        status: a_status,
+                        error: a,
+                    },
+                    ClientError::Public {
+                        status: b_status,
+                        error: b,
+                    },
+                ) => {
+                    a_status == b_status
+                        && a.details() == b.details()
+                        && a.legacy().failure == b.legacy().failure
+                        && a.legacy().error == b.legacy().error
+                        && a.legacy().message == b.legacy().message
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        same_cause
+            && self.secondary.len() == other.secondary.len()
+            && self
+                .secondary
+                .iter()
+                .zip(&other.secondary)
+                .all(|(a, b)| a.same_observation(b))
+    }
+
+    fn prevents_reconnect(&self) -> bool {
+        matches!(
+            &self.cause,
+            ShareCause::Grant {
+                operation: WorkdirManagementOperation::GrantCreate
+                    | WorkdirManagementOperation::GrantRevoke,
+                ..
+            } | ShareCause::Workdir(_)
+        ) || !self.secondary.is_empty()
+    }
+
+    fn render(&self) -> String {
+        let mut message = match &self.cause {
+            ShareCause::ProviderEnded(end) => {
+                format!("External Workdir provider ended ({end:?}); supplementary shutdown failed")
+            }
+            ShareCause::Local(message) => message.clone(),
+            ShareCause::Workdir(failure) => FailureFacts::new(*failure.details())
+                .and_then(|facts| {
+                    project_failure::<Tool, _>(
+                        &facts,
+                        &WorkdirFailureVisibility {
+                            can_view_cause: true,
+                        },
+                    )
+                })
+                .map(|projected| projected.explanation().to_string())
+                .unwrap_or_else(|_| "Workdir diagnostic projection unavailable".into()),
+            ShareCause::Grant { operation, error } => {
+                let context = match operation {
+                    WorkdirManagementOperation::GrantCreate => {
+                        "External Workdir grant request failed"
+                    }
+                    WorkdirManagementOperation::GrantInspect => {
+                        "External Workdir grant refresh failed"
+                    }
+                    WorkdirManagementOperation::GrantRevoke => {
+                        "External Workdir revoke was not confirmed by the Backend"
+                    }
+                    WorkdirManagementOperation::GrantConnect => {
+                        "External Workdir provider connection failed"
+                    }
+                    _ => "External Workdir grant operation failed",
+                };
+                let explanation = match error {
+                    ClientError::Public { status, error } => {
+                        let projected = error.details().and_then(|details| {
+                            FailureFacts::new(*details).ok().and_then(|facts| {
+                                project_failure::<Tool, _>(
+                                    &facts,
+                                    &WorkdirManagementVisibility {
+                                        can_view_cause: true,
+                                    },
+                                )
+                                .ok()
+                            })
+                        });
+                        projected.map(|value| value.explanation().to_string())
+                            .or_else(|| error.legacy().failure.as_ref().and_then(management_attachment_explanation))
+                            .unwrap_or_else(|| format!("Backend rejected the request (HTTP {}); typed cause unavailable", status.as_u16()))
+                    }
+                    ClientError::Failure(failure) => {
+                        // ClientFailure is a closed, body/path-free transport observation.
+                        // A failed mutation response is not evidence that it was not applied.
+                        let mut text = failure.to_string();
+                        if matches!(
+                            operation,
+                            WorkdirManagementOperation::GrantCreate
+                                | WorkdirManagementOperation::GrantRevoke
+                        ) {
+                            text.push_str("; mutation result is unconfirmed; inspect existing state; do not automatically resend");
+                        }
+                        text
+                    }
+                };
+                format!("{context}: {explanation}")
+            }
+        };
+        for secondary in &self.secondary {
+            message.push_str("; supplementary failure (does not replace the original result): ");
+            message.push_str(&secondary.render());
+        }
+        message
+    }
+}
+
+fn management_attachment_explanation(
+    attachment: &protocol::startup_failure::StartupFailureAttachment,
+) -> Option<String> {
+    attachment
+        .project_for::<Tool, WorkdirManagementFailure>(&WorkdirManagementVisibility {
+            can_view_cause: true,
+        })
+        .ok()
+        .map(|projected| projected.explanation().to_string())
+}
+
+fn cleanup_attachment_explanation(
+    attachment: &protocol::startup_failure::StartupFailureAttachment,
+) -> String {
+    attachment.project_for::<Tool, WorkdirFailureDetails>(&WorkdirFailureVisibility { can_view_cause: true })
+        .ok().map(|projected| projected.explanation().to_string())
+        .or_else(|| management_attachment_explanation(attachment))
+        .unwrap_or_else(|| "supplementary diagnostic unavailable or unsupported; original grant status is unchanged".into())
+}
+
+#[derive(Default)]
+struct ShareEvidence {
+    grants: Vec<ExternalWorkdirGrantResponse>,
+    failures: Vec<(ShareError, u64)>,
+}
+
+impl ShareEvidence {
+    fn retain_grant(&mut self, grant: ExternalWorkdirGrantResponse) {
+        if self.grants.last() != Some(&grant) {
+            self.grants.push(grant);
+        }
+    }
+
+    fn retain_failure(&mut self, error: ShareError) {
+        if let Some((_, count)) = self
+            .failures
+            .iter_mut()
+            .find(|(existing, _)| existing.same_observation(&error))
+        {
+            *count = count.saturating_add(1);
+        } else {
+            self.failures.push((error, 1));
+        }
+    }
+
+    fn render(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for grant in &self.grants {
+            let status = match grant.status.as_str() {
+                "pending" | "online" | "offline" | "revoked" | "expired" => grant.status.as_str(),
+                _ => "unrecognized",
+            };
+            // Never infer grant authority from cleanup completion (or vice versa).
+            lines.push(format!("External Workdir grant status: {status}"));
+            let cleanup = match grant.cleanup_state.as_str() {
+                "not_required" | "pending" | "retry_required" | "completed" | "unconfirmed" => {
+                    grant.cleanup_state.as_str()
+                }
+                _ => "unrecognized",
+            };
+            lines.push(format!(
+                "Supplementary cleanup state: {cleanup} (independent of grant status)"
+            ));
+            for failure in &grant.cleanup_failures {
+                lines.push(format!(
+                    "Supplementary cleanup/audit/persistence failure: {}",
+                    cleanup_attachment_explanation(failure)
+                ));
+            }
+        }
+        lines.extend(self.failures.iter().map(|(error, count)| {
+            let mut rendered = error.render();
+            if *count > 1 {
+                rendered.push_str(&format!(
+                    " (observed {count} times; no mutation replay authority)"
+                ));
+            }
+            rendered
+        }));
+        lines
+    }
+}
+
+fn provider_connection_error(error: tokio_tungstenite::tungstenite::Error) -> ShareError {
+    // The handshake can carry the same typed Problem Details as grant CRUD.
+    // Decode it through the existing bounded API hook; never display the HTTP
+    // body, headers, URL, or the tungstenite error's Display implementation.
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
+        let status = response.status();
+        let mut content_types = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_TYPE)
+            .iter();
+        let content_type = content_types.next().and_then(|value| value.to_str().ok());
+        let decoded = if content_types.next().is_none() {
+            server_api::WorkdirManagementApiError::decode_received(
+                status.as_u16(),
+                content_type.unwrap_or(""),
+                response.body().as_deref().unwrap_or_default(),
+            )
+        } else {
+            Err(ClientFailure::ErrorResponseDecode {
+                status: status.as_u16(),
+            })
+        };
+        let error = match decoded {
+            Ok(error) => ClientError::public(status, error),
+            Err(failure) => ClientError::Failure(failure),
+        };
+        return ShareError::grant(WorkdirManagementOperation::GrantConnect, error);
+    }
+    "External Workdir provider connection failed; inspect the current grant and connection"
+        .to_string()
+        .into()
+}
+
+fn retain_cleanup<T>(
+    original: Result<T, ShareError>,
+    cleanup: Result<(), ShareError>,
+) -> Result<T, ShareError> {
+    match (original, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(error.with_secondary(cleanup)),
+    }
+}
+
+fn retain_provider_cleanup(
+    original: Result<ProviderEnd, ShareError>,
+    cleanup: Result<(), ShareError>,
+) -> Result<ProviderEnd, ShareError> {
+    match (original, cleanup) {
+        (Ok(end), Err(cleanup)) => Err(ShareError {
+            cause: ShareCause::ProviderEnded(end),
+            secondary: vec![cleanup],
+        }),
+        (original, cleanup) => retain_cleanup(original, cleanup),
+    }
+}
+
 fn validate_provider_registration(message: Message, generation: u64) -> Result<(), String> {
     let registered = match message {
         Message::Text(text) => text,
-        Message::Close(Some(frame)) => {
-            let reason = frame.reason.trim();
-            return Err(if reason.is_empty() {
-                "Backend rejected the External Workdir provider registration".to_string()
-            } else {
-                format!("Backend rejected the External Workdir provider registration: {reason}")
-            });
-        }
-        Message::Close(None) => {
-            return Err("Backend rejected the External Workdir provider registration".to_string());
+        Message::Close(_) => {
+            // Close reasons are arbitrary server/provider text, not typed evidence.
+            return Err("Backend rejected the External Workdir provider registration; inspect the current grant".to_string());
         }
         _ => {
             return Err(
@@ -58,7 +382,7 @@ fn validate_provider_registration(message: Message, generation: u64) -> Result<(
         }
     };
     let frame = serde_json::from_str::<ExternalWorkdirServerFrame>(&registered)
-        .map_err(|error| format!("Backend returned an invalid External Workdir frame: {error}"))?;
+        .map_err(|_| "Backend returned an invalid External Workdir frame".to_string())?;
     if matches!(
         frame.message,
         ExternalWorkdirServerMessage::Registered { generation: registered_generation, .. }
@@ -126,22 +450,30 @@ impl Drop for OperationTask {
     }
 }
 
-fn pin_selected_root(path: &std::path::Path) -> Result<ExternalWorkdirRoot, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|error| format!("failed to resolve current directory: {error}"))?;
+fn pin_selected_root(path: &std::path::Path) -> Result<ExternalWorkdirRoot, ShareError> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        ShareError::workdir(
+            WorkdirFailureOperation::SessionOpen,
+            workdir::WorkdirError::Io {
+                path: std::path::PathBuf::from("<current-directory>"),
+                source: error,
+            },
+        )
+    })?;
     pin_selected_root_from(path, &cwd)
 }
 
 fn pin_selected_root_from(
     path: &std::path::Path,
     cwd: &std::path::Path,
-) -> Result<ExternalWorkdirRoot, String> {
+) -> Result<ExternalWorkdirRoot, ShareError> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
     };
-    ExternalWorkdirRoot::pin(absolute).map_err(|error| error.to_string())
+    ExternalWorkdirRoot::pin(absolute)
+        .map_err(|error| ShareError::workdir(WorkdirFailureOperation::SessionOpen, error))
 }
 
 fn authenticated_server_api_client(
@@ -458,6 +790,31 @@ async fn resolve_share_options(
 }
 
 pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
+    let mut evidence = ShareEvidence::default();
+    let result = run_typed(options, &mut evidence).await;
+    let observations = evidence.render();
+    match result {
+        Ok(()) => {
+            for observation in observations {
+                eprintln!("{observation}");
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let mut message = error.render();
+            for observation in observations {
+                message.push_str("\nRetained observation: ");
+                message.push_str(&observation);
+            }
+            Err(message)
+        }
+    }
+}
+
+async fn run_typed(
+    options: WorkdirShareOptions,
+    evidence: &mut ShareEvidence,
+) -> Result<(), ShareError> {
     let Some(options) = resolve_share_options(options).await? else {
         eprintln!("External Workdir share cancelled; no grant was created.");
         return Ok(());
@@ -482,11 +839,14 @@ pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
             },
         )
         .await
-        .map_err(|error| format!("External Workdir grant request failed: {error}"))?;
+        .map_err(|error| ShareError::grant(WorkdirManagementOperation::GrantCreate, error))?;
+    evidence.retain_grant(grant.clone());
 
     if grant.permissions != options.permissions {
         return Err(
-            "Backend returned permissions that differ from the requested grant".to_string(),
+            "Backend returned permissions that differ from the requested grant"
+                .to_string()
+                .into(),
         );
     }
     let capabilities = workdir_capabilities(grant.permissions);
@@ -529,7 +889,7 @@ pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
             limits,
             capabilities,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ShareError::workdir(WorkdirFailureOperation::SessionOpen, error))?;
         let outcome = serve_provider_connection(
             &backend_client,
             &server_api_client,
@@ -538,34 +898,42 @@ pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
             &provider_instance_id,
             &session,
             generation,
+            evidence,
         )
         .await;
-        let close_result = session.close().await.map_err(|error| error.to_string());
-        let outcome = match (outcome, close_result) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(format!(
-                "External Workdir provider session cleanup failed: {error}"
-            )),
-            (Err(connection_error), Err(close_error)) => Err(format!(
-                "{connection_error}; provider session cleanup failed: {close_error}"
-            )),
-        };
+        let close_result = session
+            .close()
+            .await
+            .map_err(|error| ShareError::workdir(WorkdirFailureOperation::SessionClose, error));
+        // A revocation request whose response was lost must never be routed
+        // through connection refresh/reconnect and sent again.
+        let cleanup_failed = close_result.is_err();
+        let outcome = retain_provider_cleanup(outcome, close_result);
+        if cleanup_failed
+            || outcome
+                .as_ref()
+                .is_err_and(|error| error.prevents_reconnect())
+        {
+            return outcome.map(|_| ());
+        }
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(connection_error) => {
+                evidence.retain_failure(connection_error);
                 if expires_at.is_some_and(|expires_at| Utc::now() >= expires_at) {
-                    return Err(format!(
-                        "External Workdir grant expired after provider connection failure: {connection_error}"
-                    ));
+                    return Err(
+                        "External Workdir grant expired after provider connection failure"
+                            .to_string()
+                            .into(),
+                    );
                 }
                 let refresh =
                     fetch_grant(&server_api_client, &options.workspace_id, &grant.grant_id);
                 let refreshed = tokio::select! {
                     signal = tokio::signal::ctrl_c() => {
                         signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-                        revoke(&server_api_client, &options.workspace_id, &grant.grant_id).await?;
-                        println!("External Workdir grant revoked.");
+                        evidence.retain_grant(revoke(&server_api_client, &options.workspace_id, &grant.grant_id).await?);
+                        println!("External Workdir revocation response received; see retained grant status.");
                         return Ok(());
                     }
                     refreshed = refresh => refreshed,
@@ -573,22 +941,24 @@ pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                 let current = match refreshed {
                     Ok(current) => current,
                     Err(refresh_error) => {
-                        eprintln!(
-                            "Connection refresh failed; retrying: {connection_error}; {refresh_error}"
-                        );
+                        evidence.retain_failure(refresh_error);
                         if wait_to_reconnect(
                             &server_api_client,
                             &options.workspace_id,
                             &grant.grant_id,
+                            evidence,
                         )
                         .await?
                         {
-                            println!("External Workdir grant revoked.");
+                            println!(
+                                "External Workdir revocation response received; see retained grant status."
+                            );
                             return Ok(());
                         }
                         continue;
                     }
                 };
+                evidence.retain_grant(current.clone());
                 match current.status.as_str() {
                     "pending" => generation = current.generation,
                     "offline" => {
@@ -604,17 +974,24 @@ pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
                         println!("External Workdir grant is no longer active.");
                         return Ok(());
                     }
-                    status => {
-                        return Err(format!(
-                            "Backend returned unknown External Workdir grant status `{status}`"
-                        ));
+                    _ => {
+                        return Err("Backend returned an unknown External Workdir grant status"
+                            .to_string()
+                            .into());
                     }
                 }
                 println!("Connection: reconnecting");
-                if wait_to_reconnect(&server_api_client, &options.workspace_id, &grant.grant_id)
-                    .await?
+                if wait_to_reconnect(
+                    &server_api_client,
+                    &options.workspace_id,
+                    &grant.grant_id,
+                    evidence,
+                )
+                .await?
                 {
-                    println!("External Workdir grant revoked.");
+                    println!(
+                        "External Workdir revocation response received; see retained grant status."
+                    );
                     return Ok(());
                 }
                 continue;
@@ -622,7 +999,9 @@ pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
         };
         match outcome {
             ProviderEnd::Interrupted => {
-                println!("External Workdir grant revoked.");
+                println!(
+                    "External Workdir revocation response received; see retained grant status."
+                );
                 return Ok(());
             }
             ProviderEnd::Revoked => {
@@ -631,16 +1010,25 @@ pub async fn run(options: WorkdirShareOptions) -> Result<(), String> {
             }
             ProviderEnd::Disconnected => {
                 if expires_at.is_some_and(|expires_at| Utc::now() >= expires_at) {
-                    return Err("External Workdir grant expired while disconnected".to_string());
+                    return Err("External Workdir grant expired while disconnected"
+                        .to_string()
+                        .into());
                 }
                 generation = generation
                     .checked_add(1)
                     .ok_or_else(|| "External Workdir provider generation overflow".to_string())?;
                 println!("Connection: reconnecting");
-                if wait_to_reconnect(&server_api_client, &options.workspace_id, &grant.grant_id)
-                    .await?
+                if wait_to_reconnect(
+                    &server_api_client,
+                    &options.workspace_id,
+                    &grant.grant_id,
+                    evidence,
+                )
+                .await?
                 {
-                    println!("External Workdir grant revoked.");
+                    println!(
+                        "External Workdir revocation response received; see retained grant status."
+                    );
                     return Ok(());
                 }
             }
@@ -656,7 +1044,8 @@ async fn serve_provider_connection(
     provider_instance_id: &str,
     session: &LocalWorkdirSession,
     generation: u64,
-) -> Result<ProviderEnd, String> {
+    evidence: &mut ShareEvidence,
+) -> Result<ProviderEnd, ShareError> {
     let provider_path = format!(
         "/api/w/{}/external-workdir-grants/{}/provider",
         encode_path_segment(&options.workspace_id),
@@ -672,36 +1061,60 @@ async fn serve_provider_connection(
     let (socket, _) = tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-            revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
+            evidence.retain_grant(revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?);
             return Ok(ProviderEnd::Interrupted);
         }
         connection = connection => connection
-            .map_err(|error| format!("External Workdir provider connection failed: {error}"))?,
+            .map_err(provider_connection_error)?,
     };
     let registration =
         ExternalWorkdirProviderFrame::current(ExternalWorkdirProviderMessage::Register {
             registration: ExternalWorkdirProviderRegistration {
                 provider_instance_id: ExternalProviderInstanceId::new(provider_instance_id)
-                    .map_err(|error| error.to_string())?,
-                grant_id: ExternalWorkdirGrantId::new(grant.grant_id.clone())
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|_| "invalid External Workdir provider identity".to_string())?,
+                grant_id: ExternalWorkdirGrantId::new(grant.grant_id.clone()).map_err(|_| {
+                    "Backend returned an invalid External Workdir grant identity".to_string()
+                })?,
                 workdir_id: session.workdir().id().clone(),
                 generation,
                 capabilities: session.capabilities(),
                 read_limits: BoundedReadLimits::EXTERNAL_DEFAULT,
             },
         });
-    let end =
-        serve_external_workdir_provider_socket(socket, registration, session, generation, async {
+    let outcome = serve_external_workdir_provider_socket_typed(
+        socket,
+        registration,
+        session,
+        generation,
+        async {
             tokio::signal::ctrl_c()
                 .await
                 .map_err(|error| format!("failed to wait for Ctrl-C: {error}"))
-        })
-        .await?;
-    if end == ProviderEnd::Interrupted {
-        revoke(server_api_client, &options.workspace_id, &grant.grant_id).await?;
+        },
+    )
+    .await;
+    let interrupted = matches!(&outcome, Ok(ProviderEnd::Interrupted))
+        || matches!(
+            &outcome,
+            Err(ShareError {
+                cause: ShareCause::ProviderEnded(ProviderEnd::Interrupted),
+                ..
+            })
+        );
+    if interrupted {
+        // Even failed local shutdown must not skip the requested authority fence.
+        // Send it once, then retain its response/error independently of shutdown.
+        match revoke(server_api_client, &options.workspace_id, &grant.grant_id).await {
+            Ok(grant) => evidence.retain_grant(grant),
+            Err(revoke_error) => {
+                return match outcome {
+                    Err(error) => Err(error.with_secondary(revoke_error)),
+                    Ok(_) => Err(revoke_error),
+                };
+            }
+        }
     }
-    Ok(end)
+    outcome
 }
 
 /// Run the production External Workdir provider protocol over an established WebSocket.
@@ -710,12 +1123,34 @@ async fn serve_provider_connection(
 /// protocol pump separate lets composed tests exercise the same registration, operation,
 /// cancellation, and result-forwarding implementation without spawning a second CLI process.
 pub async fn serve_external_workdir_provider_socket<S, I>(
-    mut socket: tokio_tungstenite::WebSocketStream<S>,
+    socket: tokio_tungstenite::WebSocketStream<S>,
     registration: ExternalWorkdirProviderFrame,
     session: &LocalWorkdirSession,
     generation: u64,
     interrupt: I,
 ) -> Result<ProviderEnd, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    I: std::future::Future<Output = Result<(), String>>,
+{
+    serve_external_workdir_provider_socket_typed(
+        socket,
+        registration,
+        session,
+        generation,
+        interrupt,
+    )
+    .await
+    .map_err(|error| error.render())
+}
+
+async fn serve_external_workdir_provider_socket_typed<S, I>(
+    mut socket: tokio_tungstenite::WebSocketStream<S>,
+    registration: ExternalWorkdirProviderFrame,
+    session: &LocalWorkdirSession,
+    generation: u64,
+    interrupt: I,
+) -> Result<ProviderEnd, ShareError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     I: std::future::Future<Output = Result<(), String>>,
@@ -731,7 +1166,7 @@ where
             registered
                 .map_err(|_| "Backend timed out External Workdir provider registration".to_string())?
                 .ok_or_else(|| "Backend closed the External Workdir provider connection".to_string())?
-                .map_err(|error| format!("External Workdir provider registration failed: {error}"))?
+                .map_err(|_| "External Workdir provider registration transport failed".to_string())?
         }
     };
     validate_provider_registration(registered, generation)?;
@@ -740,17 +1175,18 @@ where
     let (completion_sender, mut completions) =
         tokio::sync::mpsc::channel::<OperationCompletion>(16);
     let mut operations = HashMap::<String, OperationTask>::new();
-    loop {
+    let outcome = 'provider: loop {
         tokio::select! {
             signal = &mut interrupt => {
-                signal?;
-                stop_provider_operations(session, &mut operations, &mut completions).await?;
-                return Ok(ProviderEnd::Interrupted);
+                if let Err(error) = signal {
+                    break 'provider Err(ShareError::from(error));
+                }
+                break 'provider Ok(ProviderEnd::Interrupted);
             }
             completion = completions.recv() => {
                 let Some(completion) = completion else {
                     cancel_operations(&operations);
-                    return Err("External Workdir operation executor closed".to_string());
+                    break 'provider Err("External Workdir operation executor closed".to_string().into());
                 };
                 let Some(operation) = operations.remove(completion.operation_id.as_str()) else {
                     continue;
@@ -758,8 +1194,7 @@ where
                 let cancelled = match operation.join() {
                     Ok(cancelled) => cancelled,
                     Err(error) => {
-                        stop_provider_operations(session, &mut operations, &mut completions).await?;
-                        return Err(error);
+                        break 'provider Err(error.into());
                     }
                 };
                 let outcome = if cancelled {
@@ -776,29 +1211,25 @@ where
                     },
                 );
                 if send_provider_frame(&mut socket, &result).await.is_err() {
-                    stop_provider_operations(session, &mut operations, &mut completions).await?;
-                    return Ok(ProviderEnd::Disconnected);
+                    break 'provider Ok(ProviderEnd::Disconnected);
                 }
             }
             incoming = socket.next() => {
                 let Some(incoming) = incoming else {
-                    stop_provider_operations(session, &mut operations, &mut completions).await?;
-                    return Ok(ProviderEnd::Disconnected);
+                    break 'provider Ok(ProviderEnd::Disconnected);
                 };
                 let incoming = match incoming {
                     Ok(incoming) => incoming,
                     Err(_) => {
-                        stop_provider_operations(session, &mut operations, &mut completions).await?;
-                        return Ok(ProviderEnd::Disconnected);
+                        break 'provider Ok(ProviderEnd::Disconnected);
                     }
                 };
                 match incoming {
                     Message::Text(text) => {
                         let frame = match serde_json::from_str::<ExternalWorkdirServerFrame>(&text) {
                             Ok(frame) => frame,
-                            Err(error) => {
-                                stop_provider_operations(session, &mut operations, &mut completions).await?;
-                                return Err(format!("Backend returned an invalid External Workdir frame: {error}"));
+                            Err(_) => {
+                                break 'provider Err("Backend returned an invalid External Workdir frame".to_string().into());
                             }
                         };
                         match frame.message {
@@ -808,8 +1239,7 @@ where
                                 operation,
                             } if frame_generation == generation => {
                                 if operations.len() >= 16 || operations.contains_key(operation_id.as_str()) {
-                                    stop_provider_operations(session, &mut operations, &mut completions).await?;
-                                    return Err("Backend exceeded External Workdir operation bounds".to_string());
+                                    break 'provider Err("Backend exceeded External Workdir operation bounds".to_string().into());
                                 }
                                 let key = operation_id.as_str().to_string();
                                 let completion_sender = completion_sender.clone();
@@ -850,9 +1280,8 @@ where
                                     });
                                 let thread = match spawned {
                                     Ok(thread) => thread,
-                                    Err(error) => {
-                                        stop_provider_operations(session, &mut operations, &mut completions).await?;
-                                        return Err(format!("failed to start External Workdir operation: {error}"));
+                                    Err(_) => {
+                                        break 'provider Err("failed to start External Workdir operation executor".to_string().into());
                                     }
                                 };
                                 operations.insert(
@@ -871,8 +1300,7 @@ where
                                     ExternalWorkdirProviderMessage::Heartbeat { generation, sequence },
                                 );
                                 if send_provider_frame(&mut socket, &heartbeat).await.is_err() {
-                                    stop_provider_operations(session, &mut operations, &mut completions).await?;
-                                    return Ok(ProviderEnd::Disconnected);
+                                    break 'provider Ok(ProviderEnd::Disconnected);
                                 }
                             }
                             ExternalWorkdirServerMessage::Cancel {
@@ -889,16 +1317,10 @@ where
                                 generation: frame_generation,
                                 ..
                             } if frame_generation == generation => {
-                                stop_provider_operations(session, &mut operations, &mut completions).await?;
-                                let acknowledged = ExternalWorkdirProviderFrame::current(
-                                    ExternalWorkdirProviderMessage::RevokeAcknowledged { generation },
-                                );
-                                let _ = send_provider_frame(&mut socket, &acknowledged).await;
-                                return Ok(ProviderEnd::Revoked);
+                                break 'provider Ok(ProviderEnd::Revoked);
                             }
                             _ => {
-                                stop_provider_operations(session, &mut operations, &mut completions).await?;
-                                return Err("stale or unexpected External Workdir provider frame".to_string());
+                                break 'provider Err("stale or unexpected External Workdir provider frame".to_string().into());
                             }
                         }
                     }
@@ -909,19 +1331,28 @@ where
                         )
                         .await;
                         if !matches!(pong, Ok(Ok(()))) {
-                            stop_provider_operations(session, &mut operations, &mut completions).await?;
-                            return Ok(ProviderEnd::Disconnected);
+                            break 'provider Ok(ProviderEnd::Disconnected);
                         }
                     }
                     Message::Close(_) => {
-                        stop_provider_operations(session, &mut operations, &mut completions).await?;
-                        return Ok(ProviderEnd::Disconnected);
+                        break 'provider Ok(ProviderEnd::Disconnected);
                     }
                     _ => {}
                 }
             }
         }
+    };
+    let outcome = retain_provider_cleanup(
+        outcome,
+        stop_provider_operations(session, &mut operations, &mut completions).await,
+    );
+    if matches!(&outcome, Ok(ProviderEnd::Revoked)) {
+        let acknowledged = ExternalWorkdirProviderFrame::current(
+            ExternalWorkdirProviderMessage::RevokeAcknowledged { generation },
+        );
+        let _ = send_provider_frame(&mut socket, &acknowledged).await;
     }
+    outcome
 }
 
 async fn cancel_completed_command(
@@ -980,25 +1411,59 @@ async fn stop_provider_operations(
     session: &LocalWorkdirSession,
     operations: &mut HashMap<String, OperationTask>,
     completions: &mut tokio::sync::mpsc::Receiver<OperationCompletion>,
-) -> Result<(), String> {
-    session.close().await.map_err(|error| error.to_string())?;
-    stop_operations(operations, completions).await
+) -> Result<(), ShareError> {
+    let close = session
+        .close()
+        .await
+        .map_err(|error| ShareError::workdir(WorkdirFailureOperation::SessionClose, error));
+    stop_operations_after_close(close, operations, completions).await
+}
+
+async fn stop_operations_after_close(
+    close: Result<(), ShareError>,
+    operations: &mut HashMap<String, OperationTask>,
+    completions: &mut tokio::sync::mpsc::Receiver<OperationCompletion>,
+) -> Result<(), ShareError> {
+    // Closing a session may fail before cancelling/reaping its executors.
+    // Always run the executor shutdown, retaining both independent failures.
+    let stopped = stop_operations(operations, completions).await;
+    retain_cleanup(close, stopped)
 }
 
 async fn stop_operations(
     operations: &mut HashMap<String, OperationTask>,
     completions: &mut tokio::sync::mpsc::Receiver<OperationCompletion>,
-) -> Result<(), String> {
+) -> Result<(), ShareError> {
     cancel_operations(operations);
+    let mut result = Ok(());
     while !operations.is_empty() {
-        let completion = completions.recv().await.ok_or_else(|| {
-            "External Workdir operation executor closed during cancellation".to_string()
-        })?;
+        let Some(completion) = completions.recv().await else {
+            result = retain_cleanup(
+                result,
+                Err(
+                    "External Workdir operation executor closed during cancellation"
+                        .to_string()
+                        .into(),
+                ),
+            );
+            // No senders remain; join every remaining executor, even if an
+            // earlier one panicked. Dropping JoinHandles would detach them.
+            for (_, operation) in operations.drain() {
+                result = retain_cleanup(
+                    result,
+                    operation.join().map(|_| ()).map_err(ShareError::from),
+                );
+            }
+            break;
+        };
         if let Some(operation) = operations.remove(completion.operation_id.as_str()) {
-            operation.join()?;
+            result = retain_cleanup(
+                result,
+                operation.join().map(|_| ()).map_err(ShareError::from),
+            );
         }
     }
-    Ok(())
+    result
 }
 
 async fn send_provider_frame<S>(
@@ -1016,18 +1481,19 @@ where
     tokio::time::timeout(Duration::from_secs(5), socket.send(message))
         .await
         .map_err(|_| "timed out sending External Workdir provider frame".to_string())?
-        .map_err(|error| format!("failed to send External Workdir provider frame: {error}"))
+        .map_err(|_| "failed to send External Workdir provider frame".to_string())
 }
 
 async fn wait_to_reconnect(
     client: &ServerApiClient,
     workspace_id: &str,
     grant_id: &str,
-) -> Result<bool, String> {
+    evidence: &mut ShareEvidence,
+) -> Result<bool, ShareError> {
     tokio::select! {
         signal = tokio::signal::ctrl_c() => {
             signal.map_err(|error| format!("failed to wait for Ctrl-C: {error}"))?;
-            revoke(client, workspace_id, grant_id).await?;
+            evidence.retain_grant(revoke(client, workspace_id, grant_id).await?);
             Ok(true)
         }
         _ = tokio::time::sleep(Duration::from_millis(250)) => Ok(false),
@@ -1038,25 +1504,23 @@ async fn fetch_grant(
     client: &ServerApiClient,
     workspace_id: &str,
     grant_id: &str,
-) -> Result<ExternalWorkdirGrantResponse, String> {
+) -> Result<ExternalWorkdirGrantResponse, ShareError> {
     client
         .external_workdir_grant_get(workspace_id.to_string(), grant_id.to_string())
         .await
-        .map_err(|error| format!("External Workdir grant refresh failed: {error}"))
+        .map_err(|error| ShareError::grant(WorkdirManagementOperation::GrantInspect, error))
 }
 
 async fn revoke(
     client: &ServerApiClient,
     workspace_id: &str,
     grant_id: &str,
-) -> Result<(), String> {
+) -> Result<ExternalWorkdirGrantResponse, ShareError> {
+    // Exactly one mutation call. Transport/decoding failure is not a retry gate.
     client
         .external_workdir_grant_revoke(workspace_id.to_string(), grant_id.to_string())
         .await
-        .map_err(|error| {
-            format!("External Workdir revoke was not confirmed by the Backend: {error}")
-        })?;
-    Ok(())
+        .map_err(|error| ShareError::grant(WorkdirManagementOperation::GrantRevoke, error))
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -1102,20 +1566,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_registration_surfaces_backend_close_reason() {
+    fn provider_registration_does_not_disclose_untyped_backend_close_reason() {
         use tokio_tungstenite::tungstenite::protocol::CloseFrame;
         use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
         let error = validate_provider_registration(
             Message::Close(Some(CloseFrame {
                 code: CloseCode::Policy,
-                reason: "provider read limits source=1024 response=512; Backend requires source=2048 response=1024".into(),
+                reason: "provider-secret /private/provider; Backend requires internal token".into(),
             })),
             1,
         )
         .unwrap_err();
-        assert!(error.contains("provider read limits"), "{error}");
-        assert!(error.contains("Backend requires"), "{error}");
+        assert!(error.contains("rejected"), "{error}");
+        assert!(!error.contains("provider-secret"), "{error}");
+        assert!(!error.contains("/private/provider"), "{error}");
     }
 
     #[test]
@@ -1285,6 +1750,15 @@ mod tests {
         response_body: String,
         response_count: usize,
     ) -> (String, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        spawn_http_server(response_body, response_count, None, "application/json")
+    }
+
+    fn spawn_http_server(
+        response_body: String,
+        response_count: usize,
+        status_override: Option<&'static str>,
+        content_type: &'static str,
+    ) -> (String, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -1292,15 +1766,15 @@ mod tests {
             for _ in 0..response_count {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
-                let status = if request.starts_with("POST ") {
+                let status = status_override.unwrap_or(if request.starts_with("POST ") {
                     "201 Created"
                 } else {
                     "200 OK"
-                };
+                });
                 sender.send(request).unwrap();
                 write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response_body.len(),
                     response_body
                 )
@@ -1320,9 +1794,387 @@ mod tests {
             "permissions": {"read": true, "write": false, "command": false},
             "expires_at": "2026-09-23T03:00:00Z",
             "generation": 7,
-            "status": "pending"
+            "status": "pending",
+            "cleanup_state": "not_required",
+            "cleanup_failures": []
         })
         .to_string()
+    }
+
+    fn management_problem(
+        operation: WorkdirManagementOperation,
+        reason: workdir::management_failure::WorkdirManagementReason,
+    ) -> String {
+        let facts = FailureFacts::new(WorkdirManagementFailure { operation, reason }).unwrap();
+        let projected = project_failure::<error_contract::Browser, _>(
+            &facts,
+            &WorkdirManagementVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+        let api_error = server_api::WorkdirManagementApiError::projected(projected);
+        let mut body = serde_json::to_value(api_error).unwrap();
+        // Received explanation is untrusted, even when its typed cause is known.
+        body["detail"] = serde_json::json!("provider-secret /private/provider HTTP-body");
+        body["yoi_failure"]["explanation"] = body["detail"].clone();
+        body.to_string()
+    }
+
+    #[tokio::test]
+    async fn generated_grant_errors_reach_cli_with_fresh_specific_safe_projection() {
+        use workdir::management_failure::WorkdirManagementReason as Reason;
+        for (operation, reason, status, expected) in [
+            (
+                WorkdirManagementOperation::GrantCreate,
+                Reason::GrantDisplayNameInvalid,
+                "400 Bad Request",
+                "1 to 100 bytes",
+            ),
+            (
+                WorkdirManagementOperation::GrantInspect,
+                Reason::GrantNotFound,
+                "400 Bad Request",
+                "not found in this Workspace",
+            ),
+            (
+                WorkdirManagementOperation::GrantRevoke,
+                Reason::GrantCreatorRequired,
+                "403 Forbidden",
+                "grant creator",
+            ),
+        ] {
+            let (url, requests, server) = spawn_http_server(
+                management_problem(operation, reason),
+                1,
+                Some(status),
+                "application/problem+json",
+            );
+            let client = test_server_api_client(&url);
+            let error = match operation {
+                WorkdirManagementOperation::GrantCreate => client
+                    .external_workdir_grant_create(
+                        "workspace-a".into(),
+                        ExternalWorkdirGrantCreateRequest {
+                            provider_instance_id: "provider-a".into(),
+                            display_name: "Shared files".into(),
+                            ttl_seconds: None,
+                            permissions: server_api::ExternalWorkdirPermissions::READ,
+                        },
+                    )
+                    .await
+                    .map_err(|error| ShareError::grant(operation, error))
+                    .unwrap_err(),
+                WorkdirManagementOperation::GrantInspect => {
+                    fetch_grant(&client, "workspace-a", "grant-a")
+                        .await
+                        .unwrap_err()
+                }
+                WorkdirManagementOperation::GrantRevoke => {
+                    revoke(&client, "workspace-a", "grant-a").await.unwrap_err()
+                }
+                _ => unreachable!(),
+            };
+            // Evidence remains typed until the display boundary.
+            let ShareCause::Grant {
+                error: ClientError::Public { error: api, .. },
+                ..
+            } = &error.cause
+            else {
+                panic!("typed management error was lost: {error:?}");
+            };
+            assert_eq!(
+                api.details(),
+                Some(&WorkdirManagementFailure { operation, reason })
+            );
+            let rendered = error.render();
+            assert!(rendered.contains(expected), "{rendered}");
+            for secret in ["provider-secret", "/private/provider", "HTTP-body"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            requests.recv_timeout(Duration::from_secs(5)).unwrap();
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn provider_handshake_decodes_typed_management_error_without_exposing_http_body() {
+        use workdir::management_failure::WorkdirManagementReason as Reason;
+        let body = management_problem(
+            WorkdirManagementOperation::GrantConnect,
+            Reason::GrantRevoked,
+        );
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(400)
+            .header("content-type", "application/problem+json")
+            .body(Some(body.into_bytes()))
+            .unwrap();
+        let error = provider_connection_error(tokio_tungstenite::tungstenite::Error::Http(
+            Box::new(response),
+        ));
+        let rendered = error.render();
+        assert!(rendered.contains("provider connection"), "{rendered}");
+        assert!(rendered.contains("has been revoked"), "{rendered}");
+        assert!(!rendered.contains("provider-secret"), "{rendered}");
+        assert!(!rendered.contains("HTTP-body"), "{rendered}");
+    }
+
+    #[test]
+    fn connection_timeout_keeps_existing_reconnect_path_but_never_replays_grant_mutation() {
+        let connection = provider_connection_error(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "/private/provider timeout"),
+        ));
+        assert!(!connection.prevents_reconnect());
+        assert!(!connection.render().contains("/private/"));
+        let revoke = ShareError::grant(
+            WorkdirManagementOperation::GrantRevoke,
+            ClientError::Failure(ClientFailure::Timeout),
+        );
+        assert!(revoke.prevents_reconnect());
+        assert!(revoke.render().contains("do not automatically resend"));
+        let cleanup = unknown_workdir_failure(WorkdirFailureOperation::SessionClose);
+        assert!(connection.with_secondary(cleanup).prevents_reconnect());
+    }
+
+    #[tokio::test]
+    async fn revoke_response_loss_retains_unconfirmed_mutation_without_resend() {
+        // A 2xx mutation with an invalid result body is not a confirmed revoke,
+        // nor evidence that the mutation was not applied.
+        let (url, requests, server) =
+            spawn_json_server("{invalid HTTP-body provider-secret".into(), 1);
+        let error = revoke(&test_server_api_client(&url), "workspace-a", "grant-a")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error.cause,
+            ShareCause::Grant {
+                operation: WorkdirManagementOperation::GrantRevoke,
+                error: ClientError::Failure(_),
+            }
+        ));
+        assert!(error.prevents_reconnect());
+        let rendered = error.render();
+        assert!(
+            rendered.contains("mutation result is unconfirmed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("do not automatically resend"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("provider-secret"), "{rendered}");
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.starts_with("DELETE "), "{request}");
+        server.join().unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn legacy_grant_error_does_not_disclose_provider_or_http_text() {
+        let legacy = server_api::RepositoryApiError::new(
+            403,
+            "provider-code",
+            "provider-secret /private/provider HTTP-body",
+            Vec::new(),
+        );
+        let error = ShareError::grant(
+            WorkdirManagementOperation::GrantRevoke,
+            ClientError::public(reqwest::StatusCode::FORBIDDEN, legacy.into()),
+        );
+        let rendered = error.render();
+        assert!(rendered.contains("HTTP 403"), "{rendered}");
+        assert!(rendered.contains("typed cause unavailable"), "{rendered}");
+        assert!(!rendered.contains("provider-secret"), "{rendered}");
+        assert!(!rendered.contains("provider-code"), "{rendered}");
+    }
+
+    fn unknown_workdir_failure(operation: WorkdirFailureOperation) -> ShareError {
+        ShareError {
+            cause: ShareCause::Workdir(WorkdirFailure::from_transport_error(
+                operation,
+                WorkdirTransportError {
+                    code: workdir::http::WorkdirTransportErrorCode::OutcomeUnknown,
+                    failure_reason: Some(workdir::WorkdirFailureReason::ProviderResponseLost),
+                    denial_reason: None,
+                    message: "provider-secret /private/provider".into(),
+                },
+            )),
+            secondary: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn interruption_and_original_connection_failure_survive_cleanup_failure() {
+        let interrupted = retain_provider_cleanup(
+            Ok(ProviderEnd::Interrupted),
+            Err(unknown_workdir_failure(
+                WorkdirFailureOperation::SessionClose,
+            )),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            &interrupted.cause,
+            ShareCause::ProviderEnded(ProviderEnd::Interrupted)
+        ));
+        assert!(interrupted.prevents_reconnect());
+        let connection: ShareError = "original connection failure".to_string().into();
+        let error = retain_provider_cleanup(
+            Err(connection),
+            Err(unknown_workdir_failure(
+                WorkdirFailureOperation::SessionClose,
+            )),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error.cause, ShareCause::Local(message) if message == "original connection failure")
+        );
+        assert_eq!(error.secondary.len(), 1);
+        assert!(error.prevents_reconnect());
+    }
+
+    #[test]
+    fn original_unknown_is_not_replaced_by_cleanup_failure_or_its_explanation() {
+        let cleanup = ShareError::workdir(
+            WorkdirFailureOperation::SessionClose,
+            workdir::WorkdirError::Io {
+                path: std::path::PathBuf::from("/private/cleanup"),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "provider-secret",
+                ),
+            },
+        );
+        let error = retain_cleanup::<()>(
+            Err(unknown_workdir_failure(WorkdirFailureOperation::Write)),
+            Err(cleanup),
+        )
+        .unwrap_err();
+        let ShareCause::Workdir(primary) = &error.cause else {
+            panic!("original failure lost")
+        };
+        assert_eq!(
+            primary.details().classification,
+            workdir::http::WorkdirTransportErrorCode::OutcomeUnknown
+        );
+        assert_eq!(
+            primary.details().failure_reason,
+            Some(workdir::WorkdirFailureReason::ProviderResponseLost)
+        );
+        assert_eq!(error.secondary.len(), 1);
+        let rendered = error.render();
+        assert!(
+            rendered.contains("do not automatically resend"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("session closing"), "{rendered}");
+        assert!(!rendered.contains("provider-secret"), "{rendered}");
+        assert!(!rendered.contains("/private/cleanup"), "{rendered}");
+    }
+
+    #[test]
+    fn refresh_observations_do_not_replace_original_failure_or_grow_for_identical_retries() {
+        let mut evidence = ShareEvidence::default();
+        evidence.retain_failure(unknown_workdir_failure(
+            WorkdirFailureOperation::SessionOpen,
+        ));
+        evidence.retain_failure(unknown_workdir_failure(
+            WorkdirFailureOperation::SessionOpen,
+        ));
+        evidence.retain_failure(ShareError::grant(
+            WorkdirManagementOperation::GrantInspect,
+            ClientError::Failure(ClientFailure::Timeout),
+        ));
+        assert_eq!(evidence.failures.len(), 2);
+        assert_eq!(evidence.failures[0].1, 2);
+        let ShareCause::Workdir(original) = &evidence.failures[0].0.cause else {
+            panic!("primary lost")
+        };
+        assert_eq!(
+            original.details().classification,
+            workdir::http::WorkdirTransportErrorCode::OutcomeUnknown
+        );
+        let rendered = evidence.render().join("\n");
+        assert!(
+            rendered.contains("do not automatically resend"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("grant refresh failed"), "{rendered}");
+        assert!(!rendered.contains("provider-secret"), "{rendered}");
+    }
+
+    #[test]
+    fn grant_settlement_and_secondary_cleanup_diagnostics_remain_independent() {
+        use protocol::startup_failure::StartupFailureAttachment;
+        let ShareCause::Workdir(failure) =
+            unknown_workdir_failure(WorkdirFailureOperation::SessionClose).cause
+        else {
+            unreachable!()
+        };
+        let projected = project_failure::<error_contract::Browser, _>(
+            &FailureFacts::new(*failure.details()).unwrap(),
+            &WorkdirFailureVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+        let attachment = StartupFailureAttachment::from_projected(&projected).unwrap();
+        // Corrupt/future attachments must not hide the settled status or leak bytes.
+        let corrupt: StartupFailureAttachment =
+            serde_json::from_value(serde_json::json!("{provider-secret /private/cleanup")).unwrap();
+        let mut grant: ExternalWorkdirGrantResponse =
+            serde_json::from_str(&grant_response_json()).unwrap();
+        grant.status = "revoked".into();
+        grant.cleanup_state = "retry_required".into();
+        grant.cleanup_failures = vec![attachment, corrupt];
+        for reason in [
+            workdir::management_failure::WorkdirManagementReason::GrantAuditFailed,
+            workdir::management_failure::WorkdirManagementReason::GrantCleanupPersistenceFailed,
+        ] {
+            let facts = FailureFacts::new(WorkdirManagementFailure {
+                operation: WorkdirManagementOperation::GrantCleanup,
+                reason,
+            })
+            .unwrap();
+            let projected = project_failure::<error_contract::Browser, _>(
+                &facts,
+                &WorkdirManagementVisibility {
+                    can_view_cause: true,
+                },
+            )
+            .unwrap();
+            grant
+                .cleanup_failures
+                .push(StartupFailureAttachment::from_projected(&projected).unwrap());
+        }
+        let evidence = ShareEvidence {
+            grants: vec![grant.clone()],
+            failures: Vec::new(),
+        };
+        let rendered = evidence.render().join("\n");
+        assert_eq!(evidence.grants[0], grant);
+        assert!(rendered.contains("grant status: revoked"), "{rendered}");
+        assert!(
+            rendered.contains("cleanup state: retry_required"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("audit record could not be confirmed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("cleanup observation could not be saved"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("do not automatically resend"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("diagnostic unavailable or unsupported"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("provider-secret"), "{rendered}");
+        assert!(!rendered.contains("/private/cleanup"), "{rendered}");
     }
 
     #[tokio::test]
@@ -1345,8 +2197,10 @@ mod tests {
         let fetched = fetch_grant(&client, "workspace/a b", "grant/a b")
             .await
             .unwrap();
-        revoke(&client, "workspace/a b", "grant/a b").await.unwrap();
+        let revoked = revoke(&client, "workspace/a b", "grant/a b").await.unwrap();
 
+        assert_eq!(revoked.status, "pending"); // Preserve the actual DTO, not an assumed revoke result.
+        assert_eq!(revoked.cleanup_state, "not_required");
         assert_eq!(created.grant_id, "grant/a b");
         assert_eq!(fetched.generation, 7);
         let requests = (0..3)
@@ -1390,6 +2244,7 @@ mod tests {
             request
                 .starts_with("GET /api/w/workspace-a/external-workdir-grants/grant-a HTTP/1.1\r\n")
         );
+        let error = error.render();
         assert!(error.contains("External Workdir grant refresh failed"));
         assert!(
             error.contains("response body exceeded 1048576 bytes"),
@@ -1409,6 +2264,69 @@ mod tests {
 
     #[tokio::test]
     async fn operation_shutdown_waits_until_executor_has_stopped() {
+        assert_operation_shutdown(Ok(())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_close_failure_still_cancels_and_joins_executors() {
+        let error = assert_operation_shutdown(Err(unknown_workdir_failure(
+            WorkdirFailureOperation::SessionClose,
+        )))
+        .await
+        .unwrap_err();
+        let ShareCause::Workdir(failure) = &error.cause else {
+            panic!("close failure was lost")
+        };
+        assert_eq!(
+            failure.details().classification,
+            workdir::http::WorkdirTransportErrorCode::OutcomeUnknown
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_join_failure_does_not_skip_remaining_executor_shutdown() {
+        let (sender, mut completions) = tokio::sync::mpsc::channel(2);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut operations = HashMap::new();
+        for (id, panic_after_completion) in [("op-panics", true), ("op-stops", false)] {
+            let operation_id = ExternalWorkdirOperationId::new(id).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let task_cancelled = cancelled.clone();
+            let task_stopped = stopped.clone();
+            let sender = sender.clone();
+            let thread = std::thread::spawn(move || {
+                while !task_cancelled.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                sender
+                    .blocking_send(OperationCompletion {
+                        operation_id,
+                        outcome: ExternalWorkdirOperationOutcome::Cancelled,
+                    })
+                    .unwrap();
+                if panic_after_completion {
+                    panic!("injected executor join failure");
+                }
+                task_stopped.store(true, Ordering::Release);
+            });
+            operations.insert(
+                id.to_string(),
+                OperationTask {
+                    cancelled,
+                    thread: Some(thread),
+                },
+            );
+        }
+        drop(sender);
+        let error = stop_operations(&mut operations, &mut completions)
+            .await
+            .unwrap_err();
+        assert!(operations.is_empty());
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(error.render().contains("executor panicked"));
+    }
+
+    async fn assert_operation_shutdown(close: Result<(), ShareError>) -> Result<(), ShareError> {
         let operation_id = ExternalWorkdirOperationId::new("op-cancel-test").unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         let started = Arc::new(AtomicBool::new(false));
@@ -1443,12 +2361,11 @@ mod tests {
             },
         )]);
 
-        stop_operations(&mut operations, &mut completions)
-            .await
-            .unwrap();
+        let result = stop_operations_after_close(close, &mut operations, &mut completions).await;
 
         assert!(operations.is_empty());
         assert!(stopped.load(Ordering::Acquire));
+        result
     }
 
     #[test]

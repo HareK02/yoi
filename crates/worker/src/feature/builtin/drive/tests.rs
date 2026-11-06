@@ -51,11 +51,13 @@ impl WorkspaceClient for Client {
                 || self.denied_resource.lock().unwrap().as_ref() == Some(&input.resource)
             {
                 return Ok(WorkspaceResponse {
+                    content_type: Some("application/json".into()),
                     status: 403,
                     body: "{}".into(),
                 });
             }
             return Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 200,
                 body: serde_json::json!({"scope": input.resource}).to_string(),
             });
@@ -65,6 +67,7 @@ impl WorkspaceClient for Client {
         if capabilities {
             let response = self.capabilities.lock().unwrap();
             return Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: response.status,
                 body: response.body.clone(),
             });
@@ -78,6 +81,7 @@ impl WorkspaceClient for Client {
 }
 fn response(value: impl Serialize) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: Some("application/json".into()),
         status: 200,
         body: serde_json::to_string(&value).unwrap(),
     }
@@ -426,6 +430,7 @@ async fn invalid_completion_and_unresolved_or_invalid_receipt_stay_unknown_after
             response: Some(committed),
         }),
         WorkspaceResponse {
+            content_type: Some("application/json".into()),
             status: 200,
             body: "invalid-json".into(),
         },
@@ -489,6 +494,7 @@ async fn observation_eviction_never_substitutes_another_entry() {
 #[tokio::test]
 async fn backend_error_details_are_not_reflected_and_conflict_is_not_retried() {
     let client = Client::new(vec![WorkspaceResponse {
+        content_type: Some("application/json".into()),
         status: 409,
         body: serde_json::to_string(&DriveApiError {
             code: DriveApiErrorCode::Conflict,
@@ -603,6 +609,7 @@ fn chunk_client(
 }
 fn chunk(bytes: Vec<u8>) -> crate::worker::WorkspaceBinaryResponse {
     crate::worker::WorkspaceBinaryResponse {
+        content_type: Some("application/json".into()),
         status: 200,
         body: bytes,
     }
@@ -649,6 +656,7 @@ async fn multi_chunk_image_uses_one_last_mutation_id_and_never_exposes_binary_in
 async fn expired_last_mutation_id_or_partial_chunk_aborts_image_without_rebinding_or_retrying() {
     for next in [
         crate::worker::WorkspaceBinaryResponse {
+            content_type: Some("application/json".into()),
             status: 409,
             body: serde_json::to_vec(&DriveApiError::new(DriveApiErrorCode::Conflict)).unwrap(),
         },
@@ -845,6 +853,7 @@ async fn drive_common_text_refuses_truncated_mismatched_stale_and_denied_reads()
         }
         let read = if case == "denied" {
             WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 403,
                 body: "denied".into(),
             }
@@ -862,10 +871,12 @@ async fn drive_common_text_refuses_truncated_mismatched_stale_and_denied_reads()
             .handler
             .call("read_lines", &native_args(json!({})), native_context())
             .await;
-        assert!(
-            matches!(result, Err(crate::wip::WipOperationError::Protocol(ref error)) if error.code == expected),
-            "{case}"
-        );
+        let actual = match result {
+            Err(crate::wip::WipOperationError::Protocol(error))
+            | Err(crate::wip::WipOperationError::ProtocolWithFailure { error, .. }) => error.code,
+            _ => panic!("{case}: expected a classified protocol failure"),
+        };
+        assert_eq!(actual, expected, "{case}");
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 3, "{case}: no retries");
         assert!(
@@ -1017,6 +1028,7 @@ async fn drive_capability_failure_never_publishes_an_assumed_write_ceiling() {
         let entry = entry("2", "3");
         let client = Client::new(vec![response(entry.clone())]);
         *client.capabilities.lock().unwrap() = WorkspaceResponse {
+            content_type: Some("application/json".into()),
             status,
             body: body.into(),
         };
@@ -1093,6 +1105,7 @@ impl WorkspaceClient for NativeMutations {
             let input: server_api::authorization::OperationAuthorizationRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             return Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 200,
                 body: serde_json::json!({"scope": input.resource}).to_string(),
             });

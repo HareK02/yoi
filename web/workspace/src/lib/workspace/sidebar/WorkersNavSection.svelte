@@ -14,6 +14,7 @@
     canDeleteSidebarWorker,
     deleteSidebarWorker,
     stopSidebarWorker,
+    stopCleanupMessage,
   } from './worker-actions';
   import {
     workspaceWorkersStore,
@@ -139,12 +140,21 @@
     closeWorkerMenu();
     busyAction = { workerKey: workerKey(worker), kind: 'stop' };
     try {
-      await stopSidebarWorker(scope.workspaceId, worker);
+      const cleanup = await stopSidebarWorker(scope.workspaceId, worker);
       if (!scope.isCurrent()) return;
-      await refreshWorkspaceWorkers(scope.workspaceId);
-      if (!scope.isCurrent()) return;
-      pushWorkspaceAlert('info', `Stop accepted for ${worker.display_name || worker.label}. Check the refreshed Worker state for confirmation.`, {
-        title: 'Stop accepted',
+      if (cleanup.length) {
+        pushWorkspaceAlert('warning', stopCleanupMessage(cleanup), {
+          title: 'Stop accepted; cleanup needs attention',
+        });
+      } else {
+        pushWorkspaceAlert('info', `Stop accepted for ${worker.display_name || worker.label}. Check the refreshed Worker state for confirmation.`, {
+          title: 'Stop accepted',
+        });
+      }
+      await refreshWorkspaceWorkers(scope.workspaceId).catch(() => {
+        if (scope.isCurrent()) pushWorkspaceAlert('warning', 'The Worker state could not be refreshed. Stop remains accepted; reload its current state before another action.', {
+          title: 'Worker state unavailable',
+        });
       });
     } catch (cause) {
       if (!scope.isCurrent()) return;

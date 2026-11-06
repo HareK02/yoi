@@ -50,7 +50,7 @@ pub(super) fn tool_error(
     error: DriveError,
     expected_request_id: &str,
 ) -> ToolError {
-    if let DriveError::OutcomeUnknown(request_id) = &error {
+    if let DriveError::OutcomeUnknown(request_id) = error.classification_source() {
         if request_id != expected_request_id
             || request_id.len() != 64
             || !request_id.bytes().all(|b| b.is_ascii_hexdigit())
@@ -58,7 +58,7 @@ pub(super) fn tool_error(
             return ToolError::ExecutionFailed("Drive mutation outcome unknown; original request identity could not be safely displayed; do not resend the mutation.".into());
         }
     }
-    let (error_class, code) = match &error {
+    let (error_class, code) = match error.classification_source() {
         DriveError::Conflict => (
             DriveToolErrorClass::StructuredConflict,
             Some(DriveToolConflictCode::DriveConflict),
@@ -66,13 +66,13 @@ pub(super) fn tool_error(
         DriveError::Invalid(_) | DriveError::Limit => (DriveToolErrorClass::InvalidArgument, None),
         _ => (DriveToolErrorClass::ExecutionFailed, None),
     };
-    let mutation = match &error {
+    let mutation = match error.classification_source() {
         DriveError::OutcomeUnknown(request_id) => DriveToolMutationObservation::OutcomeUnknown {
             request_id: request_id.clone(),
         },
         _ => DriveToolMutationObservation::NotReported,
     };
-    let boundary = match &error {
+    let boundary = match error.classification_source() {
         DriveError::Unavailable
         | DriveError::OutcomeUnknown(_)
         | DriveError::Authorization { denied: false, .. } => ToolFailureBoundary::Observation,

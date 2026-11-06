@@ -59,23 +59,25 @@ fn stopped_worker(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId) 
         }}
     }))
     .unwrap();
-    write_json(
-        &aggregate.join("worker.json"),
-        &json!({
-            "schema_version": schema,
-            "worker_ref": {"worker_id": worker}, "worker_id": worker,
-            "profile": request.profile,
-            "profile_source": request.profile_source.reference(),
-            "display_name": null, "config_bundle": null,
-            "created_at_ms": 1234, "status": "stopped", "workspace_id": "workspace-a",
-            "last_finished_submission_request_id": "retained-submission",
-            "restore_guard": {"observation_token": "retained-token",
-                "active_request_id": null, "owners": {}},
-            "execution_state": {"state": "available", "execution": {
-                "request": request, "binding": {}, "restore_intent": "explicit"
-            }}
-        }),
-    );
+    let mut worker_document = json!({
+        "schema_version": schema,
+        "worker_ref": {"worker_id": worker}, "worker_id": worker,
+        "profile": request.profile,
+        "profile_source": request.profile_source.reference(),
+        "display_name": null, "config_bundle": null,
+        "created_at_ms": 1234, "status": "stopped", "workspace_id": "workspace-a",
+        "last_finished_submission_request_id": "retained-submission",
+        "restore_guard": {"observation_token": "retained-token",
+            "active_request_id": null, "owners": {}},
+        "execution_state": {"state": "available", "execution": {
+            "request": request, "binding": {}, "restore_intent": "explicit"
+        }}
+    });
+    if schema == SCHEMA_VERSION {
+        worker_document["workdir_attachments_guard"] =
+            serde_json::to_value(crate::runtime::WorkdirAttachmentsGuard::default()).unwrap();
+    }
+    write_json(&aggregate.join("worker.json"), &worker_document);
     let (session, segment) = write_v4_session(&aggregate);
     let mut metadata = session_store::WorkerMetadata::new(
         format!("worker-runtime-{worker}"),

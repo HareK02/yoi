@@ -30,7 +30,8 @@ impl PromptProjectionCacheKey {
     }
 }
 
-type PromptProjectionCell = OnceLock<std::result::Result<Arc<WorkspacePromptProjection>, String>>;
+type PromptProjectionCell =
+    OnceLock<std::result::Result<Arc<WorkspacePromptProjection>, Arc<Error>>>;
 
 #[derive(Debug, Default)]
 struct PromptProjectionCacheState {
@@ -81,14 +82,14 @@ impl WorkspacePromptProjectionCache {
             .get_or_init(|| {
                 project_workspace_prompt_projection(workspace_id, state)
                     .map(Arc::new)
-                    .map_err(|error| error.to_string())
+                    .map_err(Arc::new)
             })
             .clone();
         let catalog = match resolved {
             Ok(catalog) => catalog,
             Err(error) => {
                 self.lock()?.entries.remove(&key);
-                return Err(Error::Config(error));
+                return Err(Error::PromptProjection(error));
             }
         };
 

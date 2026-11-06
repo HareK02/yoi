@@ -23,6 +23,9 @@ impl ApiBoundary<ConfigurationFailureDetails> for ConfigurationBoundary {
         use ConfigurationFailureReason::*;
         let status = match details.reason {
             OwnerRequired => HttpFailureStatus::Forbidden,
+            PublicationDispatchUnavailable | PublicationProjectionUnavailable => {
+                HttpFailureStatus::Internal
+            }
             CatalogChanged
             | EditingHeadChanged
             | LegacyExportChanged

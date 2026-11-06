@@ -88,7 +88,7 @@ pub(crate) async fn execute_grep(
     target: crate::search_target::SearchTarget,
     path: WorkdirPath,
     params: GrepParams,
-) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+) -> Result<crate::checkout::CheckoutToolOutput, crate::WorkdirToolError> {
     let mode = match params.output_mode.unwrap_or_default() {
         OutputMode::FilesWithMatches => GrepOutputMode::FilesWithMatches,
         OutputMode::Content => GrepOutputMode::Content,

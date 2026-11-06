@@ -25,6 +25,8 @@ use crate::catalog::{
 use crate::identity::WorkerRef;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use workdir::management_failure::WorkdirManagementReason;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -201,7 +203,7 @@ impl WorkingDirectoryBinding {
             .acquire_session_use(&self.occupancy_id, &self.generation)?;
         if !binding_paths_are_available(self) {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_found",
+                WorkdirManagementReason::NotFound,
                 "Workdir binding is no longer available; acquire a fresh binding",
             ));
         }
@@ -243,18 +245,30 @@ impl WorkingDirectoryBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingDirectoryDiagnostic {
+    pub reason: Option<WorkdirManagementReason>,
     pub code: String,
     pub message: String,
 }
 
 impl WorkingDirectoryDiagnostic {
+    /// A custom/older backend may have only an opaque code. Do not reconstruct
+    /// a cause or infer HTTP/recovery decisions from that spelling.
     pub fn rejected(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::new(code, message)
+        Self {
+            reason: None,
+            code: code.into(),
+            message: message.into(),
+        }
     }
 
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn for_reason(reason: WorkdirManagementReason, message: impl Into<String>) -> Self {
+        Self::new(reason, message)
+    }
+
+    fn new(reason: WorkdirManagementReason, message: impl Into<String>) -> Self {
         Self {
-            code: code.into(),
+            reason: Some(reason),
+            code: reason.as_str().into(),
             message: message.into(),
         }
     }
@@ -307,7 +321,7 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
         let current = self.working_directory_status(working_directory_id)?;
         if current.summary.status != WorkingDirectoryStatusKind::Active {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_active",
+                WorkdirManagementReason::NotActive,
                 "Persisted Workdir is not active and its provider cannot validate recovery binding",
             ));
         }
@@ -433,13 +447,13 @@ impl RepositoryAccessExpiryScheduler {
     ) -> Result<uuid::Uuid, WorkingDirectoryDiagnostic> {
         let mut state = self.inner.state.lock().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_unavailable",
+                WorkdirManagementReason::RepositoryAccessUnavailable,
                 "Runtime Repository access state is unavailable",
             )
         })?;
         if state.shutdown {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_unavailable",
+                WorkdirManagementReason::RepositoryAccessUnavailable,
                 "Runtime Repository access state is shutting down",
             ));
         }
@@ -462,7 +476,7 @@ impl RepositoryAccessExpiryScheduler {
             .lock()
             .map_err(|_| {
                 WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_access_unavailable",
+                    WorkdirManagementReason::RepositoryAccessUnavailable,
                     "Runtime Repository access state is unavailable",
                 )
             })
@@ -480,7 +494,7 @@ impl RepositoryAccessExpiryScheduler {
     ) -> Result<Option<RepositorySshMaterializationAccess>, WorkingDirectoryDiagnostic> {
         let mut state = self.inner.state.lock().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_unavailable",
+                WorkdirManagementReason::RepositoryAccessUnavailable,
                 "Runtime Repository access state is unavailable",
             )
         })?;
@@ -496,7 +510,7 @@ impl RepositoryAccessExpiryScheduler {
     fn remove_pending(&self, working_directory_id: &str) -> Result<(), WorkingDirectoryDiagnostic> {
         let mut state = self.inner.state.lock().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_unavailable",
+                WorkdirManagementReason::RepositoryAccessUnavailable,
                 "Runtime Repository access state is unavailable",
             )
         })?;
@@ -717,13 +731,12 @@ impl RuntimeGitMaterializer {
         let path = binding.working_directory_root.join(MATERIALIZATION_RECORD);
         let raw = serde_json::to_vec_pretty(&record).map_err(|error| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_record_serialize_failed",
+                WorkdirManagementReason::RecordSerializeFailed,
                 format!("failed to serialize working directory record: {error}"),
             )
         })?;
         fs::write(&path, raw).map_err(|_| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_record_write_failed",
+            WorkingDirectoryDiagnostic::new(WorkdirManagementReason::RecordWriteFailed,
                 "failed to write working directory record; backend-private path details were omitted",
             )
         })
@@ -741,7 +754,7 @@ impl RuntimeGitMaterializer {
             WorkingDirectoryStatusKind::Active | WorkingDirectoryStatusKind::CleanupPending
         ) {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_active",
+                WorkdirManagementReason::NotActive,
                 "working directory working_directory is not active",
             ));
         }
@@ -770,13 +783,12 @@ impl RuntimeGitMaterializer {
         let path = working_directory_root.join(MATERIALIZATION_RECORD);
         let raw = fs::read(&path).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_not_found",
+                WorkdirManagementReason::NotFound,
                 "working directory working_directory was not found",
             )
         })?;
         let record: WorkingDirectoryMaterializationRecord = serde_json::from_slice(&raw).map_err(|_| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_record_invalid",
+            WorkingDirectoryDiagnostic::new(WorkdirManagementReason::RecordInvalid,
                 "working directory working_directory record is invalid; backend-private path details were omitted",
             )
         })?;
@@ -797,7 +809,7 @@ impl RuntimeGitMaterializer {
         })
         .map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_record_invalid",
+                WorkdirManagementReason::RecordInvalid,
                 "materialization evidence is invalid",
             )
         })?;
@@ -817,7 +829,7 @@ impl RuntimeGitMaterializer {
             if result.is_err() {
                 let _ = fs::remove_file(&temporary);
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_record_write_failed",
+                    WorkdirManagementReason::RecordWriteFailed,
                     "materialization evidence migration could not be committed",
                 ));
             }
@@ -849,7 +861,7 @@ impl RuntimeGitMaterializer {
                 .repository_access_required
             {
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_remote_repository_access_required",
+                    WorkdirManagementReason::RemoteRepositoryAccessRequired,
                     "SSH Repository access must be reacquired before opening the Workdir session",
                 ));
             }
@@ -890,7 +902,7 @@ impl RuntimeGitMaterializer {
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         if url::Url::parse(&request.repository.source.uri).is_ok_and(|url| url.scheme() == "http") {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_plain_http_unsupported",
+                WorkdirManagementReason::RepositoryPlainHttpUnsupported,
                 "plain HTTP Repository sources are not executable; register an HTTPS or SSH source instead",
             ));
         }
@@ -902,13 +914,13 @@ impl RuntimeGitMaterializer {
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         if !matches!(request.materializer, MaterializerKind::RuntimeGitClone) {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_materializer_unsupported",
+                WorkdirManagementReason::MaterializerUnsupported,
                 "the requested working directory materializer is unsupported",
             ));
         }
         if request.repository.provider != "git" {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_provider_unsupported",
+                WorkdirManagementReason::RepositoryProviderUnsupported,
                 "the configured Repository provider is unsupported",
             ));
         }
@@ -919,8 +931,7 @@ impl RuntimeGitMaterializer {
         ) {
             validate_remote_source_uri(request)?;
             let materialization = request.materialization.as_ref().ok_or_else(|| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_materialization_authority_required",
+                WorkingDirectoryDiagnostic::new(WorkdirManagementReason::RepositoryMaterializationAuthorityRequired,
                     "remote Repository materialization requires Backend-authored operation authority",
                 )
             })?;
@@ -930,7 +941,7 @@ impl RuntimeGitMaterializer {
                 || materialization.config_projection_digest.trim().is_empty()
             {
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_materialization_authority_invalid",
+                    WorkdirManagementReason::RepositoryMaterializationAuthorityInvalid,
                     "remote Repository materialization authority is invalid",
                 ));
             }
@@ -945,8 +956,7 @@ impl RuntimeGitMaterializer {
                     .as_ref()
                     .and_then(|materialization| materialization.ssh.as_ref())
                     .ok_or_else(|| {
-                        WorkingDirectoryDiagnostic::new(
-                            "working_directory_remote_repository_access_required",
+                        WorkingDirectoryDiagnostic::new(WorkdirManagementReason::RemoteRepositoryAccessRequired,
                             "SSH Repository materialization requires operation-scoped credential and host-trust authority",
                         )
                     })?;
@@ -954,7 +964,7 @@ impl RuntimeGitMaterializer {
             }
             server_api::RepositorySourceKind::Invalid => {
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_source_invalid",
+                    WorkdirManagementReason::RepositorySourceInvalid,
                     "configured Repository source is invalid and cannot be materialized",
                 ));
             }
@@ -991,8 +1001,7 @@ impl RuntimeGitMaterializer {
             .repository_access
             .pending(working_directory_id)?
             .ok_or_else(|| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_remote_repository_access_required",
+                WorkingDirectoryDiagnostic::new(WorkdirManagementReason::RemoteRepositoryAccessRequired,
                     "SSH Repository materialization requires pre-authorized credential and host-trust authority",
                 )
             })?;
@@ -1007,8 +1016,7 @@ impl RuntimeGitMaterializer {
             .materialization
             .as_mut()
             .ok_or_else(|| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_materialization_authority_required",
+                WorkingDirectoryDiagnostic::new(WorkdirManagementReason::RepositoryMaterializationAuthorityRequired,
                     "remote Repository materialization requires Backend-authored operation authority",
                 )
             })?
@@ -1032,13 +1040,13 @@ impl RuntimeGitMaterializer {
         let checkout_root = working_directory_root.join(CHECKOUT_DIR);
         if working_directory_root.symlink_metadata().is_ok() {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_exists",
+                WorkdirManagementReason::Exists,
                 "working directory target already exists; cleanup or choose a new working_directory",
             ));
         }
         fs::create_dir_all(&self.runtime_root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_create_failed",
+                WorkdirManagementReason::CreateFailed,
                 "failed to create working directory storage",
             )
         })?;
@@ -1049,7 +1057,7 @@ impl RuntimeGitMaterializer {
         // not adopt an existing partial-cleanup directory or another creator's root.
         fs::create_dir(&working_directory_root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_create_failed",
+                WorkdirManagementReason::CreateFailed,
                 "failed to create working directory; backend-private path details were omitted",
             )
         })?;
@@ -1066,7 +1074,9 @@ impl RuntimeGitMaterializer {
             ])
             .arg(&request.repository.source.uri)
             .arg(&checkout_root);
-        if let Err(error) = run_repository_git(clone, "working_directory_repository_clone_failed") {
+        if let Err(error) =
+            run_repository_git(clone, WorkdirManagementReason::RepositoryCloneFailed)
+        {
             let _ = fs::remove_dir_all(&working_directory_root);
             return Err(error);
         }
@@ -1091,7 +1101,7 @@ impl RuntimeGitMaterializer {
             .arg(&resolved_commit)
             .arg("--");
         if let Err(error) =
-            run_repository_git(checkout, "working_directory_repository_checkout_failed")
+            run_repository_git(checkout, WorkdirManagementReason::RepositoryCheckoutFailed)
         {
             let _ = fs::remove_dir_all(&working_directory_root);
             return Err(error);
@@ -1205,7 +1215,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         let _use_lease = self.occupancy.acquire_use(&request.working_directory_id)?;
         let ssh = request.materialization.ssh.as_ref().ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_remote_repository_access_required",
+                WorkdirManagementReason::RemoteRepositoryAccessRequired,
                 "SSH Repository access authority is required",
             )
         })?;
@@ -1223,7 +1233,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
             .repository_access_required
         {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_not_applicable",
+                WorkdirManagementReason::RepositoryAccessNotApplicable,
                 "Workdir is not backed by an SSH Repository",
             ));
         }
@@ -1281,19 +1291,19 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
         let mut lines = output.lines();
         let line = lines.next().ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
-                "repository_ref_not_found",
+                WorkdirManagementReason::RefNotFound,
                 "Repository provider did not return the requested ref",
             )
         })?;
         if lines.next().is_some() {
             return Err(WorkingDirectoryDiagnostic::new(
-                "repository_ref_response_invalid",
+                WorkdirManagementReason::RefResponseInvalid,
                 "Repository provider returned an ambiguous ref observation",
             ));
         }
         let (resolved_ref, observed_selector) = line.split_once('\t').ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
-                "repository_ref_response_invalid",
+                WorkdirManagementReason::RefResponseInvalid,
                 "Repository provider returned an invalid ref observation",
             )
         })?;
@@ -1302,7 +1312,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
             || !resolved_ref.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(WorkingDirectoryDiagnostic::new(
-                "repository_ref_response_invalid",
+                WorkdirManagementReason::RefResponseInvalid,
                 "Repository provider returned an invalid ref observation",
             ));
         }
@@ -1347,7 +1357,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(_) => {
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_list_failed",
+                    WorkdirManagementReason::ListFailed,
                     "failed to list working directory working_directories; backend-private path details were omitted",
                 ));
             }
@@ -1394,7 +1404,7 @@ impl WorkingDirectoryMaterializer for RuntimeGitMaterializer {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_not_found",
+                    WorkdirManagementReason::NotFound,
                     "Runtime working directory was not found",
                 ));
             }
@@ -1459,7 +1469,7 @@ impl RepositorySshAgent {
         let root = runtime_root.join(".repository-agents").join(agent_id);
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_agent_failed",
+                WorkdirManagementReason::RepositoryAgentFailed,
                 "Runtime-managed Repository SSH agent could not be created",
             )
         })?;
@@ -1475,7 +1485,7 @@ impl RepositorySshAgent {
             .spawn()
             .map_err(|_| {
                 WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_agent_unavailable",
+                    WorkdirManagementReason::RepositoryAgentUnavailable,
                     "Runtime-managed Repository SSH agent is unavailable",
                 )
             })?;
@@ -1491,7 +1501,7 @@ impl RepositorySshAgent {
                 let _ = child.wait();
                 let _ = fs::remove_dir_all(&root);
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_agent_failed",
+                    WorkdirManagementReason::RepositoryAgentFailed,
                     "Runtime-managed Repository SSH agent could not be started",
                 ));
             }
@@ -1516,7 +1526,7 @@ impl RepositorySshAgent {
                 Err(_) => {
                     drop(agent);
                     return Err(WorkingDirectoryDiagnostic::new(
-                        "working_directory_repository_agent_unavailable",
+                        WorkdirManagementReason::RepositoryAgentUnavailable,
                         "Runtime-managed Repository SSH agent is unavailable",
                     ));
                 }
@@ -1529,7 +1539,7 @@ impl RepositorySshAgent {
             if write_result.is_err() || !matches!(status, Ok(status) if status.success()) {
                 drop(agent);
                 return Err(WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_agent_failed",
+                    WorkdirManagementReason::RepositoryAgentFailed,
                     "Runtime-managed Repository SSH agent rejected credential material",
                 ));
             }
@@ -1607,13 +1617,13 @@ impl RepositorySshBroker {
         let socket = root.join("b.sock");
         let listener = UnixListener::bind(&socket).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_setup_failed",
+                WorkdirManagementReason::RepositoryAccessSetupFailed,
                 "Repository SSH broker could not be prepared",
             )
         })?;
         listener.set_nonblocking(true).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_setup_failed",
+                WorkdirManagementReason::RepositoryAccessSetupFailed,
                 "Repository SSH broker could not be prepared",
             )
         })?;
@@ -1926,7 +1936,7 @@ impl RepositorySshCommandPolicy {
     ) -> Result<Self, WorkingDirectoryDiagnostic> {
         let source = parse_repository_ssh_source(&access.repository_uri).ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_binding_mismatch",
+                WorkdirManagementReason::RepositoryAccessBindingMismatch,
                 "Repository SSH access URI is invalid",
             )
         })?;
@@ -2254,7 +2264,7 @@ impl RepositoryCommandAccess {
         let root = repository_command_access_root(runtime_root, operation_id, repository_id);
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_setup_failed",
+                WorkdirManagementReason::RepositoryAccessSetupFailed,
                 "operation-scoped Repository access could not be prepared",
             )
         })?;
@@ -2302,7 +2312,7 @@ impl RepositoryCommandAccess {
         let root = repository_command_access_root(runtime_root, operation_id, repository_id);
         fs::create_dir_all(&root).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_setup_failed",
+                WorkdirManagementReason::RepositoryAccessSetupFailed,
                 "operation-scoped Repository access could not be prepared",
             )
         })?;
@@ -2321,7 +2331,7 @@ impl RepositoryCommandAccess {
         let broker = ssh_broker.as_ref().expect("Repository SSH broker");
         let executable = std::env::current_exe().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_setup_failed",
+                WorkdirManagementReason::RepositoryAccessSetupFailed,
                 "Repository SSH broker client could not be resolved",
             )
         })?;
@@ -2366,7 +2376,7 @@ fn validate_repository_access_binding(
         || repository_uri.is_some_and(|repository_uri| access.repository_uri != repository_uri)
     {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_access_binding_mismatch",
+            WorkdirManagementReason::RepositoryAccessBindingMismatch,
             "Repository SSH access authority does not match the requested Repository source",
         ));
     }
@@ -2382,7 +2392,7 @@ fn validate_ssh_materialization_access(
         .as_secs();
     if access.expires_at_epoch_seconds <= now {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_access_expired",
+            WorkdirManagementReason::RepositoryAccessExpired,
             "operation-scoped SSH credential and host-trust authority has expired",
         ));
     }
@@ -2397,7 +2407,7 @@ fn validate_ssh_materialization_access(
         || access.known_hosts_entry.expose().trim().is_empty()
     {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_remote_repository_access_invalid",
+            WorkdirManagementReason::RemoteRepositoryAccessInvalid,
             "operation-scoped SSH credential or host-trust authority is invalid",
         ));
     }
@@ -2411,7 +2421,7 @@ fn validate_remote_source_uri(
         let source =
             parse_repository_ssh_source(&request.repository.source.uri).ok_or_else(|| {
                 WorkingDirectoryDiagnostic::new(
-                    "working_directory_repository_source_invalid",
+                    WorkdirManagementReason::RepositorySourceInvalid,
                     "remote Repository source URI is invalid",
                 )
             })?;
@@ -2420,8 +2430,7 @@ fn validate_remote_source_uri(
             .as_ref()
             .and_then(|materialization| materialization.ssh.as_ref())
             .ok_or_else(|| {
-                WorkingDirectoryDiagnostic::new(
-                    "working_directory_remote_repository_access_required",
+                WorkingDirectoryDiagnostic::new(WorkdirManagementReason::RemoteRepositoryAccessRequired,
                     "SSH Repository materialization requires operation-scoped credential and host-trust authority",
                 )
             })?;
@@ -2432,7 +2441,7 @@ fn validate_remote_source_uri(
         };
         if !access.known_hosts_entry.expose().starts_with(&known_host) {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_remote_repository_host_trust_mismatch",
+                WorkdirManagementReason::RemoteRepositoryHostTrustMismatch,
                 "SSH Repository source does not match the operation-scoped host-trust authority",
             ));
         }
@@ -2441,7 +2450,7 @@ fn validate_remote_source_uri(
 
     let url = url::Url::parse(&request.repository.source.uri).map_err(|_| {
         WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_source_invalid",
+            WorkdirManagementReason::RepositorySourceInvalid,
             "remote Repository source URI is invalid",
         )
     })?;
@@ -2456,7 +2465,7 @@ fn validate_remote_source_uri(
         || !url.username().is_empty()
     {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_source_invalid",
+            WorkdirManagementReason::RepositorySourceInvalid,
             "remote Repository source URI is invalid or contains forbidden credentials",
         ));
     }
@@ -2478,7 +2487,7 @@ fn validate_selector(selector: &str) -> Result<(), WorkingDirectoryDiagnostic> {
         });
     if !valid {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_selector_invalid",
+            WorkdirManagementReason::RepositorySelectorInvalid,
             "configured Repository selector is invalid",
         ));
     }
@@ -2534,13 +2543,13 @@ fn repository_git_command(
 fn validate_exact_branch_selector(selector: &str) -> Result<(), WorkingDirectoryDiagnostic> {
     validate_selector(selector).map_err(|_| {
         WorkingDirectoryDiagnostic::new(
-            "repository_ref_selector_invalid",
+            WorkdirManagementReason::RefSelectorInvalid,
             "Repository ref observation requires a valid exact branch selector",
         )
     })?;
     if !selector.starts_with("refs/heads/") {
         return Err(WorkingDirectoryDiagnostic::new(
-            "repository_ref_selector_invalid",
+            WorkdirManagementReason::RefSelectorInvalid,
             "Repository ref observation requires an exact branch selector",
         ));
     }
@@ -2552,13 +2561,13 @@ fn validate_exact_branch_selector(selector: &str) -> Result<(), WorkingDirectory
         .status()
         .map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "repository_ref_provider_unavailable",
+                WorkdirManagementReason::RefProviderUnavailable,
                 "Git ref validation could not be started",
             )
         })?;
     if !status.success() {
         return Err(WorkingDirectoryDiagnostic::new(
-            "repository_ref_selector_invalid",
+            WorkdirManagementReason::RefSelectorInvalid,
             "Repository ref observation requires a valid exact branch selector",
         ));
     }
@@ -2604,19 +2613,19 @@ fn run_repository_git_stdout(
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|_| {
         WorkingDirectoryDiagnostic::new(
-            "repository_ref_provider_unavailable",
+            WorkdirManagementReason::RefProviderUnavailable,
             "Repository provider operation could not be started",
         )
     })?;
     let stdout = child.stdout.take().ok_or_else(|| {
         WorkingDirectoryDiagnostic::new(
-            "repository_ref_provider_unavailable",
+            WorkdirManagementReason::RefProviderUnavailable,
             "Repository provider response could not be captured",
         )
     })?;
     let stderr = child.stderr.take().ok_or_else(|| {
         WorkingDirectoryDiagnostic::new(
-            "repository_ref_provider_unavailable",
+            WorkdirManagementReason::RefProviderUnavailable,
             "Repository provider diagnostic could not be captured",
         )
     })?;
@@ -2626,7 +2635,7 @@ fn run_repository_git_stdout(
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "repository_ref_provider_unavailable",
+                WorkdirManagementReason::RefProviderUnavailable,
                 "Repository provider operation status could not be observed",
             )
         })? {
@@ -2638,7 +2647,7 @@ fn run_repository_git_stdout(
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(WorkingDirectoryDiagnostic::new(
-                "repository_ref_provider_timeout",
+                WorkdirManagementReason::RefProviderTimeout,
                 "Repository provider operation exceeded the Runtime time limit",
             ));
         }
@@ -2649,14 +2658,14 @@ fn run_repository_git_stdout(
     if status.success() {
         return String::from_utf8(stdout).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "repository_ref_response_invalid",
+                WorkdirManagementReason::RefResponseInvalid,
                 "Repository provider returned a non-UTF-8 ref observation",
             )
         });
     }
     if status.code() == Some(2) {
         return Err(WorkingDirectoryDiagnostic::new(
-            "repository_ref_not_found",
+            WorkdirManagementReason::RefNotFound,
             "Repository provider did not return the requested ref",
         ));
     }
@@ -2672,9 +2681,9 @@ fn run_repository_git_stdout(
         .any(|marker| diagnostic.contains(marker));
     Err(WorkingDirectoryDiagnostic::new(
         if auth_failed {
-            "repository_ref_provider_auth_failed"
+            WorkdirManagementReason::RefProviderAuthFailed
         } else {
-            "repository_ref_provider_unavailable"
+            WorkdirManagementReason::RefProviderUnavailable
         },
         if auth_failed {
             "Repository provider rejected the operation-scoped authentication"
@@ -2686,7 +2695,7 @@ fn run_repository_git_stdout(
 
 fn run_repository_git(
     mut command: Command,
-    code: &'static str,
+    code: WorkdirManagementReason,
 ) -> Result<(), WorkingDirectoryDiagnostic> {
     #[cfg(test)]
     TEST_REPOSITORY_GIT_INVOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
@@ -2694,7 +2703,7 @@ fn run_repository_git(
     tracing::info!(
         target: "yoi::repository_access",
         event = "repository_git_operation_started",
-        stage = code,
+        stage = code.as_str(),
         "starting Git Repository operation"
     );
     let started = Instant::now();
@@ -2705,7 +2714,7 @@ fn run_repository_git(
         .spawn()
         .map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_git_unavailable",
+                WorkdirManagementReason::GitUnavailable,
                 "Git command could not be executed; backend-private path details were omitted",
             )
         })?;
@@ -2726,12 +2735,12 @@ fn run_repository_git(
             tracing::warn!(
                 target: "yoi::repository_access",
                 event = "repository_git_operation_timed_out",
-                stage = code,
+                stage = code.as_str(),
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Git Repository operation exceeded the Runtime time limit"
             );
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_timeout",
+                WorkdirManagementReason::RepositoryTimeout,
                 "Git Repository operation exceeded the Runtime time limit",
             ));
         }
@@ -2742,7 +2751,7 @@ fn run_repository_git(
         tracing::info!(
             target: "yoi::repository_access",
             event = "repository_git_operation_succeeded",
-            stage = code,
+            stage = code.as_str(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "Git Repository operation succeeded"
         );
@@ -2752,7 +2761,7 @@ fn run_repository_git(
         tracing::warn!(
             target: "yoi::repository_access",
             event = "repository_git_operation_failed",
-            stage = code,
+            stage = code.as_str(),
             diagnostic_code = %diagnostic.code,
             elapsed_ms = started.elapsed().as_millis() as u64,
             exit_status = %status,
@@ -2763,25 +2772,25 @@ fn run_repository_git(
 }
 
 fn repository_git_failure_diagnostic(
-    default_code: &'static str,
+    default_code: WorkdirManagementReason,
     stderr: &[u8],
 ) -> WorkingDirectoryDiagnostic {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     let (code, message) = if stderr.contains("repository ssh operation denied") {
         (
-            "working_directory_repository_access_denied",
+            WorkdirManagementReason::RepositoryAccessDenied,
             "Git SSH command was rejected by the operation-scoped Repository access policy",
         )
     } else if stderr.contains("host key verification failed")
         || stderr.contains("no ed25519 host key is known")
     {
         (
-            "working_directory_repository_host_trust_failed",
+            WorkdirManagementReason::RepositoryHostTrustFailed,
             "Git SSH host key verification failed",
         )
     } else if stderr.contains("permission denied") || stderr.contains("publickey") {
         (
-            "working_directory_repository_authentication_failed",
+            WorkdirManagementReason::RepositoryAuthenticationFailed,
             "Git SSH authentication failed for every operation-scoped credential candidate",
         )
     } else if stderr.contains("connection timed out")
@@ -2792,12 +2801,12 @@ fn repository_git_failure_diagnostic(
         || stderr.contains("name or service not known")
     {
         (
-            "working_directory_repository_connection_failed",
+            WorkdirManagementReason::RepositoryConnectionFailed,
             "Git SSH connection to the Repository host failed",
         )
     } else if stderr.contains("repository not found") {
         (
-            "working_directory_repository_not_found",
+            WorkdirManagementReason::RepositoryNotFound,
             "Git Repository was not found or is not accessible",
         )
     } else {
@@ -2834,7 +2843,7 @@ fn resolve_cloned_commit(
         }
     }
     Err(WorkingDirectoryDiagnostic::new(
-        "working_directory_repository_selector_unresolved",
+        WorkdirManagementReason::RepositorySelectorUnresolved,
         "configured Repository selector could not be resolved to a commit",
     ))
 }
@@ -2853,7 +2862,10 @@ fn apply_repository_access_policy(
                 "origin",
                 "yoi-read-only://repository-push-disabled",
             ]);
-            run_repository_git(disable_push, "working_directory_repository_policy_failed")
+            run_repository_git(
+                disable_push,
+                WorkdirManagementReason::RepositoryPolicyFailed,
+            )
         }
         server_api::RepositoryAccessMode::ReadWrite => {
             if git_stdout(
@@ -2870,7 +2882,7 @@ fn apply_repository_access_policy(
                 "--unset-all",
                 "remote.origin.pushurl",
             ]);
-            run_repository_git(enable_push, "working_directory_repository_policy_failed")
+            run_repository_git(enable_push, WorkdirManagementReason::RepositoryPolicyFailed)
         }
     }
 }
@@ -2892,7 +2904,7 @@ fn validate_repository_limits(repository_root: &Path) -> Result<(), WorkingDirec
     }
     if objects > REPOSITORY_MAX_OBJECTS || kibibytes.saturating_mul(1024) > REPOSITORY_MAX_BYTES {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_limit_exceeded",
+            WorkdirManagementReason::RepositoryLimitExceeded,
             "Git Repository exceeds Runtime object or storage limits",
         ));
     }
@@ -2909,13 +2921,13 @@ fn write_owner_only(path: &Path, content: &[u8]) -> Result<(), WorkingDirectoryD
     }
     let mut file = options.open(path).map_err(|_| {
         WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_access_setup_failed",
+            WorkdirManagementReason::RepositoryAccessSetupFailed,
             "operation-scoped Repository access could not be prepared",
         )
     })?;
     file.write_all(content).map_err(|_| {
         WorkingDirectoryDiagnostic::new(
-            "working_directory_repository_access_setup_failed",
+            WorkdirManagementReason::RepositoryAccessSetupFailed,
             "operation-scoped Repository access could not be prepared",
         )
     })
@@ -2927,7 +2939,7 @@ fn set_directory_owner_only(path: &Path) -> Result<(), WorkingDirectoryDiagnosti
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_setup_failed",
+                WorkdirManagementReason::RepositoryAccessSetupFailed,
                 "operation-scoped Repository access could not be prepared",
             )
         })?;
@@ -2941,7 +2953,7 @@ fn set_file_owner_executable(path: &Path) -> Result<(), WorkingDirectoryDiagnost
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_repository_access_setup_failed",
+                WorkdirManagementReason::RepositoryAccessSetupFailed,
                 "operation-scoped Repository access could not be prepared",
             )
         })?;
@@ -2975,13 +2987,13 @@ where
         .output()
         .map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_git_unavailable",
+                WorkdirManagementReason::GitUnavailable,
                 "Git command could not be executed; backend-private path details were omitted",
             )
         })?;
     if !output.status.success() {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_git_failed",
+            WorkdirManagementReason::GitFailed,
             "Git command failed; backend-private path details were omitted",
         ));
     }
@@ -2991,7 +3003,7 @@ where
 fn path_str(path: &Path) -> Result<String, WorkingDirectoryDiagnostic> {
     path.to_str().map(ToString::to_string).ok_or_else(|| {
         WorkingDirectoryDiagnostic::new(
-            "working_directory_non_utf8_path",
+            WorkdirManagementReason::NonUtf8Path,
             "working directory path is not valid UTF-8; backend-private path details were omitted",
         )
     })
@@ -3040,7 +3052,7 @@ fn validate_working_directory_id(
         || working_directory_id.contains('\\')
     {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_id_invalid",
+            WorkdirManagementReason::IdInvalid,
             "working directory working_directory id is invalid",
         ));
     }
@@ -3053,7 +3065,7 @@ fn validate_relative_cwd(
 ) -> Result<PathBuf, WorkingDirectoryDiagnostic> {
     let root = root.canonicalize().map_err(|_| {
         WorkingDirectoryDiagnostic::new(
-            "working_directory_root_unavailable",
+            WorkdirManagementReason::RootUnavailable,
             "working directory root is unavailable; backend-private path details were omitted",
         )
     })?;
@@ -3071,19 +3083,19 @@ fn validate_relative_cwd(
         })
     {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_relative_cwd_invalid",
+            WorkdirManagementReason::RelativeCwdInvalid,
             "working directory relative_cwd must be a relative path inside the working directory root",
         ));
     }
     let target = root.join(relative_path).canonicalize().map_err(|_| {
         WorkingDirectoryDiagnostic::new(
-            "working_directory_relative_cwd_unavailable",
+            WorkdirManagementReason::RelativeCwdUnavailable,
             "working directory relative_cwd does not identify an existing directory",
         )
     })?;
     if !target.starts_with(&root) || !target.is_dir() {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_relative_cwd_escape_rejected",
+            WorkdirManagementReason::RelativeCwdEscapeRejected,
             "working directory relative_cwd must resolve to a directory inside the working directory root",
         ));
     }
@@ -4252,7 +4264,7 @@ mod tests {
         ];
         for (stderr, expected_code) in cases {
             let diagnostic = repository_git_failure_diagnostic(
-                "working_directory_repository_fetch_failed",
+                WorkdirManagementReason::RepositoryCloneFailed,
                 stderr,
             );
             assert_eq!(&diagnostic.code, expected_code);

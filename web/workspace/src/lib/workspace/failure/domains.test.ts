@@ -1,6 +1,9 @@
 declare const Deno: { test(name: string, fn: () => void): void };
 import { DOMAIN_FAILURE_CONTRACTS } from "#lib/generated/domain-failures.ts";
-import { decodeDomainFailureDetails } from "./domains.ts";
+import {
+  decodeDomainFailureDetails,
+  type DomainFieldContract,
+} from "./domains.ts";
 import { decodeFailure } from "./receive.ts";
 
 const equal = (actual: unknown, expected: unknown) => {
@@ -13,16 +16,32 @@ const equal = (actual: unknown, expected: unknown) => {
 
 // Schema/identity interoperability only: endpoint authorization, HTTP status and
 // persisted mutation counts are covered by the Rust production-caller suites.
+type FieldValue = string | null | { [field: string]: FieldValue };
+function sample(contract: DomainFieldContract): FieldValue {
+  if (Array.isArray(contract)) {
+    return contract.includes(null) ? null : contract[0];
+  }
+  if ("any_of" in contract) {
+    return contract.any_of.map(sample).find((value) => value === null) ??
+      sample(contract.any_of[0]);
+  }
+  const object = contract as {
+    fields: Readonly<Record<string, DomainFieldContract>>;
+  };
+  return Object.fromEntries(
+    Object.entries(object.fields).map(([key, field]) => [key, sample(field)]),
+  );
+}
 function fixture(domain: keyof typeof DOMAIN_FAILURE_CONTRACTS) {
   const contract: {
-    fields: Readonly<Record<string, readonly (string | null)[]>>;
+    fields: Readonly<Record<string, DomainFieldContract>>;
     category_field: string;
     categories: Readonly<Record<string, string>>;
     reason_fields: readonly string[];
   } = DOMAIN_FAILURE_CONTRACTS[domain];
-  const details: Record<string, string | null> = {};
+  const details: Record<string, FieldValue> = {};
   for (const [field, values] of Object.entries(contract.fields)) {
-    details[field] = values.includes(null) ? null : values[0];
+    details[field] = sample(values);
   }
   const categoryKey =
     details[contract.category_field] as keyof typeof contract.categories;
@@ -118,5 +137,33 @@ Deno.test("domain and details identity cannot be substituted by a known sibling 
   equal(decode({ ...failure, domain: "repository" }).kind, "invalid");
   for (const domain of ["__proto__", "constructor", "toString"]) {
     equal(decode({ ...failure, domain }).kind, "unsupported");
+  }
+});
+
+Deno.test("nested Drive HTTP and Tool facts accept only the generated closed objects", () => {
+  const failure = fixture("workspace_drive_client");
+  const server = {
+    operation: "mutate",
+    code: "conflict",
+    classification: "unknown",
+    storage: { operation: "update", reason: "fenced" },
+  };
+  equal(
+    decode({ ...failure, details: { ...failure.details, server } }).kind,
+    "known",
+  );
+  for (
+    const changed of [
+      { ...server, provider_body: "private" },
+      { ...server, storage: { ...server.storage, path: "/private" } },
+      { ...server, storage: { ...server.storage, reason: "future" } },
+      { ...server, storage: { reason: "fenced" } },
+    ]
+  ) {
+    equal(
+      decode({ ...failure, details: { ...failure.details, server: changed } })
+        .kind,
+      "invalid",
+    );
   }
 });

@@ -54,7 +54,12 @@ impl Tool for ViewImageTool {
         let path = WorkdirPath::new(&input.path).map_err(ToolsError::from)?;
         let bytes = read_workdir_bytes(selected.session.as_ref(), path.clone(), MAX_IMAGE_BYTES)
             .await
-            .map_err(ToolsError::from)?;
+            .map_err(|error| {
+                crate::WorkdirToolError::operation(
+                    workdir::failure::WorkdirFailureOperation::ReadBytes,
+                    error,
+                )
+            })?;
         let mime_type = detect_image_mime(&bytes).ok_or_else(|| {
             ToolError::InvalidArgument(
                 "unsupported image; expected PNG, JPEG, GIF, or WebP bytes".to_string(),
@@ -103,12 +108,14 @@ pub async fn read_workdir_bytes(
         if result.path != path || result.offset != offset {
             return Err(workdir::WorkdirError::Transport(
                 "bounded binary read returned a mismatched path or offset".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch));
         }
         if result.bytes.len() > request_bytes {
             return Err(workdir::WorkdirError::Transport(
                 "bounded binary read exceeded the requested response size".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch));
         }
         let end = result
             .offset
@@ -117,16 +124,19 @@ pub async fn read_workdir_bytes(
                 workdir::WorkdirError::Transport(
                     "bounded binary read returned an invalid byte range".to_string(),
                 )
+                .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch)
             })?;
         if end > result.total_bytes || result.eof != (end == result.total_bytes) {
             return Err(workdir::WorkdirError::Transport(
                 "bounded binary read returned a truncated or invalid byte range".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch));
         }
         if result.total_bytes > max_total_bytes as u64 {
             return Err(workdir::WorkdirError::InvalidArgument(format!(
                 "file exceeds the {max_total_bytes}-byte limit"
-            )));
+            ))
+            .with_failure_reason(workdir::WorkdirFailureReason::ReadLimitExceeded));
         }
         if expected_total.is_some_and(|total| total != result.total_bytes)
             || expected_hash.is_some_and(|hash| hash != result.content_hash)
@@ -146,7 +156,8 @@ pub async fn read_workdir_bytes(
         if result.bytes.is_empty() && !result.eof {
             return Err(workdir::WorkdirError::Transport(
                 "bounded binary read made no progress".to_string(),
-            ));
+            )
+            .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch));
         }
         bytes.extend_from_slice(&result.bytes);
         offset = end;
@@ -154,13 +165,15 @@ pub async fn read_workdir_bytes(
             if bytes.len() as u64 != result.total_bytes {
                 return Err(workdir::WorkdirError::Transport(
                     "bounded binary read returned partial file bytes".to_string(),
-                ));
+                )
+                .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch));
             }
             let assembled_hash: ContentHash = Sha256::digest(&bytes).into();
             if assembled_hash != result.content_hash {
                 return Err(workdir::WorkdirError::Transport(
                     "bounded binary read assembled bytes do not match the content hash".to_string(),
-                ));
+                )
+                .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch));
             }
             return Ok(bytes);
         }
@@ -176,7 +189,9 @@ pub fn routed_view_image_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefiniti
         let schema = schemars::schema_for!(ViewImageParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
         let meta = ToolMeta::new("ViewImage")
-            .description(DESCRIPTION)
+            .description(format!(
+                "{DESCRIPTION} Maximum image size: {MAX_IMAGE_BYTES} bytes."
+            ))
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(ViewImageTool {
             router: router.clone(),
@@ -308,7 +323,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, WorkdirError::Transport(message) if message.contains("content hash"))
+            matches!(error.classification_source(), WorkdirError::Transport(message) if message.contains("content hash"))
         );
     }
 
@@ -342,7 +357,10 @@ mod tests {
             let error = read_workdir_bytes(&session, valid.path.clone(), 16 * 1024 * 1024)
                 .await
                 .unwrap_err();
-            assert!(matches!(error, WorkdirError::Transport(_)), "{error}");
+            assert!(
+                matches!(error.classification_source(), WorkdirError::Transport(_)),
+                "{error}"
+            );
         }
     }
 
@@ -398,7 +416,7 @@ mod tests {
         );
         assert!(matches!(
             read_workdir_bytes(&session, path, bytes.len() - 1).await,
-            Err(WorkdirError::InvalidArgument(_))
+            Err(error) if matches!(error.classification_source(), WorkdirError::InvalidArgument(_))
         ));
     }
 
@@ -418,7 +436,7 @@ mod tests {
         );
         assert!(matches!(
             read_workdir_bytes(&session, path.clone(), bytes.len() - 1).await,
-            Err(WorkdirError::InvalidArgument(_))
+            Err(error) if matches!(error.classification_source(), WorkdirError::InvalidArgument(_))
         ));
         std::fs::write(dir.path().join("artifact.bin"), []).unwrap();
         assert!(

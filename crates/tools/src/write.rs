@@ -72,7 +72,7 @@ pub(crate) async fn execute_write(
     content: String,
     create_path: Option<WorkdirPath>,
     ctx: agen::tool::ToolExecutionContext,
-) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+) -> Result<crate::checkout::CheckoutToolOutput, crate::WorkdirToolError> {
     // Provider size/access checks still run inside the checked save. The shared
     // core owns text semantics, not the provider's bounds or lifecycle.
     let content = fs_operation::text::write(content, Default::default())
@@ -97,7 +97,12 @@ pub(crate) async fn execute_write(
             Err(error) if matches!(error.classification_source(), WorkdirError::NotFound(_)) => {
                 None
             }
-            Err(error) => return Err(ToolsError::from(error).into()),
+            Err(error) => {
+                return Err(crate::WorkdirToolError::operation(
+                    workdir::failure::WorkdirFailureOperation::Stat,
+                    error,
+                ));
+            }
         }
     };
     let old_line_count = tracker.observed_workdir_line_count(path).unwrap_or(0);
@@ -329,17 +334,16 @@ mod tests {
                     )
                     .await
                     .unwrap_err();
-                if matches!(code, "conflict" | "outcome_unknown") {
-                    assert!(
-                        matches!(error, ToolError::ExecutionFailed(_)),
-                        "{code}, depth {depth}: {error:?}"
-                    );
-                } else {
-                    assert!(
-                        matches!(error, ToolError::InvalidArgument(_)),
-                        "{code}, depth {depth}: {error:?}"
-                    );
-                }
+                let report = crate::workdir_error::assert_report(
+                    error,
+                    if matches!(code, "conflict" | "outcome_unknown") {
+                        "execution_failed"
+                    } else {
+                        "invalid_argument"
+                    },
+                    code,
+                );
+                assert_eq!(report["failure"]["details"]["operation"], "stat");
                 assert!(!dir.path().join("new.txt").exists());
                 assert_eq!(session.stats.load(std::sync::atomic::Ordering::SeqCst), 1);
                 assert_eq!(session.writes.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -429,13 +433,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        match err {
-            ToolError::ExecutionFailed(message) => assert_eq!(
-                message,
-                "The target file's content or existence changed since it was last observed; read the file again before retrying: a.txt"
-            ),
-            other => panic!("expected execution failure, got {other:?}"),
-        }
+        let report = crate::workdir_error::assert_report(err, "execution_failed", "conflict");
+        assert_eq!(report["failure"]["details"]["operation"], "write");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "tampered");
     }
 
     #[tokio::test]

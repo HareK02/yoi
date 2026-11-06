@@ -239,76 +239,106 @@ mod restore_candidate {
                     let other_calls = calls.clone();
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let base_url = format!("http://{}", listener.local_addr().unwrap());
-                    let authorization_path =
-                        "/api/w/workspace-saved-subjektiv/authorization/check";
+                    let authorization_path = "/api/w/workspace-saved-subjektiv/authorization/check";
                     let app = axum::Router::new()
                         .route(
                             authorization_path,
-                            axum::routing::post(move |axum::Json(input): axum::Json<
-                                server_api::authorization::OperationAuthorizationRequest,
-                            >| {
-                                let calls = authorization_calls.clone();
-                                async move {
-                                    calls.lock().unwrap().push((
-                                        "POST".into(), authorization_path.into(),
-                                    ));
-                                    match saved_subjektiv_authorization_fixture(input) {
-                                        Ok(response) => (
-                                            axum::http::StatusCode::OK,
-                                            axum::Json(serde_json::to_value(response).unwrap()),
-                                        ),
-                                        Err(message) => (
-                                            axum::http::StatusCode::FORBIDDEN,
-                                            axum::Json(serde_json::json!({ "message": message })),
-                                        ),
+                            axum::routing::post(
+                                move |axum::Json(input): axum::Json<
+                                    server_api::authorization::OperationAuthorizationRequest,
+                                >| {
+                                    let calls = authorization_calls.clone();
+                                    async move {
+                                        calls
+                                            .lock()
+                                            .unwrap()
+                                            .push(("POST".into(), authorization_path.into()));
+                                        match saved_subjektiv_authorization_fixture(input) {
+                                            Ok(response) => (
+                                                axum::http::StatusCode::OK,
+                                                axum::Json(serde_json::to_value(response).unwrap()),
+                                            ),
+                                            Err(message) => (
+                                                axum::http::StatusCode::FORBIDDEN,
+                                                axum::Json(
+                                                    serde_json::json!({ "message": message }),
+                                                ),
+                                            ),
+                                        }
                                     }
-                                }
-                            }),
+                                },
+                            ),
                         )
                         .fallback(move |request: axum::extract::Request| {
                             let calls = other_calls.clone();
                             async move {
                                 calls.lock().unwrap().push((
-                                    request.method().to_string(), request.uri().path().to_owned(),
+                                    request.method().to_string(),
+                                    request.uri().path().to_owned(),
                                 ));
                                 axum::http::StatusCode::FORBIDDEN
                             }
                         });
                     let host = HostProbe {
                         calls,
-                        task: Some(tokio::spawn(async move { axum::serve(listener, app).await.unwrap() })),
+                        task: Some(tokio::spawn(async move {
+                            axum::serve(listener, app).await.unwrap()
+                        })),
                     };
                     let worker_ref = WorkerRef::new(WorkerId::now_v7());
                     let (mut manifest, mut create) =
                         saved_subjektiv_policy(&fixture_root, &worker_ref);
                     // Normal restore deliberately excludes Subject repair. Keep
                     // a real Workspace client so accidental Host effects are visible.
-                    manifest.feature.subjektiv = manifest::ResolvedSubjektivFeatureConfig::default();
+                    manifest.feature.subjektiv =
+                        manifest::ResolvedSubjektivFeatureConfig::default();
                     manifest.feature.task.enabled = true;
                     create.subjektiv_attached = false;
                     create.workspace_api.as_mut().unwrap().base_url = base_url;
-                    let aggregate = fixture_root.join("workers").join(worker_ref.worker_id.to_string());
+                    let aggregate = fixture_root
+                        .join("workers")
+                        .join(worker_ref.worker_id.to_string());
                     let session = WorkerSessionStore::new(aggregate.join("session")).unwrap();
-                    let metadata = WorkerAggregateStore::new(&aggregate, &manifest.worker.name).unwrap();
+                    let metadata =
+                        WorkerAggregateStore::new(&aggregate, &manifest.worker.name).unwrap();
                     let seed_model = if no_model {
                         MockClient::new(Vec::new())
                     } else {
-                        MockClient::sequential(vec![MockResponse::Hang(simple_text_events().into_iter().take(2).collect())])
+                        MockClient::sequential(vec![MockResponse::Hang(
+                            simple_text_events().into_iter().take(2).collect(),
+                        )])
                     };
-                    let mut engine = Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(seed_model);
+                    let mut engine = Engine::<
+                        _,
+                        agen::state::Mutable,
+                        worker::SessionHistoryMetadata,
+                    >::new_annotated(seed_model);
                     engine.set_system_prompt("Committed restore candidate fixture prompt");
                     let mut worker = Worker::new(
                         manifest.clone(),
                         engine,
                         CombinedStore::new(session.clone(), metadata.clone()),
-                        RuntimeWorkspaceBackendRef::from_worker_request(&create, Some("candidate-runtime"))
-                            .unwrap()
-                            .worker_context(&worker_ref, Some(&crate::runtime::RuntimeWorkspaceScope::new(
-                                "workspace-saved-subjektiv", "server-main",
-                            )), None, None, None, None),
+                        RuntimeWorkspaceBackendRef::from_worker_request(
+                            &create,
+                            Some("candidate-runtime"),
+                        )
+                        .unwrap()
+                        .worker_context(
+                            &worker_ref,
+                            Some(&crate::runtime::RuntimeWorkspaceScope::new(
+                                "workspace-saved-subjektiv",
+                                "server-main",
+                            )),
+                            None,
+                            None,
+                            None,
+                            None,
+                        ),
                         WorkerFilesystemAuthority::None,
                         Scope::empty(),
-                    ).await.unwrap();
+                    )
+                    .await
+                    .unwrap();
                     worker.enable_worker_metadata_write_through().unwrap();
                     worker.materialize_durable_session_head().await.unwrap();
                     let (session_id, segment_id) = (worker.session_id(), worker.segment_id());
@@ -321,8 +351,13 @@ mod restore_candidate {
                         let workspace_client = worker.workspace_client_handle();
                         let started = PreparedWorker::new(
                             worker,
-                            WorkerBootstrapLayout::RuntimeManagedRun { run_dir: fixture_root.join("seed") },
-                        ).start().await.unwrap();
+                            WorkerBootstrapLayout::RuntimeManagedRun {
+                                run_dir: fixture_root.join("seed"),
+                            },
+                        )
+                        .start()
+                        .await
+                        .unwrap();
                         let mut seed = SeedController(Some(RuntimeWorkerController {
                             handle: started.handle,
                             shutdown: Arc::new(tokio::sync::Mutex::new(Some(started.shutdown))),
@@ -335,31 +370,49 @@ mod restore_candidate {
                         submit(&handle, "candidate-setup-turn").await;
                         // Running and streaming observations can arrive in either
                         // order. Do not discard TextDelta while awaiting WorkerState.
-                        let mut running = handle.shared_state.catalog_status() == WorkerStatus::Running;
+                        let mut running =
+                            handle.shared_state.catalog_status() == WorkerStatus::Running;
                         let mut streaming = false;
-                        receive_matching(&mut started_events, "seed running and streaming", |event| {
-                            if let Event::WorkerState { snapshot } = event {
-                                running |= snapshot.catalog_status() == protocol::WorkerStatus::Running;
-                            }
-                            streaming |= matches!(event, Event::TextDelta { .. });
-                            running && streaming
-                        }).await;
+                        receive_matching(
+                            &mut started_events,
+                            "seed running and streaming",
+                            |event| {
+                                if let Event::WorkerState { snapshot } = event {
+                                    running |= snapshot.catalog_status()
+                                        == protocol::WorkerStatus::Running;
+                                }
+                                streaming |= matches!(event, Event::TextDelta { .. });
+                                running && streaming
+                            },
+                        )
+                        .await;
                         let state = Arc::new(RwLock::new(handle.shared_state.snapshot()));
                         let mut events = handle.subscribe();
-                        handle.send(Method::Pause { command: next_internal_command(&state).unwrap() })
-                            .await.unwrap();
+                        handle
+                            .send(Method::Pause {
+                                command: next_internal_command(&state).unwrap(),
+                            })
+                            .await
+                            .unwrap();
                         receive_matching(&mut events, "seed pause acknowledgement", |event| {
                             matches!(event, Event::WorkerState { snapshot }
                                 if snapshot.catalog_status() == protocol::WorkerStatus::Paused)
-                        }).await;
+                        })
+                        .await;
                         let mut receipts = Vec::new();
                         for id in [FIRST, SECOND] {
                             let receipt = submit(&handle, id).await;
-                            assert!(matches!(receipt, Event::SubmissionAccepted {
-                                disposition: protocol::SubmissionDisposition::Queued, ..
-                            }));
+                            assert!(matches!(
+                                receipt,
+                                Event::SubmissionAccepted {
+                                    disposition: protocol::SubmissionDisposition::Queued,
+                                    ..
+                                }
+                            ));
                             receipts.push(serde_json::to_value(receipt).unwrap());
-                            if id == FIRST { notify_from_source(&handle, notice_source.clone()).await; }
+                            if id == FIRST {
+                                notify_from_source(&handle, notice_source.clone()).await;
+                            }
                         }
                         assert_eq!(pending(&handle).await.submissions.len(), 2);
                         shutdown_profile_controller(seed.0.take().unwrap()).await;
@@ -367,20 +420,34 @@ mod restore_candidate {
                     };
                     // This orphan pin would be removed by the normal activation
                     // reconciliation. Preparation and discard must leave it alone.
-                    let orphan = session.write_uploaded_file(
-                        session_id, "orphan.txt", "text/plain", b"retained orphan",
-                        session_store::UploadedFileLimits::default(),
-                    ).unwrap();
-                    session.pin_uploaded_file(session_id, &orphan, "uncommitted-acceptance").unwrap();
-                    let mut saved = metadata.read_by_name(&ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref))
-                        .unwrap().unwrap();
-                    saved.resolved_manifest_snapshot = Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+                    let orphan = session
+                        .write_uploaded_file(
+                            session_id,
+                            "orphan.txt",
+                            "text/plain",
+                            b"retained orphan",
+                            session_store::UploadedFileLimits::default(),
+                        )
+                        .unwrap();
+                    session
+                        .pin_uploaded_file(session_id, &orphan, "uncommitted-acceptance")
+                        .unwrap();
+                    let mut saved = metadata
+                        .read_by_name(&ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(
+                            &worker_ref,
+                        ))
+                        .unwrap()
+                        .unwrap();
+                    saved.resolved_manifest_snapshot = Some(
+                        manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap(),
+                    );
                     saved.workspace_root = Some(fixture_root.join("stale-derived-root"));
                     metadata.write(&saved).unwrap();
                     let mut request = direct_restore_request(worker_ref);
                     request.request = create;
                     request.workspace_scope = Some(crate::runtime::RuntimeWorkspaceScope::new(
-                        "workspace-saved-subjektiv", "server-main",
+                        "workspace-saved-subjektiv",
+                        "server-main",
                     ));
                     Ok((request, session, session_id, segment_id, receipts, host))
                 })
@@ -483,22 +550,32 @@ mod restore_candidate {
                     .get(&self.request.worker_ref)
                     .is_none()
             );
-            let run_dir = self.backend.factory.worker_restore_run_dir(
-                &self.request.worker_ref, self.request.operation_id,
-            ).unwrap();
+            let run_dir = self
+                .backend
+                .factory
+                .worker_restore_run_dir(&self.request.worker_ref, self.request.operation_id)
+                .unwrap();
             // Private initialization owns only disposable operation-scoped run
             // artifacts. It has not published a listener, liveness files or a
             // delegated-child projection, and canonical files are checked by
             // each caller independently.
-            let mut artifacts = std::fs::read_dir(&run_dir).unwrap()
-                .map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect::<Vec<_>>();
+            let mut artifacts = std::fs::read_dir(&run_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
             artifacts.sort();
-            assert_eq!(artifacts, ["artifacts", "spawned", "worker.err.log", "worker.out.log"]);
+            assert_eq!(
+                artifacts,
+                ["artifacts", "spawned", "worker.err.log", "worker.out.log"]
+            );
             for log in ["worker.err.log", "worker.out.log"] {
                 assert_eq!(std::fs::metadata(run_dir.join(log)).unwrap().len(), 0);
             }
             for directory in ["artifacts", "spawned"] {
-                assert_eq!(std::fs::read_dir(run_dir.join(directory)).unwrap().count(), 0);
+                assert_eq!(
+                    std::fs::read_dir(run_dir.join(directory)).unwrap().count(),
+                    0
+                );
             }
             let table = worker::runtime::worker_allocation::LockFileGuard::open(
                 &worker::runtime::worker_allocation::default_allocation_path().unwrap(),
@@ -583,22 +660,36 @@ mod restore_candidate {
         fs::write(run.join("retained-owner"), b"live allocation").unwrap();
         let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&request.worker_ref);
         let allocation = worker::runtime::worker_allocation::install_top_level(
-            name.clone(), std::process::id(), run.join("worker.sock"),
-            Vec::new(), fixture.segment_id,
-        ).unwrap();
-        let failure = fixture.backend.run_on_adapter_runtime(async move {
-            match factory.prepare_restore(request).await {
-                Err(failure) => Ok(failure),
-                Ok(_) => Err("live allocation unexpectedly reclaimed".into()),
-            }
-        }).unwrap();
+            name.clone(),
+            std::process::id(),
+            run.join("worker.sock"),
+            Vec::new(),
+            fixture.segment_id,
+        )
+        .unwrap();
+        let failure = fixture
+            .backend
+            .run_on_adapter_runtime(async move {
+                match factory.prepare_restore(request).await {
+                    Err(failure) => Ok(failure),
+                    Ok(_) => Err("live allocation unexpectedly reclaimed".into()),
+                }
+            })
+            .unwrap();
         assert_eq!(failure.stage, RuntimeRestoreStage::Controller);
-        assert_eq!(failure.cause, "restore run directory still has an allocation owner");
+        assert_eq!(
+            failure.cause,
+            "restore run directory still has an allocation owner"
+        );
         let table = worker::runtime::worker_allocation::LockFileGuard::open(
             &worker::runtime::worker_allocation::default_allocation_path().unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(table.data().find(&name).unwrap().pid, std::process::id());
-        assert_eq!(fs::read(run.join("retained-owner")).unwrap(), b"live allocation");
+        assert_eq!(
+            fs::read(run.join("retained-owner")).unwrap(),
+            b"live allocation"
+        );
         drop(table);
         drop(allocation);
         fixture.assert_quiet();
@@ -1773,6 +1864,7 @@ mod restore_candidate {
         runtime
             .test_runtime_store()
             .write_worker_record(&PersistedWorkerRecord {
+                workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard::default(),
                 restore_guard: crate::runtime::RestoreGuard::default(),
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_ref.worker_id,

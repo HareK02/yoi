@@ -659,7 +659,7 @@ async fn observe_workspace_prompt_projection(
     state
         .runtime
         .observe_workspace_prompt_projection(request.projection)
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(RuntimeHttpRestError::runtime_control)?;
     Ok(Json(RuntimeHttpWorkspacePromptProjectionResponse {
         workspace_id,
         source_digest,
@@ -724,7 +724,12 @@ async fn authorize_working_directory_repository_access(
         .runtime
         .authorize_working_directory_repository_access_from_resource(request)
         .await
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(|error| {
+            RuntimeHttpRestError::runtime_workdir(
+                error,
+                workdir::management_failure::WorkdirManagementOperation::RepositoryAccess,
+            )
+        })?;
     Ok(Json(RuntimeHttpRepositoryAccessResponse {
         authorized: true,
     }))
@@ -790,7 +795,12 @@ async fn observe_repository_ref(
         .runtime
         .observe_repository_ref_from_resource(request)
         .await
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(|error| {
+            RuntimeHttpRestError::runtime_workdir(
+                error,
+                workdir::management_failure::WorkdirManagementOperation::RepositoryRef,
+            )
+        })?;
     Ok(Json(observation))
 }
 
@@ -802,7 +812,12 @@ async fn list_working_directories(
         tokio::task::spawn_blocking(move || state.runtime.list_working_directories())
             .await
             .map_err(RuntimeHttpRestError::working_directory_join)?
-            .map_err(RuntimeHttpRestError::runtime)?;
+            .map_err(|error| {
+                RuntimeHttpRestError::runtime_workdir(
+                    error,
+                    workdir::management_failure::WorkdirManagementOperation::List,
+                )
+            })?;
     Ok(Json(RuntimeHttpWorkingDirectoriesResponse {
         working_directories,
     }))
@@ -827,7 +842,12 @@ async fn create_working_directory(
         .runtime
         .create_working_directory_from_resource(request)
         .await
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(|error| {
+            RuntimeHttpRestError::runtime_workdir(
+                error,
+                workdir::management_failure::WorkdirManagementOperation::Create,
+            )
+        })?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -841,7 +861,12 @@ async fn get_working_directory(
         tokio::task::spawn_blocking(move || state.runtime.working_directory(&working_directory_id))
             .await
             .map_err(RuntimeHttpRestError::working_directory_join)?
-            .map_err(RuntimeHttpRestError::runtime)?;
+            .map_err(|error| {
+                RuntimeHttpRestError::runtime_workdir(
+                    error,
+                    workdir::management_failure::WorkdirManagementOperation::Detail,
+                )
+            })?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -1020,7 +1045,12 @@ async fn cleanup_working_directory(
     })
     .await
     .map_err(RuntimeHttpRestError::working_directory_join)?
-    .map_err(RuntimeHttpRestError::runtime)?;
+    .map_err(|error| {
+        RuntimeHttpRestError::runtime_workdir(
+            error,
+            workdir::management_failure::WorkdirManagementOperation::Cleanup,
+        )
+    })?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -2326,6 +2356,8 @@ impl IntoResponse for RuntimeHttpWorkdirError {
 
 #[derive(Debug)]
 struct RuntimeHttpRestError {
+    management: Option<workdir::management_failure::WorkdirManagementFailure>,
+    control: Option<protocol::control_failure::RuntimeControlCause>,
     status: StatusCode,
     code: String,
     message: String,
@@ -2339,6 +2371,8 @@ impl RuntimeHttpRestError {
             code: code.into(),
             message: message.into(),
             startup: None,
+            control: None,
+            management: None,
         }
     }
 
@@ -2359,7 +2393,42 @@ impl RuntimeHttpRestError {
             code,
             message,
             startup,
+            control: None,
+            management: None,
         }
+    }
+
+    fn runtime_workdir(
+        error: RuntimeError,
+        operation: workdir::management_failure::WorkdirManagementOperation,
+    ) -> Self {
+        let management = match &error {
+            RuntimeError::WorkingDirectory(diagnostic) => diagnostic.reason.map(|reason| {
+                workdir::management_failure::WorkdirManagementFailure { operation, reason }
+            }),
+            _ => None,
+        };
+        let mut response = Self::runtime(error);
+        if let Some(cause) = management {
+            response.status = StatusCode::from_u16(cause.reason.runtime_http_status())
+                .expect("closed Runtime HTTP status");
+            response.management = Some(cause);
+        }
+        response
+    }
+
+    fn runtime_control(error: RuntimeError) -> Self {
+        let cause = error.control_cause();
+        // Select the public facts before constructing a transferable DTO. The
+        // problem adapter is not permission to retain raw paths/provider text in
+        // RuntimeApiError.error for another transport or direct typed caller.
+        let mut response = Self::new(
+            status_for_runtime_error(&error),
+            cause.reason(),
+            cause.explanation(),
+        );
+        response.control = Some(cause);
+        response
     }
 
     fn working_directory_join(_error: tokio::task::JoinError) -> Self {
@@ -2391,6 +2460,27 @@ impl RuntimeHttpRestError {
 
 impl IntoResponse for RuntimeHttpRestError {
     fn into_response(self) -> Response {
+        if let Some(cause) = self.management {
+            return runtime_api::server_support::http_error_response(
+                self.status,
+                runtime_api::RuntimeApiError::new(self.status.as_u16(), self.code, self.message)
+                    .with_management(cause),
+            );
+        }
+
+        if self.startup.is_none() {
+            if let Some(cause) = self.control {
+                return runtime_api::server_support::http_error_response(
+                    self.status,
+                    runtime_api::RuntimeApiError::new(
+                        self.status.as_u16(),
+                        self.code,
+                        self.message,
+                    )
+                    .with_control(cause),
+                );
+            }
+        }
         let body = RuntimeHttpErrorResponse {
             error: RuntimeHttpErrorDetail {
                 code: self.code,
@@ -2488,6 +2578,8 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::StopObservationConflict { .. }
         | RuntimeError::StopRequestConflict { .. }
         | RuntimeError::StopAdmissionBusy { .. }
+        | RuntimeError::WorkdirAttachmentsRequestConflict { .. }
+        | RuntimeError::WorkdirAttachmentsGenerationStale { .. }
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
@@ -2520,6 +2612,12 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::StopObservationConflict { .. } => "stop_observation_conflict".to_string(),
         RuntimeError::StopRequestConflict { .. } => "stop_request_conflict".to_string(),
         RuntimeError::StopAdmissionBusy { .. } => "stop_admission_busy".to_string(),
+        RuntimeError::WorkdirAttachmentsRequestConflict { .. } => {
+            "workdir_attachments_request_conflict".to_string()
+        }
+        RuntimeError::WorkdirAttachmentsGenerationStale { .. } => {
+            "workdir_attachments_generation_stale".to_string()
+        }
         RuntimeError::RuntimeStoreAlreadyOpen { .. } => "runtime_store_already_open".to_string(),
         RuntimeError::WorkerNotFound { .. } => "worker_not_found".to_string(),
         RuntimeError::WorkerExecutionUnavailable { .. } => {
@@ -2573,6 +2671,10 @@ pub enum RuntimeHttpServerError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fs-store")]
+    mod attachment_operation_tests;
+    #[cfg(feature = "fs-store")]
+    mod attachment_sync_tests;
     mod command_transport_tests;
     mod runtime_workdir_failure_tests;
     #[cfg(feature = "fs-store")]
@@ -5267,6 +5369,7 @@ mod tests {
         for (code, expected_status) in cases {
             let error = RuntimeError::WorkingDirectory(
                 crate::working_directory::WorkingDirectoryDiagnostic {
+                    reason: None,
                     code: code.to_string(),
                     message: "bounded diagnostic".to_string(),
                 },

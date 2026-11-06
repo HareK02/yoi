@@ -4326,6 +4326,7 @@ name = "runtime-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "error-contract",
  "manifest",
  "plugin-plan",
  "protocol",
@@ -4783,6 +4784,7 @@ dependencies = [
  "url",
  "webauthn-rs-proto",
  "workdir",
+ "workspace-drive",
 ]
 
 [[package]]
@@ -7491,6 +7493,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "client",
+ "error-contract",
  "futures",
  "manifest",
  "project-record",

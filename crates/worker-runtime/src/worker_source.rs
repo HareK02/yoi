@@ -312,12 +312,14 @@ fn execute_remote_worker_remove_http_blocking(
     ));
     match result {
         Ok(response) => Ok(WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&response)
                 .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?,
         }),
         Err(server_api::client_support::ClientError::Public { status, error }) => {
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: status.as_u16(),
                 body: serde_json::to_string(&error).map_err(|error| {
                     RuntimeWorkerMutationForwardError::Transport(error.to_string())
@@ -462,6 +464,7 @@ impl RuntimeOwnedWorkspaceClient {
                 WorkspaceClientError::Request(message.to_string())
             })?;
         Ok(WorkspaceBinaryResponse {
+            content_type: response_content_type(&response.headers),
             status: response.status.as_u16(),
             body: response.body,
         })
@@ -503,13 +506,26 @@ impl RuntimeOwnedWorkspaceClient {
             .map_err(|error| {
                 WorkspaceClientError::Request(format!("{request_label} failed: {error}"))
             })?;
+        let content_type = response_content_type(&response.headers);
         let body = String::from_utf8(response.body)
             .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
         Ok(WorkspaceResponse {
+            content_type,
             status: response.status.as_u16(),
             body,
         })
     }
+}
+
+#[cfg(feature = "http-server")]
+fn response_content_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(reqwest::header::CONTENT_TYPE).iter();
+    let media = values.next()?.to_str().ok()?;
+    // Multiple media declarations cannot be trusted as an HTTP representation.
+    if values.next().is_some() {
+        return None;
+    }
+    Some(media.to_owned())
 }
 
 #[cfg(feature = "http-server")]
@@ -534,12 +550,14 @@ fn generated_workspace_response<T: serde::Serialize>(
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     match response {
         Ok(response) => Ok(WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&response)
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
         }),
         Err(server_api::client_support::ClientError::Public { status, error }) => {
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: status.as_u16(),
                 body: serde_json::to_string(&error)
                     .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -1308,6 +1326,58 @@ mod tests {
 
     #[cfg(feature = "http-server")]
     #[test]
+    fn workspace_error_transports_preserve_only_single_valid_content_type_headers() {
+        for (headers, expected) in [
+            (
+                &b"Content-Type: application/problem+json; charset=utf-8\r\n"[..],
+                Some("application/problem+json; charset=utf-8"),
+            ),
+            (&b""[..], None),
+            (
+                &b"Content-Type: application/problem+json\r\nContent-Type: application/json\r\n"[..],
+                None,
+            ),
+            (&b"Content-Type: application/\xff\r\n"[..], None),
+        ] {
+            for binary in [false, true] {
+                let mut wire = b"HTTP/1.1 413 Payload Too Large\r\n".to_vec();
+                wire.extend_from_slice(headers);
+                wire.extend_from_slice(b"Content-Length: 2\r\nConnection: close\r\n\r\n{}");
+                let (base_url, server) = binary_loopback(wire);
+                let client = RuntimeOwnedWorkspaceClient::new(
+                    "workspace-a",
+                    base_url,
+                    "runtime-a",
+                    "worker-a",
+                );
+                let (status, media, body) = if binary {
+                    let response = client
+                        .execute_binary(WorkspaceBinaryRequest {
+                            method: WorkspaceRequestMethod::Get,
+                            path: "/api/test".into(),
+                            body: None,
+                            max_response_bytes: 64,
+                        })
+                        .unwrap();
+                    (response.status, response.content_type, response.body)
+                } else {
+                    let response = client.execute(WorkspaceRequest::get("/api/test")).unwrap();
+                    (
+                        response.status,
+                        response.content_type,
+                        response.body.into_bytes(),
+                    )
+                };
+                server.join().unwrap();
+                assert_eq!(status, 413);
+                assert_eq!(media.as_deref(), expected);
+                assert_eq!(body, b"{}");
+            }
+        }
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
     fn binary_responses_enforce_declared_and_streamed_limits_with_fixed_errors() {
         for response in [
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nabcde".to_vec(),
@@ -1908,6 +1978,7 @@ mod tests {
                     reason.to_string(),
                 ));
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 202,
                     body: "accepted".to_string(),
                 })

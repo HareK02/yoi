@@ -5,6 +5,9 @@
 //! receipts). Published 114..121 databases retain their version, receipt names,
 //! policy, Job states, root records and erasure fences. They need no domain DDL
 //! merely to acquire the common storage identity/lifetime owned by the caller.
+//! Ordered 122..128 receipts add configuration, Job execution, startup results,
+//! bounded Job causes, Service outcomes and independent publication/connection
+//! observations; each intermediate/fresh baseline stays exact.
 //! This does not attest policy transfer, execution termination or Journal release.
 //!
 //! Frozen SQL below is a physical reference: it runs ONLY on empty, private
@@ -71,7 +74,50 @@ fn invalid(message: impl std::fmt::Display) -> Error {
 /// Every other row, gap, mixed family, unknown suffix and missing object fails.
 pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     let rows = super::workspace_schema_migration_history(conn)?;
-    verify_history_records(conn, current, &rows)
+    verify_publication_shape(conn, current)?;
+    verify_connection_observation_shape(conn, current)?;
+    let tail = failure_tail(conn, current, &rows)?;
+    verify_failure_shape(conn, current, tail)?;
+    if current < 124 {
+        return verify_history_records(conn, current, &rows);
+    }
+    verify_execution_shape(conn)?;
+    super::backend_job_upgrade::verify(conn)?;
+    let baseline = rows
+        .first()
+        .ok_or_else(|| invalid("missing migration receipts"))?;
+    // A fresh published baseline has no fabricated predecessor receipts.
+    if baseline.0 >= 124 {
+        if baseline.1 != super::SCHEMA_BASELINE_NAME {
+            return Err(invalid("unrecognized failure baseline"));
+        }
+        verify_configuration_shape(conn)?;
+        require_shape(conn, Stage::Base)?;
+        verify_103_features(conn, current, &rows)?;
+    } else {
+        let prefix: Vec<_> = rows.iter().filter(|row| row.0 < 124).cloned().collect();
+        if prefix.last().map(|row| row.0) != Some(123) {
+            return Err(invalid("missing failure migration predecessor"));
+        }
+        verify_history_records(conn, 123, &prefix)?;
+    }
+    let expected: Vec<_> = tail
+        .migrations()
+        .into_iter()
+        .filter(|(version, _)| *version >= 124 && *version > baseline.0 && *version <= current)
+        .map(|(version, name)| (version, name.to_owned()))
+        .collect();
+    let actual: Vec<_> = rows
+        .iter()
+        .filter(|row| row.0 >= 124 && row.0 > baseline.0)
+        .cloned()
+        .collect();
+    if expected != actual || rows.last().map(|row| row.0) != Some(current) {
+        return Err(invalid(
+            "mixed, missing or unrecognized failure migration receipts",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
@@ -79,21 +125,21 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
     if current == 123 {
         verify_execution_shape(conn)?;
         super::backend_job_upgrade::verify(conn)?;
-        if rows == [(123, super::SCHEMA_BASELINE_NAME.to_owned())] {
+        if rows == [(current, super::SCHEMA_BASELINE_NAME.to_owned())] {
             verify_configuration_shape(conn)?;
             require_shape(conn, Stage::Base)?;
             return verify_103_features(conn, current, rows);
         }
         if rows.last().map(|(version, name)| (*version, name.as_str()))
-            != Some((123, super::backend_job_upgrade::MIGRATION_NAME))
+            != Some((current, tail_migration_name(current)?))
         {
-            return Err(invalid("unrecognized Backend Job execution receipt"));
+            return Err(invalid(format!("unrecognized schema-{current} receipt")));
         }
         let prefix = &rows[..rows.len() - 1];
-        if prefix.last().map(|row| row.0) != Some(122) {
-            return Err(invalid("missing Backend Job execution predecessor"));
+        if prefix.last().map(|row| row.0) != Some(current - 1) {
+            return Err(invalid(format!("missing schema-{current} predecessor")));
         }
-        return verify_history_records(conn, 122, prefix);
+        return verify_history_records(conn, current - 1, prefix);
     }
     if current == 122 {
         verify_configuration_shape(conn)?;
@@ -236,11 +282,13 @@ pub(super) fn published_plan(
     verify_history(conn, current)?;
     Ok(Some(super::WorkspaceSchemaMigrationPlan {
         current_schema_version: current,
-        target_schema_version: 123,
-        migrations: [
-            (122, crate::config_adoption::MIGRATION_NAME),
-            (123, super::backend_job_upgrade::MIGRATION_NAME),
-        ]
+        target_schema_version: super::LATEST_SCHEMA_VERSION,
+        migrations: failure_tail(
+            conn,
+            current,
+            &super::workspace_schema_migration_history(conn)?,
+        )?
+        .migrations()
         .into_iter()
         .filter(|(version, _)| *version > current)
         .map(|(version, name)| super::WorkspaceSchemaMigrationStep {
@@ -249,6 +297,255 @@ pub(super) fn published_plan(
         })
         .collect(),
     }))
+}
+
+// Receipt names come from the ordered owner, including the Service-126 hook.
+// A missing registration is an integration error, never a fabricated receipt.
+fn tail_migration_name(version: i64) -> Result<&'static str> {
+    super::MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == version)
+        .map(|migration| migration.name)
+        .ok_or_else(|| invalid(format!("missing registered schema-{version} migration")))
+}
+
+// The two published histories share numbers, not identities. Fresh branch-local
+// baselines are recognized by the exact physical shape checked below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureTail {
+    Canonical,
+    Retained,
+}
+impl FailureTail {
+    fn migrations(self) -> Vec<(i64, &'static str)> {
+        let mut tail = vec![
+            (122, crate::config_adoption::MIGRATION_NAME),
+            (123, super::backend_job_upgrade::MIGRATION_NAME),
+        ];
+        tail.extend(match self {
+            Self::Canonical => vec![
+                (124, super::WORKER_CREATE_FAILURE_MIGRATION_NAME),
+                (125, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
+                (126, super::SERVICE_OUTCOME_MIGRATION_NAME),
+            ],
+            Self::Retained => vec![
+                (124, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
+                (125, super::SERVICE_OUTCOME_MIGRATION_NAME),
+                (126, super::RETAINED_STARTUP_MIGRATION_NAME),
+            ],
+        });
+        tail.push((127, crate::config_publication::MIGRATION_NAME));
+        tail.push((
+            128,
+            crate::external_workdir_connection_observations::MIGRATION_NAME,
+        ));
+        tail
+    }
+    fn startup(self, current: i64) -> bool {
+        current >= if self == Self::Canonical { 124 } else { 126 }
+    }
+    fn jobs(self, current: i64) -> bool {
+        current >= if self == Self::Canonical { 125 } else { 124 }
+    }
+    fn service(self, current: i64) -> bool {
+        current >= if self == Self::Canonical { 126 } else { 125 }
+    }
+}
+
+fn failure_tail(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<FailureTail> {
+    if current > super::LATEST_SCHEMA_VERSION {
+        return Err(invalid("unsupported future failure history"));
+    }
+    if current < 124 {
+        return Ok(FailureTail::Canonical);
+    }
+    if let Some((_, name)) = rows
+        .iter()
+        .find(|row| row.0 == 124 && row.1 != super::SCHEMA_BASELINE_NAME)
+    {
+        return match name.as_str() {
+            super::WORKER_CREATE_FAILURE_MIGRATION_NAME => Ok(FailureTail::Canonical),
+            super::backend_job_recovery_store::CAUSE_MIGRATION_NAME => Ok(FailureTail::Retained),
+            _ => Err(invalid("unrecognized schema-124 identity")),
+        };
+    }
+    let baseline = rows
+        .first()
+        .ok_or_else(|| invalid("missing failure baseline"))?
+        .0;
+    // A retained baseline after completion is identified by its 126 receipt.
+    if baseline < 126
+        && rows
+            .iter()
+            .any(|row| row.0 == 126 && row.1 == super::RETAINED_STARTUP_MIGRATION_NAME)
+    {
+        return Ok(FailureTail::Retained);
+    }
+    if baseline == 124
+        && rows
+            .iter()
+            .any(|row| row.0 == 125 && row.1 == super::SERVICE_OUTCOME_MIGRATION_NAME)
+    {
+        return Ok(FailureTail::Retained);
+    }
+    if current < 126
+        && !super::column_exists(conn, "worker_create_reservations", "startup_failure_json")?
+    {
+        return Ok(FailureTail::Retained);
+    }
+    Ok(FailureTail::Canonical)
+}
+
+// Compare tokenized complete table/index/trigger programs, not a substring that
+// a comment or a second weaker constraint could counterfeit.
+pub(super) fn verify_startup_shape(conn: &Connection) -> Result<()> {
+    verify_startup_shape_for(conn, true)
+}
+
+fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
+    static WITH_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static WITHOUT_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let select = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(_, object)| object.1 == "worker_create_reservations")
+            .collect()
+    };
+    let expected = if present {
+        &WITH_RESULT
+    } else {
+        &WITHOUT_RESULT
+    }
+    .get_or_init(|| {
+        (|| -> Result<Shape> {
+            let reference = reference_base()?;
+            if present {
+                reference.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+            }
+            Ok(select(snapshot(&reference)?))
+        })()
+        .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map_err(invalid)?;
+    let actual = select(snapshot(conn)?);
+    if actual == *expected {
+        return Ok(());
+    }
+    // Real 53 -> 73 upgrades used the exact singleton triggers without the
+    // redundant fresh-baseline table CHECK. Keep that exact published form,
+    // including supported baseline-only histories that omit predecessor receipts.
+    // The full table and both enforcing trigger programs still have to match.
+    let history = super::workspace_schema_migration_history(conn)?;
+    let retained_upgrade = history.first().is_some_and(|row| row.0 < 73)
+        && history.iter().any(|row| {
+            row.0 == 73
+                && super::MIGRATIONS
+                    .iter()
+                    .any(|migration| migration.version == 73 && migration.name == row.1)
+        });
+    let retained_baseline = history.first().is_some_and(|row| {
+        (73..=super::LATEST_SCHEMA_VERSION).contains(&row.0) && row.1 == super::SCHEMA_BASELINE_NAME
+    });
+    if retained_upgrade || retained_baseline {
+        let mut upgraded = expected.clone();
+        let (_, _, table) = upgraded
+            .get_mut("worker_create_reservations")
+            .ok_or_else(|| invalid("missing startup reference table"))?;
+        let mut declaration =
+            tokens("CHECK ((singleton_key IS NULL) = (singleton_generation IS NULL))")?;
+        declaration.push(",".into());
+        if let Some(start) = table
+            .windows(declaration.len())
+            .position(|part| part == declaration)
+        {
+            table.drain(start..start + declaration.len());
+            if actual == upgraded {
+                return Ok(());
+            }
+        }
+    }
+    let changed: BTreeSet<_> = actual
+        .keys()
+        .chain(expected.keys())
+        .filter(|key| actual.get(*key) != expected.get(*key))
+        .collect();
+    Err(invalid(format!(
+        "Worker create startup failure physical schema mismatch: {changed:?}"
+    )))
+}
+
+// Run only for the saved version, not recursively against historical prefixes.
+fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> Result<()> {
+    let startup = super::column_exists(conn, "worker_create_reservations", "startup_failure_json")?;
+    if startup != tail.startup(current) {
+        return Err(invalid("startup failure receipt/shape mismatch"));
+    }
+    if current >= 124 {
+        verify_startup_shape_for(conn, startup)?;
+    }
+    for (table, column) in [
+        ("backend_jobs", "failure_cause"),
+        ("backend_job_attempts", "failure_cause"),
+        ("backend_job_attempts", "worker_cleanup_failure_cause"),
+    ] {
+        if super::column_exists(conn, table, column)? != tail.jobs(current) {
+            return Err(invalid(format!("{table}.{column} receipt/shape mismatch")));
+        }
+    }
+    if current < 112 {
+        if super::column_exists(conn, "plugin_service_consumers", "last_outcome_json")? {
+            return Err(invalid("Service outcome before its receipt"));
+        }
+        return Ok(());
+    }
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
+    if tail.service(current) {
+        reference.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
+    }
+    let expected = snapshot(&reference)?;
+    let tables: BTreeSet<_> = expected.values().map(|object| object.1.clone()).collect();
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| tables.contains(&object.1))
+        .collect();
+    if actual != expected {
+        return Err(invalid("Service outcome receipt/shape mismatch"));
+    }
+    Ok(())
+}
+
+fn verify_connection_observation_shape(conn: &Connection, current: i64) -> Result<()> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
+    let expected = snapshot(&reference)?;
+    let tables: BTreeSet<_> = expected.values().map(|object| object.1.clone()).collect();
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| tables.contains(&object.1))
+        .collect();
+    if (current >= 128 && actual != expected) || (current < 128 && !actual.is_empty()) {
+        return Err(invalid(
+            "External Workdir connection observation receipt/shape mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_publication_shape(conn: &Connection, current: i64) -> Result<()> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(crate::config_publication::SCHEMA)?;
+    let expected = snapshot(&reference)?;
+    let tables: BTreeSet<_> = expected.values().map(|object| object.1.clone()).collect();
+    let actual: Shape = snapshot(conn)?
+        .into_iter()
+        .filter(|(_, object)| tables.contains(&object.1))
+        .collect();
+    if (current >= 127 && actual != expected) || (current < 127 && !actual.is_empty()) {
+        return Err(invalid("configuration publication receipt/shape mismatch"));
+    }
+    Ok(())
 }
 
 fn verify_configuration_shape(conn: &Connection) -> Result<()> {
@@ -465,7 +762,8 @@ fn legacy_shape(conn: &Connection) -> Result<Shape> {
 }
 
 fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
-    if super::current_schema_version(conn)? != 123 {
+    let current = super::current_schema_version(conn)?;
+    if current < 123 {
         return Ok(shape);
     }
     for table in ["backend_jobs", "backend_job_attempts"] {
@@ -500,7 +798,54 @@ fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
             }
         }
     }
+    if super::column_exists(conn, "backend_jobs", "failure_cause")? {
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            let (_, _, table_tokens) = shape
+                .get_mut(table)
+                .ok_or_else(|| invalid(format!("missing reference table {table}")))?;
+            append_reference_column(
+                table_tokens,
+                &format!(
+                    "{column} TEXT CHECK({column} IS NULL OR length(CAST({column} AS BLOB))<=32768)"
+                ),
+            )?;
+        }
+    }
     Ok(shape)
+}
+
+// Canonical snapshots end every declaration with a comma. Reuse that synthetic
+// separator before adding and re-sorting an exact declaration.
+// This transforms private reference tokens only, never an adopted database.
+fn append_reference_column(table: &mut Vec<String>, declaration: &str) -> Result<()> {
+    let start = table
+        .iter()
+        .position(|token| token == "(")
+        .ok_or_else(|| invalid("missing reference declarations"))?;
+    let mut depth = 1;
+    for i in start + 1..table.len() {
+        match table[i].as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            let mut field = tokens(declaration)?;
+            // Reuse the canonical last comma as the separator before the new
+            // declaration; declarations() restores canonical trailing commas.
+            if table.get(i - 1).map(String::as_str) != Some(",") {
+                field.insert(0, ",".into());
+            }
+            table.splice(i..i, field);
+            *table = declarations(table.clone())?;
+            return Ok(());
+        }
+    }
+    Err(invalid("unbalanced reference declarations"))
 }
 
 fn require_shape(conn: &Connection, stage: Stage) -> Result<()> {
@@ -814,6 +1159,460 @@ fn declarations(tokens: Vec<String>) -> Result<Vec<String>> {
 #[cfg(test)]
 #[path = "storage_format_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod failure_format_tests {
+    use super::super as store;
+    use super::*;
+    use rusqlite::params;
+
+    fn apply(conn: &Connection, version: i64) -> Result<()> {
+        let migration = store::MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == version)
+            .ok_or_else(|| invalid(format!("missing migration {version}")))?;
+        (migration.apply)(conn)
+    }
+
+    fn fixture_123(stage: Stage) -> Connection {
+        let conn = reference_base().unwrap();
+        install_reference(&conn, stage).unwrap();
+        let version = match stage {
+            Stage::Base => 113,
+            Stage::Published(_, count) => 113 + count as i64,
+            Stage::Converged(version) => version,
+        };
+        conn.execute("DELETE FROM __yoi_schema_migrations", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+            params![version, store::SCHEMA_BASELINE_NAME],
+        )
+        .unwrap();
+        apply(&conn, 122).unwrap();
+        apply(&conn, 123).unwrap();
+        conn
+    }
+
+    // Capture every old column, including identities, results, receipts and
+    // fences. Later nullable columns are tested separately, not mistaken for
+    // changes to retained values. Include the ledger when checking rollback.
+    fn columns(conn: &Connection) -> BTreeMap<String, Vec<String>> {
+        let mut tables: BTreeSet<_> = snapshot(conn)
+            .unwrap()
+            .into_values()
+            .filter(|object| object.0 == "table")
+            .map(|object| object.1)
+            .collect();
+        tables.insert("__yoi_schema_migrations".into());
+        tables
+            .into_iter()
+            .map(|table| {
+                let columns = store::table_columns(conn, &table).unwrap();
+                (table, columns)
+            })
+            .collect()
+    }
+
+    fn values(
+        conn: &Connection,
+        columns: &BTreeMap<String, Vec<String>>,
+    ) -> BTreeMap<String, Vec<String>> {
+        columns
+            .iter()
+            .map(|(table, columns)| {
+                let columns = columns
+                    .iter()
+                    .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut statement = conn
+                    .prepare(&format!("SELECT {columns} FROM \"{table}\""))
+                    .unwrap();
+                let count = statement.column_count();
+                let mut rows = statement
+                    .query_map([], |row| {
+                        (0..count)
+                            .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .map(|row| format!("{:?}", row.unwrap()))
+                    .collect::<Vec<_>>();
+                rows.sort();
+                (table.clone(), rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failure_tail_plans_and_fresh_baselines_keep_exact_physical_shapes() {
+        for stage in [
+            Stage::Base,
+            Stage::Published(Family::Permissions, 1),
+            Stage::Published(Family::Jobs, 5),
+            Stage::Converged(121),
+        ] {
+            let conn = fixture_123(stage);
+            for current in 123..=128 {
+                if current > 123 {
+                    apply(&conn, current).unwrap();
+                }
+                let before = snapshot(&conn).unwrap();
+                let history = store::workspace_schema_migration_history(&conn).unwrap();
+                let plan = published_plan(&conn, current).unwrap().unwrap();
+                assert_eq!(plan.current_schema_version, current);
+                assert_eq!(plan.target_schema_version, store::LATEST_SCHEMA_VERSION);
+                assert_eq!(
+                    plan.migrations
+                        .iter()
+                        .map(|step| (step.version, step.name.as_str()))
+                        .collect::<Vec<_>>(),
+                    ((current + 1)..=store::LATEST_SCHEMA_VERSION)
+                        .map(|version| (version, tail_migration_name(version).unwrap()))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(snapshot(&conn).unwrap(), before);
+                assert_eq!(
+                    store::workspace_schema_migration_history(&conn).unwrap(),
+                    history
+                );
+            }
+        }
+        // Fresh composition has the Base shape, not fabricated published-family
+        // receipts. Each supported additive intermediate is a real baseline.
+        for current in 123..=128 {
+            let conn = fixture_123(Stage::Base);
+            for version in 124..=current {
+                apply(&conn, version).unwrap();
+            }
+            conn.execute("DELETE FROM __yoi_schema_migrations", [])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+                params![current, store::SCHEMA_BASELINE_NAME],
+            )
+            .unwrap();
+            let saved_columns = columns(&conn);
+            let saved = values(&conn, &saved_columns);
+            verify_history(&conn, current).unwrap();
+            assert_eq!(values(&conn, &saved_columns), saved);
+        }
+    }
+
+    #[test]
+    fn retained_failure_tail_adds_connection_evidence_without_relabeling_receipts() {
+        let conn = fixture_123(Stage::Base);
+        store::migrate_failure_extension(
+            &conn,
+            123,
+            124,
+            store::backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+            store::backend_job_recovery_store::CAUSE_SCHEMA,
+        )
+        .unwrap();
+        for migration in store::RETAINED_FAILURE_MIGRATIONS {
+            (migration.apply)(&conn).unwrap();
+        }
+        let retained = store::workspace_schema_migration_history(&conn).unwrap();
+        let plan = published_plan(&conn, 126).unwrap().unwrap();
+        assert_eq!(
+            plan.migrations
+                .iter()
+                .map(|step| step.version)
+                .collect::<Vec<_>>(),
+            vec![127, 128]
+        );
+        apply(&conn, 127).unwrap();
+        apply(&conn, 128).unwrap();
+        verify_history(&conn, 128).unwrap();
+        let history = store::workspace_schema_migration_history(&conn).unwrap();
+        assert_eq!(&history[..retained.len()], retained.as_slice());
+        assert_eq!(
+            history.last().unwrap().1,
+            crate::external_workdir_connection_observations::MIGRATION_NAME
+        );
+        let fresh = Connection::open_in_memory().unwrap();
+        store::prepare_connection(&fresh).unwrap();
+        let select = |shape: Shape| -> Shape {
+            shape
+                .into_iter()
+                .filter(|(_, object)| object.1 == "external_workdir_connection_observations")
+                .collect()
+        };
+        assert_eq!(
+            select(snapshot(&conn).unwrap()),
+            select(snapshot(&fresh).unwrap())
+        );
+    }
+
+    #[test]
+    fn failure_tail_mismatches_are_rejected_without_repair() {
+        for (current, sql) in [
+            (127, crate::external_workdir_connection_observations::SCHEMA),
+            (
+                128,
+                "DROP TRIGGER external_workdir_connection_observations_no_update",
+            ),
+            (
+                128,
+                "UPDATE __yoi_schema_migrations SET name='counterfeit connection receipt' WHERE version=128",
+            ),
+            (126, crate::config_publication::SCHEMA),
+            (
+                127,
+                "DROP TRIGGER workspace_configuration_publication_no_update",
+            ),
+            (
+                127,
+                "UPDATE __yoi_schema_migrations SET name='counterfeit publication receipt' WHERE version=127",
+            ),
+            (123, store::backend_job_recovery_store::CAUSE_SCHEMA),
+            (124, crate::plugin_service::FAILURE_MIGRATION_SQL),
+            (
+                124,
+                "UPDATE __yoi_schema_migrations SET name='wrong cause receipt' WHERE version=124",
+            ),
+            (125, "DELETE FROM __yoi_schema_migrations WHERE version=124"),
+            (
+                125,
+                "UPDATE __yoi_schema_migrations SET name='wrong service receipt' WHERE version=125",
+            ),
+            (
+                126,
+                "ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json",
+            ),
+            (
+                126,
+                "ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json; ALTER TABLE plugin_service_consumers ADD COLUMN last_outcome_json BLOB",
+            ),
+            (
+                125,
+                "ALTER TABLE plugin_service_consumers ADD COLUMN unexpected TEXT",
+            ),
+            (
+                125,
+                "CREATE TRIGGER unexpected_service_trigger AFTER UPDATE ON plugin_service_consumers BEGIN SELECT 1; END",
+            ),
+            (
+                125,
+                "ALTER TABLE backend_jobs DROP COLUMN failure_cause; ALTER TABLE backend_jobs ADD COLUMN failure_cause TEXT",
+            ),
+            (
+                125,
+                "ALTER TABLE backend_job_attempts DROP COLUMN failure_cause; ALTER TABLE backend_job_attempts ADD COLUMN failure_cause TEXT CHECK(failure_cause IS NULL OR length(failure_cause)<=32768)",
+            ),
+            (
+                125,
+                "ALTER TABLE backend_job_attempts DROP COLUMN worker_cleanup_failure_cause",
+            ),
+            (125, "ALTER TABLE backend_jobs ADD COLUMN unexpected TEXT"),
+            (
+                125,
+                "UPDATE __yoi_schema_migrations SET version=126 WHERE version=125",
+            ),
+        ] {
+            let conn = fixture_123(Stage::Base);
+            for version in 124..=current {
+                apply(&conn, version).unwrap();
+            }
+            // Damage isolated fixtures only; no production downgrade/repair API.
+            conn.execute_batch(sql).unwrap();
+            let actual = store::current_schema_version(&conn).unwrap();
+            let before = snapshot(&conn).unwrap();
+            let saved_columns = columns(&conn);
+            let saved = values(&conn, &saved_columns);
+            assert!(verify_history(&conn, actual).is_err(), "{current}: {sql}");
+            assert!(published_plan(&conn, actual).is_err(), "{current}: {sql}");
+            assert_eq!(snapshot(&conn).unwrap(), before);
+            assert_eq!(values(&conn, &saved_columns), saved);
+        }
+    }
+
+    #[test]
+    fn failure_tail_receipt_failure_rolls_back_all_ddl_and_retained_values() {
+        let conn = fixture_123(Stage::Base);
+        conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
+            VALUES('owner','user','owner','Owner','1','1');
+            INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+            VALUES('workspace-a','owner','Saved workspace','active','1','1');
+            INSERT INTO backend_jobs(workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,state,current_attempt,result_json,result_digest,created_at,updated_at,input_disposition)
+            VALUES('workspace-a','saved-job','journal','digest','input','{}','fingerprint','completed',1,'{\"saved\":true}','result-digest','1','1','erased');
+            INSERT INTO backend_job_attempts(workspace_id,job_id,attempt_id,attempt,input_digest,state,deadline_at,result_json,result_digest,created_at,updated_at)
+            VALUES('workspace-a','saved-job','saved-attempt',1,'digest','completed','2','{\"saved\":true}','result-digest','1','1');
+            INSERT INTO plugin_service_consumers(workspace_id,consumer_id,runtime_id,worker_id,installation_id,plan_id,service_name,subscriptions_json,cursor,last_ack_event_id)
+            VALUES('workspace-a','saved-consumer','runtime','worker','installation','plan','watch','[\"changed\"]',7,'saved-event');").unwrap();
+        conn.execute("INSERT INTO plugin_installations VALUES('workspace-a','installation','alias','package','install',0)", []).unwrap();
+        let fingerprint = format!("sha256:{}", "a".repeat(64));
+        conn.execute("INSERT INTO plugin_execution_plans VALUES('workspace-a','plan','owner','plan',?1,'{}','active')", [&fingerprint]).unwrap();
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+        let mut old_columns = columns(&conn);
+        old_columns.remove("__yoi_schema_migrations");
+        let retained = values(&conn, &old_columns);
+        for version in 124..=128 {
+            conn.execute_batch(&format!("CREATE TRIGGER inject_failure_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version={version} BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")).unwrap();
+            let before = snapshot(&conn).unwrap();
+            let rollback_columns = columns(&conn);
+            let before_rows = values(&conn, &rollback_columns);
+            assert!(apply(&conn, version).is_err());
+            assert_eq!(store::current_schema_version(&conn).unwrap(), version - 1);
+            assert_eq!(snapshot(&conn).unwrap(), before);
+            assert_eq!(values(&conn, &rollback_columns), before_rows);
+            verify_history(&conn, version - 1).unwrap();
+            conn.execute_batch("DROP TRIGGER inject_failure_receipt")
+                .unwrap();
+            apply(&conn, version).unwrap();
+            verify_history(&conn, version).unwrap();
+            assert_eq!(values(&conn, &old_columns), retained);
+            assert!(
+                apply(&conn, version).is_err(),
+                "migration must not run twice"
+            );
+        }
+        let nulls: (Option<String>, Option<String>, Option<String>, Option<String>) = conn.query_row(
+            "SELECT j.failure_cause,a.failure_cause,a.worker_cleanup_failure_cause,s.last_outcome_json FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id) JOIN plugin_service_consumers s USING(workspace_id)",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap();
+        assert_eq!(nulls, (None, None, None, None));
+        // All three Job evidence columns are byte-bounded, not character-bounded;
+        // cleanup evidence remains independent of the saved successful result.
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            assert!(
+                conn.execute(
+                    &format!("UPDATE {table} SET {column}=?1"),
+                    ["é".repeat(16385)]
+                )
+                .is_err()
+            );
+            conn.execute(
+                &format!("UPDATE {table} SET {column}=?1"),
+                ["é".repeat(16384)],
+            )
+            .unwrap();
+        }
+        assert_eq!(values(&conn, &old_columns), retained);
+    }
+
+    #[test]
+    fn oldest_supported_baseline_reaches_current_through_real_runner_and_reopens() {
+        assert_eq!(store::OLDEST_SCHEMA_VERSION, 50);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oldest.db");
+        store::tests::prepare_schema_v50(&path, Some("workspace-a"));
+        let conn = Connection::open(&path).unwrap();
+        let old_columns = columns(&conn);
+        let before = values(&conn, &old_columns);
+        let identity_columns = BTreeMap::from([
+            (
+                "accounts".to_owned(),
+                vec![
+                    "account_id".to_owned(),
+                    "kind".to_owned(),
+                    "created_at".to_owned(),
+                ],
+            ),
+            (
+                "workspaces".to_owned(),
+                vec![
+                    "workspace_id".to_owned(),
+                    "owner_account_id".to_owned(),
+                    "created_at".to_owned(),
+                ],
+            ),
+        ]);
+        let identities = values(&conn, &identity_columns);
+        let shape = snapshot(&conn).unwrap();
+        drop(conn);
+        let plan = store::SqliteWorkspaceStore::migration_plan(&path).unwrap();
+        assert_eq!(plan.current_schema_version, 50);
+        assert_eq!(plan.target_schema_version, store::LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            plan.migrations
+                .iter()
+                .rev()
+                .take(4)
+                .map(|step| step.version)
+                .collect::<Vec<_>>(),
+            vec![128, 127, 126, 125]
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(snapshot(&conn).unwrap(), shape, "dry-run changed DDL");
+        assert_eq!(
+            values(&conn, &old_columns),
+            before,
+            "dry-run changed saved values"
+        );
+        drop(conn);
+        assert_eq!(
+            store::SqliteWorkspaceStore::migrate_database(&path).unwrap(),
+            plan
+        );
+        let conn = Connection::open(&path).unwrap();
+        verify_history(&conn, store::LATEST_SCHEMA_VERSION).unwrap();
+        assert_eq!(values(&conn, &identity_columns), identities);
+        let history = store::workspace_schema_migration_history(&conn).unwrap();
+        assert_eq!(
+            history.first(),
+            Some(&(50, store::SCHEMA_BASELINE_NAME.to_owned()))
+        );
+        assert_eq!(
+            &history[history.len() - 4..],
+            &[
+                (125, tail_migration_name(125).unwrap().to_owned()),
+                (126, tail_migration_name(126).unwrap().to_owned()),
+                (127, tail_migration_name(127).unwrap().to_owned()),
+                (128, tail_migration_name(128).unwrap().to_owned()),
+            ]
+        );
+        let upgraded_shape = snapshot(&conn).unwrap();
+        let reopened_columns = columns(&conn);
+        let saved = values(&conn, &reopened_columns);
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        store::prepare_connection(&conn).unwrap();
+        assert_eq!(snapshot(&conn).unwrap(), upgraded_shape);
+        assert_eq!(values(&conn, &reopened_columns), saved);
+        // Compare migration-owned tables/programs with real fresh composition,
+        // retaining baseline50's legitimate historical physical differences.
+        let fresh = Connection::open_in_memory().unwrap();
+        store::prepare_connection(&fresh).unwrap();
+        for (name, object) in snapshot(&fresh).unwrap() {
+            if [
+                "backend_jobs",
+                "backend_job_attempts",
+                "plugin_service_consumers",
+                "workspace_configuration_publication_observations",
+                "external_workdir_connection_observations",
+            ]
+            .contains(&object.1.as_str())
+            {
+                assert_eq!(upgraded_shape.get(&name), Some(&object), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_added_columns_match_sqlite_alter_table_shape() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE sample(z TEXT, a TEXT, CHECK(length(z)>0));")
+            .unwrap();
+        let mut expected = snapshot(&conn).unwrap().remove("sample").unwrap().2;
+        append_reference_column(&mut expected, "failure_cause TEXT CHECK(failure_cause IS NULL OR length(CAST(failure_cause AS BLOB))<=32768)").unwrap();
+        conn.execute_batch("ALTER TABLE sample ADD COLUMN failure_cause TEXT CHECK(failure_cause IS NULL OR length(CAST(failure_cause AS BLOB))<=32768);").unwrap();
+        assert_eq!(snapshot(&conn).unwrap()["sample"].2, expected);
+    }
+}
 
 // Exact, frozen physical references from public Git 7b39a44ca698c474287e5511f674f2e8baae4c03.
 // Per-constant source paths below permit byte-for-byte provenance checks. These

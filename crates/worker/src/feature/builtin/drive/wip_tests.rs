@@ -36,17 +36,21 @@ struct State {
     revoked: bool,
     write: bool,
     lose_next_response: bool,
+    hide_next_receipt: bool,
+    mutation_failure: Option<DriveApiErrorCode>,
 }
 #[derive(Debug)]
 struct Client(Mutex<State>);
 fn response(value: impl Serialize) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: serde_json::to_string(&value).unwrap(),
     }
 }
 fn failure(status: u16, code: DriveApiErrorCode) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: Some("application/json".into()),
         status,
         body: serde_json::to_string(&DriveApiError::new(code)).unwrap(),
     }
@@ -107,6 +111,8 @@ impl Client {
             revoked: false,
             write: true,
             lose_next_response: false,
+            hide_next_receipt: false,
+            mutation_failure: None,
         })))
     }
 }
@@ -165,6 +171,16 @@ impl State {
         request: DriveMutationRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         self.mutations.push(request.clone());
+        if let Some(code) = self.mutation_failure.take() {
+            return Ok(failure(
+                if code == DriveApiErrorCode::Conflict {
+                    409
+                } else {
+                    403
+                },
+                code,
+            ));
+        }
         if !self.write {
             return Ok(failure(403, DriveApiErrorCode::Denied));
         }
@@ -316,7 +332,11 @@ impl WorkspaceClient for Client {
             }
             operation if operation.starts_with("requests/") => {
                 let id = operation.strip_prefix("requests/").unwrap();
-                let receipt = state.receipts.get(id).cloned();
+                let receipt = if std::mem::take(&mut state.hide_next_receipt) {
+                    None
+                } else {
+                    state.receipts.get(id).cloned()
+                };
                 response(DriveRequestStatusResponse {
                     request_id: id.into(),
                     state: if receipt.is_some() {
@@ -341,6 +361,7 @@ impl WorkspaceClient for Client {
         if state.revoked || (operation == "upload" && !state.write) {
             let denied = failure(403, DriveApiErrorCode::Denied);
             return Ok(WorkspaceBinaryResponse {
+                content_type: denied.content_type,
                 status: denied.status,
                 body: denied.body.into_bytes(),
             });
@@ -351,6 +372,7 @@ impl WorkspaceClient for Client {
             let offset: usize = args["offset"].parse().unwrap();
             let length: usize = args["length"].parse().unwrap();
             return Ok(WorkspaceBinaryResponse {
+                content_type: None,
                 status: 200,
                 body: node.bytes[offset..(offset + length).min(node.bytes.len())].to_vec(),
             });
@@ -385,6 +407,7 @@ impl WorkspaceClient for Client {
         state.uploads.push((upload, bytes));
         let result = state.commit(receipt)?;
         Ok(WorkspaceBinaryResponse {
+            content_type: result.content_type,
             status: result.status,
             body: result.body.into_bytes(),
         })
@@ -1325,6 +1348,147 @@ async fn model_invoke(
         json!({"path":path,"interface":reference,"operation":operation,"arguments":arguments}),
     )
     .await
+}
+
+#[tokio::test]
+async fn native_drive_failures_keep_typed_causes_settlement_and_unknown_receipt_without_resend() {
+    use super::failure::{
+        DriveClientFailureDetails, DriveClientFailureOperation, DriveClientFailureReason,
+    };
+    use super::tool_failure::{DriveToolFailureResult, DriveToolMutationObservation};
+    use crate::wip::WipAuditOutcome;
+
+    for (rejection, reason) in [
+        (
+            Some(DriveApiErrorCode::Conflict),
+            DriveClientFailureReason::Conflict,
+        ),
+        (
+            Some(DriveApiErrorCode::Denied),
+            DriveClientFailureReason::Denied,
+        ),
+        (None, DriveClientFailureReason::OutcomeUnknown),
+    ] {
+        let unknown = rejection.is_none();
+        let client = Client::new();
+        let feature = DriveFeature::new(client.clone(), Arc::new(WorkdirSessionRouter::new()));
+        let mut mounts = WipMountRegistry::new();
+        wip::mount_drive_wip(&mut mounts, &feature).unwrap();
+        let mut engine = agen::Engine::<_, agen::state::Mutable, ()>::new_annotated(NoLlm);
+        let runtime = crate::wip::install_wip_mode_with_mounts(
+            &mut engine,
+            None,
+            "drive-failure-tools".into(),
+            mounts,
+        )
+        .unwrap();
+        let handle = engine.tool_server_handle();
+        handle.flush_pending();
+        let tools: BTreeMap<_, _> = ["Inspect", "Invoke"]
+            .into_iter()
+            .map(|name| (name.into(), handle.get_tool(name).unwrap().1))
+            .collect();
+        let service = model_native(&tools, "/drive").await;
+        let root = model_invoke(&tools, "/drive", &service, "root", json!({})).await;
+        let interface = model_native(&tools, path(&root)).await;
+        let before = client.0.lock().unwrap().nodes.len();
+        {
+            let mut state = client.0.lock().unwrap();
+            state.mutation_failure = rejection;
+            state.lose_next_response = unknown;
+            state.hide_next_receipt = unknown;
+        }
+        let context = execution();
+        let request_id = feature.request_id(&context);
+        let error = handle
+            .call_tool(
+                "Invoke",
+                &json!({
+                    "path":path(&root), "interface":interface,
+                    "operation":"create_text", "arguments":{"name":"new.md","content":"new body"}
+                })
+                .to_string(),
+                context,
+            )
+            .await
+            .unwrap_err();
+        let agen::tool_server::ToolServerError::ExecutionResult(result) = error else {
+            panic!("native Drive failure lost the shared error side channel")
+        };
+        let history = crate::test_support::reopen_result(*result);
+        let agen::Item::ToolResult {
+            summary,
+            content: Some(content),
+            is_error,
+            disposition,
+            ..
+        } = &history
+        else {
+            panic!("native Drive failure lost Session details")
+        };
+        assert!(*is_error);
+        assert_eq!(*disposition, agen::ToolResultDisposition::Error);
+        let report: Value = serde_json::from_str(content).unwrap();
+        let error_contract::DecodeFailure::Known(cause) =
+            error_contract::decode_failure::<DriveClientFailureDetails>(
+                &serde_json::to_vec(&report["failure"]).unwrap(),
+                error_contract::Budget::new(65536, 65536),
+            )
+        else {
+            panic!("native Drive cause is not decodable")
+        };
+        assert_eq!(cause.facts().cause().reason, reason);
+        assert_eq!(
+            cause.facts().cause().operation,
+            DriveClientFailureOperation::CreateText
+        );
+        let result: DriveToolFailureResult =
+            serde_json::from_value(report["result"].clone()).unwrap();
+        assert_eq!(
+            result.mutation,
+            if unknown {
+                DriveToolMutationObservation::OutcomeUnknown {
+                    request_id: request_id.clone(),
+                }
+            } else {
+                DriveToolMutationObservation::NotReported
+            }
+        );
+        assert_eq!(
+            runtime.audit().last().unwrap().outcome,
+            if unknown {
+                WipAuditOutcome::OutcomeUnknown
+            } else {
+                WipAuditOutcome::Rejected
+            }
+        );
+        {
+            let state = client.0.lock().unwrap();
+            assert_eq!(state.mutations.len(), 1, "no automatic resend");
+            assert_eq!(state.nodes.len(), before + usize::from(unknown));
+        }
+        if unknown {
+            assert!(summary.contains(&request_id));
+            assert!(summary.contains("do not resend"));
+            let mut pruned = vec![history];
+            assert_eq!(agen::prune::project(&mut pruned, &[0]), 1);
+            assert!(
+                matches!(&pruned[0], agen::Item::ToolResult { summary, content: None, .. }
+                if summary.contains(&request_id) && summary.contains("do not resend"))
+            );
+            let status = model_invoke(
+                &tools,
+                "/drive",
+                &service,
+                "request_status",
+                json!({"request_id":request_id}),
+            )
+            .await;
+            assert_eq!(status["state"], "committed");
+            assert_eq!(status["request_id"], request_id);
+            assert_eq!(client.0.lock().unwrap().mutations.len(), 1);
+        }
+    }
 }
 
 #[tokio::test]

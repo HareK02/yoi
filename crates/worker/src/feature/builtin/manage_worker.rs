@@ -122,6 +122,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             )?
         } else {
             WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "items": [] }).to_string(),
             }
@@ -180,6 +181,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             }
         }
         Ok(WorkspaceResponse {
+            content_type: None,
             status: response.status,
             body: serde_json::to_string(&payload)
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -244,6 +246,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ))
                 })?;
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::json!({
                         "subject": { "kind": "sub_worker", "name": name }
@@ -321,6 +324,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         )
                     })?;
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&summary)
                         .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -1307,6 +1311,7 @@ mod tests {
                 let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                 self.authorizations.lock().unwrap().push(auth);
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
                         403
                     } else {
@@ -1319,6 +1324,7 @@ mod tests {
                 let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                 self.bound_authorizations.lock().unwrap().push(auth);
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: r#"{"scope":null}"#.into(),
                 });
@@ -1327,6 +1333,7 @@ mod tests {
             let is_worker_input = request.path.ends_with("/input");
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: if is_worker_list {
                     serde_json::json!({
@@ -1370,6 +1377,7 @@ mod tests {
                 reason.to_string(),
             ));
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: r#"{"removed":true}"#.to_string(),
             })
@@ -1402,6 +1410,7 @@ mod tests {
 
         async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError> {
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "items": [] }).to_string(),
             })
@@ -1425,6 +1434,7 @@ mod tests {
             }
             self.sent.lock().unwrap().push((name, content));
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "status": "accepted" }).to_string(),
             })
@@ -1446,6 +1456,7 @@ mod tests {
             }
             self.stopped.lock().unwrap().push(name);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "status": "stopped" }).to_string(),
             })
@@ -1499,6 +1510,7 @@ mod tests {
             let error = tool_output(
                 WorkerOperation::Notify,
                 WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: body.to_string(),
                 },
@@ -1515,13 +1527,14 @@ mod tests {
             tool_output(
                 WorkerOperation::Notify,
                 WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: "{}".into()
                 }
             )
             .is_err()
         );
-        let accepted = tool_output(WorkerOperation::Notify,WorkspaceResponse{status:200,body:serde_json::json!({"state":"accepted","runtime_id":"r","worker_id":"w","diagnostics":[]}).to_string()}).unwrap();
+        let accepted = tool_output(WorkerOperation::Notify,WorkspaceResponse {content_type: None,status:200,body:serde_json::json!({"state":"accepted","runtime_id":"r","worker_id":"w","diagnostics":[]}).to_string()}).unwrap();
         assert!(accepted.summary.contains("unconfirmed"));
     }
 
@@ -1745,6 +1758,7 @@ mod tests {
     #[test]
     fn send_input_rejection_is_a_tool_error_with_notify_guidance() {
         let error = tool_output(WorkerOperation::SendInput, WorkspaceResponse {
+            content_type: None,
             status: 400,
             body: "WorkerSendInput requires an Idle Worker. Use WorkerNotify for work already in progress.".to_string(),
         }).unwrap_err();
@@ -2352,6 +2366,7 @@ mod tests {
             }),
         };
         let response = WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&summary).unwrap(),
         };
@@ -2445,6 +2460,7 @@ mod tests {
                         )
                         .await?;
                     Ok(WorkspaceResponse {
+                        content_type: None,
                         status: 200,
                         body: "{}".into(),
                     })

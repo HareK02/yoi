@@ -149,6 +149,7 @@ fn initialize(root: &Path, runtime_id: &str, workspace_id: &str, url: &str) {
 
 fn record(request: CreateWorkerRequest) -> PersistedWorkerRecord {
     PersistedWorkerRecord {
+        workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard::default(),
         restore_guard: crate::runtime::RestoreGuard::default(),
         worker_ref: WorkerRef::new(request.worker_id),
         worker_id: request.worker_id,

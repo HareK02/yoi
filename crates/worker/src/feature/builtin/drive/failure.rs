@@ -195,6 +195,7 @@ impl From<&DriveError> for DriveClientFailureReason {
             DriveError::Limit => Self::Limit,
             DriveError::Unavailable => Self::Unavailable,
             DriveError::OutcomeUnknown(_) => Self::OutcomeUnknown,
+            DriveError::Remote { result, .. } => Self::from(result.as_ref()),
         }
     }
 }
@@ -205,18 +206,37 @@ impl From<&DriveError> for DriveClientFailureReason {
 pub struct DriveClientFailureDetails {
     pub operation: DriveClientFailureOperation,
     pub reason: DriveClientFailureReason,
+    /// Closed received facts only; reprojected for the current audience, never prose/context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<server_api::DriveHttpFailureDetails>,
 }
 
 impl DriveClientFailureDetails {
-    fn disclosure(&self) -> Result<Disclosure<Self>, ContractError> {
+    fn disclosure<A: error_contract::Audience>(&self) -> Result<Disclosure<Self>, ContractError>
+    where
+        server_api::DriveHttpFailureDetails: ProjectFor<
+                A,
+                Authorization = server_api::DriveHttpFailureVisibility,
+                Details = server_api::DriveHttpFailureDetails,
+            >,
+    {
         let impact = format!(
             "Drive client {} reported a failure",
             self.operation.description()
         );
-        let mut disclosure = Disclosure::new(
-            *self,
-            compose_explanation(self.reason.explanation(), &impact)?,
-        );
+        let cause = match self.server {
+            Some(server) => error_contract::project_failure::<A, _>(
+                &FailureFacts::new(server)?,
+                &server_api::DriveHttpFailureVisibility {
+                    can_view_result: true,
+                    can_view_storage_cause: true,
+                },
+            )?
+            .explanation()
+            .to_owned(),
+            None => self.reason.explanation().to_owned(),
+        };
+        let mut disclosure = Disclosure::new(*self, compose_explanation(&cause, &impact)?);
         // Rebuilt from the closed operation; this is not a dispatch/commit stage.
         disclosure
             .context
@@ -237,7 +257,10 @@ impl FailureCause for DriveClientFailureDetails {
     }
 
     fn validate(&self) -> Result<(), ContractError> {
-        // Closed enums only. Operation and reason make no disposition assertion.
+        if let Some(server) = self.server {
+            server.validate()?;
+        }
+        // The cause and the caller's result are independent observations.
         Ok(())
     }
 }
@@ -269,6 +292,7 @@ impl DriveClientFailure {
             details: DriveClientFailureDetails {
                 operation,
                 reason: DriveClientFailureReason::from(&source),
+                server: source.remote_details(),
             },
             source,
         }
@@ -323,7 +347,7 @@ macro_rules! project_for {
                 if !visibility.can_view_cause {
                     return Err(ContractError::ProjectionUnavailable);
                 }
-                self.disclosure()
+                self.disclosure::<$audience>()
             }
         }
 
@@ -339,7 +363,7 @@ macro_rules! project_for {
                 if !visibility.can_view_cause {
                     return Err(ContractError::ProjectionUnavailable);
                 }
-                self.details.disclosure()
+                self.details.disclosure::<$audience>()
             }
         }
     )+};

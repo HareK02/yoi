@@ -612,7 +612,7 @@ impl WipOperationHandler for DetachBeforePublication {
             context.execution,
         )
         .await
-        .map_err(map_tool_error)?;
+        .map_err(map_workdir_tool_error)?;
         self.file
             .provider
             .router

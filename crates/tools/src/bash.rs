@@ -175,7 +175,12 @@ impl BashTool {
                 tool_call_id: Some(call_id.clone()),
             })
             .await
-            .map_err(crate::ToolsError::from)?;
+            .map_err(|error| {
+                crate::WorkdirToolError::operation(
+                    workdir::failure::WorkdirFailureOperation::CommandStart,
+                    error,
+                )
+            })?;
         let cancel_after_start = {
             let mut state = self.state.lock().unwrap();
             state.active.insert(
@@ -195,7 +200,12 @@ impl BashTool {
             session
                 .cancel_command(handle.clone())
                 .await
-                .map_err(crate::ToolsError::from)?;
+                .map_err(|error| {
+                    crate::WorkdirToolError::operation(
+                        workdir::failure::WorkdirFailureOperation::CommandCancel,
+                        error,
+                    )
+                })?;
         }
         let mut cursor = 0;
         let mut stdout_preview = Vec::new();
@@ -219,11 +229,18 @@ impl BashTool {
             )
             .await
             .map_err(|_| {
-                ToolError::ExecutionFailed(
-                    "command byte transport deadline exceeded; terminal outcome unknown".into(),
+                crate::WorkdirToolError::operation(
+                    workdir::failure::WorkdirFailureOperation::CommandOutput,
+                    workdir::WorkdirError::OutcomeUnknown("terminal deadline exceeded".into())
+                        .with_failure_reason(workdir::WorkdirFailureReason::CommandTerminalMissing),
                 )
             })?
-            .map_err(crate::ToolsError::from)?;
+            .map_err(|error| {
+                crate::WorkdirToolError::operation(
+                    workdir::failure::WorkdirFailureOperation::CommandOutput,
+                    error,
+                )
+            })?;
             let mut next = cursor;
             for chunk in &page.chunks {
                 if chunk.sequence != next || chunk.bytes.is_empty() {
@@ -411,7 +428,12 @@ impl Tool for BashTool {
                 .session
                 .cancel_command(active.handle)
                 .await
-                .map_err(crate::ToolsError::from)?;
+                .map_err(|error| {
+                    crate::WorkdirToolError::operation(
+                        workdir::failure::WorkdirFailureOperation::CommandCancel,
+                        error,
+                    )
+                })?;
         }
         Ok(())
     }
@@ -431,7 +453,12 @@ impl Tool for BashTool {
                 .session
                 .cancel_command(active.handle)
                 .await
-                .map_err(crate::ToolsError::from)?;
+                .map_err(|error| {
+                    crate::WorkdirToolError::operation(
+                        workdir::failure::WorkdirFailureOperation::CommandCancel,
+                        error,
+                    )
+                })?;
         }
         Ok(())
     }

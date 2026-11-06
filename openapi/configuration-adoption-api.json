@@ -374,7 +374,8 @@
           "source",
           "preview",
           "adopt",
-          "reconcile"
+          "reconcile",
+          "publication"
         ],
         "type": "string"
       },
@@ -403,7 +404,9 @@
           "owner_required",
           "workspace_inactive",
           "workspace_draining",
-          "request_identity_conflict"
+          "request_identity_conflict",
+          "publication_dispatch_unavailable",
+          "publication_projection_unavailable"
         ],
         "type": "string"
       },
@@ -505,6 +508,163 @@
           "changed_subjects"
         ],
         "type": "object"
+      },
+      "ConfigurationPublicationFailure": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/FailureEnvelope_ConfigurationFailureDetails"
+              },
+              "kind": {
+                "const": "configuration",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "failure"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/FailureEnvelope_RuntimeControlCause"
+              },
+              "kind": {
+                "const": "runtime",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "failure"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Retained unknown/corrupt evidence is not forwarded or replaced by a made-up cause.",
+            "properties": {
+              "kind": {
+                "const": "unavailable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ConfigurationPublicationLookup": {
+        "additionalProperties": false,
+        "properties": {
+          "publication": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigurationPublicationResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ConfigurationPublicationObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigurationPublicationFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/ConfigurationPublicationOutcome"
+          },
+          "projection_digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stage": {
+            "$ref": "#/components/schemas/ConfigurationPublicationStage"
+          }
+        },
+        "required": [
+          "stage",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "ConfigurationPublicationOutcome": {
+        "description": "Observed means queue admission, projection availability, or Runtime acknowledgement,\ndepending on stage. It never confirms model processing or current policy application.",
+        "enum": [
+          "observed",
+          "unconfirmed"
+        ],
+        "type": "string"
+      },
+      "ConfigurationPublicationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "history_head": {
+            "type": "string"
+          },
+          "observations": {
+            "items": {
+              "$ref": "#/components/schemas/ConfigurationPublicationObservation"
+            },
+            "type": "array"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "request_fingerprint": {
+            "type": "string"
+          },
+          "source_digest": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_id",
+          "operation_id",
+          "request_fingerprint",
+          "history_head",
+          "source_digest",
+          "observations"
+        ],
+        "type": "object"
+      },
+      "ConfigurationPublicationStage": {
+        "enum": [
+          "dispatch",
+          "projection",
+          "runtime"
+        ],
+        "type": "string"
       },
       "ConfigurationReconciliation": {
         "oneOf": [
@@ -748,7 +908,7 @@
         ],
         "type": "object"
       },
-      "FailureEnvelope": {
+      "FailureEnvelope_ConfigurationFailureDetails": {
         "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
         "properties": {
           "category": {
@@ -759,6 +919,66 @@
           },
           "details": {
             "$ref": "#/components/schemas/ConfigurationFailureDetails"
+          },
+          "details_version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "required_extensions": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "required_extensions",
+          "domain",
+          "reason",
+          "category",
+          "details_version",
+          "details",
+          "explanation",
+          "context"
+        ],
+        "type": "object"
+      },
+      "FailureEnvelope_RuntimeControlCause": {
+        "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/Category"
+          },
+          "context": {
+            "$ref": "#/components/schemas/FailureContext"
+          },
+          "details": {
+            "$ref": "#/components/schemas/RuntimeControlCause"
           },
           "details_version": {
             "format": "uint16",
@@ -1385,7 +1605,7 @@
           }
         ]
       },
-      "ProblemDetails": {
+      "ProblemDetails_ConfigurationFailureDetails": {
         "description": "Untrusted wire DTO. Unknown RFC extensions are ignored; yoi_failure is mandatory here.",
         "properties": {
           "detail": {
@@ -1413,7 +1633,7 @@
             "type": "string"
           },
           "yoi_failure": {
-            "$ref": "#/components/schemas/FailureEnvelope"
+            "$ref": "#/components/schemas/FailureEnvelope_ConfigurationFailureDetails"
           }
         },
         "required": [
@@ -1460,6 +1680,44 @@
           "message"
         ],
         "type": "object"
+      },
+      "RuntimeControlCause": {
+        "enum": [
+          "runtime_missing",
+          "worker_missing",
+          "invalid_worker_identifier",
+          "runtime_stopped",
+          "execution_unavailable",
+          "execution_failed",
+          "execution_rejected",
+          "restore_observation_stale",
+          "restore_observation_conflict",
+          "restore_admission_busy",
+          "stop_observation_conflict",
+          "stop_request_conflict",
+          "stop_admission_busy",
+          "create_request_conflict",
+          "invalid_request",
+          "workspace_binding_mismatch",
+          "configuration_unavailable",
+          "working_directory_failed",
+          "persistence_failed",
+          "persistence_outcome_unknown",
+          "store_unavailable",
+          "state_unavailable",
+          "authorization_failed",
+          "connection_failed",
+          "transport_failed",
+          "timed_out",
+          "request_encoding_failed",
+          "client_setup_failed",
+          "response_too_large",
+          "invalid_response",
+          "result_unavailable",
+          "unsupported_operation",
+          "remote_rejected"
+        ],
+        "type": "string"
       },
       "RuntimePolicyApplication": {
         "enum": [
@@ -1641,7 +1899,7 @@
   "info": {
     "title": "Workspace configuration adoption",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:bb4ca448f920b57a190b46a0f71f3c58062718dcb8d03bbc649a82c6296da0ef"
+    "x-yoi-source-digest": "sha256:bf96d45aa8bc319de9b1b1f9bd727f711a1a8425e82d33c771e3e0541f2dde37"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -1680,7 +1938,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1695,7 +1953,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1710,7 +1968,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1725,7 +1983,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1740,7 +1998,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1755,7 +2013,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1817,7 +2075,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1832,7 +2090,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1847,7 +2105,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1862,7 +2120,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1877,7 +2135,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1892,7 +2150,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1954,7 +2212,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1969,7 +2227,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1984,7 +2242,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -1999,7 +2257,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2014,7 +2272,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2029,7 +2287,144 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/api/w/{workspace_id}/config/adoption/publication/{operation_id}": {
+      "get": {
+        "operationId": "configuration_publication",
+        "parameters": [
+          {
+            "explode": false,
+            "in": "path",
+            "name": "workspace_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          },
+          {
+            "explode": false,
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/string"
+            },
+            "style": "simple"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigurationPublicationLookup"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2091,7 +2486,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2106,7 +2501,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2121,7 +2516,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2136,7 +2531,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2151,7 +2546,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },
@@ -2166,7 +2561,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProblemDetails"
+                  "$ref": "#/components/schemas/ProblemDetails_ConfigurationFailureDetails"
                 }
               }
             },

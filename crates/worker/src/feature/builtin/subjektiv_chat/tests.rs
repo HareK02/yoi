@@ -88,6 +88,7 @@ impl WorkspaceClient for ChatBackendFixture {
         let status = self.status.load(Ordering::SeqCst);
         if status != 200 {
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status,
                 body: serde_json::json!({"message":"Backend rejected chat operation"}).to_string(),
             });
@@ -121,6 +122,7 @@ impl WorkspaceClient for ChatBackendFixture {
             },
         };
         Ok(WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&response).unwrap(),
         })

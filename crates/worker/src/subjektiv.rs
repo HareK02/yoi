@@ -885,6 +885,7 @@ pub(crate) fn test_subject_authorization_response(
     assert_eq!(input.target, BoundAuthorizationTarget::Subject {});
     let granted = allowed.contains(&input.operation.as_str());
     Some(crate::worker::WorkspaceResponse {
+        content_type: None,
         status: if granted { 200 } else { 403 },
         body: if granted {
             serde_json::json!({
@@ -1086,6 +1087,7 @@ mod tests {
         ) -> Result<crate::WorkspaceResponse, crate::WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
             Ok(crate::WorkspaceResponse {
+                content_type: None,
                 status: self.status,
                 body: if self.status == 200 {
                     r#"{"scope":null}"#.into()

@@ -3,6 +3,19 @@
 //! authorization. The dispatcher keeps owning Pending until a definitive result.
 use super::*;
 
+/// Additive reader-first evidence columns. No state, identity, input, receipt,
+/// checkpoint or prior failure is rewritten. Invalid/future envelopes remain
+/// readable as evidence, so SQL enforces the byte bound rather than JSON meaning.
+pub(super) const CAUSE_MIGRATION_NAME: &str = "Backend Job bounded structured failure evidence";
+pub(super) const CAUSE_SCHEMA: &str = r#"
+ALTER TABLE backend_jobs ADD COLUMN failure_cause TEXT
+    CHECK(failure_cause IS NULL OR length(CAST(failure_cause AS BLOB))<=32768);
+ALTER TABLE backend_job_attempts ADD COLUMN failure_cause TEXT
+    CHECK(failure_cause IS NULL OR length(CAST(failure_cause AS BLOB))<=32768);
+ALTER TABLE backend_job_attempts ADD COLUMN worker_cleanup_failure_cause TEXT
+    CHECK(worker_cleanup_failure_cause IS NULL OR length(CAST(worker_cleanup_failure_cause AS BLOB))<=32768);
+"#;
+
 pub(super) const SCHEMA: &str = r#"
 -- An allocation must win Reserved -> Dispatching before crossing the Runtime
 -- boundary. This proof is minted only by the competing Reserved -> Failed Tx.

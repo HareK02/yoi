@@ -94,6 +94,7 @@ reasons! {
     BackendRejected => ("backend_rejected", Dependency, "the Backend explicitly reported that the request was not committed"),
     BackendUnknown => ("backend_unknown", Unknown, "the Backend explicitly reported an unknown outcome"),
     UnrecognizedResponse => ("unrecognized_response", Dependency, "the Backend returned an unrecognized failure response"),
+    InvalidMetadata => ("invalid_metadata", Dependency, "the Backend response metadata was inconsistent with the requested configuration observation"),
 }
 
 /// Closed allowlist, deliberately not an operation result or a recovery instruction.
@@ -105,15 +106,15 @@ pub struct ConfigFailureDetails {
     pub reason: ConfigFailureReason,
 }
 impl ConfigFailureDetails {
-    fn disclosure(self) -> Disclosure<Self> {
-        Disclosure::new(
-            self,
-            format!(
-                "{} failed: {}",
-                self.operation.description(),
-                self.reason.explanation()
-            ),
+    pub(super) fn explanation(&self) -> String {
+        format!(
+            "{} failed: {}",
+            self.operation.description(),
+            self.reason.explanation()
         )
+    }
+    fn disclosure(self) -> Disclosure<Self> {
+        Disclosure::new(self, self.explanation())
     }
 }
 impl FailureCause for ConfigFailureDetails {
@@ -169,6 +170,103 @@ impl ConfigFailure {
     }
     pub fn into_source(self) -> WipOperationError {
         self.source
+    }
+
+    pub(super) fn invocation_attachment(
+        &self,
+    ) -> Option<protocol::startup_failure::StartupFailureAttachment> {
+        let facts = FailureFacts::new(self.details).ok()?;
+        let projected = error_contract::project_failure::<Tool, _>(
+            &facts,
+            &ConfigFailureVisibility {
+                can_view_cause: true,
+            },
+        )
+        .ok()?;
+        protocol::startup_failure::StartupFailureAttachment::from_projected(&projected).ok()
+    }
+
+    pub(super) fn into_attach_invocation_error(mut self) -> WipOperationError {
+        // Preserve the attach entrance existing protocol classes. The Backend
+        // source remains typed until this final native result projection.
+        if let WipOperationError::Protocol(error) = &mut self.source {
+            use wip_protocol::ProtocolErrorCode;
+            if !matches!(
+                error.code,
+                ProtocolErrorCode::PermissionDenied | ProtocolErrorCode::InvalidArguments
+            ) {
+                error.code = ProtocolErrorCode::ResourceLimitExceeded;
+            }
+        }
+        self.into_invocation_error()
+    }
+
+    pub(super) fn into_attach_completion_error(mut self) -> Self {
+        // Dispatch already occurred: an invalid response identity cannot prove no effects.
+        self.source = WipOperationError::OutcomeUnknown(
+            "Workspace config attachment response could not be reconciled; inspect the same alias before recovery".into(),
+        );
+        self
+    }
+
+    /// The commit response was received, but its required path observation failed.
+    /// This caller's existing Unknown settlement is not the observation's protocol outcome.
+    pub(super) fn into_post_commit_observation_error(mut self) -> WipOperationError {
+        self.details.stage = ConfigFailureStage::Reconcile;
+        self.source = WipOperationError::OutcomeUnknown("Workspace configuration committed response could not be reconciled with the path observation; do not resend the mutation".into());
+        self.into_invocation_error()
+    }
+
+    /// Disclose only a current invocation's closed facts, not publication probes or
+    /// received prose. Keep WIP settlement independent of the shared presentation.
+    pub(super) fn into_invocation_error(self) -> WipOperationError {
+        #[derive(Serialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Outcome {
+            ProtocolFailure { code: String },
+            OutcomeUnknown,
+        }
+        let outcome = match &self.source {
+            // WIP's code has no Serde implementation. Export its closed protocol
+            // label, never its message; settlement below still uses the actual enum.
+            WipOperationError::Protocol(error) => Outcome::ProtocolFailure {
+                code: format!("{:?}", error.code),
+            },
+            WipOperationError::OutcomeUnknown(_) => Outcome::OutcomeUnknown,
+            _ => return self.source,
+        };
+        let Ok(projected) = FailureFacts::new(self.details).and_then(|facts| {
+            error_contract::project_failure::<Tool, _>(
+                &facts,
+                &ConfigFailureVisibility {
+                    can_view_cause: true,
+                },
+            )
+        }) else {
+            return self.source;
+        };
+        let mut output = tools::failure::failure_output(
+            &projected,
+            tools::failure::ToolFailureBoundary::Observation,
+            &outcome,
+            error_contract::MAX_FAILURE_BYTES,
+        );
+        match self.source {
+            WipOperationError::Protocol(error) => {
+                WipOperationError::protocol_with_failure(error, output)
+            }
+            WipOperationError::OutcomeUnknown(message) => {
+                // Content is prunable. Retain the existing non-resend instruction in
+                // the summary; this content commit API has no retry/receipt identity.
+                output.summary.push_str(if self.details.operation == ConfigFailureOperation::Attach {
+                    " Workspace config attachment outcome unknown; inspect the current attachment under the same alias before deciding recovery; do not resend automatically."
+                } else {
+                    " Workspace configuration outcome unknown; do not resend the mutation; observe the current source before deciding recovery."
+                });
+                WipOperationError::outcome_unknown_with_failure(message, output)
+            }
+            source => source,
+        }
     }
 }
 impl std::fmt::Debug for ConfigFailure {

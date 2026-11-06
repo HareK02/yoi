@@ -39,7 +39,9 @@ use super::backend::{
     MAX_DEPTH, MAX_NODES, MAX_PATH_BYTES, MAX_TEXT_BYTES, WorkspaceConfigBackend, diagnostic,
     failure, unknown,
 };
-use super::failure::ConfigFailure;
+use super::failure::{
+    ConfigFailure, ConfigFailureOperation, ConfigFailureReason, ConfigFailureStage,
+};
 use super::{CONTENT_ROOT, WorkspaceConfigFeature};
 use crate::feature::builtin::backend_diagnostic::{Diagnostic, Reason, Stage};
 use crate::wip::{
@@ -150,6 +152,7 @@ async fn observe(
         diagnostic("observe", false),
     )
     .await
+    .map_err(ConfigFailure::into_source)
 }
 
 async fn observe_diagnosed(
@@ -158,13 +161,26 @@ async fn observe_diagnosed(
     paths: Vec<String>,
     depth: u32,
     diagnostic: Diagnostic,
-) -> Result<WorkspaceConfigObserveResponse, WipOperationError> {
+) -> Result<WorkspaceConfigObserveResponse, ConfigFailure> {
+    let typed = |stage, reason, source| {
+        ConfigFailure::new(ConfigFailureOperation::Observe, stage, reason, source)
+    };
     if paths.len() > MAX_NODES || depth > MAX_DEPTH {
-        return Err(invalid());
+        return Err(typed(
+            ConfigFailureStage::Request,
+            ConfigFailureReason::InvalidRequest,
+            invalid(),
+        ));
     }
     for path in &paths {
         if !path.is_empty() {
-            validate_source(path)?;
+            validate_source(path).map_err(|source| {
+                typed(
+                    ConfigFailureStage::Request,
+                    ConfigFailureReason::InvalidRequest,
+                    source,
+                )
+            })?;
         }
     }
     let result: WorkspaceConfigObserveResponse = backend
@@ -178,8 +194,7 @@ async fn observe_diagnosed(
             false,
             diagnostic.clone(),
         )
-        .await
-        .map_err(ConfigFailure::into_source)?;
+        .await?;
     if result.connection_id != connection
         || result.nodes.len() > MAX_NODES
         || result.validator.is_empty()
@@ -195,28 +210,53 @@ async fn observe_diagnosed(
             },
             None,
         );
-        return Err(failure(
-            ProtocolErrorCode::Internal,
-            "Invalid Workspace config metadata",
+        return Err(typed(
+            ConfigFailureStage::Response,
+            if result.connection_id != connection {
+                ConfigFailureReason::Identity
+            } else {
+                ConfigFailureReason::InvalidMetadata
+            },
+            failure(
+                ProtocolErrorCode::Internal,
+                "Invalid Workspace config metadata",
+            ),
         ));
     }
     if result.entrypoints.is_empty() || result.entrypoints.len() > MAX_NODES {
         diagnostic.record(Stage::Response, Reason::InvalidMetadata, None);
-        return Err(failure(
-            ProtocolErrorCode::Internal,
-            "Invalid Workspace config entrypoints",
+        return Err(typed(
+            ConfigFailureStage::Response,
+            ConfigFailureReason::InvalidMetadata,
+            failure(
+                ProtocolErrorCode::Internal,
+                "Invalid Workspace config entrypoints",
+            ),
         ));
     }
     for path in &result.entrypoints {
         validate_source(path)
-            .inspect_err(|_| diagnostic.record(Stage::Response, Reason::InvalidMetadata, None))?;
+            .inspect_err(|_| diagnostic.record(Stage::Response, Reason::InvalidMetadata, None))
+            .map_err(|source| {
+                typed(
+                    ConfigFailureStage::Response,
+                    ConfigFailureReason::InvalidMetadata,
+                    source,
+                )
+            })?;
     }
     let mut seen = BTreeSet::new();
     for node in &result.nodes {
         if !node.path.is_empty() {
-            validate_source(&node.path).inspect_err(|_| {
-                diagnostic.record(Stage::Response, Reason::InvalidMetadata, None)
-            })?;
+            validate_source(&node.path)
+                .inspect_err(|_| diagnostic.record(Stage::Response, Reason::InvalidMetadata, None))
+                .map_err(|source| {
+                    typed(
+                        ConfigFailureStage::Response,
+                        ConfigFailureReason::InvalidMetadata,
+                        source,
+                    )
+                })?;
         }
         if !seen.insert(&node.path)
             || node.validator.is_empty()
@@ -234,9 +274,13 @@ async fn observe_diagnosed(
             })
         {
             diagnostic.record(Stage::Response, Reason::InvalidMetadata, None);
-            return Err(failure(
-                ProtocolErrorCode::Internal,
-                "Invalid Workspace config metadata scope",
+            return Err(typed(
+                ConfigFailureStage::Response,
+                ConfigFailureReason::InvalidMetadata,
+                failure(
+                    ProtocolErrorCode::Internal,
+                    "Invalid Workspace config metadata scope",
+                ),
             ));
         }
     }
@@ -555,7 +599,7 @@ impl ConfigHandler {
                 diagnostic.clone(),
             )
             .await
-            .map_err(ConfigFailure::into_source)?;
+            .map_err(ConfigFailure::into_invocation_error)?;
         if response.path != self.node.path
             || response.validator != self.node.validator
             || Some(&response.digest) != self.node.digest.as_ref()
@@ -612,13 +656,15 @@ impl ConfigHandler {
             ));
         }
         // Resolve canonical per-file preconditions at the SAME captured tree content.
-        let metadata = observe(
+        let metadata = observe_diagnosed(
             &self.backend,
             &self.attachment.connection_id,
             paths.into_iter().collect(),
             0,
+            diagnostic("observe", false),
         )
-        .await?;
+        .await
+        .map_err(ConfigFailure::into_invocation_error)?;
         same_snapshot(&self.snapshot, &metadata)?;
         changes
             .into_iter()
@@ -874,7 +920,7 @@ impl ConfigHandler {
                 diagnostic.clone(),
             )
             .await
-            .map_err(ConfigFailure::into_source)?;
+            .map_err(ConfigFailure::into_invocation_error)?;
         // Commit response supplies ROOT state. Obtain the exact post-commit PATH
         // validator, never substitute the root validator for a file validator.
         let updated = observe_diagnosed(
@@ -885,7 +931,7 @@ impl ConfigHandler {
             diagnostic.at_stage(Stage::Reconcile),
         )
         .await
-        .map_err(|_| unknown())?;
+        .map_err(ConfigFailure::into_post_commit_observation_error)?;
         if updated.digest != result.digest || updated.validator != result.validator {
             diagnostic.record(Stage::Reconcile, Reason::Identity, None);
             return Err(unknown());

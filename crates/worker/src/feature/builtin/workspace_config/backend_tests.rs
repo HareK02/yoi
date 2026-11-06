@@ -122,6 +122,7 @@ impl WorkspaceClient for Client {
             let input: server_api::authorization::OperationAuthorizationRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope": input.resource}).to_string(),
             });
@@ -155,10 +156,12 @@ impl WorkspaceClient for Client {
             Fault::Communication => Err(WorkspaceClientError::Request(self.prose.into())),
             Fault::Panic => panic!("injected blocking task failure"),
             Fault::Decode => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: UNSAFE.into(),
             }),
             Fault::Size => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: UNSAFE.repeat(MAX_RESPONSE_BYTES / UNSAFE.len() + 1),
             }),
@@ -168,6 +171,7 @@ impl WorkspaceClient for Client {
                     _ => 503,
                 };
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status,
                     body: serde_json::to_string(&WorkspaceConfigApiError {
                         status,
@@ -183,6 +187,7 @@ impl WorkspaceClient for Client {
                 })
             }
             Fault::Unrecognized => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 503,
                 body: UNSAFE.into(),
             }),
@@ -192,6 +197,7 @@ impl WorkspaceClient for Client {
                     value.workspace_id = UNSAFE.into();
                 }
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&value).unwrap(),
                 })
@@ -585,14 +591,31 @@ async fn production_attach_conversion_retains_original_reason_and_effect_count()
         let client = Client::new(fault);
         let backend = WorkspaceConfigBackend::new(client.clone());
         let capture = Capture::default();
-        assert_eq!(
-            backend
-                .attach("host-key-not-logged", None)
-                .with_subscriber(capture.dispatch())
-                .await,
-            Err(expected)
-        );
-        assert_safe(&capture, reason, Stage::Attach, expected.message());
+        let error = backend
+            .attach("host-key-not-logged", None)
+            .with_subscriber(capture.dispatch())
+            .await
+            .unwrap_err();
+        assert_eq!(error.outcome_unknown(), expected.outcome_unknown());
+        let ConfigAttachError::Backend(source) = &error else {
+            panic!("typed source lost")
+        };
+        assert_eq!(source.details().operation, Operation::Attach);
+        let expected_stage = if matches!(fault, Fault::Communication) {
+            Stage::Request
+        } else {
+            Stage::Response
+        };
+        assert_cause(source, reason, expected_stage);
+        let invocation_error = error.invocation_error();
+        let attachment = invocation_error.failure.unwrap();
+        let error_contract::DecodeFailure::Known(cause) =
+            attachment.decode::<super::super::failure::ConfigFailureDetails>()
+        else {
+            panic!("cause missing")
+        };
+        assert_eq!(cause.facts().cause().operation, Operation::Attach);
+        assert_safe(&capture, reason, Stage::Attach, &invocation_error.message);
         let text = capture.text();
         if !matches!(fault, Fault::Identity) {
             assert!(text.contains("reason=AttachConversion"), "{text}");

@@ -76,6 +76,7 @@ mod startup_binding_tests {
                 ));
             }
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 403,
                 body: serde_json::to_string(
                     &server_api::RepositoryApiError::new(

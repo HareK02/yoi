@@ -879,6 +879,12 @@ mod tests {
         );
         for (name, method, suffix, wire_method) in [
             ("drive_root", HttpMethod::Get, "/root", "get"),
+            (
+                "drive_capabilities",
+                HttpMethod::Get,
+                "/capabilities",
+                "get",
+            ),
             ("drive_metadata", HttpMethod::Get, "/metadata", "get"),
             ("drive_list", HttpMethod::Get, "/list", "get"),
             ("drive_search", HttpMethod::Get, "/search", "get"),
@@ -910,6 +916,15 @@ mod tests {
             assert_eq!(operation.method, method);
             assert_eq!(operation.path, path);
             let documented = &document["paths"][&path][wire_method];
+            let errors = &documented["responses"]["413"]["content"];
+            assert_eq!(
+                errors["application/json"]["schema"]["$ref"],
+                "#/components/schemas/DriveApiError"
+            );
+            assert_eq!(
+                errors["application/problem+json"]["schema"]["$ref"],
+                "#/components/schemas/ProblemDetails_DriveHttpFailureDetails"
+            );
             assert_eq!(documented["operationId"], name);
             assert_eq!(
                 documented["security"],

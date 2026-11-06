@@ -39,8 +39,13 @@ mod configuration_adoption_http_integration {
 
     impl Fixture {
         async fn new() -> Self {
+            Self::with_publication_host(HostExecutors::default()).await
+        }
+
+        async fn with_publication_host(host: HostExecutors) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let mut api = test_api(dir.path()).await;
+            api.host_executors = host;
             let owner_account = api
                 .store
                 .get_workspace(TEST_WORKSPACE_ID)
@@ -1262,4 +1267,155 @@ mod configuration_adoption_http_integration {
             }
         }
     }
+    #[tokio::test]
+    async fn publication_http_connects_adoption_dispatch_projection_runtime_and_read_only_lookup() {
+        let fixture = Fixture::new().await;
+        let draft = fixture.source().await;
+        let adoption = request(&draft, "publication-http-success", vec![]);
+        let receipt = fixture.commit(&adoption).await;
+        let host = fixture.api.host_executors.host().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), host.drain()).await.unwrap().unwrap();
+        let suffix = format!("/publication/{}", adoption.operation_id);
+        let (status, before) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::OK, "{before}");
+        let publication = &before["publication"];
+        assert_eq!(publication["workspace_id"], TEST_WORKSPACE_ID);
+        assert_eq!(publication["operation_id"], receipt.operation_id);
+        assert_eq!(publication["history_head"], receipt.history_head);
+        assert_eq!(publication["source_digest"], receipt.state.snapshot.digest);
+        let observations = publication["observations"].as_array().unwrap();
+        assert_eq!(observations[0]["stage"], "dispatch");
+        assert_eq!(observations[0]["outcome"], "observed");
+        assert_eq!(observations[1]["stage"], "projection");
+        assert_eq!(observations[1]["outcome"], "observed");
+        assert!(observations.len() >= 3, "real fixture Runtime must be observed");
+        for observation in &observations[2..] {
+            assert_eq!(observation["stage"], "runtime");
+            assert!(observation["runtime_id"].is_string());
+            assert_eq!(observation["projection_digest"], observations[1]["projection_digest"]);
+        }
+        let durable = fixture.durable();
+        assert_eq!(fixture.commit(&adoption).await, receipt);
+        fixture.owner_call("/reconcile", &adoption, StatusCode::OK).await;
+        tokio::time::timeout(std::time::Duration::from_secs(15), host.drain()).await.unwrap().unwrap();
+        let (status, after) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after, before, "lookup, reconcile and replay do not republish or amend observations");
+        assert_eq!(fixture.durable(), durable, "independent evidence must not rewrite source/policy/receipt");
+        let (status, missing) = fixture.call(fixture.bearer(&fixture.owner, "GET", "/publication/not-observed", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(missing["publication"].is_null());
+        let (status, denied) = fixture.call(fixture.bearer(&fixture.foreign, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!denied.to_string().contains("request_fingerprint"));
+    }
+
+    #[tokio::test]
+    async fn publication_dispatch_refusal_preserves_adoption_and_reprojects_safe_cause_for_browser_and_tool() {
+        let host = HostExecutors::default();
+        host.host.set(None).ok().unwrap();
+        let fixture = Fixture::with_publication_host(host).await;
+        let draft = fixture.source().await;
+        let adoption = request(&draft, "publication-host-unavailable", vec![]);
+        let receipt = fixture.commit(&adoption).await;
+        assert!(receipt.source_stored && receipt.policy_committed);
+        let suffix = format!("/publication/{}", adoption.operation_id);
+        let (status, body) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let observations = body["publication"]["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 1, "projection and Runtime were not dispatched");
+        assert_eq!(observations[0]["outcome"], "unconfirmed");
+        let browser_cause = &observations[0]["failure"]["failure"];
+        assert_eq!(browser_cause["reason"], "publication_dispatch_unavailable");
+        assert!(browser_cause["explanation"].as_str().unwrap().contains("adopted"));
+        let retained = fixture.api.config_store.configuration_publication(TEST_WORKSPACE_ID, &fixture.owner_account, &adoption.operation_id).unwrap().unwrap();
+        let tool = retained.observations[0].failure.as_ref().unwrap()
+            .project_for::<error_contract::Tool, server_api::configuration_failure::ConfigurationFailureDetails>(
+                &server_api::configuration_failure::ConfigurationFailureVisibility { can_view_cause: true }).unwrap();
+        assert_eq!(tool.explanation(), browser_cause["explanation"].as_str().unwrap());
+        assert_eq!(tool.details().reason, server_api::configuration_failure::ConfigurationFailureReason::PublicationDispatchUnavailable);
+        assert_eq!(fixture.commit(&adoption).await, receipt);
+        let (_, replayed) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(replayed, body);
+    }
+
+    #[tokio::test]
+    async fn publication_query_never_forwards_received_explanation_unknown_or_corrupt_evidence() {
+        let host = HostExecutors::default();
+        host.host.set(None).ok().unwrap();
+        let fixture = Fixture::with_publication_host(host).await;
+        let receipt = fixture.adopt_draft("publication-untrusted-evidence").await;
+        let facts = error_contract::FailureFacts::new(protocol::control_failure::RuntimeControlCause::TimedOut).unwrap();
+        let projected = error_contract::project_failure::<error_contract::Storage, _>(&facts, &()).unwrap();
+        let original = protocol::background_failure::BackgroundFailure::from_projected(&projected).unwrap();
+        let mut known: Value = serde_json::from_str(original.as_storage_str()).unwrap();
+        known["explanation"] = json!("TEST_ONLY_SECRET /private/path body; safe to resend");
+        let mut future = known.clone();
+        future["version"] = json!(999);
+        for (runtime, evidence) in [("known", known.to_string()), ("future", future.to_string()), ("corrupt", "{ TEST_ONLY_SECRET raw_provider_body".into())] {
+            fixture.api.config_store.with_conn(|conn| {
+                conn.execute("INSERT INTO workspace_configuration_publication_observations(workspace_id,operation_id,stage,runtime_id,projection_digest,outcome,failure_cause) VALUES(?1,?2,'runtime',?3,'observed-projection','unconfirmed',?4)", rusqlite::params![TEST_WORKSPACE_ID, receipt.operation_id, runtime, evidence])?;
+                Ok(())
+            }).unwrap();
+        }
+        let suffix = format!("/publication/{}", receipt.operation_id);
+        let (status, body) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let text = body.to_string();
+        for private in ["TEST_ONLY_SECRET", "/private/path", "raw_provider_body", "safe to resend"] { assert!(!text.contains(private), "{text}"); }
+        let observations = body["publication"]["observations"].as_array().unwrap();
+        for observation in &observations[1..] {
+            assert_eq!(observation["outcome"], "unconfirmed");
+            if observation["runtime_id"] == "known" {
+                assert_eq!(observation["failure"]["failure"]["reason"], "timed_out");
+            } else {
+                assert_eq!(observation["failure"]["kind"], "unavailable");
+            }
+        }
+        let durable = fixture.durable();
+        fixture.api.config_store.with_conn(|conn| {
+            conn.execute("UPDATE workspaces SET state='deleting' WHERE workspace_id=?1", [TEST_WORKSPACE_ID])?;
+            Ok(())
+        }).unwrap();
+        let (status, denied) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!denied.to_string().contains("request_fingerprint"));
+        assert!(durable["receipts"].as_array().unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn queued_publication_rechecks_current_head_before_resolving_or_notifying_old_source() {
+        let host = HostExecutors::default();
+        host.host.set(Some(crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
+            workers: std::num::NonZeroUsize::new(1).unwrap(),
+            queued: std::num::NonZeroUsize::new(4).unwrap(),
+        }).unwrap())).ok().unwrap();
+        let fixture = Fixture::with_publication_host(host).await;
+        let executor = fixture.api.host_executors.host().unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        executor.dispatch(move || {
+            let _ = ready.send(());
+            let _ = blocked.recv_timeout(std::time::Duration::from_secs(15));
+        }).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), started).await.unwrap().unwrap();
+        let first = fixture.adopt_draft("publication-queued-first").await;
+        let second = fixture.adopt_draft("publication-queued-second").await;
+        assert_ne!(first.history_head, second.history_head);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain()).await.unwrap().unwrap();
+        let suffix = format!("/publication/{}", first.operation_id);
+        let (status, body) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let observations = body["publication"]["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 2, "historical source must not be sent to any Runtime");
+        assert_eq!(observations[0]["outcome"], "observed");
+        assert_eq!(observations[1]["stage"], "projection");
+        assert_eq!(observations[1]["outcome"], "unconfirmed");
+        assert!(observations[1]["projection_digest"].is_null());
+        assert_eq!(observations[1]["failure"]["failure"]["reason"], "editing_head_changed");
+        assert_eq!(body["publication"]["history_head"], first.history_head);
+        assert_eq!(fixture.source().await.history_head, Some(second.history_head));
+    }
+
 }

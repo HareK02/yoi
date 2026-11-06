@@ -582,7 +582,7 @@ impl WipOperationHandler for FileHandler {
                     "byte read deadline",
                 )
             })?
-            .map_err(map_tool_error)?;
+            .map_err(map_workdir_tool_error)?;
             self.check_connection()?;
             let value = crate::file_operation::bytes_result(arguments, &read.bytes, read.eof)?;
             return Ok(WipOperationOutput::native_with_validator(
@@ -634,7 +634,7 @@ impl WipOperationHandler for FileHandler {
                     "text read deadline",
                 )
             })?
-            .map_err(map_tool_error)?;
+            .map_err(map_workdir_tool_error)?;
             let (read, validator, record_read) = result;
             self.check_connection()?;
             if read.byte_truncated {
@@ -786,7 +786,7 @@ impl WipOperationHandler for FileHandler {
                 )
             }
         })?
-        .map_err(map_tool_error)?;
+        .map_err(map_workdir_tool_error)?;
         self.publish_result(tool, result)
     }
 }
@@ -866,6 +866,26 @@ fn error(code: ProtocolErrorCode, message: &str) -> ProtocolError {
 fn protocol(code: ProtocolErrorCode, message: &str) -> WipOperationError {
     WipOperationError::Protocol(error(code, message))
 }
+fn map_workdir_tool_error(error: tools::WorkdirToolError) -> WipOperationError {
+    let (source, failure) = error.into_parts();
+    let source = map_tool_error(source);
+    let Some(mut failure) = failure else {
+        return source;
+    };
+    match source {
+        WipOperationError::Protocol(error) => {
+            WipOperationError::protocol_with_failure(error, failure)
+        }
+        WipOperationError::OutcomeUnknown(message) => {
+            // Native settlement stays unknown even for non-explicit transport/IO
+            // failures. Content pruning must not remove the non-resend guidance.
+            failure.summary.push_str(" Checkout result unknown; do not automatically resend; inspect current state before deciding recovery.");
+            WipOperationError::outcome_unknown_with_failure(message, failure)
+        }
+        source => source,
+    }
+}
+
 fn map_tool_error(e: ToolError) -> WipOperationError {
     match e {
         ToolError::InvalidArgument(_) => protocol(

@@ -49,7 +49,7 @@ impl WorkspaceClient for Host {
             server_api::authorization::BoundAuthorizationTarget::Subject {}
         );
         self.checks.fetch_add(1, Ordering::SeqCst);
-        Ok(WorkspaceResponse { status: self.status.load(Ordering::SeqCst) as u16,
+        Ok(WorkspaceResponse { content_type: None, status: self.status.load(Ordering::SeqCst) as u16,
             body: r#"{"scope":{"kind":"subject","workspace_id":"workspace-test","subject_id":"subject"}}"#.into() })
     }
 }

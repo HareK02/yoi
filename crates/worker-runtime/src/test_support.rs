@@ -386,6 +386,7 @@ impl StoppedWorkerTemplate {
         };
         let result = (|| {
             let worker = PersistedWorkerRecord {
+                workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard::default(),
                 restore_guard: crate::runtime::RestoreGuard::default(),
                 worker_ref: WorkerRef::new(self.worker_id),
                 worker_id: self.worker_id,

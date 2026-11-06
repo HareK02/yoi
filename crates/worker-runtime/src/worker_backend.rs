@@ -6444,8 +6444,7 @@ where
         request: &RepositoryRefObservationRequest,
     ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
         let materializer = self.working_directory_materializer.as_ref().ok_or_else(|| {
-            WorkingDirectoryDiagnostic::rejected(
-                "repository_ref_provider_unavailable",
+            WorkingDirectoryDiagnostic::for_reason(workdir::management_failure::WorkdirManagementReason::RefProviderUnavailable,
                 "Repository ref observation requested, but no materializer is configured for this Runtime backend",
             )
         })?;
@@ -11722,6 +11721,7 @@ mod tests {
                     .validate()
                     .map_err(worker::WorkspaceClientError::Request)?;
                 return Ok(worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(
                         &server_api::authorization::OperationAuthorizationResponse { scope: None },

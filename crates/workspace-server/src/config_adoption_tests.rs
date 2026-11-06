@@ -420,3 +420,214 @@ fn independent_database_connections_serialize_concurrent_web_and_cli_heads() {
 
 #[path = "config_adoption_failure_tests.rs"]
 mod failure_contract;
+
+mod publication_observations {
+    use super::*;
+    use crate::config_publication::PublicationIdentity;
+    use error_contract::{FailureFacts, Storage, Tool, project_failure};
+    use protocol::{background_failure::BackgroundFailure, control_failure::RuntimeControlCause};
+    use server_api::{
+        ConfigurationPublicationOutcome as Outcome, ConfigurationPublicationStage as Stage,
+    };
+
+    fn failure(cause: RuntimeControlCause) -> BackgroundFailure {
+        let facts = FailureFacts::new(cause).unwrap();
+        let projected = project_failure::<Storage, _>(&facts, &()).unwrap();
+        BackgroundFailure::from_projected(&projected).unwrap()
+    }
+
+    #[test]
+    fn publication_observations_reopen_with_original_receipt_and_never_reapply_on_reconcile() {
+        let (dir, db) = fixture();
+        let host = host(false);
+        let request = request(&db, &host, "publication-observed", Some(A));
+        let result = adopt(&db, &host, &request).unwrap();
+        let identity = PublicationIdentity {
+            request_fingerprint: request_fingerprint(WORKSPACE, OWNER, &request).unwrap(),
+            receipt: result.clone(),
+        };
+        let timeout = failure(RuntimeControlCause::TimedOut);
+        db.record_configuration_publication(
+            &identity,
+            Stage::Dispatch,
+            None,
+            None,
+            Outcome::Observed,
+            None,
+        )
+        .unwrap();
+        db.record_configuration_publication(
+            &identity,
+            Stage::Projection,
+            None,
+            Some("prompt-digest"),
+            Outcome::Observed,
+            None,
+        )
+        .unwrap();
+        // More than a presentation diagnostic limit: retain every Runtime, not a warning sample.
+        for n in 0..25 {
+            db.record_configuration_publication(
+                &identity,
+                Stage::Runtime,
+                Some(&format!("runtime-{n:02}")),
+                Some("prompt-digest"),
+                Outcome::Unconfirmed,
+                Some(&timeout),
+            )
+            .unwrap();
+        }
+        drop(db);
+        let db = open(&dir.path().join("server.sqlite"));
+        let read = db
+            .configuration_publication(WORKSPACE, OWNER, &request.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read.identity.request_fingerprint,
+            identity.request_fingerprint
+        );
+        assert_eq!(read.identity.receipt, result);
+        assert_eq!(read.observations.len(), 27);
+        for observation in &read.observations[2..] {
+            assert_eq!(observation.outcome, Outcome::Unconfirmed);
+            let projected = observation
+                .failure
+                .as_ref()
+                .unwrap()
+                .project_for::<Tool, RuntimeControlCause>(&())
+                .unwrap();
+            assert_eq!(*projected.details(), RuntimeControlCause::TimedOut);
+        }
+        assert_eq!(
+            db.configuration_request_result(WORKSPACE, OWNER, &request)
+                .unwrap(),
+            Some(result.clone())
+        );
+        assert_eq!(adopt(&db, &host, &request).unwrap(), result);
+        assert_eq!(
+            db.configuration_publication(WORKSPACE, OWNER, &request.operation_id)
+                .unwrap()
+                .unwrap()
+                .observations
+                .len(),
+            27
+        );
+        assert!(
+            db.configuration_publication(WORKSPACE, "not-owner", &request.operation_id)
+                .is_err()
+        );
+        assert!(
+            db.configuration_publication("foreign-workspace", OWNER, &request.operation_id)
+                .is_err()
+        );
+        assert!(
+            db.configuration_publication(WORKSPACE, OWNER, "absent-operation")
+                .unwrap()
+                .is_none()
+        );
+        db.with_conn(|conn| {
+            assert!(conn.execute("UPDATE workspace_configuration_publication_observations SET outcome='observed'", []).is_err());
+            assert!(conn.execute("DELETE FROM workspace_configuration_publication_observations", []).is_err());
+            assert!(conn.execute("DELETE FROM workspace_configuration_receipts", []).is_err());
+            conn.execute("UPDATE workspaces SET state='deleting' WHERE workspace_id=?1", [WORKSPACE])?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            db.configuration_publication(WORKSPACE, OWNER, &request.operation_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_writer_rejects_wrong_receipt_identity_and_invalid_stage_payloads() {
+        let (_dir, db) = fixture();
+        let host = host(false);
+        let request = request(&db, &host, "publication-binding", Some(A));
+        let result = adopt(&db, &host, &request).unwrap();
+        let identity = PublicationIdentity {
+            request_fingerprint: request_fingerprint(WORKSPACE, OWNER, &request).unwrap(),
+            receipt: result.clone(),
+        };
+        for field in 0..5 {
+            let mut changed = identity.clone();
+            match field {
+                0 => changed.receipt.workspace_id = "foreign".into(),
+                1 => changed.receipt.operation_id = "different-operation".into(),
+                2 => changed.request_fingerprint = "different-request".into(),
+                3 => changed.receipt.history_head = "different-head".into(),
+                _ => changed.receipt.state.snapshot.digest = "different-source".into(),
+            }
+            assert!(
+                db.record_configuration_publication(
+                    &changed,
+                    Stage::Dispatch,
+                    None,
+                    None,
+                    Outcome::Observed,
+                    None
+                )
+                .is_err()
+            );
+        }
+        let timeout = failure(RuntimeControlCause::TimedOut);
+        for (stage, runtime, digest, outcome, cause) in [
+            (
+                Stage::Runtime,
+                None,
+                Some("digest"),
+                Outcome::Unconfirmed,
+                Some(&timeout),
+            ),
+            (
+                Stage::Runtime,
+                Some("runtime"),
+                None,
+                Outcome::Unconfirmed,
+                Some(&timeout),
+            ),
+            (
+                Stage::Dispatch,
+                Some("runtime"),
+                None,
+                Outcome::Observed,
+                None,
+            ),
+            (
+                Stage::Dispatch,
+                None,
+                Some("digest"),
+                Outcome::Observed,
+                None,
+            ),
+            (Stage::Dispatch, None, None, Outcome::Unconfirmed, None),
+            (
+                Stage::Dispatch,
+                None,
+                None,
+                Outcome::Observed,
+                Some(&timeout),
+            ),
+            (Stage::Projection, None, None, Outcome::Observed, None),
+        ] {
+            assert!(
+                db.record_configuration_publication(
+                    &identity, stage, runtime, digest, outcome, cause
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            db.configuration_publication(WORKSPACE, OWNER, &request.operation_id)
+                .unwrap()
+                .unwrap()
+                .observations
+                .is_empty()
+        );
+        assert_eq!(
+            db.configuration_request_result(WORKSPACE, OWNER, &request)
+                .unwrap(),
+            Some(result)
+        );
+    }
+}
