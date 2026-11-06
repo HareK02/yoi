@@ -6,8 +6,10 @@
     parseWorkingDirectoryCreateResponse,
     validateWorkingDirectoryCreateRequest,
   } from '#lib/workspace/api/workdirs.ts';
+  import FailureNotice from '#lib/workspace/failure/FailureNotice.svelte';
+  import type { FailureNoticeModel } from '#lib/workspace/failure/model.ts';
+  import { submitWorkerLaunch, workerLaunchNeedsReconciliation, workerStartupNotice } from '#lib/workspace/workers/startup-failure.ts';
   import {
-    parseBrowserCreateWorkerResponse,
     parseWorkerApiError,
     parseWorkerLaunchOptionsResponse,
   } from '#lib/workspace/api/workers.ts';
@@ -19,7 +21,6 @@
     defaultWorkerLaunchForm,
     workerLaunchAttachmentError,
     genericLaunchProfiles,
-    workerLaunchOutcomeUnknown,
   } from '#lib/workspace/sidebar/worker-launch.ts';
   import type { WorkerLaunchAttachmentFormState } from '#lib/workspace/sidebar/worker-launch.ts';
   import type {
@@ -63,7 +64,8 @@
   let optionsError = $state<string | null>(null);
   let submitting = $state(false);
   let submitError = $state<DisplayError | null>(null);
-  let outcomeUnknown = $state(false);
+  let startupError = $state<FailureNoticeModel | null>(null);
+  let needsReconciliation = $state(false);
   let displayName = $state(ticketContext?.ticketTitle ?? 'Worker');
   let runtimeId = $state('');
   let profile = $state('');
@@ -108,7 +110,7 @@
       : workerLaunchAttachmentError(workdirAttachments),
   );
   let canStartWorker = $derived(Boolean(
-    runtimeId && selectedRuntime?.worker_creation_available && !outcomeUnknown &&
+    runtimeId && selectedRuntime?.worker_creation_available && !needsReconciliation &&
       !attachmentValidationError &&
       (!selectedRuntimeForbidsWorkdirAttachments || workdirAttachments.length === 0),
   ));
@@ -312,7 +314,7 @@
   }
 
   async function createWorker() {
-    if (submitting || outcomeUnknown) return;
+    if (submitting || needsReconciliation) return;
     if (!workspaceId) {
       submitError = { message: 'workspace id is unavailable', diagnostics: [] };
       return;
@@ -327,8 +329,8 @@
     }
 
     submitError = null;
+    startupError = null;
     submitting = true;
-    let dispatched = false;
     try {
       const request = buildCreateWorkspaceWorkerRequest({
         runtime_id: runtimeId,
@@ -344,24 +346,26 @@
         working_directory_repository_key: workingDirectoryRepositoryKey,
         working_directory_selector: workingDirectorySelector,
       });
-      dispatched = true;
-      const response = await fetch(workerApiPath('/workers'), {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(request),
-      });
-      if (!response.ok) {
-        submitError = await responseDisplayError(response, 'worker create failed');
-        outcomeUnknown = workerLaunchOutcomeUnknown({ error: submitError.message, message: '', diagnostics: submitError.diagnostics });
+      needsReconciliation = true;
+      const result = await submitWorkerLaunch(fetch, workerApiPath('/workers'), request);
+      if (result.kind === 'failed') {
+        startupError = workerStartupNotice(result.receipt);
+        needsReconciliation = workerLaunchNeedsReconciliation(result.receipt);
         return;
       }
-      const payload = parseBrowserCreateWorkerResponse(
-        await readBoundedJson(response, 8 * 1024 * 1024),
-      );
-      await goto(payload.console_href);
-    } catch (err) {
-      outcomeUnknown = dispatched;
-      submitError = exceptionDisplayError(err, 'worker create failed');
+      // 成功を観測しているので、navigationが失敗しても新しいWorkerを作らせない。
+      needsReconciliation = true;
+      try {
+        await goto(result.response.console_href);
+      } catch {
+        startupError = { explanation: 'The Worker was created, but its console could not be opened. Check Workers before starting another Worker.', supplements: [], compensation: [], details: [] };
+      }
+    } catch {
+      if (needsReconciliation) {
+        startupError = { explanation: 'The launch result could not be interpreted safely. Check Workers before starting another Worker.', supplements: [], compensation: [], details: [] };
+      } else {
+        submitError = { message: 'Check the Worker launch settings before starting.', diagnostics: [] };
+      }
     } finally {
       submitting = false;
     }
@@ -610,13 +614,20 @@
         </label>
       </section>
 
-      {#if submitError}
-        <div class="section-state error worker-submit-error">
-          <p>{submitError.message}</p>
-          {#if outcomeUnknown}
-            <p>The launch outcome is unknown. Check the Worker list or Ticket before starting another Worker.</p>
+      {#if startupError}
+        <FailureNotice failure={startupError} />
+        {#if needsReconciliation}
+          <div class="worker-reconciliation" role="status">
+            <p>The launch result needs reconciliation. Check the Worker list or Ticket before starting another Worker.</p>
             <a href={`/w/${workspaceId}/workers`}>Check Workers</a>
-          {/if}
+            {#if ticketContext}<a href={`/w/${workspaceId}/tickets/${encodeURIComponent(ticketContext.ticketId)}`}>Check Ticket</a>{/if}
+            <p>Share only the support correlation from Failure details with an authorized operator. It is not a retry key; do not share credentials, raw responses, or internal logs.</p>
+          </div>
+        {/if}
+      {/if}
+      {#if submitError}
+        <div class="section-state error worker-submit-error" role="alert">
+          <p>{submitError.message}</p>
           {#if submitError.diagnostics.length > 0}
             <ul class="worker-error-diagnostics">
               {#each submitError.diagnostics as diagnostic}
@@ -638,3 +649,9 @@
     </form>
   {/if}
 </section>
+
+<style>
+  .worker-reconciliation { overflow-wrap: anywhere; margin-block: var(--space-3); }
+  .worker-reconciliation p { margin-block: var(--space-2); }
+  .worker-reconciliation a + a { margin-inline-start: var(--space-4); }
+</style>
