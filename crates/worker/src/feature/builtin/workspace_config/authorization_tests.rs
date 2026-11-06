@@ -18,8 +18,18 @@ fn grant(operation: &str, path: &str, recursive: bool) -> ScopedPermission {
     }
 }
 
-fn assert_code<T>(result: Result<T, WipOperationError>, expected: ProtocolErrorCode) {
-    match result {
+fn assert_code<T>(result: Result<T, failure::ConfigFailure>, expected: ProtocolErrorCode) {
+    let error = result.as_ref().err().expect("expected config failure");
+    assert_eq!(
+        error.details().reason,
+        if expected == ProtocolErrorCode::PermissionDenied {
+            failure::ConfigFailureReason::AuthorizationDenied
+        } else {
+            failure::ConfigFailureReason::AuthorizationFailed
+        }
+    );
+    assert_eq!(error.details().stage, failure::ConfigFailureStage::Request);
+    match result.map_err(failure::ConfigFailure::into_source) {
         Err(WipOperationError::Protocol(error)) => assert_eq!(error.code, expected),
         _ => panic!("expected a classified protocol failure"),
     }

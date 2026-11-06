@@ -219,6 +219,8 @@ enum WipToolOutput {
 
 pub enum WipOperationError {
     Protocol(ProtocolError),
+    /// A dispatched operation returned a structured domain failure, not a protocol rejection.
+    ExecutionFailure(ToolOutput),
     Cancelled(ToolOutput),
     Interrupted(ToolOutput),
     OutcomeUnknown(String),
@@ -2171,6 +2173,9 @@ impl WipOperationHandler for CompatibilityHandler {
             Err(ToolError::InvalidArgument(message)) => Err(WipOperationError::Protocol(
                 protocol_error(ProtocolErrorCode::InvalidArguments, message),
             )),
+            Err(ToolError::ExecutionFailure(output)) => {
+                Err(WipOperationError::ExecutionFailure(output))
+            }
             Err(ToolError::Cancelled(output)) => Err(WipOperationError::Cancelled(output)),
             Err(ToolError::Interrupted(output)) => Err(WipOperationError::Interrupted(output)),
             Err(ToolError::StructuredConflict { code, message }) => {
@@ -2280,6 +2285,7 @@ fn compatibility_projection(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WipAuditOutcome {
     Success,
+    ExecutionFailed,
     Rejected,
     Cancelled,
     Interrupted,
@@ -2736,6 +2742,35 @@ impl WipRuntime {
                 )
                 .map_err(|encode| ToolError::Internal(encode.to_string()))?;
                 Ok((response, None, WipAuditOutcome::Rejected))
+            }
+            Err(WipOperationError::ExecutionFailure(output)) => {
+                // Compatibility operations already describe ToolOutput as their result.
+                // A failure is still an operation response, never a dispatch rejection.
+                let response = encode_call_operation_response(
+                    &request_value,
+                    &descriptor,
+                    &CallOperationResponse {
+                        result: tool_output_value(&output),
+                        validator: target_validator,
+                    },
+                    self.wire_limits,
+                );
+                let response = match response {
+                    Ok(response) => response,
+                    Err(_) => encode_protocol_error_response(
+                        ProtocolInteraction::CallOperation,
+                        &protocol_error(ProtocolErrorCode::OperationOutcomeUnknown,
+                            "operation failure could not be encoded for this interface; inspect the retained result"),
+                        self.wire_limits,
+                    ).map_err(|error| ToolError::Internal(error.to_string()))?,
+                };
+                Ok((
+                    response,
+                    Some(WipToolOutput::Passthrough(Err(
+                        ToolError::ExecutionFailure(output),
+                    ))),
+                    WipAuditOutcome::ExecutionFailed,
+                ))
             }
             Err(WipOperationError::Cancelled(output)) => {
                 let response = encode_protocol_error_response(

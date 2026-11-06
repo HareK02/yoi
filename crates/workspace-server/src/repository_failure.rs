@@ -13,12 +13,13 @@ use error_contract::{
     InternalTransfer, OperationContext, ProjectFor, Storage, Telemetry, Tool, WireDetails,
     compose_explanation,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::repositories::RepositoryLookupError;
 
 /// The caller supplies the attempted operation, never provider-authored prose.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryFailureOperation {
     Summary,
@@ -53,7 +54,7 @@ impl RepositoryFailureOperation {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryFailureReason {
     UnknownRepository,
@@ -111,7 +112,7 @@ impl From<&RepositoryLookupError> for RepositoryFailureReason {
 
 /// No raw identifier, path, selector, provider or diagnostic text is a wire field.
 /// Identity is derived from this reason, so a separate identity cannot contradict it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryFailureDetails {
     pub operation: RepositoryFailureOperation,

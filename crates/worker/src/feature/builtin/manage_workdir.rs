@@ -654,7 +654,7 @@ impl WorkspaceHttpWorkdirBackend {
             .authorize_operation(operation, resource)
             .map_err(|error| {
                 let message = error.to_string();
-                if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
+                if error.is_authorization_denial() {
                     ToolError::StructuredConflict {
                         code: "workspace_http_403".into(),
                         message: format!("Host denied {operation} for {resource:?}"),
@@ -696,12 +696,15 @@ impl WorkspaceHttpWorkdirBackend {
             .authorize_workdir_attachment_operation("workdir.detach", alias, expected_connection_id)
             .map_err(|error| {
                 let message = error.to_string();
-                if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
+                if error.is_authorization_denial() {
                     ToolError::StructuredConflict {
                         code: "workspace_http_403".into(),
                         message: format!("Host denied workdir.detach for attachment {alias}"),
                     }
-                } else if message.contains("HTTP status 409") {
+                } else if matches!(
+                    error,
+                    crate::worker::WorkspaceClientError::AuthorizationRejected { status: 409 }
+                ) {
                     ToolError::StructuredConflict {
                         code: "workspace_http_409".into(),
                         message: "attachment lifetime changed before local cleanup".into(),

@@ -36,6 +36,7 @@ pub mod prompt_settings;
 pub mod records;
 pub mod repositories;
 pub mod repository_access;
+pub mod repository_access_failure;
 pub mod repository_failure;
 pub mod repository_source;
 pub mod resource_broker;
@@ -146,6 +147,8 @@ pub enum Error {
     },
     #[error("{0}")]
     RepositoryLookup(#[from] repository_failure::RepositoryFailure),
+    #[error("{0}")]
+    RepositoryAccess(#[from] repository_access_failure::RepositoryAccessFailure),
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
     #[error("subjektiv subject `{0}` was not found in this Workspace")]

@@ -1196,7 +1196,7 @@ async fn workspace_config_backend_validators_reject_path_and_connection_transpla
         )
         .await;
     assert!(
-        matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
+        matches!(result.map_err(failure::ConfigFailure::into_source), Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
     );
     let result: WorkspaceConfigReadResponse = backend
         .post(
@@ -1220,7 +1220,7 @@ async fn workspace_config_backend_validators_reject_path_and_connection_transpla
             )
             .await;
         assert!(
-            matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
+            matches!(result.map_err(failure::ConfigFailure::into_source), Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
         );
     }
     // Fresh path/connection observation restores native common mutation access,
@@ -1349,6 +1349,74 @@ async fn production_postcommit_transport_loss_retains_cause_and_unknown_without_
     );
 }
 
+#[tokio::test]
+async fn typed_lost_commit_reply_keeps_unknown_and_reads_applied_state_without_resending() {
+    use failure::{
+        ConfigFailureOperation as Op, ConfigFailureReason as Cause, ConfigFailureStage as Stage,
+    };
+    let client = Router::new();
+    let (feature, _) = runtime(client.clone());
+    let attachment = feature.attach("typed-loss", None).await.unwrap();
+    let backend = backend::WorkspaceConfigBackend::new(client.clone());
+    let request = {
+        let mut state = client.state.lock().unwrap();
+        state.lose_commit_reply = true;
+        json!({
+            "connection_id": attachment.connection_id,
+            "validator": state.validator(""),
+            "request": {
+                "base_digest": state.tree_digest(), "entrypoints": state.entrypoints,
+                "changes": [{"kind":"update", "path":"main.dcdl", "expected_digest":digest(&state.entries["main.dcdl"].1), "content":"saved-after-reply-loss"}]
+            }
+        })
+    };
+    let error = backend
+        .post::<WorkspaceConfigCommitResponse, _>("/commit", &request, true)
+        .await
+        .unwrap_err();
+    assert_eq!(error.details().operation, Op::Commit);
+    assert_eq!(error.details().stage, Stage::Request);
+    assert_eq!(error.details().reason, Cause::Communication);
+    failure::tests::assert_projection(*error.details());
+    assert!(matches!(
+        error.source_error(),
+        WipOperationError::OutcomeUnknown(_)
+    ));
+    assert!(matches!(
+        error.into_source(),
+        WipOperationError::OutcomeUnknown(_)
+    ));
+    let read_request = {
+        let state = client.state.lock().unwrap();
+        assert_eq!(state.commits.len(), 1);
+        assert_eq!(state.applied_commits, 1);
+        json!({"connection_id":attachment.connection_id, "path":"main.dcdl", "validator":state.validator("main.dcdl")})
+    };
+    let read: WorkspaceConfigReadResponse =
+        backend.post("/read", &read_request, false).await.unwrap();
+    assert_eq!(read.content, "saved-after-reply-loss");
+    {
+        let state = client.state.lock().unwrap();
+        assert_eq!(state.applied_commits, 1);
+        assert_eq!(state.commits.len(), 1);
+    }
+    // The old successful read/attachment does not grant the next read.
+    client.state.lock().unwrap().operation_denied = true;
+    let before = client.state.lock().unwrap().requests.len();
+    let error = backend
+        .post::<WorkspaceConfigReadResponse, _>("/read", &read_request, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.details().reason, Cause::AuthorizationDenied);
+    failure::tests::assert_projection(*error.details());
+    assert!(
+        matches!(error.into_source(), WipOperationError::Protocol(error) if error.code == ProtocolErrorCode::PermissionDenied)
+    );
+    let state = client.state.lock().unwrap();
+    assert_eq!(state.requests.len(), before);
+    assert_eq!(state.applied_commits, 1);
+}
+
 #[path = "authorization_tests.rs"]
 mod authorization_tests;
 
@@ -1368,7 +1436,7 @@ async fn denied_config_operations_have_no_provider_access_or_attachment_effects(
         };
         assert!(
             matches!(
-                result,
+                result.map_err(failure::ConfigFailure::into_source),
                 Err(WipOperationError::Protocol(wip_protocol::ProtocolError {
                     code: ProtocolErrorCode::PermissionDenied,
                     ..
@@ -1448,7 +1516,7 @@ async fn config_rename_checks_both_paths_before_commit() {
     let backend = backend::WorkspaceConfigBackend::new(client.clone());
     let result = backend.post::<Json, _>("/commit", &json!({"connection_id":"c", "validator":"v", "request":{"base_digest":"d", "entrypoints":["main.dcdl"], "changes":[{"kind":"rename", "from":"main.dcdl", "to":"destination.dcdl", "expected_digest":"d"}]}}), true).await;
     assert!(matches!(
-        result,
+        result.map_err(failure::ConfigFailure::into_source),
         Err(WipOperationError::Protocol(wip_protocol::ProtocolError {
             code: ProtocolErrorCode::PermissionDenied,
             ..

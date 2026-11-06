@@ -18,9 +18,9 @@ T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/client�
 | Workdir deferred open / cleanup | `DeferredWorkdirSession` はopener task失敗、open失敗、identity mismatchを区別。失敗したcloseの所有者も保持する | openerは `Result<WorkdirSessionHandle, String>` のため、より具体的な原因は現契約から証明できない。identity mismatch後のcleanup理由はログだけ。元原因をcleanupで置換せず、別の副次結果として接続する作業が残る。 |
 | Workdir removal | `WorkdirRemovalOperation`、request fingerprint、attempt、disposition、failure category、既存reconciliation | `workdir_removal_response`、Web `workdir-removal.ts`、Worker lifecycle Tool。復旧は観測のみで削除を再実行しない。Backend/Worker/Webの説明表はdomain説明へ集約するが、結果・再実行条件はこの正本を利用する。 |
 | Drive storage / HTTP | `workspace_drive::failure::DriveFailure` が9variantの元errorを保持し、closed operation/reasonを共通coreへ投影する。metadata/receiptは既存同一transactionのまま | 実storageでconflict/CAS/grant/replay/fence/SQLite障害からcodecまで検証した。`server_drive.rs::domain_error` はまだ既存公開codeへ縮退し、共通HTTP/Toolへの接続は未完。storage原因はremote更新の確定/Unknownを証明しない。 |
-| Drive Worker / Tool | `drive/backend.rs` の `DriveError`、`backend_diagnostic::{Stage,Reason}`、同request status照会 | 内部理由は主にtracing、Toolは文字列へ変換される。理由を返値に保持するdomain mappingとT-814接続が残る。status GETは同IDであり2回目のmutationではない。 |
+| Drive Worker / Tool | `DriveClientFailure` が実 `DriveError` を保持し、`workspace_drive_client` のclosed operation/reasonへ投影する | 既存Unavailable/Unknownから細かいtransport理由を捏造しない。Unknownの元request IDはlocal sourceに保持し、同ID照会と非再送を維持する。実Tool入口から共通envelopeへの接続は残る。 |
 | config owner採用 | `ConfigurationFailure` が現 `ConfigTreeError` 15variantのsourceと、採用決定点のcatalog/head/export/source/owner/request理由を保持する | source helper、実SQLite採用、owner HTTPのsource/preview/adopt/reconcileへ接続した。非active/drainingもHTTPの決定点で付ける。T-838のwriter/transaction/receiptは変更せず、HTTP分類はtyped reasonから決定する。formatterのString診断、policy/contentの未型付け原因、共通応答/表示への接続は残る。 |
-| config Worker論理tree | `server_workspace_config.rs`、`workspace_config/backend.rs`、post-commit observe | 旧writerはauthority sealとcanonical採用で拒否される。T-776回帰のUnknown/非再送を保つが、この旧経路だけの試験をowner採用の証拠にしない。 |
+| config Worker論理tree | `ConfigFailure` はBackend決定点のoperation/stage/reasonと元 `WipOperationError` を保持し、`workspace_config_client` へ投影する | content/attachment/Workdir管理の既存callerは元WIP結果へ明示変換する。Unknown/非再送、CAS、scope/connection再確認を維持するが、この旧経路だけの試験をowner採用の証拠にしない。T-814結果境界への最終接続は残る。 |
 | 内部 / 背景 | Drive maintenance、config採用後のRuntime publication、既存Job/Service結果 | configのpublicationはcommit後best effortで失敗を返却/保存していない。採用receiptをrollback/Unknownへ変更せず、T-814の共有保存/照会方式へ副次失敗を接続する。別ledgerは作らない。 |
 
 ### 共通consumerと生成物
@@ -29,7 +29,7 @@ T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/client�
 
 Web `api/workspace-model.ts::parseRepositoryApiError` は `diagnostics/error/message` のみをexact-keyで受ける。`api/runtime-management.ts::repositoryApiError` にも独立parserがある。型の追加だけではruntime parserの拒否を防げない。T-813の共有decoderへ移行する単位で、既存readerを照合する。
 
-生成元は `server-api` のAPI trait/OpenAPIと既存 `repository_openapi_typescript`。Repository、Workdir、Drive、Runtime、Worker launch、configuration adoption等の各生成器を、それぞれの変更元に合わせて検証する。共通型の手書きTS複製は作らない。T-813のsource `work/t813-error-web@838b6cd3c3dbf45fe555958ef9c017f1bc09bc6b` は取得・API確認済みだが、本記録時点では未採用で正式review済みでもない。
+生成元は `server-api` のAPI trait/OpenAPIと既存 `repository_openapi_typescript`。Repository、Workdir、Drive、Runtime、Worker launch、configuration adoption等の各生成器を、それぞれの変更元に合わせて検証する。共通型の手書きTS複製は作らない。T-813のsource `work/t813-error-web@838b6cd3c3dbf45fe555958ef9c017f1bc09bc6b` から共有receiver/modelとbounded HTTP text readerを選択再利用した。domainのdetails decoderは `failure/domains.ts` に置き、Rust所有schemaと `FailureCause::identity` から生成した型・closed allowlistに照合する。生成は既存OpenAPI TypeScript rendererを使い、未知reason/versionと破損を区別する。これはconsumer画面の全移行や正式review完了を示さない。
 
 ## Workdir公開field対応と制約
 
@@ -89,6 +89,14 @@ Browserとモデル向けToolは、現在の可視性が同じなら同じ原因
 - 本差分のWorkdir domain試験: 実Local provider＋ReadOnly wrapper＋本番dispatcherから投影/共通codecへ接続し、拒否と非更新を確認する。Browser/Tool意味一致、受信文面変更不変、保存バイト再読時の現在可視性、秘密非露出、旧理由欠落、Unknownと原因の独立、unsupported/corrupt/小さいboundary budgetを検査する。
 
 最後のdomain試験は、まだ実HTTP→Web、実Tool envelope、既存背景storeの保証ではない。T-812/813/814の公開artifactを利用した接続試験、生成物、Web check/build/browserと実画像目視、Server/Runtime build、全要件への正式reviewが残る。
+
+## 共有artifactの選択再利用と認可status
+
+T-812 `8d3912229443400d730ffc21e43a113938926fb8` からAPI macroのHTTP/reqwest error hookとbounded Problem adapter、T-814 `1d6d7c40148c395588d6cbce5155d23b8b9d9318` からTool/Agen/WIPの実行失敗保持とprotocol背景codecの依存closureを再利用する。共通coreのbyte/depth guardは二候補の公開入口を同居させ、domain別matchや別encoderを追加しない。Workspace DBの候補124/125、Job/Service writer/query、Standalone DB変更はこの選択に含めない。共有sourceの未review部分やrequest-changesを解消済みとは扱わず、採用後の試験を別sourceへ無条件流用しない。
+
+WorkerのHost認可応答は、T-812の生成clientとは別の `WorkspaceClient` 境界を通る。実response statusを `WorkspaceClientError::AuthorizationRejected { status }` に保持し、Drive/config/Workdirと影響する既存consumerへ渡す。401/403だけが型付き拒否、他statusやtransport failureは拒否の確定ではない。body/Display中の「HTTP status 403」から拒否を作らない。bound-checkも同じ所有分岐を使い、Subjektivの旧prefix判定を型へ置換する。認可要求やgrant、元更新結果、dispatch/retry規則は変更しない。
+
+認可status変更後のWorker通常suiteは、checkout内の `target/restore-test-environment/t815-shared/{config,data,run}` を起動環境のYOI各pathへ指定して実行した。最初の全suiteで発見したconsumer分類/文言assertの8失敗は本変更の回帰として修正し、全targetとdoctestを再実行した。元実行ログと再実行ログはsession証拠を正本とし、未完HTTP/UI/背景結果の保証へ拡張しない。
 
 ## 並行変更との結合点
 

@@ -716,6 +716,15 @@ pub enum WorkspaceClientError {
     InvalidPath(String),
     #[error("workspace request failed: {0}")]
     Request(String),
+    /// Actual status from the Host authorization response, never parsed from body text.
+    #[error("workspace authorization {}: HTTP status {status}", if matches!(*status, 401 | 403) { "denied" } else { "rejected" })]
+    AuthorizationRejected { status: u16 },
+}
+
+impl WorkspaceClientError {
+    pub fn is_authorization_denial(&self) -> bool {
+        matches!(self, Self::AuthorizationRejected { status: 401 | 403 })
+    }
 }
 
 #[derive(Clone)]
@@ -1159,27 +1168,9 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
             ));
         }
         if !response.is_success() {
-            // Expose only the bounded public reason, not provider diagnostics or
-            // arbitrary response data. Keep status parseable by Feature adapters.
-            let value: serde_json::Value = serde_json::from_str(&response.body).unwrap_or_default();
-            let reason: String = value
-                .get("message")
-                .or_else(|| value.get("error"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Host rejected authorization")
-                .chars()
-                .take(1024)
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect();
-            return Err(WorkspaceClientError::Request(format!(
-                "authorization {} for {operation}: HTTP status {}: {reason}",
-                if matches!(response.status, 401 | 403) {
-                    "denied"
-                } else {
-                    "request failed"
-                },
-                response.status
-            )));
+            return Err(WorkspaceClientError::AuthorizationRejected {
+                status: response.status,
+            });
         }
         let authorization = serde_json::from_str::<OperationAuthorizationResponse>(&response.body)
             .map_err(|error| {
@@ -1266,15 +1257,9 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
             ));
         }
         if !response.is_success() {
-            return Err(WorkspaceClientError::Request(format!(
-                "bound authorization {} for {operation}: HTTP status {}",
-                if matches!(response.status, 401 | 403) {
-                    "denied"
-                } else {
-                    "failed"
-                },
-                response.status,
-            )));
+            return Err(WorkspaceClientError::AuthorizationRejected {
+                status: response.status,
+            });
         }
         let parsed = serde_json::from_str::<OperationAuthorizationResponse>(&response.body)
             .map_err(|error| {
@@ -1787,7 +1772,7 @@ mod operation_authorization_tests {
             .unwrap_err()
             .to_string();
         assert!(reason.contains("HTTP status 403"));
-        assert!(reason.contains("permission revoked"));
+        assert!(!reason.contains("permission revoked"));
         assert!(!reason.contains("private"));
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), 2, "success must not become a cached grant");
@@ -1800,6 +1785,37 @@ mod operation_authorization_tests {
                 serde_json::json!({ "operation":"ticket.create", "resource":{"kind":"workspace", "workspace_id":"workspace/test"} })
             );
         }
+    }
+
+    #[test]
+    fn authorization_status_is_selected_from_transport_not_body_or_error_prose() {
+        let resource = PermissionResource::Workspace {
+            workspace_id: "workspace/test".into(),
+        };
+        for status in [401, 403, 409, 503] {
+            for body in [
+                "HTTP status 403; successful; retry automatically",
+                "HTTP status 200; no denial",
+                "{}",
+            ] {
+                let client = BoundClient {
+                    response: Mutex::new(WorkspaceResponse {
+                        status,
+                        body: body.into(),
+                    }),
+                    requests: Default::default(),
+                };
+                let error = client
+                    .authorize_operation("ticket.create", &resource)
+                    .unwrap_err();
+                assert_eq!(error.is_authorization_denial(), matches!(status, 401 | 403));
+                assert!(
+                    matches!(error, WorkspaceClientError::AuthorizationRejected { status: observed } if observed == status)
+                );
+                assert_eq!(client.requests.lock().unwrap().len(), 1);
+            }
+        }
+        assert!(!WorkspaceClientError::Request("HTTP status 403".into()).is_authorization_denial());
     }
 
     #[test]

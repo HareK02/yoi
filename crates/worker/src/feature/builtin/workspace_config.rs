@@ -27,6 +27,7 @@ mod content;
 mod contract;
 #[cfg(test)]
 mod contract_tests;
+pub mod failure;
 pub mod wip;
 
 use std::sync::Arc;

@@ -30,7 +30,8 @@ const SKILL_API_LOAD_POLICY: JsonLoadPolicy = {
   maxResponseBytes: SKILL_API_LIMITS.maxResponseBytes,
 };
 
-class ResponseByteLimitError extends Error {}
+export class ResponseByteLimitError extends Error {}
+export class ResponseTextDecodeError extends Error {}
 
 function normalizePath(path: string): string {
   if (!path || path === "/") return "";
@@ -155,6 +156,13 @@ export async function readBoundedJson(
   response: Response,
   maxBytes: number,
 ): Promise<unknown> {
+  return JSON.parse(await readBoundedText(response, maxBytes)) as unknown;
+}
+
+export async function readBoundedText(
+  response: Response,
+  maxBytes: number,
+): Promise<string> {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
     const parsedLength = Number(contentLength);
@@ -191,8 +199,11 @@ export async function readBoundedJson(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-  return JSON.parse(text) as unknown;
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new ResponseTextDecodeError();
+  }
 }
 
 async function requireJson<T>(

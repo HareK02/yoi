@@ -3,6 +3,9 @@ use crate::worker::{WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
 use serde::Serialize;
 use std::collections::VecDeque;
 
+#[path = "failure/client_tests.rs"]
+mod failure_projection;
+
 #[derive(Debug)]
 struct Client {
     auth_denied: std::sync::atomic::AtomicBool,

@@ -303,7 +303,8 @@ pub(crate) fn record_backend_session(
                 crate::WorkspaceClientError::Unavailable(_) => {
                     SessionRegistrationCause::transport()
                 }
-                crate::WorkspaceClientError::Request(_) => {
+                crate::WorkspaceClientError::Request(_)
+                | crate::WorkspaceClientError::AuthorizationRejected { .. } => {
                     SessionRegistrationCause::outcome_unknown()
                 }
                 crate::WorkspaceClientError::InvalidPath(_) => {
@@ -416,10 +417,8 @@ impl SubjektivHost for BackendSubjektivHost {
             .map_err(|error| match error {
                 // WorkspaceClient preserves a distinct denial classification for
                 // 401/403. Transport and other HTTP errors must remain unavailable.
-                crate::WorkspaceClientError::Request(message)
-                    if message.starts_with("bound authorization denied ") =>
-                {
-                    SubjektivHostError::PermissionDenied(message)
+                error if error.is_authorization_denial() => {
+                    SubjektivHostError::PermissionDenied(error.to_string())
                 }
                 other => SubjektivHostError::Unavailable(other.to_string()),
             })

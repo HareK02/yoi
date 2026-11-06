@@ -350,7 +350,7 @@ async fn read_and_send_use_distinct_live_bound_subject_permissions() {
         *client.allowed.lock().unwrap() = vec![allowed];
         let tool = tool(client.clone(), operation);
         let error = invoke(&tool, input.clone()).await.err().unwrap();
-        assert!(error.to_string().contains("permission denied"));
+        assert!(error.to_string().contains("authorization denied"));
         assert!(
             client.chat_requests().is_empty(),
             "denied content must not be read or written"

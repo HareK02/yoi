@@ -7,6 +7,9 @@ use crate::worker::{WorkspaceBinaryResponse, WorkspaceClientError, WorkspaceResp
 use std::sync::{Condvar, Mutex};
 use tracing::instrument::WithSubscriber;
 
+#[path = "failure/backend_tests.rs"]
+mod failure_projection;
+
 const SECRET: &str = "secret-token /private/drive credential=unsafe";
 const ID: &str = "host-request-1";
 

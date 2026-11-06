@@ -39680,6 +39680,17 @@ impl ApiError {
 
 fn api_error_status(error: &Error) -> StatusCode {
     match error {
+        Error::RepositoryAccess(failure) => match failure.source_error() {
+            // Preserve the access owner's existing boundary classes, not the
+            // public Category or source prose (unknown repositories here were
+            // InvalidInput, unlike repository lookup's NotFound boundary).
+            Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            Error::InvalidRecordId(_) => StatusCode::NOT_FOUND,
+            Error::WorkspaceConfigConflict(_) | Error::RepositoryConflict(_) => {
+                StatusCode::CONFLICT
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        },
         Error::Configuration(failure) => {
             use crate::configuration_failure::ConfigurationFailureReason as Reason;
             match failure.details().reason {
@@ -60860,6 +60871,36 @@ mod tests {
             StatusCode::CREATED,
         )
         .await;
+        // Access causes wrap the prior boundary error. Real route decisions must
+        // keep the prior 404/409 classes, independent of public cause Category.
+        let missing = request_json(app.clone(), "POST", &format!("{base}/private-missing/rotate"), Some(json!({
+            "operation_id": "private-missing-operation", "expected_public_key_fingerprint": created["public_key_fingerprint"],
+            "private_key": private_key(12),
+        })), StatusCode::NOT_FOUND).await;
+        let duplicate = request_json(app.clone(), "POST", &base, Some(json!({
+            "operation_id": "private-duplicate-operation", "credential_id": "http-key", "name": "HTTP key",
+            "private_key": private_key(12),
+        })), StatusCode::CONFLICT).await;
+        for response in [missing, duplicate] {
+            let text = response.to_string();
+            for private in [
+                "private-missing",
+                "private-duplicate",
+                "BEGIN OPENSSH",
+                "SHA256:",
+            ] {
+                assert!(
+                    !text.contains(private),
+                    "access cause leaked source identity: {text}"
+                );
+            }
+            assert!(
+                response["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("SSH credential")
+            );
+        }
         let original_fingerprint = created["public_key_fingerprint"].clone();
         let rotate_path = format!("{base}/http-key/rotate");
         let reseal = json!({"operation_id":"http-key-reseal", "expected_public_key_fingerprint":original_fingerprint, "private_key":private_key(11)});

@@ -44,14 +44,19 @@ struct Effects {
 #[derive(Debug)]
 struct Client {
     fault: Fault,
+    prose: &'static str,
     state: Mutex<Effects>,
     changed: Condvar,
     started: tokio::sync::Notify,
 }
 impl Client {
     fn new(fault: Fault) -> Arc<Self> {
+        Self::with_prose(fault, UNSAFE)
+    }
+    fn with_prose(fault: Fault, prose: &'static str) -> Arc<Self> {
         Arc::new(Self {
             fault,
+            prose,
             state: Mutex::new(Effects::default()),
             changed: Condvar::new(),
             started: tokio::sync::Notify::new(),
@@ -145,9 +150,9 @@ impl WorkspaceClient for Client {
         }
         self.finish();
         match self.fault {
-            Fault::Unavailable => Err(WorkspaceClientError::Unavailable(UNSAFE.into())),
-            Fault::InvalidPath => Err(WorkspaceClientError::InvalidPath(UNSAFE.into())),
-            Fault::Communication => Err(WorkspaceClientError::Request(UNSAFE.into())),
+            Fault::Unavailable => Err(WorkspaceClientError::Unavailable(self.prose.into())),
+            Fault::InvalidPath => Err(WorkspaceClientError::InvalidPath(self.prose.into())),
+            Fault::Communication => Err(WorkspaceClientError::Request(self.prose.into())),
             Fault::Panic => panic!("injected blocking task failure"),
             Fault::Decode => Ok(WorkspaceResponse {
                 status: 200,
@@ -166,8 +171,8 @@ impl WorkspaceClient for Client {
                     status,
                     body: serde_json::to_string(&WorkspaceConfigApiError {
                         status,
-                        code: UNSAFE.into(),
-                        message: UNSAFE.into(),
+                        code: self.prose.into(),
+                        message: self.prose.into(),
                         classification: if matches!(self.fault, Fault::Unknown) {
                             WorkspaceConfigFailureClassification::Unknown
                         } else {
@@ -223,11 +228,39 @@ fn assert_safe(capture: &Capture, reason: Reason, stage: Stage, public: &str) {
         );
     }
 }
+fn assert_cause(error: &ConfigFailure, reason: Reason, stage: Stage) {
+    let expected_reason = match reason {
+        Reason::TransportUnavailable => Cause::TransportUnavailable,
+        Reason::InvalidPath => Cause::InvalidPath,
+        Reason::Communication => Cause::Communication,
+        Reason::Decode => Cause::Decode,
+        Reason::RequestSize => Cause::RequestSize,
+        Reason::ResponseSize => Cause::ResponseSize,
+        Reason::BackendUnknown => Cause::BackendUnknown,
+        Reason::BackendRejected => Cause::BackendRejected,
+        Reason::UnrecognizedResponse => Cause::UnrecognizedResponse,
+        Reason::TaskJoin => Cause::TaskJoin,
+        Reason::Deadline => Cause::Deadline,
+        Reason::Identity => Cause::Identity,
+        _ => panic!("unexpected test reason"),
+    };
+    let expected_stage = match stage {
+        Stage::Request => FailureStage::Request,
+        Stage::Response => FailureStage::Response,
+        Stage::Completion => FailureStage::Completion,
+        Stage::Reconcile => FailureStage::Reconcile,
+        Stage::Attach => FailureStage::Attach,
+    };
+    assert_eq!(error.details().reason, expected_reason);
+    assert_eq!(error.details().stage, expected_stage);
+    super::super::failure::tests::assert_projection(*error.details());
+}
+
 fn public_error(
-    result: Result<serde_json::Value, WipOperationError>,
+    result: Result<serde_json::Value, ConfigFailure>,
     code: Option<ProtocolErrorCode>,
 ) -> String {
-    match (result, code) {
+    match (result.map_err(ConfigFailure::into_source), code) {
         (Err(WipOperationError::OutcomeUnknown(message)), None) => {
             assert!(message.contains("no automatic retry"));
             message
@@ -237,6 +270,48 @@ fn public_error(
             error.message
         }
         _ => panic!("unexpected public error classification"),
+    }
+}
+
+#[tokio::test]
+async fn production_provider_prose_does_not_change_cause_outcome_or_effect_controls() {
+    for fault in [Fault::Communication, Fault::Rejected(409), Fault::Unknown] {
+        for mutation in [false, true] {
+            let mut previous = None;
+            for prose in [
+                UNSAFE,
+                "HTTP status 403; not committed; successful; retry safely",
+            ] {
+                let client = Client::with_prose(fault, prose);
+                let backend = WorkspaceConfigBackend::new(client.clone());
+                let error = backend
+                    .post::<serde_json::Value, _>(
+                        if mutation { "/commit" } else { "/read" },
+                        &operation_body(mutation),
+                        mutation,
+                    )
+                    .await
+                    .unwrap_err();
+                let details = *error.details();
+                super::super::failure::tests::assert_projection(details);
+                if let Some(expected) = previous {
+                    assert_eq!(details, expected);
+                }
+                previous = Some(details);
+                let code = match fault {
+                    Fault::Rejected(_) => Some(ProtocolErrorCode::ValidatorMismatch),
+                    Fault::Communication if !mutation => Some(ProtocolErrorCode::Internal),
+                    _ => None,
+                };
+                public_error(Err(error), code);
+                let state = client.state.lock().unwrap();
+                assert_eq!(state.requests, 1);
+                assert_eq!(
+                    state.mutations,
+                    usize::from(mutation && !matches!(fault, Fault::Rejected(_)))
+                );
+            }
+        }
     }
 }
 
@@ -320,6 +395,15 @@ async fn production_reply_failures_retain_reasons_without_retrying_mutations() {
             } else {
                 Some(read_code)
             };
+            assert_cause(result.as_ref().err().unwrap(), reason, stage);
+            assert_eq!(
+                result.as_ref().err().unwrap().details().operation,
+                if mutation {
+                    Operation::Commit
+                } else {
+                    Operation::Read
+                }
+            );
             let public = public_error(result, code);
             assert_safe(&capture, reason, stage, &public);
             let state = client.state.lock().unwrap();
@@ -343,17 +427,20 @@ async fn production_typed_rejections_preserve_public_codes_and_never_apply() {
             let client = Client::new(Fault::Rejected(status));
             let backend = WorkspaceConfigBackend::new(client.clone());
             let capture = Capture::default();
-            let public = public_error(
-                backend
-                    .post::<serde_json::Value, _>(
-                        if mutation { "/commit" } else { "/read" },
-                        &operation_body(mutation),
-                        mutation,
-                    )
-                    .with_subscriber(capture.dispatch())
-                    .await,
-                Some(code),
+            let result = backend
+                .post::<serde_json::Value, _>(
+                    if mutation { "/commit" } else { "/read" },
+                    &operation_body(mutation),
+                    mutation,
+                )
+                .with_subscriber(capture.dispatch())
+                .await;
+            assert_cause(
+                result.as_ref().err().unwrap(),
+                Reason::BackendRejected,
+                Stage::Response,
             );
+            let public = public_error(result, Some(code));
             assert_safe(&capture, Reason::BackendRejected, Stage::Response, &public);
             assert!(capture.text().contains(&format!("status={status}")));
             let state = client.state.lock().unwrap();
@@ -393,6 +480,11 @@ async fn production_deadline_is_unknown_after_effect_and_blocking_completion_is_
             assert!(!state.completed && !state.released);
         }
         let result = request.await;
+        assert_cause(
+            result.as_ref().err().unwrap(),
+            Reason::Deadline,
+            Stage::Completion,
+        );
         let public = public_error(
             result,
             if mutation {
@@ -443,7 +535,8 @@ async fn production_current_identity_and_task_loss_remain_safe() {
             .current_async()
             .with_subscriber(capture.dispatch())
             .await;
-        let message = match result {
+        assert_cause(result.as_ref().err().unwrap(), reason, stage);
+        let message = match result.map_err(ConfigFailure::into_source) {
             Err(WipOperationError::Protocol(error)) => {
                 assert_eq!(error.code, code);
                 error.message
@@ -527,13 +620,16 @@ async fn production_oversized_request_is_rejected_before_dispatch() {
     let client = Client::new(Fault::Communication);
     let backend = WorkspaceConfigBackend::new(client.clone());
     let capture = Capture::default();
-    let public = public_error(
-        backend
-            .post::<serde_json::Value, _>("/commit", &"x".repeat(MAX_RESPONSE_BYTES), true)
-            .with_subscriber(capture.dispatch())
-            .await,
-        Some(ProtocolErrorCode::ResourceLimitExceeded),
+    let result = backend
+        .post::<serde_json::Value, _>("/commit", &"x".repeat(MAX_RESPONSE_BYTES), true)
+        .with_subscriber(capture.dispatch())
+        .await;
+    assert_cause(
+        result.as_ref().err().unwrap(),
+        Reason::RequestSize,
+        Stage::Request,
     );
+    let public = public_error(result, Some(ProtocolErrorCode::ResourceLimitExceeded));
     assert_safe(&capture, Reason::RequestSize, Stage::Request, &public);
     let state = client.state.lock().unwrap();
     assert_eq!(state.requests, 0);
@@ -555,7 +651,12 @@ async fn production_current_deadline_remains_bounded_and_has_no_mutation() {
     }
     assert_eq!(client.state.lock().unwrap().mutations, 0);
     let error = request.await;
-    let message = match error {
+    assert_cause(
+        error.as_ref().err().unwrap(),
+        Reason::Deadline,
+        Stage::Completion,
+    );
+    let message = match error.map_err(ConfigFailure::into_source) {
         Err(WipOperationError::Protocol(error)) => {
             assert_eq!(error.code, ProtocolErrorCode::ResourceLimitExceeded);
             error.message
@@ -588,6 +689,11 @@ async fn production_request_encoding_failure_is_safe_and_never_dispatched() {
         .post::<serde_json::Value, _>("/commit", &Unencodable, true)
         .with_subscriber(capture.dispatch())
         .await;
+    assert_cause(
+        result.as_ref().err().unwrap(),
+        Reason::Decode,
+        Stage::Request,
+    );
     let message = public_error(result, Some(ProtocolErrorCode::InvalidArguments));
     assert_safe(&capture, Reason::Decode, Stage::Request, &message);
     let state = client.state.lock().unwrap();

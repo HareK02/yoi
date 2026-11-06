@@ -28,6 +28,7 @@
 //! for internal children. Shared WIP references, permissions, and unknown outcomes follow [`crate::wip`].
 pub mod backend;
 pub(crate) mod delegation;
+pub mod failure;
 #[cfg(test)]
 mod tests;
 pub mod wip;

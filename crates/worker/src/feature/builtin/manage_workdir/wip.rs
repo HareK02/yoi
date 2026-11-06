@@ -453,7 +453,10 @@ impl Provider {
                 crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
                     self.backend.client.clone(),
                 )
-                .current()?
+                .current()
+                .map_err(
+                    crate::feature::builtin::workspace_config::failure::ConfigFailure::into_source,
+                )?
                 && Some(current.connection_id.as_str()) == id
                 && Some(current.working_directory_id.as_str()) == workdir
                 && Some(current.alias.as_str()) == alias
@@ -989,6 +992,7 @@ fn map_tool_error(error: ToolError) -> WipOperationError {
         ToolError::InvalidArgument(message) => {
             failure(ProtocolErrorCode::InvalidArguments, message)
         }
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, .. } => {

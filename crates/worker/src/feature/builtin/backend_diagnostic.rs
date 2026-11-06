@@ -110,6 +110,7 @@ impl Diagnostic {
                 WorkspaceClientError::Unavailable(_) => Reason::TransportUnavailable,
                 WorkspaceClientError::InvalidPath(_) => Reason::InvalidPath,
                 WorkspaceClientError::Request(_) => Reason::Communication,
+                WorkspaceClientError::AuthorizationRejected { .. } => Reason::BackendRejected,
             },
             None,
         );

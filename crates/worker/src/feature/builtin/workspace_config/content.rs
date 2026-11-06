@@ -39,6 +39,7 @@ use super::backend::{
     MAX_DEPTH, MAX_NODES, MAX_PATH_BYTES, MAX_TEXT_BYTES, WorkspaceConfigBackend, diagnostic,
     failure, unknown,
 };
+use super::failure::ConfigFailure;
 use super::{CONTENT_ROOT, WorkspaceConfigFeature};
 use crate::feature::builtin::backend_diagnostic::{Diagnostic, Reason, Stage};
 use crate::wip::{
@@ -177,7 +178,8 @@ async fn observe_diagnosed(
             false,
             diagnostic.clone(),
         )
-        .await?;
+        .await
+        .map_err(ConfigFailure::into_source)?;
     if result.connection_id != connection
         || result.nodes.len() > MAX_NODES
         || result.validator.is_empty()
@@ -244,7 +246,13 @@ async fn observe_diagnosed(
 impl ConfigProvider {
     async fn projection_at(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
         let source = source_path(path).map_err(protocol)?;
-        let Some(attachment) = visible_metadata(self.backend.current_async().await)? else {
+        let Some(attachment) = visible_metadata(
+            self.backend
+                .current_async()
+                .await
+                .map_err(ConfigFailure::into_source),
+        )?
+        else {
             return Ok(None);
         };
         let Some(attachment) = attachment else {
@@ -337,7 +345,13 @@ impl WipSubtreeProvider for ConfigProvider {
 
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError> {
         let source = source_path(path).map_err(protocol)?;
-        let Some(Some(attachment)) = visible_metadata(self.backend.current_async().await)? else {
+        let Some(Some(attachment)) = visible_metadata(
+            self.backend
+                .current_async()
+                .await
+                .map_err(ConfigFailure::into_source),
+        )?
+        else {
             return Ok(Vec::new());
         };
         let Some(snapshot) = visible_metadata(
@@ -540,7 +554,8 @@ impl ConfigHandler {
                 false,
                 diagnostic.clone(),
             )
-            .await?;
+            .await
+            .map_err(ConfigFailure::into_source)?;
         if response.path != self.node.path
             || response.validator != self.node.validator
             || Some(&response.digest) != self.node.digest.as_ref()
@@ -858,7 +873,8 @@ impl ConfigHandler {
                 true,
                 diagnostic.clone(),
             )
-            .await?;
+            .await
+            .map_err(ConfigFailure::into_source)?;
         // Commit response supplies ROOT state. Obtain the exact post-commit PATH
         // validator, never substitute the root validator for a file validator.
         let updated = observe_diagnosed(
