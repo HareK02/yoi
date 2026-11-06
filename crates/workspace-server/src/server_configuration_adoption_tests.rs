@@ -355,6 +355,62 @@ mod configuration_adoption_http_integration {
         )
     }
 
+    // Uses the same catalog/owner/SQLite fixture, with only the HTTP transport
+    // extended to loopback for the production generated client's decoder.
+    struct AdoptionLoopback {
+        origin: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl AdoptionLoopback {
+        async fn start(app: Router) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            Self { origin, task }
+        }
+    }
+    impl Drop for AdoptionLoopback {
+        fn drop(&mut self) { self.task.abort(); }
+    }
+
+    #[tokio::test]
+    async fn configuration_http_problem_preserves_catalog_conflict_owner_visibility_and_durable_state() {
+        let f = Fixture::new().await;
+        let draft = f.source().await;
+        let before = f.durable();
+        let mut adoption = request(&draft, "private-config-catalog-request", vec![create_marker("private-source-body")]);
+        adoption.expected_catalog_digest.push_str("-private-stale");
+        let request = f.bearer(&f.owner, "POST", "/commit", Some(serde_json::to_value(&adoption).unwrap()));
+        let response = f.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+        let problem: Value = serde_json::from_slice(&bytes).unwrap();
+        let fixture: Value = serde_json::from_str(include_str!("../../../web/workspace/test/config-source/fixtures/catalog-changed.json")).unwrap();
+        assert_eq!(problem, fixture, "Web must consume the exact production HTTP fixture");
+        for private in ["private-config-catalog-request", "private-source-body", "private-stale", MARKER, f.subject.as_str()] {
+            assert!(!String::from_utf8_lossy(&bytes).contains(private));
+        }
+        assert_eq!(f.durable(), before);
+        f.assert_legacy_writable();
+        let (status, denied) = f.call(f.bearer(&f.foreign, "POST", "/commit", Some(serde_json::to_value(&adoption).unwrap()))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(denied.get("yoi_failure").is_none(), "owner denial is not cause visibility");
+        assert_eq!(f.durable(), before);
+
+        let server = AdoptionLoopback::start(f.app.clone()).await;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::AUTHORIZATION, format!("Bearer {}", f.owner).parse().unwrap());
+        let client = reqwest::Client::builder().default_headers(headers).timeout(std::time::Duration::from_secs(10)).build().unwrap();
+        let generated = server_api::ConfigurationAdoptionApiClient::builder(&server.origin).unwrap().client(client).build().unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(15), generated.configuration_adopt(TEST_WORKSPACE_ID.to_owned(), adoption)).await.unwrap().unwrap_err();
+        let server_api::client_support::ClientError::Public { status, error } = received else { panic!("generated client lost the real Problem response: {received:?}") };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error.details().unwrap().reason, server_api::configuration_failure::ConfigurationFailureReason::CatalogChanged);
+        assert!(api_macros::HttpError::custom_response(&error).is_none(), "received facts cannot encode a new disclosure");
+        assert_eq!(f.durable(), before);
+    }
+
     #[tokio::test]
     async fn owner_http_repository_validation_is_read_only_and_precedes_seal() {
         let f = Fixture::new().await;
@@ -491,7 +547,7 @@ mod configuration_adoption_http_integration {
                     "deploy",
                     "matching",
                     "read_only",
-                    "unknown Repository",
+                    "the configured repository was not found",
                 ),
                 (
                     "non-ssh",
@@ -499,7 +555,7 @@ mod configuration_adoption_http_integration {
                     "deploy",
                     "matching",
                     "read_only",
-                    "not an ssh",
+                    "the access binding requires an SSH repository source",
                 ),
                 (
                     "credential",
@@ -507,7 +563,7 @@ mod configuration_adoption_http_integration {
                     "absent",
                     "matching",
                     "read_only",
-                    "unknown Repository SSH credential",
+                    "the configured SSH credential was not found",
                 ),
                 (
                     "inactive",
@@ -523,7 +579,7 @@ mod configuration_adoption_http_integration {
                     "deploy",
                     "absent",
                     "read_only",
-                    "unknown Repository SSH host trust",
+                    "the configured SSH host trust was not found",
                 ),
                 (
                     "host",
@@ -531,7 +587,7 @@ mod configuration_adoption_http_integration {
                     "deploy",
                     "wrong-host",
                     "read_only",
-                    "does not match host trust",
+                    "the repository SSH endpoint does not match the host trust",
                 ),
                 (
                     "port",
@@ -539,7 +595,7 @@ mod configuration_adoption_http_integration {
                     "deploy",
                     "wrong-port",
                     "read_only",
-                    "does not match host trust",
+                    "the repository SSH endpoint does not match the host trust",
                 ),
             ] {
                 let adoption = request(

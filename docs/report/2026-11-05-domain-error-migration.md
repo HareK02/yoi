@@ -19,7 +19,7 @@ T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/client�
 | Workdir removal | `WorkdirRemovalOperation`、request fingerprint、attempt、disposition、failure category、既存reconciliation | `workdir_removal_response`、Web `workdir-removal.ts`、Worker lifecycle Tool。復旧は観測のみで削除を再実行しない。Backend/Worker/Webの説明表はdomain説明へ集約するが、結果・再実行条件はこの正本を利用する。 |
 | Drive storage / HTTP | `workspace_drive::failure::DriveFailure` が9variantの元errorを保持し、closed operation/reasonを共通coreへ投影する。metadata/receiptは既存同一transactionのまま | 実storageでconflict/CAS/grant/replay/fence/SQLite障害からcodecまで検証した。`server_drive.rs::domain_error` はまだ既存公開codeへ縮退し、共通HTTP/Toolへの接続は未完。storage原因はremote更新の確定/Unknownを証明しない。 |
 | Drive Worker / Tool | `DriveClientFailure` が実 `DriveError` を保持し、`workspace_drive_client` のclosed operation/reasonへ投影する | 既存Unavailable/Unknownから細かいtransport理由を捏造しない。登録Tool入口を共有execution_failureへ接続し、元class/codeとUnknownの元Host request IDは原因と独立したresultへ保持する。既存Store再openとモデル入力の詳細枝刈り後もsummaryに元ID・非再送案内を残す。native WIP・HTTP・背景は別の未完接続。 |
-| config owner採用 | `ConfigurationFailure` が現 `ConfigTreeError` 15variantのsourceと、採用決定点のcatalog/head/export/source/owner/request理由を保持する | source helper、実SQLite採用、owner HTTPのsource/preview/adopt/reconcileへ接続した。非active/drainingもHTTPの決定点で付ける。T-838のwriter/transaction/receiptは変更せず、HTTP分類はtyped reasonから決定する。formatterのString診断、policy/contentの未型付け原因、共通応答/表示への接続は残る。 |
+| config owner採用 | `ConfigurationFailure` が現 `ConfigTreeError` 15variantのsourceと、採用決定点のcatalog/head/export/source/owner/request理由を保持する | source helper、実SQLite採用、owner HTTPのsource/preview/adopt/reconcileへ接続した。owner確認済みcallの型付き原因はT-812 Problem/T-813 Web receiverへ投影する。T-838のwriter/transaction/receiptは変更せず、HTTP分類はtyped reasonから決定する。認可前・未型付けpolicy/contentの既存公開authoring診断はlegacyのまま。背景publicationと非Web接続は残る。 |
 | config Worker論理tree | `ConfigFailure` はBackend決定点のoperation/stage/reasonと元 `WipOperationError` を保持し、`workspace_config_client` へ投影する | content/attachment/Workdir管理の既存callerは元WIP結果へ明示変換する。Unknown/非再送、CAS、scope/connection再確認を維持するが、この旧経路だけの試験をowner採用の証拠にしない。T-814結果境界への最終接続は残る。 |
 | 内部 / 背景 | Drive maintenance、config採用後のRuntime publication、既存Job/Service結果 | configのpublicationはcommit後best effortで失敗を返却/保存していない。採用receiptをrollback/Unknownへ変更せず、T-814の共有保存/照会方式へ副次失敗を接続する。別ledgerは作らない。 |
 
@@ -137,6 +137,36 @@ WorkerのHost認可応答は、T-812の生成clientとは別の `WorkspaceClient
 - Unknownは元POST1回・同ID照合1回のまま。Uncommitted snapshotを未実行とせず、枝刈り後summaryも元request ID・非再送案内・error dispositionを保持する。拒否はdata dispatchなし、競合code/class保持、説明変更で結果状態を変更せず、履歴正本のcontentを枝刈りしないことを確認した。
 
 このsliceはDrive native WIP、全HTTP/Web、背景store/query、Workdir/config経路や正式reviewの完了を示さない。既成功の未変更Server/root検証は再実行していない。測定時の空き47GiB、当checkout `target/debug` 約43GiB・`target/t815` 約16GiB。追加cleanや全体並列設定変更はしていない。
+
+## Configuration adoptionの実HTTP→Web接続checkpoint
+
+`98b3030d4` 後のslice。pure `ConfigurationFailureDetails` とallowlistをserver-apiへ移し、Serverは原 `ConfigTreeError` と決定点を保持する。owner source/preview/adopt/reconcileの4APIをT-812 Problem response/client hookへ接続した。catalogの現在ownerを確認したcallのみBrowserへ投影し、認可前・owner不一致はcause visibilityを与えず従来JSONのままにする。内側Categoryではなく、このowner APIの従来reason→400/403/409分類を明示的に保つ。
+
+BrowserはT-813 `receiveProblem` / `failureNotice` / domain decoderを使い、共有 `readBoundedText` で既存成功・legacy応答もbounded受信する。未知version/reasonと破損は区別する。既存の公開authoring診断（read-only builtin import等）はbounded legacyのまま保持し、旧本文から型付き原因や安全な再送を推論しない。現採用writer・operation ID・CAS・transfer seal・receipt・既存reconcileは変更していない。
+
+### 実行証拠と失敗の分類
+
+Rustは既存 `CARGO_TARGET_DIR=target/t815 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0`、通常featureを使用。各logは `target/t815-evidence/`。最終候補全体のroot check・広域Server suite・正式reviewは未実施であり、この表の成功へ含めない。
+
+| 検証 | 結果 / log |
+| --- | --- |
+| `cargo check -p server-api` | 成功、22.6秒、`config-api-check.log`。 |
+| `cargo test -p yoi-workspace-server --lib configuration_http_problem` | 1成功、`config-http-problem-fixed.log`。本番catalog router・owner/session・SQLite→loopback→生成Rust clientとWebが読む同一fixtureを接続。非ownerにはcauseなし、非更新をsource/policy/head/receipt/legacy authorityから再読確認。最初は移動に伴うtest用OperationContext import欠落でcompile失敗し修正。 |
+| `cargo test -p yoi-workspace-server --lib configuration_adoption_http_integration` | 最終8成功、`config-adoption-http-regression-fixed.log`。最初7成功/1失敗は先のRepository access固定説明への旧prose期待不整合。本件回帰として安全な具体説明への期待へ更新し再走。旧秘密情報へ表示を戻していない。 |
+| `cargo test -p yoi-workspace-server --lib configuration_failure` | 5成功、`config-domain-regression.log`。原source、Browser/Tool意味・秘密境界・現在可視性を確認。 |
+| `cargo test -p server-api` | 最終lib138・integration2+2・doctest0成功、`config-server-api-tests-final.log`。最初133成功/5失敗は先のcanonical hashに対するRepository/Runtime/Ticket/Companion/Worker生成header stale。各正規generatorとcheckで更新して再走、`config-generated-refresh.log`。configuration OpenAPIも正規生成。 |
+| Web config API/adoption tests | 23成功、`config-web-test-fixed.log`。新2件は同HTTP fixture、説明変更、未知/破損、完全な同request1回を検証。最初のJSON fixture型wideningによる2型エラーはunknown比較へ修正した。 |
+| Web check / build | 成功、0 errors/0 warnings、`config-web-check.log` / `config-visual-after-build.log`。 |
+
+### 目視確認
+
+既存 `configuration_adoption_review.ts` へcatalog-conflict scenarioを追加し、実Web/実WASM＋合成HTTPで撮影した。実認証・永続効果の証拠は上記Server suiteであり、合成画面で代替しない。
+
+- 前: `target/web-ux/t815/config-before-3d4079568-r2/`（既存archive build `target/t815-visual-before/web/workspace/build`）。3d4079568から98b3030d4のconfig API/editor sourceはGit差分なしのため同画面baselineとして再利用。manifestのsourceはlauncher HEADであり、前buildのsourceではない。buildRoot/index hashと旧access captureのarchive出典を併せて照合する。
+- 後: `target/web-ux/t815/config-after-current/`（このdirty sliceのWeb build）。各 `review-context.json` とARIA、owner409/非owner403、1440/768/390px・light/darkの前後24画像を実装者が開いて確認した。競合は生JSONから具体的な操作・catalog変更説明へ改善、詳細を開かず判断でき、元の再読操作とlocal candidateを保つ。non-ownerは前後同一描画でeditorを出さない。横overflowや意図しないbrowser診断なし、mutationは1回。この条件で **pass**。
+- 最初のharness checkは既存generated TSの拡張子なしimportで失敗し、既存実WASM harnessに必要な `--sloppy-imports` でcheck/runした。最初のbefore captureは意図した409のconsole診断を未分類だったため失敗。許す診断を当該routeのHTTP409と正確なconsole文だけに限定して再撮影し、失敗artifactも保持した。
+
+このcheckpointはRepository構成全域、Drive HTTP/native WIP、Workdirの監査/cleanup、config背景publicationの保存/再読や正式reviewの完了ではない。測定時空39GiB、自debug43GiB/t81519GiB。新target・追加clean・全体並列設定変更なし。T-814所有の実Content-Type運搬/native cause hookは未公開時点では仮定せず、公開sourceと実検証を受けて接続する。
 
 ## 並行変更との結合点
 

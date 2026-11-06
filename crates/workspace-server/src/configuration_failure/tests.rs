@@ -8,7 +8,7 @@ use config_source::{
     ConfigContentType, ConfigEntry, ConfigTreeChange, ConfigTreeSnapshot, VirtualPath,
 };
 use error_contract::{
-    Budget, CorrelationRef, DecodeFailure,
+    Budget, CorrelationRef, DecodeFailure, OperationContext,
     compatibility::{StoredFailureRead, read_failure_attachment},
     decode_failure, encode_projected_failure, project_failure,
 };

@@ -35,8 +35,8 @@ use crate::subjektiv::{
 use feature_permissions::PermissionHost;
 use server_api::{
     ConfigurationAdoptionApi, ConfigurationAdoptionReceipt, ConfigurationAdoptionRequest,
-    ConfigurationMigrationDiagnostic, ConfigurationPreviewResponse, ConfigurationReconciliation,
-    ConfigurationSourceResponse, ConfigurationSubjectPolicy, RepositoryApiError,
+    ConfigurationApiError, ConfigurationMigrationDiagnostic, ConfigurationPreviewResponse,
+    ConfigurationReconciliation, ConfigurationSourceResponse, ConfigurationSubjectPolicy,
     RuntimePolicyApplication, ServerRequestContext,
 };
 
@@ -62,7 +62,7 @@ async fn owner_operation<T: Send + 'static>(
     workspace: String,
     failure_operation: FailureOperation,
     operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
-) -> std::result::Result<T, RepositoryApiError> {
+) -> std::result::Result<T, ConfigurationApiError> {
     // These owner-only routes are mounted above Workspace fallback dispatch.
     // A Runtime proof must not be ignored in favor of a shared human credential.
     if context.transport_headers.iter().any(|(name, _)| {
@@ -71,11 +71,13 @@ async fn owner_operation<T: Send + 'static>(
         return Err(ApiError::from(Error::WorkspacePermissionDenied(
             "Runtime source proofs cannot authorize owner configuration management".into(),
         ))
-        .into_repository_api_error());
+        .into_repository_api_error()
+        .into());
     }
     let actor = subject_authorization::administration_actor(&context)
         .map_err(ApiError::into_repository_api_error)?
         .clone();
+    let mut can_view_cause = false;
     let result: ApiResult<T> = async {
         let gate = service.admission_for_workspace(&workspace).await;
         let lease = gate.admit(false).ok_or_else(|| {
@@ -99,6 +101,7 @@ async fn owner_operation<T: Send + 'static>(
                 ))
                 .into());
             }
+            can_view_cause = true;
             if record.state != "active" {
                 return Err(Error::from(ConfigurationFailure::new(
                     failure_operation,
@@ -130,7 +133,22 @@ async fn owner_operation<T: Send + 'static>(
         .await
     }
     .await;
-    result.map_err(ApiError::into_repository_api_error)
+    result.map_err(|error| {
+        if can_view_cause {
+            if let Error::Configuration(cause) = &error.error {
+                use error_contract::{Browser, FailureFacts, project_failure};
+                let visibility = crate::configuration_failure::ConfigurationFailureVisibility {
+                    can_view_cause: true,
+                };
+                if let Ok(projected) = FailureFacts::new(*cause.details())
+                    .and_then(|facts| project_failure::<Browser, _>(&facts, &visibility))
+                {
+                    return ConfigurationApiError::projected(projected);
+                }
+            }
+        }
+        error.into_repository_api_error().into()
+    })
 }
 
 fn conflict(message: &str) -> Error {
@@ -339,7 +357,7 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         &self,
         context: ServerRequestContext,
         workspace_id: String,
-    ) -> std::result::Result<ConfigurationSourceResponse, RepositoryApiError> {
+    ) -> std::result::Result<ConfigurationSourceResponse, ConfigurationApiError> {
         owner_operation(
             self,
             context,
@@ -396,7 +414,7 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
-    ) -> std::result::Result<ConfigurationPreviewResponse, RepositoryApiError> {
+    ) -> std::result::Result<ConfigurationPreviewResponse, ConfigurationApiError> {
         owner_operation(
             self,
             context,
@@ -445,7 +463,7 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
-    ) -> std::result::Result<ConfigurationAdoptionReceipt, RepositoryApiError> {
+    ) -> std::result::Result<ConfigurationAdoptionReceipt, ConfigurationApiError> {
         owner_operation(
             self,
             context,
@@ -536,7 +554,7 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
-    ) -> std::result::Result<ConfigurationReconciliation, RepositoryApiError> {
+    ) -> std::result::Result<ConfigurationReconciliation, ConfigurationApiError> {
         owner_operation(
             self,
             context,
