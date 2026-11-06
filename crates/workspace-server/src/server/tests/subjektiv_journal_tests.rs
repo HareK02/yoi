@@ -4044,15 +4044,20 @@ async fn subject_removal_blocks_legacy_unbound_pending_without_execution_evidenc
 
 #[tokio::test]
 async fn subject_removal_prior_purge_receipt_recovers_without_inventing_erasure() {
-    assert_prior_purge_receipt(false).await;
+    assert_prior_purge_receipt(false, false).await;
+}
+
+#[tokio::test]
+async fn subject_removal_pending_purge_receipt_recovers_with_current_canonical_shutdown() {
+    assert_prior_purge_receipt(true, false).await;
 }
 
 #[tokio::test]
 async fn subject_removal_missing_canonical_shutdown_never_adopts_stale_catalog_purge() {
-    assert_prior_purge_receipt(true).await;
+    assert_prior_purge_receipt(true, true).await;
 }
 
-async fn assert_prior_purge_receipt(stale_catalog: bool) {
+async fn assert_prior_purge_receipt(stale_catalog: bool, missing_shutdown: bool) {
     let f = SubjectRemovalFixture::new().await;
     f.seed_completed_release_for_archive_recovery().await;
     let configured = f
@@ -4114,8 +4119,19 @@ async fn assert_prior_purge_receipt(stale_catalog: bool) {
         .prepare_worker_removal_execution(TEST_WORKSPACE_ID, &plan.plan_id, &plan.input_fingerprint)
         .unwrap();
     if stale_catalog {
-        // An old v1 pending result has no canonical shutdown/aggregate proof.
-        // A stopped catalog must not promote it into a successful Purge receipt.
+        let worker = worker_runtime::identity::WorkerRef::new(f.target.worker_id.parse().unwrap());
+        let shutdown = f
+            .execution
+            .terminations
+            .lock()
+            .unwrap()
+            .get(&worker)
+            .cloned()
+            .expect("fixture must retain its genuine Stop receipt");
+        assert!(shutdown.confirms_scope_shutdown(&worker, shutdown.stop_operation_id));
+        // The original v1 pending result has no embedded shutdown proof.
+        // Current canonical Stop must be reconciled independently; a stopped
+        // catalog and this historical receipt cannot replace missing proof.
         let request = &prepared.runtime_request;
         let pending = worker_runtime::retention::WorkerRetentionExecutionResult {
             operation_id: request.operation_id.clone(),
@@ -4160,9 +4176,35 @@ async fn assert_prior_purge_receipt(stale_catalog: bool) {
             "metadata_commit_failed",
         )
         .unwrap();
+    if missing_shutdown {
+        // Fault only the substituted execution owner's reconciliation evidence.
+        // Do not change the Runtime catalog, original operation or provider receipt.
+        let worker = worker_runtime::identity::WorkerRef::new(f.target.worker_id.parse().unwrap());
+        assert!(
+            f.execution
+                .terminations
+                .lock()
+                .unwrap()
+                .remove(&worker)
+                .is_some()
+        );
+    }
     let f = if stale_catalog { f } else { f.reopen().await };
     let response = f.remove();
     if stale_catalog {
+        let path = f
+            .dir
+            .path()
+            .join(".test-embedded-runtime-store/retention/operations")
+            .join(format!("{}.json", plan.operation_id));
+        let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(
+            receipt.get("shutdown").is_none_or(Value::is_null),
+            "historical receipt must not be upgraded into shutdown evidence"
+        );
+        assert_eq!(receipt["result"]["source_removed"], !missing_shutdown);
+    }
+    if missing_shutdown {
         assert_eq!(
             response.status,
             StatusCode::SERVICE_UNAVAILABLE.as_u16(),
