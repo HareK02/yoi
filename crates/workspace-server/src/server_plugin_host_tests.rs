@@ -94,6 +94,108 @@ fn replace_runtime_trust(f: &mut Fixture, change: RuntimeTrustChange) {
     assert_eq!(current.public_key, f.identity.public_key);
 }
 
+async fn delegate_plugin_fixture(
+    f: &mut Fixture,
+) -> server_api::authorization::SubjectPermissions {
+    use server_api::authorization::WorkerDelegationRequest;
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
+    let source = store
+        .set_subject_permissions(
+            &f.subject,
+            &SubjectPermissionsUpdate {
+                operation_id: "delegate-plugin".into(),
+                expected_change_id: Some(previous.change_id),
+                execution: previous.execution.clone(),
+                delegation: previous.execution.clone(),
+            },
+        )
+        .unwrap();
+    let grant = subject_authorization::prepare_delegation(
+        &f.api,
+        &f.source,
+        Some(&WorkerDelegationRequest {
+            permissions: source.execution.clone(),
+            redelegation: vec![],
+        }),
+        &f.source.runtime_id,
+        PROFILE,
+        "delegated-profile-digest",
+        None,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let memory = f
+        .api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let reserved = f
+        .api
+        .config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            &f.source.runtime_id,
+            "delegated-child",
+            "sha256:delegated-child",
+            None,
+            &memory,
+        )
+        .unwrap();
+    subject_authorization::bind_reserved_grant(&f.api, &grant, &reserved.worker_id.to_string())
+        .unwrap();
+    let child = RuntimeWorkerRef::new(&f.source.runtime_id, reserved.worker_id.to_string());
+    let identity = f
+        .api
+        .plugin_reserved_execution_identity(&child.runtime_id, &reserved, Some(&grant))
+        .unwrap();
+    let mut summary = f.api.runtime.worker(&f.source).unwrap();
+    summary.worker.worker_id = child.worker_id.clone();
+    summary.singleton_key = None;
+    f.runtime.workers.lock().unwrap().push(summary);
+    assert_eq!(
+        f.api.plugin_execution_identity(&child).await.unwrap(),
+        identity
+    );
+    let config = f
+        .api
+        .config_store
+        .load_workspace_config(TEST_WORKSPACE_ID)
+        .unwrap()
+        .unwrap();
+    f.plan = f
+        .api
+        .config_store
+        .with_immediate_transaction(|tx| {
+            let plan = crate::plugin_settings::resolve_worker_plugin_plan(
+                tx,
+                TEST_WORKSPACE_ID,
+                &config.snapshot.digest,
+                PROFILE,
+                identity,
+            )?;
+            crate::plugin_plan::plugin_plan_create(
+                tx,
+                "fixture-host",
+                "delegated-child-plan",
+                &plan,
+            )
+        })
+        .unwrap();
+    f.api
+        .config_store
+        .plugin_plan_transition(
+            TEST_WORKSPACE_ID,
+            &f.plan.plan_id,
+            PlanPinState::Pending,
+            PlanPinState::Active,
+        )
+        .unwrap();
+    f.source = child;
+    source
+}
+
 impl Fixture {
     async fn new(binding: Option<PluginConnectionBinding>) -> Self {
         let https = binding.is_some();
@@ -1457,9 +1559,9 @@ async fn tool_check_reuses_physical_subject_database_only_within_each_sync_scope
             owner.call(prepare(&f)).await.unwrap(),
             PluginHostResponse::Authorized
         ));
-        // Identity and permission checks are two separate synchronous scopes.
+        // Identity and permission checks share one native authority reservation.
         // The next call must open again rather than keeping a cross-call cache.
-        assert_check_physical_initializations(&f, before, 2);
+        assert_check_physical_initializations(&f, before, 1);
     }
     f.shutdown().await;
 }

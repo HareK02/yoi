@@ -3810,9 +3810,20 @@ mod tests {
         store
             .update_worker_retention("w", &request.worker, "pinned", "2026-08-24T00:00:01Z")
             .unwrap();
-        let blocked = store
-            .plan_job_cleanup_worker_removal(&request, &inv())
-            .unwrap();
+        assert!(matches!(
+            store.plan_job_cleanup_worker_removal(&request, &inv()),
+            Err(WorkerRetentionError::Blocked(blockers)) if blockers == vec![WorkerRemovalBlocker::Hold]
+        ));
+        store.with_conn(|connection| {
+            assert_eq!(connection.query_row(
+                "SELECT count(*) FROM worker_removal_operations WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                [request.worker.worker_id.as_str()], |row| row.get::<_, i64>(0),
+            )?, 0, "automatic admission refusal must not create a child");
+            Ok(())
+        }).unwrap();
+        // Explicit planning may retain a diagnostic Blocked row. It never
+        // authorizes execution or prevents cleanup's first admitted child.
+        let blocked = store.plan_worker_removal(&request, &inv()).unwrap();
         assert_eq!(blocked.state, WorkerRemovalPlanState::Blocked);
         assert!(
             store

@@ -146,7 +146,7 @@ fn with_service_effect<A, T>(
 // Receipt checks enter this current authority scope directly. An earlier
 // preflight is useful only to select/compare a pin, never as a second detached
 // permission decision before acquiring the same owners again.
-fn with_current_service_effect<A, T>(
+pub(super) fn with_current_service_effect<A, T>(
     api: &WorkspaceApi,
     context: &ServerRequestContext,
     workspace: &str,

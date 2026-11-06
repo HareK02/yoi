@@ -20725,6 +20725,289 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         fixture.commit().unwrap();
     }
 
+    fn expected_retained_migration_chain() -> Vec<WorkspaceSchemaMigrationStep> {
+        vec![
+            WorkspaceSchemaMigrationStep {
+                version: 51,
+                name: WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 52,
+                name: RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 53,
+                name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 54,
+                name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 55,
+                name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 56,
+                name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 57,
+                name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 58,
+                name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 59,
+                name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 60,
+                name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 61,
+                name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 62,
+                name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 63,
+                name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 64,
+                name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 65,
+                name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 66,
+                name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 67,
+                name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 68,
+                name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 69,
+                name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 70,
+                name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 71,
+                name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 72,
+                name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 73,
+                name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 74,
+                name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 75,
+                name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 76,
+                name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 77,
+                name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 78,
+                name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 79,
+                name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 80,
+                name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 81,
+                name: "Backend Job immutable resource serialization".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 82,
+                name: "Ticket responsibility and unfinished work separation".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 83,
+                name: "Generic Ticket Worker roles and durable claims".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 84,
+                name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 85,
+                name: "content-addressed Flow sources".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 86,
+                name: "content-fenced config, Memory settings and Jobs".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 87,
+                name: "Repository SSH key identities and encrypted operation objects".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 88,
+                name: "Runtime binding identities and retention content contracts".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 89,
+                name: "descriptive legacy evidence columns".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 90,
+                name:
+                    "Runtime binding connection configuration and historical verification archive"
+                        .to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 91,
+                name: "Ticket open/closed cases and retained routing evidence".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 92,
+                name: "Ticket-owned assignment tracking".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 93,
+                name: "Durable assignment deliveries and source-bound startup fences".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 94,
+                name: "Canonical Ticket posts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 95,
+                name: "Common notification routing and durable Worker delivery".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 96,
+                name: "Backend Job common notification routing".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 97,
+                name: "MR notifications and authenticated implementation results".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 98,
+                name: "Assignment-independent implementation reports".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 99,
+                name: "Explicit hosting administrators and self-registration policy".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 100,
+                name: "Provisional users and scoped passkey activation".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 101,
+                name: "Durable explicit Subject body release".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 102,
+                name: "Durable failed Subject creation recovery".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 103,
+                name: "Passkey metadata and atomic addition results".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 104,
+                name: "Converge Passkey results and Job input retention".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 105,
+                name: "Durable Subject deletion snapshots and Job admission fences".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 106,
+                name: crate::plugin_catalog::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 107,
+                name: "Immutable Worker Plugin plans and retained pins".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 108,
+                name: "Subject Ticket responsibility and current-body notification routing".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 109,
+                name: "Durable Plugin Host invocations and HTTPS effect receipts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 110,
+                name: "Worker Plugin launch selection associations".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 111,
+                name: "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 112,
+                name: "Ticket Service outbox and fenced consumers".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 113,
+                name: "Ticket work-decomposition parent links".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 122,
+                name: crate::config_adoption::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 123,
+                name: backend_job_upgrade::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 124,
+                name: WORKER_CREATE_FAILURE_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 125,
+                name: backend_job_recovery_store::CAUSE_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 126,
+                name: SERVICE_OUTCOME_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 127,
+                name: journal_removal_store::MIGRATION_NAME.into(),
+            },
+        ]
+    }
+
     #[test]
     fn schema_v50_plans_and_applies_the_complete_retained_chain() {
         let temp = tempfile::tempdir().unwrap();
@@ -20734,203 +21017,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 50);
         assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
-        assert_eq!(
-            plan.migrations,
-            vec![
-                WorkspaceSchemaMigrationStep {
-                    version: 51,
-                    name: WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 52,
-                    name: RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 53,
-                    name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 54,
-                    name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 55,
-                    name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 56,
-                    name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 57,
-                    name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 58,
-                    name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 59,
-                    name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 60,
-                    name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 61,
-                    name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 62,
-                    name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 63,
-                    name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 64,
-                    name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 65,
-                    name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 66,
-                    name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 67,
-                    name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 68,
-                    name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 69,
-                    name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 70,
-                    name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 71,
-                    name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 72,
-                    name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 73,
-                    name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 74,
-                    name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 75,
-                    name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 76,
-                    name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 77,
-                    name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 78,
-                    name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 79,
-                    name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 80,
-                    name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 81,
-                    name: "Backend Job immutable resource serialization".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 82,
-                    name: "Ticket responsibility and unfinished work separation".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 83,
-                    name: "Generic Ticket Worker roles and durable claims".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 84,
-                    name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 85,
-                    name: "content-addressed Flow sources".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 86,
-                    name: "content-fenced config, Memory settings and Jobs".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 87,
-                    name: "Repository SSH key identities and encrypted operation objects"
-                        .to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 88,
-                    name: "Runtime binding identities and retention content contracts".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 89,
-                    name: "descriptive legacy evidence columns".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 90,
-                    name: "Runtime binding connection configuration and historical verification archive".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 91,
-                    name: "Ticket open/closed cases and retained routing evidence".to_string()
-                },
-                WorkspaceSchemaMigrationStep {version:92, name:"Ticket-owned assignment tracking".into()},
-                WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
-                WorkspaceSchemaMigrationStep {version:94, name:"Canonical Ticket posts".into()},
-                WorkspaceSchemaMigrationStep {version:95, name:"Common notification routing and durable Worker delivery".into()},
-                WorkspaceSchemaMigrationStep {version:96, name:"Backend Job common notification routing".into()},
-                WorkspaceSchemaMigrationStep {version:97, name:"MR notifications and authenticated implementation results".into()},
-                WorkspaceSchemaMigrationStep {version:98, name:"Assignment-independent implementation reports".into()},
-                WorkspaceSchemaMigrationStep {version:99, name:"Explicit hosting administrators and self-registration policy".into()},
-                WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
-                WorkspaceSchemaMigrationStep {version:101, name:"Durable explicit Subject body release".into()},
-                WorkspaceSchemaMigrationStep {version:102, name:"Durable failed Subject creation recovery".into()},
-                WorkspaceSchemaMigrationStep {version:103, name:"Passkey metadata and atomic addition results".into()},
-                WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
-                WorkspaceSchemaMigrationStep {version:105, name:"Durable Subject deletion snapshots and Job admission fences".into()},
-                WorkspaceSchemaMigrationStep {version:106, name:crate::plugin_catalog::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:107, name:"Immutable Worker Plugin plans and retained pins".into()},
-                WorkspaceSchemaMigrationStep {version:108, name:"Subject Ticket responsibility and current-body notification routing".into()},
-                WorkspaceSchemaMigrationStep {version:109, name:"Durable Plugin Host invocations and HTTPS effect receipts".into()},
-                WorkspaceSchemaMigrationStep {version:110, name:"Worker Plugin launch selection associations".into()},
-                WorkspaceSchemaMigrationStep {version:111, name:"Typed Plugin Ticket extension data and atomic mutation receipts".into()},
-                WorkspaceSchemaMigrationStep {version:112, name:"Ticket Service outbox and fenced consumers".into()},
-                WorkspaceSchemaMigrationStep {version:113, name:"Ticket work-decomposition parent links".into()},
-                WorkspaceSchemaMigrationStep {version:122, name:crate::config_adoption::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:123, name:backend_job_upgrade::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:124, name:WORKER_CREATE_FAILURE_MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:125, name:backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:126, name:SERVICE_OUTCOME_MIGRATION_NAME.into()},
-            ]
-        );
+        assert_eq!(plan.migrations, expected_retained_migration_chain());
 
         let unchanged = Connection::open(&path).unwrap();
         assert_eq!(current_schema_version(&unchanged).unwrap(), 50);
@@ -21057,6 +21144,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.to_string()),
 (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.to_string()),
 (126, SERVICE_OUTCOME_MIGRATION_NAME.to_string()),
+(127, journal_removal_store::MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -21404,12 +21492,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 51);
         assert_eq!(
-            plan.migrations
-                .iter()
-                .map(|migration| migration.version)
-                .collect::<Vec<_>>(),
-            (52..=113)
-                .chain([122, 123, 124, 125, 126])
+            plan.migrations,
+            expected_retained_migration_chain()
+                .into_iter()
+                .filter(|migration| migration.version > 51)
                 .collect::<Vec<_>>()
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -22494,10 +22580,31 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             [],
         )
         .unwrap();
+        let history = workspace_schema_migration_history(&conn).unwrap();
+        let schema = fixture_query_rows(
+            &conn,
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name",
+        );
+        let writes: i64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
         let error = apply_migrations(&conn).unwrap_err();
         assert!(
-            matches!(&error, Error::Store(message) if message == "Server storage format: unrecognized Backend Job execution receipt"),
+            matches!(&error, Error::Store(message) if message == "Server storage format: missing failure migration predecessor"),
             "{error:?}"
+        );
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap(), history);
+        assert_eq!(
+            fixture_query_rows(
+                &conn,
+                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name"
+            ),
+            schema
+        );
+        assert_eq!(
+            conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            writes
         );
     }
 

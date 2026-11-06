@@ -208,6 +208,115 @@ async fn check(
     .await
 }
 
+fn with_current_tool_effect<T>(
+    api: &WorkspaceApi,
+    context: &ServerRequestContext,
+    workspace: &str,
+    plan_id: &str,
+    installation: &str,
+    tools: &[String],
+    operation: &PluginHostOperation,
+    preparing: bool,
+    effect: impl FnOnce(&rusqlite::Transaction<'_>, policy::AdmittedPluginOperation) -> crate::Result<T>,
+) -> crate::Result<T> {
+    crate::server::service_authority::with_service_authority(api, |current, tx| {
+        validate_workspace_scope(current, workspace).map_err(|error| error.error)?;
+        let worker =
+            subject_authorization::source_from_context(context).map_err(|error| error.error)?;
+        crate::server::service_authority::require_authenticated_runtime_binding(
+            tx,
+            workspace,
+            context.runtime_source.as_ref(),
+        )?;
+        let reserved = current
+            .store
+            .has_active_worker_create_reservation(workspace, &worker)?;
+        if current
+            .store
+            .get_worker_registry(workspace, &worker)?
+            .is_none()
+            && !reserved
+        {
+            return Err(policy::failure(PluginHostErrorCode::Denied));
+        }
+        let execution = if preparing && reserved {
+            current.plugin_reserved_identity(&worker, None, None)
+        } else {
+            subject_authorization::plugin_execution_identity(current, &worker)
+                .map_err(|error| error.error)
+        }
+        .map_err(|error| match error {
+            Error::RepositoryConflict(_) => policy::failure(PluginHostErrorCode::Denied),
+            error => error,
+        })?;
+        subject_authorization::authorize_scope(
+            current,
+            &worker,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: operation_name(operation).into(),
+                resource: server_api::authorization::PermissionResource::PluginInstallation {
+                    workspace_id: workspace.into(),
+                    installation_id: installation.into(),
+                },
+            },
+        )
+        .map_err(|error| error.error)?;
+        let admitted = policy::authorize(
+            tx,
+            workspace,
+            &execution,
+            plan_id,
+            installation,
+            tools,
+            operation,
+        )?;
+        current.authorize_plugin_entry(&worker, &admitted, tools, None)?;
+        effect(tx, admitted)
+    })
+}
+
+fn with_current_invocation_effect<T>(
+    api: &WorkspaceApi,
+    context: &ServerRequestContext,
+    workspace: &str,
+    record: &receipt::InvocationRecord,
+    operation: &PluginHostOperation,
+    effect: impl FnOnce(&rusqlite::Transaction<'_>, policy::AdmittedPluginOperation) -> crate::Result<T>,
+) -> crate::Result<T> {
+    let checked_effect = |tx: &rusqlite::Transaction<'_>,
+                          admitted: policy::AdmittedPluginOperation| {
+        if record.execution != *admitted.plan.plan.execution() {
+            return Err(policy::failure(PluginHostErrorCode::Denied));
+        }
+        receipt::verify_record(tx, record)?;
+        effect(tx, admitted)
+    };
+    match &record.consumer {
+        PluginConsumer::ToolCall { tool_name, .. } => with_current_tool_effect(
+            api,
+            context,
+            workspace,
+            &record.plan_id,
+            &record.installation_id,
+            &[tool_name.clone()],
+            operation,
+            false,
+            checked_effect,
+        ),
+        PluginConsumer::Consumer { export_name, .. } => service::with_current_service_effect(
+            api,
+            context,
+            workspace,
+            &record.plan_id,
+            &record.installation_id,
+            export_name,
+            operation,
+            |_, _| Ok(()),
+            |tx, admitted, ()| checked_effect(tx, admitted),
+        ),
+    }
+}
+
 async fn check_tools(
     api: Arc<WorkspaceApi>,
     context: ServerRequestContext,
@@ -221,55 +330,45 @@ async fn check_tools(
     validate_workspace_scope(&api, &workspace).map_err(|e| policy::map_error(e.error))?;
     let worker = subject_authorization::source_from_context(&context)
         .map_err(|e| policy::map_error(e.error))?;
-    let execution = if preparing
+    let reserved = preparing
         && api
             .store
             .has_active_worker_create_reservation(api.workspace_id(), &worker)
+            .map_err(policy::map_error)?;
+    if !reserved {
+        // Runtime availability is preflight only. Resolve persisted identity and
+        // policy once below, inside the final native authority reservation.
+        let live = api.clone();
+        api.host_executors
+            .host()
             .map_err(policy::map_error)?
-    {
-        api.plugin_reserved_identity(&worker, None, None)
-            .map_err(policy::map_error)?
-    } else {
-        api.plugin_execution_identity(&worker)
+            .run(move || {
+                let summary = live
+                    .runtime
+                    .worker(&worker)
+                    .map_err(|_| policy::failure(PluginHostErrorCode::Denied))?;
+                if summary.workspace.workspace_id.as_deref() != Some(live.workspace_id()) {
+                    return Err(policy::failure(PluginHostErrorCode::Denied));
+                }
+                Ok(())
+            })
             .await
-            .map_err(policy::map_error)?
-    };
+            .map_err(policy::map_error)?;
+    }
     let executor = api.config_store.db_executor();
     executor
         .run(move || {
-            with_authority_database(&api, || {
-                subject_authorization::authorize_scope(
-                    &api,
-                    &worker,
-                    &server_api::authorization::OperationAuthorizationRequest {
-                        operation: operation_name(&operation).into(),
-                        resource:
-                            server_api::authorization::PermissionResource::PluginInstallation {
-                                workspace_id: workspace.clone(),
-                                installation_id: installation.clone(),
-                            },
-                    },
-                )
-                .map_err(|e| e.error)?;
-                let admitted = api.config_store.with_immediate_transaction(|tx| {
-                    crate::server::service_authority::require_authenticated_runtime_binding(
-                        tx,
-                        &workspace,
-                        context.runtime_source.as_ref(),
-                    )?;
-                    policy::authorize(
-                        tx,
-                        &workspace,
-                        &execution,
-                        &plan_id,
-                        &installation,
-                        &tools,
-                        &operation,
-                    )
-                })?;
-                api.authorize_plugin_entry(&worker, &admitted, &tools, None)?;
-                Ok(admitted)
-            })
+            with_current_tool_effect(
+                &api,
+                &context,
+                &workspace,
+                &plan_id,
+                &installation,
+                &tools,
+                &operation,
+                preparing,
+                |_, admitted| Ok(admitted),
+            )
         })
         .await
         .map_err(policy::map_error)
@@ -469,7 +568,6 @@ async fn execute_with_transport(
 ) -> std::result::Result<PluginHostResponse, PluginHostError> {
     // Human management and a Runtime-only (no Worker) source both fail closed.
     subject_authorization::source_from_context(&context).map_err(|_| denied())?;
-    let authentication_source = context.runtime_source.clone();
     match request {
         PluginHostRequest::Service { request } => {
             if service_lease().is_some() {
@@ -510,12 +608,13 @@ async fn execute_with_transport(
             installation_id,
             consumer,
         } => {
-            if matches!(consumer, PluginConsumer::Consumer { .. }) {
-                return Err(denied());
-            }
+            let tools = match &consumer {
+                PluginConsumer::ToolCall { tool_name, .. } => vec![tool_name.clone()],
+                PluginConsumer::Consumer { .. } => return Err(denied()),
+            };
             let admitted = check(
                 api.clone(),
-                context,
+                context.clone(),
                 workspace.clone(),
                 plan_id,
                 installation_id.clone(),
@@ -524,28 +623,34 @@ async fn execute_with_transport(
             )
             .await?;
             let store = api.config_store.clone();
-            let record =
-                store
-                    .db_executor()
-                    .run(move || {
-                        #[cfg(test)]
-                        service::boundary_observation::observe(&admitted.plan.plan_id, "begin");
-                        store.with_immediate_transaction(|tx| {
-                            crate::server::service_authority::require_authenticated_runtime_binding(
-                            tx, &workspace, authentication_source.as_ref(),
-                        )?;
+            let record = store
+                .db_executor()
+                .run(move || {
+                    #[cfg(test)]
+                    service::boundary_observation::observe(&admitted.plan.plan_id, "begin");
+                    with_current_tool_effect(
+                        &api,
+                        &context,
+                        &workspace,
+                        &admitted.plan.plan_id,
+                        &installation_id,
+                        &tools,
+                        &PluginHostOperation::Admit,
+                        false,
+                        |tx, current| {
                             receipt::begin(
                                 tx,
-                                &admitted.plan,
+                                &current.plan,
                                 &installation_id,
                                 &consumer,
                                 now_ms(),
                                 RECEIPT_RETENTION_MS,
                             )
-                        })
-                    })
-                    .await
-                    .map_err(policy::map_error)?;
+                        },
+                    )
+                })
+                .await
+                .map_err(policy::map_error)?;
             if record.cancelled || record.expired || record.expires_at_ms <= now_ms() {
                 return Err(PluginHostError {
                     code: if record.cancelled {
@@ -578,11 +683,11 @@ async fn execute_with_transport(
                 .map_err(policy::map_error)?;
             check(
                 api.clone(),
-                context,
+                context.clone(),
                 workspace.clone(),
-                record.plan_id,
-                record.installation_id,
-                record.consumer,
+                record.plan_id.clone(),
+                record.installation_id.clone(),
+                record.consumer.clone(),
                 PluginHostOperation::Admit,
             )
             .await?;
@@ -590,14 +695,14 @@ async fn execute_with_transport(
             store
                 .db_executor()
                 .run(move || {
-                    store.with_immediate_transaction(|tx| {
-                        crate::server::service_authority::require_authenticated_runtime_binding(
-                            tx,
-                            &workspace,
-                            authentication_source.as_ref(),
-                        )?;
-                        receipt::cancel(tx, &workspace, &invocation_id)
-                    })
+                    with_current_invocation_effect(
+                        &api,
+                        &context,
+                        &workspace,
+                        &record,
+                        &PluginHostOperation::Admit,
+                        |tx, _| receipt::cancel(tx, &workspace, &invocation_id),
+                    )
                 })
                 .await
                 .map_err(policy::map_error)?;
@@ -687,21 +792,36 @@ async fn execute_with_transport(
             let fp = fingerprint.clone();
             let key = request.effect_key.clone();
             let effect_workspace = workspace.clone();
-            let admission =
-                store
-                    .db_executor()
-                    .run(move || {
-                        #[cfg(test)]
-                        service::boundary_observation::observe(&r.plan_id, "effect");
-                        store.with_immediate_transaction(|tx| {
-                            crate::server::service_authority::require_authenticated_runtime_binding(
-                            tx, &effect_workspace, authentication_source.as_ref(),
-                        )?;
+            let effect_api = api.clone();
+            let effect_context = context.clone();
+            let effect_operation = operation.clone();
+            let previous = admitted.clone();
+            let admission = store
+                .db_executor()
+                .run(move || {
+                    #[cfg(test)]
+                    service::boundary_observation::observe(&r.plan_id, "effect");
+                    with_current_invocation_effect(
+                        &effect_api,
+                        &effect_context,
+                        &effect_workspace,
+                        &r,
+                        &effect_operation,
+                        |tx, current| {
+                            if current.plan != previous.plan
+                                || current.pin != previous.pin
+                                || current.binding != previous.binding
+                                || current.data_collections != previous.data_collections
+                                || current.services != previous.services
+                            {
+                                return Err(policy::failure(PluginHostErrorCode::Denied));
+                            }
                             receipt::effect_admit(tx, &r, &key, &fp, now_ms())
-                        })
-                    })
-                    .await
-                    .map_err(policy::map_error)?;
+                        },
+                    )
+                })
+                .await
+                .map_err(policy::map_error)?;
             let result = match admission {
                 receipt::EffectAdmission::Replay(result) => result,
                 receipt::EffectAdmission::Dispatch => {
