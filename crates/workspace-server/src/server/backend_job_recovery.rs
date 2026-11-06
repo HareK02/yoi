@@ -1313,6 +1313,9 @@ impl WorkspaceApi {
             }
             subjektiv_journal::drain_after_completion(self, &job.request);
         }
+        if job.request.grants.subjektiv_journal.is_some() {
+            subjektiv_journal::resume_after_execution_cleanup(self, &job, &current)?;
+        }
         // Only after durable fences/retirement may live bookkeeping be forgotten.
         self.backend_job_recovery
             .hosts
@@ -1364,16 +1367,39 @@ impl WorkspaceApi {
         {
             return Ok(());
         }
-        let worker = attempt.worker.as_ref().ok_or_else(|| {
-            Error::RepositoryConflict("Unbound allocation cannot prove execution ended".into())
-        })?;
         let termination = self
-            .runtime
-            .backend_job_termination(worker)
-            .map_err(RuntimeRegistryError::into_error)?
+            .backend_job_execution_termination(attempt)?
             .ok_or_else(|| {
                 Error::RepositoryConflict("Actual Runtime scope termination receipt missing".into())
             })?;
+        self.store.record_backend_job_execution_fence(
+            self.workspace_id(),
+            attempt,
+            &serde_json::to_string(&termination)
+                .map_err(|error| Error::Store(error.to_string()))?,
+            &serde_json::to_string(drain.owner())
+                .map_err(|error| Error::Store(error.to_string()))?,
+            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        )?;
+        Ok(())
+    }
+
+    /// Actual Runtime termination can settle an execution outcome before Host cleanup.
+    /// It cannot by itself certify Host drain or authorize another attempt.
+    pub(super) fn backend_job_execution_termination(
+        &self,
+        attempt: &BackendJobAttemptRecord,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>> {
+        let Some(worker) = attempt.worker.as_ref() else {
+            return Ok(None);
+        };
+        let Some(termination) = self
+            .runtime
+            .backend_job_termination(worker)
+            .map_err(RuntimeRegistryError::into_error)?
+        else {
+            return Ok(None);
+        };
         if !termination.feature_failures.is_empty()
             || termination.scope
                 != worker_runtime::execution::WorkerExecutionTerminationScope::Controller
@@ -1387,16 +1413,7 @@ impl WorkspaceApi {
                     .into(),
             ));
         }
-        self.store.record_backend_job_execution_fence(
-            self.workspace_id(),
-            attempt,
-            &serde_json::to_string(&termination)
-                .map_err(|error| Error::Store(error.to_string()))?,
-            &serde_json::to_string(drain.owner())
-                .map_err(|error| Error::Store(error.to_string()))?,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        )?;
-        Ok(())
+        Ok(Some(termination))
     }
 }
 

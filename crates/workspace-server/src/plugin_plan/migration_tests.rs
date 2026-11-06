@@ -22,26 +22,12 @@ fn plugin_plan_migration_marker_failure_preserves_catalog_then_retries_and_match
     updated
         .with_conn(|conn| {
             let mut expected = before.clone();
-            expected.push((
-                107,
-                "Immutable Worker Plugin plans and retained pins".into(),
-            ));
-            expected.push((
-                108,
-                "Subject Ticket responsibility and current-body notification routing".into(),
-            ));
-            expected.push((
-                109,
-                "Durable Plugin Host invocations and HTTPS effect receipts".into(),
-            ));
-            expected.push((110, "Worker Plugin launch selection associations".into()));
-            expected.push((
-                111,
-                "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
-            ));
-            expected.push((112, "Ticket Service outbox and fenced consumers".into()));
-            expected.push((113, "Ticket work-decomposition parent links".into()));
-            expected.push((122, crate::config_adoption::MIGRATION_NAME.into()));
+            expected.extend(
+                MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version > 106)
+                    .map(|migration| (migration.version, migration.name.into())),
+            );
             assert_eq!(workspace_schema_migration_history(conn)?, expected);
             subject_assignment_migration::verify(conn)?;
             crate::plugin_plan::verify_plan_schema(conn)?;

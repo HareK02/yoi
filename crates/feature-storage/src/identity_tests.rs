@@ -1237,3 +1237,58 @@ fn explicit_guard_pins_short_decision_without_holding_connection_or_sqlite_trans
     drop(guard);
     lock.try_lock().unwrap();
 }
+
+#[test]
+fn native_admission_holds_authority_writer_fence_through_effect_commit_and_rollback() {
+    struct ObserveDrop {
+        _fence: DatabaseWriterFence,
+        effect: Connection,
+        expected: i64,
+        observed: Arc<AtomicBool>,
+    }
+    impl Drop for ObserveDrop {
+        fn drop(&mut self) {
+            let count: i64 = self
+                .effect
+                .query_row("SELECT count(*) FROM records", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, self.expected);
+            self.observed.store(true, Ordering::SeqCst);
+        }
+    }
+    for fail in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let (manager, registration) = registered(temp.path());
+        let authority = manager
+            .scope("authority")
+            .unwrap()
+            .open(&registration)
+            .unwrap();
+        let effect = manager
+            .scope("effect")
+            .unwrap()
+            .open(&registration)
+            .unwrap();
+        let contender = Connection::open(database_path(temp.path(), "authority")).unwrap();
+        contender.busy_timeout(Duration::ZERO).unwrap();
+        let observed = Arc::new(AtomicBool::new(false));
+        let result: Result<()> = effect.try_transaction_admitted(
+            |_| Ok(ObserveDrop {
+                _fence: authority.writer_fence()?,
+                effect: Connection::open(database_path(temp.path(), "effect"))?,
+                expected: if fail { 0 } else { 1 }, observed: observed.clone(),
+            }),
+            |tx| {
+                assert!(matches!(contender.execute_batch("BEGIN IMMEDIATE"), Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy));
+                tx.execute("INSERT INTO records VALUES ('effect')", [])?;
+                if fail { return Err(FeatureStorageError::operation("rollback contrast")); }
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_err(), fail);
+        assert!(observed.load(Ordering::SeqCst));
+        contender
+            .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+            .unwrap();
+    }
+}

@@ -25075,16 +25075,17 @@ async fn scoped_subjektiv_session_backend(
                 SubjektivWorkerAuthority::Subject,
                 "Session history read",
             )?;
+            let operation = match &request.operation {
+                server_api::SubjektivSessionBackendOperation::List(_) => "session.list",
+                server_api::SubjektivSessionBackendOperation::Search(_) => "session.search",
+                server_api::SubjektivSessionBackendOperation::Read(_) => "session.read",
+            };
             authorize_subjektiv_operation(
                 &api,
                 &controller,
                 &path.workspace_id,
                 &subject_id,
-                match &request.operation {
-                    server_api::SubjektivSessionBackendOperation::List(_) => "session.list",
-                    server_api::SubjektivSessionBackendOperation::Search(_) => "session.search",
-                    server_api::SubjektivSessionBackendOperation::Read(_) => "session.read",
-                },
+                operation,
             )?;
             let store = match open_subjektiv_store(&api) {
                 Ok(store) => store,
@@ -25127,9 +25128,88 @@ async fn scoped_subjektiv_session_backend(
                     )
                 }
             };
+            // Runtime transport may wait while policy, body ownership or an
+            // observation grant changes. Never deliver its earlier authorized data.
+            let (current_subject, current_controller, current_authority) =
+                subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
+            require_subjektiv_worker_authority(
+                current_authority,
+                SubjektivWorkerAuthority::Subject,
+                "Session history return",
+            )?;
+            if current_subject != subject_id || current_controller != controller {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Session principal changed during read".into(),
+                )
+                .into());
+            }
+            authorize_subjektiv_operation(
+                &api,
+                &controller,
+                &path.workspace_id,
+                &subject_id,
+                operation,
+            )?;
+            revalidate_subjektiv_session_response(
+                &api,
+                &store,
+                &path.workspace_id,
+                &subject_id,
+                &controller,
+                &response,
+            )?;
             Ok(Json(response))
         })
         .await
+}
+
+fn revalidate_subjektiv_session_response(
+    api: &WorkspaceApi,
+    store: &crate::subjektiv::SubjektivStore,
+    workspace_id: &str,
+    subject_id: &str,
+    controller: &RuntimeWorkerRef,
+    response: &server_api::SubjektivSessionBackendResponse,
+) -> ApiResult<()> {
+    use server_api::{
+        SubjektivSessionBackendResponse as Response, SubjektivSessionBackendResult as Result,
+    };
+    let Response::Ok { result } = response else {
+        return Ok(());
+    };
+    let sessions: std::collections::BTreeSet<&str> = match result {
+        Result::List(page) => page
+            .items
+            .iter()
+            .map(|item| item.session_id.as_str())
+            .collect(),
+        Result::Search(page) => page
+            .items
+            .iter()
+            .map(|item| item.session_id.as_str())
+            .collect(),
+        Result::Read(page) => [page.session_id.as_str()].into_iter().collect(),
+    };
+    for session_id in sessions {
+        let attribution = store
+            .session_attribution(session_id)
+            .map_err(subjektiv_store_error)?
+            .filter(|attribution| attribution.subject_id == subject_id)
+            .ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Session attribution is no longer available".into(),
+                )
+            })?;
+        let source = authorized_subjektiv_session(api, workspace_id, controller, attribution)
+            .map_err(Error::Store)?;
+        if source.is_none_or(|source| source.expired) {
+            return Err(Error::WorkspacePermissionDenied(
+                "Session observation grant is no longer active".into(),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn subjektiv_session_list(
@@ -26397,26 +26477,27 @@ async fn scoped_subjektiv_memory_backend(
             } else {
                 subjektiv_subject_scope(&api, &path.workspace_id, &context)?
             };
+            let operation_name = match &request.operation {
+                Op::ResidentSummary(_) | Op::ResidentContext(_) => "memory.resident.read",
+                Op::ValidateProposal(_) => "memory.proposal.validate",
+                Op::ReceiptStatus(_) => "memory.receipt.read",
+                Op::StageExplicit(_) => "memory.staging.write",
+                Op::ListCandidates(_) => "memory.staging.list",
+                Op::ReadCandidate(_) => "memory.staging.read",
+                Op::DecideCandidate(_) => "memory.candidate.decide",
+                Op::PrepareSurface(_) => "memory.surface.prepare",
+                Op::PublishSurface(_) => "memory.surface.publish",
+                Op::FailSurface(_) => "memory.surface.fail",
+                Op::Query(_) => "memory.query",
+                Op::Read(_) => "memory.read",
+                Op::ListChanges(_) => "memory.changes.list",
+            };
             authorize_subjektiv_operation(
                 &api,
                 &source_worker,
                 &path.workspace_id,
                 &subject_id,
-                match &request.operation {
-                    Op::ResidentSummary(_) | Op::ResidentContext(_) => "memory.resident.read",
-                    Op::ValidateProposal(_) => "memory.proposal.validate",
-                    Op::ReceiptStatus(_) => "memory.receipt.read",
-                    Op::StageExplicit(_) => "memory.staging.write",
-                    Op::ListCandidates(_) => "memory.staging.list",
-                    Op::ReadCandidate(_) => "memory.staging.read",
-                    Op::DecideCandidate(_) => "memory.candidate.decide",
-                    Op::PrepareSurface(_) => "memory.surface.prepare",
-                    Op::PublishSurface(_) => "memory.surface.publish",
-                    Op::FailSurface(_) => "memory.surface.fail",
-                    Op::Query(_) => "memory.query",
-                    Op::Read(_) => "memory.read",
-                    Op::ListChanges(_) => "memory.changes.list",
-                },
+                operation_name,
             )?;
             let store = open_subjektiv_store(&api)?;
             // Authentication, live Worker/Job authority and committed Session provenance
@@ -26472,11 +26553,23 @@ async fn scoped_subjektiv_memory_backend(
                     )?
                 }
             };
-            Ok(Json(subjektiv::api::execute(
+            let effect_store = subject_authorization::memory_effect_store(
+                &api,
                 &store,
-                &host_context,
-                request.operation,
-            )?))
+                &source_worker,
+                &subject_id,
+                operation_name,
+            );
+            let response =
+                subjektiv::api::execute(&effect_store, &host_context, request.operation)?;
+            authorize_subjektiv_operation(
+                &api,
+                &source_worker,
+                &path.workspace_id,
+                &subject_id,
+                operation_name,
+            )?;
+            Ok(Json(response))
         })
         .await
 }
@@ -51849,7 +51942,15 @@ mod tests {
         }
     }
 
+    struct DeterministicAdmission {
+        workspace_id: Option<String>,
+        create_fingerprint: String,
+        deletion: Option<runtime_api::SubjectDeleteWorkerRequest>,
+    }
+
     struct DeterministicExecutionBackend {
+        admissions: Mutex<HashMap<worker_runtime::identity::WorkerRef, DeterministicAdmission>>,
+        subject_delete_checks: Mutex<Vec<runtime_api::SubjectDeleteWorkerRequest>>,
         receipts: Mutex<
             HashMap<
                 (worker_runtime::identity::WorkerRef, String),
@@ -51916,6 +52017,8 @@ mod tests {
                     .as_nanos()
             );
             Self {
+                admissions: Mutex::new(HashMap::new()),
+                subject_delete_checks: Mutex::new(Vec::new()),
                 receipts: Mutex::new(HashMap::new()),
                 terminations: Mutex::new(HashMap::new()),
                 lose_input_ack: std::sync::atomic::AtomicBool::new(false),
@@ -52090,6 +52193,30 @@ mod tests {
             &self,
             request: worker_runtime::execution::WorkerExecutionSpawnRequest,
         ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            let mut admissions = self.admissions.lock().unwrap();
+            if admissions
+                .get(&request.worker_ref)
+                .is_some_and(|a| a.deletion.is_some())
+            {
+                return worker_runtime::execution::WorkerExecutionSpawnResult::Rejected(
+                    worker_runtime::execution::WorkerExecutionResult::rejected(
+                        worker_runtime::execution::WorkerExecutionOperation::Spawn,
+                        "Fixture Subject admission is fenced",
+                    ),
+                );
+            }
+            admissions.insert(
+                request.worker_ref.clone(),
+                DeterministicAdmission {
+                    workspace_id: request
+                        .workspace_scope
+                        .as_ref()
+                        .map(|scope| scope.workspace_id.clone()),
+                    create_fingerprint: request.request.create_fingerprint.clone(),
+                    deletion: None,
+                },
+            );
+            drop(admissions);
             if let Some(message) = self.spawn_failure.lock().unwrap().take() {
                 return worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
                     worker_runtime::execution::WorkerExecutionResult::errored(
@@ -52125,6 +52252,18 @@ mod tests {
             &self,
             request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
         ) -> std::result::Result<(), worker_runtime::execution::WorkerExecutionResult> {
+            if self
+                .admissions
+                .lock()
+                .unwrap()
+                .get(&request.worker_ref)
+                .is_some_and(|a| a.deletion.is_some())
+            {
+                return Err(worker_runtime::execution::WorkerExecutionResult::rejected(
+                    worker_runtime::execution::WorkerExecutionOperation::Restore,
+                    "Fixture Subject admission is fenced",
+                ));
+            }
             if let Some(execution) = self.contexts.lock().unwrap().get(&request.worker_ref) {
                 return Err(worker_runtime::execution::WorkerExecutionResult::busy(
                     worker_runtime::execution::WorkerExecutionOperation::Restore,
@@ -52169,6 +52308,17 @@ mod tests {
                     working_directory: binding.status(),
                 })
                 .collect();
+            self.admissions.lock().unwrap().insert(
+                request.worker_ref.clone(),
+                DeterministicAdmission {
+                    workspace_id: request
+                        .workspace_scope
+                        .as_ref()
+                        .map(|scope| scope.workspace_id.clone()),
+                    create_fingerprint: request.request.create_fingerprint.clone(),
+                    deletion: None,
+                },
+            );
             self.contexts.lock().unwrap().insert(
                 request.worker_ref.clone(),
                 Arc::new(DeterministicWorkerExecution::new(
@@ -52311,9 +52461,100 @@ mod tests {
 
         fn preflight_subject_delete_worker(
             &self,
-            _request: &runtime_api::SubjectDeleteWorkerRequest,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
         ) -> std::result::Result<(), String> {
+            let worker = worker_runtime::identity::WorkerRef::new(request.worker_id);
+            let admissions = self.admissions.lock().unwrap();
+            let admission = admissions
+                .get(&worker)
+                .ok_or("Fixture creation identity unavailable")?;
+            if admission.workspace_id.as_deref() != Some(request.workspace_id.as_str())
+                || admission.create_fingerprint != request.create_fingerprint
+                || admission
+                    .deletion
+                    .as_ref()
+                    .is_some_and(|saved| saved != request)
+            {
+                return Err("Fixture Subject deletion identity changed".into());
+            }
             Ok(())
+        }
+
+        fn fence_subject_delete_worker(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> std::result::Result<(), String> {
+            self.preflight_subject_delete_worker(request)?;
+            self.admissions
+                .lock()
+                .unwrap()
+                .get_mut(&worker_runtime::identity::WorkerRef::new(request.worker_id))
+                .unwrap()
+                .deletion = Some(request.clone());
+            Ok(())
+        }
+
+        fn confirm_subject_delete_worker_absent(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> std::result::Result<(), String> {
+            self.preflight_subject_delete_worker(request)?;
+            self.subject_delete_checks
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            if let Some(message) = self.subject_delete_failure.lock().unwrap().clone() {
+                return Err(message);
+            }
+            let worker = worker_runtime::identity::WorkerRef::new(request.worker_id);
+            if self
+                .admissions
+                .lock()
+                .unwrap()
+                .get(&worker)
+                .and_then(|a| a.deletion.as_ref())
+                != Some(request)
+                || self.contexts.lock().unwrap().contains_key(&worker)
+            {
+                return Err(
+                    "Fixture Subject admission not fenced or execution still present".into(),
+                );
+            }
+            // Historical shutdown is reconciled separately against the retained receipt.
+            Ok(())
+        }
+
+        fn subject_delete_worker_stop(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+            stop: worker_runtime::execution::WorkerExecutionStopRequest,
+            canonical: Option<&worker_runtime::execution::WorkerExecutionTermination>,
+        ) -> std::result::Result<worker_runtime::execution::WorkerExecutionResult, String> {
+            use worker_runtime::execution::*;
+            self.preflight_subject_delete_worker(request)?;
+            self.subject_delete_checks
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            if let Some(message) = self.subject_delete_failure.lock().unwrap().clone() {
+                return Err(message);
+            }
+            if let Some(saved) = canonical {
+                if !saved.confirms_scope_shutdown(&stop.worker_ref, stop.operation_id)
+                    || self
+                        .reconcile_termination_receipt(&stop.worker_ref, saved)?
+                        .as_ref()
+                        != Some(saved)
+                {
+                    return Err("Fixture canonical Stop no longer matches actual execution".into());
+                }
+                self.confirm_subject_delete_worker_absent(request)?;
+                let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+                result.execution_id = Some(saved.execution_id);
+                result.termination = Some(saved.clone());
+                return Ok(result);
+            }
+            Ok(self.stop_worker_operation(stop))
         }
 
         fn subject_delete_worker(
@@ -68950,7 +69191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedded_runtime_fs_store_restores_catalog_and_stops_failed_execution() {
+    async fn embedded_runtime_fs_store_retains_catalog_when_restore_and_stop_are_unconfirmed() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path().join("workspace"));
         let store_root = config.embedded_runtime_store_root.clone();
@@ -69177,33 +69418,44 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
-        assert_eq!(
-            restored_execution.stops.lock().unwrap().as_slice(),
-            &[observation.worker_ref.clone()]
+        assert_eq!(stopped.state, InternalWorkerOperationState::Rejected);
+        assert!(
+            stopped.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("No fixture execution or matching stop receipt")
+            }),
+            "missing execution must remain unconfirmed: {:?}",
+            stopped.diagnostics
         );
-        let stopped_worker = restored.runtime.worker(&worker_ref).unwrap();
-        assert_eq!(stopped_worker.state, "stopped");
-        sync_worker_observation(&restored, &stopped_worker).unwrap();
-        seed_worker_session_for_cleanup(&dir.path().join("workspace"), &worker_ref);
-        let removed = removal
+        assert!(restored_execution.stops.lock().unwrap().is_empty());
+        assert!(
+            restored
+                .runtime
+                .backend_job_termination(&worker_ref)
+                .unwrap()
+                .is_none()
+        );
+        let retained_worker = restored.runtime.worker(&worker_ref).unwrap();
+        assert_ne!(retained_worker.state, "stopped");
+        sync_worker_observation(&restored, &retained_worker).unwrap();
+        let unconfirmed = removal
             .execute_async(
                 verified_source(),
                 &worker_ref.runtime_id,
                 &worker_ref.worker_id,
-                "remove stopped Worker after rejected automatic restore",
+                "unconfirmed Stop cannot authorize removal",
             )
             .await
             .unwrap();
-        assert_eq!(removed.status, StatusCode::OK.as_u16(), "{}", removed.body);
-        assert!(removed.body.contains("\"removed\":true"));
-        assert!(restored.runtime.worker(&worker_ref).is_err());
+        assert_eq!(unconfirmed.status, StatusCode::CONFLICT.as_u16());
+        assert!(restored.runtime.worker(&worker_ref).is_ok());
         assert!(
             restored
                 .store
                 .get_worker_registry(TEST_WORKSPACE_ID, &worker_ref)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
     }
 

@@ -112,6 +112,63 @@ async fn fixture() -> (Runtime, RemoteRuntimeConfig, tokio::task::JoinHandle<()>
     (runtime, config, task)
 }
 
+#[derive(Clone)]
+struct UnusedSubscriptionModel;
+
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for UnusedSubscriptionModel {
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+
+    async fn stream(
+        &self,
+        _request: agen::llm_client::Request,
+    ) -> Result<agen::llm_client::client::ResponseStream, agen::llm_client::ClientError> {
+        panic!("subscription lifecycle must not submit model work")
+    }
+}
+
+// Only the model boundary is substituted. Stop joins the production Controller,
+// Features and relay tasks, and deletion consumes its canonical Runtime receipt.
+fn controller_fixture() -> (Runtime, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    let factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(root.path())
+        .with_runtime_store_dir(root.path().join("runtime"))
+        .with_spawn_model_client_factory(|| Box::new(UnusedSubscriptionModel));
+    let backend =
+        worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory).unwrap();
+    let runtime = Runtime::with_execution_backend(
+        worker_runtime::RuntimeOptions::default(),
+        std::sync::Arc::new(backend),
+    )
+    .unwrap();
+    let mut request = create_request("subscription Controller");
+    request.profile_source = ProfileSourceArchiveSource::Embedded {
+        archive: worker_runtime::profile_archive::ProfileSourceArchive::build(
+            worker_runtime::profile_archive::ProfileSourceArchiveInput {
+                id: "subscription-controller".into(),
+                entrypoints: std::collections::BTreeMap::from([("builtin:companion".into(), "profiles/subscription.dcdl".into())]),
+                imports: std::collections::BTreeMap::new(),
+                sources: std::collections::BTreeMap::from([("profiles/subscription.dcdl".into(), r#"{
+                    slug = "companion";
+                    description = "Subscription lifecycle Controller";
+                    scope = "workspace_read";
+                    model = { scheme = "anthropic"; model_id = "unused"; auth = { kind = "none"; }; };
+                    engine = { max_tokens = 100; };
+                }"#.into())]),
+            },
+        ).unwrap(),
+    };
+    runtime
+        .create_worker_scoped(
+            &worker_runtime::RuntimeWorkspaceScope::new("local", "local-token"),
+            request,
+        )
+        .unwrap();
+    (runtime, root)
+}
+
 async fn next_event(subscription: &mut BrokerSubscription) -> BrokerSubscriptionEvent {
     tokio::time::timeout(Duration::from_secs(5), subscription.recv())
         .await
@@ -314,7 +371,7 @@ async fn reconnect_resubscribes_and_replaces_state_from_fresh_snapshot() {
 
 #[tokio::test]
 async fn embedded_runtime_uses_in_process_subscription_source() {
-    let (runtime, _config, server) = fixture().await;
+    let (runtime, _root) = controller_fixture();
     let worker = runtime.list_workers().unwrap().remove(0);
     let broker = RuntimeSubscriptionBroker::new("local");
     broker.register_embedded_runtime("embedded-worker-runtime", runtime.clone());
@@ -391,21 +448,32 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
     runtime
         .stop_worker(&worker.worker_ref, Some("done".to_string()))
         .unwrap();
-    assert!(matches!(
-        next_event(&mut subscription).await,
-        BrokerSubscriptionEvent::Event {
-            payload: SubscriptionEventPayload::WorkerUpserted { .. },
-            ..
+    let termination = runtime
+        .execution_termination(&worker.worker_ref)
+        .unwrap()
+        .expect("actual Controller shutdown receipt");
+    assert_eq!(
+        termination.scope,
+        worker_runtime::execution::WorkerExecutionTerminationScope::Controller
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(next_event(&mut subscription).await,
+                BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerUpserted { worker: ref stopped }, .. }
+                if stopped.worker_id.as_str() == worker.worker_ref.worker_id.to_string()
+                    && stopped.state == SubscriptionWorkerState::Stopped)
+            { break; }
         }
-    ));
+    }).await.expect("Stopped upsert after actual teardown");
     runtime.delete_worker(&worker.worker_ref).unwrap();
-    assert!(matches!(
-        next_event(&mut subscription).await,
-        BrokerSubscriptionEvent::Event {
-            payload: SubscriptionEventPayload::WorkerRemoved { .. },
-            ..
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(next_event(&mut subscription).await,
+                BrokerSubscriptionEvent::Event { payload: SubscriptionEventPayload::WorkerRemoved { ref worker_id, .. }, .. }
+                if worker_id.as_str() == worker.worker_ref.worker_id.to_string())
+            { break; }
         }
-    ));
+    }).await.expect("Removed event for the stopped Worker");
     let mut after_remove = broker
         .subscribe(
             "embedded-worker-runtime",
@@ -421,6 +489,29 @@ async fn embedded_runtime_uses_in_process_subscription_source() {
         SubscriptionSnapshot::Workers { workers }
             if workers.iter().all(|candidate| candidate.worker_id.as_str() != worker.worker_ref.worker_id.to_string())
     ));
+}
+
+#[tokio::test]
+async fn accepted_only_stop_does_not_publish_termination_or_allow_removal() {
+    let (runtime, _config, server) = fixture().await;
+    let worker = runtime.list_workers().unwrap().remove(0);
+    assert!(
+        runtime
+            .stop_worker(&worker.worker_ref, Some("unconfirmed".into()))
+            .is_err()
+    );
+    assert!(
+        runtime
+            .execution_termination(&worker.worker_ref)
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(
+        runtime.worker_detail(&worker.worker_ref).unwrap().status,
+        worker_runtime::catalog::WorkerStatus::Stopped
+    );
+    assert!(runtime.delete_worker(&worker.worker_ref).is_err());
+    assert!(runtime.worker_detail(&worker.worker_ref).is_ok());
     server.abort();
 }
 

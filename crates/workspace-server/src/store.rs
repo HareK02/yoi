@@ -3041,6 +3041,17 @@ impl SqliteWorkspaceStore {
         }
     }
 
+    pub(crate) fn memory_authority_fence(
+        &self,
+    ) -> feature_storage::Result<feature_storage::DatabaseWriterFence> {
+        match &self.conn {
+            StoreConnection::Managed(database) => database.writer_fence(),
+            StoreConnection::Fixture(_) => Err(feature_storage::FeatureStorageError::operation(
+                "Memory effect authority requires a managed Host catalog",
+            )),
+        }
+    }
+
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         match &self.conn {
             StoreConnection::Managed(database) => database.try_with_connection(f),
@@ -8867,7 +8878,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR (a.state='completed' AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR ((a.state='completed' OR (a.state='failed' AND j.failure_category='journal_execution_terminated')) AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
             // Immutable identities keep the boundary stable while admitted
             // owners change cleanup state/timestamps. Selection grants no claim.
@@ -19316,7 +19327,10 @@ mod tests {
             merge_request::migrate(&conn).unwrap();
             conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
                 .unwrap();
-            create_latest_workspace_schema(&conn).unwrap();
+            let transaction =
+                rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Exclusive)
+                    .unwrap();
+            create_latest_workspace_schema(&transaction).unwrap();
             conn.execute(
                 "INSERT INTO __yoi_schema_migrations(version, name) VALUES (?1, ?2)",
                 params![baseline_version, SCHEMA_BASELINE_NAME],
@@ -19332,6 +19346,7 @@ mod tests {
                 )
                 .unwrap();
             }
+            transaction.commit().unwrap();
             verify_schema_history(&conn, LATEST_SCHEMA_VERSION).unwrap();
         }
     }
@@ -21941,31 +21956,24 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         .unwrap();
         let error = apply_migrations(&conn).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not start with a retained schema baseline")
+            matches!(&error, Error::Store(message) if message.starts_with("Server storage format: unknown baseline or current version:")),
+            "{error:?}"
         );
     }
 
     #[test]
     fn startup_rejects_noncanonical_history_at_the_baseline_version() {
         let conn = Connection::open_in_memory().unwrap();
-        configure_sqlite(&conn).unwrap();
+        prepare_connection(&conn).unwrap();
         conn.execute(
             "INSERT INTO __yoi_schema_migrations (version, name) VALUES (1, 'legacy')",
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![LATEST_SCHEMA_VERSION, "workspace schema baseline"],
-        )
-        .unwrap();
         let error = apply_migrations(&conn).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not start with a retained schema baseline")
+            matches!(&error, Error::Store(message) if message == "Server storage format: unrecognized Backend Job execution receipt"),
+            "{error:?}"
         );
     }
 

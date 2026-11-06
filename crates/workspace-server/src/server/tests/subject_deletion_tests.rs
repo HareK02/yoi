@@ -1144,6 +1144,15 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
             },
         )
         .unwrap();
+    let stop_receipt = execution
+        .terminations
+        .lock()
+        .unwrap()
+        .values()
+        .find(|receipt| receipt.worker_ref.worker_id.to_string() == worker.worker_id)
+        .unwrap()
+        .clone();
+    let stops_before = execution.stops.lock().unwrap().clone();
     let inventory = api.runtime.worker_retention_inventory(&worker).unwrap();
     let old = api
         .config_store
@@ -1179,6 +1188,15 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
     .await;
     assert_eq!(status, StatusCode::OK, "{pending}");
     assert_eq!(pending["completed"], false);
+    assert!(
+        execution
+            .subject_delete_checks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| { request.worker_id.to_string() == worker.worker_id }),
+        "the injected absence-check failure, not an unsupported backend, must keep deletion pending"
+    );
     let snapshot = api
         .config_store
         .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
@@ -1209,6 +1227,15 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
         .execute_worker_retention(&worker, saved.runtime_request)
         .unwrap();
     assert_eq!(replay, result);
+    assert_eq!(*execution.stops.lock().unwrap(), stops_before);
+    assert_eq!(
+        execution
+            .terminations
+            .lock()
+            .unwrap()
+            .get(&stop_receipt.worker_ref),
+        Some(&stop_receipt)
+    );
     let archive = result.archive.unwrap();
     assert!(
         dir.path()

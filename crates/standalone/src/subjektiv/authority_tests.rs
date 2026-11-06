@@ -529,3 +529,146 @@ fn consolidation_service_rechecks_writer_after_attempt_admission_wait() {
             .is_some()
     );
 }
+
+struct HeldMemoryAdmission {
+    entered: mpsc::Sender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+    actual: authority::LocalMemoryEffectAuthority,
+}
+impl subjektiv::effect_admission::MemoryEffectAuthority for HeldMemoryAdmission {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::MemoryEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::MemoryEffectLease>> {
+        self.entered.send(()).unwrap();
+        self.resume
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        self.actual.enter(admission)
+    }
+}
+
+#[test]
+fn memory_native_admission_revocation_prevents_memory_disposition_and_receipt_commit() {
+    // Actual domain transaction admission -> Local Host policy/writer check ->
+    // SQLite mutation. Only the external canonical policy owner is substituted.
+    for revoke in [false, true] {
+        let (fixture, source) = canonical_fixture();
+        let job = job_host(&fixture, Arc::new(OpenFence));
+        job.authorize_operation(&context(&job), "memory.candidate.decide")
+            .unwrap();
+        let authority = subjektiv::api::HostOperationContext::validated_consolidation(
+            &fixture.body.host.catalog.store,
+            &fixture.body.binding.subject_id,
+            Some(vec!["candidate".into()]),
+            None,
+        )
+        .unwrap();
+        let (entered, waiting) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let store = fixture
+            .body
+            .host
+            .catalog
+            .store
+            .with_memory_effect_authority(Arc::new(HeldMemoryAdmission {
+                entered,
+                resume: Mutex::new(resumed),
+                actual: authority::LocalMemoryEffectAuthority {
+                    host: fixture.body.host.clone(),
+                    operation: "memory.candidate.decide".into(),
+                },
+            }));
+        let decision = serde_json::from_value(serde_json::json!({
+            "request_id":"native-admission-decision", "candidate_id":"candidate", "reason":"adopt lesson",
+            "decision":{"kind":"apply", "target":{"kind":"create"}, "memory":{
+                "kind":"lesson", "state":"active", "claim":"Respect current authority",
+                "body_md":"Do not mutate after revocation", "why_useful":"Preserve authority",
+                "staleness":null, "derived_from":[], "change_reason":"adopt"
+            }}
+        })).unwrap();
+        let result = std::thread::scope(|scope| {
+            let call = scope.spawn(|| {
+                subjektiv::api::execute(
+                    &store,
+                    &authority,
+                    SubjektivMemoryBackendOperation::DecideCandidate(decision),
+                )
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            if revoke {
+                source
+                    .current
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .execution
+                    .revoked = true;
+            }
+            resume.send(()).unwrap();
+            call.join().unwrap()
+        });
+        let subject = &fixture.body.binding.subject_id;
+        if revoke {
+            assert!(
+                matches!(
+                    result,
+                    Err(subjektiv::api::OperationError::PermissionDenied(_))
+                ),
+                "{result:?}"
+            );
+            assert!(
+                fixture
+                    .body
+                    .host
+                    .catalog
+                    .store
+                    .staging_resolution(subject, "candidate")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                fixture
+                    .body
+                    .host
+                    .catalog
+                    .store
+                    .list_memories(subject)
+                    .unwrap()
+                    .is_empty()
+            );
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Ok(SubjektivMemoryBackendResponse::CandidateDecided(_))
+                ),
+                "{result:?}"
+            );
+            assert!(
+                fixture
+                    .body
+                    .host
+                    .catalog
+                    .store
+                    .staging_resolution(subject, "candidate")
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                fixture
+                    .body
+                    .host
+                    .catalog
+                    .store
+                    .list_memories(subject)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+}

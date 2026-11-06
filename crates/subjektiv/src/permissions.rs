@@ -43,23 +43,30 @@ impl SubjektivStore {
     pub fn current_subject_policy(&self, subject_id: &str) -> Result<Option<CurrentSubjectPolicy>> {
         self.database.try_transaction(|connection| {
             require_subject(connection, subject_id)?;
-            if transfer::is_sealed(connection)? {
-                return self
-                    .canonical_permission_source
-                    .as_ref()
-                    .ok_or_else(|| denied("canonical permission source is not connected"))?
-                    .current_subject_policy(self.scope_id(), subject_id);
-            }
-            stored_source(connection, subject_id)?
-                .map(|source| match source {
-                    StoredSubjectPolicy::Feature(source) => Ok(source),
-                    StoredSubjectPolicy::Legacy(source) => {
-                        CurrentSubjectPolicy::from_legacy(source)
-                            .map_err(SubjektivError::InvalidRecord)
-                    }
-                })
-                .transpose()
+            self.current_policy_in_connection(connection, subject_id)
         })
+    }
+
+    pub(crate) fn current_policy_in_connection(
+        &self,
+        connection: &Connection,
+        subject_id: &str,
+    ) -> Result<Option<CurrentSubjectPolicy>> {
+        if transfer::is_sealed(connection)? {
+            return self
+                .canonical_permission_source
+                .as_ref()
+                .ok_or_else(|| denied("canonical permission source is not connected"))?
+                .current_subject_policy(self.scope_id(), subject_id);
+        }
+        stored_source(connection, subject_id)?
+            .map(|source| match source {
+                StoredSubjectPolicy::Feature(source) => Ok(source),
+                StoredSubjectPolicy::Legacy(source) => {
+                    CurrentSubjectPolicy::from_legacy(source).map_err(SubjektivError::InvalidRecord)
+                }
+            })
+            .transpose()
     }
 
     /// Unset sources are `None` (deny), including migrated Subjects. This is an admin read,

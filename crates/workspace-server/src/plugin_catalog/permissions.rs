@@ -187,23 +187,34 @@ impl SqliteWorkspaceStore {
     ) -> Result<()> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let selected = tx.prepare("SELECT r.installation_id,r.artifact_digest,a.artifact_size \
+            self.sync_plugin_permission_registry_in_connection(&tx, root, workspace, registry)?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn sync_plugin_permission_registry_in_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        root: &Path,
+        workspace: &str,
+        registry: &mut FeaturePermissionRegistry,
+    ) -> Result<()> {
+        let selected = conn.prepare("SELECT r.installation_id,r.artifact_digest,a.artifact_size \
                 FROM plugin_references r JOIN plugin_installations i USING(workspace_id,installation_id) \
                 JOIN plugin_artifacts a USING(workspace_id,installation_id,artifact_digest) \
                 WHERE r.workspace_id=?1 AND r.kind='config' AND r.owner='workspace-config' \
                 AND i.uninstalled=0 AND a.revoked=0 ORDER BY r.installation_id,r.artifact_digest")?
                 .query_map([workspace], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut declarations = BTreeMap::new();
-            for (installation, digest, size) in selected {
-                let manifest = self.plugin_manifest_cache.read(root, &digest, size)?;
-                let id = format!("{LOADER_PREFIX}{installation}:{digest}");
-                declarations.insert(id, manifest.permission_namespaces.clone());
-            }
-            reconcile(registry, workspace, declarations)?;
-            tx.commit()?;
-            Ok(())
-        })
+        let mut declarations = BTreeMap::new();
+        for (installation, digest, size) in selected {
+            let manifest = self.plugin_manifest_cache.read(root, &digest, size)?;
+            let id = format!("{LOADER_PREFIX}{installation}:{digest}");
+            declarations.insert(id, manifest.permission_namespaces.clone());
+        }
+        reconcile(registry, workspace, declarations)?;
+        Ok(())
     }
 }
 

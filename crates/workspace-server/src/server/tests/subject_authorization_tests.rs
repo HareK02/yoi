@@ -4858,3 +4858,75 @@ async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_r
     assert_eq!(saved.request, job.request);
     assert_eq!(saved.request.source_worker.as_ref(), Some(&f.source));
 }
+
+#[tokio::test]
+async fn memory_native_effect_rechecks_prepared_authority_and_preserves_no_write_on_revocation() {
+    // Native admission component: actual owner adoption, Worker singleton,
+    // registered Feature resolver and SQLite effects. Context preparation is
+    // explicit; HTTP role dispatch/Job attempts are covered by the Job suite.
+    for change in ["unchanged", "policy", "body"] {
+        let fixture = Fixture::new().await;
+        fixture.adopt_policy(r#"{ namespaces = [{ namespace = "memory"; keys = ["memory.surface.prepare"]; }]; }"#, "{}").await;
+        let store = open_subjektiv_store(&fixture.api).unwrap();
+        let context = subjektiv::api::HostOperationContext::validated_consolidation(
+            &store,
+            &fixture.subject,
+            Some(vec![]),
+            None,
+        )
+        .unwrap();
+        authorize_subjektiv_operation(
+            &fixture.api,
+            &fixture.source,
+            TEST_WORKSPACE_ID,
+            &fixture.subject,
+            "memory.surface.prepare",
+        )
+        .unwrap();
+        match change {
+            "policy" => fixture.adopt_policy("{}", "{}").await,
+            "body" => fixture.release_source_lease(),
+            _ => {}
+        }
+        let effect_store = subject_authorization::memory_effect_store(
+            &fixture.api,
+            &store,
+            &fixture.source,
+            &fixture.subject,
+            "memory.surface.prepare",
+        );
+        let result = subjektiv::api::execute(
+            &effect_store,
+            &context,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                serde_json::from_value(json!({})).unwrap(),
+            ),
+        );
+        if change == "unchanged" {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(subjektiv::api::OperationError::PermissionDenied(_))
+                ),
+                "{change}: {result:?}"
+            );
+        }
+        fixture
+            .api
+            .feature_storage
+            .open(&fixture.api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT count(*) FROM surface_generation_runs WHERE subject_id=?1",
+                    [&fixture.subject],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(count, if change == "unchanged" { 1 } else { 0 });
+                Ok(())
+            })
+            .unwrap();
+    }
+}

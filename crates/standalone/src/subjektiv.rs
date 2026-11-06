@@ -700,6 +700,7 @@ fn operation_error(error: subjektiv::api::OperationError) -> SubjektivHostError 
             message,
         },
         Store(message) => SubjektivHostError::Unavailable(message),
+        PermissionDenied(message) => SubjektivHostError::PermissionDenied(message),
         other => SubjektivHostError::InvalidArgument(other.to_string()),
     }
 }
@@ -1531,7 +1532,8 @@ impl SubjektivHost for LocalSubjectHost {
         )
         .map_err(operation_error)?;
         self.authorize_operation(context, operation_name)?;
-        let response = subjektiv::api::execute(&self.catalog.store, &authority, operation)
+        let effect_store = self.memory_effect_store(operation_name)?;
+        let response = subjektiv::api::execute(&effect_store, &authority, operation)
             .map_err(operation_error)?;
         self.authorize_operation(context, operation_name)?;
         Ok(response)
@@ -1590,8 +1592,7 @@ impl SubjektivHost for LocalSubjectHost {
         );
         self.authorize_operation(context, "memory.extract.commit")?;
         let (staged, _) = self
-            .catalog
-            .store
+            .memory_effect_store("memory.extract.commit")?
             .stage_candidate_with_attribution(
                 subjektiv::SubjectStagingRecord::attach(&self.binding.subject_id, record),
                 attribution,
@@ -1874,8 +1875,12 @@ impl SubjektivHost for LocalConsolidationHost {
             }),
         )
         .map_err(operation_error)?;
-        let response = subjektiv::api::execute(&self.host.catalog.store, &authority, operation)
-            .map_err(operation_error)?;
+        let response = subjektiv::api::execute(
+            &self.host.memory_effect_store(operation_name)?,
+            &authority,
+            operation,
+        )
+        .map_err(operation_error)?;
         self.authorize_operation(context, operation_name)?;
         Ok(response)
     }

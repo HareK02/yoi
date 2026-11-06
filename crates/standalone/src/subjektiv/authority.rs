@@ -28,11 +28,6 @@ impl LocalSubjectHost {
     }
 
     pub(super) fn check_current_policy(&self, operation: &str) -> Result<(), SubjektivHostError> {
-        let registry = self
-            .catalog
-            .permissions
-            .lock()
-            .expect("Subject permissions poisoned");
         let subject = self
             .catalog
             .store
@@ -51,6 +46,20 @@ impl LocalSubjectHost {
             .ok_or_else(|| {
                 SubjektivHostError::PermissionDenied("Subject permissions are unset".into())
             })?;
+        let registry = self
+            .catalog
+            .permissions
+            .lock()
+            .expect("Subject permissions poisoned");
+        self.check_policy_with_registry(operation, &source, &registry)
+    }
+
+    fn check_policy_with_registry(
+        &self,
+        operation: &str,
+        source: &server_api::authorization::CurrentSubjectPolicy,
+        registry: &worker::feature::permissions::FeaturePermissionRegistry,
+    ) -> Result<(), SubjektivHostError> {
         let key = PermissionKey::parse(operation).map_err(SubjektivHostError::PermissionDenied)?;
         // These are the three service boundaries implemented by this Host, not
         // a caller-supplied Feature selector. Other Features check their own handles.
@@ -89,7 +98,7 @@ impl LocalSubjectHost {
                 "current Subject policy does not grant `{operation}`"
             )));
         }
-        if let Some(legacy) = source.legacy_constraints {
+        if let Some(legacy) = &source.legacy_constraints {
             let requested = ScopedPermission {
                 operation: operation.into(),
                 resource: PermissionResource::Subject {
@@ -108,5 +117,55 @@ impl LocalSubjectHost {
             }
         }
         Ok(())
+    }
+}
+
+pub(super) struct LocalMemoryEffectAuthority {
+    pub(super) host: Arc<LocalSubjectHost>,
+    pub(super) operation: String,
+}
+impl subjektiv::effect_admission::MemoryEffectAuthority for LocalMemoryEffectAuthority {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::MemoryEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::MemoryEffectLease>> {
+        if !self.host.live.load(Ordering::Acquire) || !admission.writer_active(&self.host.writer)? {
+            return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                "Subject writer is no longer active".into(),
+            ));
+        }
+        let policy = admission
+            .current_policy(&self.host.binding.subject_id)?
+            .ok_or_else(|| {
+                subjektiv::SubjektivError::AuthorizationDenied("Subject policy is unset".into())
+            })?;
+        let registry = self
+            .host
+            .catalog
+            .permissions
+            .lock()
+            .expect("Subject permissions poisoned");
+        self.host
+            .check_policy_with_registry(&self.operation, &policy, &registry)
+            .map_err(|error| subjektiv::SubjektivError::AuthorizationDenied(error.to_string()))?;
+        Ok(Box::new(registry))
+    }
+}
+impl LocalSubjectHost {
+    pub(super) fn memory_effect_store(
+        &self,
+        operation: &str,
+    ) -> Result<subjektiv::SubjektivStore, SubjektivHostError> {
+        let host = self
+            .self_weak
+            .upgrade()
+            .ok_or_else(|| SubjektivHostError::Unavailable("Subject Host is closed".into()))?;
+        Ok(self
+            .catalog
+            .store
+            .with_memory_effect_authority(Arc::new(LocalMemoryEffectAuthority {
+                host,
+                operation: operation.into(),
+            })))
     }
 }

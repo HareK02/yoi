@@ -42,9 +42,48 @@ impl CurrentSubjectPolicy {
         delegation: bool,
         subject_id: &str,
     ) -> ApiResult<bool> {
+        self.allows_with(
+            authority,
+            needed,
+            delegation,
+            subject_id,
+            |operation, assignment| current_key_allowed(authority, operation, assignment),
+        )
+    }
+
+    fn allows_in_registry(
+        &self,
+        authority: &WorkerAuthorityView,
+        needed: &ScopedPermission,
+        delegation: bool,
+        subject_id: &str,
+        registry: &worker::feature::permissions::FeaturePermissionRegistry,
+    ) -> ApiResult<bool> {
+        self.allows_with(
+            authority,
+            needed,
+            delegation,
+            subject_id,
+            |operation, assignment| {
+                key_allowed_in_registry(authority, registry, operation, assignment)
+            },
+        )
+    }
+
+    fn allows_with(
+        &self,
+        authority: &WorkerAuthorityView,
+        needed: &ScopedPermission,
+        delegation: bool,
+        subject_id: &str,
+        key_allowed: impl Fn(
+            &str,
+            Option<&feature_permissions::PermissionAssignment>,
+        ) -> ApiResult<bool>,
+    ) -> ApiResult<bool> {
         let constraints = match self {
             Self::Legacy(policy) => {
-                if !current_key_allowed(authority, &needed.operation, None)? {
+                if !key_allowed(&needed.operation, None)? {
                     return Ok(false);
                 }
                 Some(policy)
@@ -55,7 +94,7 @@ impl CurrentSubjectPolicy {
                 } else {
                     &policy.execution
                 };
-                if !current_key_allowed(authority, &needed.operation, Some(assignment))? {
+                if !key_allowed(&needed.operation, Some(assignment))? {
                     return Ok(false);
                 }
                 if policy.legacy_constraints.is_none()
@@ -179,6 +218,20 @@ fn current_key_allowed(
         .permission_registry
         .read()
         .map_err(|_| denied("current Feature permission registry is unavailable"))?;
+    key_allowed_in_registry(authority, &registry, operation, assignment)
+}
+
+fn key_allowed_in_registry(
+    authority: &WorkerAuthorityView,
+    registry: &worker::feature::permissions::FeaturePermissionRegistry,
+    operation: &str,
+    assignment: Option<&feature_permissions::PermissionAssignment>,
+) -> ApiResult<bool> {
+    let operation = canonical_worker_operation(operation).unwrap_or(operation);
+    if !operation.contains('.') {
+        return Ok(assignment.is_none());
+    }
+    let key = feature_permissions::PermissionKey::parse(operation).map_err(denied)?;
     let catalog = registry.host().catalog();
     if catalog.workspace.as_str() != authority.workspace_id {
         return Err(denied(
@@ -580,6 +633,15 @@ fn job_permissions(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<Option<Vec<ScopedPermission>>> {
+    job_permissions_with_policy(api, worker, |subject| policy(api, subject), None)
+}
+
+fn job_permissions_with_policy(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    current_policy: impl FnOnce(&str) -> ApiResult<Option<CurrentSubjectPolicy>>,
+    registry: Option<&worker::feature::permissions::FeaturePermissionRegistry>,
+) -> ApiResult<Option<Vec<ScopedPermission>>> {
     let Some(binding) = api
         .store
         .worker_registry_projection(api.workspace_id(), worker)?
@@ -620,7 +682,7 @@ fn job_permissions(
     if current_body_subject(api, origin)?.as_deref() != Some(subject_id.as_str()) {
         return Err(denied("Job origin is no longer the current Subject body"));
     }
-    let Some(policy) = policy(api, subject_id)? else {
+    let Some(policy) = current_policy(subject_id)? else {
         return Ok(Some(Vec::new()));
     };
     // Domain grants are immutable capabilities, not policy snapshots. Resolve
@@ -671,7 +733,12 @@ fn job_permissions(
                 subject_id: subject_id.clone(),
             },
         };
-        if policy.allows(&authority, &permission, false, subject_id)? {
+        if match registry {
+            Some(registry) => {
+                policy.allows_in_registry(&authority, &permission, false, subject_id, registry)?
+            }
+            None => policy.allows(&authority, &permission, false, subject_id)?,
+        } {
             permissions.push(permission);
         }
     }
@@ -1392,4 +1459,129 @@ pub(super) fn administration_actor(
         .actor
         .as_ref()
         .ok_or_else(|| denied("Subject permission administration requires an authenticated owner"))
+}
+
+struct MemoryEffectAuthority {
+    api: WorkspaceApi,
+    worker: RuntimeWorkerRef,
+    subject: String,
+    operation: String,
+}
+impl subjektiv::effect_admission::MemoryEffectAuthority for MemoryEffectAuthority {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::MemoryEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::MemoryEffectLease>> {
+        let reject = |error: ApiError| match error.error {
+            Error::WorkspacePermissionDenied(message) | Error::RepositoryConflict(message) => {
+                subjektiv::SubjektivError::AuthorizationDenied(message)
+            }
+            error => subjektiv::SubjektivError::Storage(
+                feature_storage::FeatureStorageError::operation(error.to_string()),
+            ),
+        };
+        // Admission order: Feature DB -> catalog registry -> Host writer. Resolve
+        // through that already held transaction, never a recursive catalog writer.
+        let mut registry = self.api.permission_registry.write().map_err(|_| {
+            subjektiv::SubjektivError::AuthorizationDenied("Feature registry is unavailable".into())
+        })?;
+        let fence = self.api.config_store.memory_authority_fence()?;
+        let authority = WorkerAuthorityView::from(&self.api);
+        fence
+            .with_connection(|connection| {
+                self.api
+                    .config_store
+                    .sync_plugin_permission_registry_in_connection(
+                        connection,
+                        &authority.plugin_artifact_root,
+                        self.api.workspace_id(),
+                        &mut registry,
+                    )
+            })
+            .map_err(|error| {
+                subjektiv::SubjektivError::Storage(feature_storage::FeatureStorageError::operation(
+                    error.to_string(),
+                ))
+            })?;
+        let source = admission.current_policy(&self.subject)?.ok_or_else(|| {
+            subjektiv::SubjektivError::AuthorizationDenied("Subject policy is unset".into())
+        })?;
+        let requested = ScopedPermission {
+            operation: self.operation.clone(),
+            resource: PermissionResource::Subject {
+                workspace_id: self.api.workspace_id().into(),
+                subject_id: self.subject.clone(),
+            },
+        };
+        let permissions = job_permissions_with_policy(
+            &self.api,
+            &self.worker,
+            |subject| {
+                if subject != self.subject {
+                    return Err(denied("Memory Job Subject changed"));
+                }
+                Ok(Some(CurrentSubjectPolicy::Canonical(source.clone())))
+            },
+            Some(&registry),
+        )
+        .map_err(reject)?;
+        if let Some(permissions) = permissions {
+            if !permissions
+                .iter()
+                .any(|permission| permission.covers(&requested))
+            {
+                return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                    "Memory operation is outside the live Job grant".into(),
+                ));
+            }
+        } else {
+            let authority = WorkerAuthorityView::from(&self.api);
+            if authority
+                .current_body_subject(&self.worker)
+                .map_err(reject)?
+                .as_deref()
+                != Some(self.subject.as_str())
+            {
+                let owner = self
+                    .api
+                    .store
+                    .require_current_worker_singleton_owner(self.api.workspace_id(), &self.worker)
+                    .map_err(|error| {
+                        subjektiv::SubjektivError::AuthorizationDenied(error.to_string())
+                    })?;
+                if owner.is_none_or(|owner| {
+                    owner.key
+                        != format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", self.subject)
+                }) {
+                    return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                        "Memory Worker ownership changed".into(),
+                    ));
+                }
+            }
+            if !CurrentSubjectPolicy::Canonical(source)
+                .allows_in_registry(&authority, &requested, false, &self.subject, &registry)
+                .map_err(reject)?
+            {
+                return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                    "Current policy denies the Memory operation".into(),
+                ));
+            }
+        }
+        Ok(Box::new((fence, registry)))
+    }
+}
+
+pub(super) fn memory_effect_store(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+) -> subjektiv::SubjektivStore {
+    store.with_memory_effect_authority(Arc::new(MemoryEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+    }))
 }

@@ -2879,6 +2879,10 @@ async fn stopped_partial_journal_recovery_fences_old_attempt_and_resumes_same_im
     .unwrap() else {
         panic!("saved receipt")
     };
+    let owner =
+        crate::backend_job_host_effects::JobHostOwner::try_from(&dispatched.attempt).unwrap();
+    let effects = f.api.backend_job_recovery.effects(&owner).unwrap();
+    let returning_host_call = effects.admit(&owner).unwrap();
     f.api
         .runtime
         .stop_worker(
@@ -2892,13 +2896,59 @@ async fn stopped_partial_journal_recovery_fences_old_attempt_and_resumes_same_im
         .unwrap();
     f.execution.take_inputs();
     f.api.recover_backend_jobs().unwrap();
-    wait_for_backend_job_worker_cleanup(
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.api
+            .backend_job_recovery
+            .cleanup_before_writer_fence
+            .notified(),
+    )
+    .await
+    .unwrap();
+    let terminated = f
+        .api
+        .store
+        .get_backend_job_attempt(
+            TEST_WORKSPACE_ID,
+            &f.request.job_id,
+            &dispatched.attempt.attempt_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminated.state, BackendJobAttemptState::Failed);
+    assert_eq!(
+        terminated.failure_category.as_deref(),
+        Some("journal_execution_terminated")
+    );
+    assert!(
+        effects.admit(&owner).is_err(),
+        "terminal cleanup must close old Host admission"
+    );
+    assert!(
+        !f.api
+            .store
+            .has_backend_job_execution_fence(TEST_WORKSPACE_ID, &terminated)
+            .unwrap(),
+        "Runtime termination is not Host drain"
+    );
+    assert!(
+        f.execution.inputs.lock().unwrap().is_empty(),
+        "never supply another attempt while the original Host callback is retained"
+    );
+    drop(returning_host_call);
+    let cleaned = wait_for_backend_job_worker_cleanup(
         &f.api,
         &f.request.job_id,
         &dispatched.attempt.attempt_id,
         BackendJobWorkerCleanupState::Completed,
     )
     .await;
+    assert!(
+        f.api
+            .store
+            .has_backend_job_execution_fence(TEST_WORKSPACE_ID, &cleaned)
+            .unwrap()
+    );
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             if !f.execution.inputs.lock().unwrap().is_empty() {

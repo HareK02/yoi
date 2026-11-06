@@ -2303,10 +2303,39 @@ fn require_current_job(api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()>
 
 fn can_resume_partial(job: &BackendJobRecord) -> bool {
     job.state == BackendJobState::Failed
-        && job.failure_category.as_deref() == Some("journal_attempt_fenced")
+        && matches!(
+            job.failure_category.as_deref(),
+            Some("journal_attempt_fenced" | "journal_execution_terminated")
+        )
         && job.input_disposition == crate::backend_job::JobInputDisposition::Available
         && job.current_attempt < job.request.limits.max_attempts
         && !legacy_descriptor(&job.request)
+}
+
+/// Continue only the frozen partial Job whose actual termination initiated cleanup.
+/// Reopen/retry rereads the same canonical Job and still checks all historical fences.
+pub(super) fn resume_after_execution_cleanup(
+    api: &WorkspaceApi,
+    job: &BackendJobRecord,
+    attempt: &BackendJobAttemptRecord,
+) -> Result<()> {
+    if job.failure_category.as_deref() != Some("journal_execution_terminated")
+        || !can_resume_partial(job)
+        || job.current_attempt != attempt.attempt
+    {
+        return Ok(());
+    }
+    let grant = job
+        .request
+        .grants
+        .subjektiv_journal
+        .as_ref()
+        .ok_or_else(|| Error::Store("Journal continuation grant missing".into()))?;
+    let attribution = store(api)?
+        .session_attribution(&grant.session_id)
+        .map_err(|error| Error::Store(error.to_string()))?
+        .ok_or_else(|| Error::Store("Journal continuation attribution missing".into()))?;
+    dispatch_saved_or_new(api, attribution, &grant.journal_id, false)
 }
 
 /// Outcome is not a shutdown receipt. Inspect every earlier attempt as well: a late
@@ -2608,8 +2637,23 @@ pub(super) fn reconcile_attempt(
         // The generic reserved-attempt owner can still dispatch this exact saved input.
         return Ok(());
     }
-    // This is a nonblocking receipt check, not a timeout or a Worker/map-absence test.
-    // Missing evidence leaves the accepted attempt owned by root receipt reconciliation.
+    // An actual Runtime receipt can settle the failed execution outcome, but Host
+    // callbacks may still be returning. Terminalize first so the existing cleanup
+    // owner can close admission and drain the original resource; retry only after it.
+    if api
+        .require_backend_job_attempt_effects_ended(attempt)
+        .is_err()
+        && api.backend_job_execution_termination(attempt)?.is_some()
+    {
+        return fail_recovery(
+            api,
+            job,
+            attempt,
+            "journal_execution_terminated",
+            "Runtime execution ended before checkpoint completion; Host drain and cleanup remain pending",
+        );
+    }
+    // Missing evidence is neither rejection nor permission to reselect input.
     api.require_backend_job_attempt_effects_ended(attempt)?;
     for number in 1..attempt.attempt {
         let id = crate::backend_job::attempt_id(&job.request.job_id, number);
