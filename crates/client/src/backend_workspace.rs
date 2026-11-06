@@ -128,9 +128,23 @@ pub(crate) fn runtime_management_client_error(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ServerBearerAuthorizer {
     authorization: String,
+}
+
+impl ServerBearerAuthorizer {
+    pub(crate) fn new(backend: &BackendApiClient) -> Self {
+        Self {
+            authorization: backend.authorization_header_value(),
+        }
+    }
+}
+
+impl fmt::Debug for ServerBearerAuthorizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServerBearerAuthorizer([REDACTED])")
+    }
 }
 
 impl server_api::client_support::RequestAuthorizer for ServerBearerAuthorizer {
@@ -139,17 +153,17 @@ impl server_api::client_support::RequestAuthorizer for ServerBearerAuthorizer {
         _request: server_api::client_support::AuthorizerRequest<'_>,
     ) -> Result<reqwest::header::HeaderMap, server_api::client_support::AuthorizationError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            self.authorization
-                .parse()
-                .map_err(|_| server_api::client_support::AuthorizationError::new())?,
-        );
+        let mut authorization: reqwest::header::HeaderValue = self
+            .authorization
+            .parse()
+            .map_err(|_| server_api::client_support::AuthorizationError::new())?;
+        authorization.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, authorization);
         Ok(headers)
     }
 }
 
-const SERVER_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+pub(crate) const SERVER_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
 pub(crate) fn server_api_client(
     backend: &BackendApiClient,
@@ -157,9 +171,7 @@ pub(crate) fn server_api_client(
     server_api::ServerApiClient::builder(backend.origin().as_str())
         .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?
         .client(backend.asynchronous_client())
-        .authorizer(ServerBearerAuthorizer {
-            authorization: backend.authorization_header_value(),
-        })
+        .authorizer(ServerBearerAuthorizer::new(backend))
         .response_body_limit(SERVER_RESPONSE_LIMIT)
         .build()
         .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))
