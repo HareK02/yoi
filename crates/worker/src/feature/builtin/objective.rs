@@ -67,8 +67,7 @@ impl WorkspaceHttpObjectiveBackend {
         self.client
             .authorize_operation(operation, &resource)
             .map_err(|error| {
-                let denied = matches!(&error, crate::worker::WorkspaceClientError::Request(message)
-                if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
+                let denied = error.is_authorization_denial();
                 WorkspaceObjectiveBackendError::Authorization {
                     operation: operation.into(),
                     resource,

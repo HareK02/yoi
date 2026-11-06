@@ -461,3 +461,101 @@ async fn generated_client_hook_uses_actual_metadata_and_preserves_unknown_corrup
         _ => panic!("legacy client-only error must keep serde behavior"),
     }
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PayloadLimit;
+impl FailureCause for PayloadLimit {
+    fn identity(&self) -> FailureIdentity {
+        FailureIdentity {
+            domain: "request_limit",
+            reason: "payload_too_large",
+            category: Category::InvalidInput,
+            details_version: 1,
+        }
+    }
+    fn validate(&self) -> Result<(), ContractError> {
+        Ok(())
+    }
+}
+impl WireDetails for PayloadLimit {
+    fn supports(domain: &str, reason: &str, version: u16) -> bool {
+        domain == "request_limit" && reason == "payload_too_large" && version == 1
+    }
+}
+impl ProjectFor<Browser> for PayloadLimit {
+    type Authorization = ();
+    type Details = Self;
+    fn disclose(&self, _: &FailureFacts<Self>, _: &()) -> Result<Disclosure<Self>, ContractError> {
+        Ok(Disclosure::new(
+            self.clone(),
+            "The request exceeds the payload limit.",
+        ))
+    }
+}
+struct PayloadLimitBoundary;
+impl api_macros::http::ApiBoundary<PayloadLimit> for PayloadLimitBoundary {
+    fn classify(&self, _: &PayloadLimit) -> error_contract::problem::ProblemClass {
+        error_contract::problem::ProblemClass {
+            status: error_contract::problem::HttpFailureStatus::PayloadTooLarge,
+            type_uri: "urn:yoi:problem:payload-too-large",
+            title: "Payload too large",
+        }
+    }
+}
+impl api_macros::HttpError for PayloadLimit {
+    fn status_code(&self) -> u16 {
+        413
+    }
+    fn custom_response(&self) -> Option<HttpErrorResponse> {
+        let projected = project_failure(&FailureFacts::new(self.clone()).unwrap(), &()).unwrap();
+        Some(
+            api_macros::http::problem_response(&projected, &PayloadLimitBoundary, "", budget())
+                .unwrap()
+                .into(),
+        )
+    }
+}
+impl HttpClientError for PayloadLimit {
+    fn decode_error(response: &ReceivedResponse) -> Result<Self, ClientFailure> {
+        match response.decode_problem::<Self>(&PayloadLimitBoundary, budget()) {
+            DecodeFailure::Known(failure) => Ok(failure.facts().cause().clone()),
+            _ => Err(ClientFailure::ErrorResponseDecode {
+                status: response.status().as_u16(),
+            }),
+        }
+    }
+}
+#[api(axum, reqwest)]
+pub trait PayloadLimitApi {
+    #[get("/payload-limit", error_status = 413, client_error_hook = true)]
+    async fn payload_limit(&self) -> Result<Payload, PayloadLimit>;
+}
+struct PayloadLimitService;
+impl PayloadLimitApi for PayloadLimitService {
+    async fn payload_limit(&self) -> Result<Payload, PayloadLimit> {
+        Err(PayloadLimit)
+    }
+}
+
+#[tokio::test]
+async fn generated_server_and_client_preserve_payload_limit_413_and_its_typed_cause() {
+    let app = PayloadLimitApiAxum::router(PayloadLimitService);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let _server = ServerTask(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let client = PayloadLimitApiClient::builder(&url)
+        .unwrap()
+        .request_timeout(Duration::from_secs(5))
+        .response_body_limit(4096)
+        .build()
+        .unwrap();
+    match client.payload_limit().await {
+        Err(ClientError::Public { status, error }) => {
+            assert_eq!(status.as_u16(), 413);
+            assert_eq!(error.identity().reason, "payload_too_large");
+        }
+        _ => panic!("413, actual media and typed cause must survive the real generated HTTP path"),
+    }
+}

@@ -2495,7 +2495,9 @@ permission = "write"
         .unwrap_err();
         assert!(matches!(
             error,
-            WorkspaceMemoryBackendError::Request(WorkspaceClientError::Request(_))
+            WorkspaceMemoryBackendError::Request(WorkspaceClientError::AuthorizationRejected {
+                status: 403
+            })
         ));
         assert!(error.to_string().contains("authorization denied"));
         assert_eq!(client.effects.load(Ordering::SeqCst), 0);
