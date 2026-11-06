@@ -7,6 +7,9 @@ pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 pub mod authorization;
+mod repository_access_error;
+pub mod repository_access_failure;
+pub use repository_access_error::RepositoryAccessApiError;
 mod chat;
 pub mod configuration_adoption;
 pub mod feature_permissions;
@@ -1084,6 +1087,8 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1091,13 +1096,15 @@ pub trait ServerApi {
         &self,
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
-    ) -> Result<RepositoryAccessProjection, RepositoryApiError>;
+    ) -> Result<RepositoryAccessProjection, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/credentials",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1105,13 +1112,15 @@ pub trait ServerApi {
         &self,
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
-    ) -> Result<RepositorySshCredentialListResponse, RepositoryApiError>;
+    ) -> Result<RepositorySshCredentialListResponse, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/credentials",
         status = 201,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1120,13 +1129,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[body] request: CreateRepositorySshCredentialRequest,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/credentials/generate",
         status = 201,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1135,13 +1146,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[body] request: GenerateRepositorySshCredentialRequest,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1150,13 +1163,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] credential_id: String,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
         status = 204,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1166,13 +1181,15 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] credential_id: String,
         #[body] request: DeleteRepositorySshCredentialRequest,
-    ) -> Result<(), RepositoryApiError>;
+    ) -> Result<(), RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/public-key",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1181,13 +1198,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] credential_id: String,
-    ) -> Result<RepositorySshPublicKey, RepositoryApiError>;
+    ) -> Result<RepositorySshPublicKey, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1197,13 +1216,15 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] credential_id: String,
         #[body] request: RotateRepositorySshCredentialRequest,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1211,7 +1232,7 @@ pub trait ServerApi {
         &self,
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
-    ) -> Result<RepositorySshHostTrustListResponse, RepositoryApiError>;
+    ) -> Result<RepositorySshHostTrustListResponse, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts",
@@ -1219,6 +1240,8 @@ pub trait ServerApi {
         alternate_status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1227,13 +1250,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[body] request: PutRepositorySshHostTrustRequest,
-    ) -> Result<RepositorySshHostTrustMutationResponse, RepositoryApiError>;
+    ) -> Result<RepositorySshHostTrustMutationResponse, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1242,13 +1267,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] host_trust_id: String,
-    ) -> Result<RepositorySshHostTrust, RepositoryApiError>;
+    ) -> Result<RepositorySshHostTrust, RepositoryAccessApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
         status = 204,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1258,7 +1285,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] host_trust_id: String,
         #[body] request: DeleteRepositorySshHostTrustRequest,
-    ) -> Result<(), RepositoryApiError>;
+    ) -> Result<(), RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/config/source-tree",

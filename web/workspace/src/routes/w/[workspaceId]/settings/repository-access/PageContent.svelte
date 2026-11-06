@@ -18,8 +18,8 @@
     parseRepositorySshPublicKey,
   } from '#lib/workspace/api/repository-access.ts';
   import { readBoundedJson } from '#lib/workspace/api/http.ts';
+  import { repositoryAccessResponseError } from '#lib/workspace/api/repository-access-error.ts';
   import {
-    repositoryAccessRequestError,
     validateCredentialRotation,
     validateGeneratedCredential,
     validateHostTrust,
@@ -260,8 +260,9 @@
       throw new StaleRepositoryAccessRequestError();
     }
     if (!response.ok) {
-      await response.body?.cancel();
-      throw repositoryAccessRequestError(response.status, operation);
+      const failure = await repositoryAccessResponseError(response, operation);
+      if (epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();
+      throw failure;
     }
     if (parse === null) {
       if (response.status !== 204) {
@@ -288,8 +289,9 @@
       throw new StaleRepositoryAccessRequestError();
     }
     if (!response.ok) {
-      await response.body?.cancel();
-      throw repositoryAccessRequestError(response.status, 'load this public key');
+      const failure = await repositoryAccessResponseError(response, 'load this public key');
+      if (epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();
+      throw failure;
     }
     const body = await readBoundedJson(response, REPOSITORY_ACCESS_MAX_RESPONSE_BYTES);
     if (epoch !== pageEpoch) throw new StaleRepositoryAccessRequestError();

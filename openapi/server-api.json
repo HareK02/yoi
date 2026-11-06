@@ -644,6 +644,41 @@
         ],
         "type": "string"
       },
+      "Category": {
+        "enum": [
+          "authorization",
+          "invalid_input",
+          "conflict",
+          "dependency",
+          "internal",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "CausalLink": {
+        "description": "Only explicit causal references belong here. Cleanup/audit failures stay in domain results.",
+        "properties": {
+          "correlation": {
+            "$ref": "#/components/schemas/CorrelationRef"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "reason",
+          "correlation"
+        ],
+        "type": "object"
+      },
       "ChatConversation": {
         "additionalProperties": false,
         "properties": {
@@ -1859,6 +1894,12 @@
           }
         },
         "type": "object"
+      },
+      "CorrelationRef": {
+        "description": "Correlation is deliberately a distinct field/type from operation identity.",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
       },
       "CreateRemoteRuntimeRequest": {
         "additionalProperties": false,
@@ -3449,6 +3490,132 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "FailureContext": {
+        "description": "Common metadata is untrusted after deserialization. No audience label confers trust.",
+        "properties": {
+          "causes": {
+            "description": "Ordered immediate-to-root chain, at most four references; never recursive payloads.",
+            "items": {
+              "$ref": "#/components/schemas/CausalLink"
+            },
+            "maxItems": 4,
+            "type": "array"
+          },
+          "correlation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorrelationRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/FailureDiagnostic"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/OperationContext"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "supplementary_omitted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operations",
+          "causes",
+          "diagnostics",
+          "supplementary_omitted"
+        ],
+        "type": "object"
+      },
+      "FailureDiagnostic": {
+        "properties": {
+          "code": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "explanation"
+        ],
+        "type": "object"
+      },
+      "FailureEnvelope": {
+        "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/Category"
+          },
+          "context": {
+            "$ref": "#/components/schemas/FailureContext"
+          },
+          "details": {
+            "$ref": "#/components/schemas/RepositoryAccessDetails"
+          },
+          "details_version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "required_extensions": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "required_extensions",
+          "domain",
+          "reason",
+          "category",
+          "details_version",
+          "details",
+          "explanation",
+          "context"
+        ],
         "type": "object"
       },
       "FeatureInvocation": {
@@ -6931,6 +7098,34 @@
           "summary",
           "linked_tickets",
           "record_source"
+        ],
+        "type": "object"
+      },
+      "OperationContext": {
+        "properties": {
+          "operation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_ref": {
+            "description": "A reference, not an idempotency/retry grant. Disclosure remains domain-owned.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stage": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "stage"
         ],
         "type": "object"
       },
@@ -11415,6 +11610,47 @@
         ],
         "type": "object"
       },
+      "ProblemDetails": {
+        "description": "Untrusted wire DTO. Unknown RFC extensions are ignored; yoi_failure is mandatory here.",
+        "properties": {
+          "detail": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "instance": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 599,
+            "minimum": 400,
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "yoi_failure": {
+            "$ref": "#/components/schemas/FailureEnvelope"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "instance",
+          "yoi_failure"
+        ],
+        "type": "object"
+      },
       "ProfileSettingsResponse": {
         "additionalProperties": false,
         "description": "Read-only Profile catalog projected from one active Workspace config tree.",
@@ -11772,10 +12008,40 @@
         ],
         "type": "object"
       },
+      "RepositoryAccessDetails": {
+        "additionalProperties": false,
+        "description": "No raw resource, source URI, key, fingerprint, operation ID or lease is a field.",
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/RepositoryAccessOperation"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/RepositoryAccessReason"
+          }
+        },
+        "required": [
+          "operation",
+          "reason"
+        ],
+        "type": "object"
+      },
       "RepositoryAccessMode": {
         "enum": [
           "read_only",
           "read_write"
+        ],
+        "type": "string"
+      },
+      "RepositoryAccessOperation": {
+        "enum": [
+          "project_access",
+          "create_credential",
+          "rotate_credential",
+          "delete_credential",
+          "put_host_trust",
+          "delete_host_trust",
+          "default_ssh_binding",
+          "lease_ssh_access"
         ],
         "type": "string"
       },
@@ -11802,6 +12068,32 @@
           "bindings"
         ],
         "type": "object"
+      },
+      "RepositoryAccessReason": {
+        "enum": [
+          "plain_http_source_unsupported",
+          "unknown_repository",
+          "ssh_source_required",
+          "binding_credential_not_found",
+          "credential_inactive",
+          "binding_host_trust_not_found",
+          "host_endpoint_mismatch",
+          "credential_already_exists",
+          "workspace_default_credential_immutable",
+          "credential_not_found",
+          "credential_observation_changed",
+          "credential_key_changed",
+          "credential_referenced",
+          "credential_retained",
+          "host_trust_observation_changed",
+          "host_trust_not_found",
+          "host_trust_key_changed",
+          "host_trust_referenced",
+          "ambiguous_host_trust",
+          "credential_unavailable_or_inactive",
+          "host_trust_unavailable"
+        ],
+        "type": "string"
       },
       "RepositoryApiError": {
         "additionalProperties": false,
@@ -23363,7 +23655,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:894ccff36a463bec91b635956924114aa0db87d8b3f815230d6e8395511d2f6e"
+    "x-yoi-source-digest": "sha256:acfa327fc3dd7ce8588e30996a7806017815279911ad70dd3e662208aff170e1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -40275,6 +40567,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40284,6 +40581,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40295,6 +40597,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40305,6 +40612,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40314,6 +40626,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40362,6 +40679,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40371,6 +40693,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40382,6 +40709,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40392,6 +40724,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40401,6 +40738,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40457,6 +40799,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40466,6 +40813,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40477,6 +40829,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40486,6 +40843,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40497,6 +40859,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40506,6 +40873,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40564,6 +40936,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40573,6 +40950,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40584,6 +40966,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40593,6 +40980,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40604,6 +40996,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40613,6 +41010,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40674,6 +41076,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40683,6 +41090,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40694,6 +41106,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40703,6 +41120,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40714,6 +41136,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40723,6 +41150,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40779,6 +41211,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40788,6 +41225,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40799,6 +41241,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40809,6 +41256,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40818,6 +41270,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40876,6 +41333,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40885,6 +41347,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40896,6 +41363,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40906,6 +41378,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40915,6 +41392,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -40983,6 +41465,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -40992,6 +41479,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41003,6 +41495,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41012,6 +41509,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41023,6 +41525,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41032,6 +41539,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41080,6 +41592,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41089,6 +41606,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41100,6 +41622,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41110,6 +41637,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41119,6 +41651,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41185,6 +41722,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41194,6 +41736,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41205,6 +41752,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41214,6 +41766,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41225,6 +41782,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41234,6 +41796,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41295,6 +41862,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41304,6 +41876,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41315,6 +41892,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41324,6 +41906,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41335,6 +41922,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41344,6 +41936,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41400,6 +41997,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41409,6 +42011,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -41420,6 +42027,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41430,6 +42042,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
               }
             },
             "description": "Error response"
@@ -41439,6 +42056,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },

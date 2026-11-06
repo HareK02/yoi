@@ -10,6 +10,7 @@ import {
 } from "@testing-library/svelte";
 import { afterEach, expect, test, vi } from "vitest";
 import RepositoryAccessPage from "./PageContent.svelte";
+import missingCredential from "../../../../../../test/repository-access/fixtures/credential-not-found.json";
 import type { ComponentProps } from "svelte";
 
 type PageProps = ComponentProps<typeof RepositoryAccessPage>;
@@ -577,4 +578,25 @@ test("locks a rotation to its host and port and discloses explicit and automatic
       screen.getByRole("button", { name: "Rotate key" }),
     )
   );
+});
+
+test("rotation shows the real HTTP public cause without opening technical details or resending", async () => {
+  const fetchMock = vi.fn(async () =>
+    new Response(JSON.stringify(missingCredential), {
+      status: 404,
+      headers: { "content-type": "application/problem+json" },
+    })
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  renderPage();
+  const row = screen.getByText("Deploy key").closest("tr")!;
+  await fireEvent.click(within(row).getByRole("button", { name: "Rotate" }));
+  await fireEvent.input(screen.getByRole("textbox", { name: /^New OpenSSH private key/ }), {
+    target: { value: "-----BEGIN OPENSSH PRIVATE KEY-----" },
+  });
+  await fireEvent.click(screen.getByRole("button", { name: "Rotate credential" }));
+  await waitFor(() =>
+    expect(screen.getByRole("alert").textContent).toContain(missingCredential.detail)
+  );
+  expect(fetchMock).toHaveBeenCalledTimes(1);
 });

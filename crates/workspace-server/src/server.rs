@@ -9386,7 +9386,7 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         actor: RequestActor,
         workspace_id: String,
-    ) -> std::result::Result<RepositoryAccessProjection, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositoryAccessProjection, server_api::RepositoryAccessApiError> {
         scoped_get_repository_access_projection(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -9394,7 +9394,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_list(
@@ -9403,7 +9403,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
     ) -> std::result::Result<
         server_api::RepositorySshCredentialListResponse,
-        server_api::RepositoryApiError,
+        server_api::RepositoryAccessApiError,
     > {
         scoped_list_repository_ssh_credentials(
             State(self.workspace_api()?.clone()),
@@ -9412,7 +9412,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| server_api::RepositorySshCredentialListResponse(response))
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_create(
@@ -9420,7 +9420,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         request: CreateRepositorySshCredentialRequest,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_create_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -9429,7 +9429,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|(_status, Json(response))| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_generate(
@@ -9437,7 +9437,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         request: GenerateRepositorySshCredentialRequest,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_generate_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -9446,7 +9446,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|(_status, Json(response))| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_get(
@@ -9454,7 +9454,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         credential_id: String,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_get_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9465,7 +9465,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_delete(
@@ -9474,7 +9474,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         credential_id: String,
         request: DeleteRepositorySshCredentialRequest,
-    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+    ) -> std::result::Result<(), server_api::RepositoryAccessApiError> {
         scoped_delete_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9486,7 +9486,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|_| ())
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_public_key(
@@ -9494,7 +9494,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         credential_id: String,
-    ) -> std::result::Result<RepositorySshPublicKey, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshPublicKey, server_api::RepositoryAccessApiError> {
         scoped_get_repository_ssh_public_key(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9505,7 +9505,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_rotate(
@@ -9514,7 +9514,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         credential_id: String,
         request: RotateRepositorySshCredentialRequest,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_rotate_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9526,7 +9526,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_list(
@@ -9535,7 +9535,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
     ) -> std::result::Result<
         server_api::RepositorySshHostTrustListResponse,
-        server_api::RepositoryApiError,
+        server_api::RepositoryAccessApiError,
     > {
         scoped_list_repository_ssh_host_trusts(
             State(self.workspace_api()?.clone()),
@@ -9544,7 +9544,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| server_api::RepositorySshHostTrustListResponse(response))
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_put(
@@ -9554,7 +9554,7 @@ impl server_api::ServerApi for ServerApiContractService {
         request: PutRepositorySshHostTrustRequest,
     ) -> std::result::Result<
         server_api::RepositorySshHostTrustMutationResponse,
-        server_api::RepositoryApiError,
+        server_api::RepositoryAccessApiError,
     > {
         let created = request.expected_fingerprint.is_none();
         scoped_put_repository_ssh_host_trust(
@@ -9570,7 +9570,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 created,
             },
         )
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_get(
@@ -9578,7 +9578,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         host_trust_id: String,
-    ) -> std::result::Result<RepositorySshHostTrust, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshHostTrust, server_api::RepositoryAccessApiError> {
         scoped_get_repository_ssh_host_trust(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryHostTrustPath {
@@ -9589,7 +9589,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_delete(
@@ -9598,7 +9598,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         host_trust_id: String,
         request: DeleteRepositorySshHostTrustRequest,
-    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+    ) -> std::result::Result<(), server_api::RepositoryAccessApiError> {
         scoped_delete_repository_ssh_host_trust(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryHostTrustPath {
@@ -9610,7 +9610,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|_| ())
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn workspace_config_tree(
@@ -39649,6 +39649,24 @@ impl ApiError {
         }
     }
 
+    // Only the management handlers above use this conversion. They run the current
+    // owner-only secret-management check before producing any access-owner cause.
+    // Preflight/authentication errors stay legacy and receive no cause visibility.
+    fn into_repository_access_api_error(self) -> server_api::RepositoryAccessApiError {
+        if let Error::RepositoryAccess(failure) = &self.error {
+            use error_contract::{Browser, FailureFacts};
+            let visibility = crate::repository_access_failure::RepositoryAccessVisibility {
+                can_view_cause: true,
+            };
+            if let Ok(projected) = FailureFacts::new(*failure.details()).and_then(|facts| {
+                error_contract::project_failure::<Browser, _>(&facts, &visibility)
+            }) {
+                return server_api::RepositoryAccessApiError::projected(projected);
+            }
+        }
+        self.into_repository_api_error().into()
+    }
+
     fn into_repository_api_error(self) -> server_api::RepositoryApiError {
         let status = api_error_status(&self.error);
         let message = self
@@ -60881,6 +60899,17 @@ mod tests {
             "operation_id": "private-duplicate-operation", "credential_id": "http-key", "name": "HTTP key",
             "private_key": private_key(12),
         })), StatusCode::CONFLICT).await;
+        assert_eq!(
+            missing,
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../web/workspace/test/repository-access/fixtures/credential-not-found.json"
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            duplicate["yoi_failure"]["reason"],
+            "credential_already_exists"
+        );
         for response in [missing, duplicate] {
             let text = response.to_string();
             for private in [
@@ -60895,12 +60924,53 @@ mod tests {
                 );
             }
             assert!(
-                response["message"]
+                response["detail"]
                     .as_str()
                     .unwrap()
                     .contains("SSH credential")
             );
         }
+        // The production generated client decodes the real router's typed body,
+        // not just a fabricated receiver DTO. A receipt is not a projection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let network_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, network_app).await.unwrap();
+        });
+        let generated = server_api::ServerApiClient::builder(&origin)
+            .unwrap()
+            .build()
+            .unwrap();
+        let received = generated
+            .repository_ssh_credential_rotate(
+                TEST_WORKSPACE_ID.to_owned(),
+                "private-missing".to_owned(),
+                RotateRepositorySshCredentialRequest {
+                    operation_id: "private-client-operation".into(),
+                    expected_public_key_fingerprint: created["public_key_fingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    private_key: private_key(12),
+                    passphrase: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        let server_api::client_support::ClientError::Public { status, error } = received else {
+            panic!("generated decoder rejected the production Problem response: {received:?}")
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.details().unwrap().reason,
+            server_api::repository_access_failure::RepositoryAccessReason::CredentialNotFound
+        );
+        assert!(
+            api_macros::HttpError::custom_response(&error).is_none(),
+            "received details are not encoder authority"
+        );
         let original_fingerprint = created["public_key_fingerprint"].clone();
         let rotate_path = format!("{base}/http-key/rotate");
         let reseal = json!({"operation_id":"http-key-reseal", "expected_public_key_fingerprint":original_fingerprint, "private_key":private_key(11)});

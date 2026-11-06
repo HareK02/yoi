@@ -4765,6 +4765,7 @@ name = "server-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "error-contract",
  "feature-permissions",
  "memory",
  "merge-request",

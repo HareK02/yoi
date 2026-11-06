@@ -10,8 +10,9 @@ default = []
 typescript = ["dep:ts-rs", "protocol/typescript"]
 
 [dependencies]
+error-contract = { workspace = true, features = ["json-schema"] }
 feature-permissions.workspace = true
-api-macros = { workspace = true, features = ["reqwest", "axum", "openapi"] }
+api-macros = { workspace = true, features = ["reqwest", "axum", "openapi", "error-contract"] }
 memory.workspace = true
 plugin-plan.workspace = true
 merge-request.workspace = true

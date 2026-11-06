@@ -98,6 +98,36 @@ WorkerのHost認可応答は、T-812の生成clientとは別の `WorkspaceClient
 
 認可status変更後のWorker通常suiteは、checkout内の `target/restore-test-environment/t815-shared/{config,data,run}` を起動環境のYOI各pathへ指定して実行した。最初の全suiteで発見したconsumer分類/文言assertの8失敗は本変更の回帰として修正し、全targetとdoctestを再実行した。元実行ログと再実行ログはsession証拠を正本とし、未完HTTP/UI/背景結果の保証へ拡張しない。
 
+## Repository access管理APIのHTTP→Web接続checkpoint
+
+`3d4079568` 後の接続slice。純粋な `RepositoryAccessDetails` とその既存allowlistを `server-api::repository_access_failure` へ移し、ローカル `RepositoryAccessFailure` の原source保持はServerに残した。`/api/w/{workspace_id}/settings/repository-access` 配下12操作を `RepositoryAccessApiError` / T-812の共通Problem response・生成client hookへ接続する。現在のowner-only secret管理検査後に生じたtyped access原因のみBrowser投影し、認可前・request rejection・未型付けの既存失敗は従来JSONのまま。resource permission一般を診断可視性へ昇格させない。
+
+- 公開fieldはclosed `operation/reason` と共通envelope。credential/trust不存在404、CAS・参照・既存credential競合409、その他の既知access入力拒否400は管理route所有の明示分類であり、Category/本文から決めない。鍵・fingerprint・元operation ID・path・provider本文は公開しない。
+- Webのページ操作とsection loaderはT-813のbounded receiver / `failureNotice` を使う。未知version/reason・破損は区別し、旧本文から原因を作らず、旧JSONの認可/失敗表示は維持する。説明変更でmutationの自動再送、CAS更新、結果確定を行わない。
+- `server::tests::ssh_rotation_http_fences_key_identity_and_replays_exact_operations` は実routerと実SQLiteの404/409、秘密非露出、CAS/replayに加え、loopback経由の本番生成Rust clientと、Webが読む同一JSON fixtureまで接続する。受信値だけではHTTP再投影できないことも確認する。Web fixtureはこの実HTTP応答との完全一致を検査し、別々のfake結果を接続保証にしない。
+
+### 今回実行した検証と限界
+
+基点 `3d4079568` にこのsliceを加えたdirty候補。Rust testは `CARGO_TARGET_DIR=target/t815 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0`、通常root checkは既存debug targetを使用した。各logは `target/t815-evidence/` に保存し、コマンド/exitはsessionの実行証拠を参照する。
+
+| 検証 | 結果 / log |
+| --- | --- |
+| `cargo check -p yoi-workspace-server` / `cargo check` | 成功。`access-server-check.log` / `access-root-check.log`。既存dead-code警告あり。 |
+| 上記HTTP test / `cargo test -p yoi-workspace-server --lib repository_access` | 1 / 26成功。`access-http-problem.log` / `access-domain-regression.log`。全Server suiteではない。 |
+| `cargo test -p server-api` | 137成功、canonical artifact staleの1失敗。正規 `export_openapi` 後、`canonical_openapi_artifact_is_current` は1成功（他137は同一codeの先行証拠を再利用）。`access-server-api-tests.log` / `access-openapi-current.log`。 |
+| Repository access Web receiver/loader / 実Page component | 13 / 10成功。`access-web-test.log` / `access-component-test.log`。最初のloader legacy文言回帰は従来表示を維持して修正、新componentの誤ったhostボタン選択も修正した。 |
+| `deno task check` / Web build / visual harness check | 成功、Web checkは0 errors/0 warnings。`access-web-check.log` / `access-visual-{before,after}-build.log` / `access-visual-harness-check.log`。 |
+
+### 目視確認
+
+`tools/web-ux/browser-tests/repository_access_failure_review.ts` で実Web build＋合成HTTP（実Backend認証の証拠ではない）を使用した。変更前は `3d4079568` のarchiveから隔離build、変更後は当該slice。ownerのcredential rotation不存在、1440/768/390px、light/darkの前後12画像と各 `review-context.json`・ARIAを実装者が開いて確認した。
+
+- 前: `target/web-ux/t815/access-before-3d4079568-r4/`。後: `target/web-ux/t815/access-after-current/`。各manifestにbuild index hash、source、route、HTTP document status、期待404と診断、画像hash、要求回数を保持。
+- 全条件でdocument 200、意図した404以外の新規browser errorなし、mutation 1回、横overflowなし。原因と操作をalert本文で判別でき、詳細を開く必要なし。mobileでも折返しと操作の順序を維持し、秘密入力をmaskした。判定はこの6条件について **pass**。
+- 最初のcaptureは共有fixtureの現permission field欠落で失敗した。製品の認可を変更せず、他の既存review harness同様に合成workspace応答へ `delete_subjects` fieldを補った。失敗artifactも保持し、成功画像と混同しない。旧表示がbodyをcancelする期待ERR_ABORTEDは変更前の当該mutationだけに限定して診断する。
+
+このcheckpointはRepository構成全域・Workdir・Drive/config・実Tool/history・背景正本保存再読・監査/cleanup副次結果の完了や正式reviewを示さない。広域Rustの追加再buildは容量上の親判断で一時繰延べ、既成功の未変更検証を重複実行しない。生成物変更と検証影響は最終候補で再評価する。
+
 ## 並行変更との結合点
 
 T-837は現行Feature認可、主体/委譲、管理UIを変更中である。可視性決定を古い保存receiptや起動時grantへ固定せず、採用source上の現在の境界で確認する。T-842は削除、Job記録、writer解放、Workdir detachと共有DTO/保存結果を変更中である。削除待ちを完了へ投影せず、元結果・secondary failureと未解放資源を保持する。共有file名だけで依存とせず、target移動時に実際の型・feature・保存/初期化・回復経路の結合影響を再評価する。
