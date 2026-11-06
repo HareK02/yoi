@@ -303,7 +303,8 @@ pub(crate) fn record_backend_session(
                 crate::WorkspaceClientError::Unavailable(_) => {
                     SessionRegistrationCause::transport()
                 }
-                crate::WorkspaceClientError::Request(_) => {
+                crate::WorkspaceClientError::Request(_)
+                | crate::WorkspaceClientError::AuthorizationRejected { .. } => {
                     SessionRegistrationCause::outcome_unknown()
                 }
                 crate::WorkspaceClientError::InvalidPath(_) => {
@@ -416,10 +417,8 @@ impl SubjektivHost for BackendSubjektivHost {
             .map_err(|error| match error {
                 // WorkspaceClient preserves a distinct denial classification for
                 // 401/403. Transport and other HTTP errors must remain unavailable.
-                crate::WorkspaceClientError::Request(message)
-                    if message.starts_with("bound authorization denied ") =>
-                {
-                    SubjektivHostError::PermissionDenied(message)
+                error if error.is_authorization_denial() => {
+                    SubjektivHostError::PermissionDenied(error.to_string())
                 }
                 other => SubjektivHostError::Unavailable(other.to_string()),
             })
@@ -896,6 +895,7 @@ pub(crate) fn test_subject_authorization_response(
     assert_eq!(input.target, BoundAuthorizationTarget::Subject {});
     let granted = allowed.contains(&input.operation.as_str());
     Some(crate::worker::WorkspaceResponse {
+        content_type: None,
         status: if granted { 200 } else { 403 },
         body: if granted {
             serde_json::json!({
@@ -1097,6 +1097,7 @@ mod tests {
         ) -> Result<crate::WorkspaceResponse, crate::WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
             Ok(crate::WorkspaceResponse {
+                content_type: None,
                 status: self.status,
                 body: if self.status == 200 {
                     r#"{"scope":null}"#.into()

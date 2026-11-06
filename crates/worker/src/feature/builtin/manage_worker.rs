@@ -2,6 +2,10 @@
 
 pub(crate) mod permission_declaration;
 
+#[cfg(test)]
+#[path = "manage_worker_startup_tests.rs"]
+mod startup_tests;
+
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -124,6 +128,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             )?
         } else {
             WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "items": [] }).to_string(),
             }
@@ -182,6 +187,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             }
         }
         Ok(WorkspaceResponse {
+            content_type: response.content_type,
             status: response.status,
             body: serde_json::to_string(&payload)
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -246,6 +252,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ))
                 })?;
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::json!({
                         "subject": { "kind": "sub_worker", "name": name }
@@ -323,6 +330,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         )
                     })?;
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&summary)
                         .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -954,10 +962,20 @@ impl Tool for WorkspaceWorkerTool {
                 } else {
                     WorkerControlInputKind::User
                 };
-                self.control
+                let direct_subworker = matches!(&subject, WorkerControlSubject::SubWorker { .. });
+                let response = self
+                    .control
                     .send_input(subject, content, kind)
                     .await
-                    .map_err(control_tool_error)?
+                    .map_err(control_tool_error)?;
+                if direct_subworker && response.is_success() {
+                    return Ok(ToolOutput {
+                        summary: "SubWorker input accepted; model processing and completion are unconfirmed".into(),
+                        content: Some(response.body),
+                        attachments: Vec::new(),
+                    });
+                }
+                response
             }
             WorkerOperation::Cancel | WorkerOperation::Stop => {
                 let input = if self.runtime_worker_control {
@@ -996,10 +1014,17 @@ impl Tool for WorkspaceWorkerTool {
                         "request_id must contain at most 512 bytes".into(),
                     ));
                 }
-                let recoverable_error = |error| {
-                    ToolError::ExecutionFailed(format!(
-                        "WorkerRestore request_id={request_id}; reuse this ID with the original observation token only for explicit unknown/pending outcome recovery, not after a stale-intent conflict: {error}"
-                    ))
+                let recoverable_error = |error: ToolError| {
+                    let guidance = format!(
+                        "WorkerRestore request_id={request_id}; reuse this ID with the original observation token only for explicit unknown/pending outcome recovery, not after a stale-intent conflict"
+                    );
+                    match error {
+                        ToolError::ExecutionFailure(mut output) => {
+                            output.summary = format!("{guidance}: {}", output.summary);
+                            ToolError::ExecutionFailure(output)
+                        }
+                        error => ToolError::ExecutionFailed(format!("{guidance}: {error}")),
+                    }
                 };
                 let response = self
                     .control
@@ -1075,55 +1100,206 @@ fn unsupported_subject(operation: WorkerOperation, kind: &str) -> ToolError {
 }
 
 fn control_tool_error(error: WorkspaceClientError) -> ToolError {
-    ToolError::ExecutionFailed(error.to_string())
+    use protocol::control_failure::RuntimeControlCause as C;
+    let cause = match error {
+        WorkspaceClientError::Unavailable(_) => C::ExecutionUnavailable,
+        WorkspaceClientError::InvalidPath(_) => C::InvalidRequest,
+        // Legacy clients have not attested a typed domain verdict. Their text is
+        // neither a cause classifier nor safe material to copy into model history.
+        WorkspaceClientError::Request(_) => C::ResultUnavailable,
+        WorkspaceClientError::AuthorizationRejected { status: 401 | 403 } => C::AuthorizationFailed,
+        WorkspaceClientError::AuthorizationRejected { .. } => C::ResultUnavailable,
+    };
+    worker_tool_failure(cause, tools::failure::ToolFailureBoundary::Observation, &())
+}
+
+fn worker_tool_failure<R: serde::Serialize>(
+    cause: protocol::control_failure::RuntimeControlCause,
+    boundary: tools::failure::ToolFailureBoundary,
+    result: &R,
+) -> ToolError {
+    let failure = error_contract::FailureFacts::new(cause)
+        .and_then(|facts| error_contract::project_failure::<error_contract::Tool, _>(&facts, &()));
+    match failure {
+        Ok(failure) => tools::failure::execution_failure(&failure, boundary, result, 64 * 1024),
+        Err(_) => ToolError::ExecutionFailure(ToolOutput {
+            summary: format!("{} Failure details unavailable.", cause.explanation()),
+            content: None,
+            attachments: Vec::new(),
+        }),
+    }
+}
+
+fn api_macros_control_decode(
+    response: &WorkspaceResponse,
+) -> Option<protocol::control_failure::RuntimeControlCause> {
+    // Never infer a representation from body contents or trust received explanation text.
+    match error_contract::problem::decode_problem_details::<
+        protocol::control_failure::RuntimeControlCause,
+    >(
+        response.body.as_bytes(),
+        response.status,
+        response.content_type.as_deref().unwrap_or(""),
+        &server_api::control_failure::ControlBoundary,
+        error_contract::Budget::new(16384, 16384),
+    ) {
+        error_contract::DecodeFailure::Known(value) => Some(*value.facts().cause()),
+        _ => None,
+    }
 }
 
 fn tool_output(
     operation: WorkerOperation,
     response: WorkspaceResponse,
 ) -> Result<ToolOutput, ToolError> {
+    use protocol::control_failure::RuntimeControlCause as C;
+    use tools::failure::ToolFailureBoundary as B;
     if !response.is_success() {
-        return Err(ToolError::ExecutionFailed(format!(
-            "Workspace Worker operation returned HTTP {}: {}",
-            response.status, response.body
-        )));
+        if operation == WorkerOperation::Spawn {
+            use runtime_api::startup::{
+                CreationAcceptance, DecodeStartupProblem, ExecutionOutcome, StartupBoundary,
+                StartupCause, StartupProblemFacts, decode_startup_problem,
+            };
+            if let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+                response.body.as_bytes(),
+                response.status,
+                response.content_type.as_deref().unwrap_or(""),
+                StartupBoundary::Browser,
+            ) {
+                // The Worker control service authorized this current caller. A
+                // received explanation is not authority for model disclosure.
+                let projected = failure
+                    .startup()
+                    .primary
+                    .project_for::<error_contract::Tool, StartupCause>(
+                        &protocol::session_failure::SessionFailureVisibility {
+                            can_view_cause: true,
+                        },
+                    );
+                let boundary = if failure.operation().acceptance == CreationAcceptance::Unknown
+                    || matches!(
+                        failure.operation().execution,
+                        ExecutionOutcome::Unknown | ExecutionOutcome::Unsupported
+                    ) {
+                    B::Observation
+                } else {
+                    B::Execution
+                };
+                #[derive(serde::Serialize)]
+                struct StartupObservation {
+                    status: u16,
+                    startup: StartupProblemFacts,
+                }
+                return Err(match projected {
+                    Ok(projected) => tools::failure::execution_failure(
+                        &projected,
+                        boundary,
+                        &StartupObservation {
+                            status: response.status,
+                            startup: failure.public_facts(),
+                        },
+                        64 * 1024,
+                    ),
+                    Err(_) => worker_tool_failure(C::ResultUnavailable, B::Observation, &()),
+                });
+            }
+        }
+        #[derive(serde::Serialize)]
+        struct HttpObservation {
+            status: u16,
+        }
+        let cause = match api_macros_control_decode(&response) {
+            Some(cause) => cause,
+            None => C::ResultUnavailable,
+        };
+        return Err(worker_tool_failure(
+            cause,
+            B::Observation,
+            &HttpObservation {
+                status: response.status,
+            },
+        ));
     }
-    if operation == WorkerOperation::Notify {
-        let notified: server_api::RuntimeWorkerInputResult = serde_json::from_str(&response.body)
-            .map_err(|error| {
-            ToolError::ExecutionFailed(format!("invalid WorkerNotify response: {error}"))
-        })?;
-        // HTTP transport success is not Runtime acceptance. Preserve uncertain
-        // diagnostics in the error; callers must inspect history, not resend or
-        // implicitly Restore a stopped destination.
-        if notified.state != server_api::WorkerOperationState::Accepted
-            || notified
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "worker_input_outcome_unknown")
+    if matches!(
+        operation,
+        WorkerOperation::Notify | WorkerOperation::SendInput
+    ) {
+        let input: server_api::RuntimeWorkerInputResult = serde_json::from_str(&response.body)
+            .map_err(|_| worker_tool_failure(C::InvalidResponse, B::Observation, &()))?;
+        // This is the source-owned acceptance result, independent of diagnostic
+        // severity/code/order and independent of later model processing.
+        if input.disposition != server_api::WorkerInputDisposition::Accepted
+            || input.state != server_api::WorkerOperationState::Accepted
         {
-            return Err(ToolError::ExecutionFailed(format!(
-                "WorkerNotify was not confirmed accepted (no automatic retry or Restore): {}",
-                response.body
-            )));
+            let (cause, boundary) = match input.disposition {
+                server_api::WorkerInputDisposition::Unknown => {
+                    (C::ResultUnavailable, B::Observation)
+                }
+                _ => (C::ExecutionRejected, B::Execution),
+            };
+            return Err(worker_tool_failure(
+                input.control.unwrap_or(cause),
+                boundary,
+                &input,
+            ));
         }
         return Ok(ToolOutput {
-            summary: "WorkerNotify accepted; model processing and work completion are unconfirmed"
-                .into(),
+            summary: format!(
+                "{} accepted; model processing and work completion are unconfirmed",
+                operation.tool_name()
+            ),
             content: Some(response.body),
             attachments: Vec::new(),
         });
     }
     if operation == WorkerOperation::Restore {
         let restored: server_api::WorkerRestoreResponse = serde_json::from_str(&response.body)
-            .map_err(|error| {
-                ToolError::ExecutionFailed(format!("invalid WorkerRestore response: {error}"))
-            })?;
+            .map_err(|_| worker_tool_failure(C::InvalidResponse, B::Observation, &()))?;
         if restored.result.state != server_api::WorkerRestoreState::Accepted {
-            return Err(ToolError::ExecutionFailed(format!(
-                "WorkerRestore returned {:?}: {}",
-                restored.result.state, response.body
-            )));
+            let cause = match restored.result.state {
+                server_api::WorkerRestoreState::Rejected => C::ExecutionRejected,
+                server_api::WorkerRestoreState::RolledBack => C::ExecutionFailed,
+                server_api::WorkerRestoreState::Superseded
+                | server_api::WorkerRestoreState::ReconciliationRequired => C::ResultUnavailable,
+                server_api::WorkerRestoreState::Accepted => unreachable!(),
+            };
+            let boundary = if matches!(
+                restored.result.state,
+                server_api::WorkerRestoreState::Superseded
+                    | server_api::WorkerRestoreState::ReconciliationRequired
+            ) {
+                B::Observation
+            } else {
+                B::Execution
+            };
+            if let Some(startup) = &restored.result.startup {
+                use crate::startup_failure::PublicStartupFailure;
+                let projected =
+                    crate::startup_failure::project_public_startup_failure::<error_contract::Tool>(
+                        &startup.primary,
+                        protocol::session_failure::SessionFailureVisibility {
+                            can_view_cause: true,
+                        },
+                    );
+                return Err(match projected {
+                    Ok(PublicStartupFailure::Session(failure)) => {
+                        tools::failure::execution_failure(&failure, boundary, &restored, 64 * 1024)
+                    }
+                    Ok(PublicStartupFailure::Runtime(failure)) => {
+                        tools::failure::execution_failure(&failure, boundary, &restored, 64 * 1024)
+                    }
+                    Err(_) => worker_tool_failure(
+                        C::ResultUnavailable,
+                        B::Observation,
+                        &restored.result.state,
+                    ),
+                });
+            }
+            return Err(worker_tool_failure(
+                restored.result.control.unwrap_or(cause),
+                boundary,
+                &restored,
+            ));
         }
     }
     if operation == WorkerOperation::Stop
@@ -1131,6 +1307,30 @@ fn tool_output(
     {
         return Ok(ToolOutput {
             summary: render_subworker_stop_summary(&summary),
+            content: Some(response.body),
+            attachments: Vec::new(),
+        });
+    }
+    if matches!(operation, WorkerOperation::Stop | WorkerOperation::Cancel) {
+        let lifecycle: server_api::RuntimeWorkerLifecycleResult =
+            serde_json::from_str(&response.body)
+                .map_err(|_| worker_tool_failure(C::InvalidResponse, B::Observation, &()))?;
+        if lifecycle.state != server_api::WorkerOperationState::Accepted {
+            let cause = match lifecycle.state {
+                server_api::WorkerOperationState::Unsupported => C::UnsupportedOperation,
+                _ => C::ExecutionRejected,
+            };
+            return Err(worker_tool_failure(
+                lifecycle.control.unwrap_or(cause),
+                B::Execution,
+                &lifecycle,
+            ));
+        }
+        return Ok(ToolOutput {
+            summary: format!(
+                "{} request accepted; this receipt alone does not prove execution termination",
+                operation.tool_name()
+            ),
             content: Some(response.body),
             attachments: Vec::new(),
         });
@@ -1323,6 +1523,7 @@ mod tests {
                 let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                 self.authorizations.lock().unwrap().push(auth);
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
                         403
                     } else {
@@ -1335,14 +1536,18 @@ mod tests {
                 let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                 self.bound_authorizations.lock().unwrap().push(auth);
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: r#"{"scope":null}"#.into(),
                 });
             }
             let is_worker_list = request.path.ends_with("/worker-control/workers");
             let is_worker_input = request.path.ends_with("/input");
+            let is_worker_lifecycle =
+                request.path.ends_with("/cancel") || request.path.ends_with("/stop");
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: if is_worker_list {
                     serde_json::json!({
@@ -1367,7 +1572,27 @@ mod tests {
                     })
                     .to_string()
                 } else if is_worker_input {
-                    serde_json::json!({"state":"accepted","runtime_id":"runtime-a","worker_id":"worker-a","diagnostics":[]}).to_string()
+                    serde_json::to_string(&server_api::RuntimeWorkerInputResult {
+                        control_explanation: None,
+                        control: None,
+                        state: server_api::WorkerOperationState::Accepted,
+                        disposition: server_api::WorkerInputDisposition::Accepted,
+                        runtime_id: "runtime-a".into(),
+                        worker_id: "worker-a".into(),
+                        diagnostics: vec![],
+                    })
+                    .unwrap()
+                } else if is_worker_lifecycle {
+                    serde_json::to_string(&server_api::RuntimeWorkerLifecycleResult {
+                        control_explanation: None,
+                        control: None,
+                        replayed: false,
+                        state: server_api::WorkerOperationState::Accepted,
+                        runtime_id: "runtime-a".into(),
+                        worker_id: "worker-a".into(),
+                        diagnostics: vec![],
+                    })
+                    .unwrap()
                 } else {
                     "{}".to_string()
                 },
@@ -1386,6 +1611,7 @@ mod tests {
                 reason.to_string(),
             ));
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: r#"{"removed":true}"#.to_string(),
             })
@@ -1418,6 +1644,7 @@ mod tests {
 
         async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError> {
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "items": [] }).to_string(),
             })
@@ -1439,10 +1666,14 @@ mod tests {
                     "expected user input".to_string(),
                 ));
             }
-            self.sent.lock().unwrap().push((name, content));
+            self.sent.lock().unwrap().push((name.clone(), content));
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
-                body: serde_json::json!({ "status": "accepted" }).to_string(),
+                body: serde_json::json!({
+                    "subject": { "kind": "sub_worker", "name": name }
+                })
+                .to_string(),
             })
         }
 
@@ -1460,10 +1691,19 @@ mod tests {
             if kind != WorkerControlStopKind::Stop {
                 return Err(WorkspaceClientError::Request("expected stop".to_string()));
             }
-            self.stopped.lock().unwrap().push(name);
+            self.stopped.lock().unwrap().push(name.clone());
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
-                body: serde_json::json!({ "status": "stopped" }).to_string(),
+                body: serde_json::to_string(&SubWorkerStopSummary {
+                    session_id: "review-session".into(),
+                    display_name: name,
+                    outcome: crate::spawn::registry::SubWorkerFinalOutcome::Done,
+                    elapsed_ms: 0,
+                    tool_counts: vec![],
+                    change_stat: None,
+                })
+                .unwrap(),
             })
         }
 
@@ -1506,39 +1746,205 @@ mod tests {
     }
 
     #[test]
-    fn notify_transport_success_requires_runtime_acceptance_and_preserves_unknown_diagnostics() {
-        for body in [
-            serde_json::json!({"state":"rejected","runtime_id":"r","worker_id":"w","diagnostics":[]}),
-            serde_json::json!({"state":"unsupported","runtime_id":"r","worker_id":"w","diagnostics":[]}),
-            serde_json::json!({"state":"rejected","runtime_id":"r","worker_id":"w","diagnostics":[{"code":"worker_input_outcome_unknown","severity":"warning","message":"inspect current session before retrying"}]}),
-        ] {
-            let error = tool_output(
-                WorkerOperation::Notify,
+    fn shared_control_problem_reaches_model_failure_without_disclosing_received_prose() {
+        for cause in protocol::control_failure::RuntimeControlCause::ALL {
+            let response = server_api::control_failure::control_problem(*cause).unwrap();
+            let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            body["detail"] = "private-body-canary".into();
+            body["yoi_failure"]["explanation"] = "private-body-canary".into();
+            let result = tool_output(
+                WorkerOperation::Stop,
                 WorkspaceResponse {
-                    status: 200,
+                    content_type: Some(response.content_type.to_owned()),
+                    status: response.status,
                     body: body.to_string(),
                 },
             )
-            .unwrap_err()
-            .to_string();
-            assert!(error.contains("not confirmed accepted"), "{error}");
-            assert!(error.contains("no automatic retry or Restore"), "{error}");
-            if !body["diagnostics"].as_array().unwrap().is_empty() {
-                assert!(error.contains("worker_input_outcome_unknown"));
-            }
+            .unwrap_err();
+            assert!(!format!("{result:?}").contains("private-body-canary"));
+            assert_control_failure(
+                result,
+                tools::failure::ToolFailureBoundary::Observation,
+                *cause,
+            );
         }
-        assert!(
+    }
+
+    #[test]
+    fn control_tool_does_not_infer_problem_from_body_when_media_or_status_is_wrong() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        let problem = server_api::control_failure::control_problem(C::AuthorizationFailed).unwrap();
+        for (status, content_type) in [
+            (problem.status, None),
+            (problem.status, Some("text/plain".to_owned())),
+            (409, Some(problem.content_type.to_owned())),
+        ] {
+            let error = tool_output(
+                WorkerOperation::Stop,
+                WorkspaceResponse {
+                    status,
+                    content_type,
+                    body: String::from_utf8(problem.body.to_vec()).unwrap(),
+                },
+            )
+            .unwrap_err();
+            assert_control_failure(
+                error,
+                tools::failure::ToolFailureBoundary::Observation,
+                C::ResultUnavailable,
+            );
+        }
+    }
+
+    fn assert_control_failure(
+        error: ToolError,
+        boundary: tools::failure::ToolFailureBoundary,
+        cause: protocol::control_failure::RuntimeControlCause,
+    ) -> serde_json::Value {
+        #[derive(Deserialize)]
+        struct Report {
+            boundary: tools::failure::ToolFailureBoundary,
+            failure: serde_json::Value,
+            result: serde_json::Value,
+        }
+        let ToolError::ExecutionFailure(output) = error else {
+            panic!("expected a structured execution failure, got {error:?}");
+        };
+        let report: Report = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(report.boundary, boundary);
+        let encoded = serde_json::to_vec(&report.failure).unwrap();
+        let error_contract::DecodeFailure::Known(failure) =
+            error_contract::decode_failure::<protocol::control_failure::RuntimeControlCause>(
+                &encoded,
+                error_contract::Budget::new(65536, 65536),
+            )
+        else {
+            panic!("expected a known Runtime control cause");
+        };
+        assert_eq!(*failure.facts().cause(), cause);
+        // Restore may prefix its recovery identity; the projected explanation stays intact.
+        assert!(output.summary.ends_with(cause.explanation()));
+        report.result
+    }
+
+    #[test]
+    fn notify_transport_success_requires_runtime_acceptance_and_preserves_unknown_diagnostics() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        use server_api::{WorkerInputDisposition as D, WorkerOperationState as S};
+        use tools::failure::ToolFailureBoundary as B;
+
+        // Diagnostic severity, code and prose must not override the source-owned verdict.
+        let diagnostics = serde_json::json!([
+            {"code":"worker_input_outcome_unknown","severity":"warning","message":"inspect current session before retrying"},
+            {"code":"arbitrary_code","severity":"error","message":"accepted rejected unknown: not a verdict"}
+        ]);
+        for (state, disposition, boundary, cause) in [
+            (S::Rejected, D::Rejected, B::Execution, C::ExecutionRejected),
+            (S::Rejected, D::Accepted, B::Execution, C::ExecutionRejected),
+            (
+                S::Unsupported,
+                D::Rejected,
+                B::Execution,
+                C::ExecutionRejected,
+            ),
+            (
+                S::Rejected,
+                D::Unknown,
+                B::Observation,
+                C::ResultUnavailable,
+            ),
+            (
+                S::Accepted,
+                D::Unknown,
+                B::Observation,
+                C::ResultUnavailable,
+            ),
+        ] {
+            let input = server_api::RuntimeWorkerInputResult {
+                control_explanation: None,
+                control: None,
+                state,
+                disposition,
+                runtime_id: "r".into(),
+                worker_id: "w".into(),
+                diagnostics: serde_json::from_value(diagnostics.clone()).unwrap(),
+            };
+            let result = assert_control_failure(
+                tool_output(
+                    WorkerOperation::Notify,
+                    WorkspaceResponse {
+                        content_type: None,
+                        status: 200,
+                        body: serde_json::to_string(&input).unwrap(),
+                    },
+                )
+                .unwrap_err(),
+                boundary,
+                cause,
+            );
+            let retained: server_api::RuntimeWorkerInputResult =
+                serde_json::from_value(result).unwrap();
+            assert_eq!(retained, input);
+        }
+
+        // Missing legacy disposition is unknown, even with an accepted state.
+        let result = assert_control_failure(
             tool_output(
                 WorkerOperation::Notify,
                 WorkspaceResponse {
+                    content_type: None,
                     status: 200,
-                    body: "{}".into()
-                }
+                    body: serde_json::json!({"state":"accepted","runtime_id":"r","worker_id":"w"})
+                        .to_string(),
+                },
             )
-            .is_err()
+            .unwrap_err(),
+            B::Observation,
+            C::ResultUnavailable,
         );
-        let accepted = tool_output(WorkerOperation::Notify,WorkspaceResponse{status:200,body:serde_json::json!({"state":"accepted","runtime_id":"r","worker_id":"w","diagnostics":[]}).to_string()}).unwrap();
-        assert!(accepted.summary.contains("unconfirmed"));
+        let legacy: server_api::RuntimeWorkerInputResult = serde_json::from_value(result).unwrap();
+        assert_eq!(legacy.state, S::Accepted);
+        assert_eq!(legacy.disposition, D::Unknown);
+        assert_control_failure(
+            tool_output(
+                WorkerOperation::Notify,
+                WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: "{}".into(),
+                },
+            )
+            .unwrap_err(),
+            B::Observation,
+            C::InvalidResponse,
+        );
+
+        let input = server_api::RuntimeWorkerInputResult {
+            control_explanation: None,
+            control: None,
+            state: S::Accepted,
+            disposition: D::Accepted,
+            runtime_id: "r".into(),
+            worker_id: "w".into(),
+            diagnostics: serde_json::from_value(diagnostics).unwrap(),
+        };
+        let accepted = tool_output(
+            WorkerOperation::Notify,
+            WorkspaceResponse {
+                content_type: None,
+                status: 200,
+                body: serde_json::to_string(&input).unwrap(),
+            },
+        )
+        .unwrap();
+        let retained: server_api::RuntimeWorkerInputResult =
+            serde_json::from_str(accepted.content.as_deref().unwrap()).unwrap();
+        assert_eq!(retained, input);
+        assert!(
+            accepted
+                .summary
+                .contains("model processing and work completion are unconfirmed")
+        );
     }
 
     #[tokio::test]
@@ -1760,13 +2166,63 @@ mod tests {
 
     #[test]
     fn send_input_rejection_is_a_tool_error_with_notify_guidance() {
-        let error = tool_output(WorkerOperation::SendInput, WorkspaceResponse {
-            status: 400,
-            body: "WorkerSendInput requires an Idle Worker. Use WorkerNotify for work already in progress.".to_string(),
-        }).unwrap_err();
-        assert!(matches!(error, ToolError::ExecutionFailed(_)));
-        assert!(error.to_string().contains("WorkerNotify"));
-        assert!(!error.to_string().contains("completed"));
+        use protocol::control_failure::RuntimeControlCause as C;
+        use tools::failure::ToolFailureBoundary as B;
+
+        let rejected = server_api::RuntimeWorkerInputResult {
+            control_explanation: None,
+            control: None,
+            state: server_api::WorkerOperationState::Rejected,
+            disposition: server_api::WorkerInputDisposition::Rejected,
+            runtime_id: "r".into(),
+            worker_id: "w".into(),
+            diagnostics: vec![],
+        };
+        let result = assert_control_failure(
+            tool_output(
+                WorkerOperation::SendInput,
+                WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: serde_json::to_string(&rejected).unwrap(),
+                },
+            )
+            .unwrap_err(),
+            B::Execution,
+            C::ExecutionRejected,
+        );
+        assert_eq!(
+            serde_json::from_value::<server_api::RuntimeWorkerInputResult>(result).unwrap(),
+            rejected
+        );
+
+        // A non-success HTTP response without a typed verdict is an observation
+        // failure, not proof of rejection. Arbitrary transport prose is not public.
+        for body in [
+            "WorkerSendInput requires an Idle Worker. Use WorkerNotify for work already in progress.",
+            "accepted: private provider text /secret/path?token=do-not-expose",
+        ] {
+            let error = tool_output(
+                WorkerOperation::SendInput,
+                WorkspaceResponse {
+                    content_type: None,
+                    status: 400,
+                    body: body.into(),
+                },
+            )
+            .unwrap_err();
+            let ToolError::ExecutionFailure(output) = &error else {
+                panic!("expected a structured failure");
+            };
+            assert!(!output.summary.contains(body));
+            assert!(!output.content.as_deref().unwrap().contains(body));
+            let result = assert_control_failure(error, B::Observation, C::ResultUnavailable);
+            assert_eq!(result, serde_json::json!({"status":400}));
+        }
+        // Advisory guidance belongs to the Tool contract, not untrusted HTTP prose.
+        let description = WorkerOperation::SendInput.description();
+        assert!(description.contains("Non-Idle Workers reject WorkerSendInput without queueing"));
+        assert!(description.contains("Use WorkerNotify"));
     }
 
     #[tokio::test]
@@ -1861,20 +2317,42 @@ mod tests {
             runtime_worker_control: false,
         };
 
-        send_tool
+        let sent = send_tool
             .execute(
                 r#"{"subject":{"kind":"sub_worker","name":"reviewer"},"content":"continue"}"#,
                 ToolExecutionContext::new("call-send", "batch-control", 0),
             )
             .await
             .unwrap();
-        stop_tool
+        assert!(
+            sent.summary
+                .contains("model processing and completion are unconfirmed")
+        );
+        let input_receipt: serde_json::Value =
+            serde_json::from_str(sent.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            input_receipt["subject"],
+            serde_json::json!({"kind":"sub_worker","name":"reviewer"})
+        );
+        let stopped = stop_tool
             .execute(
                 r#"{"subject":{"kind":"sub_worker","name":"reviewer"},"reason":"review completed"}"#,
                 ToolExecutionContext::new("call-stop", "batch-control", 1),
             )
             .await
             .unwrap();
+        let stop_receipt: SubWorkerStopSummary =
+            serde_json::from_str(stopped.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stop_receipt.session_id, "review-session");
+        assert_eq!(stop_receipt.display_name, "reviewer");
+        assert_eq!(
+            stop_receipt.outcome,
+            crate::spawn::registry::SubWorkerFinalOutcome::Done
+        );
+        assert_eq!(
+            stopped.summary,
+            render_subworker_stop_summary(&stop_receipt)
+        );
 
         assert_eq!(
             *control.sent.lock().unwrap(),
@@ -2186,7 +2664,7 @@ mod tests {
                 None,
             ),
         ] {
-            WorkspaceWorkerTool {
+            let output = WorkspaceWorkerTool {
                 operation,
                 control: test_control(client.clone()),
                 runtime_worker_control: true,
@@ -2197,6 +2675,29 @@ mod tests {
             )
             .await
             .unwrap();
+            if expected_kind.is_some() {
+                let receipt: server_api::RuntimeWorkerInputResult =
+                    serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+                assert_eq!(receipt.state, server_api::WorkerOperationState::Accepted);
+                assert_eq!(
+                    receipt.disposition,
+                    server_api::WorkerInputDisposition::Accepted
+                );
+                assert!(
+                    output
+                        .summary
+                        .contains("model processing and work completion are unconfirmed")
+                );
+            } else {
+                let receipt: server_api::RuntimeWorkerLifecycleResult =
+                    serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+                assert_eq!(receipt.state, server_api::WorkerOperationState::Accepted);
+                assert!(
+                    output
+                        .summary
+                        .contains("does not prove execution termination")
+                );
+            }
             let check = client
                 .authorizations
                 .lock()
@@ -2368,6 +2869,7 @@ mod tests {
             }),
         };
         let response = WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&summary).unwrap(),
         };
@@ -2461,6 +2963,7 @@ mod tests {
                         )
                         .await?;
                     Ok(WorkspaceResponse {
+                        content_type: None,
                         status: 200,
                         body: "{}".into(),
                     })
@@ -2604,10 +3107,13 @@ mod tests {
                     .execute(&input.to_string(), ToolExecutionContext::direct())
                     .await
                     .unwrap_err();
-                assert!(
-                    error.to_string().contains("authorization denied"),
-                    "{tool_name}: {error}"
+                // The Host response owns the typed denial; its prose is not a classifier.
+                let result = assert_control_failure(
+                    error,
+                    tools::failure::ToolFailureBoundary::Observation,
+                    protocol::control_failure::RuntimeControlCause::AuthorizationFailed,
                 );
+                assert!(result.is_null());
                 let checks = client.authorizations.lock().unwrap();
                 let check = checks.last().unwrap();
                 assert_eq!(check.operation, operation);

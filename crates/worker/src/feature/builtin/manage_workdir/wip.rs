@@ -989,6 +989,7 @@ fn map_tool_error(error: ToolError) -> WipOperationError {
         ToolError::InvalidArgument(message) => {
             failure(ProtocolErrorCode::InvalidArguments, message)
         }
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, .. } => {
@@ -1280,7 +1281,8 @@ pub(crate) mod tests {
                 };
                 state.bound_authorizations.push(auth);
                 return Ok(WorkspaceResponse {
-                    status: if state.authorization_denied { 403 } else if connection.is_none() { 409 } else { 200 },
+                    content_type: None,
+status: if state.authorization_denied { 403 } else if connection.is_none() { 409 } else { 200 },
                     body: json!({"scope":{"kind":"workdir_attachment", "workspace_id":"test-workspace", "connection_id":connection.unwrap_or_default()}}).to_string(),
                 });
             }
@@ -1289,6 +1291,7 @@ pub(crate) mod tests {
                     .authorizations
                     .push(serde_json::from_str(request.body.as_deref().unwrap()).unwrap());
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: if state.authorization_denied { 403 } else { 200 },
                     body: r#"{"scope":null}"#.into(),
                 });
@@ -1296,6 +1299,7 @@ pub(crate) mod tests {
             state.requests.push(request.clone());
             if state.denied {
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 403,
                     body: "SECRET /host/path".into(),
                 });
@@ -1393,6 +1397,7 @@ pub(crate) mod tests {
                         Some(r) => json!({"item":r}),
                         None => {
                             return Ok(WorkspaceResponse {
+                                content_type: None,
                                 status: 404,
                                 body: String::new(),
                             });
@@ -1409,6 +1414,7 @@ pub(crate) mod tests {
                         Some(r) => json!({"item":r}),
                         None => {
                             return Ok(WorkspaceResponse {
+                                content_type: None,
                                 status: 404,
                                 body: String::new(),
                             });
@@ -1449,6 +1455,7 @@ pub(crate) mod tests {
                         .position(|r| r["alias"] == alias && r["connection_id"] == expected)
                     else {
                         return Ok(WorkspaceResponse {
+                            content_type: None,
                             status: 409,
                             body: "stale".into(),
                         });
@@ -1462,6 +1469,7 @@ pub(crate) mod tests {
                 other => panic!("unexpected catalog request: {other:?}"),
             };
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: value.to_string(),
             })

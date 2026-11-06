@@ -1622,6 +1622,7 @@ mod tests {
                     server_api::authorization::BoundAuthorizationTarget::Subject {}
                 ));
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: if self.scope_allowed.load(std::sync::atomic::Ordering::SeqCst) {
                         200
                     } else {
@@ -1640,12 +1641,14 @@ mod tests {
             ));
             if !self.scope_allowed.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 403,
                     body: "subject scope unavailable".into(),
                 });
             }
             let behavior_md = self.behavior.lock().unwrap().clone();
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(
                     &server_api::SubjektivMemoryBackendResponse::ResidentContext(
@@ -2334,6 +2337,7 @@ permission = "write"
                     ));
                 }
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status,
                     body: if status == 200 {
                         r#"{"scope":{"kind":"workspace","workspace_id":"workspace"}}"#.into()
@@ -2360,6 +2364,7 @@ permission = "write"
                 })
             };
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&MemoryBackendHttpResponse::Ok { result }).unwrap(),
             })
@@ -2499,7 +2504,9 @@ permission = "write"
         .unwrap_err();
         assert!(matches!(
             error,
-            WorkspaceMemoryBackendError::Request(WorkspaceClientError::Request(_))
+            WorkspaceMemoryBackendError::Request(WorkspaceClientError::AuthorizationRejected {
+                status: 403
+            })
         ));
         assert!(error.to_string().contains("authorization denied"));
         assert_eq!(client.effects.load(Ordering::SeqCst), 0);

@@ -38,6 +38,7 @@ async fn mr_only_controller_reserves_ticket_coordinates_without_publishing_ticke
                     }
                 );
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: if self.allowed.load(Ordering::SeqCst) {
                         200
                     } else {
@@ -49,6 +50,7 @@ async fn mr_only_controller_reserves_ticket_coordinates_without_publishing_ticke
             assert_eq!(request.path, "/api/w/workspace/tickets/T-42/merge-request");
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"merge_request_id":"MR-42"}).to_string(),
             })

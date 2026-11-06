@@ -451,11 +451,26 @@ pub enum BackgroundTaskOutcome {
     TimedOut,
     Failed(HookError),
     JoinFailed,
-    StaleGenerationDiscarded,
-    CleanupFailed(HookError),
-    CleanupTimedOut,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskCleanupOutcome {
+    /// The driver did not report cleanup, for example after a join failure.
+    NotObserved,
+    Completed,
+    Failed(HookError),
+    TimedOut,
+}
+
+/// A snapshot at diagnostic recording, not authority to commit task output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundTaskGenerationObservation {
+    pub expected_generation: u64,
+    pub observed_generation: u64,
+}
+
+/// Bounded, process-local observations, not durable Job or Service results.
+/// Cleanup and a stale generation never replace the driver's primary outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundTaskDiagnostic {
     pub execution_id: u64,
@@ -463,6 +478,9 @@ pub struct BackgroundTaskDiagnostic {
     pub task_name: String,
     pub attempts: u16,
     pub outcome: BackgroundTaskOutcome,
+    pub cleanup_outcome: BackgroundTaskCleanupOutcome,
+    /// Absent when the driver did not reach its recording boundary.
+    pub generation_observation: Option<BackgroundTaskGenerationObservation>,
 }
 
 impl FeatureBackgroundTaskRegistry {
@@ -606,26 +624,27 @@ impl FeatureBackgroundTaskRegistry {
                 task.stopped(context),
             )
             .await;
-            let cleanup_error = match cleanup {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => {
-                    outcome = BackgroundTaskOutcome::CleanupFailed(error.clone());
-                    Some(error)
-                }
-                Err(_) => {
-                    outcome = BackgroundTaskOutcome::CleanupTimedOut;
+            let (cleanup_outcome, cleanup_error) = match cleanup {
+                Ok(Ok(())) => (BackgroundTaskCleanupOutcome::Completed, None),
+                Ok(Err(error)) => (
+                    BackgroundTaskCleanupOutcome::Failed(error.clone()),
+                    Some(error),
+                ),
+                Err(_) => (
+                    BackgroundTaskCleanupOutcome::TimedOut,
                     Some(HookError::new(
                         HookErrorCategory::Timeout,
                         "background task cleanup exceeded its host deadline",
-                    ))
-                }
+                    )),
+                ),
             };
             if let Some(inner) = weak_inner.upgrade() {
                 if matches!(spec.trigger, BackgroundTaskTrigger::HostReady { .. })
-                    && !matches!(
-                        outcome,
-                        BackgroundTaskOutcome::Completed | BackgroundTaskOutcome::Cancelled
-                    )
+                    && (cleanup_error.is_some()
+                        || !matches!(
+                            outcome,
+                            BackgroundTaskOutcome::Completed | BackgroundTaskOutcome::Cancelled
+                        ))
                 {
                     inner
                         .registrations
@@ -634,11 +653,10 @@ impl FeatureBackgroundTaskRegistry {
                         .host_ready_active
                         .store(false, Ordering::Release);
                 }
-                let outcome = if generation_fence.ensure_current().is_ok() {
-                    outcome
-                } else {
-                    BackgroundTaskOutcome::StaleGenerationDiscarded
-                };
+                let generation_observation = Some(BackgroundTaskGenerationObservation {
+                    expected_generation: generation_fence.expected,
+                    observed_generation: generation_fence.current.load(Ordering::Acquire),
+                });
                 let mut diagnostics = inner.diagnostics.lock().expect("diagnostics poisoned");
                 diagnostics.push(BackgroundTaskDiagnostic {
                     execution_id,
@@ -646,6 +664,8 @@ impl FeatureBackgroundTaskRegistry {
                     task_name: task_task_name,
                     attempts,
                     outcome,
+                    cleanup_outcome,
+                    generation_observation,
                 });
                 if diagnostics.len() > MAX_RETAINED_DIAGNOSTICS {
                     let remove = diagnostics.len() - MAX_RETAINED_DIAGNOSTICS;
@@ -922,8 +942,12 @@ impl FeatureBackgroundTaskRegistry {
                     for cancellation in &cancellations {
                         cancellation.cancel();
                     }
-                    let _ = (&mut task.handle).await;
-                    Some(BackgroundTaskOutcome::TimedOut)
+                    // The runner records its observed result and cleanup. The
+                    // settlement deadline is not a second execution outcome.
+                    match (&mut task.handle).await {
+                        Ok(_) => None,
+                        Err(_) => Some(BackgroundTaskOutcome::JoinFailed),
+                    }
                 }
             };
             let task = waiting.task.take().expect("joined task retained");
@@ -935,6 +959,8 @@ impl FeatureBackgroundTaskRegistry {
                     task_name: task.task_name,
                     attempts: 0,
                     outcome,
+                    cleanup_outcome: BackgroundTaskCleanupOutcome::NotObserved,
+                    generation_observation: None,
                 });
                 if diagnostics.len() > MAX_RETAINED_DIAGNOSTICS {
                     let remove = diagnostics.len() - MAX_RETAINED_DIAGNOSTICS;
@@ -1156,6 +1182,10 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(registry.diagnostics()[0].attempts, 3);
+        assert_eq!(
+            registry.diagnostics()[0].cleanup_outcome,
+            BackgroundTaskCleanupOutcome::Completed
+        );
         assert_eq!(
             registry.diagnostics()[0].outcome,
             BackgroundTaskOutcome::Completed
@@ -1404,9 +1434,20 @@ mod tests {
             HookErrorCategory::Cancelled
         );
         assert_eq!(registry.diagnostics().len(), 1);
+        let diagnostic = &registry.diagnostics()[0];
+        assert_eq!(diagnostic.outcome, BackgroundTaskOutcome::Cancelled);
         assert_eq!(
-            registry.diagnostics()[0].outcome,
-            BackgroundTaskOutcome::Cancelled
+            diagnostic.cleanup_outcome,
+            BackgroundTaskCleanupOutcome::Completed
+        );
+        // The fence is stale now, but the retained observation was current
+        // when the old driver recorded its result before rewrite advanced it.
+        assert_eq!(
+            diagnostic.generation_observation,
+            Some(BackgroundTaskGenerationObservation {
+                expected_generation: 1,
+                observed_generation: 1,
+            })
         );
         drop(rewrite_guard);
         assert!(matches!(
@@ -1513,7 +1554,7 @@ mod tests {
             }
             if self.cleanup_fails {
                 Err(HookError::new(
-                    HookErrorCategory::Dependency,
+                    HookErrorCategory::Internal,
                     "on-stop failed",
                 ))
             } else {
@@ -1561,6 +1602,190 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    async fn finish_with_cleanup_failure(
+        run_fails: bool,
+        stale_generation: bool,
+    ) -> FeatureBackgroundTaskRegistry {
+        let feature = FeatureId::builtin("result-cleanup");
+        let (mut task, mut runs, mut stops) = controlled_task();
+        task.fail.store(run_fails, Ordering::SeqCst);
+        task.cleanup_fails = true;
+        let release_run = task.release_run.clone();
+        let release_stop = Arc::new(tokio::sync::Semaphore::new(0));
+        task.release_stop = Some(release_stop.clone());
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(
+                feature.clone(),
+                BackgroundTaskSpec::single_flight(
+                    BackgroundTaskDeclaration::worker_managed("result", "result"),
+                    Duration::from_secs(1),
+                ),
+                task,
+            )
+            .unwrap();
+        let registry = builder.build();
+        let started = registry.start(&feature, "result", invocation()).unwrap();
+        let run = next_context(&mut runs).await;
+        assert_eq!(
+            started,
+            BackgroundTaskStart::Started {
+                execution_id: run.execution_id,
+            }
+        );
+        release_run.add_permits(1);
+        let stop = next_context(&mut stops).await;
+        assert_eq!(run.execution_id, stop.execution_id);
+        if stale_generation {
+            registry
+                .inner
+                .session_generation
+                .fetch_add(1, Ordering::AcqRel);
+            assert!(run.generation_fence.ensure_current().is_err());
+        }
+        // Inspect the driver's join result directly: cleanup remains a caller
+        // error even though diagnostics retain the independent run result.
+        let running = registry
+            .inner
+            .running
+            .lock()
+            .unwrap()
+            .remove(&run.execution_id)
+            .unwrap();
+        release_stop.add_permits(1);
+        let error = tokio::time::timeout(Duration::from_secs(2), running.handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            HookError::new(HookErrorCategory::Internal, "on-stop failed")
+        );
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].execution_id, run.execution_id);
+        assert_eq!(diagnostics[0].feature_id, feature);
+        assert_eq!(diagnostics[0].task_name, "result");
+        assert_eq!(diagnostics[0].attempts, 1);
+        assert_eq!(
+            diagnostics[0].cleanup_outcome,
+            BackgroundTaskCleanupOutcome::Failed(error)
+        );
+        assert_eq!(
+            diagnostics[0].generation_observation,
+            Some(BackgroundTaskGenerationObservation {
+                expected_generation: run.generation_fence.generation(),
+                observed_generation: run.generation_fence.generation()
+                    + u64::from(stale_generation),
+            })
+        );
+        registry.shutdown().await.unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn execution_failure_survives_cleanup_failure() {
+        let registry = finish_with_cleanup_failure(true, false).await;
+        assert_eq!(
+            registry.diagnostics()[0].outcome,
+            BackgroundTaskOutcome::Failed(HookError::new(
+                HookErrorCategory::Dependency,
+                "consumer paused",
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_execution_survives_cleanup_failure() {
+        let registry = finish_with_cleanup_failure(false, false).await;
+        assert_eq!(
+            registry.diagnostics()[0].outcome,
+            BackgroundTaskOutcome::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_generation_retains_execution_and_cleanup_causes() {
+        let registry = finish_with_cleanup_failure(true, true).await;
+        assert_eq!(
+            registry.diagnostics()[0].outcome,
+            BackgroundTaskOutcome::Failed(HookError::new(
+                HookErrorCategory::Dependency,
+                "consumer paused",
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_observer_mutation_cannot_change_retained_results() {
+        let registry = finish_with_cleanup_failure(true, false).await;
+        let retained = registry.diagnostics();
+        let mut observed = registry.diagnostics();
+        observed[0].outcome = BackgroundTaskOutcome::Completed;
+        observed[0].cleanup_outcome = BackgroundTaskCleanupOutcome::Completed;
+        observed[0].generation_observation = None;
+        observed.clear();
+        assert_eq!(registry.diagnostics(), retained);
+    }
+
+    #[tokio::test]
+    async fn driver_join_failure_does_not_claim_cleanup_or_generation_observation() {
+        let feature = FeatureId::builtin("join-observation");
+        let (task, mut runs, mut stops) = controlled_task();
+        let release_run = task.release_run.clone();
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder
+            .register(feature, host_ready_spec("service"), task)
+            .unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        let run = next_context(&mut runs).await;
+        // A closed fixture gate panics the run future before cleanup begins.
+        release_run.close();
+        let error = registry.shutdown().await.unwrap_err();
+        assert_eq!(error.category, HookErrorCategory::Internal);
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].execution_id, run.execution_id);
+        assert_eq!(diagnostics[0].outcome, BackgroundTaskOutcome::JoinFailed);
+        assert_eq!(
+            diagnostics[0].cleanup_outcome,
+            BackgroundTaskCleanupOutcome::NotObserved
+        );
+        assert_eq!(diagnostics[0].generation_observation, None);
+        assert!(stops.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn run_timeout_survives_cleanup_failure() {
+        let feature = FeatureId::builtin("timeout-cleanup");
+        let (mut task, mut runs, mut stops) = controlled_task();
+        task.cleanup_fails = true;
+        let mut spec = host_ready_spec("service");
+        spec.timeout_ms = 10;
+        let mut builder = FeatureBackgroundTaskRegistryBuilder::default();
+        builder.register(feature, spec, task).unwrap();
+        let registry = builder.build();
+        registry.start_host_ready(invocation()).unwrap();
+        let run = next_context(&mut runs).await;
+        let stop = next_context(&mut stops).await;
+        assert_eq!(run.execution_id, stop.execution_id);
+        let error = registry.shutdown().await.unwrap_err();
+        assert_eq!(error.category, HookErrorCategory::Internal);
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].execution_id, run.execution_id);
+        assert_eq!(diagnostics[0].outcome, BackgroundTaskOutcome::TimedOut);
+        assert_eq!(
+            diagnostics[0].cleanup_outcome,
+            BackgroundTaskCleanupOutcome::Failed(HookError::new(
+                HookErrorCategory::Internal,
+                "on-stop failed",
+            ))
+        );
     }
 
     #[tokio::test]
@@ -1713,12 +1938,37 @@ mod tests {
                 .is_err()
         );
         let diagnostics = registry.diagnostics();
-        assert!(diagnostics.iter().any(|d| d.task_name == "failed"
-            && matches!(d.outcome, BackgroundTaskOutcome::CleanupFailed(_))));
+        assert_eq!(diagnostics.len(), 2);
+        let failed = diagnostics
+            .iter()
+            .find(|d| d.task_name == "failed")
+            .unwrap();
+        assert_eq!(failed.outcome, BackgroundTaskOutcome::Cancelled);
+        assert_eq!(
+            failed.cleanup_outcome,
+            BackgroundTaskCleanupOutcome::Failed(HookError::new(
+                HookErrorCategory::Internal,
+                "on-stop failed",
+            ))
+        );
+        let healthy = diagnostics
+            .iter()
+            .find(|d| d.task_name == "healthy")
+            .unwrap();
+        assert_eq!(healthy.outcome, BackgroundTaskOutcome::Cancelled);
+        assert_eq!(
+            healthy.cleanup_outcome,
+            BackgroundTaskCleanupOutcome::Completed
+        );
         assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.task_name == "healthy" && d.outcome == BackgroundTaskOutcome::Cancelled)
+            !registry.inner.registrations[&(failed.feature_id.clone(), failed.task_name.clone())]
+                .host_ready_active
+                .load(Ordering::Acquire)
+        );
+        assert!(
+            registry.inner.registrations[&(healthy.feature_id.clone(), healthy.task_name.clone())]
+                .host_ready_active
+                .load(Ordering::Acquire)
         );
         assert!(registry.inner.running.lock().unwrap().is_empty());
     }
@@ -1743,10 +1993,22 @@ mod tests {
         assert_eq!(error.category, HookErrorCategory::Internal);
         next_context(&mut stops).await;
         assert!(dropped.load(Ordering::SeqCst));
+        let diagnostics = registry.diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].outcome, BackgroundTaskOutcome::Cancelled);
         assert_eq!(
-            registry.diagnostics()[0].outcome,
-            BackgroundTaskOutcome::CleanupTimedOut
+            diagnostics[0].cleanup_outcome,
+            BackgroundTaskCleanupOutcome::TimedOut
         );
+        let registration = registry
+            .inner
+            .registrations
+            .get(&(
+                diagnostics[0].feature_id.clone(),
+                diagnostics[0].task_name.clone(),
+            ))
+            .unwrap();
+        assert!(!registration.host_ready_active.load(Ordering::Acquire));
         assert!(registry.inner.running.lock().unwrap().is_empty());
     }
 

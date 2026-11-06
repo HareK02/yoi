@@ -891,6 +891,7 @@ fn map_tool_error(e: ToolError) -> WipOperationError {
             ),
             _ => WipOperationError::OutcomeUnknown("unclassified file operation failure".into()),
         },
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(o) => WipOperationError::Cancelled(o),
         ToolError::Interrupted(o) => WipOperationError::Interrupted(o),
         _ => WipOperationError::OutcomeUnknown(

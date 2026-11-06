@@ -48,6 +48,7 @@ impl FeaturePermissionRegistrar<'_> {
     }
 }
 
+#[derive(Clone)]
 pub struct FeaturePermissionRegistry {
     host: PermissionHost,
     features: BTreeMap<FeatureId, FeatureHandle>,

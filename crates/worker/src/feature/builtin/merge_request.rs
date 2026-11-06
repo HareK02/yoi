@@ -730,6 +730,7 @@ fn map_merge_request_tool_error(error: ToolError, _mutating: bool) -> WipOperati
         ToolError::InvalidArgument(message) => {
             merge_request_protocol_failure(ProtocolErrorCode::InvalidArguments, message)
         }
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, message } => merge_request_protocol_failure(
@@ -964,11 +965,13 @@ mod tests {
                 self.authorizations.lock().unwrap().push(input.clone());
                 if self.auth_denied.load(std::sync::atomic::Ordering::SeqCst) {
                     return Ok(WorkspaceResponse {
+                        content_type: None,
                         status: 403,
                         body: "{}".into(),
                     });
                 }
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::json!({"scope": input.resource}).to_string(),
                 });
@@ -984,6 +987,7 @@ mod tests {
 
     pub(super) fn response(body: serde_json::Value) -> WorkspaceResponse {
         WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: body.to_string(),
         }
@@ -1487,6 +1491,7 @@ mod tests {
             WipOperationError::OutcomeUnknown(_)
         ));
         let invalid_json = Arc::new(RecordingWorkspaceClient::new(vec![WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: "not-json".into(),
         }]));

@@ -37,6 +37,7 @@ async fn tool_and_native_open_contracts_produce_the_same_authorized_domain_reque
 async fn native_backend_conflict_is_a_domain_rejection_not_a_type_rejection_or_retry() {
     let client = Arc::new(RecordingWorkspaceClient::new(vec![
         crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 409,
             body: "approval snapshot is stale".into(),
         },

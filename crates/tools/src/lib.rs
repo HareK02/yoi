@@ -2,6 +2,7 @@
 
 pub mod checkout;
 pub mod error;
+pub mod failure;
 pub mod tracker;
 
 mod bash;

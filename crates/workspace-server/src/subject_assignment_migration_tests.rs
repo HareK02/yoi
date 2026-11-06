@@ -1036,14 +1036,24 @@ mod subject_assignment_migration_tests {
                     } else {
                         String::new()
                     };
-                    let without_rowid: bool = conn.query_row(
-                        "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1", [&table], |row| row.get(0),
-                    ).unwrap();
-                    let query = if without_rowid {
-                        format!("SELECT {columns} FROM \"{table}\"{sequence_filter} ORDER BY {columns}")
+                    // Keep append identities for rowid tables; current content
+                    // history tables are WITHOUT ROWID, so compare every column
+                    // in deterministic value order instead of inventing rowids.
+                    let without_rowid: bool = conn
+                        .query_row(
+                            "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1",
+                            [&table],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let (projection, order) = if without_rowid {
+                        (columns.clone(), columns)
                     } else {
-                        format!("SELECT rowid,{columns} FROM \"{table}\"{sequence_filter} ORDER BY rowid")
+                        (format!("rowid,{columns}"), "rowid".into())
                     };
+                    let query = format!(
+                        "SELECT {projection} FROM \"{table}\"{sequence_filter} ORDER BY {order}"
+                    );
                     let rows = fixture_query_rows(conn, &query);
                     (query, rows)
                 })
@@ -1123,9 +1133,15 @@ mod subject_assignment_migration_tests {
         }
 
         fn expected_tail(version: i64) -> Vec<(i64, String)> {
-            assert!(matches!(version, 96 | 106 | 107), "unsupported fixture origin");
-            MIGRATIONS.iter().filter(|migration| migration.version > version)
-                .map(|migration| (migration.version, migration.name.into())).collect()
+            assert!(
+                matches!(version, 96 | 106 | 107),
+                "unsupported fixture origin"
+            );
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > version)
+                .map(|migration| (migration.version, migration.name.into()))
+                .collect()
         }
 
         fn plan_steps(version: i64) -> Vec<WorkspaceSchemaMigrationStep> {

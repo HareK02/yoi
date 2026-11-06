@@ -58,12 +58,17 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     drop(conn);
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 93);
+    assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
     assert_eq!(
-        plan.migrations
+        plan.migrations,
+        MIGRATIONS
             .iter()
-            .map(|step| step.version)
-            .collect::<Vec<_>>(),
-        (94..=113).chain([122, 123]).collect::<Vec<_>>()
+            .filter(|migration| migration.version > 93)
+            .map(|migration| WorkspaceSchemaMigrationStep {
+                version: migration.version,
+                name: migration.name.into(),
+            })
+            .collect::<Vec<_>>()
     );
     let expected_history: Vec<_> = old_history.into_iter()
         .chain(plan.migrations.iter().map(|step| (step.version, step.name.clone())))

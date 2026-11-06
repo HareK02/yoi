@@ -454,7 +454,7 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .iter()
             .map(|m| m.version)
             .collect::<Vec<_>>(),
-        (92..=113).chain([122, 123]).collect::<Vec<_>>()
+        (92..=113).chain([122, 123, 124, 125, 126]).collect::<Vec<_>>()
     );
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store
@@ -529,7 +529,10 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (112, "Ticket Service outbox and fenced consumers".into()),
                     (113, "Ticket work-decomposition parent links".into()),
                     (122, crate::config_adoption::MIGRATION_NAME.into()),
-                    (123, backend_job_upgrade::MIGRATION_NAME.into())
+                    (123, backend_job_upgrade::MIGRATION_NAME.into()),
+                    (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
+                    (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
+                    (126, SERVICE_OUTCOME_MIGRATION_NAME.into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

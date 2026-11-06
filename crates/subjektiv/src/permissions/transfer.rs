@@ -134,6 +134,28 @@ impl PermissionAuthorityGuard<'_> {
         Ok(())
     }
 
+    /// Read creation-only enrollment in this already-held transaction. This is
+    /// retained evidence, never a current policy or a read-time default issuance.
+    pub fn subject_permission_enrollment(
+        &self,
+        subject: &str,
+    ) -> Result<Option<server_api::authorization::SubjectPolicySource>> {
+        self.require_subject(subject)?;
+        let transaction = self.transaction.borrow();
+        let tx = transaction
+            .as_ref()
+            .ok_or(SubjektivError::PermissionAuthoritySealed)?;
+        if !has_table(tx, "permission_authority_seal")? {
+            return Ok(None);
+        }
+        let raw: Option<String> = tx.query_row(
+            "SELECT permission_enrollment_json FROM subject_creation_receipts WHERE subject_id=?1",
+            [subject], |row| row.get::<_, Option<String>>(0),
+        ).optional()?.flatten();
+        raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+            .transpose()
+    }
+
     /// Commit the exact Feature seal independently of the enclosing action's result.
     /// Exact receipt retries use the same identity, fingerprint and export checks, and
     /// commit their read-only transaction too. Failure drops the transaction to roll back;

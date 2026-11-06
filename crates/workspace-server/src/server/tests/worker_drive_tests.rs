@@ -124,6 +124,7 @@ impl WorkspaceClient for RouterClient {
             2 * 1024 * 1024,
         )?;
         Ok(WorkspaceResponse {
+            content_type: None,
             status: response.status,
             body: String::from_utf8(response.body)
                 .map_err(|e| WorkspaceClientError::Request(e.to_string()))?,

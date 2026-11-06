@@ -41,12 +41,14 @@ struct State {
 struct Client(Mutex<State>);
 fn response(value: impl Serialize) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: serde_json::to_string(&value).unwrap(),
     }
 }
 fn failure(status: u16, code: DriveApiErrorCode) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status,
         body: serde_json::to_string(&DriveApiError::new(code)).unwrap(),
     }

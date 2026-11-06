@@ -178,12 +178,14 @@ impl SubjektivStore {
     /// a missing retained parent is not ownership evidence. Profile resolution, provider scope,
     /// Worker creation and caller authentication also remain Host duties.
     pub fn bind_worker_execution_grant(&self, grant: &WorkerExecutionGrant) -> Result<()> {
-        self.bind_worker_execution_grant_inner(grant, None)
+        self.bind_worker_execution_grant_inner(grant, || Ok(((), None)))
     }
 
     /// Feature-aware binding through the same immutable grant writer and replay
-    /// boundary as legacy binding. The caller supplies its current registered Host
-    /// (and holds its catalog/lifecycle fence through this call). No Feature policy
+    /// boundary as legacy binding. This accepts an already immutable registered
+    /// Host. For a catalog behind a live registry lock, use
+    /// [`Self::bind_worker_execution_grant_with_host_lease`] instead: acquiring that
+    /// lock before this call inverts native effect admission. No Feature policy
     /// is projected into legacy all-target resources. Each requested scoped
     /// operation is an exact, frozen key; resolving the Subject's delegation may
     /// follow current declared children, but never expands the saved child grant.
@@ -202,7 +204,21 @@ impl SubjektivStore {
         if host.catalog().workspace.as_str() != self.scope_id() {
             return Err(denied("permission Host belongs to another Workspace"));
         }
-        self.bind_worker_execution_grant_inner(grant, Some(host))
+        self.bind_worker_execution_grant_inner(grant, || Ok(((), Some(host.clone()))))
+    }
+
+    /// Acquire the current catalog only after the native Feature connection and
+    /// IMMEDIATE transaction. The returned lease fences catalog changes through
+    /// FeatureStorage's COMMIT, including immutable replay. The callback must not
+    /// reenter this store. A cloned Host without its retained lease is not a fence.
+    pub fn bind_worker_execution_grant_with_host_lease<L>(
+        &self,
+        grant: &WorkerExecutionGrant,
+        acquire_host: impl FnOnce() -> Result<(L, feature_permissions::PermissionHost)>,
+    ) -> Result<()> {
+        self.bind_worker_execution_grant_inner(grant, || {
+            acquire_host().map(|(lease, host)| (lease, Some(host)))
+        })
     }
 
     fn policy_source_in_connection(
@@ -220,78 +236,113 @@ impl SubjektivStore {
         stored_source(connection, subject)
     }
 
-    fn bind_worker_execution_grant_inner(
+    fn bind_worker_execution_grant_inner<L>(
         &self,
+        grant: &WorkerExecutionGrant,
+        acquire_host: impl FnOnce() -> Result<(L, Option<feature_permissions::PermissionHost>)>,
+    ) -> Result<()> {
+        validate_grant(self.scope_id(), grant)?;
+        let host = std::cell::RefCell::new(None);
+        self.database.try_transaction_admitted(
+            |_| {
+                let (lease, current) = acquire_host()?;
+                if current
+                    .as_ref()
+                    .is_some_and(|host| host.catalog().workspace.as_str() != self.scope_id())
+                {
+                    return Err(denied("permission Host belongs to another Workspace"));
+                }
+                *host.borrow_mut() = current;
+                Ok(lease)
+            },
+            |tx| self.bind_worker_execution_grant_in_transaction(tx, grant, host.borrow().as_ref()),
+        )
+    }
+
+    fn bind_worker_execution_grant_in_transaction(
+        &self,
+        tx: &Transaction<'_>,
         grant: &WorkerExecutionGrant,
         host: Option<&feature_permissions::PermissionHost>,
     ) -> Result<()> {
-        validate_grant(self.scope_id(), grant)?;
-        self.database.try_transaction(|tx| {
-            require_subject(tx, &grant.subject_id)?;
-            for (runtime, worker) in [(&grant.runtime_id, &grant.worker_id), (&grant.origin_runtime_id, &grant.origin_worker_id)] {
-                if tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_deleted_workers WHERE runtime_id=?1 AND worker_id=?2)", params![runtime,worker], |r|r.get::<_,bool>(0))? { return Err(denied("Worker belongs to a deleted Subject")); }
+        require_subject(tx, &grant.subject_id)?;
+        for (runtime, worker) in [
+            (&grant.runtime_id, &grant.worker_id),
+            (&grant.origin_runtime_id, &grant.origin_worker_id),
+        ] {
+            if tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_deleted_workers WHERE runtime_id=?1 AND worker_id=?2)", params![runtime,worker], |r|r.get::<_,bool>(0))? { return Err(denied("Worker belongs to a deleted Subject")); }
+        }
+        if let Some(existing) = grant_in_connection(tx, &grant.runtime_id, &grant.worker_id)? {
+            return if existing == *grant {
+                Ok(())
+            } else {
+                Err(SubjektivError::WorkerExecutionGrantConflict(format!(
+                    "{}/{}",
+                    grant.runtime_id, grant.worker_id
+                )))
+            };
+        }
+        require_active_subject(tx, &grant.subject_id)?;
+        match host {
+            None => {
+                let source = self
+                    .current_permission_source(tx, &grant.subject_id)?
+                    .ok_or_else(|| denied("Subject permissions are unset"))?;
+                require_source_change(&source.change_id, grant)?;
+                require_covered(&source.delegation, &grant.permissions)?;
+                require_covered(&source.delegation, &grant.redelegation)?;
             }
-            if let Some(existing) = grant_in_connection(tx, &grant.runtime_id, &grant.worker_id)? {
-                return if existing == *grant { Ok(()) } else {
-                    Err(SubjektivError::WorkerExecutionGrantConflict(format!("{}/{}", grant.runtime_id, grant.worker_id)))
-                };
-            }
-            require_active_subject(tx, &grant.subject_id)?;
-            match host {
-                None => {
-                    let source = self.current_permission_source(tx, &grant.subject_id)?
-                        .ok_or_else(|| denied("Subject permissions are unset"))?;
-                    require_source_change(&source.change_id, grant)?;
-                    require_covered(&source.delegation, &grant.permissions)?;
-                    require_covered(&source.delegation, &grant.redelegation)?;
-                }
-                Some(host) => {
-                    let source = self.policy_source_in_connection(tx, &grant.subject_id)?
-                        .ok_or_else(|| denied("Subject permissions are unset"))?;
-                    match source {
-                        SubjectPolicySource::Legacy(source) => {
-                            validate_scope(self.scope_id(), &source.execution)?;
-                            validate_scope(self.scope_id(), &source.delegation)?;
-                            require_source_change(&source.change_id, grant)?;
-                            require_covered(&source.delegation, &grant.permissions)?;
-                            require_covered(&source.delegation, &grant.redelegation)?;
-                        }
-                        SubjectPolicySource::Feature(source) => {
-                            require_source_change(&source.change_id, grant)?;
-                            require_feature_delegation(host, &source, grant)?;
-                            if let Some(limits) = &source.legacy_constraints {
-                                validate_scope(self.scope_id(), &limits.execution)?;
-                                validate_scope(self.scope_id(), &limits.delegation)?;
-                                // Original domain/path constraints remain a separate
-                                // conjunct. A new key cannot erase old finite limits.
-                                require_covered(&limits.delegation, &grant.permissions)?;
-                                require_covered(&limits.delegation, &grant.redelegation)?;
-                            }
+            Some(host) => {
+                let source = self
+                    .policy_source_in_connection(tx, &grant.subject_id)?
+                    .ok_or_else(|| denied("Subject permissions are unset"))?;
+                match source {
+                    SubjectPolicySource::Legacy(source) => {
+                        validate_scope(self.scope_id(), &source.execution)?;
+                        validate_scope(self.scope_id(), &source.delegation)?;
+                        require_source_change(&source.change_id, grant)?;
+                        require_covered(&source.delegation, &grant.permissions)?;
+                        require_covered(&source.delegation, &grant.redelegation)?;
+                    }
+                    SubjectPolicySource::Feature(source) => {
+                        require_source_change(&source.change_id, grant)?;
+                        require_feature_delegation(host, &source, grant)?;
+                        if let Some(limits) = &source.legacy_constraints {
+                            validate_scope(self.scope_id(), &limits.execution)?;
+                            validate_scope(self.scope_id(), &limits.delegation)?;
+                            // Original domain/path constraints remain a separate
+                            // conjunct. A new key cannot erase old finite limits.
+                            require_covered(&limits.delegation, &grant.permissions)?;
+                            require_covered(&limits.delegation, &grant.redelegation)?;
                         }
                     }
                 }
             }
-            // A child grant cannot turn a body (including a released historical body) into a
-            // delegated child or attach a Worker historically attributed to a different Subject.
-            let invalid_target: bool = tx.query_row(
+        }
+        // A child grant cannot turn a body (including a released historical body) into a
+        // delegated child or attach a Worker historically attributed to a different Subject.
+        let invalid_target: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM journal_writer_bindings WHERE runtime_id=?1 AND worker_id=?2) OR EXISTS(SELECT 1 FROM subject_session_attributions WHERE runtime_id=?1 AND worker_id=?2 AND subject_id<>?3)",
                 params![grant.runtime_id, grant.worker_id, grant.subject_id], |row| row.get(0),
             )?;
-            if invalid_target { return Err(denied("target is a body or belongs to another Subject")); }
-            let origin = require_retained_origin(tx, grant)?;
-            if let Some(origin) = origin {
-                require_covered(&origin.redelegation, &grant.permissions)?;
-                require_covered(&origin.redelegation, &grant.redelegation)?;
-            }
-            let table = if transfer::is_sealed(tx)? {
-                // Canonical IDs must not be mirrored into legacy source history to satisfy its FK.
-                crate::storage_formats::install_permission_transfer(tx)?;
-                "canonical_worker_execution_grants"
-            } else { "worker_execution_grants" };
-            tx.execute(&format!("INSERT INTO {table}(runtime_id,worker_id,subject_id,source_change_id,record_json) VALUES(?1,?2,?3,?4,?5)"),
+        if invalid_target {
+            return Err(denied("target is a body or belongs to another Subject"));
+        }
+        let origin = require_retained_origin(tx, grant)?;
+        if let Some(origin) = origin {
+            require_covered(&origin.redelegation, &grant.permissions)?;
+            require_covered(&origin.redelegation, &grant.redelegation)?;
+        }
+        let table = if transfer::is_sealed(tx)? {
+            // Canonical IDs must not be mirrored into legacy source history to satisfy its FK.
+            crate::storage_formats::install_permission_transfer(tx)?;
+            "canonical_worker_execution_grants"
+        } else {
+            "worker_execution_grants"
+        };
+        tx.execute(&format!("INSERT INTO {table}(runtime_id,worker_id,subject_id,source_change_id,record_json) VALUES(?1,?2,?3,?4,?5)"),
                 params![grant.runtime_id, grant.worker_id, grant.subject_id, grant.source_change_id, serde_json::to_string(grant)?])?;
-            Ok(())
-        })
+        Ok(())
     }
 
     /// Returns this Subject's retained grants, including stale grants needed for cancellation

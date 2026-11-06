@@ -1690,3 +1690,59 @@ impl fmt::Debug for WorkerExecutionBackendRef {
             .finish_non_exhaustive()
     }
 }
+
+/// Transfer a spawn result without deriving operation acceptance from its error text,
+/// HTTP status, cleanup disposition, or persistence outcome. Other operation kinds
+/// keep their existing result contracts and are not reclassified as creation.
+pub fn startup_create_failure(
+    result: &WorkerExecutionResult,
+) -> Result<Option<runtime_api::startup::WorkerCreateFailure>, error_contract::ContractError> {
+    use runtime_api::startup::{
+        CreationAcceptance, ExecutionOutcome, StartupOperationFacts, WorkerCreateFailure,
+    };
+    if result.operation != WorkerExecutionOperation::Spawn {
+        return Ok(None);
+    }
+    let execution = match result.outcome {
+        WorkerExecutionOutcome::Accepted => ExecutionOutcome::Accepted,
+        WorkerExecutionOutcome::Busy => ExecutionOutcome::Busy,
+        WorkerExecutionOutcome::Rejected => ExecutionOutcome::Rejected,
+        WorkerExecutionOutcome::Errored => ExecutionOutcome::Errored,
+        WorkerExecutionOutcome::Unsupported => ExecutionOutcome::Unsupported,
+    };
+    let acceptance = match result.outcome {
+        WorkerExecutionOutcome::Accepted => CreationAcceptance::Accepted,
+        WorkerExecutionOutcome::Rejected | WorkerExecutionOutcome::Unsupported => {
+            CreationAcceptance::Rejected
+        }
+        WorkerExecutionOutcome::Busy | WorkerExecutionOutcome::Errored => {
+            CreationAcceptance::Unknown
+        }
+    };
+    let primary = match result.startup_failure.as_ref() {
+        Some(primary) => primary.clone(),
+        None => worker::startup_failure::runtime_startup_attachment(
+            protocol::startup_failure::RuntimeStartupCause {
+                stage: protocol::startup_failure::StartupStage::Controller,
+                reason: protocol::startup_failure::RuntimeStartupReason::StartupFailed,
+            },
+        )?,
+    };
+    WorkerCreateFailure::new(
+        runtime_api::WorkerStartupFailure {
+            primary,
+            secondary: result.secondary_failures.clone(),
+            resources: result.startup_resources,
+            persistence: result.startup_failure_persistence,
+            io_kind: result.startup_io_kind,
+        },
+        StartupOperationFacts {
+            acceptance,
+            execution,
+            finalize: None,
+            correlation: None,
+            backend_compensation: None,
+        },
+    )
+    .map(Some)
+}

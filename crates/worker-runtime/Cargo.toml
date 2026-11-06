@@ -23,10 +23,11 @@ fs-store = ["dep:fs4"]
 test-support = ["fs-store", "ws-server"]
 # Explicit process-test synchronization; independent of offline fixture tooling.
 restore-checkpoints = ["fs-store"]
-http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
+http-server = ["dep:api-macros", "dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "tokio/sync"]
 
 [dependencies]
+api-macros = { workspace = true, optional = true }
 error-contract.workspace = true
 agen.workspace = true
 async-trait.workspace = true

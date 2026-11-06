@@ -114,7 +114,8 @@ mod tests {
             );
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(WorkspaceResponse {
-                status: if self.allowed.load(Ordering::SeqCst) { 200 } else { 403 },
+                content_type: None,
+status: if self.allowed.load(Ordering::SeqCst) { 200 } else { 403 },
                 body: r#"{"scope":{"kind":"subject","workspace_id":"workspace","subject_id":"bound-subject"}}"#.into(),
             })
         }

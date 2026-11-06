@@ -1292,3 +1292,47 @@ fn native_admission_holds_authority_writer_fence_through_effect_commit_and_rollb
             .unwrap();
     }
 }
+
+#[test]
+fn query_reader_reenters_native_authority_without_writes_or_writer_escalation() {
+    let temp = tempfile::tempdir().unwrap();
+    let (manager, registration) = registered(temp.path());
+    let database = manager.scope(SCOPE).unwrap().open(&registration).unwrap();
+    insert(&database, "committed");
+    let reader = database.query_reader().unwrap();
+    assert_eq!(reader.identity(), database.identity());
+    database
+        .transaction(|tx| {
+            tx.execute("INSERT INTO records VALUES ('pending')", [])?;
+            let nested = database.query_reader()?;
+            assert_eq!(values(&nested), ["committed"]);
+            assert_eq!(values(&reader), ["committed"]);
+            assert!(nested.writer_fence().is_err());
+            assert!(
+                nested
+                    .transaction(|write| {
+                        write.execute("INSERT INTO records VALUES ('forbidden')", [])?;
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert!(
+                nested
+                    .with_connection(|conn| {
+                        conn.pragma_update(None, "query_only", false)?;
+                        conn.execute("INSERT INTO records VALUES ('read-only-file')", [])?;
+                        Ok(())
+                    })
+                    .is_err(),
+                "SQLite read-only open flags survive query_only being cleared"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(values(&database), ["committed", "pending"]);
+    assert_eq!(
+        values(&reader),
+        ["committed", "pending"],
+        "a reader is not a frozen policy receipt"
+    );
+}

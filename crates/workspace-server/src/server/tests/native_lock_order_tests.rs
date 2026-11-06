@@ -1,5 +1,5 @@
-//! Native Memory admission versus the production chat consumer. Real Feature
-//! SQLite, registry, canonical adoption, body/Job ownership and Host fences are
+//! Native Memory admission versus production chat, grant binding and enrollment.
+//! Real Feature SQLite, registry, canonical adoption, body/Job ownership and Host fences are
 //! connected; Fixture replaces Runtime execution only. Authentication transport
 //! is outside this component test: chat receives an already-authenticated context.
 //! The two explicit observers schedule requests without replacing authorization.
@@ -321,4 +321,270 @@ async fn memory_chat_schedule(remove_chat: bool) {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn native_memory_and_grant_binding_commit_without_registry_inversion() {
+    bounded_case("native_memory_binding_allowed_case");
+}
+
+#[test]
+fn native_memory_and_grant_binding_recheck_removed_feature_without_binding() {
+    bounded_case("native_memory_binding_removed_case");
+}
+
+#[test]
+fn native_memory_and_subject_enrollment_commit_without_registry_inversion() {
+    bounded_case("native_memory_enrollment_case");
+}
+
+#[derive(Clone, Copy)]
+enum AuthorityConsumer {
+    Binding { remove_ticket: bool },
+    Enrollment,
+}
+
+#[test]
+#[ignore = "exact subprocess case; run by the bounded native Memory/binding parent test"]
+fn native_memory_binding_allowed_case() {
+    native_memory_authority_case(AuthorityConsumer::Binding {
+        remove_ticket: false,
+    });
+}
+
+#[test]
+#[ignore = "exact subprocess case; run by the bounded native Memory/binding parent test"]
+fn native_memory_binding_removed_case() {
+    native_memory_authority_case(AuthorityConsumer::Binding {
+        remove_ticket: true,
+    });
+}
+
+#[test]
+#[ignore = "exact subprocess case; run by the bounded native Memory/enrollment parent test"]
+fn native_memory_enrollment_case() {
+    native_memory_authority_case(AuthorityConsumer::Enrollment);
+}
+
+fn native_memory_authority_case(consumer: AuthorityConsumer) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(memory_authority_schedule(consumer));
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}
+
+async fn memory_authority_schedule(consumer: AuthorityConsumer) {
+    let f = Fixture::new().await;
+    f.adopt_policy(
+        r#"{ sets = ["memory"]; }"#,
+        r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.create"]; }]; }"#,
+    )
+    .await;
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let owner = f
+        .api
+        .store
+        .get_workspace(TEST_WORKSPACE_ID)
+        .await
+        .unwrap()
+        .unwrap()
+        .owner_account_id;
+    let enrollment = store
+        .create_subject_idempotent(
+            crate::subjektiv::SubjectRole::new("native-enrollment").unwrap(),
+            "enrollment behavior".into(),
+            "native-enrollment-creation",
+        )
+        .unwrap();
+    let schema = f.api.config_schema_registry.compose().unwrap();
+    let grant = subject_authorization::prepare_delegation(
+        &f.api,
+        &f.source,
+        Some(&server_api::authorization::WorkerDelegationRequest {
+            permissions: vec![create_permission()],
+            redelegation: vec![],
+        }),
+        &f.source.runtime_id,
+        "native-binding-profile",
+        "native-binding-profile-digest",
+        None,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let context = subjektiv::api::HostOperationContext::validated_consolidation(
+        &store,
+        &f.subject,
+        Some(vec![]),
+        None,
+    )
+    .unwrap();
+    let (start_memory, memory_start) = std::sync::mpsc::channel();
+    let (admitted, memory_admitted) = std::sync::mpsc::channel();
+    let (consumer_at_wait, wait_for_consumer) = std::sync::mpsc::channel();
+    let wait_for_consumer = Mutex::new(wait_for_consumer);
+    let effect_store = subject_authorization::memory_effect_store_before_registry(
+        &f.api,
+        &store,
+        &f.source,
+        &f.subject,
+        "memory.surface.prepare",
+        Arc::new(move || {
+            // Actual native Feature connection + IMMEDIATE transaction are held.
+            admitted.send(()).unwrap();
+            wait_for_consumer
+                .lock()
+                .unwrap()
+                .recv_timeout(PHASE_BOUND)
+                .expect("binding/enrollment must reach its Feature wait edge");
+        }),
+    );
+    let (memory_finished, memory_result) = std::sync::mpsc::channel();
+    let memory = std::thread::spawn(move || {
+        memory_start
+            .recv_timeout(PHASE_BOUND)
+            .expect("consumer prechecks finished");
+        let result = subjektiv::api::execute(
+            &effect_store,
+            &context,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                serde_json::from_value(json!({})).unwrap(),
+            ),
+        );
+        memory_finished.send(result).unwrap();
+    });
+    // This observer is immediately before the real consumer's native writer;
+    // no earlier Feature read can accidentally consume the forced wait edge.
+    let before_feature = || {
+        start_memory.send(()).unwrap();
+        memory_admitted
+            .recv_timeout(PHASE_BOUND)
+            .expect("Memory owns native Feature");
+        if matches!(
+            consumer,
+            AuthorityConsumer::Binding {
+                remove_ticket: true
+            }
+        ) {
+            f.api
+                .permission_registry
+                .write()
+                .unwrap()
+                .set_enabled(&worker::feature::FeatureId::builtin("ticket"), false)
+                .unwrap();
+        }
+        consumer_at_wait.send(()).unwrap();
+    };
+    match consumer {
+        AuthorityConsumer::Binding { remove_ticket } => {
+            let result = subject_authorization::bind_reserved_grant_before_feature(
+                &f.api,
+                &grant,
+                "native-bound-child",
+                before_feature,
+            );
+            let saved = store
+                .worker_execution_grant(&grant.runtime_id, "native-bound-child")
+                .unwrap();
+            if remove_ticket {
+                assert!(
+                    result.is_err(),
+                    "removed catalog key must deny issuance: {result:?}"
+                );
+                assert!(saved.is_none(), "denial must not persist a grant");
+            } else {
+                result.unwrap();
+                let mut expected = grant.clone();
+                expected.worker_id = "native-bound-child".into();
+                assert_eq!(saved, Some(expected));
+                // The same authenticated binding path must recover immutable evidence.
+                subject_authorization::bind_reserved_grant(&f.api, &grant, "native-bound-child")
+                    .unwrap();
+            }
+        }
+        AuthorityConsumer::Enrollment => {
+            let result = f
+                .api
+                .config_store
+                .enroll_created_subject_observed(
+                    TEST_WORKSPACE_ID,
+                    &owner,
+                    &store,
+                    &enrollment.id,
+                    schema.clone(),
+                    || {
+                        let registry = f.api.permission_registry.read().unwrap();
+                        let host = registry.host().clone();
+                        Ok((registry, host))
+                    },
+                    before_feature,
+                )
+                .unwrap()
+                .expect("post-seal enrollment");
+            assert!(result.source_stored && result.policy_committed);
+            let policy = f
+                .api
+                .config_store
+                .adopted_subject_policy(TEST_WORKSPACE_ID, &enrollment.id)
+                .unwrap()
+                .expect("enrollment persisted canonical policy");
+            assert!(policy.current().legacy_constraints.is_none());
+            let replay = f
+                .api
+                .config_store
+                .enroll_created_subject(
+                    TEST_WORKSPACE_ID,
+                    &owner,
+                    &store,
+                    &enrollment.id,
+                    schema,
+                    || {
+                        let registry = f.api.permission_registry.read().unwrap();
+                        let host = registry.host().clone();
+                        Ok((registry, host))
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                replay, result,
+                "same enrollment returns its adoption receipt"
+            );
+            assert_eq!(
+                f.api
+                    .config_store
+                    .configuration_adoption_result(
+                        TEST_WORKSPACE_ID,
+                        &owner,
+                        &format!("subject-enrollment:{}", enrollment.id),
+                    )
+                    .unwrap(),
+                Some(result)
+            );
+        }
+    }
+    let memory_result = memory_result
+        .recv_timeout(PHASE_BOUND)
+        .expect("native Memory completion");
+    memory.join().unwrap();
+    let server_api::SubjektivMemoryBackendResponse::SurfacePrepared(prepared) =
+        memory_result.unwrap()
+    else {
+        panic!("native Memory must return its committed generation");
+    };
+    f.api.feature_storage.open(&f.api.subjektiv_registration).unwrap().with_connection(|connection| {
+        let count: i64 = connection.query_row(
+            "SELECT count(*) FROM surface_generation_runs WHERE subject_id=?1", [&f.subject], |row| row.get(0),
+        )?;
+        assert_eq!(count, 1, "exactly one Memory effect persisted");
+        let fingerprint: String = connection.query_row(
+            "SELECT memory_fingerprint FROM surface_generation_runs WHERE subject_id=?1 AND generation_id=?2",
+            rusqlite::params![f.subject, prepared.generation_id], |row| row.get(0),
+        )?;
+        assert_eq!(fingerprint, prepared.memory_fingerprint);
+        Ok(())
+    }).unwrap();
 }

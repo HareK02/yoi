@@ -335,41 +335,67 @@ impl SqliteWorkspaceStore {
     /// source adoption writer used by owner edits. Call only from authenticated
     /// creation/retry, never from permission reads, launch, restore or migration.
     /// `account` is the authenticated Workspace owner, `schema` the application's
-    /// composed config_schema_registry and `host` its current registered catalog.
+    /// composed config_schema_registry. `acquire_host` returns the current catalog
+    /// and its lease after the native Feature connection/IMMEDIATE transaction;
+    /// that lease stays alive through the Server adoption COMMIT.
     ///
     /// Feature creation commits independently. A failure leaves durable enrollment
     /// evidence and no permission: retry creation with its original request, then
     /// call this again. The stable Server adoption receipt consumes enrollment once;
     /// historical replay never edits today's source or revives a removed policy.
     /// No new database, policy mirror, migration writer or path-based authority.
-    pub(crate) fn enroll_created_subject(
+    pub(crate) fn enroll_created_subject<L>(
         &self,
         workspace: &str,
         account: &str,
         legacy: &subjektiv::SubjektivStore,
         subject: &str,
         schema: WorkspaceConfigSchemaBundle,
-        host: &PermissionHost,
+        acquire_host: impl FnOnce() -> Result<(L, PermissionHost)>,
+    ) -> Result<Option<ConfigurationAdoptionResult>> {
+        self.enroll_created_subject_observed(
+            workspace,
+            account,
+            legacy,
+            subject,
+            schema,
+            acquire_host,
+            || {},
+        )
+    }
+
+    pub(crate) fn enroll_created_subject_observed<L>(
+        &self,
+        workspace: &str,
+        account: &str,
+        legacy: &subjektiv::SubjektivStore,
+        subject: &str,
+        schema: WorkspaceConfigSchemaBundle,
+        acquire_host: impl FnOnce() -> Result<(L, PermissionHost)>,
+        before_feature: impl FnOnce(),
     ) -> Result<Option<ConfigurationAdoptionResult>> {
         // Authenticate before looking at Feature metadata or enrollment evidence.
         self.configuration_current(workspace, account)?;
-        if legacy.scope_id() != workspace || host.catalog().workspace.as_str() != workspace {
+        if legacy.scope_id() != workspace {
             return Err(Error::WorkspaceIdMismatch);
         }
-        let enrollment = legacy
-            .subject_permission_enrollment(subject)
-            .map_err(|error| Error::Store(format!("Subject enrollment: {error}")))?;
-        let Some(enrollment) = enrollment else {
-            return Ok(None);
-        };
         let operation = format!("subject-enrollment:{subject}");
         let identity = legacy
             .database_identity()
             .map_err(|error| Error::Store(format!("Subject enrollment identity: {error}")))?;
+        before_feature();
         legacy.with_permission_authority_guard(&identity, |authority| {
             // Holds Feature lifecycle/deletion fence before entering Server storage.
             authority.require_subject(subject)?;
+            let enrollment = authority.subject_permission_enrollment(subject)?;
             Ok((|| {
+                let (_lease, host) = acquire_host()?;
+                if host.catalog().workspace.as_str() != workspace {
+                    return Err(Error::WorkspaceIdMismatch);
+                }
+                let Some(enrollment) = enrollment else {
+                    return Ok(None);
+                };
                 // Read-only receipt lookup precedes current-source checks. It is
                 // historical evidence, not a request to apply the saved assignment.
                 if let Some(saved) = self.configuration_adoption_result(workspace, account, &operation)? {
@@ -407,7 +433,7 @@ impl SqliteWorkspaceStore {
                 let request = ConfigurationAdoptionRequest {
                     operation_id: operation,
                     expected_head: current.history_head,
-                    expected_catalog_digest: catalog_digest(host)?,
+                    expected_catalog_digest: catalog_digest(&host)?,
                     expected_legacy_export: None,
                     source: ConfigCommitRequest {
                         base_digest: current.state.snapshot.digest,
@@ -415,7 +441,7 @@ impl SqliteWorkspaceStore {
                         entrypoints: contract.entrypoints,
                     },
                 };
-                self.adopt_configuration(workspace, account, &request, schema, host, None,
+                self.adopt_configuration(workspace, account, &request, schema, &host, None,
                     |id| authority.require_subject(id).map_err(|error| Error::Store(format!("Subject enrollment reference: {error}"))),
                     |_| Err(conflict("Subject enrollment must never migrate permission authority")),
                 ).map(Some)

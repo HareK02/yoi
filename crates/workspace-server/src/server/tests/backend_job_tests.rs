@@ -297,9 +297,22 @@ async fn backend_job_executing_cleanup_restart_fences_original_writers_at_each_c
                 .run_backend_job_cleanup(claimed.clone())
                 .await
                 .unwrap_err();
+            let Error::BackendJobFailure {
+                primary,
+                failure_cause,
+                recording,
+            } = &error
+            else {
+                panic!("{cut}: missing operation/recording separation: {error:?}");
+            };
             assert!(
-                error.to_string().contains("Original Job Host admission"),
-                "{cut}: {error}"
+                primary.to_string().contains("Original Job Host admission"),
+                "{cut}: {primary}"
+            );
+            assert!(recording.is_empty(), "{cut}: {recording:?}");
+            assert!(
+                failure_cause.is_some(),
+                "cleanup preflight cause must be retained"
             );
             assert!(
                 api.require_backend_job_attempt_effects_ended(&claimed)

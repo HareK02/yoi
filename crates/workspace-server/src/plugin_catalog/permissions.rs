@@ -125,7 +125,6 @@ pub(crate) fn reconcile(
     if catalog.workspace.as_str() != workspace {
         return Err(invalid_permission("registry belongs to another Workspace"));
     }
-    let host_id = FeatureId::new(HOST_FEATURE).map_err(invalid_permission)?;
     if !catalog
         .namespaces
         .iter()
@@ -156,11 +155,7 @@ pub(crate) fn reconcile(
             continue;
         }
         let feature = FeatureId::new(&id).map_err(invalid_permission)?;
-        if existing.get(&id) == Some(&declaration) {
-            registry
-                .set_enabled(&feature, true)
-                .map_err(invalid_permission)?;
-        } else {
+        if existing.get(&id) != Some(&declaration) {
             registry
                 .add_module(&TrustedPluginPermissions {
                     id: feature,
@@ -169,27 +164,22 @@ pub(crate) fn reconcile(
                 .map_err(invalid_permission)?;
         }
     }
-    registry
-        .set_enabled(&host_id, true)
-        .map_err(invalid_permission)?;
+    // Refreshing adopted contributions must not undo an explicit Host disable.
     Ok(())
 }
 
 impl SqliteWorkspaceStore {
-    /// Call before resolving current policy, outside any existing config-store
-    /// transaction. Lock order is registry write -> catalog transaction. This is a
-    /// rebuildable projection of adopted references, not a second policy writer.
+    /// Refresh the rebuildable declaration projection from one catalog query.
+    /// No SQL writes are needed; callers may supply a reserved read owner while
+    /// retaining their native authority transaction through the actual effect.
     pub(crate) fn sync_plugin_permission_registry(
         &self,
         root: &Path,
         workspace: &str,
         registry: &mut FeaturePermissionRegistry,
     ) -> Result<()> {
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            self.sync_plugin_permission_registry_in_connection(&tx, root, workspace, registry)?;
-            tx.commit()?;
-            Ok(())
+        self.with_conn(|conn| {
+            self.sync_plugin_permission_registry_in_connection(conn, root, workspace, registry)
         })
     }
 

@@ -397,9 +397,25 @@ impl Runtime {
                     WorkerExecutionSpawnResult::RolledBack(result) => {
                         let receipt = RuntimeWorkerRestoreResult::failed(
                             WorkerRestoreState::RolledBack,
+                            match result.outcome {
+                                crate::execution::WorkerExecutionOutcome::Busy
+                                | crate::execution::WorkerExecutionOutcome::Rejected => {
+                                    RuntimeControlCause::ExecutionRejected
+                                }
+                                crate::execution::WorkerExecutionOutcome::Unsupported => {
+                                    RuntimeControlCause::UnsupportedOperation
+                                }
+                                crate::execution::WorkerExecutionOutcome::Errored => {
+                                    RuntimeControlCause::ExecutionFailed
+                                }
+                                crate::execution::WorkerExecutionOutcome::Accepted => {
+                                    RuntimeControlCause::ResultUnavailable
+                                }
+                            },
                             "worker_restore_rolled_back",
                             result.message_or_default(),
-                        );
+                        )
+                        .with_execution_failure(&result);
                         #[cfg(feature = "fs-store")]
                         self.lock()?
                             .record_restore_failure(worker_ref, &result, &receipt)?;
@@ -479,7 +495,7 @@ fn run(
             }
             Ok(Step::Waiting) | Ok(Step::Contended) => None,
             Ok(Step::Retry(reason)) => Some(reason),
-            Err(error) => Some(sanitize_worker_create_failure_message(&error.to_string())),
+            Err(error) => Some(sanitize_worker_restore_failure_message(&error.to_string())),
         };
         if let Some(reason) = &reason {
             repeated = repeated.saturating_add(1);

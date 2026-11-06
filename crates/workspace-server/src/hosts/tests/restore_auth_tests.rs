@@ -132,17 +132,32 @@ async fn restore_capabilities_authorize_runtime_routes_without_relaxing_request_
                 .await
                 .unwrap();
             let status = response.status();
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
             let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            let error: RuntimeHttpErrorResponse = serde_json::from_slice(&bytes).unwrap();
             if case == "authorized" {
-                assert_eq!(
-                    status,
-                    StatusCode::NOT_FOUND,
-                    "{path}: {}",
-                    error.error.message
-                );
-                assert_eq!(error.error.code, "worker_not_found", "{path}");
+                assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+                match api_macros::http::decode_problem_response::<RuntimeControlCause>(
+                    &bytes,
+                    status.as_u16(),
+                    &content_type,
+                    &runtime_api::control_failure::ControlBoundary,
+                    error_contract::Budget::new(16384, 16384),
+                ) {
+                    error_contract::DecodeFailure::Known(value) => {
+                        assert_eq!(*value.facts().cause(), RuntimeControlCause::WorkerMissing)
+                    }
+                    _ => panic!(
+                        "authorized request must reach the typed Worker-missing owner boundary: {path}"
+                    ),
+                }
             } else {
+                let error: RuntimeHttpErrorResponse = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(
                     status,
                     StatusCode::UNAUTHORIZED,

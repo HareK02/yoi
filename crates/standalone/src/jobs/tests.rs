@@ -85,7 +85,7 @@ impl LlmClient for DomainTestClient {
         {
             release.notified().await;
             return Err(ClientError::Config(
-                "known scripted provider failure".into(),
+                "TEST_ONLY_SECRET /private/provider/path raw_http_body".into(),
             ));
         }
         if self.stall {
@@ -317,6 +317,132 @@ async fn overdue_timeout_keeps_owned_future_and_capacity_until_feature_shutdown_
     jobs.shutdown().await.unwrap();
 }
 
+#[test]
+fn job_failure_mapping_uses_variants_not_error_prose() {
+    use worker::job::JobExecutionError as E;
+    for (error, expected) in [
+        (
+            E::UnsupportedProfile("timeout TEST_ONLY_SECRET".into()),
+            JobFailureCause::UnsupportedProfile,
+        ),
+        (
+            E::Worker(Box::new(worker::WorkerError::InvalidState(
+                "cancelled TEST_ONLY_SECRET".into(),
+            ))),
+            JobFailureCause::Worker,
+        ),
+        (
+            E::ResultUnconfirmed("missing result TEST_ONLY_SECRET".into()),
+            JobFailureCause::ResultUnconfirmed,
+        ),
+        (E::Cancelled, JobFailureCause::Cancelled),
+        (E::MissingResult, JobFailureCause::MissingResult),
+    ] {
+        assert_eq!(JobFailureCause::execution(&error), expected);
+        let encoded = expected.attachment().unwrap();
+        assert!(!encoded.as_storage_str().contains("TEST_ONLY_SECRET"));
+    }
+}
+
+fn assert_failure_cause(
+    observation: JobFailureObservation<error_contract::Tool>,
+    cause: JobFailureCause,
+) {
+    match observation {
+        JobFailureObservation::Known(projected) => {
+            assert_eq!(*projected.details(), cause);
+            let encoded = error_contract::encode_projected_failure(
+                &projected,
+                error_contract::Budget::new(8192, 8192),
+            )
+            .unwrap();
+            let encoded = std::str::from_utf8(encoded.as_bytes()).unwrap();
+            assert!(!encoded.contains("TEST_ONLY_SECRET"));
+            assert!(!encoded.contains("/private/"));
+        }
+        _ => panic!("expected supported current-policy projection"),
+    }
+}
+
+fn visible_failures(
+    jobs: &StandaloneJobs,
+    id: &str,
+) -> JobFailureObservations<error_contract::Tool> {
+    jobs.failure_observations(
+        id,
+        &JobFailureVisibility {
+            can_view_cause: true,
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn execution_failure_and_cleanup_failure_survive_reopen_without_releasing_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("jobs.sqlite3");
+    let jobs = StandaloneJobs::open(&path, temp.path().into()).unwrap();
+    jobs.bind_domain(Arc::new(ControlledShutdown {
+        fail: true,
+        ..Default::default()
+    }))
+    .unwrap();
+    jobs.request_granted(
+        domain_request("execution-error"),
+        domain_grant("execution-error"),
+    )
+    .unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    release.notify_one();
+    let model = DomainTestClient {
+        failure_release: Some(release),
+        ..Default::default()
+    };
+    jobs.start_with_model_client("execution-error", model.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), jobs.wait("execution-error"))
+            .await
+            .unwrap(),
+        Err(JobServiceError::Cleanup(_))
+    ));
+    let saved = jobs.get("execution-error").unwrap();
+    assert_eq!(saved.state, JobState::Failed);
+    assert!(saved.result.is_none());
+    assert!(!saved.executions_released());
+    let observed = visible_failures(&jobs, "execution-error");
+    assert_failure_cause(observed.primary, JobFailureCause::Worker);
+    assert_failure_cause(observed.cleanup, JobFailureCause::CleanupUnconfirmed);
+    assert!(matches!(
+        observed.post_result,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert!(matches!(
+        observed.result_receipt,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("TEST_ONLY_SECRET")
+    );
+    // Reopen is a read, not transfer of the original retained cleanup handles.
+    let reopened = StandaloneJobs::open(&path, temp.path().into()).unwrap();
+    assert_eq!(reopened.get("execution-error").unwrap(), saved);
+    assert_failure_cause(
+        visible_failures(&reopened, "execution-error").primary,
+        JobFailureCause::Worker,
+    );
+    assert_failure_cause(
+        visible_failures(&reopened, "execution-error").cleanup,
+        JobFailureCause::CleanupUnconfirmed,
+    );
+    assert!(reopened.retry("execution-error").is_err());
+    assert!(jobs.try_shutdown().is_err());
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn accepted_result_with_feature_shutdown_failure_retains_typed_owner_and_blocks_release() {
     let temp = tempfile::tempdir().unwrap();
@@ -367,6 +493,15 @@ async fn accepted_result_with_feature_shutdown_failure_retains_typed_owner_and_b
     ));
     assert!(jobs.store.lock().unwrap().is_some());
     assert_eq!(jobs.get("cleanup-error").unwrap(), accepted);
+    let reopened =
+        StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    assert_eq!(reopened.get("cleanup-error").unwrap(), accepted);
+    let observed = visible_failures(&reopened, "cleanup-error");
+    assert!(matches!(
+        observed.primary,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert_failure_cause(observed.cleanup, JobFailureCause::CleanupUnconfirmed);
 }
 
 #[tokio::test]
@@ -430,6 +565,33 @@ async fn accepted_result_with_ordinary_worker_failure_confirms_independent_clean
     assert!(jobs.reserve_quiescent_closure().is_ok());
     jobs.shutdown().await.unwrap();
     assert!(jobs.store.lock().unwrap().is_none());
+    let reopened =
+        StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    let saved = reopened.get("post-result-error").unwrap();
+    assert_eq!(saved, accepted);
+    assert!(saved.outcome().failure_category.is_none());
+    let observed = visible_failures(&reopened, "post-result-error");
+    assert!(matches!(
+        observed.primary,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert!(matches!(
+        observed.cleanup,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert_failure_cause(observed.post_result, JobFailureCause::Worker);
+    assert!(matches!(
+        reopened
+            .failure_observations::<error_contract::Tool>(
+                "post-result-error",
+                &JobFailureVisibility {
+                    can_view_cause: false
+                }
+            )
+            .unwrap()
+            .post_result,
+        JobFailureObservation::NotVisible
+    ));
 }
 
 #[tokio::test]
@@ -777,6 +939,25 @@ async fn host_restart_rejects_live_lease_then_fails_only_unconfirmed_dispatch_wi
     // The fixture never had a real prior runner to join; do not forge its receipt.
 }
 
+#[derive(Default)]
+struct CountingFinalizer(std::sync::atomic::AtomicUsize);
+#[async_trait]
+impl worker::job::JobResultFinalizer for CountingFinalizer {
+    fn validate_profile(&self, _: &manifest::WorkerManifest) -> Result<(), String> {
+        Ok(())
+    }
+    async fn finalize(
+        &self,
+        result: Value,
+        _: manifest::WorkerManifest,
+        _: Box<dyn LlmClient>,
+        _: worker::feature::background::BackgroundTaskCancellation,
+    ) -> Result<Value, agen::tool::ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(result)
+    }
+}
+
 struct UnconfirmedSink {
     bound: BoundResultSink,
     commit_before_error: bool,
@@ -804,8 +985,17 @@ async fn sealed_non_journal_result_recovers_store_or_ack_loss_without_running_mo
             .with_store(|store| store.dispatch("receipt", &reserved.attempt.attempt_id, 8))
             .unwrap();
         let model = DomainTestClient::success();
-        let prepared =
-            worker::job::prepare_job(&intent, temp.path(), Some(Box::new(model.clone()))).unwrap();
+        let finalizer = Arc::new(CountingFinalizer::default());
+        let prepared = worker::job::prepare_job_with_grant(
+            &intent,
+            temp.path(),
+            Some(Box::new(model.clone())),
+            worker::job::JobFeatureGrant {
+                finalizer: Some(finalizer.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let owned = tokio::time::timeout(
             Duration::from_secs(5),
             prepared.run_owned(
@@ -839,6 +1029,49 @@ async fn sealed_non_journal_result_recovers_store_or_ack_loss_without_running_mo
         );
         let model_calls = model.requests.lock().unwrap().len();
         let owned = Ok(owned);
+        // Fail the real settlement write, not merely the sink's acknowledgement.
+        // A failed save cannot publish attachments or discharge cleanup. The same
+        // typed report/sealed payload remains available; no model or finalizer rerun.
+        let fault = rusqlite::Connection::open(temp.path().join("jobs.sqlite3")).unwrap();
+        fault.execute_batch(if committed {
+            "CREATE TRIGGER fail_settlement BEFORE UPDATE OF result_receipt_failure_json ON job_attempts
+             BEGIN SELECT RAISE(ABORT,'injected attachment persistence failure'); END;"
+        } else {
+            "CREATE TRIGGER fail_settlement BEFORE UPDATE OF result_json ON job_attempts
+             BEGIN SELECT RAISE(ABORT,'injected result persistence failure'); END;"
+        }).unwrap();
+        let error = settle_owned_execution(
+            &jobs.store,
+            "receipt",
+            &reserved.attempt.attempt_id,
+            &reserved.input_digest,
+            &dispatched.executions[0],
+            true,
+            None,
+            true,
+            &owned,
+        )
+        .unwrap_err();
+        let observed_error = observed_settlement_error(Arc::new(error));
+        assert!(
+            matches!(observed_error, JobServiceError::SettlementFailure { source }
+            if matches!(source.as_ref(), JobServiceError::Store(JobStoreError::Sqlite(_))))
+        );
+        let unsaved = jobs.get("receipt").unwrap();
+        assert_eq!(
+            unsaved.state,
+            if committed {
+                JobState::Completed
+            } else {
+                JobState::Pending
+            }
+        );
+        assert!(!unsaved.executions_released());
+        assert!(matches!(
+            visible_failures(&jobs, "receipt").result_receipt,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        fault.execute_batch("DROP TRIGGER fail_settlement").unwrap();
         recover_settlement(|| {
             settle_owned_execution(
                 &jobs.store,
@@ -861,7 +1094,31 @@ async fn sealed_non_journal_result_recovers_store_or_ack_loss_without_running_mo
         assert_eq!(saved.attempt.number, 1);
         assert!(saved.executions_released());
         assert_eq!(model.requests.lock().unwrap().len(), model_calls);
+        assert_eq!(
+            finalizer.0.load(Ordering::SeqCst),
+            1,
+            "sealed side effect must not be repeated"
+        );
+        let observed = visible_failures(&jobs, "receipt");
+        assert!(matches!(
+            observed.primary,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        assert_failure_cause(observed.result_receipt, JobFailureCause::ResultUnconfirmed);
         jobs.shutdown().await.unwrap();
+        let reopened =
+            StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+        assert_eq!(reopened.get("receipt").unwrap(), saved);
+        assert_failure_cause(
+            visible_failures(&reopened, "receipt").result_receipt,
+            JobFailureCause::ResultUnconfirmed,
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), model_calls);
+        assert_eq!(
+            finalizer.0.load(Ordering::SeqCst),
+            1,
+            "sealed side effect must not be repeated"
+        );
     }
 }
 

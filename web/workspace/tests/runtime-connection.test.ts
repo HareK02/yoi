@@ -132,3 +132,21 @@ Deno.test("runtime authentication failure remains an observed result without gra
     null,
   );
 });
+
+Deno.test("Runtime connection generic diagnostics do not accept primary control fields", () => {
+  assertEquals(
+    parseRuntimeConnectionTestResponse({
+      ...compatibleResponse(),
+      status: "failed",
+      failure_kind: "authentication",
+      actual_protocol_version: null,
+      diagnostics: [{
+        code: "supplement",
+        severity: "error",
+        message: "Supplement only",
+        control: "authorization_failed",
+      }],
+    }),
+    null,
+  );
+});

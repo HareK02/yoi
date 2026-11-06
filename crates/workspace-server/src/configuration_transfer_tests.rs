@@ -1232,7 +1232,9 @@ fn enroll(
     subject: &str,
 ) -> Result<ConfigurationAdoptionResult> {
     server
-        .enroll_created_subject(WORKSPACE, OWNER, &features.store, subject, schema(), host)
+        .enroll_created_subject(WORKSPACE, OWNER, &features.store, subject, schema(), || {
+            Ok(((), host.clone()))
+        })
         .map(|result| result.expect("post-seal creation evidence"))
 }
 
@@ -1266,7 +1268,7 @@ fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed
                 &features.store,
                 &created.id,
                 schema(),
-                &host
+                || Ok(((), host.clone()))
             )
             .is_err()
     );
@@ -1529,7 +1531,7 @@ fn preseal_feature_defaults_transfer_as_live_sets_not_legacy_copies() {
                 &features.store,
                 &subject.id,
                 schema(),
-                &host
+                || Ok(((), host.clone()))
             )
             .unwrap()
             .is_none()
@@ -1600,7 +1602,7 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
     assert!(canonical.subject_permissions(&created.id).is_err()); // never synthesize legacy all-target vectors
     let bound = grant(&created.id, &current.change_id, "canonical-feature-child");
     canonical
-        .bind_worker_execution_grant_with_host(&bound, &host)
+        .bind_worker_execution_grant_with_host_lease(&bound, || Ok(((), host.clone())))
         .unwrap();
     assert_eq!(
         canonical
@@ -1615,7 +1617,7 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
         "canonical-limited-child-v2",
     );
     canonical
-        .bind_worker_execution_grant_with_host(&bounded, &host)
+        .bind_worker_execution_grant_with_host_lease(&bounded, || Ok(((), host.clone())))
         .unwrap();
     let mut wider = bounded.clone();
     wider.worker_id = "wider-canonical-limits".into();
@@ -1626,7 +1628,7 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
     };
     assert!(
         canonical
-            .bind_worker_execution_grant_with_host(&wider, &host)
+            .bind_worker_execution_grant_with_host_lease(&wider, || Ok(((), host.clone())))
             .is_err()
     );
     let current = server.configuration_current(WORKSPACE, OWNER).unwrap();
@@ -1653,11 +1655,11 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
     late.worker_id = "removed-source-child".into();
     assert!(
         canonical
-            .bind_worker_execution_grant_with_host(&late, &host)
+            .bind_worker_execution_grant_with_host_lease(&late, || Ok(((), host.clone())))
             .is_err()
     );
     canonical
-        .bind_worker_execution_grant_with_host(&bound, &host)
+        .bind_worker_execution_grant_with_host_lease(&bound, || Ok(((), host.clone())))
         .unwrap(); // retained receipt only
     assert!(
         canonical
@@ -1679,11 +1681,11 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
             host: host.clone(),
         }));
     canonical
-        .bind_worker_execution_grant_with_host(&bound, &host)
+        .bind_worker_execution_grant_with_host_lease(&bound, || Ok(((), host.clone())))
         .unwrap();
     assert!(
         canonical
-            .bind_worker_execution_grant_with_host(&late, &host)
+            .bind_worker_execution_grant_with_host_lease(&late, || Ok(((), host.clone())))
             .is_err()
     );
     assert!(
@@ -1750,10 +1752,129 @@ fn legacy_unicode_subject_identity_migrates_through_virtual_source_and_reopen_wi
     assert_eq!(current.legacy_constraints, Some(original.clone()));
     let child = grant(subject, &current.change_id, "unicode-canonical-child");
     canonical
-        .bind_worker_execution_grant_with_host(&child, &host)
+        .bind_worker_execution_grant_with_host_lease(&child, || Ok(((), host.clone())))
         .unwrap();
     assert_eq!(
         canonical.subject_permissions(subject).unwrap(),
         Some(original)
     );
+}
+
+// These leases observe committed records from a separate connection, not the
+// writer's uncommitted view. Catalog release before COMMIT must fail the check.
+struct AfterCommit<F: FnMut()>(F);
+impl<F: FnMut()> Drop for AfterCommit<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+#[test]
+fn deferred_binding_catalog_lease_outlives_native_commit() {
+    let (root, server, features, subjects) = fixture();
+    let host = host();
+    let seed = migration(&server, &features, &host);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+            store: server,
+            host: host.clone(),
+        }));
+    let observer = FeatureFixture::open(
+        &root.path().join("features"),
+        Some(features.database.identity()),
+    );
+    let grant = grant(
+        &subjects.limited,
+        &subjects.limited_source.change_id,
+        "leased-binding",
+    );
+    let catalog = std::sync::RwLock::new(host);
+    let released = std::cell::Cell::new(false);
+    canonical
+        .bind_worker_execution_grant_with_host_lease(&grant, || {
+            let registry = catalog.read().unwrap();
+            let host = registry.clone();
+            let committed = AfterCommit(|| {
+                assert!(
+                    catalog.try_write().is_err(),
+                    "catalog still fenced at commit observation"
+                );
+                assert_eq!(
+                    observer
+                        .store
+                        .worker_execution_grant(&grant.runtime_id, &grant.worker_id)
+                        .unwrap(),
+                    Some(grant.clone())
+                );
+                released.set(true);
+            });
+            // Tuple field order keeps the registry held during the commit observation.
+            Ok(((committed, registry), host))
+        })
+        .unwrap();
+    assert!(released.get(), "owner released admission after COMMIT");
+    assert!(catalog.try_write().is_ok());
+}
+
+#[test]
+fn deferred_enrollment_catalog_lease_outlives_adoption_commit() {
+    let (_root, server, features, _subjects) = fixture();
+    let host = enrollment_host();
+    let seed = migration(&server, &features, &host);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let subject = features
+        .store
+        .create_subject_idempotent(
+            SubjectRole::new("leased-enrollment").unwrap(),
+            "behavior".into(),
+            "leased-enrollment",
+        )
+        .unwrap();
+    let catalog = std::sync::RwLock::new(host);
+    let released = std::cell::Cell::new(false);
+    let result = server
+        .enroll_created_subject(
+            WORKSPACE,
+            OWNER,
+            &features.store,
+            &subject.id,
+            schema(),
+            || {
+                let registry = catalog.read().unwrap();
+                let host = registry.clone();
+                let committed = AfterCommit(|| {
+                    assert!(
+                        catalog.try_write().is_err(),
+                        "catalog still fenced at commit observation"
+                    );
+                    let receipt = server
+                        .configuration_adoption_result(
+                            WORKSPACE,
+                            OWNER,
+                            &format!("subject-enrollment:{}", subject.id),
+                        )
+                        .unwrap()
+                        .expect("adoption receipt committed before catalog release");
+                    assert!(receipt.source_stored && receipt.policy_committed);
+                    assert!(
+                        server
+                            .adopted_subject_policy(WORKSPACE, &subject.id)
+                            .unwrap()
+                            .is_some()
+                    );
+                    released.set(true);
+                });
+                Ok(((committed, registry), host))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(result.policy_committed);
+    assert!(released.get(), "owner released catalog after Server COMMIT");
+    assert!(catalog.try_write().is_ok());
 }

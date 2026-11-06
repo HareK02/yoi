@@ -46,11 +46,13 @@ impl WorkspaceClient for Client {
                 || self.denied_resource.lock().unwrap().as_ref() == Some(&input.resource)
             {
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 403,
                     body: "{}".into(),
                 });
             }
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope": input.resource}).to_string(),
             });
@@ -60,6 +62,7 @@ impl WorkspaceClient for Client {
         if capabilities {
             let response = self.capabilities.lock().unwrap();
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: response.status,
                 body: response.body.clone(),
             });
@@ -73,6 +76,7 @@ impl WorkspaceClient for Client {
 }
 fn response(value: impl Serialize) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: serde_json::to_string(&value).unwrap(),
     }
@@ -421,6 +425,7 @@ async fn invalid_completion_and_unresolved_or_invalid_receipt_stay_unknown_after
             response: Some(committed),
         }),
         WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: "invalid-json".into(),
         },
@@ -484,6 +489,7 @@ async fn observation_eviction_never_substitutes_another_entry() {
 #[tokio::test]
 async fn backend_error_details_are_not_reflected_and_conflict_is_not_retried() {
     let client = Client::new(vec![WorkspaceResponse {
+        content_type: None,
         status: 409,
         body: serde_json::to_string(&DriveApiError {
             code: DriveApiErrorCode::Conflict,
@@ -840,6 +846,7 @@ async fn drive_common_text_refuses_truncated_mismatched_stale_and_denied_reads()
         }
         let read = if case == "denied" {
             WorkspaceResponse {
+                content_type: None,
                 status: 403,
                 body: "denied".into(),
             }
@@ -1012,6 +1019,7 @@ async fn drive_capability_failure_never_publishes_an_assumed_write_ceiling() {
         let entry = entry("2", "3");
         let client = Client::new(vec![response(entry.clone())]);
         *client.capabilities.lock().unwrap() = WorkspaceResponse {
+            content_type: None,
             status,
             body: body.into(),
         };
@@ -1088,6 +1096,7 @@ impl WorkspaceClient for NativeMutations {
             let input: server_api::authorization::OperationAuthorizationRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope": input.resource}).to_string(),
             });

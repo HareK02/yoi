@@ -219,9 +219,40 @@ enum WipToolOutput {
 
 pub enum WipOperationError {
     Protocol(ProtocolError),
+    /// Preserve the native protocol rejection while attaching a model-visible cause.
+    ProtocolWithFailure {
+        error: ProtocolError,
+        failure: ToolOutput,
+    },
+    /// Compatibility-only operation failure whose return schema describes ToolOutput.
+    /// Native providers must retain their protocol/unknown outcome instead.
+    ExecutionFailure(ToolOutput),
     Cancelled(ToolOutput),
     Interrupted(ToolOutput),
     OutcomeUnknown(String),
+    /// Cause disclosure does not settle the operation or authorize another attempt.
+    OutcomeUnknownWithFailure {
+        message: String,
+        failure: ToolOutput,
+    },
+}
+
+impl WipOperationError {
+    /// Attach an already-public ToolOutput from `tools::failure` without encoding it
+    /// as a native return value or replacing the provider's protocol code/message.
+    pub fn protocol_with_failure(error: ProtocolError, failure: ToolOutput) -> Self {
+        Self::ProtocolWithFailure { error, failure }
+    }
+
+    /// Keep the WIP/client/audit outcome unknown independently of the attached cause.
+    /// The provider supplies current-authority output from `tools::failure`, including
+    /// its existing public domain result; neither summary nor content controls retry.
+    pub fn outcome_unknown_with_failure(message: impl Into<String>, failure: ToolOutput) -> Self {
+        Self::OutcomeUnknownWithFailure {
+            message: message.into(),
+            failure,
+        }
+    }
 }
 
 /// Async extension point used by future native Feature projections. Host-side
@@ -2171,6 +2202,9 @@ impl WipOperationHandler for CompatibilityHandler {
             Err(ToolError::InvalidArgument(message)) => Err(WipOperationError::Protocol(
                 protocol_error(ProtocolErrorCode::InvalidArguments, message),
             )),
+            Err(ToolError::ExecutionFailure(output)) => {
+                Err(WipOperationError::ExecutionFailure(output))
+            }
             Err(ToolError::Cancelled(output)) => Err(WipOperationError::Cancelled(output)),
             Err(ToolError::Interrupted(output)) => Err(WipOperationError::Interrupted(output)),
             Err(ToolError::StructuredConflict { code, message }) => {
@@ -2280,6 +2314,7 @@ fn compatibility_projection(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WipAuditOutcome {
     Success,
+    ExecutionFailed,
     Rejected,
     Cancelled,
     Interrupted,
@@ -2606,23 +2641,32 @@ impl WipRuntime {
         }
     }
 
+    fn protocol_failure_response(
+        &self,
+        error: ProtocolError,
+        tool_error: Option<ToolError>,
+        outcome: WipAuditOutcome,
+    ) -> Result<(Response<Vec<u8>>, Option<WipToolOutput>, WipAuditOutcome), ToolError> {
+        let response = encode_protocol_error_response(
+            ProtocolInteraction::CallOperation,
+            &error,
+            self.wire_limits,
+        )
+        .map_err(|encode| ToolError::Internal(encode.to_string()))?;
+        Ok((
+            response,
+            tool_error.map(|error| WipToolOutput::Passthrough(Err(error))),
+            outcome,
+        ))
+    }
+
     async fn dispatch_call(
         &self,
         request: &Request<Vec<u8>>,
         execution: ToolExecutionContext,
     ) -> Result<(Response<Vec<u8>>, Option<WipToolOutput>, WipAuditOutcome), ToolError> {
-        let rejected = |error: ProtocolError| -> Result<_, ToolError> {
-            Ok((
-                encode_protocol_error_response(
-                    ProtocolInteraction::CallOperation,
-                    &error,
-                    self.wire_limits,
-                )
-                .map_err(|e| ToolError::Internal(e.to_string()))?,
-                None,
-                WipAuditOutcome::Rejected,
-            ))
-        };
+        let rejected =
+            |error| self.protocol_failure_response(error, None, WipAuditOutcome::Rejected);
         let metadata = match decode_call_operation_metadata(request.body(), self.wire_limits) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -2728,14 +2772,41 @@ impl WipRuntime {
                     WipAuditOutcome::Success,
                 ))
             }
-            Err(WipOperationError::Protocol(error)) => {
-                let response = encode_protocol_error_response(
-                    ProtocolInteraction::CallOperation,
-                    &error,
+            Err(WipOperationError::Protocol(error)) => rejected(error),
+            Err(WipOperationError::ProtocolWithFailure { error, failure }) => self
+                .protocol_failure_response(
+                    error,
+                    Some(ToolError::ExecutionFailure(failure)),
+                    WipAuditOutcome::Rejected,
+                ),
+            Err(WipOperationError::ExecutionFailure(output)) => {
+                // Compatibility operations already describe ToolOutput as their result.
+                // A failure is still an operation response, never a dispatch rejection.
+                let response = encode_call_operation_response(
+                    &request_value,
+                    &descriptor,
+                    &CallOperationResponse {
+                        result: tool_output_value(&output),
+                        validator: target_validator,
+                    },
                     self.wire_limits,
-                )
-                .map_err(|encode| ToolError::Internal(encode.to_string()))?;
-                Ok((response, None, WipAuditOutcome::Rejected))
+                );
+                let response = match response {
+                    Ok(response) => response,
+                    Err(_) => encode_protocol_error_response(
+                        ProtocolInteraction::CallOperation,
+                        &protocol_error(ProtocolErrorCode::OperationOutcomeUnknown,
+                            "operation failure could not be encoded for this interface; inspect the retained result"),
+                        self.wire_limits,
+                    ).map_err(|error| ToolError::Internal(error.to_string()))?,
+                };
+                Ok((
+                    response,
+                    Some(WipToolOutput::Passthrough(Err(
+                        ToolError::ExecutionFailure(output),
+                    ))),
+                    WipAuditOutcome::ExecutionFailed,
+                ))
             }
             Err(WipOperationError::Cancelled(output)) => {
                 let response = encode_protocol_error_response(
@@ -2774,22 +2845,21 @@ impl WipRuntime {
                 ))
             }
             Err(WipOperationError::OutcomeUnknown(message)) => {
-                let response = encode_protocol_error_response(
-                    ProtocolInteraction::CallOperation,
-                    &protocol_error(ProtocolErrorCode::OperationOutcomeUnknown, message.clone()),
-                    self.wire_limits,
-                )
-                .map_err(|encode| ToolError::Internal(encode.to_string()))?;
-                Ok((
-                    response,
-                    Some(WipToolOutput::Passthrough(Err(ToolError::ExecutionFailed(
-                        format!(
-                            "WIP operation outcome unknown; do not retry automatically: {message}"
-                        ),
-                    )))),
+                let tool_error = ToolError::ExecutionFailed(format!(
+                    "WIP operation outcome unknown; do not retry automatically: {message}"
+                ));
+                self.protocol_failure_response(
+                    protocol_error(ProtocolErrorCode::OperationOutcomeUnknown, message),
+                    Some(tool_error),
                     WipAuditOutcome::OutcomeUnknown,
-                ))
+                )
             }
+            Err(WipOperationError::OutcomeUnknownWithFailure { message, failure }) => self
+                .protocol_failure_response(
+                    protocol_error(ProtocolErrorCode::OperationOutcomeUnknown, message),
+                    Some(ToolError::ExecutionFailure(failure)),
+                    WipAuditOutcome::OutcomeUnknown,
+                ),
         }
     }
 }
@@ -3203,6 +3273,7 @@ mod tests {
                     "unexpected operation/resource authorization"
                 );
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: json!({"scope": null}).to_string(),
                 });
@@ -3233,6 +3304,7 @@ mod tests {
 
     fn objective_detail_response(content_digest: &str) -> crate::worker::WorkspaceResponse {
         crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({
                 "id": "00001OBJECTIVE",
@@ -5593,6 +5665,273 @@ mod tests {
         assert!(error.to_string().contains("outcome unknown"), "{error}");
     }
 
+    // Integration boundary: real registered Invoke, WIP HTTP codec/client settlement,
+    // and Engine history. Only the native operation and model responses are fixtures.
+    struct NativeFailure {
+        code: ProtocolErrorCode,
+        message: &'static str,
+        attach_failure: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    fn native_failure_output(unknown: bool) -> ToolOutput {
+        use protocol::control_failure::RuntimeControlCause;
+        let cause = if unknown {
+            RuntimeControlCause::TimedOut
+        } else {
+            RuntimeControlCause::ExecutionRejected
+        };
+        let mut facts = error_contract::FailureFacts::new(cause).unwrap();
+        let mut context =
+            error_contract::OperationContext::new("native_apply", "provider").unwrap();
+        context.operation_ref = Some("private-native-operation".into());
+        facts.with_context(context).unwrap();
+        let failure =
+            error_contract::project_failure::<error_contract::Tool, _>(&facts, &()).unwrap();
+        let ToolError::ExecutionFailure(output) = tools::failure::execution_failure(
+            &failure,
+            if unknown {
+                tools::failure::ToolFailureBoundary::Observation
+            } else {
+                tools::failure::ToolFailureBoundary::Execution
+            },
+            &json!({
+                "disposition": if unknown { "unknown" } else { "rejected" },
+                "request_id": "native-request-1",
+            }),
+            64 * 1024,
+        ) else {
+            panic!("common projection must return structured failure output")
+        };
+        output
+    }
+
+    #[async_trait]
+    impl WipOperationHandler for NativeFailure {
+        async fn call(
+            &self,
+            operation: &str,
+            _arguments: &BTreeMap<String, Value>,
+            _context: WipCallContext,
+        ) -> Result<WipOperationOutput, WipOperationError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let error = match (operation, self.attach_failure) {
+                ("reject", true) => WipOperationError::protocol_with_failure(
+                    protocol_error(self.code.clone(), self.message),
+                    native_failure_output(false),
+                ),
+                ("reject", false) => {
+                    WipOperationError::Protocol(protocol_error(self.code.clone(), self.message))
+                }
+                ("unknown", true) => WipOperationError::outcome_unknown_with_failure(
+                    self.message,
+                    native_failure_output(true),
+                ),
+                ("unknown", false) => WipOperationError::OutcomeUnknown(self.message.into()),
+                _ => panic!("unexpected fixture operation"),
+            };
+            Err(error)
+        }
+    }
+
+    fn native_failure_registry(
+        code: ProtocolErrorCode,
+        message: &'static str,
+        attach_failure: bool,
+        calls: Arc<AtomicUsize>,
+    ) -> WipMountRegistry {
+        let mut registry = WipMountRegistry::new();
+        registry.allocate_namespace("native", "native").unwrap();
+        let interface = root_reference("yoi.native/failure/v1");
+        registry
+            .mount(WipProjection {
+                route: "/native/failure".into(),
+                capability: "native:failure".into(),
+                kind: WipProjectionKind::Native,
+                object: Object {
+                    name: "failure".into(),
+                    description: None,
+                    interfaces: vec![interface.clone()],
+                    r#ref: Some("native:failure".into()),
+                    validator: Some(vec![1]),
+                },
+                interface,
+                descriptor: InterfaceDescriptor {
+                    format: INTERFACE_FORMAT_V1.into(),
+                    documentation: None,
+                    types: Vec::new(),
+                    operations: ["reject", "unknown"]
+                        .into_iter()
+                        .map(|name| OperationDeclaration {
+                            name: name.into(),
+                            documentation: None,
+                            parameters: Vec::new(),
+                            returns: ReturnDeclaration {
+                                documentation: None,
+                                // Deliberately not the compatibility ToolOutput record.
+                                r#type: TypeExpr::String,
+                            },
+                        })
+                        .collect(),
+                },
+                interface_validator: Some(vec![1]),
+                handler: Arc::new(NativeFailure {
+                    code,
+                    message,
+                    attach_failure,
+                    calls,
+                }),
+            })
+            .unwrap();
+        registry
+    }
+
+    fn native_failure_invoke(operation: &str) -> String {
+        json!({
+            "path":"/native/failure",
+            "interface":{"scope":"/","name":"yoi.native/failure/v1"},
+            "operation":operation,
+            "arguments":{}
+        })
+        .to_string()
+    }
+
+    fn assert_native_failure_output(output: &ToolOutput, unknown: bool) {
+        use protocol::control_failure::RuntimeControlCause;
+        let expected = native_failure_output(unknown);
+        assert_eq!(output.summary, expected.summary);
+        assert_eq!(output.content, expected.content);
+        assert!(output.attachments.is_empty());
+        let content = output.content.as_deref().unwrap();
+        assert!(!content.contains("private-native-operation"));
+        let report: Json = serde_json::from_str(content).unwrap();
+        assert_eq!(report["result"]["request_id"], "native-request-1");
+        assert_eq!(
+            report["result"]["disposition"],
+            if unknown { "unknown" } else { "rejected" }
+        );
+        let cause = serde_json::to_vec(&report["failure"]).unwrap();
+        let error_contract::DecodeFailure::Known(failure) =
+            error_contract::decode_failure::<RuntimeControlCause>(
+                &cause,
+                error_contract::Budget::new(65536, 65536),
+            )
+        else {
+            panic!("Invoke lost the typed common cause")
+        };
+        assert_eq!(
+            failure.facts().cause(),
+            &if unknown {
+                RuntimeControlCause::TimedOut
+            } else {
+                RuntimeControlCause::ExecutionRejected
+            }
+        );
+    }
+
+    async fn assert_native_invoke_failure(
+        operation: &str,
+        code: ProtocolErrorCode,
+        message: &'static str,
+    ) {
+        let unknown = operation == "unknown";
+        // Compare legacy and cause-carrying errors through the same registered entry.
+        for attach_failure in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
+            let runtime = install_wip_mode_with_mounts(
+                &mut engine,
+                None,
+                "worker-a".into(),
+                native_failure_registry(code.clone(), message, attach_failure, calls.clone()),
+            )
+            .unwrap();
+            let tools = engine.tool_server_handle();
+            tools.flush_pending();
+            let error = tools
+                .call_tool(
+                    "Invoke",
+                    &native_failure_invoke(operation),
+                    ToolExecutionContext::direct(),
+                )
+                .await
+                .unwrap_err();
+            if attach_failure {
+                let agen::tool_server::ToolServerError::ExecutionResult(output) = error else {
+                    panic!("native cause must use the Engine's structured error side channel")
+                };
+                assert!(output.is_error);
+                assert_native_failure_output(
+                    &ToolOutput {
+                        summary: output.summary,
+                        content: output.content,
+                        attachments: output.attachments,
+                    },
+                    unknown,
+                );
+            } else {
+                assert!(matches!(
+                    error,
+                    agen::tool_server::ToolServerError::ToolExecution(_)
+                ));
+            }
+            let state = runtime.state.lock().unwrap();
+            let history = state.client.call_history(&state.session).unwrap();
+            assert_eq!(history.len(), 1);
+            match &history.back().unwrap().outcome {
+                CallOutcome::Unknown { failure, .. } if unknown => {
+                    assert!(failure.is_none());
+                }
+                CallOutcome::ProtocolFailure(error) if !unknown => {
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.message, message);
+                }
+                outcome => panic!("cause attachment changed native settlement: {outcome:?}"),
+            }
+            assert_eq!(runtime.audit().len(), 1);
+            assert_eq!(
+                runtime.audit()[0].outcome,
+                if unknown {
+                    WipAuditOutcome::OutcomeUnknown
+                } else {
+                    WipAuditOutcome::Rejected
+                }
+            );
+            assert_eq!(runtime.metrics().operation_successes, 0);
+            assert_eq!(runtime.metrics().operation_round_trips, 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no automatic reexecution");
+            assert!(runtime.active.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_invoke_failure_side_channel_preserves_protocol_rejection_and_audit() {
+        for code in [
+            ProtocolErrorCode::InvalidArguments,
+            ProtocolErrorCode::PermissionDenied,
+            ProtocolErrorCode::ValidatorMismatch,
+            ProtocolErrorCode::ResourceLimitExceeded,
+        ] {
+            for message in [
+                "provider refused the operation",
+                "outcome unknown; misleading prose",
+            ] {
+                assert_native_invoke_failure("reject", code.clone(), message).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_invoke_failure_side_channel_preserves_unknown_without_reexecution() {
+        for message in [
+            "provider result unavailable",
+            "operation rejected; misleading prose",
+        ] {
+            assert_native_invoke_failure("unknown", ProtocolErrorCode::InvalidArguments, message)
+                .await;
+        }
+    }
+
     #[derive(Clone)]
     struct NativeImageClient {
         events: Arc<Mutex<VecDeque<Vec<agen::llm_client::event::Event>>>>,
@@ -5613,6 +5952,94 @@ mod tests {
                 .pop_front()
                 .expect("unexpected model request");
             Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    #[tokio::test]
+    async fn native_invoke_failure_side_channel_reaches_engine_history_and_model() {
+        use agen::llm_client::event::{Event, ResponseStatus, StatusEvent};
+        for operation in ["reject", "unknown"] {
+            let completed = || {
+                Event::Status(StatusEvent {
+                    status: ResponseStatus::Completed,
+                })
+            };
+            let client = NativeImageClient {
+                events: Arc::new(Mutex::new(VecDeque::from([
+                    vec![
+                        Event::tool_use_start(0, "native-failure-call", "Invoke"),
+                        Event::tool_input_delta(0, &native_failure_invoke(operation)),
+                        Event::tool_use_stop(0),
+                        completed(),
+                    ],
+                    vec![completed()],
+                ]))),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut engine = Engine::new(client.clone());
+            let runtime = install_wip_mode_with_mounts(
+                &mut engine,
+                None,
+                "worker-a".into(),
+                native_failure_registry(
+                    ProtocolErrorCode::InvalidArguments,
+                    "provider public message",
+                    true,
+                    calls.clone(),
+                ),
+            )
+            .unwrap();
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&captured);
+            engine.on_history_append(move |item| {
+                sink.lock().unwrap().push(item.clone());
+                Ok(())
+            });
+            let mut history = agen::History::new();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                engine.run(&mut history, "invoke the native operation once"),
+            )
+            .await
+            .expect("native failure must terminate without retry");
+            assert!(matches!(result.result, agen::EngineRunExit::Finished));
+            let saved = history.items().find(|item| matches!(item, agen::Item::ToolResult { call_id, .. } if call_id == "native-failure-call")).unwrap();
+            let agen::Item::ToolResult {
+                summary,
+                content,
+                attachments,
+                is_error,
+                ..
+            } = saved
+            else {
+                unreachable!()
+            };
+            assert!(
+                is_error,
+                "native cause must not become a successful Tool result"
+            );
+            assert_native_failure_output(
+                &ToolOutput {
+                    summary: summary.clone(),
+                    content: content.clone(),
+                    attachments: attachments.clone(),
+                },
+                operation == "unknown",
+            );
+            assert!(captured.lock().unwrap().iter().any(|item| item == saved));
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].items.iter().any(|item| item == saved));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                runtime.audit()[0].outcome,
+                if operation == "unknown" {
+                    WipAuditOutcome::OutcomeUnknown
+                } else {
+                    WipAuditOutcome::Rejected
+                }
+            );
         }
     }
 
@@ -6228,6 +6655,7 @@ mod tests {
     #[tokio::test]
     async fn ticket_native_runtime_covers_authoring_and_workflow_role_surfaces() {
         let query_response = crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({
                 "items": [],
@@ -6236,6 +6664,7 @@ mod tests {
             .to_string(),
         };
         let create_response = crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({
                 "id": "00001TICKET",
@@ -6246,6 +6675,7 @@ mod tests {
             .to_string(),
         };
         let comment_response = crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 204,
             body: String::new(),
         };
@@ -6352,14 +6782,17 @@ mod tests {
         let workflow_client = Arc::new(
             ScriptedWorkspaceClient::new([
                 crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: json!({"id": "00001SOURCE", "resource_key": "T-9"}).to_string(),
                 },
                 crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: json!({"id": "00001TARGET", "resource_key": "T-10"}).to_string(),
                 },
                 crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: json!({
                         "ticket_id": "00001SOURCE",
@@ -6461,7 +6894,8 @@ mod tests {
 
         let coder_client = Arc::new(ScriptedWorkspaceClient::new([
             crate::worker::WorkspaceResponse {
-                status: 200,
+                content_type: None,
+status: 200,
                 body: json!({
                     "workspace_id": "workspace",
                     "merge_request_id": "MR-1",
@@ -6477,7 +6911,8 @@ mod tests {
                 .to_string(),
             },
             crate::worker::WorkspaceResponse {
-                status: 200,
+                content_type: None,
+status: 200,
                 body: json!({
                     "workspace_id": "workspace",
                     "merge_request_id": "MR-1",
@@ -6597,7 +7032,8 @@ mod tests {
 
         let reviewer_inner = Arc::new(ScriptedWorkspaceClient::new([
             crate::worker::WorkspaceResponse {
-                status: 200,
+                content_type: None,
+status: 200,
                 body: json!({
                     "event_id": "review-1",
                     "sequence": 2,
@@ -6685,6 +7121,7 @@ mod tests {
         let orchestrator_client = Arc::new(
             ScriptedWorkspaceClient::new([
                 crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: json!({
                         "ready": true,
@@ -6695,6 +7132,7 @@ mod tests {
                     .to_string(),
                 },
                 crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: json!({
                         "event_id": "merge-1",
@@ -6823,6 +7261,7 @@ mod tests {
     #[tokio::test]
     async fn objective_native_runtime_covers_discovery_and_all_backend_operations() {
         let query_response = crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({
                 "items": [{
@@ -6844,6 +7283,7 @@ mod tests {
             .to_string(),
         };
         let ticket_response = || crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({"resource_key": "T-7"}).to_string(),
         };

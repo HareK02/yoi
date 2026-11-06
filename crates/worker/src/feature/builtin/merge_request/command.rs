@@ -266,8 +266,7 @@ impl Executor {
     fn authorize(&self, operation: &str, resource: PermissionResource) -> Result<(), ToolError> {
         self.client.authorize_operation(operation, &resource)
             .map_err(|error| {
-                let denied = matches!(&error, crate::worker::WorkspaceClientError::Request(message)
-                    if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
+                let denied = error.is_authorization_denial();
                 ToolError::ExecutionFailed(format!("Merge Request operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"))
             })
     }

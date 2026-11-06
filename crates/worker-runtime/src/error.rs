@@ -63,8 +63,20 @@ pub enum RuntimeError {
         result: WorkerExecutionResult,
     },
 
+    /// Creation failed after connection; the original error remains internal source
+    /// evidence. Display deliberately never renders it or the startup attachment.
+    #[error("worker creation failed")]
+    WorkerCreateFailed {
+        failure: Box<runtime_api::startup::WorkerCreateFailure>,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+
     #[error("limit {requested} exceeds maximum {max}")]
     LimitTooLarge { requested: usize, max: usize },
+
+    #[error("worker {worker_id} was already created with different request identity input")]
+    WorkerCreateConflict { worker_id: WorkerId },
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -149,12 +161,67 @@ pub enum RuntimeError {
 }
 
 impl RuntimeError {
+    /// Only an owning create boundary or a Spawn result can identify a creation
+    /// failure. Independent Input errors retain their ordinary API contract.
+    pub fn create_failure(&self) -> Option<runtime_api::startup::WorkerCreateFailure> {
+        match self {
+            Self::WorkerCreateFailed { failure, .. } => Some((**failure).clone()),
+            Self::WorkerExecutionRejected { result, .. } => {
+                crate::execution::startup_create_failure(result)
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        }
+    }
+
     /// The original execution result, including primary facts and independent secondary
     /// failures. Display is presentation only and must not be parsed to recover causes.
     pub fn execution_result(&self) -> Option<&WorkerExecutionResult> {
         match self {
             Self::WorkerExecutionRejected { result, .. } => Some(result),
+            Self::WorkerCreateFailed { source, .. } => source.execution_result(),
             _ => None,
+        }
+    }
+}
+
+impl RuntimeError {
+    pub fn control_cause(&self) -> protocol::control_failure::RuntimeControlCause {
+        use RuntimeError as E;
+        use protocol::control_failure::RuntimeControlCause;
+        let error = self;
+        use RuntimeControlCause as C;
+        match error {
+            E::WorkerCreateFailed { source, .. } => source.control_cause(),
+            E::WorkerNotFound { .. } => C::WorkerMissing,
+            E::WorkerCreateConflict { .. } => C::CreateRequestConflict,
+            E::RuntimeStopped => C::RuntimeStopped,
+            E::InvalidInitialInputKind { .. } | E::LimitTooLarge { .. } | E::InvalidRequest(_) => {
+                C::InvalidRequest
+            }
+            E::RestoreObservationStale { .. } => C::RestoreObservationStale,
+            E::RestoreObservationConflict { .. } => C::RestoreObservationConflict,
+            E::RestoreAdmissionBusy { .. } => C::RestoreAdmissionBusy,
+            E::StopObservationConflict { .. } => C::StopObservationConflict,
+            E::StopRequestConflict { .. } => C::StopRequestConflict,
+            E::StopAdmissionBusy { .. } => C::StopAdmissionBusy,
+            E::WorkerExecutionUnavailable { .. } | E::ExecutionBackendUnavailable { .. } => {
+                C::ExecutionUnavailable
+            }
+            E::WorkerExecutionRejected { .. } => C::ExecutionRejected,
+            E::WorkerDeletePersistenceFailed { .. } | E::StoreIo { .. } => C::PersistenceFailed,
+            E::StoreCommitOutcomeUnknown { .. } => C::PersistenceOutcomeUnknown,
+            E::WorkspaceOwnerMismatch { .. } => C::WorkspaceBindingMismatch,
+            E::WorkingDirectory(_) => C::WorkingDirectoryFailed,
+            E::ConfigBundleMissing { .. }
+            | E::ConfigBundleDigestMismatch { .. }
+            | E::InvalidProfileSelector { .. }
+            | E::UnsupportedConfigDeclaration { .. } => C::ConfigurationUnavailable,
+            E::RuntimeStoreAlreadyOpen { .. } | E::StoreMissing { .. } | E::StoreCorrupt { .. } => {
+                C::StoreUnavailable
+            }
+            E::StatePoisoned => C::StateUnavailable,
         }
     }
 }

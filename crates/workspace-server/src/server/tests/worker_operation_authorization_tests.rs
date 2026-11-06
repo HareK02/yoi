@@ -969,3 +969,52 @@ async fn replaced_policy_and_body_never_revive_delegated_worker_control() {
     assert_backend_denied(&f, &current, &target, None).await;
     assert_backend_denied(&f, &f.source, &target, Some(StatusCode::UNAUTHORIZED)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_policy_control_rejection_produces_typed_problem_without_runtime_effect() {
+    let f = OperationFixture::new().await;
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "worker"; keys = ["worker.create", "worker.stop"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let target = f.child("typed-control-target", vec![]).await;
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let before = effects(&f);
+    let request = runtime_source_request(
+        &f.identity,
+        Some(&f.source.worker_id),
+        "POST",
+        &format!(
+            "/api/w/{TEST_WORKSPACE_ID}/worker-control/workers/{}/{}/stop",
+            target.runtime_id, target.worker_id
+        ),
+        serde_json::to_vec(&json!({"reason":"private-control-canary"})).unwrap(),
+    );
+    let response = build_router(f.api.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+    let body = to_bytes(response.into_body(), 16384).await.unwrap();
+    let decoded = api_macros::http::decode_problem_response::<
+        protocol::control_failure::RuntimeControlCause,
+    >(
+        &body,
+        403,
+        "application/problem+json",
+        &runtime_api::control_failure::ControlBoundary,
+        error_contract::Budget::new(16384, 16384),
+    );
+    let error_contract::DecodeFailure::Known(failure) = decoded else {
+        panic!("current policy rejection must retain typed control cause");
+    };
+    assert_eq!(
+        *failure.facts().cause(),
+        protocol::control_failure::RuntimeControlCause::AuthorizationFailed
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("canary"));
+    assert_eq!(effects(&f), before);
+}

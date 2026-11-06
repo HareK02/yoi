@@ -79,8 +79,7 @@ impl WorkspaceConfigBackend {
         self.client
             .authorize_operation(operation, &resource)
             .map_err(|error| {
-                let denied = matches!(&error, WorkspaceClientError::Request(message)
-                if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
+                let denied = error.is_authorization_denial();
                 failure(
                     if denied {
                         ProtocolErrorCode::PermissionDenied

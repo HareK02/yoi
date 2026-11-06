@@ -79,6 +79,7 @@ impl WorkspaceClient for Client {
             self.response.clone()
         };
         Ok(WorkspaceResponse {
+            content_type: None,
             status: if resolving { 200 } else { self.status },
             body: response.to_string(),
         })

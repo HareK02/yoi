@@ -14,6 +14,16 @@ extern crate self as api_macros;
 /// leave authentication, authorization, body limits, and timeouts to the enclosing application.
 /// Declarations without adapters do not depend on an HTTP framework.
 ///
+/// `#[api(reqwest, client_error_hook)]` delegates error decoding to the error type's
+/// `reqwest::HttpClientError` implementation. A mixed-error API can instead set
+/// `client_error_hook = true` on individual HTTP operations. Either flag enables the hook;
+/// a method-level `false` does not override a trait-wide opt-in. Without opt-in, client-only
+/// errors need only serde deserialization; server traits and codecs are not imposed on them.
+///
+/// `additional_error_content_types = ["application/problem+json"]` on an HTTP operation
+/// declares extra representations for every declared error status, alongside legacy JSON.
+/// Each representation uses the error type's schema; the producer still owns its encoding.
+///
 /// This declaration checks that a Rust trait and typed operation markers can be defined together.
 ///
 /// ```
@@ -71,6 +81,8 @@ pub use api_macros_impl::api;
 
 #[cfg(feature = "axum")]
 pub mod axum;
+#[cfg(feature = "error-contract")]
+pub mod http;
 #[cfg(feature = "openapi")]
 pub mod openapi;
 #[cfg(feature = "reqwest")]
@@ -213,6 +225,8 @@ pub struct ResponseHeaderMetadata {
 pub struct ResponseMetadata {
     pub status: u16,
     pub body: BodyMetadata,
+    /// Declared media types, empty for bodyless responses. JSON remains the default error media.
+    pub content_types: &'static [&'static str],
     pub headers: &'static [ResponseHeaderMetadata],
 }
 
@@ -272,6 +286,24 @@ pub trait WebSocketOperation {
 /// service's typed 401/403/404/409 responses without introducing duplicate route handlers.
 pub trait HttpError {
     fn status_code(&self) -> u16;
+
+    /// Opt in to an already encoded public response instead of the legacy JSON representation.
+    /// The adapter retains the original error as a server-local `Arc<Self>` extension.
+    /// Returning `None` preserves the existing JSON/status behavior exactly.
+    fn custom_response(&self) -> Option<HttpErrorResponse> {
+        None
+    }
+}
+
+/// An explicitly encoded HTTP error, independent of any server or client framework.
+///
+/// Producers own disclosure and byte limits. Adapters reject non-error statuses and invalid
+/// content types rather than substituting the legacy representation, which may not be public.
+#[derive(Debug)]
+pub struct HttpErrorResponse {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: BinaryBody,
 }
 
 /// Successful JSON response that selects one of an operation's declared success statuses.

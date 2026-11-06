@@ -4341,6 +4341,7 @@ mod tests {
                     );
                     self.operations.lock().unwrap().push(input.operation);
                     return Ok(crate::worker::WorkspaceResponse {
+                        content_type: None,
                         status: if self.granted { 200 } else { 403 },
                         body: serde_json::json!({"scope":input.resource}).to_string(),
                     });
@@ -4350,12 +4351,14 @@ mod tests {
                 assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Get);
                 if request.path == "/api/w/workspace-1/drive/capabilities" {
                     return Ok(crate::worker::WorkspaceResponse {
+                        content_type: None,
                         status: 200,
                         body: serde_json::json!({"write":true}).to_string(),
                     });
                 }
                 assert_eq!(request.path, "/api/w/workspace-1/drive/root");
-                Ok(crate::worker::WorkspaceResponse { status: 200, body: serde_json::json!({
+                Ok(crate::worker::WorkspaceResponse { content_type: None,
+status: 200, body: serde_json::json!({
                     "entry": {"workspace_id": "workspace-1", "node_id": "1"},
                     "parent": null, "name": "", "kind": "folder", "last_mutation_id": "",
                     "size": null, "content_type": null, "updated_by": "test",

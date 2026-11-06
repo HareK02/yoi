@@ -147,10 +147,9 @@ impl CurrentSubjectPolicy {
             }
             Self::Canonical(policy) => {
                 authority.refresh_permission_registry()?;
-                let registry = authority
-                    .permission_registry
-                    .read()
-                    .map_err(|_| denied("current Feature permission registry is unavailable"))?;
+                let registry = authority.permission_registry.read().map_err(|_| {
+                    Error::Config("current Feature permission registry is unavailable".into())
+                })?;
                 let filter = |assignment: &feature_permissions::PermissionAssignment,
                               constraints: &[ScopedPermission]|
                  -> ApiResult<Vec<ScopedPermission>> {
@@ -216,7 +215,7 @@ fn current_key_allowed(
     let registry = authority
         .permission_registry
         .read()
-        .map_err(|_| denied("current Feature permission registry is unavailable"))?;
+        .map_err(|_| Error::Config("current Feature permission registry is unavailable".into()))?;
     key_allowed_in_registry(authority, &registry, operation, assignment)
 }
 
@@ -230,7 +229,7 @@ fn key_allowed_in_registry(
     if !operation.contains('.') {
         return Ok(assignment.is_none());
     }
-    let key = feature_permissions::PermissionKey::parse(operation).map_err(denied)?;
+    let key = feature_permissions::PermissionKey::parse(operation).map_err(Error::InvalidInput)?;
     let catalog = registry.host().catalog();
     if catalog.workspace.as_str() != authority.workspace_id {
         return Err(denied(
@@ -264,7 +263,7 @@ fn key_allowed_in_registry(
     registry
         .host()
         .allows(namespace, &resolved, &key)
-        .map_err(|error| denied(error.to_string()))
+        .map_err(|error| Error::Config(error.to_string()).into())
 }
 
 fn denied(message: impl Into<String>) -> ApiError {
@@ -282,6 +281,7 @@ pub(super) struct WorkerAuthorityView {
     feature_storage: crate::WorkspaceFeatureStorage,
     subjektiv_registration: crate::RegisteredFeature,
     plugin_artifact_root: PathBuf,
+    subject_authority_store: Option<crate::subjektiv::SubjektivStore>,
     permission_registry:
         Arc<std::sync::RwLock<worker::feature::permissions::FeaturePermissionRegistry>>,
 }
@@ -299,16 +299,16 @@ impl From<&WorkspaceApi> for WorkerAuthorityView {
             )
             .join("plugin-artifacts"),
             permission_registry: api.permission_registry.clone(),
+            subject_authority_store: api.subject_authority_store.clone(),
         }
     }
 }
 
 impl WorkerAuthorityView {
     fn refresh_permission_registry(&self) -> ApiResult<()> {
-        let mut registry = self
-            .permission_registry
-            .write()
-            .map_err(|_| denied("current Feature permission registry is unavailable"))?;
+        let mut registry = self.permission_registry.write().map_err(|_| {
+            Error::Config("current Feature permission registry is unavailable".into())
+        })?;
         self.config_store.sync_plugin_permission_registry(
             &self.plugin_artifact_root,
             &self.workspace_id,
@@ -318,6 +318,9 @@ impl WorkerAuthorityView {
     }
 
     fn subject_store(&self) -> ApiResult<crate::subjektiv::SubjektivStore> {
+        if let Some(reader) = &self.subject_authority_store {
+            return Ok(reader.clone());
+        }
         crate::subjektiv::SubjektivStore::open(&self.feature_storage, &self.subjektiv_registration)
             .map_err(|error| subjektiv_store_error(error).into())
     }
@@ -1179,20 +1182,44 @@ pub(super) fn bind_reserved_grant(
     grant: &WorkerExecutionGrant,
     worker_id: &str,
 ) -> ApiResult<()> {
+    bind_reserved_grant_observed(api, grant, worker_id, || {})
+}
+
+fn bind_reserved_grant_observed(
+    api: &WorkspaceApi,
+    grant: &WorkerExecutionGrant,
+    worker_id: &str,
+    before_feature: impl FnOnce(),
+) -> ApiResult<()> {
     let mut bound = grant.clone();
     bound.worker_id = worker_id.to_owned();
     revalidate_execution_grant(api, &bound)?;
-    // Opening the store connects its canonical provider. Do this before taking
-    // the registry guard, avoiding a recursive read when a writer is queued.
     let store = open_subjektiv_store(api)?;
-    let registry = api
-        .permission_registry
-        .read()
-        .map_err(|_| denied("current Feature permission registry is unavailable"))?;
+    before_feature();
     store
-        .bind_worker_execution_grant_with_host(&bound, registry.host())
+        .bind_worker_execution_grant_with_host_lease(&bound, || {
+            // The Feature owner has acquired its actual connection/IMMEDIATE
+            // transaction. Retain registry fencing through its COMMIT.
+            let registry = api.permission_registry.read().map_err(|_| {
+                subjektiv::SubjektivError::AuthorizationDenied(
+                    "current Feature permission registry is unavailable".into(),
+                )
+            })?;
+            let host = registry.host().clone();
+            Ok((registry, host))
+        })
         .map_err(subjektiv_store_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn bind_reserved_grant_before_feature(
+    api: &WorkspaceApi,
+    grant: &WorkerExecutionGrant,
+    worker_id: &str,
+    observe: impl FnOnce(),
+) -> ApiResult<()> {
+    bind_reserved_grant_observed(api, grant, worker_id, observe)
 }
 
 /// Persist only the confirmed execution delegation's reply direction, never an

@@ -1677,22 +1677,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             ToolExecutionTerminal::Confirmed(Ok(output)) => {
                                 ToolResult::from_output(&call_id, output)
                             }
-                            ToolExecutionTerminal::Confirmed(Err(ToolError::Cancelled(output))) => {
-                                ToolResult::from_output_with_disposition(
-                                    &call_id,
-                                    output,
-                                    ToolResultDisposition::Cancelled,
-                                )
-                            }
-                            ToolExecutionTerminal::Confirmed(Err(ToolError::Interrupted(
-                                output,
-                            ))) => ToolResult::from_output_with_disposition(
-                                &call_id,
-                                output,
-                                ToolResultDisposition::Interrupted,
-                            ),
                             ToolExecutionTerminal::Confirmed(Err(error)) => {
-                                ToolResult::error(&call_id, error.to_string())
+                                ToolResult::from_error(&call_id, error)
                             }
                             ToolExecutionTerminal::OutcomeUnknown => {
                                 ToolResult::outcome_unknown(&call_id)
@@ -2149,22 +2135,8 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
                             ToolExecutionTerminal::Confirmed(Ok(output)) => {
                                 ToolResult::from_output(&call_id, output)
                             }
-                            ToolExecutionTerminal::Confirmed(Err(ToolError::Cancelled(output))) => {
-                                ToolResult::from_output_with_disposition(
-                                    &call_id,
-                                    output,
-                                    ToolResultDisposition::Cancelled,
-                                )
-                            }
-                            ToolExecutionTerminal::Confirmed(Err(ToolError::Interrupted(
-                                output,
-                            ))) => ToolResult::from_output_with_disposition(
-                                &call_id,
-                                output,
-                                ToolResultDisposition::Interrupted,
-                            ),
                             ToolExecutionTerminal::Confirmed(Err(error)) => {
-                                ToolResult::error(&call_id, error.to_string())
+                                ToolResult::from_error(&call_id, error)
                             }
                             ToolExecutionTerminal::OutcomeUnknown => {
                                 ToolResult::outcome_unknown(&call_id)
@@ -2420,7 +2392,23 @@ impl<C: LlmClient, S: EngineState, A: Send + Sync> Engine<C, S, A> {
 
         // Bound the terminal payload before committing it so the post-tool
         // interceptor observes exactly the model-visible durable result.
-        if let (Some(limits), Some((tool_call, _, _, _)), Some(content)) = (
+        let error_details_exceed_limit = tool_result.disposition == ToolResultDisposition::Error
+            && self.tool_output_limits.as_ref().zip(call_info).is_some_and(
+                |(limits, (call, _, _, _))| {
+                    tool_result
+                        .content
+                        .as_ref()
+                        .is_some_and(|content| content.len() > limits.limit_for(&call.name))
+                },
+            );
+        if error_details_exceed_limit {
+            // Execution details may be a required structured cause + domain result.
+            // Never publish a partial JSON document as if it were a complete failure.
+            tool_result.content = None;
+            tool_result
+                .summary
+                .push_str(" Detailed failure result exceeds the output limit.");
+        } else if let (Some(limits), Some((tool_call, _, _, _)), Some(content)) = (
             self.tool_output_limits.as_ref(),
             call_info,
             tool_result.content.as_mut(),

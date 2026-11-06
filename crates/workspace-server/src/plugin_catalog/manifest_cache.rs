@@ -52,8 +52,10 @@ impl SqliteWorkspaceStore {
         installation: &str,
         digest: &str,
     ) -> Result<std::sync::Arc<plugin::PluginPackageManifest>> {
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        self.with_conn(|conn| {
+            // This projection reads immutable bytes and a coherent revocation
+            // snapshot; it neither writes SQL nor upgrades a reserved read owner.
+            let tx = conn.unchecked_transaction()?;
             let current = load_installation(&tx, workspace, installation)?;
             if current.uninstalled {
                 return fail(PluginCatalogError::NotFound);

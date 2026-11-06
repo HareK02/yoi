@@ -740,7 +740,11 @@ async fn execute_with_transport(
                             status: response.status,
                             headers: response.headers,
                             body: response.body,
-                        }).map_err(sent_transport_error),
+                        }).map_err(|error| {
+                            #[cfg(test)]
+                            eprintln!("HTTPS dispatch returned transport class {error:?}");
+                            sent_transport_error(error)
+                        }),
                         error = monitor_invocation(api.clone(), &context, &workspace, &invocation_id, operation.clone()) => {
                             cancellation.cancel();
                             Err(error)
@@ -818,8 +822,16 @@ async fn monitor_invocation(
         .await;
         let error = match checked {
             Ok(Ok(_)) => continue,
-            Ok(Err(error)) => error,
-            Err(_) => policy::map_error(policy::failure(PluginHostErrorCode::Unavailable)),
+            Ok(Err(error)) => {
+                #[cfg(test)]
+                eprintln!("HTTPS monitor current authority returned {:?}", error.code);
+                error
+            }
+            Err(_) => {
+                #[cfg(test)]
+                eprintln!("HTTPS monitor current authority exceeded one-second budget");
+                policy::map_error(policy::failure(PluginHostErrorCode::Unavailable))
+            }
         };
         // After admission the request may have reached the peer. Neither a
         // failed check nor a local connection shutdown proves remote rollback.
