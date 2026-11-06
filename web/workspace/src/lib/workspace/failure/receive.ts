@@ -20,8 +20,12 @@ export type DetailsDecoder<D> = (
   envelope: FailureEnvelope<unknown>,
 ) => DetailsDecode<D>;
 
-export type FailureReceipt<D> =
-  | { kind: "problem"; problem: ProblemDetails<D> }
+export type ProblemExtensionDecoder<E> = (
+  problem: Readonly<Record<string, unknown>>,
+) => DetailsDecode<E>;
+
+export type FailureReceipt<D, E = undefined> =
+  | { kind: "problem"; problem: ProblemDetails<D>; extension?: E }
   | { kind: "unsupported" }
   | { kind: "invalid" }
   | { kind: "too_large" }
@@ -247,12 +251,13 @@ function uriReference(value: unknown): string {
   return value;
 }
 
-export function decodeProblem<D>(
+export function decodeProblem<D, E = undefined>(
   text: string,
   status: number,
   contentType: string,
   decode: DetailsDecoder<D>,
-): FailureReceipt<D> {
+  decodeExtension?: ProblemExtensionDecoder<E>,
+): FailureReceipt<D, E> {
   try {
     if (
       contentType.split(";")[0].trim().toLowerCase() !==
@@ -270,8 +275,11 @@ export function decodeProblem<D>(
     const failure = decodeEnvelope(raw.yoi_failure, decode);
     if (detail !== failureRecord(raw.yoi_failure).explanation) return invalid();
     if (failure.kind !== "known") return failure;
+    const extension = decodeExtension?.(raw);
+    if (extension && extension.kind !== "known") return extension;
     return {
       kind: "problem",
+      ...(extension?.kind === "known" ? { extension: extension.details } : {}),
       problem: {
         type,
         instance,
@@ -288,10 +296,11 @@ export function decodeProblem<D>(
   }
 }
 
-export async function receiveProblem<D>(
+export async function receiveProblem<D, E = undefined>(
   response: Response,
   decode: DetailsDecoder<D>,
-): Promise<FailureReceipt<D>> {
+  decodeExtension?: ProblemExtensionDecoder<E>,
+): Promise<FailureReceipt<D, E>> {
   const contentType = response.headers.get("content-type") ?? "";
   if (
     contentType.split(";")[0].trim().toLowerCase() !==
@@ -312,5 +321,11 @@ export async function receiveProblem<D>(
         : "transport",
     };
   }
-  return decodeProblem(text, response.status, contentType, decode);
+  return decodeProblem(
+    text,
+    response.status,
+    contentType,
+    decode,
+    decodeExtension,
+  );
 }
