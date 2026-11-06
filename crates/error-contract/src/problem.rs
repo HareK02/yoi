@@ -14,6 +14,7 @@ pub enum HttpFailureStatus {
     Forbidden,
     NotFound,
     Conflict,
+    PayloadTooLarge,
     Unprocessable,
     TooManyRequests,
     Internal,
@@ -29,6 +30,7 @@ impl HttpFailureStatus {
             Self::Forbidden => 403,
             Self::NotFound => 404,
             Self::Conflict => 409,
+            Self::PayloadTooLarge => 413,
             Self::Unprocessable => 422,
             Self::TooManyRequests => 429,
             Self::Internal => 500,
@@ -84,6 +86,7 @@ pub trait ApiBoundary<D> {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", schemars(rename = "ProblemDetails_{D}"))]
 pub struct ProblemDetails<D> {
     #[serde(rename = "type")]
     #[cfg_attr(feature = "json-schema", schemars(length(max = 2048)))]

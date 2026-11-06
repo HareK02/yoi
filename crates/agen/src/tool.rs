@@ -27,6 +27,10 @@ pub enum ToolError {
     /// Execution failed
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
+    /// A completed execution failure with provider-selected structured details.
+    /// Dispatch/protocol errors remain separate variants; decoding this output is not success.
+    #[error("{summary}", summary = .0.summary)]
+    ExecutionFailure(ToolOutput),
     /// Internal error
     #[error("Internal error: {0}")]
     Internal(String),
@@ -654,6 +658,29 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// Preserve provider execution details instead of reducing them to Display text.
+    pub fn from_error(tool_use_id: impl Into<String>, error: ToolError) -> Self {
+        let tool_use_id = tool_use_id.into();
+        match error {
+            ToolError::ExecutionFailure(output) => Self::from_output_with_disposition(
+                tool_use_id,
+                output,
+                ToolResultDisposition::Error,
+            ),
+            ToolError::Cancelled(output) => Self::from_output_with_disposition(
+                tool_use_id,
+                output,
+                ToolResultDisposition::Cancelled,
+            ),
+            ToolError::Interrupted(output) => Self::from_output_with_disposition(
+                tool_use_id,
+                output,
+                ToolResultDisposition::Interrupted,
+            ),
+            error => Self::error(tool_use_id, error.to_string()),
+        }
+    }
+
     /// Create a success result from a [`ToolOutput`].
     pub fn from_output(tool_use_id: impl Into<String>, output: ToolOutput) -> Self {
         Self::from_output_with_disposition(tool_use_id, output, ToolResultDisposition::Success)

@@ -2642,6 +2642,7 @@ fn map_ticket_tool_error(error: ToolError) -> WipOperationError {
             ProtocolErrorCode::InvalidArguments,
             format!("Ticket domain rejection: {message}"),
         ),
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, message } => protocol_failure(
@@ -2887,6 +2888,7 @@ mod tests {
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
             if request.path.ends_with("/authorization/check") {
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: "{}".into(),
                 });
@@ -2916,6 +2918,7 @@ mod tests {
         Arc::new(DecisionClient {
             requests: Mutex::new(Vec::new()),
             response: crate::worker::WorkspaceResponse {
+                content_type: None,
                 status,
                 body: serde_json::to_string(&record).unwrap(),
             },
@@ -2942,7 +2945,8 @@ mod tests {
             let client = Arc::new(DecisionClient {
                 requests: Mutex::new(Vec::new()),
                 response: crate::worker::WorkspaceResponse {
-                    status,
+                    content_type: None,
+status,
                     body: json!({
                         "error": "Rejected",
                         "message": "Verified actor is required; unrelated HTTP status 401",
@@ -3118,6 +3122,7 @@ mod tests {
             let client = Arc::new(DecisionClient {
                 requests: Mutex::new(Vec::new()),
                 response: crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status,
                     body: serde_json::to_string(&(record.clone(), record.clone())).unwrap(),
                 },
@@ -3176,6 +3181,7 @@ mod tests {
             let client = Arc::new(DecisionClient {
                 requests: Mutex::new(Vec::new()),
                 response: crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: target_detail_fixture(targets.clone()).to_string(),
                 },
@@ -3247,6 +3253,7 @@ mod tests {
             let client = Arc::new(DecisionClient {
                 requests: Mutex::new(Vec::new()),
                 response: crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: detail.to_string(),
                 },
@@ -4591,6 +4598,7 @@ mod tests {
             }
             self.requests.lock().unwrap().push(request);
             Ok(crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: if authorization {
                     if permitted { 200 } else { 403 }
                 } else {
@@ -4991,6 +4999,7 @@ mod tests {
                     .find(|permission| permission.covers(&needed))
                     .map(|permission| permission.resource.clone());
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: if scope.is_some() { 200 } else { 403 },
                     body: scope
                         .map(|scope| json!({"scope":scope}))
@@ -5010,6 +5019,7 @@ mod tests {
                 .create(serde_json::from_str(request.body.as_deref().unwrap()).unwrap())
                 .unwrap();
             Ok(crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&created).unwrap(),
             })
@@ -5543,6 +5553,7 @@ mod tests {
                     calls >= 2 && operation == "ticket.relation.record"
                 };
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: if revoked { 403 } else { 200 },
                     body: if revoked {
                         json!({"message":"permission revoked during operation"}).to_string()
@@ -5558,6 +5569,7 @@ mod tests {
             });
             self.provider_requests.lock().unwrap().push(request);
             Ok(crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: if self.case {
                     self.record["meta"].to_string()

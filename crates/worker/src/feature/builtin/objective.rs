@@ -67,8 +67,7 @@ impl WorkspaceHttpObjectiveBackend {
         self.client
             .authorize_operation(operation, &resource)
             .map_err(|error| {
-                let denied = matches!(&error, crate::worker::WorkspaceClientError::Request(message)
-                if message.contains("HTTP status 403") || message.contains("HTTP status 401"));
+                let denied = error.is_authorization_denial();
                 WorkspaceObjectiveBackendError::Authorization {
                     operation: operation.into(),
                     resource,
@@ -1603,11 +1602,13 @@ mod tests {
                 self.authorizations.lock().unwrap().push(input.clone());
                 if self.auth_denied.load(std::sync::atomic::Ordering::SeqCst) {
                     return Ok(crate::worker::WorkspaceResponse {
+                        content_type: None,
                         status: 403,
                         body: "{}".into(),
                     });
                 }
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::json!({"scope": input.resource}).to_string(),
                 });
@@ -1630,6 +1631,7 @@ mod tests {
 
     pub(super) fn objective_response(title: &str) -> crate::worker::WorkspaceResponse {
         crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({
                 "id": "00001OBJECTIVE",
@@ -2058,6 +2060,7 @@ mod tests {
     #[tokio::test]
     async fn native_create_read_state_and_ticket_links_use_existing_backend_routes() {
         let ticket_response = || crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({"resource_key": "T-7"}).to_string(),
         };
@@ -2158,6 +2161,7 @@ mod tests {
     #[tokio::test]
     async fn native_missing_objective_and_ticket_refs_are_deterministic_not_found() {
         let missing = || crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 404,
             body: "missing".into(),
         };

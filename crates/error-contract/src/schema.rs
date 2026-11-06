@@ -6,6 +6,14 @@ use crate::{codec::FailureEnvelope, problem::ProblemDetails};
 pub fn failure_schema<D: schemars::JsonSchema>() -> schemars::Schema {
     schemars::schema_for!(FailureEnvelope<D>)
 }
+/// Embed the canonical wire schema in an existing boundary result without copying its fields.
+/// Definitions remain owned by the caller's generator, so nested references resolve normally.
+pub fn failure_subschema<D: schemars::JsonSchema>(
+    generator: &mut schemars::SchemaGenerator,
+) -> schemars::Schema {
+    generator.subschema_for::<FailureEnvelope<D>>()
+}
+
 pub fn problem_schema<D: schemars::JsonSchema>() -> schemars::Schema {
     schemars::schema_for!(ProblemDetails<D>)
 }

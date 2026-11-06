@@ -1,14 +1,18 @@
-//! Focused T840 connection: real Subject policy -> signed Session POST -> real
-//! ProfileRuntimeWorkerFactory startup -> RuntimeHTTP/Host diagnostic -> saved
-//! Worker metadata. Only the unused external model is replaced. No restore,
-//! operation replay, singleton-release, or Browser rendering contract is asserted.
+//! Connected startup acceptance: real Subject policy -> signed Session POST ->
+//! ProfileRuntimeWorkerFactory -> Runtime HTTP -> Backend, including the real
+//! authenticated Browser worker-create HTTP route and saved Worker metadata.
+//! Only the unused external model is replaced. Read-only reconciliation is not
+//! restore, operation replay, or a Browser rendering contract.
 use super::*;
 use api_macros::HttpError as _;
 use protocol::session_failure::{
     SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
 };
 use session_store::WorkerMetadataStore as _;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::instrument::WithSubscriber as _;
+use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
 use worker_runtime::worker_backend::RuntimeWorkerFactory as _;
 
 #[derive(Clone, Default)]
@@ -30,6 +34,57 @@ impl agen::llm_client::LlmClient for UnusedModel {
     }
 }
 
+#[derive(Clone, Default)]
+struct StartupEvents(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+#[derive(Default)]
+struct StartupEventFields(BTreeMap<String, String>);
+
+impl tracing::field::Visit for StartupEventFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().into(), value.into());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().into(), format!("{value:?}"));
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for StartupEvents {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "yoi::worker_startup" {
+            let mut fields = StartupEventFields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+/// A real formatter writer failure, not a replacement result/observer function.
+/// The request-scoped subscriber avoids process-global test interference.
+#[derive(Clone, Default)]
+struct FailedStartupSink(Arc<AtomicUsize>);
+
+impl std::io::Write for FailedStartupSink {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::other(
+            "test: startup observation sink unavailable",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FailedStartupSink {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 type ReleaseFence = (
     crate::store::WorkerSingletonLease,
     subjektiv::journal::JournalWriterBinding,
@@ -41,6 +96,8 @@ struct RegistrationFixture {
     callbacks: Arc<Mutex<Vec<(StatusCode, Value)>>>,
     model: UnusedModel,
     release_fence: Arc<Mutex<Option<ReleaseFence>>>,
+    startup_events: StartupEvents,
+    failed_sink: FailedStartupSink,
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +106,7 @@ enum RegistrationFault {
     Deny,
     DenyWithMetadataReadFailure,
     ReleasePending,
+    CommittedResponseLost,
 }
 
 impl RegistrationFixture {
@@ -63,13 +121,31 @@ impl RegistrationFixture {
         let model = UnusedModel::default();
         let release_fence = Arc::new(Mutex::new(None));
         let reserved = release_fence.clone();
+        let startup_events = StartupEvents::default();
+        let failed_sink = FailedStartupSink::default();
+        let events = startup_events.clone();
+        let sink = failed_sink.clone();
         let connected = ConnectedWorkerHarness::start_with_layer(model.clone(), move |router| {
             router.layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
                     let hook = hook.clone();
                     let observed = observed.clone();
                     let reserved = reserved.clone();
+                    let events = events.clone();
+                    let sink = sink.clone();
                     async move {
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path() == format!("/api/w/{TEST_WORKSPACE_ID}/workers")
+                        {
+                            let subscriber = tracing_subscriber::registry()
+                                .with(events)
+                                .with(tracing_subscriber::fmt::layer()
+                                    .with_writer(sink)
+                                    .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                                        metadata.target() == "yoi::worker_startup"
+                                    })));
+                            return next.run(request).with_subscriber(subscriber).await;
+                        }
                         if request.method() != axum::http::Method::POST
                             || request.uri().path()
                                 != format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions")
@@ -108,7 +184,7 @@ impl RegistrationFixture {
                                 assert!(store.journal_writer_active(&writer).unwrap());
                                 assert_eq!(api.store.current_worker_singleton_owner(TEST_WORKSPACE_ID, &key).unwrap(), Some(lease.clone()));
                                 *reserved.lock().unwrap() = Some((lease, writer));
-                            } else {
+                            } else if !matches!(fault, RegistrationFault::CommittedResponseLost) {
                                 store
                                     .set_subject_permissions(
                                         &subject,
@@ -163,6 +239,20 @@ impl RegistrationFixture {
                             std::fs::create_dir(&metadata).unwrap();
                         }
                         observed.lock().unwrap().push((response.status(), input));
+                        if matches!(fault, RegistrationFault::CommittedResponseLost) {
+                            assert_eq!(response.status(), StatusCode::OK);
+                            // The genuine signed handler committed before its response is
+                            // lost. Do not replace its authorization, attribution, or write.
+                            // A broken body fails the actual Runtime HTTP client rather
+                            // than fabricating a typed Runtime/domain failure in this layer.
+                            let (parts, _) = response.into_parts();
+                            let body = Body::from_stream(futures::stream::once(async {
+                                Err::<Vec<u8>, _>(std::io::Error::other(
+                                    "test: committed registration response lost",
+                                ))
+                            }));
+                            return Response::from_parts(parts, body);
+                        }
                         response
                     }
                 },
@@ -200,6 +290,8 @@ impl RegistrationFixture {
             callbacks,
             model,
             release_fence,
+            startup_events,
+            failed_sink,
         }
     }
 
@@ -220,6 +312,178 @@ impl RegistrationFixture {
             control_operation_id: None,
             execution_grant: None,
         }
+    }
+
+    async fn browser_failure(
+        &self,
+        expected_status: StatusCode,
+    ) -> (
+        runtime_api::startup::StartupProblemDetails,
+        runtime_api::startup::WorkerCreateFailure,
+    ) {
+        use runtime_api::startup::{
+            DecodeStartupProblem, PROBLEM_CONTENT_TYPE, StartupBoundary, decode_startup_problem,
+        };
+        let (status, headers, bytes) = self
+            .connected
+            .human_raw(
+                reqwest::Method::POST,
+                &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+                serde_json::to_value(self.request()).unwrap(),
+            )
+            .await;
+        assert_eq!(status, expected_status);
+        let content_type = headers[axum::http::header::CONTENT_TYPE].to_str().unwrap();
+        assert_eq!(content_type, PROBLEM_CONTENT_TYPE);
+        let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+            &bytes,
+            status.as_u16(),
+            content_type,
+            StartupBoundary::Browser,
+        ) else {
+            panic!("real Browser HTTP response must decode as a bounded startup Problem");
+        };
+        let problem: runtime_api::startup::StartupProblemDetails =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(problem.status, status.as_u16());
+        // Neither raw callback diagnostics nor authority-bearing identifiers may
+        // be copied into a public explanation/extension by the adapters.
+        let body = std::str::from_utf8(&bytes).unwrap();
+        for secret in [
+            &self.connected.owner,
+            &self.subject,
+            &self.connected.backend_url,
+        ] {
+            assert!(
+                !body.contains(secret),
+                "Browser Problem disclosed private fixture data"
+            );
+        }
+        assert!(!body.contains("test: committed registration response lost"));
+        assert!(!body.contains("worker-runtime-"));
+        // Public, bounded handler bytes, after the non-disclosure checks above.
+        // These provide the actual shared Browser fixture source under --nocapture;
+        // no metadata, callback body, credential, or private upstream text is logged.
+        eprintln!(
+            "T812_BROWSER_STARTUP_PROBLEM status={status} content_type={content_type} body={body}"
+        );
+        (problem, failure)
+    }
+
+    fn assert_backend_failure(
+        &self,
+        worker: &str,
+        session: &str,
+        problem: &runtime_api::startup::StartupProblemDetails,
+        browser: &runtime_api::startup::WorkerCreateFailure,
+        expected: SessionRegistrationCause,
+    ) {
+        use protocol::startup_failure::StartupPersistenceOutcome::Persisted;
+        use runtime_api::startup::DecodeStoredWorkerCreateFailure;
+        let reference = RuntimeWorkerRef::new(CONNECTED_RUNTIME, worker);
+        let Some(DecodeStoredWorkerCreateFailure::Known(saved)) = self
+            .connected
+            .api
+            .worker_create_failure(&reference)
+            .unwrap()
+        else {
+            panic!("real Browser failure must be readable from the canonical Backend reservation");
+        };
+        assert_startup_semantics(saved.startup(), browser.startup(), expected);
+        assert_eq!(
+            saved.operation(),
+            browser.operation(),
+            "HTTP cannot rewrite acceptance/execution/finalization/compensation/correlation"
+        );
+        assert_eq!(saved.backend_result_persistence(), Some(Persisted));
+        assert_eq!(browser.backend_result_persistence(), Some(Persisted));
+        assert_eq!(
+            problem.yoi_startup.backend_result_persistence,
+            Some(Persisted)
+        );
+        assert_eq!(saved.public_facts(), problem.yoi_startup);
+        let correlation = saved
+            .operation()
+            .correlation
+            .as_ref()
+            .expect("Backend-selected lookup token");
+        assert_eq!(
+            correlation.as_str(),
+            worker_startup::correlation(CONNECTED_RUNTIME, worker)
+        );
+        assert_eq!(
+            problem.instance,
+            format!("urn:yoi:worker-startup:{}", correlation.as_str())
+        );
+
+        let events = self.startup_events.0.lock().unwrap();
+        let result_events = events
+            .iter()
+            .filter(|event| {
+                event
+                    .get("event")
+                    .is_some_and(|value| value == "worker_create_result")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result_events.len(),
+            1,
+            "one HTTP responsibility boundary records the primary, not every adapter"
+        );
+        let event = result_events[0];
+        assert_eq!(event["domain"], problem.yoi_failure.domain);
+        assert_eq!(event["reason"], problem.yoi_failure.reason);
+        assert_eq!(event["correlation"], correlation.as_str());
+        assert_eq!(event["status"], problem.status.to_string());
+        assert_eq!(
+            event["acceptance"],
+            format!("{:?}", saved.operation().acceptance)
+        );
+        assert_eq!(
+            event["execution"],
+            format!("{:?}", saved.operation().execution)
+        );
+        let logged = serde_json::to_string(&*events).unwrap();
+        for secret in [
+            self.connected.owner.as_str(),
+            self.subject.as_str(),
+            self.connected.backend_url.as_str(),
+            session,
+            worker,
+            "test: committed registration response lost",
+        ] {
+            assert!(
+                !logged.contains(secret),
+                "startup observation leaked private fixture data"
+            );
+        }
+        assert!(!logged.contains(self.connected.runtime_root.to_str().unwrap()));
+        drop(events);
+        assert!(
+            self.failed_sink.0.load(Ordering::SeqCst) > 0,
+            "actual tracing formatter sink failed while HTTP/Backend/metadata results were preserved"
+        );
+        assert_eq!(
+            self.connected
+                .api
+                .worker_create_failure(&reference)
+                .unwrap(),
+            Some(DecodeStoredWorkerCreateFailure::Known(saved)),
+            "lookup is read-only, never a create retry"
+        );
+    }
+
+    fn attempted_worker(&self) -> String {
+        let workers = std::fs::read_dir(self.connected.runtime_root.join("workers"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            workers.len(),
+            1,
+            "one real factory attempt, never a new create/replay"
+        );
+        workers[0].clone()
     }
 
     fn assert_callback(&self, expected: StatusCode) -> String {
@@ -248,6 +512,42 @@ fn contains_saved_value(saved: &Value, expected: &Value) -> bool {
                 .any(|value| contains_saved_value(value, expected)),
             _ => false,
         }
+}
+
+// Runtime/Browser normalization reprojects for the receiving boundary, including
+// its local explanation. Compare domain enums, not byte identity of envelopes;
+// saved metadata below still checks the original Storage attachment independently.
+fn session_primary(
+    primary: &protocol::startup_failure::StartupFailureAttachment,
+) -> Option<SessionRegistrationCause> {
+    match primary.decode::<SessionRegistrationCause>() {
+        error_contract::DecodeFailure::Known(received) => Some(*received.facts().cause()),
+        _ => None,
+    }
+}
+
+fn assert_session_primary(
+    primary: &protocol::startup_failure::StartupFailureAttachment,
+    expected: SessionRegistrationCause,
+) {
+    assert_eq!(
+        session_primary(primary),
+        Some(expected),
+        "Session failure must remain a known typed domain cause"
+    );
+}
+
+fn assert_startup_semantics(
+    host: &runtime_api::WorkerStartupFailure,
+    wire: &runtime_api::WorkerStartupFailure,
+    expected: SessionRegistrationCause,
+) {
+    assert_session_primary(&host.primary, expected);
+    assert_session_primary(&wire.primary, expected);
+    assert_eq!(host.secondary, wire.secondary);
+    assert_eq!(host.persistence, wire.persistence);
+    assert_eq!(host.resources, wire.resources);
+    assert_eq!(host.io_kind, wire.io_kind);
 }
 
 fn read_metadata(root: &std::path::Path, worker: &str) -> Value {
@@ -347,6 +647,168 @@ fn assert_registration_cause(body: Value, cause: SessionRegistrationCause) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn browser_http_session_record_denial_retains_subject_cause_and_saved_resources() {
+    use protocol::startup_failure::{
+        StartupFailurePhase, StartupPersistenceOutcome, StartupSecondaryFailure,
+    };
+    use runtime_api::startup::{ExecutionOutcome, StartupCause};
+
+    let fixture = RegistrationFixture::new(RegistrationFault::Deny).await;
+    // This POST must pass the real Browser authentication/preflight and reach
+    // the signed callback. Only then does the fixture remove session.record.
+    let (problem, browser) = fixture.browser_failure(StatusCode::CONFLICT).await;
+    let session = fixture.assert_callback(StatusCode::FORBIDDEN);
+    assert_eq!(fixture.callbacks.lock().unwrap().len(), 1);
+    let expected = SessionRegistrationCause::denied(SessionPrincipal::Subject);
+    assert_eq!(problem.type_uri, "urn:yoi:problem:conflict");
+    assert_eq!(problem.yoi_failure.domain, "session_registration");
+    assert_eq!(problem.yoi_failure.reason, "permission_denied");
+    assert_eq!(problem.yoi_failure.details, StartupCause::Session(expected));
+    assert!(problem.detail.contains("Subject"), "{}", problem.detail);
+    assert!(
+        problem.detail.contains("session.record"),
+        "{}",
+        problem.detail
+    );
+    assert_eq!(browser.operation().execution, ExecutionOutcome::Errored);
+    assert_session_primary(&browser.startup().primary, expected);
+
+    let runtime = fixture.connected.runtime_startup_failures.lock().unwrap();
+    assert_eq!(runtime.len(), 1, "one actual Runtime HTTP failure");
+    assert_session_primary(&runtime[0].primary, expected);
+    assert_eq!(
+        browser.startup().persistence,
+        Some(StartupPersistenceOutcome::Persisted)
+    );
+    assert_eq!(browser.startup().persistence, runtime[0].persistence);
+    assert!(
+        runtime[0].resources.is_some(),
+        "resource disposition is independent of the denial"
+    );
+    assert_eq!(browser.startup().resources, runtime[0].resources);
+    assert!(
+        browser.startup().secondary.iter().any(|secondary| matches!(
+            secondary,
+            StartupSecondaryFailure::Persistence {
+                phase: StartupFailurePhase::RuntimeRecordDelete,
+                ..
+            }
+        )),
+        "real retention pin prevents Runtime record deletion without replacing the denial"
+    );
+    drop(runtime);
+
+    let store = open_subjektiv_store(&fixture.connected.api).unwrap();
+    assert!(store.session_attribution(&session).unwrap().is_none());
+    assert!(
+        store
+            .subject_session_attributions(&fixture.subject)
+            .unwrap()
+            .is_empty()
+    );
+    let worker = fixture.attempted_worker();
+    fixture.assert_backend_failure(&worker, &session, &problem, &browser, expected);
+    let saved = read_metadata(&fixture.connected.runtime_root, &worker);
+    assert!(contains_saved_value(
+        &saved,
+        &serde_json::to_value(session_registration_attachment(expected).unwrap()).unwrap()
+    ));
+    assert_eq!(
+        fixture.connected.runtime.list_workers().unwrap().len(),
+        1,
+        "retained Runtime resource is observed separately from persisted cause and HTTP409"
+    );
+    assert_eq!(
+        read_metadata(&fixture.connected.runtime_root, &worker),
+        saved,
+        "ordinary read-only reopen, not create/restore/retry"
+    );
+    assert_eq!(fixture.callbacks.lock().unwrap().len(), 1);
+    assert_eq!(fixture.model.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn browser_http_committed_registration_response_loss_stays_unknown_without_reexecution() {
+    use protocol::startup_failure::StartupPersistenceOutcome;
+    use runtime_api::startup::StartupCause;
+
+    let fixture = RegistrationFixture::new(RegistrationFault::CommittedResponseLost).await;
+    let (problem, browser) = fixture.browser_failure(StatusCode::BAD_GATEWAY).await;
+    // This is the status of the original signed handler, before transport loss.
+    let session = fixture.assert_callback(StatusCode::OK);
+    assert_eq!(
+        fixture.callbacks.lock().unwrap().len(),
+        1,
+        "response loss must not automatically reexecute Session registration"
+    );
+    let expected = SessionRegistrationCause::outcome_unknown();
+    assert_eq!(problem.yoi_failure.domain, "session_registration");
+    assert_eq!(problem.yoi_failure.reason, "outcome_unknown");
+    assert_eq!(problem.yoi_failure.details, StartupCause::Session(expected));
+    assert!(
+        problem.detail.contains("session.record"),
+        "{}",
+        problem.detail
+    );
+    assert_session_primary(&browser.startup().primary, expected);
+    assert_eq!(
+        browser.startup().persistence,
+        Some(StartupPersistenceOutcome::Persisted)
+    );
+    let runtime = fixture.connected.runtime_startup_failures.lock().unwrap();
+    assert_eq!(runtime.len(), 1);
+    assert_session_primary(&runtime[0].primary, expected);
+    assert_eq!(browser.startup().resources, runtime[0].resources);
+    assert_eq!(browser.startup().persistence, runtime[0].persistence);
+    drop(runtime);
+
+    let store = open_subjektiv_store(&fixture.connected.api).unwrap();
+    let committed = store.session_attribution(&session).unwrap().unwrap();
+    assert_eq!(committed.subject_id, fixture.subject);
+    assert_eq!(committed.runtime_id, CONNECTED_RUNTIME);
+    let worker = fixture.attempted_worker();
+    fixture.assert_backend_failure(&worker, &session, &problem, &browser, expected);
+    assert_eq!(committed.worker_id, worker);
+    assert_eq!(
+        store
+            .subject_session_attributions(&fixture.subject)
+            .unwrap()
+            .len(),
+        1,
+        "HTTP failure is not proof of no Backend write"
+    );
+    let saved = read_metadata(&fixture.connected.runtime_root, &worker);
+    assert_eq!(
+        saved["subjektiv_session_attribution"]["state"], "outcome_unknown",
+        "saved Runtime observation must not claim confirmed registration or rejection"
+    );
+    assert_eq!(
+        saved["subjektiv_session_attribution"]["session_id"],
+        session
+    );
+    assert!(contains_saved_value(
+        &saved,
+        &serde_json::to_value(session_registration_attachment(expected).unwrap()).unwrap()
+    ));
+    assert_eq!(
+        read_metadata(&fixture.connected.runtime_root, &worker),
+        saved
+    );
+    assert_eq!(
+        store.session_attribution(&session).unwrap(),
+        Some(committed)
+    );
+    assert_eq!(fixture.connected.runtime.list_workers().unwrap().len(), 1);
+    assert_eq!(fixture.attempted_worker(), worker);
+    assert_eq!(
+        fixture.callbacks.lock().unwrap().len(),
+        1,
+        "Problem decoding, attribution lookup and metadata reopen are read-only, never replay authority"
+    );
+    assert_eq!(fixture.model.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() {
     let fixture = RegistrationFixture::new(RegistrationFault::Deny).await;
     // The real create preflight sees normal defaults. Revocation happens only
@@ -390,7 +852,10 @@ async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() 
         SessionPrincipal::Subject,
     ))
     .unwrap();
-    assert_eq!(wire.primary, expected_primary);
+    assert_session_primary(
+        &wire.primary,
+        SessionRegistrationCause::denied(SessionPrincipal::Subject),
+    );
     assert_eq!(
         wire.persistence,
         Some(protocol::startup_failure::StartupPersistenceOutcome::Persisted)
@@ -399,9 +864,16 @@ async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() 
         .diagnostics
         .iter()
         .filter_map(|d| d.startup.as_ref())
-        .find(|startup| startup.primary == wire.primary)
+        .find(|startup| {
+            session_primary(&startup.primary)
+                == Some(SessionRegistrationCause::denied(SessionPrincipal::Subject))
+        })
         .expect("RemoteWorkerRuntime must preserve the typed startup primary in Host diagnostics");
-    assert_eq!(host.primary, wire.primary);
+    assert_startup_semantics(
+        host,
+        wire,
+        SessionRegistrationCause::denied(SessionPrincipal::Subject),
+    );
     assert!(
         host.secondary.iter().any(|failure| matches!(
             failure,
@@ -412,7 +884,7 @@ async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() 
         )),
         "a real Session retention pin rejects outer Runtime deletion without hiding the primary"
     );
-    let expected = serde_json::to_value(&wire.primary).unwrap();
+    let expected = serde_json::to_value(&expected_primary).unwrap();
     assert!(
         expected.is_string(),
         "the shared attachment contains a codec envelope"
@@ -467,12 +939,9 @@ async fn real_session_record_denial_and_metadata_save_failure_remain_separate() 
         "one real startup attempt, not an operation replay"
     );
     let wire = &failures[0];
-    assert_eq!(
-        wire.primary,
-        session_registration_attachment(SessionRegistrationCause::denied(
-            SessionPrincipal::Subject
-        ),)
-        .unwrap()
+    assert_session_primary(
+        &wire.primary,
+        SessionRegistrationCause::denied(SessionPrincipal::Subject),
     );
     assert_eq!(wire.persistence, Some(StartupPersistenceOutcome::NotSaved));
     assert!(wire.secondary.iter().any(|failure| matches!(
@@ -486,11 +955,15 @@ async fn real_session_record_denial_and_metadata_save_failure_remain_separate() 
         .diagnostics
         .iter()
         .filter_map(|d| d.startup.as_ref())
-        .find(|startup| startup.primary == wire.primary)
+        .find(|startup| {
+            session_primary(&startup.primary)
+                == Some(SessionRegistrationCause::denied(SessionPrincipal::Subject))
+        })
         .unwrap();
-    assert_eq!(
-        host, wire,
-        "Remote Host preserves the refusal and independent save failure"
+    assert_startup_semantics(
+        host,
+        wire,
+        SessionRegistrationCause::denied(SessionPrincipal::Subject),
     );
     assert!(
         open_subjektiv_store(&fixture.connected.api)
@@ -623,7 +1096,7 @@ async fn release_fence_refusal_survives_signed_registration_and_metadata_reopen(
     let wire = &failures[0];
     let expected =
         session_registration_attachment(SessionRegistrationCause::binding_mismatch()).unwrap();
-    assert_eq!(wire.primary, expected);
+    assert_session_primary(&wire.primary, SessionRegistrationCause::binding_mismatch());
     assert_eq!(
         wire.persistence,
         Some(protocol::startup_failure::StartupPersistenceOutcome::Persisted)
@@ -632,9 +1105,11 @@ async fn release_fence_refusal_survives_signed_registration_and_metadata_reopen(
         .diagnostics
         .iter()
         .filter_map(|d| d.startup.as_ref())
-        .find(|failure| failure.primary == expected)
+        .find(|failure| {
+            session_primary(&failure.primary) == Some(SessionRegistrationCause::binding_mismatch())
+        })
         .expect("Remote Host retains known refusal");
-    assert_eq!(host.primary, wire.primary);
+    assert_startup_semantics(host, wire, SessionRegistrationCause::binding_mismatch());
     assert!(
         host.secondary.iter().any(|failure| matches!(
             failure,

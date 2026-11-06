@@ -77,12 +77,14 @@ impl WorkspaceClient for Client {
             let _: server_api::authorization::OperationAuthorizationRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"scope":null}).to_string(),
             });
         }
         self.requests.lock().unwrap().push(request);
         Ok(WorkspaceResponse {
+            content_type: None,
             status: self.status,
             body: self.body.clone(),
         })
@@ -221,6 +223,7 @@ impl WorkspaceClient for BoundClient {
                 "backend-job-notification:hash-A" | "legacy-A" => "Job-A",
                 "backend-job-notification:hash-B" | "legacy-B" | "mr-event:legacy-B:e" => "Job-B",
                 _ => return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 403,
                     body: json!({"message":"Notification source is unavailable or not authorized"})
                         .to_string(),

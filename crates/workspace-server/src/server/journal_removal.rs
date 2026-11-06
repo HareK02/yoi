@@ -47,6 +47,7 @@ fn waiting(
     };
     Ok(Some(worker::WorkspaceResponse {
         status: StatusCode::ACCEPTED.as_u16(),
+        content_type: None,
         body: serde_json::to_string(&response).map_err(|error| Error::Store(error.to_string()))?,
     }))
 }

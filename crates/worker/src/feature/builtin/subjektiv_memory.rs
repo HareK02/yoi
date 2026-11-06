@@ -980,6 +980,7 @@ mod tests {
                 ));
             };
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&SubjektivMemoryBackendResponse::ReceiptStatus(
                     server_api::SubjektivMemoryReceiptStatusResponse {
@@ -1021,6 +1022,7 @@ mod tests {
                 return Ok(response);
             }
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 409,
                 body: serde_json::to_string(&server_api::RepositoryApiError::new(
                     409,
@@ -1071,6 +1073,7 @@ mod tests {
                 SubjektivMemoryBackendOperation::Read(_)
             ));
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&SubjektivMemoryBackendResponse::Read(self.0.clone()))
                     .unwrap(),
@@ -1141,6 +1144,7 @@ mod tests {
                         .is_ok()
                     {
                         return Ok(WorkspaceResponse {
+                            content_type: None,
                             status: 503,
                             body: r#"{"error":"Unavailable","message":"retry","diagnostics":[]}"#
                                 .into(),
@@ -1158,6 +1162,7 @@ mod tests {
                 other => panic!("unexpected test operation: {other:?}"),
             };
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&response).unwrap(),
             })

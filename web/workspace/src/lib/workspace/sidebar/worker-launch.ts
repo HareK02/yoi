@@ -2,7 +2,6 @@ import type {
   BrowserWorkerWorkingDirectorySelection,
   CreateWorkspaceWorkerRequest,
   CreateWorkspaceWorkerTicketAssignmentRequest,
-  RepositoryApiError,
   WorkerLaunchProfileCandidate,
 } from "#lib/generated/worker-launch-api.ts";
 import { parseCreateWorkspaceWorkerRequest } from "#lib/workspace/api/workers.ts";
@@ -41,12 +40,16 @@ export function defaultWorkerLaunchForm(
       options?.runtimes.find((runtime) => runtime.worker_creation_available) ??
       options?.runtimes[0];
   const runtime =
-    options?.runtimes.find((candidate) => candidate.runtime_id === current.runtime_id) ??
+    options?.runtimes.find((candidate) =>
+      candidate.runtime_id === current.runtime_id
+    ) ??
       preferredRuntime;
   const availableWorkdirIds = new Set(
     (options?.working_directories ?? []).filter((directory) =>
-      directory.status === "active" && directory.source.kind !== "workspace_config" &&
-      (directory.source.kind === "external_grant" || directory.cleanliness === "clean") &&
+      directory.status === "active" &&
+      directory.source.kind !== "workspace_config" &&
+      (directory.source.kind === "external_grant" ||
+        directory.cleanliness === "clean") &&
       directory.occupied_by == null
     ).map((directory) => directory.working_directory_id),
   );
@@ -137,7 +140,9 @@ export function buildCreateWorkspaceWorkerRequest(
     ticket_assignment: form.ticket_assignment ?? null,
     initial_submit: [
       ...(initialMessage ? [{ kind: "text", content: form.initial_text }] : []),
-      ...(form.flow?.trim() ? [{ kind: "flow", selector: form.flow.trim() }] : []),
+      ...(form.flow?.trim()
+        ? [{ kind: "flow", selector: form.flow.trim() }]
+        : []),
     ],
     workdir_attachments: validatedAttachments(form.workdir_attachments),
     feature_connections: form.subjektiv_subject_id.trim()
@@ -154,13 +159,4 @@ export function genericLaunchProfiles(
   return profiles.filter((candidate) =>
     candidate.id !== "builtin:reviewer" && candidate.id !== "reviewer"
   );
-}
-
-export function workerLaunchOutcomeUnknown(error: RepositoryApiError): boolean {
-  return [
-    error.error,
-    error.message,
-    ...(error.diagnostics ?? []).flatMap((item) => [item.code, item.message]),
-  ]
-    .some((value) => /outcome[_\s-]?unknown|OutcomeUnknown/i.test(value));
 }

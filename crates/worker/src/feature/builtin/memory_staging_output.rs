@@ -511,6 +511,7 @@ mod tests {
             }
             self.requests.lock().unwrap().push(request);
             Ok(crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&server_api::SubjektivStageCandidateResponse {
                     staging_id: "subject-candidate-1".to_string(),

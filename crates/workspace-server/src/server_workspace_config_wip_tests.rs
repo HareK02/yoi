@@ -122,7 +122,11 @@ impl worker::WorkspaceClient for ConfigRouterClient {
                     .map_err(|_| Failure::Request("response unavailable after dispatch".into()))?;
                 let body = String::from_utf8(bytes.to_vec())
                     .map_err(|_| Failure::Request("invalid response".into()))?;
-                Ok(WorkspaceResponse { status, body })
+                Ok(WorkspaceResponse {
+                    content_type: None,
+                    status,
+                    body,
+                })
             })
         })
         .join()

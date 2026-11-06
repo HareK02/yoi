@@ -107,6 +107,7 @@ pub struct CausalLink {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", schemars(rename = "FailureDiagnostic"))]
 pub struct Diagnostic {
     #[cfg_attr(feature = "json-schema", schemars(length(min = 1, max = 128)))]
     pub code: String,

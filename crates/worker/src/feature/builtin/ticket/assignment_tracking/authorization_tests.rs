@@ -58,6 +58,7 @@ impl WorkspaceClient for AuthorizedClient {
                 .any(|grant| grant.covers(&requested));
             self.authorizations.lock().unwrap().push(auth);
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: if allowed { 200 } else { 403 },
                 body: if allowed {
                     json!({"scope": requested.resource})
@@ -69,6 +70,7 @@ impl WorkspaceClient for AuthorizedClient {
         }
         self.requests.lock().unwrap().push(request);
         Ok(WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: self.response.to_string(),
         })

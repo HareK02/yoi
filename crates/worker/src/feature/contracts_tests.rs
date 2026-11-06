@@ -36,6 +36,7 @@ impl Default for TestServices {
 
 fn response() -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: r#"{"worker_id":"test-worker"}"#.into(),
     }

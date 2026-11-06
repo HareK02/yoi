@@ -1215,6 +1215,7 @@ mod tests {
                     .unwrap()
                     .push(check["operation"].as_str().unwrap().to_owned());
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: if self.denied.load(Ordering::SeqCst) {
                         403
                     } else {
@@ -1236,6 +1237,7 @@ mod tests {
             self.requests.lock().unwrap().push(request);
             if is_subjektiv_consolidation {
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&server_api::MemoryConsolidationResponse {
                         status: "started".into(),
@@ -1248,6 +1250,7 @@ mod tests {
             }
             if is_subjektiv_stage {
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&server_api::SubjektivStageCandidateResponse {
                         staging_id: "subject-candidate-1".to_string(),
@@ -1257,6 +1260,7 @@ mod tests {
             }
             if is_stage_candidate {
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&memory::backend::MemoryBackendHttpResponse::Ok {
                         result: memory::backend::MemoryBackendOperationResult::StagingWritten(
@@ -1271,6 +1275,7 @@ mod tests {
             }
             if is_append_audit {
                 return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&memory::backend::MemoryBackendHttpResponse::Ok {
                         result: memory::backend::MemoryBackendOperationResult::Acknowledged(

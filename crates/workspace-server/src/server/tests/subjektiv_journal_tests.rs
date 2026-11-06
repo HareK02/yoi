@@ -1832,12 +1832,21 @@ async fn domain_storage_lock_stops_at_original_attempt_deadline_without_dispatch
         failed.failure_category.as_deref(),
         Some("recovery_cannot_continue")
     );
-    let detail = failed.failure_detail.as_deref().unwrap();
-    assert!(
-        detail.contains("Original attempt deadline exceeded"),
-        "{detail}"
+    // T814 preserves the first typed storage-reconciliation cause even when the
+    // original deadline subsequently stops recovery. Legacy Display prose is
+    // not the failure contract, nor does expiry attest execution termination.
+    let error_contract::DecodeFailure::Known(primary) = failed
+        .failure_cause
+        .as_ref()
+        .unwrap()
+        .decode::<crate::backend_job::BackgroundJobCause>(
+    ) else {
+        panic!("missing typed retained cause")
+    };
+    assert_eq!(
+        *primary.facts().cause(),
+        crate::backend_job::BackgroundJobCause::ReconciliationRequired
     );
-    assert!(detail.contains("Subjektiv storage"), "{detail}");
     let attempt = current_journal_attempt(&f, &f.reserved.attempt.attempt_id);
     assert_eq!(attempt.deadline_at, deadline);
     assert!(attempt.worker.is_none());

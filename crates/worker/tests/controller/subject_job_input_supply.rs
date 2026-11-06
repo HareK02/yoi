@@ -52,7 +52,8 @@ impl WorkspaceClient for JobHost {
         );
         self.checks.fetch_add(1, Ordering::SeqCst);
         Ok(WorkspaceResponse {
-            status: if self.denied.load(Ordering::SeqCst) { 403 } else { 200 },
+            content_type: None,
+status: if self.denied.load(Ordering::SeqCst) { 403 } else { 200 },
             body: r#"{"scope":{"kind":"subject","workspace_id":"workspace-test","subject_id":"bound-subject"}}"#.into(),
         })
     }

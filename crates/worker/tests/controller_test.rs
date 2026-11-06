@@ -245,6 +245,7 @@ impl WorkspaceClient for AvailableWorkspaceClient {
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         if request.path.ends_with("/authorization/check") {
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             });
@@ -258,6 +259,7 @@ impl WorkspaceClient for AvailableWorkspaceClient {
                 server_api::authorization::BoundAuthorizationTarget::Subject {}
             );
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: if self.consolidation_input_granted {
                     200
                 } else {
@@ -297,6 +299,7 @@ impl WorkspaceClient for NoopWorkspaceClient {
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         if request.path.ends_with("/authorization/check") {
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             });
@@ -1184,6 +1187,7 @@ impl WorkspaceClient for JournalWorkspaceClient {
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         if request.path.ends_with("/authorization/check") {
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             });
@@ -1197,6 +1201,7 @@ impl WorkspaceClient for JournalWorkspaceClient {
                 server_api::authorization::BoundAuthorizationTarget::Subject {}
             );
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: if self.journal_input_granted { 200 } else { 403 },
                 body: serde_json::json!({"scope": {
                     "kind": "subject",
@@ -1235,6 +1240,7 @@ impl WorkspaceClient for JournalWorkspaceClient {
             panic!("unexpected Journal request {}", request.path)
         };
         Ok(WorkspaceResponse {
+            content_type: None,
             status,
             body: body.to_string(),
         })

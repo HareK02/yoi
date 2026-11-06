@@ -29,11 +29,12 @@ use agen::llm_client::LlmClient;
 use job::{JobRequest, JobResultSubmission};
 use tokio::sync::{Notify, watch};
 
-use crate::job_store::JobStore;
 pub use crate::job_store::{
-    JobAttempt, JobAttemptState, JobExecutionOwnership, JobInputDisposition,
-    JobInputRetirementReason, JobSnapshot, JobState, JobStoreError,
+    JobAttempt, JobAttemptState, JobExecutionOwnership, JobFailureCause, JobFailureObservation,
+    JobFailureObservations, JobFailureVisibility, JobInputDisposition, JobInputRetirementReason,
+    JobSnapshot, JobState, JobStoreError,
 };
+use crate::job_store::{JobStore, SettlementFailures};
 
 #[derive(Debug, thiserror::Error)]
 pub enum JobServiceError {
@@ -49,6 +50,11 @@ pub enum JobServiceError {
     Capacity,
     #[error("standalone Job cleanup failed: {0}")]
     Cleanup(String),
+    #[error("standalone Job settlement failed: {source}")]
+    SettlementFailure {
+        #[source]
+        source: Arc<JobServiceError>,
+    },
     #[error("standalone Job shutdown is incomplete; execution resources are still owned")]
     ShutdownIncomplete,
     #[error(
@@ -93,7 +99,7 @@ type OwnedExecutionReport = Arc<
 
 struct Execution {
     cancel: watch::Sender<bool>,
-    complete: watch::Receiver<Option<Result<(), String>>>,
+    complete: watch::Receiver<Option<Result<(), Arc<JobServiceError>>>>,
     attempt_id: String,
     resource_key: Option<String>,
     max_concurrent: u16,
@@ -387,6 +393,23 @@ impl StandaloneJobs {
 
     pub fn get(&self, job_id: &str) -> Result<JobSnapshot, JobServiceError> {
         Ok(self.with_store(|store| store.get(job_id))?)
+    }
+
+    /// Read safe, typed failure observations; the boundary resolves visibility now.
+    /// Stored/legacy prose is never returned as an encodable attachment.
+    pub fn failure_observations<A: error_contract::Audience>(
+        &self,
+        job_id: &str,
+        current: &JobFailureVisibility,
+    ) -> Result<JobFailureObservations<A>, JobServiceError>
+    where
+        JobFailureCause: error_contract::ProjectFor<
+                A,
+                Authorization = JobFailureVisibility,
+                Details = JobFailureCause,
+            >,
+    {
+        Ok(self.get(job_id)?.attempt.failure_observations(current))
     }
 
     /// Pending attempts survive shutdown. The consumer chooses when to resume
@@ -704,8 +727,8 @@ impl StandaloneJobs {
                 result = &mut run => result,
                 reason = async {
                     tokio::select! {
-                        _ = tokio::time::sleep_until(deadline) => "timeout",
-                        _ = cancellation.wait_for(|cancelled| *cancelled) => "Host cancellation/shutdown",
+                        _ = tokio::time::sleep_until(deadline) => JobStopReason::Deadline,
+                        _ = cancellation.wait_for(|cancelled| *cancelled) => JobStopReason::Host,
                     }
                 } => {
                     // The persisted terminal state revokes future domain calls, while the gate
@@ -717,7 +740,12 @@ impl StandaloneJobs {
                         // A transient store failure does not cancel ownership of settlement.
                         // The local revocation and effect gate still fence callbacks;
                         // retry the exact terminal write after the owned runner returns.
-                        let _ = finish_if_pending(&store, &id, &attempt_id, JobAttemptState::Failed, reason);
+                        if let Some(store) = store.lock().expect("Job store poisoned").as_mut() {
+                            let _ = store.record_settlement_failures(&id, &attempt_id, SettlementFailures {
+                                primary: Some(reason.cause()),
+                                ..Default::default()
+                            });
+                        }
                     }
                     if let Ok(Ok(sender)) = tokio::time::timeout(Duration::from_secs(1), &mut sender_rx).await {
                         let _ = sender.try_send(());
@@ -779,13 +807,12 @@ impl StandaloneJobs {
                     .expect("Job diagnostics poisoned")
                     .insert((id.clone(), attempt_id.clone()), retained.clone());
             }
-            complete_tx.send_replace(Some(
-                outcome.as_ref().map(|_| ()).map_err(ToString::to_string),
-            ));
+            let outcome = outcome.map_err(Arc::new);
+            complete_tx.send_replace(Some(outcome.clone()));
             // A wake is only an observation: recovery joins the successful task
             // return before rechecking capacity. An error does not free its slot.
             capacity_changed.notify_waiters();
-            outcome
+            outcome.map_err(observed_settlement_error)
         });
         executions.jobs.insert(
             job_id.to_string(),
@@ -820,7 +847,7 @@ impl StandaloneJobs {
                 .map_err(|error| JobServiceError::Cleanup(error.to_string()))?
                 .clone()
                 .expect("completion");
-            result.map_err(JobServiceError::Cleanup)?;
+            result.map_err(observed_settlement_error)?;
             // Completion is published immediately before the task returns. Do not remove
             // its ownership record until the runtime confirms that return (and future drop).
             while self
@@ -871,7 +898,7 @@ impl StandaloneJobs {
             }
             match execution.complete.borrow().as_ref() {
                 Some(Ok(())) => {}
-                Some(Err(error)) => return Err(JobServiceError::Cleanup(error.clone())),
+                Some(Err(error)) => return Err(observed_settlement_error(error.clone())),
                 None => {
                     return Err(JobServiceError::Cleanup(
                         "Internal Worker ended without cleanup confirmation".into(),
@@ -937,6 +964,16 @@ impl StandaloneJobs {
                 result => return result,
             }
         }
+    }
+}
+
+// Completion observers preserve storage/contract failures as typed causes rather
+// than relabeling every failed settlement as cleanup. Existing cleanup callers keep
+// their explicit cleanup verdict; its owned Worker handles are retained separately.
+fn observed_settlement_error(source: Arc<JobServiceError>) -> JobServiceError {
+    match source.as_ref() {
+        JobServiceError::Cleanup(detail) => JobServiceError::Cleanup(detail.clone()),
+        _ => JobServiceError::SettlementFailure { source },
     }
 }
 
@@ -1019,6 +1056,20 @@ fn transient_settlement_storage_error(error: &JobServiceError) -> bool {
             | rusqlite::ErrorCode::CannotOpen))
 }
 
+#[derive(Clone, Copy)]
+enum JobStopReason {
+    Deadline,
+    Host,
+}
+impl JobStopReason {
+    fn cause(self) -> JobFailureCause {
+        match self {
+            Self::Deadline => JobFailureCause::DeadlineExceeded,
+            Self::Host => JobFailureCause::HostStopped,
+        }
+    }
+}
+
 fn settle_owned_execution(
     store: &Mutex<Option<JobStore>>,
     id: &str,
@@ -1026,19 +1077,13 @@ fn settle_owned_execution(
     input_digest: &str,
     ownership: &JobExecutionOwnership,
     domain_fenced: bool,
-    stop_reason: Option<&str>,
+    stop_reason: Option<JobStopReason>,
     allow_unconfirmed: bool,
     result: &Result<worker::job::OwnedInternalJobExecution, worker::job::JobExecutionError>,
 ) -> Result<(), JobServiceError> {
-    let detail = match result {
-        Ok(execution) => execution
-            .result
-            .as_ref()
-            .err()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "Worker finished without an accepted structured result".into()),
-        Err(error) => error.to_string(),
-    };
+    // Original typed reports stay retained by the existing execution owner if any
+    // write fails. Persistence failure is not saved execution failure or permission
+    // to repeat Worker/finalizer effects.
     // Validate the saved owner before any terminal write. A stale result/cleanup
     // must not finish a later attempt, even if that later attempt is still pending.
     let mut slot = store.lock().expect("Job store poisoned");
@@ -1076,14 +1121,56 @@ fn settle_owned_execution(
         }
     }
     let snapshot = store.get(id)?;
-    if snapshot.state == JobState::Pending {
-        store.finish(
-            id,
-            attempt,
-            JobAttemptState::Failed,
-            Some(stop_reason.unwrap_or(&detail)),
-        )?;
-    }
+    let observed_error = match result {
+        Ok(execution) => execution.result.as_ref().err(),
+        Err(error) => Some(error),
+    };
+    let receipt_unconfirmed = matches!(
+        observed_error,
+        Some(worker::job::JobExecutionError::ResultUnconfirmed(_))
+    );
+    let cleanup_unconfirmed = match result {
+        Ok(execution) => {
+            !domain_fenced
+                || !execution.feature_shutdown_complete()
+                || execution.requires_worker_cleanup_reconciliation()
+        }
+        Err(_) => true, // No owned return is never proof of successful cleanup.
+    };
+    let primary = if snapshot.state == JobState::Completed {
+        None
+    } else {
+        stop_reason.map(JobStopReason::cause).or_else(|| {
+            if receipt_unconfirmed {
+                None
+            } else {
+                observed_error.map(JobFailureCause::execution)
+            }
+        })
+    };
+    // worker_failure also returns a pre-result Worker error. Exclude that case;
+    // a sealed result with lost acknowledgement may also have a later Worker error.
+    let post_result = match result {
+        Ok(execution)
+            if !matches!(
+                &execution.result,
+                Err(worker::job::JobExecutionError::Worker(_))
+            ) && execution.worker_failure().is_some() =>
+        {
+            Some(JobFailureCause::Worker)
+        }
+        _ => None,
+    };
+    store.record_settlement_failures(
+        id,
+        attempt,
+        SettlementFailures {
+            primary,
+            post_result,
+            result_receipt: receipt_unconfirmed.then_some(JobFailureCause::ResultUnconfirmed),
+            cleanup: cleanup_unconfirmed.then_some(JobFailureCause::CleanupUnconfirmed),
+        },
+    )?;
     let execution = result
         .as_ref()
         .map_err(|error| JobServiceError::Cleanup(error.to_string()))?;
@@ -1102,6 +1189,7 @@ fn settle_owned_execution(
     Ok(())
 }
 
+#[cfg(test)]
 fn finish_if_pending(
     store: &Mutex<Option<JobStore>>,
     id: &str,

@@ -5,7 +5,8 @@ use thiserror::Error;
 
 use crate::llm_client::ToolDefinition as LlmToolDefinition;
 use crate::tool::{
-    Tool, ToolDefinition as EngineToolDefinition, ToolExecutionContext, ToolMeta, ToolOutput,
+    Tool, ToolDefinition as EngineToolDefinition, ToolError, ToolExecutionContext, ToolMeta,
+    ToolOutput, ToolResult,
 };
 
 type ToolMap = HashMap<String, (ToolMeta, Arc<dyn Tool>)>;
@@ -22,6 +23,9 @@ pub enum ToolServerError {
     /// Tool execution failed.
     #[error("Tool execution failed: {0}")]
     ToolExecution(String),
+    /// Provider failure details, distinct from lookup/dispatch failure.
+    #[error("Tool execution failed: {}", .0.summary)]
+    ExecutionResult(Box<ToolResult>),
 }
 
 /// In-memory tool server.
@@ -127,9 +131,17 @@ impl ToolServerHandle {
                 .ok_or_else(|| ToolServerError::ToolNotFound(name.to_string()))?;
             Arc::clone(tool)
         };
+        let call_id = ctx.call_id.clone();
         tool.execute(input_json, ctx)
             .await
-            .map_err(|e| ToolServerError::ToolExecution(e.to_string()))
+            .map_err(|error| match error {
+                ToolError::ExecutionFailure(_)
+                | ToolError::Cancelled(_)
+                | ToolError::Interrupted(_) => ToolServerError::ExecutionResult(Box::new(
+                    ToolResult::from_error(call_id, error),
+                )),
+                error => ToolServerError::ToolExecution(error.to_string()),
+            })
     }
 
     /// Remove a registered tool by name.

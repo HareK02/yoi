@@ -785,7 +785,7 @@ async fn generic_management_aliases_cannot_bypass_worker_grants_or_target_bound_
 }
 
 #[test]
-fn uncertain_unary_input_keeps_a_distinct_diagnostic_without_claiming_acceptance() {
+fn uncertain_unary_input_preserves_typed_disposition_without_claiming_acceptance() {
     let result = worker_input_result_to_api(WorkerInputResult {
         state: InternalWorkerOperationState::Rejected,
         disposition: WorkerInputDisposition::Unknown,
@@ -794,12 +794,14 @@ fn uncertain_unary_input_keeps_a_distinct_diagnostic_without_claiming_acceptance
         diagnostics: Vec::new(),
     });
     assert_eq!(result.state, server_api::WorkerOperationState::Rejected);
-    assert!(
-        result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "worker_input_outcome_unknown")
-    );
+    assert_eq!(result.disposition, WorkerInputDisposition::Unknown);
+    assert!(result.diagnostics.is_empty());
+    let wire = serde_json::to_value(&result).unwrap();
+    assert_eq!(wire["disposition"], "unknown");
+    let mut legacy = wire;
+    legacy.as_object_mut().unwrap().remove("disposition");
+    let decoded: server_api::RuntimeWorkerInputResult = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.disposition, WorkerInputDisposition::Unknown);
 }
 
 #[tokio::test]
@@ -1671,4 +1673,96 @@ async fn restore_keeps_cross_runtime_ssh_attachment_without_issuing_repository_a
             links
         );
     }
+}
+#[tokio::test]
+async fn restore_public_wire_keeps_session_primary_and_independent_cleanup_observations() {
+    use protocol::control_failure::RuntimeControlCause as C;
+    use protocol::session_failure::{SessionPrincipal, SessionRegistrationCause};
+    use protocol::startup_failure::{
+        StartupCleanup, StartupCleanupFailure, StartupPersistenceOutcome, StartupResourceFacts,
+        StartupResources, StartupSecondaryFailure,
+    };
+    let workspace = tempfile::tempdir().unwrap();
+    let mut config = test_server_config(workspace.path());
+    config.workspace_id = "home-owner".into();
+    let api =
+        WorkspaceApi::new_api_fixture(config, Arc::new(DeterministicExecutionBackend::default()))
+            .await
+            .unwrap();
+    let primary = protocol::session_failure::session_registration_attachment(
+        SessionRegistrationCause::denied(SessionPrincipal::Subject),
+    )
+    .unwrap();
+    let mut encoded: serde_json::Value = serde_json::from_str(
+        &serde_json::from_value::<String>(serde_json::to_value(&primary).unwrap()).unwrap(),
+    )
+    .unwrap();
+    encoded["explanation"] = "PRIVATE_TRANSFER_CANARY".into();
+    let primary = serde_json::from_value(serde_json::json!(encoded.to_string())).unwrap();
+    let result = crate::hosts::InternalWorkerRestoreResult {
+        control: Some(C::ExecutionRejected),
+        startup: Some(runtime_api::WorkerStartupFailure {
+            primary,
+            secondary: vec![StartupSecondaryFailure::Cleanup {
+                failure: StartupCleanupFailure::Workdir,
+            }],
+            resources: Some(StartupResourceFacts {
+                resources: StartupResources::WorkerStartup,
+                cleanup: StartupCleanup::Failed(StartupCleanupFailure::Workdir),
+                durable_effects_possible: true,
+            }),
+            persistence: Some(StartupPersistenceOutcome::OutcomeUnknown),
+            io_kind: None,
+        }),
+        state: server_api::WorkerRestoreState::RolledBack,
+        worker: None,
+        diagnostics: vec![RuntimeDiagnostic::new(
+            "supplementary_cleanup",
+            "error",
+            "Supplementary cleanup observation is not the primary failure",
+        )],
+    };
+    let Json(response) = project_worker_restore_response_owned(
+        api,
+        "fixture-runtime".into(),
+        "fixture-worker".into(),
+        result.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.result.state, result.state);
+    assert_eq!(response.result.control, result.control);
+    assert!(
+        response
+            .result
+            .control_explanation
+            .as_ref()
+            .unwrap()
+            .contains("Session")
+    );
+    let startup = response.result.startup.as_ref().unwrap();
+    assert_eq!(startup.secondary, result.startup.unwrap().secondary);
+    let error_contract::DecodeFailure::Known(cause) =
+        startup.primary.decode::<SessionRegistrationCause>()
+    else {
+        panic!("Session primary was replaced by the coarse control cause")
+    };
+    assert_eq!(
+        cause.facts().cause(),
+        &SessionRegistrationCause::denied(SessionPrincipal::Subject)
+    );
+    let wire = serde_json::to_string(&response).unwrap();
+    assert!(!wire.contains("PRIVATE_TRANSFER_CANARY"));
+    let reopened: server_api::WorkerRestoreResponse = serde_json::from_str(&wire).unwrap();
+    assert_eq!(reopened, response);
+    // Shared external bytes are consumed by the strict Web parser and browser test.
+    // This checks the post-authorization projection/Serde boundary, not authentication.
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../error-contract/fixtures/runtime-restore-session-denied.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&wire).unwrap(),
+        fixture
+    );
 }

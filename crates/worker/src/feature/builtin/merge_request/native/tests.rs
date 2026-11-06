@@ -326,6 +326,7 @@ async fn native_review_typed_findings_reaches_only_injected_route_and_never_retr
     let inner = Arc::new(RecordingWorkspaceClient::new(vec![
         response(json!({"event_id":"review-1"})),
         crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 503,
             body: "unavailable".into(),
         },

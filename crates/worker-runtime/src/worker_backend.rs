@@ -8558,6 +8558,7 @@ mod tests {
 
     include!("subject_delete_backend_tests.rs");
     include!("worker_backend/startup_binding_tests.rs");
+    include!("worker_backend/spawn_tool_startup_tests.rs");
     include!("worker_backend/termination_persistence_tests.rs");
     include!("worker_backend/submission_termination_tests.rs");
     #[cfg(feature = "fs-store")]
@@ -11809,6 +11810,7 @@ mod tests {
                     .validate()
                     .map_err(worker::WorkspaceClientError::Request)?;
                 return Ok(worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(
                         &server_api::authorization::OperationAuthorizationResponse { scope: None },

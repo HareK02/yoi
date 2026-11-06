@@ -852,8 +852,6 @@ mod subject_assignment_migration_tests {
         };
 
         const PLAN_NAME: &str = "Immutable Worker Plugin plans and retained pins";
-        const SUBJECT_NAME: &str =
-            "Subject Ticket responsibility and current-body notification routing";
         type Rows = Vec<Vec<rusqlite::types::Value>>;
 
         fn raw(path: &Path) -> Connection {
@@ -1038,8 +1036,23 @@ mod subject_assignment_migration_tests {
                     } else {
                         String::new()
                     };
+                    // Keep append identities for rowid tables; current content
+                    // history tables are WITHOUT ROWID, so compare every column
+                    // in deterministic value order instead of inventing rowids.
+                    let without_rowid: bool = conn
+                        .query_row(
+                            "SELECT wr FROM pragma_table_list WHERE schema='main' AND name=?1",
+                            [&table],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let (projection, order) = if without_rowid {
+                        (columns.clone(), columns)
+                    } else {
+                        (format!("rowid,{columns}"), "rowid".into())
+                    };
                     let query = format!(
-                        "SELECT rowid,{columns} FROM \"{table}\"{sequence_filter} ORDER BY rowid"
+                        "SELECT {projection} FROM \"{table}\"{sequence_filter} ORDER BY {order}"
                     );
                     let rows = fixture_query_rows(conn, &query);
                     (query, rows)
@@ -1120,49 +1133,15 @@ mod subject_assignment_migration_tests {
         }
 
         fn expected_tail(version: i64) -> Vec<(i64, String)> {
-            let mut tail = match version {
-                96 => vec![
-                    (
-                        97,
-                        "MR notifications and authenticated implementation results".into(),
-                    ),
-                    (98, "Assignment-independent implementation reports".into()),
-                    (
-                        99,
-                        "Explicit hosting administrators and self-registration policy".into(),
-                    ),
-                    (
-                        100,
-                        "Provisional users and scoped passkey activation".into(),
-                    ),
-                    (101, "Durable explicit Subject body release".into()),
-                    (102, "Durable failed Subject creation recovery".into()),
-                    (103, "Passkey metadata and atomic addition results".into()),
-                    (
-                        104,
-                        "Converge Passkey results and Job input retention".into(),
-                    ),
-                    (
-                        105,
-                        "Durable Subject deletion snapshots and Job admission fences".into(),
-                    ),
-                    (106, crate::plugin_catalog::MIGRATION_NAME.into()),
-                    (107, PLAN_NAME.into()),
-                    (108, SUBJECT_NAME.into()),
-                ],
-                106 => vec![(107, PLAN_NAME.into()), (108, SUBJECT_NAME.into())],
-                107 => vec![(108, SUBJECT_NAME.into())],
-                _ => panic!("unsupported fixture origin"),
-            };
-            tail.push((109, "Durable Plugin Host invocations and HTTPS effect receipts".into()));
-            tail.push((110, "Worker Plugin launch selection associations".into()));
-            tail.push((
-                111,
-                "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
-            ));
-            tail.push((112, "Ticket Service outbox and fenced consumers".into()));
-            tail.push((113, "Ticket work-decomposition parent links".into()));
-            tail
+            assert!(
+                matches!(version, 96 | 106 | 107),
+                "unsupported fixture origin"
+            );
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version > version)
+                .map(|migration| (migration.version, migration.name.into()))
+                .collect()
         }
 
         fn plan_steps(version: i64) -> Vec<WorkspaceSchemaMigrationStep> {

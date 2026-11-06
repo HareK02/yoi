@@ -599,14 +599,25 @@ async fn ordinary_model_failure_preserves_cause_and_confirms_independent_cleanup
     assert_eq!(jobs.get("model-failure").unwrap(), failure);
     assert_eq!(failure.state, JobState::Failed);
     assert!(failure.result.is_none());
+    use standalone::jobs::{JobFailureCause, JobFailureObservation, JobFailureVisibility};
+    let observations = jobs
+        .failure_observations::<error_contract::Tool>(
+            "model-failure",
+            &JobFailureVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+    let JobFailureObservation::Known(primary) = observations.primary else {
+        panic!("model failure must survive the real execution/store/query path");
+    };
+    assert_eq!(primary.details(), &JobFailureCause::Worker);
     assert!(
-        failure
-            .attempt
-            .failure
-            .as_deref()
+        !serde_json::to_string(&failure)
             .unwrap()
             .contains("scripted model failure")
     );
+    assert!(!primary.explanation().contains("scripted model failure"));
     assert!(failure.executions_released());
     assert_eq!(failure.executions.len(), 1);
     let execution = &failure.executions[0];

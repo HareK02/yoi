@@ -401,6 +401,7 @@ mod tests {
         Arc::new(Transport {
             workspace: Some("workspace".into()),
             response: WorkspaceResponse {
+                content_type: None,
                 status,
                 body: body.into(),
             },
@@ -550,6 +551,7 @@ mod tests {
         let client = Arc::new(Transport {
             workspace: None,
             response: WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             },

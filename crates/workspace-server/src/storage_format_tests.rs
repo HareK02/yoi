@@ -132,7 +132,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     verify_history(conn, current).unwrap();
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
-        assert_eq!(plan.migrations.len(), 3);
+        assert_eq!(plan.migrations.len(), 6);
         assert_eq!(plan.migrations[0].version, 122);
         assert_eq!(
             plan.migrations[0].name,
@@ -143,12 +143,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
             plan.migrations[1].name,
             super::super::backend_job_upgrade::MIGRATION_NAME
         );
-        assert_eq!(plan.migrations[2].version, 124);
-        assert_eq!(
-            plan.migrations[2].name,
-            super::super::journal_removal_store::MIGRATION_NAME
-        );
-        assert_eq!(plan.target_schema_version, 124);
+        assert_eq!(plan.target_schema_version, 127);
     }
     assert_eq!(rows, saved_rows(conn));
     assert_eq!(shape, snapshot(conn).unwrap());
@@ -203,7 +198,7 @@ fn converged_shapes_keep_all_real_predecessor_receipts_and_erasure_fences() {
     }
 }
 
-// Snapshot every retained value except the three fields the new migration owns.
+// Snapshot retained values, excluding the execution conversion fields and new nullable columns.
 // Existing published-family history tables remain byte-for-byte in this check.
 fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
     let mut result = Vec::new();
@@ -216,7 +211,22 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
             .into_iter()
             .filter(|column| {
                 !["backend_jobs", "backend_job_attempts"].contains(&name.as_str())
-                    || !["state", "failure_category", "failure_detail"].contains(&column.as_str())
+                    || ![
+                        "state",
+                        "failure_category",
+                        "failure_detail",
+                        "allocation_precluded_at",
+                        "failure_cause",
+                        "worker_cleanup_failure_cause",
+                    ]
+                    .contains(&column.as_str())
+            })
+            .filter(|column| name != "plugin_service_consumers" || column != "last_outcome_json")
+            .filter(|column| {
+                name != "worker_removal_operations" || column != "journal_removal_json"
+            })
+            .filter(|column| {
+                name != "worker_create_reservations" || column != "startup_failure_json"
             })
             .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
             .collect::<Vec<_>>()
@@ -257,7 +267,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
         let conn = Connection::open(&path).unwrap();
         // Actual production open/ordered runner, including the new migration.
         super::super::prepare_connection(&conn).unwrap();
-        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 124);
+        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 127);
         let actual = immutable_rows(&conn);
         for (table, rows) in &expected {
             assert_eq!(
@@ -276,13 +286,12 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             )
         );
         let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
-        assert_eq!(
-            history.pop(),
-            Some((
-                124,
-                super::super::journal_removal_store::MIGRATION_NAME.into()
-            ))
-        );
+        for version in [127, 126, 125, 124] {
+            assert_eq!(
+                history.pop(),
+                Some((version, tail_migration_name(version).unwrap().into()))
+            );
+        }
         assert_eq!(
             history.pop(),
             Some((
@@ -295,7 +304,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             Some((122, crate::config_adoption::MIGRATION_NAME.into()))
         );
         assert_eq!(history, original_receipts);
-        verify_history(&conn, 124).unwrap();
+        verify_history(&conn, 127).unwrap();
         let saved = saved_rows(&conn);
         if let Some(previous) = &committed_history {
             assert_eq!(previous, &saved);

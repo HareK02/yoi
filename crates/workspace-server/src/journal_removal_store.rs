@@ -461,6 +461,7 @@ impl SqliteWorkspaceStore {
     }
 }
 
+#[cfg(test)]
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 123 {
         return Err(Error::Store(
@@ -475,6 +476,45 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         [MIGRATION_NAME],
     )?;
     storage_formats::verify_history(&tx, 124)?;
+    tx.commit()?;
+    Ok(())
+}
+
+// Canonical and retained failure histories have actually installed all three
+// extensions at 126. The published Journal-124 branch instead jumps directly
+// to 127 in one transaction, retaining its original receipt and frozen values.
+pub(super) const RETAINED_BRIDGE_NAME: &str =
+    "Startup Job and Service causes after retained Journal removal";
+
+pub(super) fn migrate_to_v127(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 126 {
+        return Err(Error::Store(
+            "Journal removal migration requires schema 126".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 126)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(SCHEMA_SQL)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(127,?1)",
+        [MIGRATION_NAME],
+    )?;
+    storage_formats::verify_history(&tx, 127)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(super) fn migrate_retained_to_v127(conn: &Connection) -> Result<()> {
+    storage_formats::verify_retained_journal_history(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    tx.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
+    tx.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(127,?1)",
+        [RETAINED_BRIDGE_NAME],
+    )?;
+    storage_formats::verify_history(&tx, 127)?;
     tx.commit()?;
     Ok(())
 }
@@ -533,14 +573,14 @@ mod tests {
             VALUES('op','plan','fp','w','r','worker','observed','policy','digest','archive','tombstone','forever','purge','[]','failed','cleanup','execution_unconfirmed','t','t');").unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 123);
-        assert_eq!(plan.migrations.len(), 1);
+        assert_eq!(plan.migrations.len(), 4);
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             123,
             "preflight must not change source"
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 124);
+        assert_eq!(current_schema_version(&conn).unwrap(), 127);
         let saved = conn.query_row(
             "SELECT plan_id,input_fingerprint,state,failure_category,journal_removal_json FROM worker_removal_operations WHERE operation_id='op'", [],
             |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?)),

@@ -1987,7 +1987,7 @@ async fn pending_original_model_and_accepted_queue_are_not_stopped_or_discarded_
     assert!(persisted.contains(queued_id) && persisted.contains(queued_text));
     let runtime = f.api().runtime.clone();
     let source = f.source.clone();
-    tokio::task::spawn_blocking(move || {
+    let stop_result = tokio::task::spawn_blocking(move || {
         runtime.stop_worker(&source, WorkerLifecycleRequest::default())
     })
     .await
@@ -2006,7 +2006,12 @@ async fn pending_original_model_and_accepted_queue_are_not_stopped_or_discarded_
         }
     })
     .await
-    .expect("Stop acceptance eventually publishes its stopped catalog projection");
+    .unwrap_or_else(|error| {
+        panic!(
+            "Stop projection did not settle: {error}; result={stop_result:?}; current={:?}",
+            f.api().runtime.worker(&f.source)
+        )
+    });
     let response = f.remove().await;
     assert_eq!(
         response.status,

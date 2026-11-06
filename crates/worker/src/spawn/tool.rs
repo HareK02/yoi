@@ -1640,6 +1640,7 @@ enabled = false
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             })
@@ -2040,6 +2041,7 @@ enabled = false
                 "unexpected bound authorization: {body}"
             );
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope": null}).to_string(),
             })
@@ -2092,6 +2094,7 @@ enabled = false
             match operation.operation {
                 workdir::http::WorkdirSessionOperation::AuthorizeScope(_) => {
                     Ok(WorkspaceResponse {
+                        content_type: None,
                         status: 200,
                         body: serde_json::to_string(
                             &workdir::http::WorkdirSessionOperationResult::AuthorizeScope,

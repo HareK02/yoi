@@ -199,6 +199,7 @@ dependencies = [
  "api-macros-impl",
  "axum",
  "bytes",
+ "error-contract",
  "futures",
  "oas3",
  "reqwest",
@@ -4325,12 +4326,15 @@ name = "runtime-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "error-contract",
  "manifest",
  "plugin-plan",
  "protocol",
+ "schemars",
  "serde",
  "serde_json",
  "session-store",
+ "sha2 0.11.0",
  "tokio",
  "workdir",
 ]
@@ -4764,6 +4768,7 @@ name = "server-api"
 version = "0.1.0"
 dependencies = [
  "api-macros",
+ "error-contract",
  "feature-permissions",
  "memory",
  "merge-request",
@@ -5613,9 +5618,11 @@ version = "0.1.0"
 dependencies = [
  "agen",
  "async-trait",
+ "error-contract",
  "filetime",
  "fs-operation",
  "html5ever",
+ "jsonschema",
  "manifest",
  "markup5ever_rcdom",
  "pdf-extract",
@@ -7334,6 +7341,7 @@ dependencies = [
  "minijinja",
  "protocol",
  "reqwest",
+ "runtime-api",
  "schemars",
  "secrets",
  "serde",
@@ -7370,6 +7378,7 @@ name = "worker-runtime"
 version = "0.1.0"
 dependencies = [
  "agen",
+ "api-macros",
  "async-trait",
  "axum",
  "base64 0.22.1",

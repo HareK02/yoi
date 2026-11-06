@@ -723,6 +723,7 @@ mod tests {
 
         fn response(value: server_api::SubjektivMemoryBackendResponse) -> WorkspaceResponse {
             WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&value).unwrap(),
             }
@@ -770,6 +771,7 @@ mod tests {
                     .pop_front()
                     .unwrap_or_else(|| {
                         Ok(WorkspaceResponse {
+                            content_type: None,
                             status: 200,
                             body: "{\"replayed\":false}".into(),
                         })
@@ -795,6 +797,7 @@ mod tests {
                     let call = self.publish_calls.fetch_add(1, Ordering::SeqCst) + 1;
                     if call <= self.conflict_count {
                         return Ok(WorkspaceResponse {
+                            content_type: None,
                             status: 409,
                             body: "store generation moved".into(),
                         });
@@ -1410,6 +1413,7 @@ permission = "write"
 
     fn rejection(status: u16) -> Result<WorkspaceResponse, WorkspaceClientError> {
         Ok(WorkspaceResponse {
+            content_type: None,
             status,
             body: "explicit rejection before acceptance".into(),
         })

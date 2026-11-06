@@ -117,6 +117,7 @@ impl WorkspaceClient for Client {
             let input: server_api::authorization::OperationAuthorizationRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope": input.resource}).to_string(),
             });
@@ -150,10 +151,12 @@ impl WorkspaceClient for Client {
             Fault::Communication => Err(WorkspaceClientError::Request(UNSAFE.into())),
             Fault::Panic => panic!("injected blocking task failure"),
             Fault::Decode => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: UNSAFE.into(),
             }),
             Fault::Size => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: UNSAFE.repeat(MAX_RESPONSE_BYTES / UNSAFE.len() + 1),
             }),
@@ -163,6 +166,7 @@ impl WorkspaceClient for Client {
                     _ => 503,
                 };
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status,
                     body: serde_json::to_string(&WorkspaceConfigApiError {
                         status,
@@ -178,6 +182,7 @@ impl WorkspaceClient for Client {
                 })
             }
             Fault::Unrecognized => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 503,
                 body: UNSAFE.into(),
             }),
@@ -187,6 +192,7 @@ impl WorkspaceClient for Client {
                     value.workspace_id = UNSAFE.into();
                 }
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&value).unwrap(),
                 })

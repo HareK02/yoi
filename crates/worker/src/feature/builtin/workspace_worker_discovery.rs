@@ -223,6 +223,7 @@ mod tests {
                 .unwrap()
                 .push(serde_json::from_str(request.body.as_deref().unwrap()).unwrap());
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
                     403
                 } else {

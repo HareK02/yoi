@@ -54,6 +54,7 @@ mod ticket_browse_performance_tests;
 mod ticket_item_checker;
 pub mod workdir_create_operations;
 mod workdir_removal;
+mod worker_create_failure_store;
 mod worker_projection;
 pub mod worker_source;
 pub mod workspace_catalog;
@@ -124,6 +125,20 @@ pub enum Error {
     InvalidRuntimeIdentifier { kind: String, value: String },
     #[error("worker name is reserved for a dedicated Workspace service: {0}")]
     ReservedWorkerName(String),
+    #[error("{}", cause.explanation())]
+    RuntimeControlFailed {
+        runtime_id: String,
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
+    /// Typed startup result; HTTP and other callers project this without parsing Display.
+    #[error(
+        "Worker creation failed; the typed result retains its cause and operation observations"
+    )]
+    WorkerCreateFailed {
+        failure: Box<runtime_api::startup::WorkerCreateFailure>,
+        #[source]
+        source: Option<Box<Error>>,
+    },
     #[error("runtime `{runtime_id}` operation failed ({code}): {message}")]
     RuntimeOperationFailed {
         runtime_id: String,
@@ -203,6 +218,18 @@ pub enum Error {
     DbExecutorUnavailable,
     #[error("DB operation outcome unknown; do not automatically retry")]
     DbOperationOutcomeUnknown,
+    /// Observed operation failure and independent projection/save failures. Neither
+    /// recording failure nor this wrapper is proof of a durable Job transition.
+    /// Display is deliberately static; authenticated consumers inspect typed fields.
+    #[error("Backend Job operation failed; recording evidence is separate")]
+    BackendJobFailure {
+        #[source]
+        primary: std::sync::Arc<Error>,
+        failure_cause: Option<backend_job::BackgroundFailure>,
+        recording: Vec<Error>,
+    },
+    #[error("Backend Job cause projection failed")]
+    BackendJobCauseProjection(#[source] error_contract::ContractError),
     #[error("store error: {0}")]
     Store(String),
 }

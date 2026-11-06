@@ -2,6 +2,14 @@ declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
 };
 
+import {
+  controlProblem,
+  controlProblemResponse,
+} from "../src/lib/workspace/failure/runtime-control.test-fixtures.ts";
+import {
+  loadRuntimeJson,
+  RuntimeControlHttpError,
+} from "../src/lib/workspace/failure/runtime-control.ts";
 import type { RepositoryApiError } from "../src/lib/generated/repository-api.ts";
 import type { RuntimeManagementApiError } from "../src/lib/generated/runtime-api.ts";
 import {
@@ -722,4 +730,85 @@ Deno.test("Runtime create surfaces bounded Settings error details", async () => 
       `unexpected create error: ${message}`,
     );
   }
+});
+
+Deno.test("Runtime management GET and mutation share primary typed HTTP failures instead of legacy conflict decoding", async () => {
+  const explanation = "The operation was rejected by its Runtime owner.";
+  const fetchFn = (() =>
+    Promise.resolve(
+      controlProblemResponse(
+        controlProblem("execution_rejected", explanation),
+      ),
+    )) as typeof fetch;
+  const loaded = await loadRuntimeJson(
+    fetchFn,
+    "/api/w/workspace-a/runtimes",
+    undefined,
+    parseWorkspaceRuntimeList,
+  );
+  assert(
+    loaded.data === null && loaded.status === 409 &&
+      loaded.error === explanation,
+    "GET lost public primary cause",
+  );
+  for (
+    const mutate of [
+      () =>
+        createRemoteRuntime("workspace-a", {
+          public_bundle: {
+            identity_id: "arcadia",
+            public_key: "synthetic-key",
+          },
+          endpoint: "https://example.test",
+        }, fetchFn),
+      () =>
+        updateRemoteRuntime("workspace-a", "arcadia", {
+          endpoint: "https://example.test",
+        }, fetchFn),
+      () =>
+        removeRemoteRuntime("workspace-a", "arcadia", {
+          expected_binding_id: "binding-3",
+          operation_id: "same-operation",
+        }, fetchFn),
+      () =>
+        revokeRuntimeTrustKey(
+          "workspace-a",
+          "arcadia",
+          { expected_binding_id: "binding-3" },
+          "fingerprint",
+          "fingerprint",
+          fetchFn,
+        ),
+    ]
+  ) {
+    try {
+      await mutate();
+      throw new Error("must reject");
+    } catch (error) {
+      assert(
+        error instanceof RuntimeControlHttpError,
+        "typed error fell into legacy trust conflict",
+      );
+      assert(
+        error.message === explanation && error.receipt.kind === "problem",
+        "primary cause lost",
+      );
+    }
+  }
+});
+
+Deno.test("Runtime management generic diagnostics cannot carry a primary control cause", () => {
+  const payload = detail();
+  Object.assign(payload.runtime, {
+    diagnostics: [{
+      code: "not-a-cause",
+      severity: "info",
+      message: "Supplement only",
+      control: "authorization_failed",
+    }],
+  });
+  assertThrows(
+    () => parseWorkspaceRuntimeDetail(payload),
+    "is not part of the wire contract",
+  );
 });
