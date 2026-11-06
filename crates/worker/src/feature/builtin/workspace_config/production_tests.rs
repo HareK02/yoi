@@ -93,6 +93,7 @@ impl Router {
 }
 fn response<T: Serialize>(value: &T) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: serde_json::to_string(value).unwrap(),
     }
@@ -100,6 +101,7 @@ fn response<T: Serialize>(value: &T) -> WorkspaceResponse {
 fn denied(status: u16, classification: WorkspaceConfigFailureClassification) -> WorkspaceResponse {
     // Deliberately unsafe provider text must never be propagated by the adapter.
     WorkspaceResponse {
+        content_type: None,
         status,
         body: serde_json::to_string(&WorkspaceConfigApiError {
             status,
@@ -205,6 +207,7 @@ impl WorkspaceClient for Router {
             });
             return Ok(if status != 200 {
                 WorkspaceResponse {
+                    content_type: None,
                     status,
                     body: "{}".into(),
                 }
@@ -229,6 +232,7 @@ impl WorkspaceClient for Router {
             if request.method == WorkspaceRequestMethod::Get {
                 if state.fail_current {
                     return Ok(WorkspaceResponse {
+                        content_type: None,
                         status: 503,
                         body: "unsafe provider diagnostic /private/host/config".into(),
                     });

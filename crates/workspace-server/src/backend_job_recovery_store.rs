@@ -167,7 +167,7 @@ pub(super) fn record(
             return Err(Error::InvalidInput("Backend Job reconciliation owner changed".into()));
         }
         subject_deletion_store::require_job_admission(&tx,workspace,&job.request)?;
-        let failure_cause = crate::backend_job::prefer_retained_startup_cause(
+        let failure_cause = crate::backend_job::prefer_retained_primary_cause(
             current.failure_cause.as_ref(), failure_cause,
         ).map_err(Error::BackendJobCauseProjection)?;
         let detail = bounded_failure_detail(detail);
@@ -569,6 +569,173 @@ mod tests {
             .reserve_backend_job("workspace", &request, NOW)
             .unwrap();
         (dir, store, reserved)
+    }
+
+    #[test]
+    fn retained_control_primary_survives_terminal_update_and_reprojects_for_current_query_viewer() {
+        use crate::backend_job::{
+            BackendJobFailureObservation as O, BackgroundJobCause,
+            BackgroundJobFailureVisibility as V,
+        };
+        use protocol::control_failure::RuntimeControlCause;
+        let (dir, store, reserved) = fixture();
+        let cause = RuntimeControlCause::PersistenceOutcomeUnknown;
+        let primary = crate::backend_job::operation_failure_cause(
+            &Error::RuntimeControlFailed {
+                runtime_id: "private runtime".into(),
+                cause,
+            },
+            BackgroundJobCause::DispatchFailed,
+        )
+        .unwrap();
+        let first = store
+            .record_backend_job_reconciliation_with_cause(
+                "workspace",
+                &reserved.attempt,
+                "same receipt",
+                "not a classifier",
+                "Read same identity",
+                Some(&primary),
+                NOW,
+            )
+            .unwrap();
+        let generic = BackgroundJobCause::DeadlineExceeded.storage().unwrap();
+        let finished = store
+            .finish_backend_job_attempt_with_cause(
+                "workspace",
+                &first.job_id,
+                &first.attempt_id,
+                BackendJobAttemptState::Failed,
+                "deadline",
+                "different text",
+                Some(&generic),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(finished.failure_cause, first.failure_cause);
+        drop(store);
+        let reopened =
+            SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+        let attempt = reopened
+            .get_backend_job_attempt("workspace", &first.job_id, &first.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        match attempt
+            .failure_for_tool(&V {
+                can_view_cause: true,
+            })
+            .primary
+        {
+            O::Control(value) => {
+                assert_eq!(value.details(), &cause);
+                assert_eq!(value.explanation(), cause.explanation());
+            }
+            _ => panic!("stored control cause was not queryable"),
+        }
+        assert!(matches!(
+            attempt
+                .failure_for_tool(&V {
+                    can_view_cause: false
+                })
+                .primary,
+            O::NotVisible
+        ));
+        assert!(matches!(
+            attempt
+                .failure_for_browser(&V {
+                    can_view_cause: true
+                })
+                .cleanup,
+            O::LegacyWithoutFacts
+        ));
+        let job = reopened
+            .get_backend_job("workspace", &first.job_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            job.failure_for_browser(&V {
+                can_view_cause: true
+            }),
+            O::Control(_)
+        ));
+        assert!(matches!(
+            job.failure_for_browser(&V {
+                can_view_cause: false
+            }),
+            O::NotVisible
+        ));
+    }
+
+    #[test]
+    fn future_or_corrupt_retained_cause_blocks_reclassification_without_losing_bytes_on_reopen() {
+        for future in [false, true] {
+            let (dir, store, reserved) = fixture();
+            let cause = crate::backend_job::BackgroundJobCause::ReconciliationRequired
+                .storage()
+                .unwrap();
+            let mut raw: serde_json::Value = serde_json::from_str(cause.as_storage_str()).unwrap();
+            raw["version"] = 99.into();
+            let raw = if future {
+                raw.to_string()
+            } else {
+                "{corrupt".into()
+            };
+            store
+                .with_conn(|conn| {
+                    conn.execute("UPDATE backend_job_attempts SET failure_cause=?1", [&raw])?;
+                    conn.execute("UPDATE backend_jobs SET failure_cause=?1", [&raw])?;
+                    Ok(())
+                })
+                .unwrap();
+            let before = store
+                .get_backend_job_attempt(
+                    "workspace",
+                    &reserved.job.request.job_id,
+                    &reserved.attempt.attempt_id,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                store.record_backend_job_reconciliation_with_cause(
+                    "workspace",
+                    &before,
+                    "uncertain",
+                    "safe",
+                    "same receipt",
+                    Some(&cause),
+                    NOW
+                ),
+                Err(Error::BackendJobCauseProjection(_))
+            ));
+            assert!(matches!(
+                store.finish_backend_job_attempt_with_cause(
+                    "workspace",
+                    &before.job_id,
+                    &before.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "deadline",
+                    "safe",
+                    Some(&cause),
+                    NOW
+                ),
+                Err(Error::BackendJobCauseProjection(_))
+            ));
+            drop(store);
+            let reopened =
+                SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+            assert_eq!(
+                reopened
+                    .get_backend_job_attempt("workspace", &before.job_id, &before.attempt_id)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            reopened.with_conn(|conn| {
+                let retained: (String,String) = conn.query_row("SELECT j.failure_cause,a.failure_cause FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id)", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                assert_eq!(retained, (raw.clone(),raw.clone())); Ok(())
+            }).unwrap();
+        }
     }
 
     #[test]

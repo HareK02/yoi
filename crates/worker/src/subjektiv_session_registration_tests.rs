@@ -36,6 +36,7 @@ impl WorkspaceClient for Client {
         assert_eq!(request.path, "/api/w/workspace/subjektiv/sessions");
         match &self.reply {
             Reply::Response(status, body) => Ok(WorkspaceResponse {
+                content_type: None,
                 status: *status,
                 body: body.clone(),
             }),

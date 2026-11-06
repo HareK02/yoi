@@ -397,9 +397,25 @@ impl Runtime {
                     WorkerExecutionSpawnResult::RolledBack(result) => {
                         let receipt = RuntimeWorkerRestoreResult::failed(
                             WorkerRestoreState::RolledBack,
+                            match result.outcome {
+                                crate::execution::WorkerExecutionOutcome::Busy
+                                | crate::execution::WorkerExecutionOutcome::Rejected => {
+                                    RuntimeControlCause::ExecutionRejected
+                                }
+                                crate::execution::WorkerExecutionOutcome::Unsupported => {
+                                    RuntimeControlCause::UnsupportedOperation
+                                }
+                                crate::execution::WorkerExecutionOutcome::Errored => {
+                                    RuntimeControlCause::ExecutionFailed
+                                }
+                                crate::execution::WorkerExecutionOutcome::Accepted => {
+                                    RuntimeControlCause::ResultUnavailable
+                                }
+                            },
                             "worker_restore_rolled_back",
                             result.message_or_default(),
-                        );
+                        )
+                        .with_execution_failure(&result);
                         #[cfg(feature = "fs-store")]
                         self.lock()?
                             .record_restore_failure(worker_ref, &result, &receipt)?;

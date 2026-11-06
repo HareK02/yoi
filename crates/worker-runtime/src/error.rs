@@ -66,6 +66,9 @@ pub enum RuntimeError {
     #[error("limit {requested} exceeds maximum {max}")]
     LimitTooLarge { requested: usize, max: usize },
 
+    #[error("worker {worker_id} was already created with different request identity input")]
+    WorkerCreateConflict { worker_id: WorkerId },
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
@@ -155,6 +158,45 @@ impl RuntimeError {
         match self {
             Self::WorkerExecutionRejected { result, .. } => Some(result),
             _ => None,
+        }
+    }
+}
+
+impl RuntimeError {
+    pub fn control_cause(&self) -> protocol::control_failure::RuntimeControlCause {
+        use RuntimeError as E;
+        use protocol::control_failure::RuntimeControlCause;
+        let error = self;
+        use RuntimeControlCause as C;
+        match error {
+            E::WorkerNotFound { .. } => C::WorkerMissing,
+            E::WorkerCreateConflict { .. } => C::CreateRequestConflict,
+            E::RuntimeStopped => C::RuntimeStopped,
+            E::InvalidInitialInputKind { .. } | E::LimitTooLarge { .. } | E::InvalidRequest(_) => {
+                C::InvalidRequest
+            }
+            E::RestoreObservationStale { .. } => C::RestoreObservationStale,
+            E::RestoreObservationConflict { .. } => C::RestoreObservationConflict,
+            E::RestoreAdmissionBusy { .. } => C::RestoreAdmissionBusy,
+            E::StopObservationConflict { .. } => C::StopObservationConflict,
+            E::StopRequestConflict { .. } => C::StopRequestConflict,
+            E::StopAdmissionBusy { .. } => C::StopAdmissionBusy,
+            E::WorkerExecutionUnavailable { .. } | E::ExecutionBackendUnavailable { .. } => {
+                C::ExecutionUnavailable
+            }
+            E::WorkerExecutionRejected { .. } => C::ExecutionRejected,
+            E::WorkerDeletePersistenceFailed { .. } | E::StoreIo { .. } => C::PersistenceFailed,
+            E::StoreCommitOutcomeUnknown { .. } => C::PersistenceOutcomeUnknown,
+            E::WorkspaceOwnerMismatch { .. } => C::WorkspaceBindingMismatch,
+            E::WorkingDirectory(_) => C::WorkingDirectoryFailed,
+            E::ConfigBundleMissing { .. }
+            | E::ConfigBundleDigestMismatch { .. }
+            | E::InvalidProfileSelector { .. }
+            | E::UnsupportedConfigDeclaration { .. } => C::ConfigurationUnavailable,
+            E::RuntimeStoreAlreadyOpen { .. } | E::StoreMissing { .. } | E::StoreCorrupt { .. } => {
+                C::StoreUnavailable
+            }
+            E::StatePoisoned => C::StateUnavailable,
         }
     }
 }

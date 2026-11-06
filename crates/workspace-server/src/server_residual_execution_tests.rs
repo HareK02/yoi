@@ -341,6 +341,8 @@ async fn post_restore_projection_waits_off_tokio_and_preserves_historical_result
     historical.label = "historical label".into();
     historical.state = "paused".into();
     let result = || crate::hosts::InternalWorkerRestoreResult {
+        control: None,
+        startup: None,
         state: server_api::WorkerRestoreState::Rejected,
         worker: Some(historical.clone()),
         diagnostics: Vec::new(),
@@ -392,6 +394,8 @@ async fn post_restore_projection_waits_off_tokio_and_preserves_historical_result
         record.worker.runtime_id.clone(),
         record.worker.worker_id.clone(),
         crate::hosts::InternalWorkerRestoreResult {
+            control: None,
+            startup: None,
             state: server_api::WorkerRestoreState::Rejected,
             worker: None,
             diagnostics: Vec::new(),

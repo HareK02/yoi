@@ -1266,6 +1266,9 @@ fn validate_runtime_operation_contracts(
                 operation.operation_id,
             )?;
             roots.insert(expected.to_owned());
+            if !successes.contains_key(status.as_str()) {
+                collect_control_error_schema(response, operation.operation_id, &mut roots)?;
+            }
         }
         for (status, expected) in successes {
             if !responses.contains_key(status) {
@@ -1338,6 +1341,9 @@ fn validate_operation_contracts(
                 .unwrap_or("RepositoryApiError");
             require_schema_ref(schema, expected, operation.operation_id)?;
             roots.insert(expected.to_owned());
+            if !successes.contains_key(status.as_str()) {
+                collect_control_error_schema(response, operation.operation_id, &mut roots)?;
+            }
         }
         for (status, expected) in successes {
             if !responses.contains_key(status) {
@@ -1357,6 +1363,23 @@ struct OperationContract {
     operation_id: &'static str,
     request: Option<&'static str>,
     successes: &'static [(&'static str, &'static str)],
+}
+
+fn collect_control_error_schema(
+    response: &Map<String, Value>,
+    context: &str,
+    roots: &mut BTreeSet<String>,
+) -> Result<(), GenerationError> {
+    let content = object_field(response, "content", context)?;
+    if let Some(problem) = content.get("application/problem+json") {
+        let problem = object(problem, context)?;
+        let schema = problem
+            .get("schema")
+            .ok_or_else(|| GenerationError::invalid("missing control Problem Details schema"))?;
+        require_schema_ref(schema, "ControlProblemPublicationSchema", context)?;
+        roots.insert("ControlProblemPublicationSchema".into());
+    }
+    Ok(())
 }
 
 fn validate_binary_request_body(
@@ -1789,8 +1812,31 @@ fn render_typed_schema(
 ) -> Result<String, GenerationError> {
     match kind {
         "string" => {
-            ensure_schema_keywords(schema, &["type"], context)?;
-            Ok("string".to_owned())
+            ensure_schema_keywords(
+                schema,
+                &["type", "minLength", "maxLength", "pattern"],
+                context,
+            )?;
+            let mut constraints = Vec::new();
+            if schema.contains_key("minLength") || schema.contains_key("maxLength") {
+                let range =
+                    render_length_range(schema.get("minLength"), schema.get("maxLength"), context)?;
+                constraints.push(format!("readonly \"__yoiStringLength\": \"{range}\";"));
+            }
+            if let Some(pattern) = schema.get("pattern") {
+                let pattern = pattern.as_str().ok_or_else(|| {
+                    GenerationError::invalid(format!("{context} string pattern must be a string"))
+                })?;
+                constraints.push(format!(
+                    "readonly \"__yoiStringPattern\": {};",
+                    serde_json::to_string(pattern).expect("string encoding")
+                ));
+            }
+            if constraints.is_empty() {
+                Ok("string".to_owned())
+            } else {
+                Ok(format!("string & {{ {} }}", constraints.join(" ")))
+            }
         }
         "boolean" => {
             ensure_schema_keywords(schema, &["type"], context)?;
@@ -1880,9 +1926,12 @@ fn render_typed_schema(
                             .join(", ")
                     ))
                 }
-                _ => Err(GenerationError::invalid(format!(
-                    "{context} contains unsupported variable array bounds"
-                ))),
+                (minimum, maximum) => {
+                    let range = render_length_range(minimum, maximum, context)?;
+                    Ok(format!(
+                        "Array<{item}> & {{ readonly \"__yoiArrayLength\": \"{range}\"; }}"
+                    ))
+                }
             }
         }
         "object" => {
@@ -1897,6 +1946,36 @@ fn render_typed_schema(
             "{context} uses unsupported type `{other}`"
         ))),
     }
+}
+
+// Nominal markers preserve wire bounds in generated declarations; they are not
+// runtime validators. Only finite safe non-negative integer constraints are admitted.
+fn render_length_range(
+    minimum: Option<&Value>,
+    maximum: Option<&Value>,
+    context: &str,
+) -> Result<String, GenerationError> {
+    let bound = |value: &Value| {
+        value
+            .as_u64()
+            .filter(|value| *value <= MAX_SAFE_INTEGER as u64)
+            .ok_or_else(|| {
+                GenerationError::invalid(format!(
+                    "{context} length bound must be a safe non-negative integer"
+                ))
+            })
+    };
+    let minimum = minimum.map(bound).transpose()?.unwrap_or(0);
+    let maximum = maximum.map(bound).transpose()?;
+    if maximum.is_some_and(|maximum| minimum > maximum) {
+        return Err(GenerationError::invalid(format!(
+            "{context} length range is inverted"
+        )));
+    }
+    Ok(format!(
+        "{minimum}..{}",
+        maximum.map_or_else(|| "unbounded".into(), |maximum| maximum.to_string())
+    ))
 }
 
 fn render_object(schema: &Map<String, Value>, context: &str) -> Result<String, GenerationError> {
@@ -2283,6 +2362,50 @@ mod tests {
     }
 
     #[test]
+    fn bounded_strings_and_variable_arrays_preserve_constraints_without_becoming_validators() {
+        assert_eq!(
+            render_schema(
+                &serde_json::json!({"type":"string", "minLength":1, "maxLength":128}),
+                "bounded"
+            )
+            .unwrap(),
+            "string & { readonly \"__yoiStringLength\": \"1..128\"; }"
+        );
+        assert_eq!(
+            render_schema(
+                &serde_json::json!({"type":"array", "items":{"type":"string"}, "maxItems":8}),
+                "bounded"
+            )
+            .unwrap(),
+            "Array<string> & { readonly \"__yoiArrayLength\": \"0..8\"; }"
+        );
+        assert_eq!(
+            render_schema(
+                &serde_json::json!({"type":"string", "pattern":"^[a-z]+$"}),
+                "pattern"
+            )
+            .unwrap(),
+            "string & { readonly \"__yoiStringPattern\": \"^[a-z]+$\"; }"
+        );
+        assert!(
+            render_schema(
+                &serde_json::json!({"type":"string", "pattern":42}),
+                "pattern"
+            )
+            .is_err()
+        );
+        for schema in [
+            serde_json::json!({"type":"string", "maxLength":-1}),
+            serde_json::json!({"type":"string", "minLength":2, "maxLength":1}),
+            serde_json::json!({"type":"string", "maxLength":1.5}),
+            serde_json::json!({"type":"array", "items":{"type":"string"}, "maxItems":9007199254740992u64}),
+            serde_json::json!({"type":"array", "items":{"type":"string"}, "minItems":9, "maxItems":8}),
+        ] {
+            assert!(render_schema(&schema, "bounded").is_err(), "{schema}");
+        }
+    }
+
+    #[test]
     fn generator_rejects_lossy_reference_siblings() {
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["source"]["maxLength"] =
@@ -2303,13 +2426,13 @@ mod tests {
     #[test]
     fn generator_rejects_unimplemented_ordinary_schema_keywords() {
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
-        document["components"]["schemas"]["RepositorySource"]["properties"]["uri"]["maxLength"] =
-            serde_json::json!(1);
+        document["components"]["schemas"]["RepositorySource"]["properties"]["uri"]["format"] =
+            serde_json::json!("email");
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("unsupported schema keyword `maxLength`")
+                .contains("unsupported schema keyword `format`")
         );
 
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();

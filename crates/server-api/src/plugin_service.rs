@@ -76,6 +76,9 @@ pub struct PluginServiceDiagnostics {
     /// Last owner-committed invocation observation, not a retry or recovery grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<PluginServiceOutcomeDiagnostic>,
+    /// Independent driver boundary observations; never delivery/retry authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_lifecycle: Option<PluginServiceLifecycleDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -125,6 +128,12 @@ pub enum PluginServiceRequest {
     Release {
         lease: PluginServiceLease,
     },
+    /// Records only same-owner boundary evidence under an exact current/released
+    /// proof. Does not complete an event, release a lease, or admit any effect.
+    ObserveLifecycle {
+        lease: PluginServiceLease,
+        observation: PluginServiceLifecycleObservation,
+    },
     Diagnostics {
         consumer_id: String,
     },
@@ -160,6 +169,7 @@ pub enum PluginServiceResponse {
     },
     Completed,
     Released,
+    LifecycleObserved,
     Diagnostics {
         diagnostics: PluginServiceDiagnostics,
     },
@@ -190,6 +200,65 @@ pub struct PluginServiceRecoveryRequest {
     pub action: PluginServiceRecoveryAction,
     pub operation_key: String,
     pub reason: String,
+}
+
+/// Exact owner-issued delivery identity, not a new operation or replay grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceInvocationIdentity {
+    pub event_id: String,
+    pub invocation_id: String,
+    pub attempt: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginServiceLifecycleObservation {
+    CompletionUnconfirmed {
+        invocation: PluginServiceInvocationIdentity,
+    },
+    Stop {
+        reason: PluginServiceExecutionFailure,
+    },
+    ReleaseUnconfirmed,
+}
+impl PluginServiceLifecycleObservation {
+    pub fn cause(&self) -> PluginServiceFailure {
+        match self {
+            Self::CompletionUnconfirmed { .. } => PluginServiceFailure::CompletionUnconfirmed,
+            Self::Stop { reason } => PluginServiceFailure::Stop { reason: *reason },
+            Self::ReleaseUnconfirmed => PluginServiceFailure::ReleaseUnconfirmed,
+        }
+    }
+    pub fn invocation(&self) -> Option<&PluginServiceInvocationIdentity> {
+        match self {
+            Self::CompletionUnconfirmed { invocation } => Some(invocation),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceLifecycleObservationDiagnostic {
+    /// One-way correlation of the existing lease, never its bearer credential.
+    pub lease_id: String,
+    pub invocation: Option<PluginServiceInvocationIdentity>,
+    pub failure: PluginServiceFailureDiagnostic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginServiceLifecycleDiagnostic {
+    Known {
+        observations: Vec<PluginServiceLifecycleObservationDiagnostic>,
+    },
+    Unsupported,
+    Corrupt,
 }
 
 /// Closed Service-owned cause vocabulary. No guest code/message, source chain,
@@ -472,6 +541,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(diagnostic.last_outcome, None);
+        assert_eq!(diagnostic.last_lifecycle, None);
     }
 
     #[test]

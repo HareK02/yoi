@@ -30,6 +30,17 @@ import type {
 } from "#lib/generated/runtime-api.ts";
 import type { RepositoryApiError } from "#lib/generated/repository-api.ts";
 import { workspaceApiPath } from "./http.ts";
+import { runtimeControlHttpError } from "#lib/workspace/failure/runtime-control.ts";
+
+async function receiveControlProblem(response: Response): Promise<void> {
+  if (
+    !response.ok &&
+    (response.headers.get("content-type") ?? "").split(";")[0].trim()
+        .toLowerCase() === "application/problem+json"
+  ) {
+    throw await runtimeControlHttpError(response);
+  }
+}
 
 export type WorkspaceRuntimeList =
   & Omit<WorkspaceRuntimeListResponse, "diagnostics">
@@ -872,6 +883,7 @@ async function finishMutation(
   workspaceId: string,
   runtimeId: string,
 ): Promise<WorkspaceRuntimeDetail> {
+  await receiveControlProblem(response);
   const payload = await readBoundedJson(response);
   if (response.status === 409) throwRuntimeTrustConflict(payload);
   if (!response.ok) throw requestErrorFrom(payload, response.status);
@@ -905,6 +917,7 @@ export async function createRemoteRuntime(
       body: JSON.stringify(request),
     },
   );
+  await receiveControlProblem(response);
   const payload = await readBoundedJson(response);
   if (response.status === 409) throwRuntimeCreationConflict(payload);
   if (!response.ok) throw requestErrorFrom(payload, response.status);
@@ -971,6 +984,7 @@ export async function removeRemoteRuntime(
       body: JSON.stringify(request),
     },
   );
+  await receiveControlProblem(response);
   let payload: unknown;
   try {
     payload = await readBoundedJson(response);
@@ -1011,6 +1025,7 @@ export async function revealRuntimeTrustKey(
       `/runtimes/${encodeURIComponent(runtimeId)}/trust-key`,
     ),
   );
+  await receiveControlProblem(response);
   const payload = await readBoundedJson(response);
   if (!response.ok) throw requestErrorFrom(payload, response.status);
   return parseRuntimeTrustKeyRevealResponse(payload);

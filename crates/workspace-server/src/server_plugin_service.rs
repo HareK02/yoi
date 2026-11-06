@@ -412,6 +412,29 @@ pub(super) async fn execute(
                 .map_err(policy::map_error)?;
             Ok(PluginServiceResponse::Released)
         }
+        PluginServiceRequest::ObserveLifecycle { lease, observation } => {
+            // Evidence recording, like Release, must survive revoked guest grants
+            // and response loss. It authenticates the immutable Worker, and the
+            // store accepts only its exact current/released proof; no effects.
+            validate_workspace_scope(&api, &workspace).map_err(|e| policy::map_error(e.error))?;
+            let worker =
+                subject_authorization::source_from_context(&context).map_err(|_| denied())?;
+            let config = api.config_store.clone();
+            config
+                .db_executor()
+                .run(move || {
+                    config.with_immediate_transaction(|tx| {
+                        let c = store::load(tx, &workspace, &lease.consumer_id)?;
+                        if c.runtime_id != worker.runtime_id || c.worker_id != worker.worker_id {
+                            return Err(policy::failure(PluginHostErrorCode::Denied));
+                        }
+                        store::observe_lifecycle(tx, &workspace, &lease, &observation)
+                    })
+                })
+                .await
+                .map_err(policy::map_error)?;
+            Ok(PluginServiceResponse::LifecycleObserved)
+        }
         PluginServiceRequest::Diagnostics { consumer_id } => {
             let (c, _) =
                 checked_consumer(api.clone(), context, workspace, consumer_id, None).await?;

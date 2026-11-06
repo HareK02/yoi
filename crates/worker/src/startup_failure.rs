@@ -120,6 +120,59 @@ pub fn reproject_internal_startup_failure(
     StartupFailureAttachment::from_projected(&projected)
 }
 
+/// A fresh audience projection, never a relabeled transfer/storage envelope.
+pub enum PublicStartupFailure<A: error_contract::Audience> {
+    Session(
+        error_contract::ProjectedFailure<A, protocol::session_failure::SessionRegistrationCause>,
+    ),
+    Runtime(error_contract::ProjectedFailure<A, RuntimeStartupCause>),
+}
+
+impl<A: error_contract::Audience> PublicStartupFailure<A> {
+    pub fn explanation(&self) -> &str {
+        match self {
+            Self::Session(value) => value.explanation(),
+            Self::Runtime(value) => value.explanation(),
+        }
+    }
+
+    pub fn attachment(&self) -> Result<StartupFailureAttachment, error_contract::ContractError> {
+        match self {
+            Self::Session(value) => StartupFailureAttachment::from_projected(value),
+            Self::Runtime(value) => StartupFailureAttachment::from_projected(value),
+        }
+    }
+}
+
+/// Visibility is supplied by the current operation owner after authorization.
+/// Unsupported/corrupt primary evidence is not replaced with a generic cause.
+pub fn project_public_startup_failure<A>(
+    source: &StartupFailureAttachment,
+    visibility: protocol::session_failure::SessionFailureVisibility,
+) -> Result<PublicStartupFailure<A>, error_contract::ContractError>
+where
+    A: error_contract::Audience,
+    protocol::session_failure::SessionRegistrationCause: error_contract::ProjectFor<
+            A,
+            Authorization = protocol::session_failure::SessionFailureVisibility,
+            Details = protocol::session_failure::SessionRegistrationCause,
+        >,
+    RuntimeStartupCause:
+        error_contract::ProjectFor<A, Authorization = (), Details = RuntimeStartupCause>,
+{
+    if !visibility.can_view_cause {
+        return Err(error_contract::ContractError::ProjectionUnavailable);
+    }
+    if let Ok(projected) =
+        source.project_for::<A, protocol::session_failure::SessionRegistrationCause>(&visibility)
+    {
+        return Ok(PublicStartupFailure::Session(projected));
+    }
+    source
+        .project_for::<A, RuntimeStartupCause>(&())
+        .map(PublicStartupFailure::Runtime)
+}
+
 /// Fixed, identifier-free summary for an already authenticated internal caller.
 /// Keep the required operation actionable without exposing the source's Display.
 /// This neither projects a Browser cause nor chooses an HTTP status.
@@ -290,6 +343,71 @@ mod tests {
         assert_eq!(
             internal_startup_failure_summary(&corrupt),
             "Worker startup failed"
+        );
+    }
+
+    #[test]
+    fn current_public_startup_projection_preserves_domain_cause_and_rebuilds_explanation() {
+        use protocol::session_failure::{
+            SessionFailureVisibility, SessionPrincipal, SessionRegistrationCause,
+        };
+        let source = protocol::session_failure::session_registration_attachment(
+            SessionRegistrationCause::denied(SessionPrincipal::Subject),
+        )
+        .unwrap();
+        let mut encoded: String =
+            serde_json::from_value(serde_json::to_value(&source).unwrap()).unwrap();
+        let mut envelope: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        envelope["explanation"] = "PRIVATE_STORED_TEXT".into();
+        encoded = envelope.to_string();
+        let source: StartupFailureAttachment =
+            serde_json::from_value(serde_json::json!(encoded)).unwrap();
+        let visibility = SessionFailureVisibility {
+            can_view_cause: true,
+        };
+        let browser =
+            project_public_startup_failure::<error_contract::Browser>(&source, visibility).unwrap();
+        let tool =
+            project_public_startup_failure::<error_contract::Tool>(&source, visibility).unwrap();
+        assert_eq!(browser.explanation(), tool.explanation());
+        assert!(browser.explanation().contains("Session"));
+        assert!(!browser.explanation().contains("PRIVATE_STORED_TEXT"));
+        for projected in [browser.attachment().unwrap(), tool.attachment().unwrap()] {
+            let error_contract::DecodeFailure::Known(known) =
+                projected.decode::<SessionRegistrationCause>()
+            else {
+                panic!("primary domain cause was lost")
+            };
+            assert_eq!(
+                known.facts().cause(),
+                &SessionRegistrationCause::denied(SessionPrincipal::Subject)
+            );
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("PRIVATE_STORED_TEXT")
+            );
+        }
+        assert!(
+            project_public_startup_failure::<error_contract::Browser>(
+                &source,
+                SessionFailureVisibility::default()
+            )
+            .is_err()
+        );
+        assert!(
+            project_public_startup_failure::<error_contract::Tool>(
+                &source,
+                SessionFailureVisibility::default()
+            )
+            .is_err()
+        );
+        let future: StartupFailureAttachment = serde_json::from_value(serde_json::json!(
+            encoded.replace("\"version\":1", "\"version\":999")
+        ))
+        .unwrap();
+        assert!(
+            project_public_startup_failure::<error_contract::Browser>(&future, visibility).is_err()
         );
     }
 

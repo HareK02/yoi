@@ -322,6 +322,7 @@ async fn selected_denied_or_deleted_entry_never_retries_successful_open() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
             response(json!({"merge_request_id":"MR-1","ticket_ids":["T-1"]})),
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status,
                 body: "{}".into(),
             },
@@ -396,6 +397,7 @@ async fn successful_open_with_unroutable_response_identity_is_unknown_without_re
 async fn malformed_domain_response_after_open_is_unknown_without_replaying_mutation() {
     let client = Arc::new(RecordingWorkspaceClient::new(vec![
         crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: "not-json".into(),
         },

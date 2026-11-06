@@ -118,6 +118,8 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<RuntimeControlCause>,
     /// Internal startup observations; public consumers must separately authorize projection.
     #[serde(skip)]
     pub startup: Option<runtime_api::WorkerStartupFailure>,
@@ -406,6 +408,10 @@ pub(crate) fn workspace_worker_summary(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InternalWorkerRestoreResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<RuntimeControlCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<runtime_api::WorkerStartupFailure>,
     pub state: server_api::WorkerRestoreState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<InternalWorkerSummary>,
@@ -1068,6 +1074,8 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: runtime_api::WorkerRestoreRequest,
     ) -> InternalWorkerRestoreResult {
         InternalWorkerRestoreResult {
+            control: None,
+            startup: None,
             state: server_api::WorkerRestoreState::Rejected,
             worker: None,
             diagnostics: vec![diagnostic(
@@ -3032,6 +3040,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .map_err(|error| embedded_runtime_diagnostic(&error))?;
         Ok((
             result.map(|result| InternalWorkerRestoreResult {
+                control: result.control,
+                startup: result.startup.and_then(internal_startup_transfer),
                 state: result.state,
                 worker: result.worker.map(|detail| self.map_worker_detail(detail)),
                 diagnostics: match (result.reason_code, result.message) {
@@ -3052,6 +3062,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     ) -> InternalWorkerRestoreResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return InternalWorkerRestoreResult {
+                control: None,
+                startup: None,
                 state: server_api::WorkerRestoreState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic(
@@ -3070,6 +3082,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     _ => Vec::new(),
                 };
                 InternalWorkerRestoreResult {
+                    control: result.control,
+                    startup: result.startup.and_then(internal_startup_transfer),
                     state: result.state,
                     worker: result.worker.map(|detail| self.map_worker_detail(detail)),
                     diagnostics,
@@ -3077,6 +3091,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             }
             Err(worker_runtime::error::RuntimeError::RestoreObservationConflict { .. }) => {
                 InternalWorkerRestoreResult {
+                    control: Some(RuntimeControlCause::RestoreObservationConflict),
+                    startup: None,
                     state: server_api::WorkerRestoreState::Rejected,
                     worker: None,
                     diagnostics: vec![diagnostic(
@@ -3087,6 +3103,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 }
             }
             Err(err) => InternalWorkerRestoreResult {
+                control: Some(err.control_cause()),
+                startup: embedded_runtime_diagnostic(&err).startup,
                 state: server_api::WorkerRestoreState::ReconciliationRequired,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
@@ -5520,6 +5538,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 let state =
                     runtime_contract_convert::<_, server_api::WorkerRestoreState>(result.state)?;
                 Ok(InternalWorkerRestoreResult {
+                    control: result.control,
+                    startup: result.startup.and_then(internal_startup_transfer),
                     state,
                     worker: worker.map(|detail| self.map_worker_detail(detail)),
                     diagnostics: match (result.reason_code, result.message) {
@@ -5551,9 +5571,16 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     .worker
                     .map(runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>)
                     .transpose()?;
-                Ok((value.state, worker, value.reason_code, value.message))
+                Ok((
+                    value.state,
+                    worker,
+                    value.reason_code,
+                    value.message,
+                    value.control,
+                    value.startup,
+                ))
             }) {
-            Ok((state, worker, reason_code, message)) => {
+            Ok((state, worker, reason_code, message, control, startup)) => {
                 let diagnostics = match (reason_code, message) {
                     (Some(code), Some(message)) => {
                         vec![diagnostic(code, HostDiagnosticSeverity::Warning, message)]
@@ -5561,6 +5588,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     _ => Vec::new(),
                 };
                 InternalWorkerRestoreResult {
+                    control,
+                    startup: startup.and_then(internal_startup_transfer),
                     state: match state {
                         runtime_api::WorkerRestoreState::Accepted => {
                             server_api::WorkerRestoreState::Accepted
@@ -5583,6 +5612,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 }
             }
             Err(diagnostic) => InternalWorkerRestoreResult {
+                control: diagnostic.control,
+                startup: diagnostic.startup.clone(),
                 // A transport/protocol failure cannot prove that the Runtime
                 // rejected before side effects. Preserve uncertainty.
                 state: server_api::WorkerRestoreState::ReconciliationRequired,
@@ -6920,6 +6951,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             HostDiagnosticSeverity::Warning,
             "Restore observation changed; refresh before a new intent".to_string(),
         ),
+        EmbeddedRuntimeError::WorkerCreateConflict { .. } => diagnostic(
+            "worker_create_conflict",
+            HostDiagnosticSeverity::Error,
+            "Worker create identity conflicts with existing input".to_string(),
+        ),
         EmbeddedRuntimeError::RuntimeStopped => diagnostic(
             "embedded_runtime_stopped",
             HostDiagnosticSeverity::Warning,
@@ -7025,6 +7061,7 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             })
         });
     }
+    projection.control = Some(error.control_cause());
     projection
 }
 
@@ -7102,10 +7139,14 @@ fn runtime_api_diagnostic(
     runtime_id: &str,
     error: runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
 ) -> RuntimeDiagnostic {
-    match error {
+    let cause = remote_control_cause(&error);
+    let mut result = match error {
         runtime_api::client_support::ClientError::Public { status, error } => {
             if let Some(startup) = error.error.startup {
-                return remote_startup_diagnostic(runtime_id, status, startup);
+                let mut diagnostic = remote_startup_diagnostic(runtime_id, status, startup);
+                diagnostic.control =
+                    Some(protocol::control_failure::RuntimeControlCause::ExecutionRejected);
+                return diagnostic;
             }
             let startup = None;
             let remote_code = error.error.code;
@@ -7163,7 +7204,9 @@ fn runtime_api_diagnostic(
                 format!("Remote Runtime client error for '{runtime_id}': {failure}"),
             )
         }
-    }
+    };
+    result.control = Some(cause);
+    result
 }
 
 fn sanitize_remote_runtime_message(code: &str, message: &str) -> String {
@@ -7262,6 +7305,7 @@ fn diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        control: None,
         startup: None,
         code: code.into(),
         severity,
@@ -7270,37 +7314,7 @@ fn diagnostic(
 }
 
 fn embedded_control_cause(error: &EmbeddedRuntimeError) -> RuntimeControlCause {
-    use EmbeddedRuntimeError as E;
-    use RuntimeControlCause as C;
-    match error {
-        E::WorkerNotFound { .. } => C::WorkerMissing,
-        E::RuntimeStopped => C::RuntimeStopped,
-        E::InvalidInitialInputKind { .. } | E::LimitTooLarge { .. } | E::InvalidRequest(_) => {
-            C::InvalidRequest
-        }
-        E::RestoreObservationStale { .. } => C::RestoreObservationStale,
-        E::RestoreObservationConflict { .. } => C::RestoreObservationConflict,
-        E::RestoreAdmissionBusy { .. } => C::RestoreAdmissionBusy,
-        E::StopObservationConflict { .. } => C::StopObservationConflict,
-        E::StopRequestConflict { .. } => C::StopRequestConflict,
-        E::StopAdmissionBusy { .. } => C::StopAdmissionBusy,
-        E::WorkerExecutionUnavailable { .. } | E::ExecutionBackendUnavailable { .. } => {
-            C::ExecutionUnavailable
-        }
-        E::WorkerExecutionRejected { .. } => C::ExecutionRejected,
-        E::WorkerDeletePersistenceFailed { .. } | E::StoreIo { .. } => C::PersistenceFailed,
-        E::StoreCommitOutcomeUnknown { .. } => C::PersistenceOutcomeUnknown,
-        E::WorkspaceOwnerMismatch { .. } => C::WorkspaceBindingMismatch,
-        E::WorkingDirectory(_) => C::WorkingDirectoryFailed,
-        E::ConfigBundleMissing { .. }
-        | E::ConfigBundleDigestMismatch { .. }
-        | E::InvalidProfileSelector { .. }
-        | E::UnsupportedConfigDeclaration { .. } => C::ConfigurationUnavailable,
-        E::RuntimeStoreAlreadyOpen { .. } | E::StoreMissing { .. } | E::StoreCorrupt { .. } => {
-            C::StoreUnavailable
-        }
-        E::StatePoisoned => C::StateUnavailable,
-    }
+    error.control_cause()
 }
 
 /// GET-worker's endpoint contract assigns a decoded public 404 to absence. A raw
@@ -7310,21 +7324,45 @@ fn embedded_control_cause(error: &EmbeddedRuntimeError) -> RuntimeControlCause {
 fn remote_lookup_cause(
     error: &runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
 ) -> RuntimeControlCause {
+    if matches!(error, runtime_api::client_support::ClientError::Public { status, error } if *status == StatusCode::NOT_FOUND && error.control_cause().is_none())
+    {
+        return RuntimeControlCause::WorkerMissing;
+    }
+    remote_control_cause(error)
+}
+
+fn remote_control_cause(
+    error: &runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> RuntimeControlCause {
     use RuntimeControlCause as C;
     use runtime_api::client_support::{ClientError, ClientFailure};
     match error {
-        ClientError::Public { status, .. } => match *status {
-            StatusCode::NOT_FOUND => C::WorkerMissing,
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => C::AuthorizationFailed,
-            _ => C::RemoteRejected,
-        },
+        ClientError::Public { status, error } => {
+            if let Some(cause) = error.control_cause() {
+                cause
+            } else if error.error.startup.is_some() {
+                C::ExecutionRejected
+            } else {
+                match *status {
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => C::AuthorizationFailed,
+                    _ => C::RemoteRejected,
+                }
+            }
+        }
         ClientError::Failure(failure) => match failure {
             ClientFailure::Authorization => C::AuthorizationFailed,
+            ClientFailure::ErrorResponseDecode { status }
+            | ClientFailure::UnsupportedErrorResponse { status }
+                if matches!(status, 401 | 403) =>
+            {
+                C::AuthorizationFailed
+            }
             ClientFailure::RequestEncoding => C::RequestEncodingFailed,
             ClientFailure::Connect => C::ConnectionFailed,
             ClientFailure::Transport => C::TransportFailed,
             ClientFailure::Timeout => C::TimedOut,
             ClientFailure::ResponseTooLarge { .. } => C::ResponseTooLarge,
+            ClientFailure::UnsupportedErrorResponse { .. } => C::ResultUnavailable,
             ClientFailure::UnexpectedStatus { .. }
             | ClientFailure::ErrorResponseDecode { .. }
             | ClientFailure::Decode { .. }

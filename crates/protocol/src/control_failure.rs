@@ -43,6 +43,7 @@ macro_rules! control_causes {
 }
 
 control_causes! {
+    RuntimeMissing => ("runtime_missing", Dependency, "The requested Runtime is not registered in this Workspace."),
     WorkerMissing => ("worker_missing", Dependency, "The Runtime did not find the requested Worker."),
     InvalidWorkerIdentifier => ("invalid_worker_identifier", InvalidInput, "The Worker identifier is invalid; lookup was not performed."),
     RuntimeStopped => ("runtime_stopped", Dependency, "The Runtime is stopped and cannot perform the requested operation."),
@@ -55,6 +56,7 @@ control_causes! {
     StopObservationConflict => ("stop_observation_conflict", Conflict, "The Stop observation conflicts with the current lifecycle."),
     StopRequestConflict => ("stop_request_conflict", Conflict, "The Stop request identity conflicts with existing input or a pending Stop."),
     StopAdmissionBusy => ("stop_admission_busy", Conflict, "The Worker lifecycle is busy; Stop admission was not obtained."),
+    CreateRequestConflict => ("create_request_conflict", Conflict, "The Worker create identity is already bound to different request input; reconcile the original request."),
     InvalidRequest => ("invalid_request", InvalidInput, "The Runtime request does not satisfy its input contract."),
     WorkspaceBindingMismatch => ("workspace_binding_mismatch", Authorization, "The Workspace binding does not match the Runtime owner."),
     ConfigurationUnavailable => ("configuration_unavailable", Dependency, "The required Runtime configuration is missing, invalid, or unsupported."),

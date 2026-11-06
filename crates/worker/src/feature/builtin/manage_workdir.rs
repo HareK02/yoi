@@ -1443,7 +1443,8 @@ mod tests {
                 };
                 self.bound_authorizations.lock().unwrap().push(auth);
                 return Ok(WorkspaceResponse {
-                    status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 200 },
+                    content_type: None,
+status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 200 },
                     body: json!({"scope":{"kind":"workdir_attachment", "workspace_id":"workspace/test", "connection_id":connection_id}}).to_string(),
                 });
             }
@@ -1451,6 +1452,7 @@ mod tests {
                 let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
                 self.authorizations.lock().unwrap().push(auth);
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
                         403
                     } else {
@@ -1470,6 +1472,7 @@ mod tests {
 
     fn response(body: serde_json::Value) -> WorkspaceResponse {
         WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&body).unwrap(),
         }
@@ -1481,6 +1484,7 @@ mod tests {
         message: &str,
     ) -> WorkspaceResponse {
         WorkspaceResponse {
+            content_type: None,
             status,
             body: serde_json::to_string(&workdir::http::WorkdirTransportError {
                 failure_reason: None,
@@ -1870,6 +1874,7 @@ mod tests {
     #[test]
     fn attach_reports_other_worker_occupancy_without_exposing_backend_details() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![WorkspaceResponse {
+            content_type: None,
             status: 409,
             body: serde_json::to_string(&server_api::RepositoryApiError::new(
                 409,
@@ -1993,6 +1998,7 @@ mod tests {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![
             response(json!({"operation":"write","result":{"bytes_written":3,"created":false}})),
             WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "invalid payload".into(),
             },
@@ -2055,7 +2061,8 @@ mod tests {
         ] {
             let mut failure = failure.clone();
             failure["operation_outcome"] = outcome;
-            responses.push(WorkspaceResponse { status, body: json!({
+            responses.push(WorkspaceResponse { content_type: None,
+status, body: json!({
                 "code":code, "message":"safe provider classification", "audit_failures":[failure]
             }).to_string() });
         }
@@ -2161,6 +2168,7 @@ mod tests {
     #[tokio::test]
     async fn attached_session_does_not_expose_untyped_workspace_error_body() {
         let client = Arc::new(RecordingWorkspaceClient::new(vec![WorkspaceResponse {
+            content_type: None,
             status: 502,
             body: "secret token and /host/private/path".to_string(),
         }]));

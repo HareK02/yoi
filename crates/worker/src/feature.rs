@@ -2556,6 +2556,7 @@ mod tests {
             assert_eq!(input.resource, PermissionResource::Feature);
             self.requested.lock().unwrap().push(input.operation.clone());
             Ok(crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: if self.allowed.contains(&input.operation) {
                     200
                 } else {

@@ -362,7 +362,7 @@ impl WorkspaceApi {
         next: &str,
         cause: Option<&crate::backend_job::BackgroundFailure>,
     ) -> Result<BackendJobAttemptRecord> {
-        let cause = crate::backend_job::prefer_retained_startup_cause(
+        let cause = crate::backend_job::prefer_retained_primary_cause(
             attempt.failure_cause.as_ref(),
             cause,
         )

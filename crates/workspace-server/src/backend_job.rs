@@ -131,9 +131,9 @@ pub(crate) fn worker_cleanup_failure_cause(
     operation_failure_cause(error, BackgroundJobCause::CleanupFailed)
 }
 
-/// Preserve a retained, supported startup primary across receipt/timeout updates.
+/// Preserve a retained supported startup/control primary across receipt/timeout updates.
 /// The new operation state still comes from its existing owner, not from this cause.
-pub(crate) fn prefer_retained_startup_cause(
+pub(crate) fn prefer_retained_primary_cause(
     retained: Option<&StoredFailure>,
     new: Option<&BackgroundFailure>,
 ) -> std::result::Result<Option<BackgroundFailure>, error_contract::ContractError> {
@@ -151,6 +151,18 @@ pub(crate) fn prefer_retained_startup_cause(
         ) {
             return BackgroundFailure::from_projected(&retained.project_for::<error_contract::Storage,
                 protocol::startup_failure::RuntimeStartupCause>(&())?).map(Some);
+        }
+        if matches!(
+            retained.decode::<protocol::control_failure::RuntimeControlCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ) {
+            return BackgroundFailure::from_projected(&retained.project_for::<error_contract::Storage, protocol::control_failure::RuntimeControlCause>(&())?).map(Some);
+        }
+        if !matches!(
+            retained.decode::<BackgroundJobCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ) {
+            return Err(error_contract::ContractError::ProjectionUnavailable);
         }
     }
     Ok(new.cloned())
@@ -330,6 +342,121 @@ macro_rules! project_job_cause_public {
     )*};
 }
 project_job_cause_public!(error_contract::Browser, error_contract::Tool);
+
+/// Query-time observations. Retained bytes never become a fresh disclosure capability.
+/// The existing owner must authorize the exact Job/attempt before supplying current visibility.
+pub enum BackendJobFailureObservation<A> {
+    LegacyWithoutFacts,
+    Job(error_contract::ProjectedFailure<A, BackgroundJobCause>),
+    Control(error_contract::ProjectedFailure<A, protocol::control_failure::RuntimeControlCause>),
+    Session(
+        error_contract::ProjectedFailure<A, protocol::session_failure::SessionRegistrationCause>,
+    ),
+    Startup(error_contract::ProjectedFailure<A, protocol::startup_failure::RuntimeStartupCause>),
+    Unsupported,
+    Corrupt,
+    NotVisible,
+}
+
+pub struct BackendJobFailureObservations<A> {
+    pub primary: BackendJobFailureObservation<A>,
+    pub cleanup: BackendJobFailureObservation<A>,
+}
+
+macro_rules! backend_query_projection {
+    ($method:ident, $audience:ty) => {
+        impl BackendJobRecord {
+            pub fn $method(
+                &self,
+                current: &BackgroundJobFailureVisibility,
+            ) -> BackendJobFailureObservation<$audience> {
+                project_background_failure::<$audience>(self.failure_cause.as_ref(), current)
+            }
+        }
+        impl BackendJobAttemptRecord {
+            pub fn $method(
+                &self,
+                current: &BackgroundJobFailureVisibility,
+            ) -> BackendJobFailureObservations<$audience> {
+                BackendJobFailureObservations {
+                    primary: project_background_failure::<$audience>(
+                        self.failure_cause.as_ref(),
+                        current,
+                    ),
+                    cleanup: project_background_failure::<$audience>(
+                        self.worker_cleanup_failure_cause.as_ref(),
+                        current,
+                    ),
+                }
+            }
+        }
+    };
+}
+backend_query_projection!(failure_for_browser, error_contract::Browser);
+backend_query_projection!(failure_for_tool, error_contract::Tool);
+
+fn project_background_failure<A: error_contract::Audience>(
+    stored: Option<&StoredFailure>,
+    current: &BackgroundJobFailureVisibility,
+) -> BackendJobFailureObservation<A>
+where
+    BackgroundJobCause: error_contract::ProjectFor<
+            A,
+            Authorization = BackgroundJobFailureVisibility,
+            Details = BackgroundJobCause,
+        >,
+    protocol::control_failure::RuntimeControlCause: error_contract::ProjectFor<
+            A,
+            Authorization = (),
+            Details = protocol::control_failure::RuntimeControlCause,
+        >,
+    protocol::startup_failure::RuntimeStartupCause: error_contract::ProjectFor<
+            A,
+            Authorization = (),
+            Details = protocol::startup_failure::RuntimeStartupCause,
+        >,
+    protocol::session_failure::SessionRegistrationCause: error_contract::ProjectFor<
+            A,
+            Authorization = protocol::session_failure::SessionFailureVisibility,
+            Details = protocol::session_failure::SessionRegistrationCause,
+        >,
+{
+    use BackendJobFailureObservation as O;
+    use error_contract::DecodeFailure;
+    if !current.can_view_cause {
+        return O::NotVisible;
+    }
+    let Some(stored) = stored else {
+        return O::LegacyWithoutFacts;
+    };
+    macro_rules! known {
+        ($domain:ty, $auth:expr, $variant:ident) => {
+            if matches!(stored.decode::<$domain>(), DecodeFailure::Known(_)) {
+                return match stored.project_for::<A, $domain>($auth) {
+                    Ok(projected) => O::$variant(projected),
+                    Err(_) => O::NotVisible,
+                };
+            }
+        };
+    }
+    known!(
+        protocol::session_failure::SessionRegistrationCause,
+        &protocol::session_failure::SessionFailureVisibility {
+            can_view_cause: true
+        },
+        Session
+    );
+    known!(protocol::startup_failure::RuntimeStartupCause, &(), Startup);
+    known!(protocol::control_failure::RuntimeControlCause, &(), Control);
+    match stored.decode::<BackgroundJobCause>() {
+        DecodeFailure::Known(_) => match stored.project_for::<A, BackgroundJobCause>(current) {
+            Ok(projected) => O::Job(projected),
+            Err(_) => O::NotVisible,
+        },
+        DecodeFailure::Unsupported(_) => O::Unsupported,
+        DecodeFailure::Corrupt(_) => O::Corrupt,
+    }
+}
 
 pub const BACKEND_JOB_RUNTIME_ID: &str = crate::hosts::EMBEDDED_RUNTIME_ID;
 pub use job::{

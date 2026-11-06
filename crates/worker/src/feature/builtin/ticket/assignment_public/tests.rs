@@ -37,6 +37,7 @@ fn transport(status: u16, body: Value) -> Arc<Transport> {
         requests: Mutex::new(vec![]),
         available: true,
         response: Ok(WorkspaceResponse {
+            content_type: None,
             status,
             body: body.to_string(),
         }),
@@ -509,14 +510,17 @@ async fn public_assignment_rejections_and_unknown_outcomes_never_auto_retry_or_r
     for (kind, input, _) in cases() {
         for response in [
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 403,
                 body: "permission denied".into(),
             }),
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 409,
                 body: "stale assignment or operation fingerprint mismatch".into(),
             }),
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "invalid response after dispatch".into(),
             }),

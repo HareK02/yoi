@@ -1,3 +1,5 @@
+import { runtimeControlHttpError } from "#lib/workspace/failure/runtime-control.ts";
+import { readBoundedJson } from "./http.ts";
 import type {
   Diagnostic,
   RuntimeConnectionTestFailureKind,
@@ -131,9 +133,11 @@ export async function testRuntimeConnection(
     { method: "POST" },
   );
   if (!response.ok) {
-    throw new Error(`Connection test failed (${response.status})`);
+    throw await runtimeControlHttpError(response);
   }
-  const parsed = parseRuntimeConnectionTestResponse(await response.json());
+  const parsed = parseRuntimeConnectionTestResponse(
+    await readBoundedJson(response, 512 * 1024),
+  );
   if (!parsed) {
     throw new Error("Connection test returned an invalid response");
   }

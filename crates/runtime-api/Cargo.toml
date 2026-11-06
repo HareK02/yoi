@@ -6,7 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-api-macros = { workspace = true, features = ["reqwest", "axum"] }
+api-macros = { workspace = true, features = ["reqwest", "axum", "error-contract"] }
+error-contract.workspace = true
+serde_json.workspace = true
 manifest.workspace = true
 plugin-plan = { path = "../plugin-plan" }
 protocol.workspace = true
@@ -15,5 +17,4 @@ serde = { workspace = true, features = ["derive"] }
 workdir.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

@@ -203,6 +203,229 @@ struct StoredOutcome {
     failure: Option<PluginServiceFailureAttachment>,
 }
 
+// V1 invocation bytes stay opaque when adding lifecycle evidence, including
+// unsupported/corrupt cause attachments. Neither slot grants writer authority
+// over the other. Older readers see version 2 as Unsupported, not a false result.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredEvidence {
+    version: u16,
+    invocation: Option<String>,
+    lifecycle: Vec<StoredLifecycleObservation>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredLifecycleObservation {
+    lease_id: String,
+    observation: PluginServiceLifecycleObservation,
+}
+#[derive(serde::Deserialize)]
+struct EvidenceHeader {
+    version: u16,
+}
+
+fn evidence_json(conn: &Connection, c: &Consumer) -> Result<Option<String>> {
+    let (bytes, json): (Option<i64>, Option<String>) = conn.query_row(
+        "SELECT length(CAST(last_outcome_json AS BLOB)),CASE WHEN length(CAST(last_outcome_json AS BLOB))<=?3 THEN last_outcome_json ELSE NULL END FROM plugin_service_consumers WHERE workspace_id=?1 AND consumer_id=?2",
+        params![c.workspace, c.consumer_id, MAX_OUTCOME_BYTES], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if bytes.is_some_and(|bytes| bytes > MAX_OUTCOME_BYTES as i64) {
+        // Sentinel is deliberately not valid JSON; never allocate oversized data.
+        return Ok(Some(String::new()));
+    }
+    Ok(json)
+}
+fn decode_evidence(json: Option<String>) -> Result<StoredEvidence> {
+    let mut evidence = StoredEvidence {
+        version: 2,
+        invocation: None,
+        lifecycle: vec![],
+    };
+    if let Some(json) = json {
+        match serde_json::from_str::<EvidenceHeader>(&json) {
+            Ok(EvidenceHeader { version: 1 }) => evidence.invocation = Some(json),
+            Ok(EvidenceHeader { version: 2 }) => {
+                evidence = decode(&json)?;
+                if evidence.lifecycle.len() > 3
+                    || evidence.lifecycle.iter().enumerate().any(|(index, slot)| {
+                        let digest = slot.lease_id.strip_prefix("sha256:");
+                        !digest.is_some_and(|digest| {
+                            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                        }) || slot.observation.invocation().is_some_and(|identity| {
+                            !valid(&identity.event_id, 1024)
+                                || !valid(&identity.invocation_id, 1024)
+                                || identity.attempt == 0
+                        }) || evidence.lifecycle[..index].iter().any(|previous| {
+                            same_lifecycle_slot(&previous.observation, &slot.observation)
+                        })
+                    })
+                {
+                    return Err(failure(PluginHostErrorCode::Unavailable));
+                }
+            }
+            // Do not destroy unrecognized retained evidence on a write.
+            _ => return Err(failure(PluginHostErrorCode::Unavailable)),
+        }
+    }
+    Ok(evidence)
+}
+fn write_evidence(tx: &Transaction<'_>, c: &Consumer, evidence: &StoredEvidence) -> Result<()> {
+    let json = if evidence.lifecycle.is_empty() {
+        evidence
+            .invocation
+            .clone()
+            .ok_or_else(|| failure(PluginHostErrorCode::InvalidInput))?
+    } else {
+        encode(evidence)?
+    };
+    if json.len() > MAX_OUTCOME_BYTES {
+        return Err(failure(PluginHostErrorCode::QuotaExceeded));
+    }
+    tx.execute("UPDATE plugin_service_consumers SET last_outcome_json=?3 WHERE workspace_id=?1 AND consumer_id=?2",
+        params![c.workspace, c.consumer_id, json])?;
+    Ok(())
+}
+fn invocation_json(conn: &Connection, c: &Consumer) -> Result<Option<String>> {
+    let json = evidence_json(conn, c)?;
+    if json.as_ref().is_some_and(|json| {
+        matches!(
+            serde_json::from_str::<EvidenceHeader>(json),
+            Ok(EvidenceHeader { version: 2 })
+        )
+    }) {
+        #[derive(serde::Deserialize)]
+        struct InvocationSlot {
+            invocation: Option<String>,
+        }
+        // Decode this slot independently: damaged cleanup evidence must not hide
+        // an otherwise readable owner-committed invocation result.
+        return Ok(Some(
+            match serde_json::from_str::<InvocationSlot>(json.as_deref().unwrap_or("")) {
+                Ok(slot) => match slot.invocation {
+                    Some(invocation) => invocation,
+                    None => return Ok(None),
+                },
+                Err(_) => String::new(),
+            },
+        ));
+    }
+    Ok(json)
+}
+fn same_lifecycle_slot(
+    a: &PluginServiceLifecycleObservation,
+    b: &PluginServiceLifecycleObservation,
+) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
+/// Observation-only owner transaction. The authenticated boundary checks the
+/// immutable Worker; this proof cannot mutate delivery state or a successor.
+/// Released proofs admit delayed response-loss evidence, but not after rotation.
+pub fn observe_lifecycle(
+    tx: &Transaction<'_>,
+    workspace: &str,
+    lease: &PluginServiceLease,
+    observation: &PluginServiceLifecycleObservation,
+) -> Result<()> {
+    let c = load(tx, workspace, &lease.consumer_id)?;
+    if !valid(&lease.lease_token, 512) {
+        return Err(failure(PluginHostErrorCode::InvalidInput));
+    }
+    match c.lease_token.as_deref() {
+        Some(token) if token == lease.lease_token => {}
+        None => {
+            // Release receipts append once in the owner transaction. Their
+            // insertion order (not wall time/token ordering) identifies the last
+            // released lifetime. Older proofs still reconcile Release, but may
+            // not displace observations after a successor has also released.
+            let released: Option<String> = tx.query_row(
+                "SELECT lease_token FROM plugin_service_released_proofs WHERE workspace_id=?1 AND consumer_id=?2 ORDER BY rowid DESC LIMIT 1",
+                params![workspace, lease.consumer_id], |r| r.get(0)).optional()?;
+            if released.as_deref() != Some(lease.lease_token.as_str()) {
+                return Err(failure(PluginHostErrorCode::Conflict));
+            }
+        }
+        _ => return Err(failure(PluginHostErrorCode::Conflict)),
+    }
+    let mut evidence = decode_evidence(evidence_json(tx, &c)?)?;
+    if let Some(identity) = observation.invocation() {
+        let current_matches = c.current_event_id.as_ref() == Some(&identity.event_id)
+            && c.invocation_id.as_ref() == Some(&identity.invocation_id)
+            && c.attempt == identity.attempt;
+        let retained_matches = evidence
+            .invocation
+            .as_ref()
+            .and_then(|json| serde_json::from_str::<StoredOutcome>(json).ok())
+            .is_some_and(|outcome| {
+                outcome.version == 1
+                    && outcome.event_id == identity.event_id
+                    && outcome.invocation_id == identity.invocation_id
+                    && outcome.attempt == identity.attempt
+            });
+        if !valid(&identity.event_id, 1024)
+            || !valid(&identity.invocation_id, 1024)
+            || identity.attempt == 0
+            || (!current_matches && !retained_matches)
+        {
+            return Err(failure(PluginHostErrorCode::Conflict));
+        }
+    }
+    let hex: String = Sha256::digest(lease.lease_token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let lease_id = format!("sha256:{hex}");
+    let saved = StoredLifecycleObservation {
+        lease_id,
+        observation: observation.clone(),
+    };
+    if let Some(slot) = evidence
+        .lifecycle
+        .iter_mut()
+        .find(|slot| same_lifecycle_slot(&slot.observation, observation))
+    {
+        *slot = saved;
+    } else {
+        evidence.lifecycle.push(saved);
+    }
+    write_evidence(tx, &c, &evidence)
+}
+
+fn lifecycle_diagnostic(
+    conn: &Connection,
+    c: &Consumer,
+) -> Result<Option<PluginServiceLifecycleDiagnostic>> {
+    let Some(json) = evidence_json(conn, c)? else {
+        return Ok(None);
+    };
+    let evidence = match serde_json::from_str::<EvidenceHeader>(&json) {
+        Ok(EvidenceHeader { version: 1 }) => return Ok(None),
+        Ok(EvidenceHeader { version: 2 }) => decode_evidence(Some(json)),
+        Ok(EvidenceHeader { version: 0 }) | Err(_) => {
+            return Ok(Some(PluginServiceLifecycleDiagnostic::Corrupt));
+        }
+        Ok(_) => return Ok(Some(PluginServiceLifecycleDiagnostic::Unsupported)),
+    };
+    let Ok(evidence) = evidence else {
+        return Ok(Some(PluginServiceLifecycleDiagnostic::Corrupt));
+    };
+    let access = PluginServiceFailureAccess::authorized_service_observer();
+    let mut observations = Vec::new();
+    for slot in evidence.lifecycle {
+        let cause = slot.observation.cause();
+        let failure = PluginServiceFailureAttachment::from_cause(cause)
+            .map(|attachment| attachment.diagnostic(&access))
+            .unwrap_or(PluginServiceFailureDiagnostic::Corrupt);
+        observations.push(PluginServiceLifecycleObservationDiagnostic {
+            lease_id: slot.lease_id,
+            invocation: slot.observation.invocation().cloned(),
+            failure,
+        });
+    }
+    Ok(Some(PluginServiceLifecycleDiagnostic::Known {
+        observations,
+    }))
+}
+
 fn save_outcome(
     tx: &Transaction<'_>,
     c: &Consumer,
@@ -242,13 +465,9 @@ fn save_outcome(
         result: result.clone(),
         failure: attachment,
     };
-    let json = encode(&outcome)?;
-    if json.len() > MAX_OUTCOME_BYTES {
-        return Err(failure(PluginHostErrorCode::QuotaExceeded));
-    }
-    tx.execute("UPDATE plugin_service_consumers SET last_outcome_json=?3 WHERE workspace_id=?1 AND consumer_id=?2",
-        params![c.workspace, c.consumer_id, json])?;
-    Ok(())
+    let mut evidence = decode_evidence(evidence_json(tx, c)?)?;
+    evidence.invocation = Some(encode(&outcome)?);
+    write_evidence(tx, c, &evidence)
 }
 
 /// Owner discovery of an unknown effect must not erase an already committed
@@ -258,9 +477,7 @@ fn retained_invocation_cause(
     conn: &Connection,
     c: &Consumer,
 ) -> Result<Option<PluginServiceFailureAttachment>> {
-    let json: Option<String> = conn.query_row(
-        "SELECT CASE WHEN length(CAST(last_outcome_json AS BLOB))<=?3 THEN last_outcome_json ELSE NULL END FROM plugin_service_consumers WHERE workspace_id=?1 AND consumer_id=?2",
-        params![c.workspace, c.consumer_id, MAX_OUTCOME_BYTES], |r| r.get(0))?;
+    let json = invocation_json(conn, c)?;
     let Some(outcome) = json.and_then(|json| serde_json::from_str::<StoredOutcome>(&json).ok())
     else {
         return Ok(None);
@@ -291,16 +508,9 @@ fn outcome_diagnostic(
     conn: &Connection,
     c: &Consumer,
 ) -> Result<Option<PluginServiceOutcomeDiagnostic>> {
-    // Bound the DB read before allocating the value, including damaged/future rows.
-    let (bytes, json): (Option<i64>, Option<String>) = conn.query_row(
-        "SELECT length(CAST(last_outcome_json AS BLOB)),CASE WHEN length(CAST(last_outcome_json AS BLOB))<=?3 THEN last_outcome_json ELSE NULL END FROM plugin_service_consumers WHERE workspace_id=?1 AND consumer_id=?2",
-        params![c.workspace, c.consumer_id, MAX_OUTCOME_BYTES], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    let Some(bytes) = bytes else { return Ok(None) };
-    if bytes > MAX_OUTCOME_BYTES as i64 {
-        return Ok(Some(PluginServiceOutcomeDiagnostic::Corrupt));
-    }
-    let Some(json) = json else {
-        return Ok(Some(PluginServiceOutcomeDiagnostic::Corrupt));
+    // Bound both the DB read and the nested invocation before decoding.
+    let Some(json) = invocation_json(conn, c)? else {
+        return Ok(None);
     };
     // Unknown versions are observations, not fabricated execution causes.
     #[derive(serde::Deserialize)]
@@ -352,6 +562,7 @@ pub fn diagnostics(conn: &Connection, c: &Consumer, now: i64) -> Result<PluginSe
         },
         lease_active: c.lease_token.is_some() && c.lease_until_ms > now,
         last_outcome: outcome_diagnostic(conn, c)?,
+        last_lifecycle: lifecycle_diagnostic(conn, c)?,
     })
 }
 pub fn pause(tx: &Transaction<'_>, c: &Consumer, reason: PluginServicePauseReason) -> Result<()> {
@@ -1084,6 +1295,216 @@ mod failure_storage_tests {
         assert_eq!(c.invocation_id.as_deref(), Some("invocation"));
         assert_eq!(c.attempt, 1);
         assert_eq!(c.pause, None);
+    }
+
+    #[test]
+    fn lifecycle_slots_preserve_invocation_bytes_and_survive_new_outcomes() {
+        let f = Fixture::new(true);
+        f.complete(
+            PluginServiceEventResult::RetryAfter { delay_ms: 1 },
+            Some(invocation(PluginServiceExecutionFailure::Deadline)),
+        );
+        let mut original: serde_json::Value = serde_json::from_str(&f.saved()).unwrap();
+        // Future/corrupt attachments stay byte-for-byte intact when lifecycle
+        // evidence is added; they are not promoted to fresh writer capabilities.
+        for attachment in ["{broken".to_string(), {
+            let mut envelope: serde_json::Value =
+                serde_json::from_str(original["failure"].as_str().unwrap()).unwrap();
+            envelope["version"] = json!(99);
+            envelope.to_string()
+        }] {
+            original["failure"] = json!(attachment);
+            let bytes = original.to_string();
+            f.replace(&bytes);
+            let mut conn = f.conn();
+            let tx = conn.transaction().unwrap();
+            observe_lifecycle(
+                &tx,
+                "w",
+                &f.lease(),
+                &PluginServiceLifecycleObservation::Stop {
+                    reason: PluginServiceExecutionFailure::Guest,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            assert_eq!(
+                serde_json::from_str::<StoredEvidence>(&f.saved())
+                    .unwrap()
+                    .invocation
+                    .as_deref(),
+                Some(bytes.as_str())
+            );
+            assert!(matches!(
+                f.diagnostics().last_outcome,
+                Some(PluginServiceOutcomeDiagnostic::Known {
+                    result: PluginServiceEventResult::RetryAfter { delay_ms: 1 },
+                    ..
+                })
+            ));
+            assert!(
+                matches!(f.diagnostics().last_lifecycle, Some(PluginServiceLifecycleDiagnostic::Known { observations }) if observations.len() == 1)
+            );
+        }
+        // A later invocation result updates only its own slot.
+        f.complete(PluginServiceEventResult::Ack, None);
+        assert_known(f.diagnostics(), PluginServiceEventResult::Ack, None);
+        assert!(
+            matches!(f.diagnostics().last_lifecycle, Some(PluginServiceLifecycleDiagnostic::Known { observations }) if observations.len() == 1)
+        );
+        let original = f.saved();
+        let mut damaged: serde_json::Value = serde_json::from_str(&original).unwrap();
+        damaged["lifecycle"][0]["lease_id"] = json!("credential-secret");
+        f.replace(&damaged.to_string());
+        assert_known(f.diagnostics(), PluginServiceEventResult::Ack, None);
+        assert_eq!(
+            f.diagnostics().last_lifecycle,
+            Some(PluginServiceLifecycleDiagnostic::Corrupt)
+        );
+        assert!(
+            !serde_json::to_string(&f.diagnostics())
+                .unwrap()
+                .contains("credential-secret")
+        );
+    }
+
+    #[test]
+    fn lifecycle_observation_fences_identity_released_proof_and_successor_without_mutating_delivery()
+     {
+        let f = Fixture::new(true);
+        let observation = PluginServiceLifecycleObservation::CompletionUnconfirmed {
+            invocation: PluginServiceInvocationIdentity {
+                event_id: "event".into(),
+                invocation_id: "invocation".into(),
+                attempt: 1,
+            },
+        };
+        let mut conn = f.conn();
+        let tx = conn.transaction().unwrap();
+        observe_lifecycle(&tx, "w", &f.lease(), &observation).unwrap();
+        let before = evidence_json(&tx, &load(&tx, "w", "consumer").unwrap()).unwrap();
+        for wrong in [
+            PluginServiceInvocationIdentity {
+                event_id: "other".into(),
+                invocation_id: "invocation".into(),
+                attempt: 1,
+            },
+            PluginServiceInvocationIdentity {
+                event_id: "event".into(),
+                invocation_id: "other".into(),
+                attempt: 1,
+            },
+            PluginServiceInvocationIdentity {
+                event_id: "event".into(),
+                invocation_id: "invocation".into(),
+                attempt: 2,
+            },
+        ] {
+            assert!(
+                observe_lifecycle(
+                    &tx,
+                    "w",
+                    &f.lease(),
+                    &PluginServiceLifecycleObservation::CompletionUnconfirmed { invocation: wrong }
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            evidence_json(&tx, &load(&tx, "w", "consumer").unwrap()).unwrap(),
+            before
+        );
+        release(&tx, "w", &f.lease(), 100).unwrap();
+        observe_lifecycle(
+            &tx,
+            "w",
+            &f.lease(),
+            &PluginServiceLifecycleObservation::ReleaseUnconfirmed,
+        )
+        .unwrap();
+        let fake = PluginServiceLease {
+            consumer_id: "consumer".into(),
+            lease_token: "not-issued".into(),
+        };
+        assert!(observe_lifecycle(&tx, "w", &fake, &observation).is_err());
+        // Rotate only the test lease boundary; immutable consumer/event/receipt
+        // identity is unchanged. A delayed old observation cannot mutate it.
+        tx.execute(
+            "UPDATE plugin_service_consumers SET lease_token='successor',lease_until_ms=60000",
+            [],
+        )
+        .unwrap();
+        assert!(observe_lifecycle(&tx, "w", &f.lease(), &observation).is_err());
+        let successor = PluginServiceLease {
+            consumer_id: "consumer".into(),
+            lease_token: "successor".into(),
+        };
+        release(&tx, "w", &successor, 100).unwrap(); // same timestamp, later receipt
+        assert!(observe_lifecycle(&tx, "w", &f.lease(), &observation).is_err());
+        observe_lifecycle(
+            &tx,
+            "w",
+            &successor,
+            &PluginServiceLifecycleObservation::ReleaseUnconfirmed,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        let c = load(&f.conn(), "w", "consumer").unwrap();
+        assert_eq!(c.cursor, 0);
+        assert_eq!(c.current_event_id.as_deref(), Some("event"));
+        assert_eq!(c.invocation_id.as_deref(), Some("invocation"));
+        assert_eq!(c.attempt, 1);
+        assert_eq!(c.next_attempt_ms, 0);
+        assert_eq!(c.pause, None);
+        assert_eq!(
+            f.diagnostics().last_outcome,
+            None,
+            "recording uncertainty is not an invocation commit"
+        );
+        assert!(
+            matches!(f.diagnostics().last_lifecycle, Some(PluginServiceLifecycleDiagnostic::Known { observations }) if observations.len() == 2)
+        );
+    }
+
+    #[test]
+    fn lifecycle_write_failure_and_unrecognized_root_do_not_destroy_retained_evidence() {
+        let f = Fixture::new(true);
+        f.complete(PluginServiceEventResult::RetryAfter { delay_ms: 1 }, None);
+        let saved = f.saved();
+        f.conn().execute_batch("CREATE TRIGGER fail_lifecycle BEFORE UPDATE OF last_outcome_json ON plugin_service_consumers BEGIN SELECT RAISE(ABORT,'injected observation failure'); END;").unwrap();
+        let mut conn = f.conn();
+        let tx = conn.transaction().unwrap();
+        assert!(
+            observe_lifecycle(
+                &tx,
+                "w",
+                &f.lease(),
+                &PluginServiceLifecycleObservation::ReleaseUnconfirmed
+            )
+            .is_err()
+        );
+        tx.commit().unwrap();
+        assert_eq!(f.saved(), saved);
+        f.conn()
+            .execute_batch("DROP TRIGGER fail_lifecycle")
+            .unwrap();
+        for retained in ["{broken", r#"{"version":99,"future":"preserve"}"#] {
+            f.replace(retained);
+            let tx = conn.transaction().unwrap();
+            assert!(
+                observe_lifecycle(
+                    &tx,
+                    "w",
+                    &f.lease(),
+                    &PluginServiceLifecycleObservation::ReleaseUnconfirmed
+                )
+                .is_err()
+            );
+            tx.commit().unwrap();
+            assert_eq!(f.saved(), retained);
+        }
+        assert_eq!(load(&f.conn(), "w", "consumer").unwrap().cursor, 0);
     }
 
     #[test]

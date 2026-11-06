@@ -64,6 +64,21 @@ impl StartupFailureAttachment {
     }
 }
 
+/// Projected startup evidence and independent owner observations. This does not
+/// attest lifecycle completion, durable receipt, current visibility or retry rights.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+pub struct StartupFailureObservations {
+    pub primary: StartupFailureAttachment,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary: Vec<StartupSecondaryFailure>,
+    pub resources: Option<StartupResourceFacts>,
+    pub persistence: Option<StartupPersistenceOutcome>,
+    pub io_kind: Option<StartupIoKind>,
+}
+
 /// Storage encoding cannot be constructed by relabeling an internal-transfer attachment.
 /// A loaded value remains untrusted evidence; publication still requires `project_for`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +152,40 @@ pub enum RuntimeStartupReason {
     FeatureFailed,
 }
 
+impl RuntimeStartupCause {
+    fn public_explanation(&self) -> &'static str {
+        match self.reason {
+            RuntimeStartupReason::StartupFailed => "Worker startup did not complete.",
+            RuntimeStartupReason::SegmentEmpty => {
+                "Worker startup requires a nonempty initial segment."
+            }
+            RuntimeStartupReason::SystemPromptMissing => "Worker startup requires a system prompt.",
+            RuntimeStartupReason::MetadataPending => {
+                "Worker metadata is still pending; startup is not confirmed."
+            }
+            RuntimeStartupReason::MetadataMissing => "Saved Worker metadata is missing.",
+            RuntimeStartupReason::MetadataInactive => "Saved Worker metadata is inactive.",
+            RuntimeStartupReason::ManifestMissing => "The Worker startup manifest is missing.",
+            RuntimeStartupReason::AllocationFailed => {
+                "Worker startup could not allocate its resources."
+            }
+            RuntimeStartupReason::SessionReadFailed => {
+                "Worker startup could not read the saved Session."
+            }
+            RuntimeStartupReason::MetadataReadFailed => {
+                "Worker startup could not read its saved metadata."
+            }
+            RuntimeStartupReason::ProviderFailed => "The Worker startup provider failed.",
+            RuntimeStartupReason::AttributionFailed => {
+                "Worker startup could not establish Session attribution."
+            }
+            RuntimeStartupReason::FeatureFailed => {
+                "Worker startup could not activate a required Feature."
+            }
+        }
+    }
+}
+
 impl error_contract::FailureCause for RuntimeStartupCause {
     fn identity(&self) -> error_contract::FailureIdentity {
         error_contract::FailureIdentity {
@@ -166,7 +215,7 @@ macro_rules! project_runtime {
             fn disclose(&self, facts: &error_contract::FailureFacts<Self>, _: &())
                 -> Result<error_contract::Disclosure<Self>, ContractError>
             {
-                let mut disclosure = error_contract::Disclosure::new(self.clone(), "Worker startup failed.");
+                let mut disclosure = error_contract::Disclosure::new(self.clone(), self.public_explanation());
                 // Only fixed owner-selected operation/stage labels are published here.
                 for context in &facts.context().operations {
                     if context.operation == "worker_startup" && context.stage == "runtime" {
@@ -184,7 +233,8 @@ macro_rules! project_runtime {
 project_runtime!(
     error_contract::InternalTransfer,
     error_contract::Storage,
-    error_contract::Browser
+    error_contract::Browser,
+    error_contract::Tool
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

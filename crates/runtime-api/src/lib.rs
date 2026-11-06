@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+pub mod control_failure;
+
 use std::collections::BTreeMap;
 
 use api_macros::api;
@@ -100,23 +102,14 @@ pub enum WorkerRestoreState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiError {
+    #[serde(skip)]
+    control: Option<control_failure::RuntimeControlCause>,
     pub error: RuntimeApiErrorDetail,
     #[serde(skip)]
     status: u16,
 }
 
-/// Transient, allowlisted startup observations copied from the execution owner.
-/// This is not an operation result, lifecycle record, or permission to retry.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerStartupFailure {
-    pub primary: StartupFailureAttachment,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secondary: Vec<StartupSecondaryFailure>,
-    pub resources: Option<StartupResourceFacts>,
-    pub persistence: Option<StartupPersistenceOutcome>,
-    pub io_kind: Option<StartupIoKind>,
-}
+pub use protocol::startup_failure::StartupFailureObservations as WorkerStartupFailure;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiErrorDetail {
@@ -127,6 +120,13 @@ pub struct RuntimeApiErrorDetail {
 }
 
 impl RuntimeApiError {
+    pub fn with_control(mut self, cause: control_failure::RuntimeControlCause) -> Self {
+        self.control = Some(cause);
+        self
+    }
+    pub fn control_cause(&self) -> Option<control_failure::RuntimeControlCause> {
+        self.control
+    }
     pub fn new(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             error: RuntimeApiErrorDetail {
@@ -135,6 +135,7 @@ impl RuntimeApiError {
                 startup: None,
             },
             status,
+            control: None,
         }
     }
 
@@ -144,6 +145,19 @@ impl RuntimeApiError {
 }
 
 impl api_macros::HttpError for RuntimeApiError {
+    fn custom_response(&self) -> Option<api_macros::HttpErrorResponse> {
+        self.control.map(|cause| {
+            control_failure::control_problem(cause).unwrap_or_else(|_| {
+                api_macros::HttpErrorResponse {
+                    status: 500,
+                    content_type: "application/problem+json",
+                    body: error_contract::problem::STATIC_PROBLEM_FALLBACK
+                        .to_vec()
+                        .into(),
+                }
+            })
+        })
+    }
     fn status_code(&self) -> u16 {
         self.status
     }
@@ -613,6 +627,10 @@ pub struct WorkingDirectoryRepositoryAccessRequest {
 /// using the same Restore intent.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerRestoreResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<protocol::control_failure::RuntimeControlCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<WorkerStartupFailure>,
     pub state: WorkerRestoreState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerDetail>,
@@ -1305,7 +1323,7 @@ pub struct SubjectJobRemovalPurgeResponse {
     pub input_fingerprint: String,
 }
 
-#[api(reqwest, axum)]
+#[api(reqwest, axum, client_error_hook)]
 pub trait RuntimeApi {
     #[post("/v1/subject-job-removal-purge", status = 200, error_status = 400)]
     async fn purge_subject_job_removal(
@@ -1925,7 +1943,7 @@ mod tests {
 
         async fn get_worker(&self, worker_id: String) -> Result<WorkerResponse, RuntimeApiError> {
             assert_eq!(worker_id, "missing worker");
-            Err(test_error(404))
+            Err(test_error(404).with_control(control_failure::RuntimeControlCause::WorkerMissing))
         }
 
         async fn worker_session(
@@ -2231,7 +2249,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, client_support::ClientError::Public { status, .. } if status.as_u16() == 404)
+            matches!(error, client_support::ClientError::Public { status, error } if status.as_u16() == 404 && error.control_cause() == Some(control_failure::RuntimeControlCause::WorkerMissing))
         );
         server.abort();
     }

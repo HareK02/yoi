@@ -8917,15 +8917,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 return Ok(attempt);
             }
             backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
+            let failure_cause = crate::backend_job::prefer_retained_primary_cause(
+                attempt.failure_cause.as_ref(), failure_cause,
+            ).map_err(Error::BackendJobCauseProjection)?;
             tx.execute(
                 "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, failure_cause = ?8, worker_cleanup_state = CASE WHEN state='reserved' AND worker_id IS NULL THEN 'completed' ELSE 'pending' END, worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_failure_cause = NULL, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = CASE WHEN state='reserved' AND worker_id IS NULL THEN ?7 ELSE NULL END, allocation_precluded_at = CASE WHEN state='reserved' AND runtime_id IS NULL AND worker_id IS NULL AND runtime_run_id IS NULL AND dispatched_at IS NULL THEN ?7 ELSE NULL END, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
-                params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now, failure_cause.map(crate::backend_job::BackgroundFailure::as_storage_str)],
+                params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now, failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)],
             )?;
             if attempt.attempt == job.current_attempt && job.state == BackendJobState::Pending {
                 let job_state = BackendJobState::Failed;
                 tx.execute(
                     "UPDATE backend_jobs SET state = ?3, failure_category = ?4, failure_detail = ?5, failure_cause = ?7, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
-                    params![workspace_id, job_id, job_state.as_str(), failure_category, detail, now, failure_cause.map(crate::backend_job::BackgroundFailure::as_storage_str)],
+                    params![workspace_id, job_id, job_state.as_str(), failure_category, detail, now, failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)],
                 )?;
             }
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?

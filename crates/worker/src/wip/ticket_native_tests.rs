@@ -15,15 +15,18 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
     let client = Arc::new(
         ScriptedWorkspaceClient::new([
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"items":[query_item],"page":{"next_cursor":null,"has_more":false}})
                     .to_string(),
             },
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: detail.to_string(),
             },
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 204,
                 body: String::new(),
             },
@@ -31,8 +34,16 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
         .with_authorizations([
             expected_authorization("ticket.query", "workspace", None),
             expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
             expected_authorization("ticket.event.add", "ticket", Some(("ticket_id", "T-42"))),
         ]),
     );
@@ -158,6 +169,7 @@ fn native_namespace_reference_lookup_is_explicit_unique_and_not_publication() {
 async fn large_ticket_interface_is_explicitly_bounded_and_selected_operation_remains_invokable() {
     let client = Arc::new(
         ScriptedWorkspaceClient::new([crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 204,
             body: String::new(),
         }])
@@ -306,6 +318,7 @@ async fn native_plan_kind_reaches_persisted_query_through_inspect_and_dispatch()
                     }
                 );
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: "{}".into(),
                 });
@@ -324,6 +337,7 @@ async fn native_plan_kind_reaches_persisted_query_through_inspect_and_dispatch()
                 .unwrap();
             self.requests.lock().unwrap().push(body);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&records).unwrap(),
             })
@@ -449,10 +463,12 @@ async fn ticket_inspect_explains_unpublished_objective_and_mr_input_roots() {
     let client = Arc::new(
         ScriptedWorkspaceClient::new([
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"items":[],"page":{"next_cursor":null,"has_more":false}}).to_string(),
             },
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"items":[],"next_cursor":null,"source_checks":[]}).to_string(),
             },
@@ -646,6 +662,7 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
         let mut second_item = query_item.clone();
         second_item["resource_key"] = json!("T-43");
         let response = |value: Json| crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: value.to_string(),
         };
@@ -812,15 +829,18 @@ async fn ticket_successful_create_is_never_replayed_after_selected_deleted_or_de
     let client = Arc::new(
         ScriptedWorkspaceClient::new([
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"id":"internal123","resource_key":"T-9","slug":"new","status":"Open"})
                     .to_string(),
             },
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 404,
                 body: json!({"error":"not_found","message":"deleted"}).to_string(),
             },
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 403,
                 body: json!({"error":"permission_denied","message":"denied"}).to_string(),
             },
@@ -954,7 +974,9 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
             FeatureDescriptor::builtin("late-failure", "Late failure")
         }
         fn install(&self, _: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-            Err(FeatureInstallError::InvalidDescriptor("late failure".into()))
+            Err(FeatureInstallError::InvalidDescriptor(
+                "late failure".into(),
+            ))
         }
     }
     for fail in [false, true] {
@@ -973,7 +995,10 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
         let objective = mounts.allocate_namespace("objective", "goals").unwrap();
         let mut features = FeatureRegistryBuilder::new();
         crate::feature::builtin::objective::composition::compose(
-            &mut features, true, client.clone(), Some((objective, None)),
+            &mut features,
+            true,
+            client.clone(),
+            Some((objective, None)),
         )
         .unwrap();
         if fail {
@@ -981,12 +1006,17 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
         }
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         let report = features.install_into_engine_with_wip(
-            &mut engine, &mut crate::hook::HookRegistryBuilder::default(), Some(&mut mounts),
+            &mut engine,
+            &mut crate::hook::HookRegistryBuilder::default(),
+            Some(&mut mounts),
         );
         assert_eq!(report.has_errors(), fail);
         let after = WipHost::new(mounts);
         assert_eq!(after.result_namespaces.root("ticket"), Some("/cases"));
-        assert_eq!(after.result_namespaces.root("objective"), (!fail).then_some("/goals"));
+        assert_eq!(
+            after.result_namespaces.root("objective"),
+            (!fail).then_some("/goals")
+        );
         assert_eq!(before.result_namespaces.root("objective"), None);
         assert_eq!(before.result_namespaces.root("ticket"), Some("/cases"));
         assert_eq!(after.observe("/goals", 1).is_ok(), !fail);
@@ -1001,13 +1031,22 @@ async fn host_overwrites_forged_result_context_and_omits_unpublished_cross_domai
         json!([{"resource_key":"O-3","title":"Visible ID only","state":"active"}]);
     let client = Arc::new(
         ScriptedWorkspaceClient::new([crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: detail.to_string(),
         }])
         .with_authorizations([
             expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
         ]),
     );
     let mut registry = WipMountRegistry::new();
@@ -1152,10 +1191,12 @@ async fn retained_ticket_result_mr_reference_is_model_navigation_not_body_or_sna
     let client = Arc::new(
         ScriptedWorkspaceClient::new([
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: receipt.to_string(),
             },
             crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"merge_request_id":"MR-1","ticket_ids":[],"thread":[]}).to_string(),
             },
@@ -1254,6 +1295,7 @@ async fn diagnostics_uncaptured_mr_origin_is_typed_lazy_model_navigation_even_on
         let page = json!({"items":[],"next_cursor":"opaque-next",
             "source_checks":[{"resource_kind":"merge_request_events","reference":"MR-1","origin_present":true,"captured":false}]});
         let mut responses = vec![crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: page.to_string(),
         }];
@@ -1264,6 +1306,7 @@ async fn diagnostics_uncaptured_mr_origin_is_typed_lazy_model_navigation_even_on
         )];
         if published {
             responses.push(crate::worker::WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"merge_request_id":"MR-1","ticket_ids":[],"thread":[]}).to_string(),
             });

@@ -43,6 +43,7 @@ fn mutation() -> DriveMutationRequest {
 }
 fn json(value: impl Serialize) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: None,
         status: 200,
         body: serde_json::to_string(&value).unwrap(),
     }
@@ -104,14 +105,17 @@ impl Client {
             Fault::InvalidPath => Err(WorkspaceClientError::InvalidPath(SECRET.into())),
             Fault::Panic => panic!("injected adapter task panic"),
             Fault::Decode => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: SECRET.into(),
             }),
             Fault::Size => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: SECRET.repeat(RESPONSE_LIMIT / SECRET.len() + 1),
             }),
             Fault::Rejected | Fault::Unknown => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 409,
                 body: serde_json::to_string(&DriveApiError {
                     code: DriveApiErrorCode::Conflict,
@@ -125,6 +129,7 @@ impl Client {
                 .unwrap(),
             }),
             Fault::Unrecognized => Ok(WorkspaceResponse {
+                content_type: None,
                 status: 503,
                 body: SECRET.into(),
             }),
@@ -174,6 +179,7 @@ impl WorkspaceClient for Client {
             let input: server_api::authorization::OperationAuthorizationRequest =
                 serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({"scope": input.resource}).to_string(),
             });
@@ -281,6 +287,7 @@ impl WorkspaceClient for Client {
             })
         } else {
             WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: if matches!(self.fault, Fault::Length) {
                     "x"

@@ -315,6 +315,7 @@ mod tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
             Ok(self.response.clone().unwrap_or_else(|| WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: r#"{"worker_id":"42"}"#.to_string(),
             }))
@@ -586,6 +587,7 @@ mod tests {
         for state in [TicketState::Open, TicketState::Closed] {
             let service = Arc::new(RecordingService {
                 response: Some(WorkspaceResponse {
+                    content_type: None,
                     status: 409,
                     body: "Backend rejected Ticket claim".into(),
                 }),

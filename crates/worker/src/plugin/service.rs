@@ -131,6 +131,22 @@ impl ServiceDriver {
             .await
             .map_err(|_| dependency())
     }
+    async fn observe_lifecycle(
+        &self,
+        lease: &PluginServiceLease,
+        observation: PluginServiceLifecycleObservation,
+    ) -> Result<(), HookError> {
+        match self
+            .request(PluginServiceRequest::ObserveLifecycle {
+                lease: lease.clone(),
+                observation,
+            })
+            .await
+        {
+            Ok(PluginServiceResponse::LifecycleObserved) => Ok(()),
+            _ => Err(dependency()),
+        }
+    }
     pub(super) async fn reconcile_release(&self) -> Result<(), HookError> {
         let Some(lease) = self.lease.lock().expect("Service lease lock").clone() else {
             return Ok(());
@@ -155,6 +171,13 @@ impl ServiceDriver {
                 .lock()
                 .expect("Service observations lock")
                 .release = Some(PluginServiceFailure::ReleaseUnconfirmed);
+            // The Release transaction may already have committed. Its retained
+            // exact proof admits observation, not a new cleanup/effect operation.
+            self.observe_lifecycle(
+                &lease,
+                PluginServiceLifecycleObservation::ReleaseUnconfirmed,
+            )
+            .await?;
             return Err(dependency());
         }
         self.observations
@@ -377,7 +400,7 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                         self.observations.lock().expect("Service observations lock");
                     *observations = ServiceDriverObservations {
                         event_id: Some(envelope.event_id.clone()),
-                        invocation_id: Some(invocation_id),
+                        invocation_id: Some(invocation_id.clone()),
                         attempt: Some(envelope.attempt),
                         result: Some(result.clone()),
                         invocation_cause: cause,
@@ -404,6 +427,26 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                         .lock()
                         .expect("Service observations lock")
                         .completion = Some(PluginServiceFailure::CompletionUnconfirmed);
+                    if self
+                        .observe_lifecycle(
+                            &lease,
+                            PluginServiceLifecycleObservation::CompletionUnconfirmed {
+                                invocation: PluginServiceInvocationIdentity {
+                                    event_id: envelope.event_id.clone(),
+                                    invocation_id,
+                                    attempt: envelope.attempt,
+                                },
+                            },
+                        )
+                        .await
+                        .is_err()
+                    {
+                        // No durable-evidence success is asserted when this
+                        // independent recording boundary is unavailable either.
+                        tracing::warn!(
+                            "Plugin Service completion observation was not confirmed by owner"
+                        );
+                    }
                     // The cursor/pause transaction may have committed even if its
                     // reply was lost. Keep the read-only observer alive instead
                     // of permanently deactivating this HostReady registration.
@@ -464,7 +507,16 @@ impl FeatureBackgroundTask for Arc<ServiceDriver> {
                 .lock()
                 .expect("Service observations lock")
                 .stop = reason.map(|reason| PluginServiceFailure::Stop { reason });
-            reason.is_some()
+            if let Some(reason) = reason {
+                // Persist before releasing this exact proof. Failure to record
+                // still cannot suppress the independent fencing/release attempt.
+                let _ = self
+                    .observe_lifecycle(&lease, PluginServiceLifecycleObservation::Stop { reason })
+                    .await;
+                true
+            } else {
+                false
+            }
         } else {
             false
         };

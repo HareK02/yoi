@@ -11722,6 +11722,7 @@ mod tests {
                     .validate()
                     .map_err(worker::WorkspaceClientError::Request)?;
                 return Ok(worker::WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(
                         &server_api::authorization::OperationAuthorizationResponse { scope: None },

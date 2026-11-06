@@ -644,6 +644,41 @@
         ],
         "type": "string"
       },
+      "Category": {
+        "enum": [
+          "authorization",
+          "invalid_input",
+          "conflict",
+          "dependency",
+          "internal",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "CausalLink": {
+        "description": "Only explicit causal references belong here. Cleanup/audit failures stay in domain results.",
+        "properties": {
+          "correlation": {
+            "$ref": "#/components/schemas/CorrelationRef"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "domain",
+          "reason",
+          "correlation"
+        ],
+        "type": "object"
+      },
       "ChatConversation": {
         "additionalProperties": false,
         "properties": {
@@ -1859,6 +1894,53 @@
           }
         },
         "type": "object"
+      },
+      "ControlProblemPublicationSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "instance": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 599,
+            "minimum": 400,
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "yoi_failure": {
+            "$ref": "#/components/schemas/FailureEnvelope"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "instance",
+          "yoi_failure"
+        ],
+        "type": "object"
+      },
+      "CorrelationRef": {
+        "description": "Correlation is deliberately a distinct field/type from operation identity.",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
       },
       "CreateRemoteRuntimeRequest": {
         "additionalProperties": false,
@@ -3449,6 +3531,132 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "FailureContext": {
+        "description": "Common metadata is untrusted after deserialization. No audience label confers trust.",
+        "properties": {
+          "causes": {
+            "description": "Ordered immediate-to-root chain, at most four references; never recursive payloads.",
+            "items": {
+              "$ref": "#/components/schemas/CausalLink"
+            },
+            "maxItems": 4,
+            "type": "array"
+          },
+          "correlation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CorrelationRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/FailureDiagnostic"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/OperationContext"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "supplementary_omitted": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "operations",
+          "causes",
+          "diagnostics",
+          "supplementary_omitted"
+        ],
+        "type": "object"
+      },
+      "FailureDiagnostic": {
+        "properties": {
+          "code": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "explanation"
+        ],
+        "type": "object"
+      },
+      "FailureEnvelope": {
+        "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/Category"
+          },
+          "context": {
+            "$ref": "#/components/schemas/FailureContext"
+          },
+          "details": {
+            "$ref": "#/components/schemas/RuntimeControlCause"
+          },
+          "details_version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "domain": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "explanation": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "required_extensions": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "required_extensions",
+          "domain",
+          "reason",
+          "category",
+          "details_version",
+          "details",
+          "explanation",
+          "context"
+        ],
         "type": "object"
       },
       "FeatureInvocation": {
@@ -6931,6 +7139,34 @@
           "summary",
           "linked_tickets",
           "record_source"
+        ],
+        "type": "object"
+      },
+      "OperationContext": {
+        "properties": {
+          "operation": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation_ref": {
+            "description": "A reference, not an idempotency/retry grant. Disclosure remains domain-owned.",
+            "maxLength": 128,
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stage": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "stage"
         ],
         "type": "object"
       },
@@ -10485,6 +10721,17 @@
               "null"
             ]
           },
+          "last_lifecycle": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PluginServiceLifecycleDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Independent driver boundary observations; never delivery/retry authority."
+          },
           "last_outcome": {
             "anyOf": [
               {
@@ -10747,6 +10994,29 @@
           }
         ]
       },
+      "PluginServiceInvocationIdentity": {
+        "additionalProperties": false,
+        "description": "Exact owner-issued delivery identity, not a new operation or replay grant.",
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "invocation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "invocation_id",
+          "attempt"
+        ],
+        "type": "object"
+      },
       "PluginServiceLease": {
         "additionalProperties": false,
         "properties": {
@@ -10760,6 +11030,134 @@
         "required": [
           "consumer_id",
           "lease_token"
+        ],
+        "type": "object"
+      },
+      "PluginServiceLifecycleDiagnostic": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "known",
+                "type": "string"
+              },
+              "observations": {
+                "items": {
+                  "$ref": "#/components/schemas/PluginServiceLifecycleObservationDiagnostic"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "observations"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unsupported",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "corrupt",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginServiceLifecycleObservation": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "invocation": {
+                "$ref": "#/components/schemas/PluginServiceInvocationIdentity"
+              },
+              "kind": {
+                "const": "completion_unconfirmed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "invocation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "stop",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/PluginServiceExecutionFailure"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "release_unconfirmed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PluginServiceLifecycleObservationDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "failure": {
+            "$ref": "#/components/schemas/PluginServiceFailureDiagnostic"
+          },
+          "invocation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PluginServiceInvocationIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lease_id": {
+            "description": "One-way correlation of the existing lease, never its bearer credential.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_id",
+          "failure"
         ],
         "type": "object"
       },
@@ -11110,6 +11508,28 @@
           },
           {
             "additionalProperties": false,
+            "description": "Records only same-owner boundary evidence under an exact current/released\nproof. Does not complete an event, release a lease, or admit any effect.",
+            "properties": {
+              "kind": {
+                "const": "observe_lifecycle",
+                "type": "string"
+              },
+              "lease": {
+                "$ref": "#/components/schemas/PluginServiceLease"
+              },
+              "observation": {
+                "$ref": "#/components/schemas/PluginServiceLifecycleObservation"
+              }
+            },
+            "required": [
+              "kind",
+              "lease",
+              "observation"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
             "properties": {
               "consumer_id": {
                 "type": "string"
@@ -11271,6 +11691,19 @@
             "properties": {
               "kind": {
                 "const": "released",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "lifecycle_observed",
                 "type": "string"
               }
             },
@@ -13083,6 +13516,44 @@
         ],
         "type": "string"
       },
+      "RuntimeControlCause": {
+        "enum": [
+          "runtime_missing",
+          "worker_missing",
+          "invalid_worker_identifier",
+          "runtime_stopped",
+          "execution_unavailable",
+          "execution_failed",
+          "execution_rejected",
+          "restore_observation_stale",
+          "restore_observation_conflict",
+          "restore_admission_busy",
+          "stop_observation_conflict",
+          "stop_request_conflict",
+          "stop_admission_busy",
+          "create_request_conflict",
+          "invalid_request",
+          "workspace_binding_mismatch",
+          "configuration_unavailable",
+          "working_directory_failed",
+          "persistence_failed",
+          "persistence_outcome_unknown",
+          "store_unavailable",
+          "state_unavailable",
+          "authorization_failed",
+          "connection_failed",
+          "transport_failed",
+          "timed_out",
+          "request_encoding_failed",
+          "client_setup_failed",
+          "response_too_large",
+          "invalid_response",
+          "result_unavailable",
+          "unsupported_operation",
+          "remote_rejected"
+        ],
+        "type": "string"
+      },
       "RuntimeIdentityAuthority": {
         "enum": [
           "runtime_registry_projection",
@@ -13647,6 +14118,22 @@
       "RuntimeWorkerInputResult": {
         "additionalProperties": false,
         "properties": {
+          "control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeControlCause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "control_explanation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -13710,6 +14197,22 @@
       "RuntimeWorkerLifecycleResult": {
         "additionalProperties": false,
         "properties": {
+          "control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeControlCause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "control_explanation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "diagnostics": {
             "default": [],
             "items": {
@@ -15069,9 +15572,228 @@
         ],
         "type": "object"
       },
+      "StartupCleanup": {
+        "oneOf": [
+          {
+            "enum": [
+              "not_needed",
+              "required",
+              "confirmed"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "failed": {
+                "$ref": "#/components/schemas/StartupCleanupFailure"
+              }
+            },
+            "required": [
+              "failed"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "StartupCleanupFailure": {
+        "enum": [
+          "ownership",
+          "workdir",
+          "artifacts",
+          "allocation",
+          "feature",
+          "unsupported"
+        ],
+        "type": "string"
+      },
       "StartupFailureAttachment": {
         "description": "A bounded, projected envelope at the Worker/Runtime or metadata boundary.\nNo constructor accepts Display text, arbitrary JSON fields, or an unprojected error.",
         "type": "string"
+      },
+      "StartupFailureObservations": {
+        "additionalProperties": false,
+        "description": "Projected startup evidence and independent owner observations. This does not\nattest lifecycle completion, durable receipt, current visibility or retry rights.",
+        "properties": {
+          "io_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupIoKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "persistence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupPersistenceOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "primary": {
+            "$ref": "#/components/schemas/StartupFailureAttachment"
+          },
+          "resources": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupResourceFacts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "secondary": {
+            "items": {
+              "$ref": "#/components/schemas/StartupSecondaryFailure"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "primary"
+        ],
+        "type": "object"
+      },
+      "StartupFailurePhase": {
+        "oneOf": [
+          {
+            "enum": [
+              "cleanup",
+              "runtime_record_delete",
+              "runtime_snapshot_save",
+              "runtime_removal_publish",
+              "metadata_save"
+            ],
+            "type": "string"
+          },
+          {
+            "const": "runtime_reconciliation_record_save",
+            "description": "Retaining create reconciliation observations in the canonical Worker record.",
+            "type": "string"
+          },
+          {
+            "const": "runtime_reconciliation_publish",
+            "description": "Publishing a retained record to Runtime subscribers; not a durable write.",
+            "type": "string"
+          }
+        ]
+      },
+      "StartupIoKind": {
+        "description": "Path-free IO classification. Nonportable OS details remain at the resource owner.",
+        "enum": [
+          "not_found",
+          "permission_denied",
+          "already_exists",
+          "invalid_input",
+          "invalid_data",
+          "interrupted",
+          "timed_out",
+          "would_block",
+          "unexpected_eof",
+          "other"
+        ],
+        "type": "string"
+      },
+      "StartupPersistenceOutcome": {
+        "description": "Persisted is evidence only for this attachment/record write, not execution completion.",
+        "enum": [
+          "persisted",
+          "not_saved",
+          "conflict",
+          "outcome_unknown"
+        ],
+        "type": "string"
+      },
+      "StartupResourceFacts": {
+        "properties": {
+          "cleanup": {
+            "$ref": "#/components/schemas/StartupCleanup"
+          },
+          "durable_effects_possible": {
+            "type": "boolean"
+          },
+          "resources": {
+            "$ref": "#/components/schemas/StartupResources"
+          }
+        },
+        "required": [
+          "resources",
+          "cleanup",
+          "durable_effects_possible"
+        ],
+        "type": "object"
+      },
+      "StartupResources": {
+        "description": "Independent resource observations from the existing execution owner. These diagnostics\nnever promote a result to RolledBack or authorize replay; the backend disposition does.",
+        "enum": [
+          "none",
+          "worker_startup",
+          "unproven"
+        ],
+        "type": "string"
+      },
+      "StartupSecondaryFailure": {
+        "description": "A separate secondary fact, not a replacement primary cause or a causal-chain link.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "projection_unavailable",
+                "type": "string"
+              },
+              "phase": {
+                "$ref": "#/components/schemas/StartupFailurePhase"
+              }
+            },
+            "required": [
+              "kind",
+              "phase"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/StartupCleanupFailure"
+              },
+              "kind": {
+                "const": "cleanup",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "failure"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "persistence",
+                "type": "string"
+              },
+              "outcome": {
+                "$ref": "#/components/schemas/StartupPersistenceOutcome"
+              },
+              "phase": {
+                "$ref": "#/components/schemas/StartupFailurePhase"
+              }
+            },
+            "required": [
+              "kind",
+              "phase",
+              "outcome"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "SubjectBodyApiError": {
         "additionalProperties": false,
@@ -21111,12 +21833,38 @@
       "WorkerRestoreResult": {
         "additionalProperties": false,
         "properties": {
+          "control": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RuntimeControlCause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "control_explanation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "diagnostics": {
             "default": [],
             "items": {
               "$ref": "#/components/schemas/Diagnostic"
             },
             "type": "array"
+          },
+          "startup": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupFailureObservations"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "state": {
             "$ref": "#/components/schemas/WorkerRestoreState"
@@ -23631,7 +24379,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:b0f5bc9c3e07b536335ef6ad93a5b4be8151b910a4a6c6cefc586c33be29734c"
+    "x-yoi-source-digest": "sha256:8c8607630989d8e6847c7423a9049301cb3ac11e944f826a61f6adde88ed6958"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -25310,6 +26058,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25319,6 +26072,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25330,6 +26088,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25339,6 +26102,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25350,6 +26133,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25360,6 +26148,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25369,6 +26162,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25788,6 +26601,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25797,6 +26615,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25808,6 +26631,41 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25817,6 +26675,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25828,6 +26691,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25837,6 +26705,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25895,6 +26783,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25904,6 +26797,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25915,6 +26813,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25924,6 +26827,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25935,6 +26843,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25944,6 +26857,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -25955,6 +26873,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -25964,6 +26887,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26032,6 +26975,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26041,6 +26989,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26052,6 +27005,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26061,6 +27019,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26072,6 +27050,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26082,6 +27065,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26091,6 +27079,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26149,6 +27157,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26158,6 +27171,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26169,6 +27187,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26178,6 +27201,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26189,6 +27232,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26199,6 +27247,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26208,6 +27261,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26264,6 +27337,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26273,6 +27351,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26284,6 +27367,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26293,6 +27381,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26304,6 +27397,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26313,6 +27411,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26324,6 +27427,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26333,6 +27441,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26391,6 +27519,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26400,6 +27533,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26411,6 +27549,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26420,6 +27563,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26431,6 +27594,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26441,6 +27609,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26450,6 +27623,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26518,6 +27711,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26527,6 +27725,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26538,6 +27741,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26547,6 +27755,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26558,6 +27771,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26567,6 +27785,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26578,6 +27801,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26587,6 +27815,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26655,6 +27903,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26664,6 +27917,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26675,6 +27933,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26684,6 +27947,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26695,6 +27963,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26704,6 +27977,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26715,6 +27993,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26724,6 +28007,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26792,6 +28095,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26801,6 +28109,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26812,6 +28125,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26821,6 +28139,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26832,6 +28155,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26841,6 +28169,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26852,6 +28185,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26861,6 +28199,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26929,6 +28287,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26938,6 +28301,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26949,6 +28317,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26958,6 +28331,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26969,6 +28347,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26978,6 +28361,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -26989,6 +28377,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -26999,6 +28392,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -27008,6 +28406,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -27076,6 +28479,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -27085,6 +28493,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -27096,6 +28509,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -27105,6 +28523,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -27116,6 +28539,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -27125,6 +28553,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -27136,6 +28569,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -27146,6 +28584,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -27155,6 +28598,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -29974,7 +31422,37 @@
             },
             "description": "Error response"
           },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveApiError"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
             "content": {
               "application/json": {
                 "schema": {
@@ -31064,6 +32542,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -31073,6 +32556,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -31084,6 +32572,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -31093,6 +32586,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -31104,6 +32617,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -31114,6 +32632,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -31123,6 +32646,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36029,6 +37572,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36038,6 +37586,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36049,6 +37602,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36058,6 +37616,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36069,6 +37647,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36079,6 +37662,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36088,6 +37676,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36154,6 +37762,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36163,6 +37776,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36174,6 +37792,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36183,6 +37806,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36194,6 +37822,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36203,6 +37836,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36214,6 +37852,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36223,6 +37866,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36291,6 +37954,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36300,6 +37968,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36311,6 +37984,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36320,6 +37998,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36331,6 +38014,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36340,6 +38028,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36351,6 +38044,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36360,6 +38058,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36416,6 +38134,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36425,6 +38148,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36436,6 +38164,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36445,6 +38178,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36456,6 +38209,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36466,6 +38224,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36475,6 +38238,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36541,6 +38324,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36550,6 +38338,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36561,6 +38354,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36570,6 +38368,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36581,6 +38384,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36590,6 +38398,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36601,6 +38414,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36610,6 +38428,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36678,6 +38516,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36687,6 +38530,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36698,6 +38546,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36707,6 +38560,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36718,6 +38576,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36727,6 +38590,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36738,6 +38606,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36747,6 +38620,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36805,6 +38698,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36814,6 +38712,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36825,6 +38728,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36834,6 +38742,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36845,6 +38758,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36854,6 +38772,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36865,6 +38788,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36874,6 +38802,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36942,6 +38890,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36951,6 +38904,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36962,6 +38920,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36971,6 +38934,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -36982,6 +38950,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -36991,6 +38964,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37002,6 +38980,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37011,6 +38994,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37089,6 +39092,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37098,6 +39106,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37109,6 +39122,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37118,6 +39136,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37129,6 +39167,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37139,6 +39182,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37148,6 +39196,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37206,6 +39274,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37215,6 +39288,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37226,6 +39304,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37235,6 +39318,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37246,6 +39334,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37255,6 +39348,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37266,6 +39364,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37276,6 +39379,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37285,6 +39393,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37458,6 +39571,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37467,6 +39585,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37478,6 +39601,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37488,6 +39616,26 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37497,6 +39645,56 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37565,6 +39763,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37574,6 +39777,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37585,6 +39793,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37594,6 +39807,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37605,6 +39838,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37615,6 +39853,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37624,6 +39867,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37690,6 +39953,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37699,6 +39967,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37710,6 +39983,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37719,6 +39997,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37730,6 +40013,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37739,6 +40027,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37750,6 +40043,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37759,6 +40057,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37827,6 +40145,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37836,6 +40159,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37847,6 +40175,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37856,6 +40189,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37867,6 +40220,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37877,6 +40235,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37886,6 +40249,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37964,6 +40347,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37973,6 +40361,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -37984,6 +40377,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -37993,6 +40391,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38004,6 +40407,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38013,6 +40421,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38024,6 +40437,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38033,6 +40451,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38111,6 +40549,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38120,6 +40563,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38131,6 +40579,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38140,6 +40593,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38151,6 +40609,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38160,6 +40623,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38171,6 +40639,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38180,6 +40653,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38267,6 +40760,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38276,6 +40774,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38287,6 +40790,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38296,6 +40804,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38307,6 +40820,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38316,6 +40834,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38327,6 +40850,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38337,6 +40865,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38346,6 +40879,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38424,6 +40977,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38433,6 +40991,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38444,6 +41007,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38453,6 +41021,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38464,6 +41037,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38473,6 +41051,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38484,6 +41067,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38493,6 +41081,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38571,6 +41179,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38580,6 +41193,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38591,6 +41209,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38600,6 +41223,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38611,6 +41239,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38620,6 +41253,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38631,6 +41269,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38640,6 +41283,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38718,6 +41381,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38727,6 +41395,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38738,6 +41411,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38747,6 +41425,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38758,6 +41441,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38767,6 +41455,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38778,6 +41471,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38787,6 +41485,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38865,6 +41583,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38874,6 +41597,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38885,6 +41613,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38894,6 +41627,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38905,6 +41643,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38914,6 +41657,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -38925,6 +41673,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -38934,6 +41687,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39002,6 +41775,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39011,6 +41789,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39022,6 +41805,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39031,6 +41819,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39042,6 +41835,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39051,6 +41849,56 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39117,6 +41965,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39126,6 +41979,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39137,6 +41995,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39146,6 +42009,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39157,6 +42025,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39166,6 +42039,56 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39254,6 +42177,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39263,6 +42191,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39274,6 +42207,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39283,6 +42221,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39294,6 +42237,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39303,6 +42251,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39314,6 +42267,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39324,6 +42282,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39333,6 +42296,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39411,6 +42379,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39420,6 +42393,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39431,6 +42409,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39440,6 +42423,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39451,6 +42439,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39460,6 +42453,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -39471,6 +42469,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39481,6 +42484,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -39490,6 +42498,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -48883,6 +51896,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -48892,6 +51910,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -48903,6 +51926,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -48912,6 +51940,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -48923,6 +51971,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -48933,6 +51986,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -48942,6 +52000,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -48998,6 +52076,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49007,6 +52090,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49018,6 +52106,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49027,6 +52120,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49038,6 +52136,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49047,6 +52150,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49058,6 +52166,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49067,6 +52180,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49115,6 +52248,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49124,6 +52262,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49135,6 +52278,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49144,6 +52292,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49155,6 +52323,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49165,6 +52338,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49174,6 +52352,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49232,6 +52430,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49241,6 +52444,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49252,6 +52460,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49261,6 +52474,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -49272,6 +52505,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49282,6 +52520,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -49291,6 +52534,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50122,6 +53385,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50131,6 +53399,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50142,6 +53415,41 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50151,6 +53459,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50162,6 +53475,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50171,6 +53489,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50215,6 +53553,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50224,6 +53567,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50235,6 +53583,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50244,6 +53597,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50255,6 +53613,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50264,6 +53627,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50275,6 +53643,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50284,6 +53657,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50320,6 +53713,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50329,6 +53727,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50340,6 +53743,41 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50349,6 +53787,11 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },
@@ -50360,6 +53803,11 @@
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
                 }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
               }
             },
             "description": "Error response"
@@ -50369,6 +53817,26 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                }
+              }
+            },
+            "description": "Error response"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepositoryApiError"
+                }
+              },
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
                 }
               }
             },

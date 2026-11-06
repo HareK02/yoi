@@ -172,6 +172,10 @@ async fn runtime_api_wire_compatibility(
         response.status(),
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
     ) && !is_json_error
+        && response
+            .extensions()
+            .get::<Arc<runtime_api::RuntimeApiError>>()
+            .is_none()
     {
         return RuntimeHttpRestError::new(
             StatusCode::BAD_REQUEST,
@@ -226,6 +230,11 @@ where
 fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
     let mut response =
         runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message);
+    if error.startup.is_none() {
+        if let Some(cause) = error.control {
+            response = response.with_control(cause);
+        }
+    }
     response.error.startup = error.startup;
     response
 }
@@ -783,6 +792,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         let result = result
             .map(|result| -> Result<_, runtime_api::RuntimeApiError> {
                 Ok(runtime_api::WorkerRestoreResponse {
+                    control: result.control,
+                    startup: result.startup,
                     state: match result.state {
                         server_api::WorkerRestoreState::Accepted => {
                             runtime_api::WorkerRestoreState::Accepted
@@ -836,6 +847,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
         Ok(runtime_api::WorkerRestoreResponse {
+            control: result.control,
+            startup: result.startup,
             state: match result.state {
                 server_api::WorkerRestoreState::Accepted => {
                     runtime_api::WorkerRestoreState::Accepted

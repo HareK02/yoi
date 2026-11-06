@@ -184,6 +184,7 @@ impl Owner {
             current_event_id: Some("event".into()),
             lease_active: state.lease.is_some(),
             last_outcome: None,
+            last_lifecycle: None,
         }
     }
 }
@@ -323,6 +324,10 @@ impl PluginHostOwner for Owner {
                 }
                 state.lease = None;
                 PluginServiceResponse::Released
+            }
+            PluginServiceRequest::ObserveLifecycle { lease, .. } => {
+                assert_eq!(lease.consumer_id, self.consumer());
+                PluginServiceResponse::LifecycleObserved
             }
             PluginServiceRequest::Diagnostics { consumer_id } => {
                 assert_eq!(consumer_id, self.consumer());
@@ -675,10 +680,15 @@ async fn unconfirmed_release_retains_the_exact_proof_until_retry_is_confirmed() 
     assert!(driver.stopped(context.clone()).await.is_err());
     assert_eq!(driver.lease.lock().unwrap().as_ref(), Some(&lease));
     assert_eq!(owner.state.lock().unwrap().lease.as_ref(), Some(&lease));
+    assert!(owner.requests().iter().any(|request| request
+        == &PluginServiceRequest::Release {
+            lease: lease.clone(),
+        }));
     assert_eq!(
         owner.requests().last(),
-        Some(&PluginServiceRequest::Release {
+        Some(&PluginServiceRequest::ObserveLifecycle {
             lease: lease.clone(),
+            observation: PluginServiceLifecycleObservation::ReleaseUnconfirmed,
         })
     );
     owner.deny_release.store(false, Ordering::SeqCst);

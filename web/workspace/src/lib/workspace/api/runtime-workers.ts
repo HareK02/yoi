@@ -15,6 +15,21 @@ import type {
   WorkerRetentionResponse,
 } from "#lib/generated/runtime-api.ts";
 
+import type {
+  StartupCleanup,
+  StartupCleanupFailure,
+  StartupFailureAttachment,
+  StartupFailurePhase,
+  StartupIoKind,
+  StartupPersistenceOutcome,
+  StartupResourceFacts,
+  StartupResources,
+  StartupSecondaryFailure,
+} from "#lib/generated/protocol.ts";
+import { FAILURE_LIMITS } from "#lib/generated/error-contract.ts";
+import { failureString } from "#lib/workspace/failure/receive.ts";
+import { parseRuntimeControl } from "#lib/workspace/failure/runtime-control.ts";
+import type { RuntimeControlEvidence } from "#lib/workspace/failure/runtime-control.ts";
 import { parseWorkerSummary } from "#lib/workspace/api/workers.ts";
 
 const MAX_STRING_BYTES = 4_096;
@@ -315,12 +330,12 @@ const WORKER_OPERATION_STATES = new Set<WorkerOperationState>([
 
 export function parseRuntimeWorkerLifecycleResult(
   value: unknown,
-): RuntimeWorkerLifecycleResult {
+): RuntimeWorkerLifecycleResult & RuntimeControlEvidence {
   const item = object(value, "Runtime Worker lifecycle result");
   exactKeys(
     item,
     ["state", "runtime_id", "worker_id", "diagnostics"],
-    ["replayed"],
+    ["replayed", "control", "control_explanation"],
     "Runtime Worker lifecycle result",
   );
   const state = boundedString(
@@ -331,6 +346,7 @@ export function parseRuntimeWorkerLifecycleResult(
     fail("Runtime Worker lifecycle result.state", "has an unknown value");
   }
   return {
+    ...parseRuntimeControl(item.control, item.control_explanation),
     replayed: item.replayed === undefined
       ? false
       : boolean(item.replayed, "Runtime Worker lifecycle result.replayed"),
@@ -350,10 +366,200 @@ export function parseRuntimeWorkerLifecycleResult(
   };
 }
 
+// 観測の保持だけを行う。attachmentのdecode・公開説明・settlementの選択はしない。
+export type RestoreStartupEvidence = {
+  primary: StartupFailureAttachment;
+  secondary: StartupSecondaryFailure[];
+  resources: StartupResourceFacts | null;
+  persistence: StartupPersistenceOutcome | null;
+  io_kind: StartupIoKind | null;
+};
+type RestoreStartupReceipt = {
+  startup?: RestoreStartupEvidence | null;
+  startupEvidenceUnavailable?: true;
+};
+
+const STARTUP_PHASES = {
+  cleanup: true,
+  runtime_record_delete: true,
+  runtime_snapshot_save: true,
+  runtime_removal_publish: true,
+  runtime_reconciliation_record_save: true,
+  runtime_reconciliation_publish: true,
+  metadata_save: true,
+} as const satisfies Record<StartupFailurePhase, true>;
+const STARTUP_CLEANUP_FAILURES = {
+  ownership: true,
+  workdir: true,
+  artifacts: true,
+  allocation: true,
+  feature: true,
+  unsupported: true,
+} as const satisfies Record<StartupCleanupFailure, true>;
+const STARTUP_PERSISTENCE = {
+  persisted: true,
+  not_saved: true,
+  conflict: true,
+  outcome_unknown: true,
+} as const satisfies Record<StartupPersistenceOutcome, true>;
+const STARTUP_RESOURCES = {
+  none: true,
+  worker_startup: true,
+  unproven: true,
+} as const satisfies Record<StartupResources, true>;
+const STARTUP_CLEANUP = {
+  not_needed: true,
+  required: true,
+  confirmed: true,
+} as const satisfies Record<Extract<StartupCleanup, string>, true>;
+const STARTUP_IO = {
+  not_found: true,
+  permission_denied: true,
+  already_exists: true,
+  invalid_input: true,
+  invalid_data: true,
+  interrupted: true,
+  timed_out: true,
+  would_block: true,
+  unexpected_eof: true,
+  other: true,
+} as const satisfies Record<StartupIoKind, true>;
+
+function startupEnum<T extends string>(
+  value: unknown,
+  values: Record<T, true>,
+  path: string,
+): T {
+  if (typeof value !== "string" || !Object.hasOwn(values, value)) {
+    return fail(path, "has an unsupported value");
+  }
+  return value as T;
+}
+
+function startupCleanup(value: unknown, path: string): StartupCleanup {
+  if (typeof value === "string") {
+    return startupEnum(value, STARTUP_CLEANUP, path);
+  }
+  const item = object(value, path);
+  exactKeys(item, ["failed"], [], path);
+  return {
+    failed: startupEnum(
+      item.failed,
+      STARTUP_CLEANUP_FAILURES,
+      `${path}.failed`,
+    ),
+  };
+}
+
+function startupResources(value: unknown, path: string): StartupResourceFacts {
+  const item = object(value, path);
+  exactKeys(
+    item,
+    ["resources", "cleanup", "durable_effects_possible"],
+    [],
+    path,
+  );
+  return {
+    resources: startupEnum(
+      item.resources,
+      STARTUP_RESOURCES,
+      `${path}.resources`,
+    ),
+    cleanup: startupCleanup(item.cleanup, `${path}.cleanup`),
+    durable_effects_possible: boolean(
+      item.durable_effects_possible,
+      `${path}.durable_effects_possible`,
+    ),
+  };
+}
+
+function startupSecondary(
+  value: unknown,
+  path: string,
+): StartupSecondaryFailure {
+  const item = object(value, path);
+  switch (item.kind) {
+    case "projection_unavailable":
+      exactKeys(item, ["kind", "phase"], [], path);
+      return {
+        kind: item.kind,
+        phase: startupEnum(item.phase, STARTUP_PHASES, `${path}.phase`),
+      };
+    case "cleanup":
+      exactKeys(item, ["kind", "failure"], [], path);
+      return {
+        kind: item.kind,
+        failure: startupEnum(
+          item.failure,
+          STARTUP_CLEANUP_FAILURES,
+          `${path}.failure`,
+        ),
+      };
+    case "persistence":
+      exactKeys(item, ["kind", "phase", "outcome"], [], path);
+      return {
+        kind: item.kind,
+        phase: startupEnum(item.phase, STARTUP_PHASES, `${path}.phase`),
+        outcome: startupEnum(
+          item.outcome,
+          STARTUP_PERSISTENCE,
+          `${path}.outcome`,
+        ),
+      };
+    default:
+      return fail(`${path}.kind`, "has an unsupported value");
+  }
+}
+
+function restoreStartup(value: unknown, path: string): RestoreStartupReceipt {
+  if (value === undefined) return {};
+  if (value === null) return { startup: null };
+  try {
+    const item = object(value, path);
+    exactKeys(item, ["primary"], [
+      "secondary",
+      "resources",
+      "persistence",
+      "io_kind",
+    ], path);
+    return {
+      startup: {
+        // Serdeのtransparent stringはopaqueなまま保持する。JSON本文を表示に使わない。
+        primary: failureString(item.primary, FAILURE_LIMITS.bytes),
+        secondary: item.secondary === undefined
+          ? []
+          : array(item.secondary, `${path}.secondary`, MAX_DIAGNOSTICS).map(
+            (entry, index) =>
+              startupSecondary(entry, `${path}.secondary[${index}]`),
+          ),
+        resources: item.resources == null
+          ? null
+          : startupResources(item.resources, `${path}.resources`),
+        persistence: item.persistence == null ? null : startupEnum(
+          item.persistence,
+          STARTUP_PERSISTENCE,
+          `${path}.persistence`,
+        ),
+        io_kind: item.io_kind == null
+          ? null
+          : startupEnum(item.io_kind, STARTUP_IO, `${path}.io_kind`),
+      },
+    };
+  } catch {
+    // 未対応・不正な任意観測で、別の正本が持つRestore stateを失わない。
+    return { startupEvidenceUnavailable: true };
+  }
+}
+
 /** Restore is a wrapped Workspace response, not the flat Stop lifecycle result. */
 export function parseWorkerRestoreResponse(
   value: unknown,
-): WorkerRestoreResponse {
+): WorkerRestoreResponse & {
+  result:
+    & WorkerRestoreResponse["result"]
+    & RuntimeControlEvidence
+    & RestoreStartupReceipt;
+} {
   const path = "Worker Restore response";
   const item = object(value, path);
   exactKeys(
@@ -363,7 +569,12 @@ export function parseWorkerRestoreResponse(
     path,
   );
   const result = object(item.result, `${path}.result`);
-  exactKeys(result, ["state"], ["diagnostics", "worker"], `${path}.result`);
+  exactKeys(
+    result,
+    ["state"],
+    ["diagnostics", "worker", "control", "control_explanation", "startup"],
+    `${path}.result`,
+  );
   const state = boundedString(result.state, `${path}.result.state`);
   if (
     ![
@@ -395,6 +606,8 @@ export function parseWorkerRestoreResponse(
     runtime_id,
     worker_id,
     result: {
+      ...parseRuntimeControl(result.control, result.control_explanation),
+      ...restoreStartup(result.startup, `${path}.result.startup`),
       state: state as WorkerRestoreState,
       diagnostics: result.diagnostics === undefined
         ? []

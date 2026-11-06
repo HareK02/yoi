@@ -39,7 +39,25 @@ export type PluginServiceDiagnostics = { consumer_id: string, pause_reason: Plug
 /**
  * Last owner-committed invocation observation, not a retry or recovery grant.
  */
-last_outcome?: PluginServiceOutcomeDiagnostic | null, };
+last_outcome?: PluginServiceOutcomeDiagnostic | null,
+/**
+ * Independent driver boundary observations; never delivery/retry authority.
+ */
+last_lifecycle?: PluginServiceLifecycleDiagnostic | null, };
+
+export type PluginServiceLifecycleOperation = "admit" | "publish";
+
+export type PluginServiceInvocationIdentity = { event_id: string, invocation_id: string, attempt: number, };
+
+export type PluginServiceLifecycleObservation = { "kind": "completion_unconfirmed", invocation: PluginServiceInvocationIdentity, } | { "kind": "stop", reason: PluginServiceExecutionFailure, } | { "kind": "release_unconfirmed" };
+
+export type PluginServiceLifecycleObservationDiagnostic = {
+/**
+ * One-way correlation of the existing lease, never its bearer credential.
+ */
+lease_id: string, invocation: PluginServiceInvocationIdentity | null, failure: PluginServiceFailureDiagnostic, };
+
+export type PluginServiceLifecycleDiagnostic = { "kind": "known", observations: Array<PluginServiceLifecycleObservationDiagnostic>, } | { "kind": "unsupported" } | { "kind": "corrupt" };
 
 export type PluginServiceRecoveryAction = { "kind": "resume" } | { "kind": "skip", event_id: string, } | { "kind": "accept_gap" };
 

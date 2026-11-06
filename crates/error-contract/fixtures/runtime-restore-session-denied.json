@@ -1,0 +1,35 @@
+{
+  "workspace_id": "home-owner",
+  "runtime_id": "fixture-runtime",
+  "worker_id": "fixture-worker",
+  "result": {
+    "startup": {
+      "primary": "{\"version\":1,\"required_extensions\":[],\"domain\":\"session_registration\",\"reason\":\"permission_denied\",\"category\":\"authorization\",\"details_version\":1,\"details\":{\"reason\":\"permission_denied\",\"principal\":\"subject\",\"required_operation\":\"session.record\"},\"explanation\":\"Session registration permission denied.\",\"context\":{\"operations\":[{\"operation\":\"session.record\",\"stage\":\"registration\",\"operation_ref\":null},{\"operation\":\"worker_startup\",\"stage\":\"binding\",\"operation_ref\":null}],\"causes\":[],\"diagnostics\":[],\"correlation\":null,\"supplementary_omitted\":false}}",
+      "secondary": [
+        {
+          "kind": "cleanup",
+          "failure": "workdir"
+        }
+      ],
+      "resources": {
+        "resources": "worker_startup",
+        "cleanup": {
+          "failed": "workdir"
+        },
+        "durable_effects_possible": true
+      },
+      "persistence": "outcome_unknown",
+      "io_kind": null
+    },
+    "control_explanation": "Session registration permission denied.",
+    "control": "execution_rejected",
+    "state": "rolled_back",
+    "diagnostics": [
+      {
+        "code": "supplementary_cleanup",
+        "severity": "error",
+        "message": "Supplementary cleanup observation is not the primary failure"
+      }
+    ]
+  }
+}

@@ -27,12 +27,14 @@ impl WorkspaceClient for RecordingClient {
             let body: Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
             assert_eq!(Some(body), self.authorizations.lock().unwrap().pop_front());
             return Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: json!({"scope": null}).to_string(),
             });
         }
         self.requests.lock().unwrap().push(request);
         Ok(WorkspaceResponse {
+            content_type: None,
             status: self.status,
             body: self.body.clone(),
         })

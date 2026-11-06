@@ -6,6 +6,10 @@ pub fn plugin_host_typescript() -> String {
     let config = ts_rs::Config::default();
     let declarations = [
         PluginServiceLease::decl(&config),
+        PluginServiceInvocationIdentity::decl(&config),
+        PluginServiceLifecycleObservation::decl(&config),
+        PluginServiceLifecycleObservationDiagnostic::decl(&config),
+        PluginServiceLifecycleDiagnostic::decl(&config),
         PluginTicketEventType::decl(&config),
         PluginTicketEventEnvelope::decl(&config),
         PluginServiceEventResult::decl(&config),
@@ -76,6 +80,11 @@ pub fn plugin_api_typescript() -> String {
         PluginServiceFailureDiagnostic::decl(&config),
         PluginServiceOutcomeDiagnostic::decl(&config),
         PluginServiceDiagnostics::decl(&config),
+        PluginServiceLifecycleOperation::decl(&config),
+        PluginServiceInvocationIdentity::decl(&config),
+        PluginServiceLifecycleObservation::decl(&config),
+        PluginServiceLifecycleObservationDiagnostic::decl(&config),
+        PluginServiceLifecycleDiagnostic::decl(&config),
         PluginServiceRecoveryAction::decl(&config),
         PluginServiceRecoveryRequest::decl(&config),
         PluginDataSchemaMetadata::decl(&config),

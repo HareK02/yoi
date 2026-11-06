@@ -312,12 +312,14 @@ fn execute_remote_worker_remove_http_blocking(
     ));
     match result {
         Ok(response) => Ok(WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&response)
                 .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?,
         }),
         Err(server_api::client_support::ClientError::Public { status, error }) => {
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: status.as_u16(),
                 body: serde_json::to_string(&error).map_err(|error| {
                     RuntimeWorkerMutationForwardError::Transport(error.to_string())
@@ -503,9 +505,23 @@ impl RuntimeOwnedWorkspaceClient {
             .map_err(|error| {
                 WorkspaceClientError::Request(format!("{request_label} failed: {error}"))
             })?;
+        let mut values = response
+            .headers
+            .get_all(reqwest::header::CONTENT_TYPE)
+            .iter();
+        let content_type = values
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let content_type = if values.next().is_none() {
+            content_type
+        } else {
+            None
+        };
         let body = String::from_utf8(response.body)
             .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
         Ok(WorkspaceResponse {
+            content_type,
             status: response.status.as_u16(),
             body,
         })
@@ -534,12 +550,32 @@ fn generated_workspace_response<T: serde::Serialize>(
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     match response {
         Ok(response) => Ok(WorkspaceResponse {
+            content_type: Some("application/json".to_owned()),
             status: 200,
             body: serde_json::to_string(&response)
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
         }),
         Err(server_api::client_support::ClientError::Public { status, error }) => {
+            // The generated receiver already validated the actual status, media type and
+            // envelope. Reproject its typed cause instead of serializing skipped state
+            // or relabeling a legacy JSON body as a received Problem response.
+            if let Some(cause) = error.control_cause() {
+                let problem =
+                    server_api::control_failure::control_problem(cause).map_err(|_| {
+                        WorkspaceClientError::Request(
+                            "control failure projection unavailable".into(),
+                        )
+                    })?;
+                return Ok(WorkspaceResponse {
+                    status: status.as_u16(),
+                    content_type: Some(problem.content_type.to_owned()),
+                    body: String::from_utf8(problem.body.to_vec()).map_err(|_| {
+                        WorkspaceClientError::Request("control failure encoding unavailable".into())
+                    })?,
+                });
+            }
             Ok(WorkspaceResponse {
+                content_type: Some("application/json".to_owned()),
                 status: status.as_u16(),
                 body: serde_json::to_string(&error)
                     .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -1014,6 +1050,98 @@ mod tests {
             (head, body)
         });
         (base_url, server)
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
+    fn workspace_http_response_retains_actual_media_without_body_inference() {
+        for (header, expected) in [
+            (
+                "Content-Type: application/problem+json\r\n",
+                Some("application/problem+json"),
+            ),
+            ("Content-Type: text/plain\r\n", Some("text/plain")),
+            ("", None),
+            (
+                "Content-Type: application/problem+json\r\nContent-Type: text/plain\r\n",
+                None,
+            ),
+        ] {
+            let body = r#"{"type":"urn:yoi:problem:runtime-control"}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (base_url, server) = binary_loopback(response.into_bytes());
+            let client =
+                RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                    .with_request_timeout(Some(Duration::from_secs(5)));
+            let received = client
+                .execute(WorkspaceRequest::get("/api/w/workspace-a/test"))
+                .unwrap();
+            server.join().unwrap();
+            assert_eq!(received.status, 403);
+            assert_eq!(received.content_type.as_deref(), expected);
+            assert_eq!(received.body, body);
+        }
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
+    fn generated_worker_control_keeps_validated_cause_and_rejects_mislabeled_problem() {
+        use error_contract::{Budget, DecodeFailure};
+        use protocol::control_failure::RuntimeControlCause as C;
+        let problem = server_api::control_failure::control_problem(C::AuthorizationFailed).unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&problem.body).unwrap();
+        body["detail"] = "PRIVATE_RECEIVED_TEXT".into();
+        body["yoi_failure"]["explanation"] = "PRIVATE_RECEIVED_TEXT".into();
+        let body = body.to_string();
+        for (status, media, known) in [
+            (403, "application/problem+json", true),
+            (403, "text/plain", false),
+            (409, "application/problem+json", false),
+        ] {
+            let response = format!(
+                "HTTP/1.1 {status} Failure\r\nContent-Type: {media}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (base_url, server) = binary_loopback(response.into_bytes());
+            let client =
+                RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                    .with_request_timeout(Some(Duration::from_secs(5)));
+            let received =
+                client.execute_server_operation(WorkspaceServerOperation::WorkerControlStop {
+                    runtime_id: "runtime-a".into(),
+                    worker_id: "worker-a".into(),
+                    request: server_api::RuntimeWorkerLifecycleRequest {
+                        stop_intent: None,
+                        reason: None,
+                        ticket_assignment: None,
+                    },
+                });
+            server.join().unwrap();
+            if known {
+                let received = received.unwrap();
+                assert_eq!(received.status, status);
+                assert_eq!(received.content_type.as_deref(), Some(media));
+                assert!(!received.body.contains("PRIVATE_RECEIVED_TEXT"));
+                let DecodeFailure::Known(failure) =
+                    error_contract::problem::decode_problem_details::<C>(
+                        received.body.as_bytes(),
+                        received.status,
+                        received.content_type.as_deref().unwrap(),
+                        &server_api::control_failure::ControlBoundary,
+                        Budget::new(16384, 16384),
+                    )
+                else {
+                    panic!("validated cause lost at the generated-to-Worker boundary")
+                };
+                assert_eq!(failure.facts().cause(), &C::AuthorizationFailed);
+            } else {
+                let error = received.unwrap_err();
+                assert!(!error.to_string().contains("PRIVATE_RECEIVED_TEXT"));
+            }
+        }
     }
 
     #[cfg(feature = "http-server")]
@@ -1908,6 +2036,7 @@ mod tests {
                     reason.to_string(),
                 ));
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 202,
                     body: "accepted".to_string(),
                 })
