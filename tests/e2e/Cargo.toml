@@ -49,6 +49,11 @@ path = "tests/rewind.rs"
 required-features = ["e2e"]
 
 [[test]]
+name = "configuration_cli"
+path = "tests/configuration_cli.rs"
+required-features = ["e2e"]
+
+[[test]]
 name = "worker_environment"
 path = "tests/worker_environment.rs"
 required-features = ["e2e"]

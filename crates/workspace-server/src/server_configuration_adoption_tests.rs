@@ -3,9 +3,12 @@ mod configuration_adoption_http_integration {
     //! Ordinary Server library integration tests: real catalog router (including
     //! cookie-origin middleware), owner/session lookup, builtin permission catalog,
     //! migration, guarded Feature storage and Server SQLite adoption. Only unused
-    //! Runtime execution is the existing deterministic fixture. Router oneshot is
-    //! the HTTP boundary; these are not TCP-loss, OS-crash or store-fault tests.
-    //! The separate configuration_transfer/config_adoption suites own store faults.
+    //! Runtime execution is the existing deterministic fixture. Existing route tests
+    //! use Router oneshot; cli_tcp tests connect the production CLI library and
+    //! generated client over loopback TCP to this same Server and real SQLite.
+    //! The response-loss case fails one outbound body only after a real commit;
+    //! it does not simulate arbitrary TCP loss or OS crashes. The separate
+    //! configuration_transfer/config_adoption suites own store faults.
     use super::*;
     use server_api::authorization::{
         PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,
@@ -335,6 +338,877 @@ mod configuration_adoption_http_integration {
         let (status, resolution) = f.call(request).await;
         assert_eq!(status, StatusCode::OK, "{resolution}");
         assert!(resolution["allowed"].get("ticket.read").is_some());
+    }
+
+    struct CliBearer(String);
+
+    impl server_api::client_support::RequestAuthorizer for CliBearer {
+        fn authorize(
+            &self,
+            _: server_api::client_support::AuthorizerRequest<'_>,
+        ) -> std::result::Result<
+            reqwest::header::HeaderMap,
+            server_api::client_support::AuthorizationError,
+        > {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.0).parse().unwrap(),
+            );
+            Ok(headers)
+        }
+    }
+
+    #[derive(Default)]
+    struct CommitResponseLoss {
+        requests: Vec<Vec<u8>>,
+        lost_receipt: Option<Receipt>,
+    }
+
+    async fn fail_first_committed_response(
+        axum::extract::State(evidence): axum::extract::State<
+            Arc<std::sync::Mutex<CommitResponseLoss>>,
+        >,
+        request: Request<Body>,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        if request.method() != axum::http::Method::POST
+            || request.uri().path() != Fixture::path("/commit")
+        {
+            return next.run(request).await;
+        }
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+        evidence.lock().unwrap().requests.push(bytes.to_vec());
+        let response = next
+            .run(Request::from_parts(parts, Body::from(bytes)))
+            .await;
+        if !response.status().is_success() || evidence.lock().unwrap().lost_receipt.is_some() {
+            return response;
+        }
+
+        // This runs after the actual router has returned its committed receipt.
+        // Preserve the request and response headers; fail only the outbound body.
+        let (parts, body) = response.into_parts();
+        let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
+        let receipt: Receipt = serde_json::from_slice(&bytes).unwrap();
+        evidence.lock().unwrap().lost_receipt = Some(receipt);
+        let truncated = bytes.slice(..bytes.len() / 2);
+        let body = Body::from_stream(futures::stream::iter([
+            Ok(truncated),
+            Err(std::io::Error::other(
+                "injected body failure after Server commit",
+            )),
+        ]));
+        axum::response::Response::from_parts(parts, body)
+    }
+
+    struct CliServer {
+        origin: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for CliServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl CliServer {
+        async fn start(fixture: &Fixture) -> Self {
+            Self::serve(fixture.app.clone()).await
+        }
+
+        async fn with_commit_response_loss(
+            fixture: &Fixture,
+        ) -> (Self, Arc<std::sync::Mutex<CommitResponseLoss>>) {
+            let evidence = Arc::new(std::sync::Mutex::new(CommitResponseLoss::default()));
+            let app = fixture
+                .app
+                .clone()
+                .layer(axum::middleware::from_fn_with_state(
+                    evidence.clone(),
+                    fail_first_committed_response,
+                ));
+            (Self::serve(app).await, evidence)
+        }
+
+        async fn serve(app: Router) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            Self { origin, task }
+        }
+
+        fn client(&self, token: &str) -> server_api::ConfigurationAdoptionApiClient<CliBearer> {
+            server_api::ConfigurationAdoptionApiClient::builder(&self.origin)
+                .unwrap()
+                .client(
+                    reqwest::Client::builder()
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .unwrap(),
+                )
+                .authorizer(CliBearer(token.to_owned()))
+                .request_timeout(std::time::Duration::from_secs(15))
+                .response_body_limit(4 * 1024 * 1024)
+                .build()
+                .unwrap()
+        }
+
+        async fn run(
+            &self,
+            token: &str,
+            directory: &std::path::Path,
+            command: yoi::config_cli::Command,
+        ) -> std::result::Result<String, yoi::config_cli::Error> {
+            let api = self.client(token);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(45),
+                yoi::config_cli::run(
+                    &api,
+                    &self.origin,
+                    TEST_WORKSPACE_ID,
+                    &yoi::config_cli::Options {
+                        command,
+                        directory: directory.to_owned(),
+                    },
+                ),
+            )
+            .await
+            .expect("bounded CLI command against real Server")
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_tcp_lost_commit_response_recovers_real_receipt_without_reapplying_policy_or_losing_edits()
+     {
+        use yoi::config_cli::Command::*;
+        for recovery in [Reconcile, Retry] {
+            let f = Fixture::new().await;
+            let (server, evidence) = CliServer::with_commit_response_loss(&f).await;
+            let dir = tempfile::tempdir().unwrap();
+            let checkout = dir.path().join("checkout");
+            server.run(&f.owner, &checkout, Pull).await.unwrap();
+            let draft = f.source().await;
+            let path = permission_path(&draft);
+            let local = checkout.join("source").join(&path);
+            let sent_text = permission_source(&f.subject, "ticket.create", "ticket.query");
+            std::fs::write(&local, &sent_text).unwrap();
+
+            let error = server.run(&f.owner, &checkout, Push).await.unwrap_err();
+            assert_eq!(error.exit_code, 7, "{recovery:?}: {error}");
+            assert!(error.message.contains("unknown"), "{error}");
+            let metadata = checkout.join(".yoi-config/state.json");
+            let unknown: Value =
+                serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+            let pending: Adoption = serde_json::from_value(unknown["pending"].clone()).unwrap();
+            assert_eq!(unknown["base"]["history_head"], Value::Null);
+            let (receipt, original_wire) = {
+                let captured = evidence.lock().unwrap();
+                assert_eq!(
+                    captured.requests.len(),
+                    1,
+                    "unknown push must not automatically resend"
+                );
+                (
+                    captured
+                        .lost_receipt
+                        .clone()
+                        .expect("real Server returned a receipt before body failure"),
+                    captured.requests[0].clone(),
+                )
+            };
+            assert_eq!(
+                serde_json::from_slice::<Value>(&original_wire).unwrap(),
+                serde_json::to_value(&pending).unwrap()
+            );
+            assert_eq!(receipt.operation_id, pending.operation_id);
+            let saved = f
+                .api
+                .config_store
+                .configuration_request_result(
+                    TEST_WORKSPACE_ID,
+                    &f.owner_account,
+                    &core_request(&pending),
+                )
+                .unwrap()
+                .expect("actual SQLite receipt exists despite CLI Unknown");
+            assert_eq!(saved.history_head, receipt.history_head);
+            assert_eq!(workspace_config_state_to_api(saved.state), receipt.state);
+            let committed = f.source().await;
+            assert_eq!(committed.state, receipt.state);
+            assert_eq!(
+                committed.history_head.as_deref(),
+                Some(receipt.history_head.as_str())
+            );
+            assert_eq!(committed.policies[0].execution, assignment("ticket.create"));
+            assert_eq!(committed.policies[0].delegation, assignment("ticket.query"));
+            assert_eq!(f.durable()["receipts"].as_array().unwrap().len(), 1);
+            f.assert_legacy_sealed();
+
+            // The editor moves on while the original request is still unresolved.
+            let later_text = permission_source(&f.subject, "ticket.query", "ticket.create");
+            std::fs::write(&local, &later_text).unwrap();
+            let marker = checkout.join("source").join(MARKER);
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            std::fs::write(&marker, "local edit after the lost response").unwrap();
+            assert_eq!(std::fs::read_to_string(&local).unwrap(), later_text);
+
+            // A real Web owner then removes the adopted policy. Historical receipt
+            // recovery must not resurrect it, rewind the head, or send later edits.
+            let removal = format!(
+                "{{ subjects = []; remove_subjects = [{:?}]; }}\n",
+                f.subject
+            );
+            let web = request(
+                &committed,
+                "response-loss-later-web-removal",
+                vec![update(&committed, &path, &removal)],
+            );
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap()
+                .post(format!("{}{}", server.origin, Fixture::path("/commit")))
+                .header(reqwest::header::COOKIE, &f.cookie)
+                .header(reqwest::header::ORIGIN, &f.origin)
+                .json(&web)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let web_receipt: Receipt = response.json().await.unwrap();
+            assert_ne!(web_receipt.history_head, receipt.history_head);
+            assert!(f.source().await.policies.is_empty());
+            assert!(
+                f.api
+                    .config_store
+                    .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+                    .unwrap()
+                    .is_none()
+            );
+            let current = f.durable();
+
+            let recovered = server.run(&f.owner, &checkout, recovery).await.unwrap();
+            assert!(
+                recovered.contains(&format!("operation={}", receipt.operation_id)),
+                "{recovered}"
+            );
+            assert!(
+                recovered.contains(&format!("head={}", receipt.history_head)),
+                "{recovered}"
+            );
+            assert!(
+                recovered.contains("source_stored=true policy_committed=true"),
+                "{recovered}"
+            );
+            assert_eq!(
+                f.durable(),
+                current,
+                "{recovery:?} must only recover the historical receipt"
+            );
+            assert_eq!(std::fs::read_to_string(&local).unwrap(), later_text);
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "local edit after the lost response"
+            );
+            let resolved: Value =
+                serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
+            assert!(resolved["pending"].is_null());
+            assert_eq!(
+                resolved["base"]["history_head"],
+                json!(receipt.history_head)
+            );
+            assert_eq!(
+                resolved["base"]["state"],
+                serde_json::to_value(&receipt.state).unwrap()
+            );
+            {
+                let captured = evidence.lock().unwrap();
+                match recovery {
+                    Reconcile => {
+                        assert_eq!(captured.requests.len(), 2, "reconciliation sends no commit")
+                    }
+                    Retry => {
+                        assert_eq!(captured.requests.len(), 3);
+                        assert_eq!(
+                            captured.requests[2], original_wire,
+                            "exact retry sends the original payload, not post-send edits"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let diff = server.run(&f.owner, &checkout, Diff).await.unwrap();
+            assert!(
+                diff.contains(&format!("update {path}"))
+                    && diff.contains(&format!("create {MARKER}")),
+                "{diff}"
+            );
+            let error = server.run(&f.owner, &checkout, Push).await.unwrap_err();
+            assert_eq!(
+                error.exit_code, 4,
+                "later local edits need fresh-head conflict resolution: {error}"
+            );
+            assert_eq!(f.durable(), current);
+            assert_eq!(std::fs::read_to_string(&local).unwrap(), later_text);
+            assert_eq!(
+                std::fs::read_to_string(&marker).unwrap(),
+                "local edit after the lost response"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_tcp_unmodified_push_persists_migration_and_repulls_identical_source_and_policy() {
+        use yoi::config_cli::Command::*;
+        let f = Fixture::new().await;
+        let server = CliServer::start(&f).await;
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        let before = f.durable();
+        let draft = f.source().await;
+        let pulled = server.run(&f.owner, &checkout, Pull).await.unwrap();
+        assert!(pulled.contains("source_stored=false"), "{pulled}");
+        let diff = server.run(&f.owner, &checkout, Diff).await.unwrap();
+        assert!(
+            !diff.contains("\ncreate ")
+                && !diff.contains("\nupdate ")
+                && !diff.contains("\ndelete "),
+            "{diff}"
+        );
+        server.run(&f.owner, &checkout, Validate).await.unwrap();
+        server.run(&f.owner, &checkout, Preview).await.unwrap();
+        assert_eq!(f.durable(), before, "pull, diff and preview do not adopt");
+
+        let pushed = server.run(&f.owner, &checkout, Push).await.unwrap();
+        assert!(
+            pushed.contains("source_stored=true policy_committed=true"),
+            "{pushed}"
+        );
+        assert!(pushed.contains("NextCurrentPolicyCheck"), "{pushed}");
+        let stored = f.source().await;
+        assert!(stored.source_stored);
+        assert_eq!(stored.state, draft.state);
+        assert_eq!(stored.policies, draft.policies);
+        let current = f
+            .api
+            .config_store
+            .configuration_current(TEST_WORKSPACE_ID, &f.owner_account)
+            .unwrap();
+        assert!(current.canonical);
+        assert_eq!(workspace_config_state_to_api(current.state), stored.state);
+        assert_eq!(current.history_head, stored.history_head);
+        f.assert_legacy_sealed();
+
+        let repull = dir.path().join("repull");
+        server.run(&f.owner, &repull, Pull).await.unwrap();
+        for (path, entry) in &stored.state.snapshot.entries {
+            assert_eq!(
+                std::fs::read_to_string(repull.join("source").join(path)).unwrap(),
+                entry.content
+            );
+        }
+        let canonical = f.durable();
+        server.run(&f.owner, &checkout, Push).await.unwrap();
+        let unchanged = f.source().await;
+        assert_eq!(unchanged.state, stored.state);
+        assert_eq!(unchanged.policies, stored.policies);
+        // A new operation may record another history event; it must not change
+        // configuration meaning or reseal/rewrite the legacy transfer.
+        assert_eq!(f.durable()["legacy_receipt"], canonical["legacy_receipt"]);
+    }
+
+    #[tokio::test]
+    async fn cli_tcp_permission_text_preserves_sets_namespaces_exact_keys_and_independent_lanes() {
+        use feature_permissions::{
+            PermissionKey, PermissionReference, PermissionSetId, WorkspaceId,
+        };
+        use yoi::config_cli::Command::*;
+        let f = Fixture::new().await;
+        let server = CliServer::start(&f).await;
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        server.run(&f.owner, &checkout, Pull).await.unwrap();
+        let draft = f.source().await;
+        let path = permission_path(&draft);
+        let text = format!(
+            r#"{{
+    subjects = [{{
+        subject_id = {:?};
+        execution = {{ namespaces = [{{ namespace = "worker"; keys = ["worker.observe"]; }}]; }};
+        delegation = {{
+            sets = ["ticket"];
+            namespaces = [{{ namespace = "worker"; keys = ["worker.observe.list"]; }}];
+            exclude_namespaces = [{{ namespace = "ticket"; keys = ["ticket.create"]; }}];
+        }};
+    }}];
+    remove_subjects = [];
+}}
+"#,
+            f.subject
+        );
+        std::fs::write(checkout.join("source").join(&path), &text).unwrap();
+        let before = f.durable();
+        server.run(&f.owner, &checkout, Validate).await.unwrap();
+        let preview = server.run(&f.owner, &checkout, Preview).await.unwrap();
+        assert!(
+            preview.contains(&path) && preview.contains(&f.subject),
+            "{preview}"
+        );
+        assert_eq!(f.durable(), before);
+        server.run(&f.owner, &checkout, Push).await.unwrap();
+        let source = f.source().await;
+        let policy = source
+            .policies
+            .iter()
+            .find(|p| p.subject_id == f.subject)
+            .unwrap();
+        let key = |value| PermissionKey::parse(value).unwrap();
+        assert_eq!(
+            policy.delegation.grants[0],
+            PermissionReference::Set(PermissionSetId::parse("ticket").unwrap())
+        );
+        assert_eq!(policy.execution.grants.len(), 1);
+        let wire = serde_json::to_value(&policy.execution).unwrap();
+        assert_eq!(
+            wire["grants"][0]["value"]["keys"],
+            json!(["worker.observe"])
+        );
+        assert_eq!(policy.legacy_constraints, Some(f.legacy_policy.clone()));
+
+        let host = worker::feature::permissions::builtin_permission_host(
+            WorkspaceId::parse(TEST_WORKSPACE_ID).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            source.catalog,
+            host.catalog(),
+            "the CLI must not replace Feature-owned catalog metadata"
+        );
+        let worker_catalog = source
+            .catalog
+            .namespaces
+            .iter()
+            .find(|n| n.namespace.as_str() == "worker")
+            .unwrap();
+        assert_eq!(worker_catalog.feature.as_str(), "builtin:worker");
+        for spelling in ["worker.observe", "worker.observe.list"] {
+            let definition = worker_catalog
+                .declaration
+                .permissions
+                .iter()
+                .find(|p| p.key.as_str() == spelling)
+                .unwrap();
+            assert!(
+                definition.children.is_empty(),
+                "actual builtin keys have no declared children"
+            );
+        }
+        let ticket = source
+            .catalog
+            .namespaces
+            .iter()
+            .find(|n| n.namespace.as_str() == "ticket")
+            .unwrap();
+        assert_eq!(ticket.feature.as_str(), "builtin:ticket");
+        let set = ticket
+            .declaration
+            .sets
+            .iter()
+            .find(|s| s.set.as_str() == "ticket")
+            .unwrap();
+        assert!(set.children.iter().any(|child| matches!(child, PermissionReference::Namespace(n) if n.namespace.as_str() == "ticket" && n.keys.contains(&key("ticket.query")))));
+        let execution = host.resolve(Some(&policy.execution));
+        assert_eq!(
+            execution
+                .projection()
+                .allowed
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![key("worker.observe")]
+        );
+        assert!(
+            !execution
+                .projection()
+                .allowed
+                .contains_key(&key("worker.observe.list")),
+            "dot prefixes are not children"
+        );
+        let delegation = host.resolve(Some(&policy.delegation));
+        assert!(
+            delegation
+                .projection()
+                .allowed
+                .contains_key(&key("worker.observe.list"))
+        );
+        assert!(
+            delegation
+                .projection()
+                .allowed
+                .contains_key(&key("ticket.query")),
+            "explicit Set children expand"
+        );
+        assert!(
+            !delegation
+                .projection()
+                .allowed
+                .contains_key(&key("ticket.create")),
+            "exclusion remains effective"
+        );
+        let adopted = f
+            .api
+            .config_store
+            .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.source.execution.assignment(), policy.execution);
+        assert_eq!(adopted.source.delegation.assignment(), policy.delegation);
+
+        let repull = dir.path().join("repull");
+        server.run(&f.owner, &repull, Pull).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("source").join(&path)).unwrap(),
+            text,
+            "push does not rewrite the owner's local text"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repull.join("source").join(&path)).unwrap(),
+            source.state.snapshot.entries[&path].content,
+            "repull returns the Server-formatted editable source"
+        );
+        server.run(&f.owner, &repull, Push).await.unwrap();
+        let unchanged = f.source().await;
+        assert_eq!(unchanged.policies, source.policies);
+        assert_eq!(unchanged.catalog, source.catalog);
+        assert_eq!(unchanged.state, source.state);
+    }
+
+    #[tokio::test]
+    async fn cli_tcp_file_add_delete_and_omission_preserve_policy_until_explicit_removal() {
+        use yoi::config_cli::Command::*;
+        let f = Fixture::new().await;
+        let server = CliServer::start(&f).await;
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        server.run(&f.owner, &checkout, Pull).await.unwrap();
+        server.run(&f.owner, &checkout, Push).await.unwrap();
+        let initial = f.source().await;
+        let policy_path = permission_path(&initial);
+        let marker = checkout.join("source").join(MARKER);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "owner added source note").unwrap();
+        let diff = server.run(&f.owner, &checkout, Diff).await.unwrap();
+        assert!(diff.contains(&format!("create {MARKER}")), "{diff}");
+        assert!(
+            !diff.contains("update main.dcdl"),
+            "unchanged source omitted: {diff}"
+        );
+        let preview = server.run(&f.owner, &checkout, Preview).await.unwrap();
+        assert!(preview.contains(MARKER), "{preview}");
+        server.run(&f.owner, &checkout, Push).await.unwrap();
+        let added = f.source().await;
+        assert_eq!(
+            added.state.snapshot.entries[MARKER].content,
+            "owner added source note"
+        );
+        assert_eq!(added.policies, initial.policies);
+        assert_eq!(
+            added.state.snapshot.entries["main.dcdl"],
+            initial.state.snapshot.entries["main.dcdl"]
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(checkout.join("source").join(&policy_path)).unwrap();
+        // Remove the import as well as its file. Omitting permissions is not revocation.
+        std::fs::write(
+            checkout.join("source/main.dcdl"),
+            "{} as WorkspaceConfigSchema\n",
+        )
+        .unwrap();
+        let diff = server.run(&f.owner, &checkout, Diff).await.unwrap();
+        assert!(
+            diff.contains(&format!("delete {MARKER}"))
+                && diff.contains(&format!("delete {policy_path}")),
+            "{diff}"
+        );
+        assert!(diff.contains("update main.dcdl"), "{diff}");
+        let before = f.durable();
+        let preview = server.run(&f.owner, &checkout, Preview).await.unwrap();
+        assert!(
+            preview.contains(MARKER) && preview.contains(&policy_path),
+            "{preview}"
+        );
+        assert!(preview.contains("changed_subjects=[]"), "{preview}");
+        assert_eq!(f.durable(), before);
+        server.run(&f.owner, &checkout, Push).await.unwrap();
+        let omitted = f.source().await;
+        assert!(!omitted.state.snapshot.entries.contains_key(MARKER));
+        assert!(!omitted.state.snapshot.entries.contains_key(&policy_path));
+        assert_eq!(
+            omitted.policies, added.policies,
+            "source deletion is not implicit policy deletion"
+        );
+
+        let main = format!(
+            "{{ permissions = {{ subjects = []; remove_subjects = [{:?}]; }}; }} as WorkspaceConfigSchema\n",
+            f.subject
+        );
+        std::fs::write(checkout.join("source/main.dcdl"), &main).unwrap();
+        let preview = server.run(&f.owner, &checkout, Preview).await.unwrap();
+        assert!(preview.contains(&f.subject), "{preview}");
+        server.run(&f.owner, &checkout, Push).await.unwrap();
+        let removed = f.source().await;
+        assert!(removed.policies.is_empty());
+        assert!(
+            f.api
+                .config_store
+                .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+                .unwrap()
+                .is_none()
+        );
+        let repull = dir.path().join("repull");
+        server.run(&f.owner, &repull, Pull).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("source/main.dcdl")).unwrap(),
+            main,
+            "adoption keeps the local editor's text"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repull.join("source/main.dcdl")).unwrap(),
+            removed.state.snapshot.entries["main.dcdl"].content
+        );
+        assert!(!repull.join("source").join(MARKER).exists());
+        assert!(!repull.join("source").join(&policy_path).exists());
+    }
+
+    #[tokio::test]
+    async fn cli_tcp_stale_edit_rejects_concurrent_cli_and_browser_aba_without_losing_dirty_files()
+    {
+        use yoi::config_cli::Command::*;
+        let f = Fixture::new().await;
+        let server = CliServer::start(&f).await;
+        let dir = tempfile::tempdir().unwrap();
+        let writer = dir.path().join("writer");
+        server.run(&f.owner, &writer, Pull).await.unwrap();
+        let marker = writer.join("source").join(MARKER);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "A").unwrap();
+        server.run(&f.owner, &writer, Push).await.unwrap();
+        let a = f.source().await;
+        let stale = dir.path().join("stale-editor");
+        server.run(&f.owner, &stale, Pull).await.unwrap();
+        let local = stale.join("source").join(MARKER);
+        std::fs::write(&local, "unsaved local edit").unwrap();
+        let metadata = stale.join(".yoi-config/state.json");
+        let before_metadata = std::fs::read(&metadata).unwrap();
+
+        std::fs::write(&marker, "B").unwrap();
+        server.run(&f.owner, &writer, Push).await.unwrap();
+        let b = f.source().await;
+        let before = f.durable();
+        for command in [Validate, Preview, Push] {
+            let error = server.run(&f.owner, &stale, command).await.unwrap_err();
+            assert_eq!(error.exit_code, 4, "{command:?}: {error}");
+            assert_eq!(f.durable(), before);
+            assert_eq!(std::fs::read(&metadata).unwrap(), before_metadata);
+            assert_eq!(
+                std::fs::read_to_string(&local).unwrap(),
+                "unsaved local edit"
+            );
+        }
+        let error = server.run(&f.owner, &stale, Pull).await.unwrap_err();
+        assert_eq!(error.exit_code, 2, "dirty pull must refuse: {error}");
+        assert_eq!(std::fs::read(&metadata).unwrap(), before_metadata);
+        assert_eq!(
+            std::fs::read_to_string(&local).unwrap(),
+            "unsaved local edit"
+        );
+        assert_eq!(f.durable(), before);
+
+        // An independently authenticated Web owner returns content to A over TCP.
+        let returning = request(&b, "cli-aba-web-return-a", vec![update(&b, MARKER, "A")]);
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap()
+            .post(format!("{}{}", server.origin, Fixture::path("/commit")))
+            .header(reqwest::header::COOKIE, &f.cookie)
+            .header(reqwest::header::ORIGIN, &f.origin)
+            .json(&returning)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let receipt: Receipt = response.json().await.unwrap();
+        let returned = f.source().await;
+        assert_eq!(
+            returned.state.snapshot, a.state.snapshot,
+            "real content root returned to A"
+        );
+        assert_eq!(
+            returned.history_head.as_deref(),
+            Some(receipt.history_head.as_str())
+        );
+        assert_ne!(
+            returned.history_head, a.history_head,
+            "history did not return to A"
+        );
+        let before = f.durable();
+        for command in [Preview, Push] {
+            let error = server.run(&f.owner, &stale, command).await.unwrap_err();
+            assert_eq!(error.exit_code, 4, "ABA {command:?}: {error}");
+            assert_eq!(f.durable(), before);
+        }
+        assert_eq!(std::fs::read(&metadata).unwrap(), before_metadata);
+        assert_eq!(
+            std::fs::read_to_string(&local).unwrap(),
+            "unsaved local edit"
+        );
+        let fresh = dir.path().join("resolved");
+        server.run(&f.owner, &fresh, Pull).await.unwrap();
+        std::fs::copy(&local, fresh.join("source").join(MARKER)).unwrap();
+        server.run(&f.owner, &fresh, Push).await.unwrap();
+        assert_eq!(
+            f.source().await.state.snapshot.entries[MARKER].content,
+            "unsaved local edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_tcp_invalid_source_is_validation_refusal_without_storage_or_local_loss() {
+        use yoi::config_cli::Command::*;
+        let f = Fixture::new().await;
+        let server = CliServer::start(&f).await;
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout");
+        server.run(&f.owner, &checkout, Pull).await.unwrap();
+        let draft = f.source().await;
+        let path = permission_path(&draft);
+        let local = checkout.join("source").join(&path);
+        let original = std::fs::read(&local).unwrap();
+        let metadata = checkout.join(".yoi-config/state.json");
+        let metadata_before = std::fs::read(&metadata).unwrap();
+        let before = f.durable();
+        for (case, content) in [
+            ("syntax", "{ subjects = [".to_owned()),
+            (
+                "unknown-key",
+                permission_source(&f.subject, "ticket.not_a_builtin_operation", "ticket.query"),
+            ),
+            (
+                "unknown-set",
+                format!(
+                    "{{ subjects = [{{ subject_id = {:?}; execution = {{ sets = [\"not-a-builtin-set\"]; }}; }}]; }}",
+                    f.subject
+                ),
+            ),
+            (
+                "key-payload",
+                format!(
+                    "{{ subjects = [{{ subject_id = {:?}; execution = {{ namespaces = [{{ namespace = \"ticket\"; keys = [{{ key = \"ticket.query\"; arguments = {{}}; }}]; }}]; }}; }}]; }}",
+                    f.subject
+                ),
+            ),
+            (
+                "wrong-namespace",
+                format!(
+                    "{{ subjects = [{{ subject_id = {:?}; execution = {{ namespaces = [{{ namespace = \"ticket\"; keys = [\"worker.observe\"]; }}]; }}; }}]; }}",
+                    f.subject
+                ),
+            ),
+        ] {
+            std::fs::write(&local, &content).unwrap();
+            for command in [Validate, Preview, Push] {
+                let error = server.run(&f.owner, &checkout, command).await.unwrap_err();
+                assert_eq!(error.exit_code, 3, "{case} {command:?}: {error}");
+                assert_eq!(
+                    f.durable(),
+                    before,
+                    "{case} {command:?} must not adopt or seal"
+                );
+                assert_eq!(std::fs::read_to_string(&local).unwrap(), content);
+                assert_eq!(std::fs::read(&metadata).unwrap(), metadata_before);
+                f.assert_legacy_writable();
+            }
+        }
+        std::fs::write(&local, original).unwrap();
+        server.run(&f.owner, &checkout, Push).await.unwrap();
+        f.assert_legacy_sealed();
+    }
+
+    #[tokio::test]
+    async fn cli_tcp_nonowner_is_refused_by_server_before_and_after_owner_adoption() {
+        use server_api::client_support::ClientError;
+        use yoi::config_cli::Command::*;
+        let f = Fixture::new().await;
+        let server = CliServer::start(&f).await;
+        let dir = tempfile::tempdir().unwrap();
+        for canonical in [false, true] {
+            let checkout = dir.path().join(format!("owner-{canonical}"));
+            server.run(&f.owner, &checkout, Pull).await.unwrap();
+            let source = f.source().await;
+            assert_eq!(source.source_stored, canonical);
+            let before = f.durable();
+            let denied_checkout = dir.path().join(format!("foreign-{canonical}"));
+            let error = server
+                .run(&f.foreign, &denied_checkout, Pull)
+                .await
+                .unwrap_err();
+            assert_eq!(error.exit_code, 5, "{error}");
+            assert!(!denied_checkout.exists());
+            let metadata = std::fs::read(checkout.join(".yoi-config/state.json")).unwrap();
+            for command in [Validate, Preview, Push] {
+                let error = server
+                    .run(&f.foreign, &checkout, command)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.exit_code, 5, "{command:?}: {error}");
+                assert_eq!(f.durable(), before);
+                assert_eq!(
+                    std::fs::read(checkout.join(".yoi-config/state.json")).unwrap(),
+                    metadata
+                );
+            }
+            // CLI push stops at preview. Also prove the actual commit/reconcile
+            // boundaries refuse this same authenticated nonowner independently.
+            let adoption = request(
+                &source,
+                &format!("cli-denied-{canonical}"),
+                vec![create_marker("forbidden")],
+            );
+            let foreign = server.client(&f.foreign);
+            for result in [
+                foreign
+                    .configuration_adopt(TEST_WORKSPACE_ID.into(), adoption.clone())
+                    .await
+                    .map(|_| ()),
+                foreign
+                    .configuration_reconcile(TEST_WORKSPACE_ID.into(), adoption)
+                    .await
+                    .map(|_| ()),
+            ] {
+                match result.unwrap_err() {
+                    ClientError::Public { status, .. } => assert_eq!(status.as_u16(), 403),
+                    other => panic!("expected actual Server authorization refusal: {other:?}"),
+                }
+                assert_eq!(f.durable(), before);
+            }
+            if canonical {
+                f.assert_legacy_sealed();
+            } else {
+                f.assert_legacy_writable();
+            }
+            server.run(&f.owner, &checkout, Push).await.unwrap();
+            f.assert_legacy_sealed();
+        }
     }
 
     fn core_request(request: &Adoption) -> crate::config_adoption::ConfigurationAdoptionRequest {
