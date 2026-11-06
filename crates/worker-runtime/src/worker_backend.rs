@@ -8471,6 +8471,7 @@ mod tests {
 
     include!("subject_delete_backend_tests.rs");
     include!("worker_backend/startup_binding_tests.rs");
+    include!("worker_backend/spawn_tool_startup_tests.rs");
     include!("worker_backend/termination_persistence_tests.rs");
     include!("worker_backend/submission_termination_tests.rs");
     #[cfg(feature = "fs-store")]

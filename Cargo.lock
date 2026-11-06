@@ -7341,6 +7341,7 @@ dependencies = [
  "minijinja",
  "protocol",
  "reqwest",
+ "runtime-api",
  "schemars",
  "secrets",
  "serde",

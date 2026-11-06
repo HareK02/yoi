@@ -1,5 +1,9 @@
 //! Workspace-authority-backed Worker session management tools.
 
+#[cfg(test)]
+#[path = "manage_worker_startup_tests.rs"]
+mod startup_tests;
+
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -1135,6 +1139,55 @@ fn tool_output(
     use protocol::control_failure::RuntimeControlCause as C;
     use tools::failure::ToolFailureBoundary as B;
     if !response.is_success() {
+        if operation == WorkerOperation::Spawn {
+            use runtime_api::startup::{
+                CreationAcceptance, DecodeStartupProblem, ExecutionOutcome, StartupBoundary,
+                StartupCause, StartupProblemFacts, decode_startup_problem,
+            };
+            if let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+                response.body.as_bytes(),
+                response.status,
+                response.content_type.as_deref().unwrap_or(""),
+                StartupBoundary::Browser,
+            ) {
+                // The Worker control service authorized this current caller. A
+                // received explanation is not authority for model disclosure.
+                let projected = failure
+                    .startup()
+                    .primary
+                    .project_for::<error_contract::Tool, StartupCause>(
+                        &protocol::session_failure::SessionFailureVisibility {
+                            can_view_cause: true,
+                        },
+                    );
+                let boundary = if failure.operation().acceptance == CreationAcceptance::Unknown
+                    || matches!(
+                        failure.operation().execution,
+                        ExecutionOutcome::Unknown | ExecutionOutcome::Unsupported
+                    ) {
+                    B::Observation
+                } else {
+                    B::Execution
+                };
+                #[derive(serde::Serialize)]
+                struct StartupObservation {
+                    status: u16,
+                    startup: StartupProblemFacts,
+                }
+                return Err(match projected {
+                    Ok(projected) => tools::failure::execution_failure(
+                        &projected,
+                        boundary,
+                        &StartupObservation {
+                            status: response.status,
+                            startup: failure.public_facts(),
+                        },
+                        64 * 1024,
+                    ),
+                    Err(_) => worker_tool_failure(C::ResultUnavailable, B::Observation, &()),
+                });
+            }
+        }
         #[derive(serde::Serialize)]
         struct HttpObservation {
             status: u16,

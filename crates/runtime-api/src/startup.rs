@@ -407,26 +407,62 @@ impl ProjectFor<Browser> for StartupCause {
         facts: &FailureFacts<Self>,
         visibility: &SessionFailureVisibility,
     ) -> Result<Disclosure<Self>, ContractError> {
-        match self {
-            Self::Session(cause) => {
-                let concrete = domain_facts(*cause, facts)?;
-                let disclosed = <SessionRegistrationCause as ProjectFor<Browser>>::disclose(
-                    cause, &concrete, visibility,
-                )?;
-                Ok(wrap(disclosed, Self::Session, session_explanation(cause)))
-            }
-            Self::Runtime(cause) => {
-                let concrete = domain_facts(cause.clone(), facts)?;
-                let disclosed =
-                    <RuntimeStartupCause as ProjectFor<Browser>>::disclose(cause, &concrete, &())?;
-                Ok(wrap(
-                    disclosed,
-                    Self::Runtime,
-                    runtime_explanation(cause).into(),
-                ))
-            }
-            Self::Boundary(cause) => Ok(Disclosure::new(self.clone(), boundary_explanation(cause))),
+        public_startup_disclosure::<Browser>(self, facts, visibility)
+    }
+}
+
+impl ProjectFor<error_contract::Tool> for StartupCause {
+    type Authorization = SessionFailureVisibility;
+    type Details = Self;
+
+    fn disclose(
+        &self,
+        facts: &FailureFacts<Self>,
+        visibility: &SessionFailureVisibility,
+    ) -> Result<Disclosure<Self>, ContractError> {
+        public_startup_disclosure::<error_contract::Tool>(self, facts, visibility)
+    }
+}
+
+// Invoke the concrete domain's allowlist for the requested audience. Neither
+// the wire explanation nor a Browser projection is a Tool disclosure capability.
+fn public_startup_disclosure<A>(
+    cause: &StartupCause,
+    facts: &FailureFacts<StartupCause>,
+    visibility: &SessionFailureVisibility,
+) -> Result<Disclosure<StartupCause>, ContractError>
+where
+    A: error_contract::Audience,
+    SessionRegistrationCause:
+        ProjectFor<A, Authorization = SessionFailureVisibility, Details = SessionRegistrationCause>,
+    RuntimeStartupCause: ProjectFor<A, Authorization = (), Details = RuntimeStartupCause>,
+{
+    match cause {
+        StartupCause::Session(cause) => {
+            let concrete = domain_facts(*cause, facts)?;
+            let disclosed = <SessionRegistrationCause as ProjectFor<A>>::disclose(
+                cause, &concrete, visibility,
+            )?;
+            Ok(wrap(
+                disclosed,
+                StartupCause::Session,
+                session_explanation(cause),
+            ))
         }
+        StartupCause::Runtime(cause) => {
+            let concrete = domain_facts(cause.clone(), facts)?;
+            let disclosed =
+                <RuntimeStartupCause as ProjectFor<A>>::disclose(cause, &concrete, &())?;
+            Ok(wrap(
+                disclosed,
+                StartupCause::Runtime,
+                runtime_explanation(cause).into(),
+            ))
+        }
+        StartupCause::Boundary(boundary) => Ok(Disclosure::new(
+            cause.clone(),
+            boundary_explanation(boundary),
+        )),
     }
 }
 
