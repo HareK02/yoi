@@ -10,13 +10,28 @@ use crate::RepositoryApiError;
 use workdir::management_failure::WorkdirManagementFailure;
 
 /// A receive carrier for existing domain causes, not a new failure vocabulary.
-/// Untagged details preserve each owner's original identity and JSON shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// The three closed JSON shapes are disjoint: management requires `reason`,
+/// session requires `classification`, and Runtime control is a string. Both
+/// object owners reject unknown fields, so mixed causes cannot select a branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkdirManagementCause {
     Management(WorkdirManagementFailure),
     Session(workdir::failure::WorkdirFailureDetails),
     Runtime(protocol::control_failure::RuntimeControlCause),
+}
+impl JsonSchema for WorkdirManagementCause {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WorkdirManagementCause".into()
+    }
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        // Declare exclusive owner schemas, not a general ambiguous untagged union.
+        schemars::json_schema!({"oneOf": [
+            WorkdirManagementFailure::json_schema(generator),
+            workdir::failure::WorkdirFailureDetails::json_schema(generator),
+            protocol::control_failure::RuntimeControlCause::json_schema(generator)
+        ]})
+    }
 }
 impl error_contract::FailureCause for WorkdirManagementCause {
     fn identity(&self) -> error_contract::FailureIdentity {
@@ -463,6 +478,48 @@ mod tests {
     use workdir::management_failure::{
         WorkdirManagementOperation, WorkdirManagementReason, WorkdirManagementVisibility,
     };
+
+    #[test]
+    fn attachment_cause_json_shapes_are_exclusive_and_reject_mixed_owner_fields() {
+        let management = serde_json::json!({"operation":"cleanup", "reason":"workdir_occupied"});
+        let session = serde_json::json!({"operation":"session_close", "classification":"transport", "denial_reason":null, "failure_reason":null});
+        let runtime =
+            serde_json::to_value(protocol::control_failure::RuntimeControlCause::TimedOut).unwrap();
+        for (wire, expected) in [
+            (management.clone(), "management"),
+            (session.clone(), "session"),
+            (runtime, "runtime"),
+        ] {
+            let cause: WorkdirManagementCause = serde_json::from_value(wire.clone()).unwrap();
+            let branch = match cause {
+                WorkdirManagementCause::Management(_) => "management",
+                WorkdirManagementCause::Session(_) => "session",
+                WorkdirManagementCause::Runtime(_) => "runtime",
+            };
+            assert_eq!(branch, expected);
+            assert_eq!(serde_json::to_value(cause).unwrap(), wire);
+        }
+        let mut mixed = management;
+        mixed["classification"] = session["classification"].clone();
+        assert!(serde_json::from_value::<WorkdirManagementCause>(mixed).is_err());
+        let schema = schemars::schema_for!(WorkdirManagementCause);
+        let schema = serde_json::to_value(schema).unwrap();
+        assert!(schema.get("anyOf").is_none());
+        for branch in schema["oneOf"].as_array().unwrap() {
+            if branch["type"] == "object" {
+                assert_eq!(branch["additionalProperties"], false);
+                assert!(
+                    branch["required"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|name| name == "reason" || name == "classification")
+                );
+            } else {
+                assert_eq!(branch["type"], "string");
+            }
+        }
+    }
 
     #[test]
     fn backend_http_keeps_its_class_separate_from_runtime_cause_and_tool_explanation() {

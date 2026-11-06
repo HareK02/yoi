@@ -31,9 +31,12 @@ impl ApiBoundary<RuntimeControlCause> for ControlBoundary {
             | C::StoreUnavailable
             | C::StateUnavailable
             | C::ClientSetupFailed => S::Internal,
-            C::PersistenceOutcomeUnknown | C::TransportFailed | C::ResultUnavailable => {
-                S::Unavailable
-            }
+            C::PersistenceOutcomeUnknown
+            | C::TransportFailed
+            | C::ResultUnavailable
+            | C::RecordingSourceUnavailable
+            | C::RecordingOwnershipUnknown
+            | C::RecordingExecutionUnconfirmed => S::Unavailable,
             C::TimedOut => S::GatewayTimeout,
             C::WorkingDirectoryFailed
             | C::ConnectionFailed
@@ -64,30 +67,22 @@ pub fn control_problem(
         .map(Into::into)
 }
 
-impl api_macros::reqwest::HttpClientError for super::RuntimeApiError {
-    fn decode_error(
-        response: &api_macros::reqwest::ReceivedResponse,
-    ) -> Result<Self, api_macros::reqwest::ClientFailure> {
-        Self::decode_control_error(response)
-    }
-}
-
 impl super::RuntimeApiError {
     pub(crate) fn decode_control_error(
-        response: &api_macros::reqwest::ReceivedResponse,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
     ) -> Result<Self, api_macros::reqwest::ClientFailure> {
         use api_macros::reqwest::ClientFailure;
-        let status = response.status().as_u16();
-        let media = response
-            .content_type()?
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let media = content_type.split(';').next().unwrap_or("").trim();
         if media.eq_ignore_ascii_case("application/problem+json") {
-            return match response
-                .decode_problem::<RuntimeControlCause>(&ControlBoundary, Budget::new(16384, 16384))
-            {
+            return match api_macros::http::decode_problem_response::<RuntimeControlCause>(
+                body,
+                status,
+                content_type,
+                &ControlBoundary,
+                Budget::new(16384, 16384),
+            ) {
                 DecodeFailure::Known(failure) => {
                     let cause = *failure.facts().cause();
                     Ok(Self::new(status, cause.reason(), cause.explanation()).with_control(cause))
@@ -103,7 +98,7 @@ impl super::RuntimeApiError {
         }
         // Reader-first compatibility for Runtime startup and old non-control endpoints.
         // The absence of a typed cause remains absence; do not parse legacy code/prose.
-        let mut error: Self = serde_json::from_slice(response.body())
+        let mut error: Self = serde_json::from_slice(body)
             .map_err(|_| ClientFailure::ErrorResponseDecode { status })?;
         error.status = status;
         Ok(error)

@@ -2,6 +2,7 @@
 
 pub mod control_failure;
 pub mod management_failure;
+pub mod startup;
 
 use std::collections::BTreeMap;
 
@@ -110,20 +111,12 @@ pub struct RuntimeApiError {
     pub error: RuntimeApiErrorDetail,
     #[serde(skip)]
     status: u16,
+    /// Local owner/normalized observations, never a second wire attachment.
+    #[serde(skip)]
+    create_failure: Option<startup::WorkerCreateFailure>,
 }
 
-/// Transient, allowlisted startup observations copied from the execution owner.
-/// This is not an operation result, lifecycle record, or permission to retry.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerStartupFailure {
-    pub primary: StartupFailureAttachment,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secondary: Vec<StartupSecondaryFailure>,
-    pub resources: Option<StartupResourceFacts>,
-    pub persistence: Option<StartupPersistenceOutcome>,
-    pub io_kind: Option<StartupIoKind>,
-}
+pub use protocol::startup_failure::StartupFailureObservations as WorkerStartupFailure;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiErrorDetail {
@@ -163,32 +156,49 @@ impl RuntimeApiError {
             status,
             control: None,
             management: None,
+            create_failure: None,
         }
     }
 
     pub fn status(&self) -> u16 {
         self.status
     }
+
+    /// Retain owner-selected facts locally; the HTTP hook projects them afresh.
+    pub fn with_create_failure(mut self, failure: startup::WorkerCreateFailure) -> Self {
+        self.create_failure = Some(failure);
+        self
+    }
+
+    pub fn create_failure(&self) -> Option<&startup::WorkerCreateFailure> {
+        self.create_failure.as_ref()
+    }
+
+    pub fn into_create_failure(self) -> Option<startup::WorkerCreateFailure> {
+        self.create_failure
+    }
 }
 
 impl api_macros::HttpError for RuntimeApiError {
     fn custom_response(&self) -> Option<api_macros::HttpErrorResponse> {
-        let encoded = if let Some(cause) = self.management {
-            management_failure::management_problem(cause)
-        } else if let Some(cause) = self.control {
-            control_failure::control_problem(cause)
-        } else {
-            return None;
-        };
-        Some(encoded.unwrap_or_else(|_| {
-            api_macros::HttpErrorResponse {
-                status: 500,
-                content_type: "application/problem+json",
-                body: error_contract::problem::STATIC_PROBLEM_FALLBACK
-                    .to_vec()
-                    .into(),
-            }
-        }))
+        startup::http::runtime_error_response(self).or_else(|| {
+            let encoded = if let Some(cause) = self.management {
+                management_failure::management_problem(cause)
+            } else if let Some(cause) = self.control {
+                control_failure::control_problem(cause)
+            } else {
+                return None;
+            };
+            Some(encoded.unwrap_or_else(|_| {
+                api_macros::HttpErrorResponse {
+                    status: 500,
+                    content_type: "application/problem+json",
+                    body: error_contract::problem::STATIC_PROBLEM_FALLBACK
+                        .to_vec()
+                        .into(),
+                }
+            }))
+        })
     }
     fn status_code(&self) -> u16 {
         self.status
@@ -727,6 +737,10 @@ pub struct WorkingDirectoryRepositoryAccessRequest {
 /// using the same Restore intent.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerRestoreResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<protocol::control_failure::RuntimeControlCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<WorkerStartupFailure>,
     pub state: WorkerRestoreState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerDetail>,
@@ -889,6 +903,52 @@ pub struct WorkerRetentionExecutionRequest {
     pub diagnostics_disposition: DiagnosticsDisposition,
 }
 
+/// Metadata-only, operation-bound inventory of all retained recording sources.
+/// This freezes original Worker ingress, not the authority of Journal Jobs reading
+/// these sources. Bodies remain at their producer-owned storage locations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalFreeze {
+    pub operation_id: String,
+    pub input_fingerprint: String,
+    pub workspace_id: String,
+    pub source_runtime_id: String,
+    pub worker_id: WorkerId,
+    pub members: Vec<WorkerRemovalSessionMember>,
+}
+
+/// One canonical union per retained Session. The active lineage is an unchanged
+/// prefix, followed by deduplicated branch originals in deterministic Segment order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalSessionMember {
+    pub session_id: session_store::SessionId,
+    /// The original active lineage endpoint; its descriptor order is preserved.
+    /// None is reserved for an attested not-yet-materialized Session.
+    pub active_segment_id: Option<session_store::SegmentId>,
+    pub materialized: bool,
+    /// Exclusive end in this member's recording view. Empty views end at zero.
+    pub end: session_store::capture::RecordingPosition,
+    /// Original identities/digests only, without bodies. Shared ancestors occur
+    /// once across members, keyed by Session plus original material identity.
+    /// Orders are contiguous within the selected member view, beginning at zero;
+    /// scoped capture uses exactly these orders, not the unfiltered source view.
+    pub descriptors: Vec<session_store::public_material::PublicMaterialDescriptor>,
+}
+
+/// Bounded capture from one Session union of the exact Worker removal operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalSessionCaptureRequest {
+    pub workspace_id: String,
+    pub operation_id: String,
+    pub session_id: session_store::SessionId,
+    pub active_segment_id: Option<session_store::SegmentId>,
+    pub start: session_store::capture::RecordingPosition,
+    pub max_entries: usize,
+    pub max_serialized_bytes: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerSessionArchiveManifest {
     pub schema_version: u32,
@@ -897,6 +957,8 @@ pub struct WorkerSessionArchiveManifest {
     pub source_runtime_id: String,
     pub source_worker_id: WorkerId,
     pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_sessions: Vec<session_store::worker_sources::RetainedSessionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_active_segment_id: Option<String>,
     pub segment_ids: Vec<String>,
@@ -1349,6 +1411,18 @@ pub struct SubjectReleaseResponse {
     pub operation_id: String,
     pub binding_id: String,
     pub state: SubjectReleaseState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_scope: Option<SubjectReleaseRecordingScope>,
+}
+
+/// Complete producer-owned inventory, fixed under the actual Controller reservation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectReleaseRecordingScope {
+    pub workspace_id: String,
+    pub source_runtime_id: String,
+    pub worker_id: WorkerId,
+    pub members: Vec<WorkerRemovalSessionMember>,
 }
 
 /// Irreversibly fence an unpublished failed Subject create. Exact retries must retain
@@ -1419,7 +1493,7 @@ pub struct SubjectJobRemovalPurgeResponse {
     pub input_fingerprint: String,
 }
 
-#[api(reqwest, axum)]
+#[api(reqwest, axum, client_error_hook)]
 pub trait RuntimeApi {
     #[post("/v1/subject-job-removal-purge", status = 200, error_status = 400)]
     async fn purge_subject_job_removal(
@@ -1710,6 +1784,28 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[body] request: WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/freeze",
+        status = 200,
+        error_status = 400
+    )]
+    async fn freeze_worker_removal(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/capture",
+        status = 200,
+        error_status = 400
+    )]
+    async fn capture_worker_removal_session(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2080,8 +2176,36 @@ mod tests {
         }
 
         async fn get_worker(&self, worker_id: String) -> Result<WorkerResponse, RuntimeApiError> {
+            if worker_id == "management" {
+                use workdir::management_failure::{
+                    WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
+                };
+                return Err(test_error(500).with_management(WorkdirManagementFailure {
+                    operation: WorkdirManagementOperation::Cleanup,
+                    reason: WorkdirManagementReason::CleanupResourceBusy,
+                }));
+            }
+            if worker_id == "startup" {
+                use startup::*;
+                let failure = WorkerCreateFailure::from_cause(
+                    StartupCause::Session(
+                        protocol::session_failure::SessionRegistrationCause::denied(
+                            protocol::session_failure::SessionPrincipal::Subject,
+                        ),
+                    ),
+                    StartupOperationFacts {
+                        acceptance: CreationAcceptance::Unknown,
+                        execution: ExecutionOutcome::Unknown,
+                        finalize: None,
+                        backend_compensation: None,
+                        correlation: None,
+                    },
+                )
+                .unwrap();
+                return Err(test_error(500).with_create_failure(failure));
+            }
             assert_eq!(worker_id, "missing worker");
-            Err(test_error(404))
+            Err(test_error(404).with_control(control_failure::RuntimeControlCause::WorkerMissing))
         }
 
         async fn worker_session(
@@ -2340,6 +2464,25 @@ mod tests {
         ) -> Result<WorkerRetentionInventory, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn freeze_worker_removal(
+            &self,
+            _worker_id: String,
+            _request: WorkerRetentionExecutionRequest,
+        ) -> Result<WorkerRemovalFreeze, RuntimeApiError> {
+            assert_eq!(_worker_id, _request.worker_id.to_string());
+            Err(test_error(409))
+        }
+        async fn capture_worker_removal_session(
+            &self,
+            _worker_id: String,
+            _request: WorkerRemovalSessionCaptureRequest,
+        ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError> {
+            assert_eq!(_request.operation_id, "capture-operation");
+            assert_eq!(_request.start.canonical_order, 11);
+            assert_eq!(_request.start.byte_offset, 3);
+            Err(test_error(409))
+        }
+
         async fn execute_retention(
             &self,
             _worker_id: String,
@@ -2417,6 +2560,34 @@ mod tests {
         assert_eq!(receipt.worker_id, purge.removal.worker_id);
         assert_eq!(receipt.operation_id, purge.removal.operation_id);
         assert_eq!(receipt.input_fingerprint, purge.removal.input_fingerprint);
+        let freeze_error = client
+            .freeze_worker_removal(purge.removal.worker_id.to_string(), purge.removal.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(freeze_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
+        );
+        let capture_error = client
+            .capture_worker_removal_session(
+                purge.removal.worker_id.to_string(),
+                WorkerRemovalSessionCaptureRequest {
+                    workspace_id: purge.removal.workspace_id.clone(),
+                    operation_id: "capture-operation".into(),
+                    session_id: session_store::new_session_id(),
+                    active_segment_id: Some(session_store::new_segment_id()),
+                    start: session_store::capture::RecordingPosition {
+                        canonical_order: 11,
+                        byte_offset: 3,
+                    },
+                    max_entries: 3,
+                    max_serialized_bytes: 128 * 1024,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(capture_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
+        );
         let summary = client.runtime_summary().await.unwrap();
         assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));
         let workers = client
@@ -2431,7 +2602,55 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, client_support::ClientError::Public { status, .. } if status.as_u16() == 404)
+            matches!(error, client_support::ClientError::Public { status, error } if status.as_u16() == 404 && error.control_cause() == Some(control_failure::RuntimeControlCause::WorkerMissing))
+        );
+        let error = client
+            .get_worker("management".to_string())
+            .await
+            .unwrap_err();
+        let client_support::ClientError::Public { status, error } = error else {
+            panic!("expected a normalized public Workdir management failure");
+        };
+        assert_eq!(status.as_u16(), 409);
+        assert_eq!(error.status(), 409);
+        assert_eq!(
+            error.management_cause(),
+            Some(workdir::management_failure::WorkdirManagementFailure {
+                operation: workdir::management_failure::WorkdirManagementOperation::Cleanup,
+                reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy,
+            })
+        );
+        assert!(error.control_cause().is_none());
+        assert!(error.create_failure().is_none());
+        assert!(error.error.startup.is_none());
+        assert_ne!(error.error.message, "test error");
+        let error = client.get_worker("startup".to_string()).await.unwrap_err();
+        let client_support::ClientError::Public { status, error } = error else {
+            panic!("expected a normalized public startup failure");
+        };
+        assert_eq!(status.as_u16(), 403);
+        assert_eq!(error.status(), 403);
+        let failure = error
+            .create_failure()
+            .expect("hook retains non-HTTP observations");
+        assert_eq!(
+            failure.operation().acceptance,
+            startup::CreationAcceptance::Unknown
+        );
+        let browser = failure
+            .problem(
+                startup::StartupBoundary::Browser,
+                &startup::SessionFailureVisibility {
+                    can_view_cause: true,
+                },
+                "",
+            )
+            .unwrap();
+        assert_eq!(browser.status, 409);
+        assert!(
+            std::str::from_utf8(browser.body())
+                .unwrap()
+                .contains("session.record")
         );
         let operation = WorkerWorkdirAttachmentsOperationRequest {
             request_id: "attachment-attempt-1".into(),

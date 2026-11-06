@@ -42,6 +42,47 @@ pub fn management_problem(
     .map(Into::into)
 }
 
+impl super::RuntimeApiError {
+    pub(crate) fn decode_management_error(
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<Self, api_macros::reqwest::ClientFailure> {
+        use api_macros::reqwest::ClientFailure;
+        use error_contract::{DecodeFailure, InternalTransfer};
+
+        match api_macros::http::decode_problem_response::<WorkdirManagementFailure>(
+            body,
+            status,
+            content_type,
+            &ManagementBoundary,
+            Budget::new(16384, 16384),
+        ) {
+            DecodeFailure::Known(failure) => {
+                let cause = *failure.facts().cause();
+                let projected = project_failure::<InternalTransfer, _>(
+                    failure.facts(),
+                    &WorkdirManagementVisibility {
+                        can_view_cause: true,
+                    },
+                )
+                .map_err(|_| ClientFailure::ErrorResponseDecode { status })?;
+                Ok(
+                    Self::new(status, cause.reason.as_str(), projected.explanation())
+                        .with_management(cause),
+                )
+            }
+            DecodeFailure::Unsupported(_) => {
+                Err(ClientFailure::UnsupportedErrorResponse { status })
+            }
+            DecodeFailure::Corrupt(error_contract::ContractError::TooLarge) => {
+                Err(ClientFailure::ResponseTooLarge { limit: 16384 })
+            }
+            DecodeFailure::Corrupt(_) => Err(ClientFailure::ErrorResponseDecode { status }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

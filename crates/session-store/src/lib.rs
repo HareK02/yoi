@@ -58,6 +58,7 @@ pub mod system_item;
 pub mod uploaded_file;
 pub mod worker_metadata;
 pub mod worker_session_store;
+pub mod worker_sources;
 
 pub use agen::UsageRecord;
 pub use agen::llm_client::types::{ContentPart, Item, Role};

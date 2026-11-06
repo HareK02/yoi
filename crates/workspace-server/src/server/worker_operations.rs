@@ -880,7 +880,7 @@ impl WorkspaceWorker {
         &self,
         context: &WorkerOperationContext,
         candidate: &CleanupWorkerCandidate,
-    ) -> ApiResult<()> {
+    ) -> ApiResult<server_api::WorkerRemoveResponse> {
         let _guard = self.authorize_operation(context, "remove").await?;
         if candidate.runtime_id != self.identity.runtime_id
             || candidate.runtime_worker_id != self.identity.worker_id

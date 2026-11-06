@@ -292,6 +292,7 @@ mod service_connection {
                 &request,
                 PluginHostRequest::Service {
                     request: PluginServiceRequest::Complete {
+                        failure: None,
                         result: PluginServiceEventResult::Ack,
                         ..
                     }
@@ -334,6 +335,7 @@ mod service_connection {
         owner: Arc<dyn PluginHostOwner>,
         allow_reply: std::sync::atomic::AtomicBool,
         released: tokio::sync::Notify,
+        polled: tokio::sync::Notify,
         lifecycle_logs: std::sync::atomic::AtomicUsize,
     }
 
@@ -349,6 +351,16 @@ mod service_connection {
                     request: PluginServiceRequest::Release { .. }
                 }
             );
+            if matches!(
+                &request,
+                PluginHostRequest::Service {
+                    request: PluginServiceRequest::Poll { .. }
+                }
+            ) {
+                // Poll can only be sent after the driver retained Acquire's
+                // response proof. A committed consumer row alone is too early.
+                self.polled.notify_one();
+            }
             if matches!(
                 &request,
                 PluginHostRequest::Service {
@@ -389,6 +401,7 @@ mod service_connection {
                 owner: owner.clone(),
                 allow_reply: std::sync::atomic::AtomicBool::new(false),
                 released: tokio::sync::Notify::new(),
+                polled: tokio::sync::Notify::new(),
                 lifecycle_logs: std::sync::atomic::AtomicUsize::new(0),
             });
             let host =
@@ -401,6 +414,12 @@ mod service_connection {
                 .await
                 .unwrap();
             until(&f, "lease acquisition", || state(&f).is_some()).await;
+            // Owner commit is not response delivery: shutting down before the
+            // driver receives Acquire would test a different unknown-proof case,
+            // not the retained-proof Release reconciliation contract below.
+            tokio::time::timeout(Duration::from_secs(10), boundary.polled.notified())
+                .await
+                .expect("driver must retain its lease and begin polling before shutdown");
             let (consumer_id, cursor, _, token) = state(&f).unwrap();
             let lease = PluginServiceLease {
                 consumer_id,
@@ -459,6 +478,383 @@ mod service_connection {
             drop(owner_server);
             f.shutdown().await;
         }
+    }
+
+    // Only the transport boundary is faulted: the real driver, signed owner,
+    // event/receipt transactions and authorized Diagnostics remain connected.
+    struct LoseLifecycleResponses {
+        owner: Arc<dyn PluginHostOwner>,
+        commit_completion: bool,
+        completed: std::sync::atomic::AtomicBool,
+        release_lost: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl PluginHostOwner for LoseLifecycleResponses {
+        async fn call(
+            &self,
+            request: PluginHostRequest,
+        ) -> std::result::Result<PluginHostResponse, PluginHostError> {
+            let unavailable = || PluginHostError {
+                code: PluginHostErrorCode::Unavailable,
+                effect: PluginEffectObservation::NotDispatched,
+                diagnostic_id: String::new(),
+            };
+            let completing = matches!(
+                &request,
+                PluginHostRequest::Service {
+                    request: PluginServiceRequest::Complete { .. }
+                }
+            );
+            let releasing = matches!(
+                &request,
+                PluginHostRequest::Service {
+                    request: PluginServiceRequest::Release { .. }
+                }
+            );
+            if matches!(
+                &request,
+                PluginHostRequest::Service {
+                    request: PluginServiceRequest::LifecycleLog { .. }
+                }
+            ) && self.completed.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // The real stop export calls logging and returns a guest error
+                // when that import fails. The driver must retain Guest, never
+                // infer a reason from the guest's error message.
+                return Err(unavailable());
+            }
+            if matches!(
+                &request,
+                PluginHostRequest::Service {
+                    request: PluginServiceRequest::Diagnostics { .. }
+                }
+            ) && self.completed.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // Keep the old driver read-only/parked until it is dropped. The
+                // fresh owner below observes recovery without this lost channel.
+                return Err(unavailable());
+            }
+            if completing {
+                self.completed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                if !self.commit_completion {
+                    return Err(unavailable());
+                }
+            }
+            let response = self.owner.call(request).await?;
+            if completing
+                || (releasing
+                    && !self
+                        .release_lost
+                        .swap(true, std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err(unavailable());
+            }
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn service_lifecycle_response_loss_survives_driver_loss_and_reopened_authorized_query() {
+        for remote in [false, true] {
+            for commit_completion in [false, true] {
+                let mut peer = Peer::new(HOST, vec![response(200, &[], b"accepted")]).await;
+                let f = fixture(&peer).await;
+                let ticket = create_ticket(&f);
+                let (artifacts, delivery_server) = artifact_source(&f, remote).await;
+                let (owner, owner_server) = if remote {
+                    let (owner, task) =
+                        remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
+                    (owner, Some(task))
+                } else {
+                    (f.owner(Some(peer.transport())).await, None)
+                };
+                let boundary = Arc::new(LoseLifecycleResponses {
+                    owner,
+                    commit_completion,
+                    completed: std::sync::atomic::AtomicBool::new(false),
+                    release_lost: std::sync::atomic::AtomicBool::new(false),
+                });
+                let host = service_host(&f, artifacts, boundary.clone(), "durable-lifecycle").await;
+                let (handle, shutdown) =
+                    worker::controller::WorkerController::spawn_runtime_managed(
+                        host,
+                        &f._directory.path().join("durable-lifecycle-controller"),
+                    )
+                    .await
+                    .unwrap();
+                until(&f, "lifecycle consumer acquisition", || state(&f).is_some()).await;
+                let (consumer, cursor, _, token) = state(&f).unwrap();
+                let token = token.unwrap();
+                comment(&f, &ticket);
+                until(&f, "three independent owner lifecycle observations", || {
+                    f.api.config_store.with_conn(|conn| {
+                        let c = crate::plugin_service::load(conn, TEST_WORKSPACE_ID, &consumer)?;
+                        let diagnostics = crate::plugin_service::diagnostics(conn, &c, chrono::Utc::now().timestamp_millis())?;
+                        Ok(matches!(diagnostics.last_lifecycle, Some(PluginServiceLifecycleDiagnostic::Known { observations }) if observations.len() == 3))
+                    }).unwrap()
+                }).await;
+                handle
+                    .send(protocol::Method::Shutdown {
+                        command: protocol::WorkerCommandEnvelope::new(1),
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), shutdown)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(handle);
+                drop(boundary);
+                // Drop the driver/controller and reopen the production catalog.
+                // Query through a freshly authenticated owner, not driver memory.
+                let mut recovered_api = f.api.clone();
+                recovered_api.config_store = Arc::new(
+                    SqliteWorkspaceStore::open_for_test(&f.api.config.database_path).unwrap(),
+                );
+                let recovered = super::plugin_host::EmbeddedPluginHostOwner::new(
+                    Arc::new(recovered_api.clone()),
+                    f.verified_context().await,
+                    TEST_WORKSPACE_ID.into(),
+                );
+                let PluginServiceResponse::Diagnostics { diagnostics } = request(
+                    &recovered,
+                    PluginServiceRequest::Diagnostics {
+                        consumer_id: consumer.clone(),
+                    },
+                )
+                .await
+                .unwrap() else {
+                    panic!("expected authorized owner diagnostics");
+                };
+                assert!(!diagnostics.lease_active);
+                assert_eq!(diagnostics.pause_reason, None);
+                let Some(PluginServiceLifecycleDiagnostic::Known { observations }) =
+                    &diagnostics.last_lifecycle
+                else {
+                    panic!("missing durable lifecycle evidence")
+                };
+                assert_eq!(observations.len(), 3);
+                let hex: String = Sha256::digest(token.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let lease_id = format!("sha256:{hex}");
+                assert!(observations.iter().all(|o| o.lease_id == lease_id));
+                let causes: Vec<_> = observations
+                    .iter()
+                    .map(|o| match &o.failure {
+                        PluginServiceFailureDiagnostic::Known { cause, explanation } => {
+                            assert_eq!(explanation, &cause.explanation());
+                            *cause
+                        }
+                        other => panic!("unreadable lifecycle cause: {other:?}"),
+                    })
+                    .collect();
+                assert!(causes.contains(&PluginServiceFailure::CompletionUnconfirmed));
+                assert!(causes.contains(&PluginServiceFailure::ReleaseUnconfirmed));
+                assert!(causes.contains(&PluginServiceFailure::Stop {
+                    reason: PluginServiceExecutionFailure::Guest
+                }));
+                let completion = observations
+                    .iter()
+                    .find(|o| o.invocation.is_some())
+                    .unwrap()
+                    .invocation
+                    .as_ref()
+                    .unwrap();
+                if commit_completion {
+                    assert!(
+                        matches!(&diagnostics.last_outcome, Some(PluginServiceOutcomeDiagnostic::Known { event_id, invocation_id, attempt: 1, result: PluginServiceEventResult::Ack, failure: None })
+                        if event_id == &completion.event_id && invocation_id == &completion.invocation_id)
+                    );
+                    assert!(state(&f).unwrap().1 > cursor);
+                    assert_eq!(diagnostics.current_event_id, None);
+                } else {
+                    assert_eq!(
+                        diagnostics.last_outcome, None,
+                        "response loss must not fabricate a failed or committed invocation"
+                    );
+                    assert_eq!(state(&f).unwrap().1, cursor);
+                    assert_eq!(
+                        diagnostics.current_event_id.as_ref(),
+                        Some(&completion.event_id)
+                    );
+                }
+                let management = recovered_api
+                    .plugin_service_diagnostics(
+                        TEST_WORKSPACE_ID.into(),
+                        test_owner_actor(),
+                        consumer.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(management, diagnostics);
+                let serialized = serde_json::to_string(&diagnostics).unwrap();
+                assert!(!serialized.contains(&token));
+                assert!(!serialized.contains("private Service"));
+                assert_eq!(f.count("plugin_invocations"), 1);
+                assert_eq!(f.count("plugin_effect_receipts"), 1);
+                assert_eq!(f.count("plugin_data_receipts"), 1);
+                assert_eq!(
+                    peer.connection_count(),
+                    1,
+                    "neither lifecycle recording nor query replays the effect"
+                );
+                // Current policy, not stored presentation, governs disclosure.
+                f.revoke();
+                assert_eq!(
+                    request(
+                        &recovered,
+                        PluginServiceRequest::Diagnostics {
+                            consumer_id: consumer
+                        }
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                    PluginHostErrorCode::Denied
+                );
+                drop(owner_server);
+                drop(delivery_server);
+                f.shutdown().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_lifecycle_observation_requires_same_worker_and_exact_proof_after_revocation() {
+        let peer = Peer::new(HOST, vec![]).await;
+        let f = fixture(&peer).await;
+        let (owners, server) = owners(&f).await;
+        let lease = acquire(owners[0].as_ref(), &f).await;
+        let observation = PluginServiceLifecycleObservation::Stop {
+            reason: PluginServiceExecutionFailure::HostDenied,
+        };
+        // A random UUID never reaches the consumer-owner check: the signed
+        // request verifier first requires registered/reserved Worker membership.
+        // Use a real owner reservation so Denied proves the immutable consumer
+        // identity fence, rather than an earlier proof/transport rejection.
+        let memory = f
+            .api
+            .config_store
+            .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+            .unwrap();
+        let foreign_reservation = f
+            .api
+            .config_store
+            .reserve_worker_create(
+                TEST_WORKSPACE_ID,
+                &f.source.runtime_id,
+                "foreign-service-observer",
+                "sha256:foreign-service-observer",
+                None,
+                &memory,
+            )
+            .unwrap();
+        let (foreign, foreign_server) = remote_owner_for(
+            &f,
+            &foreign_reservation.worker_id.to_string(),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(
+            request(
+                foreign.as_ref(),
+                PluginServiceRequest::ObserveLifecycle {
+                    lease: lease.clone(),
+                    observation: observation.clone()
+                }
+            )
+            .await
+            .unwrap_err()
+            .code,
+            PluginHostErrorCode::Denied
+        );
+        for owner in &owners {
+            let fake = PluginServiceLease {
+                consumer_id: lease.consumer_id.clone(),
+                lease_token: "not-issued".into(),
+            };
+            assert_eq!(
+                request(
+                    owner.as_ref(),
+                    PluginServiceRequest::ObserveLifecycle {
+                        lease: fake,
+                        observation: observation.clone()
+                    }
+                )
+                .await
+                .unwrap_err()
+                .code,
+                PluginHostErrorCode::Conflict
+            );
+        }
+        f.revoke();
+        // Cleanup evidence may be recorded by its original authenticated owner
+        // even though live grants correctly prohibit delivery and disclosure.
+        for owner in &owners {
+            assert_eq!(
+                request(
+                    owner.as_ref(),
+                    PluginServiceRequest::ObserveLifecycle {
+                        lease: lease.clone(),
+                        observation: observation.clone()
+                    }
+                )
+                .await
+                .unwrap(),
+                PluginServiceResponse::LifecycleObserved
+            );
+            assert_eq!(
+                request(
+                    owner.as_ref(),
+                    PluginServiceRequest::Diagnostics {
+                        consumer_id: lease.consumer_id.clone()
+                    }
+                )
+                .await
+                .unwrap_err()
+                .code,
+                PluginHostErrorCode::Denied
+            );
+        }
+        request(
+            owners[0].as_ref(),
+            PluginServiceRequest::Release {
+                lease: lease.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        request(
+            owners[1].as_ref(),
+            PluginServiceRequest::ObserveLifecycle {
+                lease: lease.clone(),
+                observation: PluginServiceLifecycleObservation::ReleaseUnconfirmed,
+            },
+        )
+        .await
+        .unwrap();
+        let management = f
+            .api
+            .plugin_service_diagnostics(
+                TEST_WORKSPACE_ID.into(),
+                test_owner_actor(),
+                lease.consumer_id,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(management.last_lifecycle, Some(PluginServiceLifecycleDiagnostic::Known { observations }) if observations.len() == 2)
+        );
+        assert_eq!(management.last_outcome, None);
+        assert!(!management.lease_active);
+        assert_eq!(f.count("plugin_invocations"), 0);
+        assert_eq!(peer.connection_count(), 0);
+        drop(foreign_server);
+        drop(server);
+        f.shutdown().await;
     }
 
     async fn complete_failure_restore(remote: bool) {
@@ -739,6 +1135,7 @@ mod service_connection {
                 request(
                     owner.as_ref(),
                     PluginServiceRequest::Complete {
+                        failure: None,
                         lease: lease.clone(),
                         event_id: event.into(),
                         result: PluginServiceEventResult::Ack,
@@ -1154,6 +1551,7 @@ mod service_connection {
             request(
                 parent.as_ref(),
                 PluginServiceRequest::Complete {
+                    failure: None,
                     lease: parent_lease.clone(),
                     event_id: parent_event.event_id,
                     result: PluginServiceEventResult::Ack,
@@ -1274,6 +1672,7 @@ mod service_connection {
                 request(
                     owners[0].as_ref(),
                     PluginServiceRequest::Complete {
+                        failure: None,
                         lease: lease.clone(),
                         event_id: deletion,
                         result: PluginServiceEventResult::Ack

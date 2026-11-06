@@ -33,7 +33,16 @@ mod recovery;
 #[path = "job_store/start_rejection_tests.rs"]
 mod start_rejection_tests;
 
-const SCHEMA_VERSION: i64 = 8;
+#[path = "job_store/failure.rs"]
+mod failure;
+pub(crate) use failure::SettlementFailures;
+use failure::StoredJobFailures;
+pub use failure::{
+    JobFailureCause, JobFailureObservation, JobFailureObservations, JobFailureVisibility,
+};
+use protocol::background_failure::{BackgroundFailure, StoredFailure};
+
+const SCHEMA_VERSION: i64 = 9;
 
 /// Availability of the immutable input body, independent of execution outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,14 +210,26 @@ impl JobSnapshot {
                 JobAttemptState::Cancelled => job::JobAttemptState::Cancelled,
             },
             result: self.result.clone(),
-            failure_category: self.attempt.failure.as_ref().map(|_| {
-                match self.attempt.state {
-                    JobAttemptState::Cancelled => "cancelled",
-                    _ => "execution_failed",
-                }
-                .to_string()
-            }),
-            failure_detail: self.attempt.failure.clone(),
+            failure_category: self
+                .attempt
+                .failure
+                .as_ref()
+                .filter(|_| matches!(self.state, JobState::Failed | JobState::Cancelled))
+                .map(|_| {
+                    match self.attempt.state {
+                        JobAttemptState::Cancelled => "cancelled",
+                        _ => "execution_failed",
+                    }
+                    .to_string()
+                }),
+            // Legacy prose is retained for the owner, never endorsed or redisclosed.
+            // Typed consumers use JobAttempt::failure_observations with current visibility.
+            failure_detail: self
+                .attempt
+                .failure
+                .as_ref()
+                .filter(|_| matches!(self.state, JobState::Failed | JobState::Cancelled))
+                .map(|_| "Failure details unavailable.".into()),
         }
     }
 }
@@ -218,7 +239,28 @@ pub struct JobAttempt {
     pub attempt_id: String,
     pub number: u8,
     pub state: JobAttemptState,
+    /// Owner-local legacy diagnostics. Untrusted text is not a query attachment.
+    #[serde(skip)]
     pub failure: Option<String>,
+    #[serde(skip)]
+    failures: StoredJobFailures,
+}
+
+impl JobAttempt {
+    /// Reproject stored facts using the query boundary's current authorization.
+    pub fn failure_observations<A: error_contract::Audience>(
+        &self,
+        current: &JobFailureVisibility,
+    ) -> JobFailureObservations<A>
+    where
+        JobFailureCause: error_contract::ProjectFor<
+                A,
+                Authorization = JobFailureVisibility,
+                Details = JobFailureCause,
+            >,
+    {
+        self.failures.project(current)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -233,6 +275,8 @@ pub enum JobStoreError {
     Job(#[from] job::JobError),
     #[error("Job directory: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Job failure contract: {0}")]
+    FailureContract(#[from] error_contract::ContractError),
     #[error("unsupported Job schema version {0}")]
     UnsupportedSchema(i64),
     #[error("corrupt Job database: {0}")]
@@ -816,6 +860,78 @@ impl JobStore {
         Ok(snapshot)
     }
 
+    /// Persist attempt evidence with its terminal transition. Exact settlement retries
+    /// retain first observations; accepted results and cleanup ownership are independent.
+    pub(crate) fn record_settlement_failures(
+        &mut self,
+        job_id: &str,
+        attempt_id: &str,
+        failures: SettlementFailures,
+    ) -> Result<(), JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = require_snapshot(&tx, job_id)?;
+        check_attempt(&saved, attempt_id)?;
+        if saved.version_stopped
+            || !saved
+                .executions
+                .iter()
+                .any(|bound| bound.attempt_id == attempt_id && bound.owner_id == self.owner_id)
+        {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        let completed = saved.state == JobState::Completed;
+        let primary = (!completed).then_some(failures.primary).flatten();
+        let post_result = completed.then_some(failures.post_result).flatten();
+        let encode =
+            |cause: Option<JobFailureCause>| cause.map(JobFailureCause::attachment).transpose();
+        let primary_attachment = encode(primary)?;
+        let post_attachment = encode(post_result)?;
+        let receipt_attachment = encode(failures.result_receipt)?;
+        let cleanup_attachment = encode(failures.cleanup)?;
+        if saved.state == JobState::Pending {
+            let cause = primary
+                .or(failures.result_receipt)
+                .unwrap_or(JobFailureCause::MissingResult);
+            let detail = match cause {
+                // Preserve the existing owner-local stop diagnostic, not its classification.
+                JobFailureCause::DeadlineExceeded => "timeout",
+                JobFailureCause::HostStopped => "Host cancellation/shutdown",
+                _ => cause.explanation(),
+            };
+            set_terminal(&tx, &saved, JobAttemptState::Failed, Some(detail))?;
+        }
+        // Nullable additions allow historical rows with no typed facts. Never infer
+        // a cause from those rows' prose or overwrite unknown retained evidence.
+        tx.execute(
+            "UPDATE job_attempts SET
+                primary_failure_json=COALESCE(primary_failure_json,?3),
+                post_result_failure_json=COALESCE(post_result_failure_json,?4),
+                result_receipt_failure_json=COALESCE(result_receipt_failure_json,?5),
+                cleanup_failure_json=COALESCE(cleanup_failure_json,?6)
+             WHERE job_id=?1 AND attempt_id=?2",
+            params![
+                job_id,
+                attempt_id,
+                primary_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str),
+                post_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str),
+                receipt_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str),
+                cleanup_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub(crate) fn finish(
         &mut self,
         job_id: &str,
@@ -973,6 +1089,31 @@ fn require_snapshot(conn: &Connection, job_id: &str) -> Result<JobSnapshot, JobS
     read_snapshot(conn, job_id)?.ok_or_else(|| JobStoreError::NotFound(job_id.to_owned()))
 }
 
+fn read_attempt_failures(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<StoredJobFailures, JobStoreError> {
+    // The reader can precede the additive writer/schema rollout. A genuine
+    // storage error or partially installed schema must not become absent facts.
+    let has_attachments: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('job_attempts') WHERE name='primary_failure_json')",
+        [], |row| row.get(0),
+    )?;
+    if !has_attachments {
+        return Ok(StoredJobFailures::default());
+    }
+    Ok(conn.query_row(
+        "SELECT primary_failure_json, post_result_failure_json, result_receipt_failure_json, cleanup_failure_json FROM job_attempts WHERE attempt_id=?1",
+        [attempt_id],
+        |r| Ok(StoredJobFailures {
+            primary: r.get::<_, Option<String>>(0)?.map(StoredFailure::from_storage),
+            post_result: r.get::<_, Option<String>>(1)?.map(StoredFailure::from_storage),
+            result_receipt: r.get::<_, Option<String>>(2)?.map(StoredFailure::from_storage),
+            cleanup: r.get::<_, Option<String>>(3)?.map(StoredFailure::from_storage),
+        }),
+    )?)
+}
+
 fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>, JobStoreError> {
     let row = conn
         .query_row(
@@ -1063,6 +1204,7 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
                     stmt.query_map([job_id], |r| Ok(JobExecutionOwnership { attempt_id:r.get(0)?,owner_id:r.get(1)?,run_id:r.get(2)?,writes_revoked:r.get(3)?,cleanup_receipt:r.get(4)? }))?.collect::<Result<Vec<_>,_>>()?
                 },
                 attempt: JobAttempt {
+                    failures: read_attempt_failures(conn, &attempt_id)?,
                     attempt_id,
                     number,
                     state: attempt_state,
@@ -1204,6 +1346,252 @@ mod tests {
             serialization_key: None,
             limits: JobLimits::default(),
         }
+    }
+
+    #[test]
+    fn failure_reader_reprojects_and_quarantines_legacy_unknown_and_corrupt_bytes() {
+        let (dir, mut store) = fixture();
+        let saved = dispatched(&mut store, request("failure-reader"));
+        store
+            .finish(
+                "failure-reader",
+                &saved.attempt.attempt_id,
+                JobAttemptState::Failed,
+                Some("TEST_ONLY_SECRET /private/legacy/path"),
+            )
+            .unwrap();
+        let known = JobFailureCause::Worker.attachment().unwrap();
+        let forged_explanation = known.as_storage_str().replace(
+            JobFailureCause::Worker.explanation(),
+            "TEST_ONLY_SECRET /private/retained/path",
+        );
+        let future = known
+            .as_storage_str()
+            .replace("\"version\":1", "\"version\":999");
+        store
+            .conn
+            .execute(
+                "UPDATE job_attempts SET primary_failure_json=?1,post_result_failure_json=?2,
+            result_receipt_failure_json=?3 WHERE attempt_id=?4",
+                params![
+                    forged_explanation,
+                    future,
+                    "{ TEST_ONLY_SECRET /private/corrupt",
+                    saved.attempt.attempt_id
+                ],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        let saved = reopened.get("failure-reader").unwrap();
+        let observed =
+            saved
+                .attempt
+                .failure_observations::<error_contract::Tool>(&JobFailureVisibility {
+                    can_view_cause: true,
+                });
+        let JobFailureObservation::Known(projected) = observed.primary else {
+            panic!("known cause lost")
+        };
+        assert_eq!(*projected.details(), JobFailureCause::Worker);
+        assert_eq!(
+            projected.explanation(),
+            JobFailureCause::Worker.explanation()
+        );
+        let encoded = error_contract::encode_projected_failure(
+            &projected,
+            error_contract::Budget::new(8192, 8192),
+        )
+        .unwrap();
+        let encoded = std::str::from_utf8(encoded.as_bytes()).unwrap();
+        assert!(!encoded.contains("TEST_ONLY_SECRET"));
+        assert!(!encoded.contains("/private/"));
+        assert!(matches!(
+            observed.post_result,
+            JobFailureObservation::Unsupported
+        ));
+        assert!(matches!(
+            observed.result_receipt,
+            JobFailureObservation::Corrupt
+        ));
+        assert!(matches!(
+            observed.cleanup,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        let hidden =
+            saved
+                .attempt
+                .failure_observations::<error_contract::Tool>(&JobFailureVisibility {
+                    can_view_cause: false,
+                });
+        assert!(matches!(hidden.primary, JobFailureObservation::NotVisible));
+        assert!(matches!(
+            hidden.post_result,
+            JobFailureObservation::NotVisible
+        ));
+        assert!(matches!(
+            hidden.result_receipt,
+            JobFailureObservation::NotVisible
+        ));
+        for json in [
+            serde_json::to_string(&saved).unwrap(),
+            serde_json::to_string(&saved.outcome()).unwrap(),
+        ] {
+            assert!(!json.contains("TEST_ONLY_SECRET"));
+            assert!(!json.contains("/private/"));
+            assert!(!json.contains("primary_failure_json"));
+        }
+        assert!(
+            saved
+                .attempt
+                .failure
+                .as_ref()
+                .unwrap()
+                .contains("TEST_ONLY_SECRET"),
+            "legacy bytes remain owner-local, not reclassified"
+        );
+        assert!(!saved.executions_released());
+    }
+
+    #[test]
+    fn failure_attachment_and_terminal_state_commit_together_or_not_at_all() {
+        let (dir, mut store) = fixture();
+        let saved = dispatched(&mut store, request("atomic-failure"));
+        store.conn.execute_batch("CREATE TRIGGER fail_attachment BEFORE UPDATE OF primary_failure_json ON job_attempts
+            BEGIN SELECT RAISE(ABORT,'injected attachment failure'); END;").unwrap();
+        let failures = || SettlementFailures {
+            primary: Some(JobFailureCause::Worker),
+            cleanup: Some(JobFailureCause::CleanupUnconfirmed),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .record_settlement_failures("atomic-failure", &saved.attempt.attempt_id, failures())
+                .is_err()
+        );
+        assert_eq!(store.get("atomic-failure").unwrap(), saved);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("atomic-failure").unwrap(), saved);
+        drop(reopened);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_attachment")
+            .unwrap();
+        store
+            .record_settlement_failures("atomic-failure", &saved.attempt.attempt_id, failures())
+            .unwrap();
+        let failed = store.get("atomic-failure").unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert!(!failed.executions_released());
+        store
+            .record_settlement_failures("atomic-failure", &saved.attempt.attempt_id, failures())
+            .unwrap();
+        assert_eq!(
+            store.get("atomic-failure").unwrap(),
+            failed,
+            "same settlement is idempotent"
+        );
+        drop(store);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("atomic-failure").unwrap(), failed);
+    }
+
+    #[test]
+    fn v9_failure_migration_is_additive_atomic_reader_first_and_does_not_cut_over_jobs() {
+        let (dir, mut store) = fixture();
+        let pending = store.reserve(request("legacy-pending")).unwrap();
+        let running = dispatched(&mut store, request("legacy-running"));
+        let failed = store
+            .finish(
+                "legacy-running",
+                &running.attempt.attempt_id,
+                JobAttemptState::Failed,
+                Some("old explanation says timeout; not typed evidence"),
+            )
+            .unwrap();
+        let complete = dispatched(&mut store, request("legacy-complete"));
+        let complete = store
+            .accept(&JobResultSubmission {
+                job_id: "legacy-complete".into(),
+                attempt_id: complete.attempt.attempt_id.clone(),
+                input_digest: complete.input_digest.clone(),
+                result: json!({"saved":true}),
+            })
+            .unwrap();
+        // Reconstruct the actual v8 schema, with unchanged legacy rows and receipts.
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE job_attempts DROP COLUMN primary_failure_json;
+            ALTER TABLE job_attempts DROP COLUMN post_result_failure_json;
+            ALTER TABLE job_attempts DROP COLUMN result_receipt_failure_json;
+            ALTER TABLE job_attempts DROP COLUMN cleanup_failure_json;
+            PRAGMA user_version=8;",
+            )
+            .unwrap();
+        let before = require_snapshot(&store.conn, "legacy-running").unwrap();
+        assert_eq!(before, failed);
+        assert!(matches!(
+            before
+                .attempt
+                .failure_observations::<error_contract::Tool>(&JobFailureVisibility {
+                    can_view_cause: true
+                })
+                .primary,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        // Fault after DDL: initialize must roll the columns/version back together.
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE migration_fault(id TEXT REFERENCES job_intents(job_id));
+            INSERT INTO migration_fault VALUES('missing');",
+            )
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        assert!(recovery::initialize(&mut store.conn).is_err());
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            require_snapshot(&store.conn, "legacy-running").unwrap(),
+            failed
+        );
+        let column_exists: bool = store.conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('job_attempts') WHERE name='primary_failure_json')",
+            [], |r| r.get(0)).unwrap();
+        assert!(!column_exists);
+        store
+            .conn
+            .execute_batch("DROP TABLE migration_fault")
+            .unwrap();
+        drop(store);
+        let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        for original in [pending, failed, complete] {
+            assert_eq!(reopened.get(&original.request.job_id).unwrap(), original);
+            assert!(!original.version_stopped);
+        }
+        let fresh = reopened.reserve(request("after-v9")).unwrap();
+        drop(reopened);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("after-v9").unwrap(), fresh);
+        assert_eq!(
+            reopened
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
     }
 
     #[test]

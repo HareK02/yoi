@@ -84,7 +84,7 @@ impl CleanupOperation {
     }
 }
 
-/// The exact committed preimage, not a wall-clock revision or a retry token.
+/// The exact committed preimage for CAS, not time ordering or retry permission.
 /// A caller cannot reconstruct it from displayed causes or cleanup state.
 #[derive(Clone)]
 pub struct LoadedCleanupOperation {

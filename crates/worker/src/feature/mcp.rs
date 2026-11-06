@@ -1219,6 +1219,7 @@ impl McpStdioTool {
 
         match call_result {
             Ok(result) => {
+                let execution_failed = result.is_error;
                 let mut output = render_call_tool_result(&self.mcp_tool_name, result)?;
                 append_mcp_list_changed_warning(&mut output, &list_changes, "tools/call");
                 if let Err(err) = shutdown_result {
@@ -1231,7 +1232,11 @@ impl McpStdioTool {
                         None => format!("Shutdown warning: {warning}"),
                     });
                 }
-                Ok(output)
+                if execution_failed {
+                    Err(ToolError::ExecutionFailure(output))
+                } else {
+                    Ok(output)
+                }
             }
             Err(err) => {
                 let mut message = mcp_call_error_message(&err);

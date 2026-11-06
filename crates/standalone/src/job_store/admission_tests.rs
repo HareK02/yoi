@@ -30,6 +30,14 @@ fn granted_admission_guard_upgrade_rolls_back_retries_preserves_reservations_and
     conn.execute_batch("DROP TRIGGER job_start_rejection_guard")
         .unwrap();
     conn.execute_batch(old_guard).unwrap();
+    // Recreate the actual pre-v9 columns as well as the old v7 guard.
+    conn.execute_batch(
+        "ALTER TABLE job_attempts DROP COLUMN primary_failure_json;
+        ALTER TABLE job_attempts DROP COLUMN post_result_failure_json;
+        ALTER TABLE job_attempts DROP COLUMN result_receipt_failure_json;
+        ALTER TABLE job_attempts DROP COLUMN cleanup_failure_json;",
+    )
+    .unwrap();
     conn.pragma_update(None, "user_version", 7).unwrap();
     conn.execute_batch("CREATE TABLE migration_fault(value TEXT REFERENCES job_intents(job_id))")
         .unwrap();

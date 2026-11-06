@@ -71,8 +71,20 @@ pub enum RuntimeError {
         result: WorkerExecutionResult,
     },
 
+    /// Creation failed after connection; the original error remains internal source
+    /// evidence. Display deliberately never renders it or the startup attachment.
+    #[error("worker creation failed")]
+    WorkerCreateFailed {
+        failure: Box<runtime_api::startup::WorkerCreateFailure>,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+
     #[error("limit {requested} exceeds maximum {max}")]
     LimitTooLarge { requested: usize, max: usize },
+
+    #[error("worker {worker_id} was already created with different request identity input")]
+    WorkerCreateConflict { worker_id: WorkerId },
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -85,6 +97,15 @@ pub enum RuntimeError {
         owner_server_id: String,
         requester_server_id: String,
     },
+
+    #[error("recording source unavailable: {message}")]
+    RecordingSourceUnavailable { message: String },
+
+    #[error("recording ownership unknown: {message}")]
+    RecordingOwnershipUnknown { message: String },
+
+    #[error("recording execution unconfirmed: {message}")]
+    RecordingExecutionUnconfirmed { message: String },
 
     #[error(transparent)]
     WorkingDirectory(#[from] WorkingDirectoryDiagnostic),
@@ -157,11 +178,26 @@ pub enum RuntimeError {
 }
 
 impl RuntimeError {
+    /// Only an owning create boundary or a Spawn result can identify a creation
+    /// failure. Independent Input errors retain their ordinary API contract.
+    pub fn create_failure(&self) -> Option<runtime_api::startup::WorkerCreateFailure> {
+        match self {
+            Self::WorkerCreateFailed { failure, .. } => Some((**failure).clone()),
+            Self::WorkerExecutionRejected { result, .. } => {
+                crate::execution::startup_create_failure(result)
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        }
+    }
+
     /// The original execution result, including primary facts and independent secondary
     /// failures. Display is presentation only and must not be parsed to recover causes.
     pub fn execution_result(&self) -> Option<&WorkerExecutionResult> {
         match self {
             Self::WorkerExecutionRejected { result, .. } => Some(result),
+            Self::WorkerCreateFailed { source, .. } => source.execution_result(),
             _ => None,
         }
     }
@@ -174,7 +210,9 @@ impl RuntimeError {
         let error = self;
         use RuntimeControlCause as C;
         match error {
+            E::WorkerCreateFailed { source, .. } => source.control_cause(),
             E::WorkerNotFound { .. } => C::WorkerMissing,
+            E::WorkerCreateConflict { .. } => C::CreateRequestConflict,
             E::RuntimeStopped => C::RuntimeStopped,
             E::InvalidInitialInputKind { .. } | E::LimitTooLarge { .. } | E::InvalidRequest(_) => {
                 C::InvalidRequest
@@ -202,6 +240,9 @@ impl RuntimeError {
             E::RuntimeStoreAlreadyOpen { .. } | E::StoreMissing { .. } | E::StoreCorrupt { .. } => {
                 C::StoreUnavailable
             }
+            E::RecordingSourceUnavailable { .. } => C::RecordingSourceUnavailable,
+            E::RecordingOwnershipUnknown { .. } => C::RecordingOwnershipUnknown,
+            E::RecordingExecutionUnconfirmed { .. } => C::RecordingExecutionUnconfirmed,
             E::StatePoisoned => C::StateUnavailable,
         }
     }

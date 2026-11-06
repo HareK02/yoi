@@ -30,6 +30,28 @@ struct WorkdirDocument {
     problem: ProblemDetails<WorkdirFailureDetails>,
 }
 impl OpenApiSchema for WorkdirDocument {}
+use protocol::control_failure::RuntimeControlCause;
+use protocol::session_failure::SessionRegistrationCause;
+use protocol::startup_failure::RuntimeStartupCause;
+
+#[derive(JsonSchema)]
+struct StartupDocument {
+    failure: FailureEnvelope<RuntimeStartupCause>,
+    problem: ProblemDetails<RuntimeStartupCause>,
+}
+impl OpenApiSchema for StartupDocument {}
+#[derive(JsonSchema)]
+struct ControlDocument {
+    failure: FailureEnvelope<RuntimeControlCause>,
+    problem: ProblemDetails<RuntimeControlCause>,
+}
+impl OpenApiSchema for ControlDocument {}
+#[derive(JsonSchema)]
+struct SessionDocument {
+    failure: FailureEnvelope<SessionRegistrationCause>,
+    problem: ProblemDetails<SessionRegistrationCause>,
+}
+impl OpenApiSchema for SessionDocument {}
 
 fn builder() -> OpenApiBuilder {
     OpenApiBuilder::new(OpenApiInfo {
@@ -57,6 +79,10 @@ fn mixed_domains_keep_distinct_details_references_and_same_domain_registration_i
     );
     let configuration = builder.schema_ref::<ConfigurationDocument>().unwrap();
     let workdir = builder.schema_ref::<WorkdirDocument>().unwrap();
+    let startup = builder.schema_ref::<StartupDocument>().unwrap();
+    assert_eq!(startup, builder.schema_ref::<StartupDocument>().unwrap());
+    let control = builder.schema_ref::<ControlDocument>().unwrap();
+    let session = builder.schema_ref::<SessionDocument>().unwrap();
     let document: Value =
         serde_json::from_str(&builder.finish().unwrap().to_json().unwrap()).unwrap();
     let schemas = &document["components"]["schemas"];
@@ -66,6 +92,9 @@ fn mixed_domains_keep_distinct_details_references_and_same_domain_registration_i
         (repository, "RepositoryAccessDetails"),
         (configuration, "ConfigurationFailureDetails"),
         (workdir, "WorkdirFailureDetails"),
+        (startup, "RuntimeStartupCause"),
+        (control, "RuntimeControlCause"),
+        (session, "SessionRegistrationCause"),
     ] {
         let properties = &schemas[component_name(&reference)]["properties"];
         let envelope_ref = &properties["failure"];

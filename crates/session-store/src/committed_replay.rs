@@ -180,6 +180,7 @@ pub struct CommittedPublicReplay {
     retention: Option<crate::retention::SessionRetentionStore>,
 }
 
+#[derive(Clone)]
 enum Layout {
     Worker(PathBuf),
     Fs(PathBuf),
@@ -347,6 +348,71 @@ impl CommittedPublicReplay {
     /// Consume replay metadata for guarded recording admission, without reading or
     /// collecting original bodies. The public capture facade exposes only these
     /// descriptors to its callback, never this replay's body-read capability.
+    /// Preserve the active recording order, then add every retained branch in
+    /// stable Segment order. Identity collisions with changed bodies fail closed.
+    pub(crate) fn recording_union(mut self) -> Result<Self, PublicMaterialError> {
+        let mut seen = self
+            .materials
+            .iter()
+            .enumerate()
+            .map(|(index, material)| (material.descriptor.identity.clone(), index))
+            .collect::<HashMap<_, _>>();
+        let mut segments = self.file_ends.keys().copied().collect::<Vec<_>>();
+        segments.sort();
+        for segment in segments {
+            if segment == self.active_segment_id {
+                continue;
+            }
+            let branch = Self::open(
+                self.session_id,
+                segment,
+                self.layout.clone(),
+                self.limits,
+                None,
+                PublicMaterialUse::Recording,
+            )?;
+            if branch.file_ends != self.file_ends {
+                return Err(PublicMaterialError::Changed);
+            }
+            for mut material in branch.materials {
+                if let Some(index) = seen.get(&material.descriptor.identity) {
+                    let original = &self.materials[*index].descriptor;
+                    if original.sha256 != material.descriptor.sha256
+                        || original.total_bytes != material.descriptor.total_bytes
+                        || original.origin != material.descriptor.origin
+                    {
+                        return Err(PublicMaterialError::Changed);
+                    }
+                    continue;
+                }
+                if self.materials.len() >= self.limits.max_entries {
+                    return Err(PublicMaterialError::ResourceLimit);
+                }
+                let index = self.materials.len();
+                material.descriptor.canonical_order = index as u64;
+                seen.insert(material.descriptor.identity.clone(), index);
+                self.materials.push(material);
+            }
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn verify_recording_descriptors(
+        &self,
+        expected: &[PublicMaterialDescriptor],
+    ) -> Result<(), PublicMaterialError> {
+        if self.materials.len() != expected.len()
+            || self
+                .materials
+                .iter()
+                .zip(expected)
+                .any(|(m, d)| &m.descriptor != d)
+        {
+            return Err(PublicMaterialError::Changed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn into_recording_descriptors(self) -> Vec<PublicMaterialDescriptor> {
         self.materials
             .into_iter()

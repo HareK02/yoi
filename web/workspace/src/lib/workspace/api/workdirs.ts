@@ -22,7 +22,7 @@ import type {
   WorkingDirectoryRemovalResponse,
   WorkingDirectorySource,
   WorkingDirectorySummary,
-} from "../../generated/workdir-api";
+} from "../../generated/workdir-api.ts";
 
 const SUMMARY_KEYS = new Set([
   "working_directory_id",

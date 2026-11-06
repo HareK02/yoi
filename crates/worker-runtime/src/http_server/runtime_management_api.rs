@@ -201,6 +201,10 @@ async fn runtime_api_wire_compatibility(
         response.status(),
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
     ) && !is_json_error
+        && response
+            .extensions()
+            .get::<Arc<runtime_api::RuntimeApiError>>()
+            .is_none()
     {
         return RuntimeHttpRestError::new(
             StatusCode::BAD_REQUEST,
@@ -255,9 +259,17 @@ where
 fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
     let mut response =
         runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message);
+    if error.startup.is_none() {
+        if let Some(cause) = error.control {
+            response = response.with_control(cause);
+        }
+    }
     response.error.startup = error.startup;
-    if let Some(cause) = error.control {
-        response = response.with_control(cause);
+    if let Some(cause) = error.management {
+        response = response.with_management(cause);
+    }
+    if let Some(failure) = error.create_failure {
+        return response.with_create_failure(failure);
     }
     response
 }
@@ -815,6 +827,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         let result = result
             .map(|result| -> Result<_, runtime_api::RuntimeApiError> {
                 Ok(runtime_api::WorkerRestoreResponse {
+                    control: result.control,
+                    startup: result.startup,
                     state: match result.state {
                         server_api::WorkerRestoreState::Accepted => {
                             runtime_api::WorkerRestoreState::Accepted
@@ -868,6 +882,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
         Ok(runtime_api::WorkerRestoreResponse {
+            control: result.control,
+            startup: result.startup,
             state: match result.state {
                 server_api::WorkerRestoreState::Accepted => {
                     runtime_api::WorkerRestoreState::Accepted
@@ -1083,6 +1099,75 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 503,
                 "worker_retention_unavailable",
                 "Worker retention requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn freeze_worker_removal(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerRetentionExecutionRequest,
+    ) -> Result<runtime_api::WorkerRemovalFreeze, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &value.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        if value.worker_id != worker_ref.worker_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                400,
+                "worker_id_mismatch",
+                "Worker removal route identity mismatch",
+            ));
+        }
+        #[cfg(feature = "fs-store")]
+        {
+            let request: WorkerRetentionExecutionRequest = request(value)?;
+            self.state
+                .runtime
+                .freeze_worker_removal_scoped(&scope, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, value);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Worker removal requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn capture_worker_removal_session(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .capture_worker_removal_session_scoped(
+                    &scope,
+                    &request.operation_id,
+                    worker_ref.worker_id,
+                    request.session_id,
+                    request.active_segment_id,
+                    request.start,
+                    request.max_entries,
+                    request.max_serialized_bytes,
+                )
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, worker_ref, request);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Worker removal requires filesystem storage",
             ))
         }
     }

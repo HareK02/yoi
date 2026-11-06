@@ -43,6 +43,7 @@ mod subjektiv_memory_journal;
 mod workdir_authorization;
 mod worker_operations;
 mod worker_protocol;
+mod worker_startup;
 pub(crate) use worker_operations::{
     WorkerOperationContext, WorkspaceWorker, WorkspaceWorkerMethodSender,
 };
@@ -2356,7 +2357,10 @@ impl WorkerRemovalService {
         })
     }
 
-    async fn execute_cleanup_removal(&self, candidate: &CleanupWorkerCandidate) -> ApiResult<()> {
+    async fn execute_cleanup_removal(
+        &self,
+        candidate: &CleanupWorkerCandidate,
+    ) -> ApiResult<server_api::WorkerRemoveResponse> {
         let target = RuntimeWorkerRef::new(
             candidate.runtime_id.clone(),
             candidate.runtime_worker_id.clone(),
@@ -2379,14 +2383,19 @@ impl WorkerRemovalService {
                     message.as_str(),
                 )
             })?;
-        if response.status != StatusCode::OK.as_u16() {
+        if !(200..300).contains(&response.status) {
             return Err(cleanup_api_error(
                 candidate.runtime_id.as_str(),
                 "workspace_cleanup_worker_removal_rejected",
                 response.body.as_str(),
             ));
         }
-        Ok(())
+        serde_json::from_str(&response.body).map_err(|error| {
+            Error::Store(format!(
+                "Worker removal returned an invalid typed result: {error}"
+            ))
+            .into()
+        })
     }
 
     fn delete_spawn_compensation_runtime_worker(
@@ -2577,6 +2586,14 @@ impl WorkerRemovalService {
             match runtime.execute_worker_retention(target, prepared.runtime_request.clone()) {
                 Ok(result) => result,
                 Err(error) => {
+                    if let Err(save_error) = self.store.fail_worker_removal(
+                        &self.workspace_id,
+                        &prepared.plan.operation_id,
+                        &prepared.plan.input_fingerprint,
+                        "runtime_retention_failed",
+                    ) {
+                        return WorkerRemovalFailure::retention_response(save_error);
+                    }
                     return Ok(runtime_retention_failure_response(
                         target,
                         &prepared.plan.operation_id,
@@ -2615,7 +2632,17 @@ impl WorkerRemovalService {
                 subjektiv_journal::after_worker_removal(self, &result);
                 Ok(worker_remove_success_response(target))
             }
-            Err(error) => WorkerRemovalFailure::retention_response(error),
+            Err(error) => {
+                if let Err(save_error) = self.store.fail_worker_removal(
+                    &self.workspace_id,
+                    &prepared.plan.operation_id,
+                    &prepared.plan.input_fingerprint,
+                    "metadata_commit_failed",
+                ) {
+                    return WorkerRemovalFailure::retention_response(save_error);
+                }
+                WorkerRemovalFailure::retention_response(error)
+            }
         }
     }
 
@@ -2884,6 +2911,12 @@ impl WorkerRemovalService {
                     )
                     .map_err(WorkerRemovalFailure::from)?;
             }
+            if let Some(waiting) =
+                subjektiv_journal::advance_worker_removal(self, runtime, target, &prepared)
+                    .map_err(WorkerRemovalFailure::from)?
+            {
+                return Ok(waiting);
+            }
             if close_worker_workdir_sessions(&self.workdir_sessions, &target)
                 .await
                 .is_err()
@@ -3010,6 +3043,12 @@ impl WorkerRemovalService {
                     &prepared.plan.operation_id,
                 )
                 .map_err(WorkerRemovalFailure::from)?;
+        }
+        if let Some(waiting) =
+            subjektiv_journal::advance_worker_removal(self, runtime, target, &prepared)
+                .map_err(WorkerRemovalFailure::from)?
+        {
+            return Ok(waiting);
         }
         if close_worker_workdir_sessions(&self.workdir_sessions, &target)
             .await
@@ -5057,7 +5096,15 @@ impl WorkspaceApi {
             .get_backend_job(self.workspace_id(), &request.job_id)?
             .is_none()
         {
-            self.resolve_backend_job_profile(request)?;
+            self.resolve_backend_job_profile(request).map_err(|error| {
+                let cause = crate::backend_job::operation_failure_cause(
+                    &error,
+                    crate::backend_job::BackgroundJobCause::DispatchFailed,
+                );
+                // No reservation exists yet. Preserve rejection without inventing a
+                // durable attempt or changing the existing admission boundary.
+                crate::backend_job::record_operation_failure(error, cause, |_| Ok(()))
+            })?;
         }
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         let reservation = {
@@ -5221,14 +5268,25 @@ impl WorkspaceApi {
             match self.backend_job_spawn_request(&reservation.job, &reservation.attempt) {
                 Ok(request) => request,
                 Err(error) => {
-                    self.finish_backend_job_attempt(
-                        &request.job_id,
-                        &reservation.attempt.attempt_id,
-                        BackendJobAttemptState::Failed,
-                        "profile_requirements",
-                        &error.to_string(),
-                    )?;
-                    return Err(error);
+                    let cause = crate::backend_job::operation_failure_cause(
+                        &error,
+                        crate::backend_job::BackgroundJobCause::DispatchFailed,
+                    );
+                    let detail = error.to_string();
+                    return Err(crate::backend_job::record_operation_failure(
+                        error,
+                        cause,
+                        |cause| {
+                            self.finish_backend_job_attempt_with_cause(
+                                &request.job_id,
+                                &reservation.attempt.attempt_id,
+                                BackendJobAttemptState::Failed,
+                                "profile_requirements",
+                                &detail,
+                                cause,
+                            )
+                        },
+                    ));
                 }
             };
         let worker_input = request.worker_input(&reservation.attempt.attempt_id)?;
@@ -5236,50 +5294,87 @@ impl WorkspaceApi {
             Ok(spawned) => spawned,
             Err(error) => {
                 let detail = error.error.to_string();
-                if matches!(
+                let cause = if error
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.startup.is_some())
+                {
+                    crate::backend_job::diagnostic_failure_cause(
+                        &error.diagnostics,
+                        crate::backend_job::BackgroundJobCause::DispatchFailed,
+                    )
+                } else if let Some(cause) = error.session_registration_cause.as_ref() {
+                    (|| {
+                        let facts = error_contract::FailureFacts::new(cause.clone())?;
+                        crate::backend_job::BackgroundFailure::from_projected(
+                            &error_contract::project_failure::<error_contract::Storage, _>(
+                                &facts,
+                                &(),
+                            )?,
+                        )
+                    })()
+                } else {
+                    crate::backend_job::operation_failure_cause(
+                        &error.error,
+                        crate::backend_job::BackgroundJobCause::DispatchFailed,
+                    )
+                };
+                let rejected = matches!(
                     &error.error,
                     Error::UnknownRuntime(_)
                         | Error::InvalidInput(_)
                         | Error::WorkspacePermissionDenied(_)
-                ) {
-                    self.finish_backend_job_attempt(
-                        &request.job_id,
-                        &reservation.attempt.attempt_id,
-                        BackendJobAttemptState::Failed,
-                        "dispatch_rejected",
-                        &detail,
-                    )?;
-                    return Err(error.error);
-                }
-                self.retain_backend_job_recovery(
-                    &reservation.attempt,
-                    "allocation_response_lost",
-                    &detail,
-                    "Read the same allocation receipt; never allocate a replacement Worker",
-                )?;
-                return Err(error.error);
+                );
+                return Err(crate::backend_job::record_operation_failure(
+                    error.error,
+                    cause,
+                    |cause| {
+                        if rejected {
+                            self.finish_backend_job_attempt_with_cause(
+                                &request.job_id,
+                                &reservation.attempt.attempt_id,
+                                BackendJobAttemptState::Failed,
+                                "dispatch_rejected",
+                                &detail,
+                                cause,
+                            )
+                        } else {
+                            self.retain_backend_job_recovery_with_cause(
+                            &reservation.attempt, "allocation_response_lost", &detail,
+                            "Read the same allocation receipt; never allocate a replacement Worker", cause,
+                        )
+                        }
+                    },
+                ));
             }
         };
         let worker = match (spawned.state, spawned.worker) {
             (InternalWorkerOperationState::Accepted, Some(worker)) => worker,
             _ => {
-                let detail = spawned
-                    .diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.message.as_str())
-                    .unwrap_or("embedded Runtime rejected Backend Job Worker dispatch");
-                self.finish_backend_job_attempt(
-                    &request.job_id,
-                    &reservation.attempt.attempt_id,
-                    BackendJobAttemptState::Failed,
-                    "dispatch_rejected",
-                    detail,
-                )?;
-                return Err(Error::RuntimeOperationFailed {
+                let cause = crate::backend_job::diagnostic_failure_cause(
+                    &spawned.diagnostics,
+                    crate::backend_job::BackgroundJobCause::DispatchFailed,
+                );
+                let detail = "Runtime did not accept Backend Job Worker dispatch";
+                let primary = Error::RuntimeOperationFailed {
                     runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
                     code: "backend_job_dispatch_rejected".to_string(),
                     message: detail.to_string(),
-                });
+                };
+                return Err(crate::backend_job::record_operation_failure(
+                    primary,
+                    cause,
+                    |cause| {
+                        self.finish_backend_job_attempt_with_cause(
+                            &request.job_id,
+                            &reservation.attempt.attempt_id,
+                            BackendJobAttemptState::Failed,
+                            "dispatch_rejected",
+                            detail,
+                            cause,
+                        )
+                    },
+                ));
             }
         };
         let bound_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
@@ -5466,13 +5561,46 @@ impl WorkspaceApi {
         failure_category: &str,
         failure_detail: &str,
     ) -> Result<BackendJobAttemptRecord> {
-        self.store.finish_backend_job_attempt(
+        let cause = crate::backend_job::BackgroundJobCause::ExecutionFailed
+            .storage()
+            .map_err(Error::BackendJobCauseProjection)?;
+        self.finish_backend_job_attempt_with_cause(
+            job_id,
+            attempt_id,
+            state,
+            failure_category,
+            failure_detail,
+            Some(&cause),
+        )
+    }
+
+    fn finish_backend_job_attempt_with_cause(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        state: BackendJobAttemptState,
+        failure_category: &str,
+        failure_detail: &str,
+        cause: Option<&crate::backend_job::BackgroundFailure>,
+    ) -> Result<BackendJobAttemptRecord> {
+        let retained =
+            self.store
+                .get_backend_job_attempt(self.workspace_id(), job_id, attempt_id)?;
+        let cause = crate::backend_job::prefer_retained_primary_cause(
+            retained
+                .as_ref()
+                .and_then(|attempt| attempt.failure_cause.as_ref()),
+            cause,
+        )
+        .map_err(Error::BackendJobCauseProjection)?;
+        self.store.finish_backend_job_attempt_with_cause(
             &self.config.workspace_id,
             job_id,
             attempt_id,
             state,
             failure_category,
             failure_detail,
+            cause.as_ref(),
             &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
         )?;
         let current = self
@@ -5593,38 +5721,43 @@ impl WorkspaceApi {
             Error::Store("claimed Backend Job Worker cleanup lost its binding".to_string())
         })?;
 
-        let record_failure = |category: &str, detail: &str| -> Result<()> {
-            self.store.finish_backend_job_worker_cleanup_owned(
-                &self.config.workspace_id,
-                &history,
-                &attempt,
-                BackendJobWorkerCleanupState::Failed,
-                Some(category),
-                Some(detail),
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )?;
+        let record_failure = |category: &str,
+                              detail: &str,
+                              cause: Option<&crate::backend_job::BackgroundFailure>|
+         -> Result<()> {
+            self.store
+                .finish_backend_job_worker_cleanup_owned_with_cause(
+                    &self.config.workspace_id,
+                    &history,
+                    &attempt,
+                    BackendJobWorkerCleanupState::Failed,
+                    Some(category),
+                    Some(detail),
+                    cause,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
             Ok(())
         };
         let fail = |category: &str, detail: String| -> Result<()> {
-            record_failure(category, &detail)?;
-            Err(Error::RuntimeOperationFailed {
+            let primary = Error::RuntimeOperationFailed {
                 runtime_id: worker.runtime_id.clone(),
                 code: category.to_string(),
-                message: detail,
-            })
+                message: detail.clone(),
+            };
+            Err(crate::backend_job::record_operation_failure(
+                primary,
+                crate::backend_job::BackgroundJobCause::CleanupFailed.storage(),
+                |cause| record_failure(category, &detail, cause),
+            ))
         };
         let fail_with_error = |category: &str, error: Error| -> Result<()> {
-            if let Err(diagnostic) = record_failure(category, &error.to_string()) {
-                tracing::warn!(%error, %diagnostic, "Cleanup failure diagnosis was not confirmed");
-                // Keep transient storage ownership even when a definitive operation
-                // failure could not be diagnosed durably. Neither error proves cleanup.
-                if !backend_job_recovery::transient_storage(&error)
-                    && backend_job_recovery::transient_storage(&diagnostic)
-                {
-                    return Err(diagnostic);
-                }
-            }
-            Err(error)
+            let cause = crate::backend_job::worker_cleanup_failure_cause(&error);
+            let detail = error.to_string();
+            Err(crate::backend_job::record_operation_failure(
+                error,
+                cause,
+                |cause| record_failure(category, &detail, cause),
+            ))
         };
         let complete = || -> Result<()> {
             self.require_backend_job_attempt_effects_ended(&attempt)?;
@@ -5660,15 +5793,17 @@ impl WorkspaceApi {
                     subjektiv_journal::close(self, &job.request, &attempt)?;
                 }
             }
-            self.store.finish_backend_job_worker_cleanup_owned(
-                &self.config.workspace_id,
-                &history,
-                &attempt,
-                BackendJobWorkerCleanupState::Completed,
-                None,
-                None,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )?;
+            self.store
+                .finish_backend_job_worker_cleanup_owned_with_cause(
+                    &self.config.workspace_id,
+                    &history,
+                    &attempt,
+                    BackendJobWorkerCleanupState::Completed,
+                    None,
+                    None,
+                    None,
+                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+                )?;
             self.finish_backend_job_cleanup_retirement(job_id, attempt_id)
         };
 
@@ -5693,7 +5828,12 @@ impl WorkspaceApi {
                         runtime_diagnostics_message(&result.diagnostics),
                     );
                 }
-                Err(error) => return fail("backend_job_cleanup_stop_unconfirmed", error.message()),
+                Err(error) => {
+                    return fail_with_error(
+                        "backend_job_cleanup_stop_unconfirmed",
+                        error.into_error(),
+                    );
+                }
             }
             if let Err(error) = self.fence_backend_job_effects(&attempt, drain).await {
                 return fail_with_error("backend_job_cleanup_effects_unconfirmed", error);
@@ -5827,14 +5967,23 @@ impl WorkspaceApi {
             {
                 let detail = error.to_string();
                 if attempt.state == BackendJobAttemptState::Dispatched {
-                    self.finish_backend_job_attempt(
-                        &submission.job_id,
-                        &submission.attempt_id,
-                        BackendJobAttemptState::Failed,
-                        "invalid_result",
-                        &detail,
-                    )?;
+                    let cause = crate::backend_job::operation_failure_cause(
+                        &error,
+                        crate::backend_job::BackgroundJobCause::ExecutionFailed,
+                    );
+                    let failure =
+                        crate::backend_job::record_operation_failure(error, cause, |cause| {
+                            self.finish_backend_job_attempt_with_cause(
+                                &submission.job_id,
+                                &submission.attempt_id,
+                                BackendJobAttemptState::Failed,
+                                "invalid_result",
+                                &detail,
+                                cause,
+                            )
+                        });
                     self.drain_reserved_backend_jobs();
+                    return Err(failure);
                 }
                 return Err(error);
             }
@@ -6001,6 +6150,23 @@ impl WorkspaceApi {
         }
     }
 
+    /// Read retained creation evidence for this Workspace without changing lifecycle
+    /// state. Trusted internal callers must enforce their current authority before
+    /// redisclosure; a saved record never supplies visibility or retry permission.
+    pub fn worker_create_failure(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<runtime_api::startup::DecodeStoredWorkerCreateFailure>> {
+        let worker_id = WorkerId::parse(&worker.worker_id)
+            .ok_or_else(|| Error::InvalidInput("invalid Worker identity".into()))?;
+        self.config_store
+            .worker_create_failure(self.workspace_id(), &worker.runtime_id, worker_id)
+            .map(|encoded| {
+                encoded
+                    .map(|value| runtime_api::startup::decode_stored_worker_create_failure(&value))
+            })
+    }
+
     fn spawn_workspace_worker(
         &self,
         runtime_id: &str,
@@ -6017,7 +6183,46 @@ impl WorkspaceApi {
     ) -> ApiResult<WorkerSpawnResult> {
         let assignment = request.ticket_assignment.clone();
         let mut dispatched = false;
-        let mut result = self.spawn_workspace_worker_inner(runtime_id, request, &mut dispatched);
+        let mut reserved_worker = None;
+        let mut result = self.spawn_workspace_worker_inner(
+            runtime_id,
+            request,
+            &mut dispatched,
+            &mut reserved_worker,
+        );
+        if let Some(worker) = reserved_worker.as_ref() {
+            result = result
+                .map(|mut result| {
+                    if let Some(failure) = result.failure.take() {
+                        result.failure = Some(worker_startup::persist(self, worker, failure));
+                    }
+                    result
+                })
+                .map_err(|mut error| {
+                    error.error = match error.error {
+                        Error::WorkerCreateFailed { failure, source } => {
+                            Error::WorkerCreateFailed {
+                                failure: Box::new(worker_startup::persist(self, worker, *failure)),
+                                source,
+                            }
+                        }
+                        source if dispatched => {
+                            // Dispatch is not proof of acceptance or execution.
+                            let failure = worker_startup::persist(
+                                self,
+                                worker,
+                                worker_startup::unknown_result(),
+                            );
+                            Error::WorkerCreateFailed {
+                                failure: Box::new(failure),
+                                source: Some(Box::new(source)),
+                            }
+                        }
+                        source => source,
+                    };
+                    error
+                });
+        }
         // Only a newly inserted durable receipt proves there was no earlier
         // dispatch. A local rejection on replay says nothing about a prior
         // unknown outcome; keep its fence until absence is confirmed.
@@ -6045,6 +6250,7 @@ impl WorkspaceApi {
         runtime_id: &str,
         mut request: WorkerSpawnRequest,
         dispatched: &mut bool,
+        reserved_identity: &mut Option<RuntimeWorkerRef>,
     ) -> ApiResult<WorkerSpawnResult> {
         if let Some(singleton_key) = request.singleton_key.as_deref() {
             crate::store::validate_worker_singleton_key(singleton_key)?;
@@ -6197,6 +6403,7 @@ impl WorkspaceApi {
                 .worker(&reserved_worker)
                 .unwrap_or_else(|_| worker_summary_from_registry(&record));
             return Ok(WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Accepted,
                 worker: Some(summary),
                 acceptance_evidence: vec![crate::hosts::WorkerSpawnAcceptanceEvidence {
@@ -6235,6 +6442,7 @@ impl WorkspaceApi {
         };
         request.resolved_memory_settings = Some(reservation.memory_settings);
         let reservation_fingerprint = create_binding.create_fingerprint.clone();
+        *reserved_identity = Some(reserved_worker.clone());
         let lifecycle_assignment = request.ticket_assignment.clone();
         let compensation_context = WorkerSpawnCompensationContext {
             assignment: lifecycle_assignment.as_ref(),
@@ -6377,19 +6585,35 @@ impl WorkspaceApi {
                 return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
             }
         };
+        if result.state == InternalWorkerOperationState::Accepted && result.worker.is_none() {
+            // A malformed success is not conclusive evidence about the reserved Worker.
+            result.state = InternalWorkerOperationState::Unknown;
+        }
+        if result.state != InternalWorkerOperationState::Accepted && result.failure.is_none() {
+            result.failure = Some(if result.state == InternalWorkerOperationState::Unknown {
+                worker_startup::unknown_result()
+            } else {
+                worker_startup::local_rejection()
+            });
+        }
+        if let Some(failure) = result.failure.take() {
+            result.failure = Some(worker_startup::correlate(failure, &reserved_worker));
+        }
         let Some(worker) = result.worker.as_mut() else {
-            result
-                .diagnostics
-                .extend(compensate_failed_workspace_worker_create(
-                    self,
-                    runtime_id,
-                    worker_id,
-                    &reservation_fingerprint,
-                    "runtime_spawn_rejected",
-                    None,
-                    &compensation_context,
-                    &reserved_attachments,
-                ));
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
+                self,
+                runtime_id,
+                worker_id,
+                &reservation_fingerprint,
+                "runtime_spawn_failure",
+                None,
+                &compensation_context,
+                &reserved_attachments,
+            );
+            if let Some(failure) = result.failure.take() {
+                result.failure = Some(worker_startup::compensated(failure, compensation));
+            }
+            result.diagnostics.extend(diagnostics);
             return Ok(result);
         };
         // Runtime metadata is display-only. The lease returned by the same DB transaction that
@@ -6442,21 +6666,26 @@ impl WorkspaceApi {
         {
             Ok(replacement) => replacement,
             Err(error) => {
-                let diagnostics = compensate_failed_workspace_worker_create(
-                    self,
-                    runtime_id,
-                    worker_id,
-                    &reservation_fingerprint,
-                    "workspace_api_transport",
-                    Some(worker),
-                    &compensation_context,
-                    &reserved_attachments,
-                );
-                return Err(ApiError::with_diagnostics(error.into_error(), diagnostics));
+                let (diagnostics, compensation) =
+                    compensate_failed_workspace_worker_create_observed(
+                        self,
+                        runtime_id,
+                        worker_id,
+                        &reservation_fingerprint,
+                        "workspace_api_transport",
+                        Some(worker),
+                        &compensation_context,
+                        &reserved_attachments,
+                    );
+                return Err(worker_startup::finalize_error(
+                    ApiError::with_diagnostics(error.into_error(), diagnostics),
+                    WorkerSpawnFinalizeStage::WorkspaceApiBinding,
+                    compensation,
+                ));
             }
         };
         if replacement.state != InternalWorkerOperationState::Accepted {
-            let diagnostics = compensate_failed_workspace_worker_create(
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
                 self,
                 runtime_id,
                 worker_id,
@@ -6466,23 +6695,27 @@ impl WorkspaceApi {
                 &compensation_context,
                 &reserved_attachments,
             );
-            return Err(ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: runtime_id.to_string(),
-                    code: "worker_workspace_api_replace_failed".to_string(),
-                    message: replacement
-                        .diagnostics
-                        .first()
-                        .map(|diagnostic| diagnostic.message.clone())
-                        .unwrap_or_else(|| {
-                            "Runtime rejected Workspace API replacement after spawn".to_string()
-                        }),
-                },
-                diagnostics,
+            return Err(worker_startup::finalize_error(
+                ApiError::with_diagnostics(
+                    Error::RuntimeOperationFailed {
+                        runtime_id: runtime_id.to_string(),
+                        code: "worker_workspace_api_replace_failed".to_string(),
+                        message: replacement
+                            .diagnostics
+                            .first()
+                            .map(|diagnostic| diagnostic.message.clone())
+                            .unwrap_or_else(|| {
+                                "Runtime rejected Workspace API replacement after spawn".to_string()
+                            }),
+                    },
+                    diagnostics,
+                ),
+                WorkerSpawnFinalizeStage::WorkspaceApiBinding,
+                compensation,
             ));
         }
         if let Err(error) = parse_runtime_worker_id_for_registry(&worker.worker.worker_id) {
-            let diagnostics = compensate_failed_workspace_worker_create(
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
                 self,
                 runtime_id,
                 worker_id,
@@ -6492,7 +6725,11 @@ impl WorkspaceApi {
                 &compensation_context,
                 &reserved_attachments,
             );
-            return Err(api_error_with_additional_diagnostics(error, diagnostics));
+            return Err(worker_startup::finalize_error(
+                api_error_with_additional_diagnostics(error, diagnostics),
+                WorkerSpawnFinalizeStage::WorkerIdentity,
+                compensation,
+            ));
         }
         let registry_result = record_worker_summary(
             self,
@@ -6561,7 +6798,7 @@ impl WorkspaceApi {
             .config_store
             .complete_worker_create_reservation(&self.config.workspace_id, worker_id)
         {
-            let diagnostics = compensate_failed_workspace_worker_create(
+            let (diagnostics, compensation) = compensate_failed_workspace_worker_create_observed(
                 self,
                 runtime_id,
                 worker_id,
@@ -6571,9 +6808,10 @@ impl WorkspaceApi {
                 &compensation_context,
                 &reserved_attachments,
             );
-            return Err(ApiError::with_diagnostics(
-                Error::Config(error.to_string()),
-                diagnostics,
+            return Err(worker_startup::finalize_error(
+                ApiError::with_diagnostics(Error::Config(error.to_string()), diagnostics),
+                WorkerSpawnFinalizeStage::CreateReservation,
+                compensation,
             ));
         }
         if let Err(error) = subjektiv_journal::reconcile_created_worker(self, &worker_ref) {
@@ -6674,6 +6912,8 @@ impl WorkspaceApi {
                 && live.worker_state.is_some()
             {
                 return Ok(InternalWorkerRestoreResult {
+                    control: None,
+                    startup: None,
                     state: server_api::WorkerRestoreState::Accepted,
                     worker: Some(live),
                     diagnostics: Vec::new(),
@@ -8533,22 +8773,94 @@ fn worker_spawn_result_to_api(
     })
 }
 
-fn worker_input_result_to_api(
-    mut result: WorkerInputResult,
-) -> server_api::RuntimeWorkerInputResult {
-    // The existing wire result has no disposition field. Keep uncertain delivery
-    // distinguishable without collapsing it into a definite refusal or replaying input.
-    if result.disposition == WorkerInputDisposition::Unknown {
-        result.diagnostics.push(RuntimeDiagnostic {
-            workdir: None,
-            startup: None,
-            code: "worker_input_outcome_unknown".into(),
-            severity: HostDiagnosticSeverity::Warning,
-            message: "Worker input delivery outcome is unknown; inspect the current session before retrying".into(),
-        });
+fn retained_control_cause(
+    diagnostics: &[RuntimeDiagnostic],
+) -> Option<protocol::control_failure::RuntimeControlCause> {
+    let mut found = None;
+    for cause in diagnostics.iter().filter_map(|d| d.control) {
+        if found.is_some_and(|prior| prior != cause) {
+            return Some(protocol::control_failure::RuntimeControlCause::ResultUnavailable);
+        }
+        found = Some(cause);
     }
+    found
+}
+
+fn retained_control_explanation(diagnostics: &[RuntimeDiagnostic]) -> Option<String> {
+    retained_control_cause(diagnostics)
+        .and_then(|cause| runtime_api::control_failure::control_explanation(cause).ok())
+}
+
+fn api_control_cause(error: &Error) -> Option<protocol::control_failure::RuntimeControlCause> {
+    use protocol::control_failure::RuntimeControlCause as C;
+    match error {
+        Error::RuntimeControlFailed { cause, .. } => Some(*cause),
+        Error::UnknownWorker { .. } => Some(C::WorkerMissing),
+        Error::UnknownRuntime(_) | Error::RuntimeBindingNotFound { .. } => Some(C::RuntimeMissing),
+        Error::InvalidRuntimeIdentifier { .. } => Some(C::InvalidWorkerIdentifier),
+        Error::RestoreObservationConflict => Some(C::RestoreObservationConflict),
+        Error::BackendJobFailure {
+            primary, recording, ..
+        } if recording.is_empty() => api_control_cause(primary),
+        _ => None,
+    }
+}
+
+fn restore_public_evidence(
+    result: &crate::hosts::InternalWorkerRestoreResult,
+) -> (
+    Option<protocol::control_failure::RuntimeControlCause>,
+    Option<String>,
+    Option<runtime_api::WorkerStartupFailure>,
+) {
+    let control = result
+        .control
+        .or_else(|| retained_control_cause(&result.diagnostics));
+    let Some(source) = result.startup.as_ref() else {
+        return (
+            control,
+            control.and_then(|cause| runtime_api::control_failure::control_explanation(cause).ok()),
+            None,
+        );
+    };
+    // The enclosing WorkspaceWorker operation already enforced current viewing authority.
+    // Retained transfer/storage bytes themselves are not that authority.
+    match worker::startup_failure::project_public_startup_failure::<error_contract::Browser>(
+        &source.primary,
+        protocol::session_failure::SessionFailureVisibility {
+            can_view_cause: true,
+        },
+    ) {
+        Ok(projected) => match projected.attachment() {
+            Ok(primary) => {
+                let mut startup = source.clone();
+                startup.primary = primary;
+                (
+                    control,
+                    Some(projected.explanation().to_owned()),
+                    Some(startup),
+                )
+            }
+            Err(_) => (
+                control,
+                Some("Worker restore failure details are unavailable.".into()),
+                None,
+            ),
+        },
+        Err(_) => (
+            control,
+            Some("Worker restore failure details are unavailable.".into()),
+            None,
+        ),
+    }
+}
+
+fn worker_input_result_to_api(result: WorkerInputResult) -> server_api::RuntimeWorkerInputResult {
     server_api::RuntimeWorkerInputResult {
+        control: retained_control_cause(&result.diagnostics),
+        control_explanation: retained_control_explanation(&result.diagnostics),
         state: result.state.into(),
+        disposition: result.disposition,
         runtime_id: result.worker.runtime_id,
         worker_id: result.worker.worker_id,
         diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
@@ -8576,6 +8888,8 @@ fn worker_lifecycle_result_to_api(
         .collect();
     server_api::RuntimeWorkerLifecycleResult {
         cleanup_failures,
+        control: retained_control_cause(&result.diagnostics),
+        control_explanation: retained_control_explanation(&result.diagnostics),
         replayed: result.replayed,
         state: result.state.into(),
         runtime_id: result.worker.runtime_id,
@@ -10785,8 +11099,10 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         context: server_api::ServerRequestContext,
         request: server_api::CreateWorkspaceWorkerRequest,
-    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::BrowserCreateWorkerResponse,
+        server_api::WorkerCreateApiError,
+    > {
         create_workspace_worker_authenticated(
             self.workspace_api()?.clone(),
             contract_request_headers(&context)?,
@@ -10796,7 +11112,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_worker_create_api_error)
     }
 
     async fn workspace_orchestrator_status(
@@ -10892,8 +11208,10 @@ impl server_api::ServerApi for ServerApiContractService {
         context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::CreateWorkspaceWorkerRequest,
-    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::BrowserCreateWorkerResponse,
+        server_api::WorkerCreateApiError,
+    > {
         spawn_known_worker_authenticated(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -10903,7 +11221,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_worker_create_api_error)
     }
 
     async fn worker_control_input(
@@ -11071,8 +11389,10 @@ impl server_api::ServerApi for ServerApiContractService {
         context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::CreateWorkspaceWorkerRequest,
-    ) -> std::result::Result<server_api::BrowserCreateWorkerResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::BrowserCreateWorkerResponse,
+        server_api::WorkerCreateApiError,
+    > {
         validate_workspace_scope(self.workspace_api()?, &workspace_id)
             .map_err(|error| ApiError::from(error).into_repository_api_error())?;
         create_workspace_worker_authenticated(
@@ -11084,7 +11404,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_worker_create_api_error)
     }
 
     async fn workspace_worker_detail(
@@ -15132,6 +15452,15 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
         .and_then(|source| source.token_id_hash.clone());
     let response = next.run(request).await;
     let status = response.status();
+    if let Some(error) = response
+        .extensions()
+        .get::<Arc<server_api::WorkerCreateApiError>>()
+    {
+        if let Some(failure) = error.failure() {
+            worker_startup::observe_http(failure, status);
+            return response;
+        }
+    }
 
     let is_api = uri.path().starts_with("/api/")
         || canonical_ticket_operation_workspace_id(uri.path()).is_some();
@@ -15141,6 +15470,12 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
             .extensions()
             .get::<Arc<server_api::RepositoryApiError>>()
             .map(|error| ApiErrorLog::from_repository_error(error))
+            .or_else(|| {
+                response
+                    .extensions()
+                    .get::<Arc<server_api::WorkerCreateApiError>>()
+                    .map(|error| ApiErrorLog::from_repository_error(error.legacy()))
+            })
             .or_else(|| {
                 response
                     .extensions()
@@ -21806,6 +22141,7 @@ fn ticket_notification_delivery_error_category(
             InternalWorkerOperationState::Accepted => None,
             InternalWorkerOperationState::Rejected => Some("runtime_rejected"),
             InternalWorkerOperationState::Unsupported => Some("runtime_unsupported"),
+            InternalWorkerOperationState::Unknown => Some("runtime_outcome_unknown"),
         },
         Err(RuntimeRegistryError::InvalidIdentifier { .. }) => Some("invalid_identifier"),
         Err(RuntimeRegistryError::UnknownRuntime(_)) => Some("unknown_runtime"),
@@ -21813,6 +22149,7 @@ fn ticket_notification_delivery_error_category(
         Err(RuntimeRegistryError::UnknownWorker { .. }) => Some("unknown_worker"),
         Err(
             RuntimeRegistryError::WorkdirSessionOpenFailed { .. }
+            | RuntimeRegistryError::RuntimeControlFailed { .. }
             | RuntimeRegistryError::RuntimeOperationFailed { .. },
         ) => Some("runtime_operation_failed"),
     }
@@ -27214,6 +27551,7 @@ fn skill_api_error(error: skills::SkillError) -> ApiError {
             },
             vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "skill_not_found".to_string(),
                 severity: HostDiagnosticSeverity::Error,
@@ -30668,6 +31006,7 @@ fn workdir_runtime_failure_code(error: &RuntimeRegistryError) -> String {
             "workdir_session_open_failed".to_string()
         }
         RuntimeRegistryError::RuntimeOperationFailed { code, .. } => code.clone(),
+        RuntimeRegistryError::RuntimeControlFailed { cause, .. } => cause.reason().to_string(),
         RuntimeRegistryError::InvalidIdentifier { .. } => "invalid_runtime".to_string(),
         RuntimeRegistryError::UnknownWorker { .. } => "runtime_workdir_lookup_failed".to_string(),
     }
@@ -30888,6 +31227,7 @@ fn prepare_workspace_workdir_create(
                     vec![RuntimeDiagnostic {
             workdir: None,
             startup: None,
+            control: None,
                         code: "default_runtime_not_configured".to_string(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "Workspace default Runtime is not configured".to_string(),
@@ -31043,6 +31383,7 @@ async fn create_workspace_working_directory(
                 Error::UnknownRuntime(reserved.resolved_runtime_id),
                 vec![RuntimeDiagnostic {
                     workdir: None,
+                    control: None,
                     startup: None,
                     code: "runtime_unavailable".to_string(),
                     severity: HostDiagnosticSeverity::Error,
@@ -31068,6 +31409,7 @@ async fn create_workspace_working_directory(
             },
             vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "runtime_unavailable".to_string(),
                 severity: HostDiagnosticSeverity::Error,
@@ -31126,6 +31468,7 @@ async fn create_workspace_working_directory(
                 error.into_error(),
                 vec![RuntimeDiagnostic {
                     workdir: None,
+                    control: None,
                     startup: None,
                     code: failure_code,
                     severity: HostDiagnosticSeverity::Error,
@@ -31166,6 +31509,7 @@ async fn create_workspace_working_directory(
                     error.into_error(),
                     vec![RuntimeDiagnostic {
                         workdir: None,
+                        control: None,
                         startup: None,
                         code: failure_code,
                         severity: HostDiagnosticSeverity::Error,
@@ -31207,6 +31551,7 @@ async fn create_workspace_working_directory(
                 0,
                 RuntimeDiagnostic {
                     workdir: None,
+                    control: None,
                     startup: None,
                     code: failure_code.clone(),
                     severity: HostDiagnosticSeverity::Error,
@@ -31332,6 +31677,18 @@ fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static st
         RuntimeRegistryError::WorkdirSessionOpenFailed { .. }
         | RuntimeRegistryError::RuntimeOperationFailed { .. } => ("provider_unavailable", true),
         RuntimeRegistryError::UnknownRuntime(_) => ("runtime_unavailable", true),
+        RuntimeRegistryError::RuntimeControlFailed { cause, .. } => {
+            use protocol::control_failure::RuntimeControlCause as C;
+            match cause {
+                C::WorkerMissing
+                | C::InvalidWorkerIdentifier
+                | C::InvalidRequest
+                | C::WorkspaceBindingMismatch
+                | C::AuthorizationFailed
+                | C::RequestEncodingFailed => ("authority_invalid", false),
+                _ => ("provider_unavailable", true),
+            }
+        }
         RuntimeRegistryError::InvalidIdentifier { .. }
         | RuntimeRegistryError::UnknownHost(_)
         | RuntimeRegistryError::UnknownWorker { .. } => ("authority_invalid", false),
@@ -31950,6 +32307,7 @@ fn build_runtime_cleanup_plan(
                 if diagnostics.is_empty() {
                     diagnostics.push(RuntimeDiagnostic {
                         workdir: None,
+                        control: None,
                         startup: None,
                         code: "workspace_cleanup_runtime_observation_unavailable".to_string(),
                         severity: HostDiagnosticSeverity::Warning,
@@ -32261,19 +32619,23 @@ async fn execute_runtime_cleanup_with_context(
             ));
         }
         parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
-        WorkspaceWorker::resolve_async(api, &worker.runtime_id, &worker.worker_id)
+        let removal = WorkspaceWorker::resolve_async(api, &worker.runtime_id, &worker.worker_id)
             .await?
             .delete_from_plan(context, candidate)
             .await?;
-        api.workdir_session_locks
-            .lock()
-            .expect("Workdir session lock registry poisoned")
-            .remove(&worker);
+        if removal.removed {
+            api.workdir_session_locks
+                .lock()
+                .expect("Workdir session lock registry poisoned")
+                .remove(&worker);
+        }
         results.push(RuntimeCleanupExecutionResult {
             target_id: candidate.target_id.clone(),
             action: candidate.action.clone(),
-            status: "deleted".to_string(),
-            message: "Worker deleted from Runtime and Backend registry".to_string(),
+            status: if removal.removed { "deleted" } else if removal.state == Some(server_api::WorkerRemovalState::Held) { "held" } else { "waiting" }.into(),
+            message: if removal.removed { "Worker deleted from Runtime and Backend registry" }
+                else { "Removal intent retained; original history and writer remain until Journal completion is confirmed" }.into(),
+            removal: removal.observation(),
         });
     }
 
@@ -32295,6 +32657,7 @@ async fn execute_runtime_cleanup_with_context(
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
                     status: "retained".to_string(),
+                    removal: None,
                     message:
                         "Dirty or unknown Workdir was retained; forced deletion is not supported"
                             .to_string(),
@@ -32335,6 +32698,7 @@ async fn execute_runtime_cleanup_with_context(
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
                     status: status.to_string(),
+                    removal: None,
                     message: removal.failure_category.as_deref().map_or_else(
                         || message.to_string(),
                         |category| {
@@ -35411,6 +35775,7 @@ fn record_browser_worker_spawn(
     if result.state != InternalWorkerOperationState::Accepted {
         return Err(worker_create_not_accepted_error(
             requested_runtime_id.clone(),
+            result.failure,
             result.diagnostics,
         ));
     }
@@ -35429,20 +35794,24 @@ fn browser_worker_response_from_summary(
     diagnostics: Vec<RuntimeDiagnostic>,
     assignment: Option<&WorkerTicketAssignmentRequest>,
 ) -> ApiResult<BrowserCreateWorkerResponse> {
-    let worker_record = match record_worker_summary(
-        api,
-        &worker,
-        display_name.as_str(),
-        worker.profile.clone(),
-        WorkerRegistryDisplayNamePolicy::UseProvided,
-    ) {
-        Ok(record) => record,
-        Err(error) => return Err(error.into()),
-    };
     let compensation = WorkerSpawnCompensationContext {
         assignment,
         spawned_workdir_ids: &[],
     };
+    let worker_record = finalize_worker_spawn_stage(
+        api,
+        &worker,
+        &compensation,
+        WorkerSpawnFinalizeStage::WorkerRegistry,
+        record_worker_summary(
+            api,
+            &worker,
+            display_name.as_str(),
+            worker.profile.clone(),
+            WorkerRegistryDisplayNamePolicy::UseProvided,
+        )
+        .map_err(ApiError::from),
+    )?;
     if let Some(assignment) = assignment {
         if let Err(error) = api.store.bind_ticket_assignment_operation_worker(
             &api.config.workspace_id,
@@ -35496,12 +35865,15 @@ fn browser_worker_response_for_committed_summary(
     let workspace_id = api.workspace_id().to_string();
     let resource_key = api
         .store
-        .worker_resource_key(&workspace_id, &worker.worker)?
-        .ok_or_else(|| {
-            Error::Store(format!(
-                "Workspace Worker `{worker_id}` has no resource key after registration"
-            ))
-        })?;
+        .worker_resource_key(&workspace_id, &worker.worker)
+        .and_then(|key| {
+            key.ok_or_else(|| {
+                Error::Store(format!(
+                    "Workspace Worker `{worker_id}` has no resource key after registration"
+                ))
+            })
+        })
+        .map_err(|error| worker_startup::publication_error(api, &worker.worker, error.into()))?;
     let worker = worker_launch_worker_summary(worker);
     let console_href = browser_worker_console_href(&workspace_id, &resource_key);
     Ok(BrowserCreateWorkerResponse {
@@ -35986,6 +36358,7 @@ async fn project_worker_restore_response_owned(
     worker_id: String,
     mut result: crate::hosts::InternalWorkerRestoreResult,
 ) -> ApiResult<Json<server_api::WorkerRestoreResponse>> {
+    let (control, control_explanation, startup) = restore_public_evidence(&result);
     // A terminal result without a Worker has no stored projection to read.
     // Do not turn that pure response into a new availability failure on DB overload.
     if result.worker.is_none() {
@@ -35994,6 +36367,9 @@ async fn project_worker_restore_response_owned(
             runtime_id,
             worker_id,
             result: server_api::WorkerRestoreResult {
+                startup,
+                control,
+                control_explanation,
                 state: result.state,
                 worker: None,
                 diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
@@ -36042,6 +36418,9 @@ async fn project_worker_restore_response_owned(
                 runtime_id: runtime_id.clone(),
                 worker_id: worker_id.clone(),
                 result: server_api::WorkerRestoreResult {
+                    startup,
+                    control,
+                    control_explanation,
                     state: result.state,
                     worker: projected_worker,
                     diagnostics: result.diagnostics.into_iter().map(Into::into).collect(),
@@ -36063,6 +36442,7 @@ fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> A
         },
         vec![RuntimeDiagnostic {
             workdir: None,
+            control: None,
             startup: None,
             code: "embedded_worker_workdir_unsupported".to_string(),
             severity: HostDiagnosticSeverity::Error,
@@ -36112,25 +36492,15 @@ async fn list_runtime_workers(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerSpawnFinalizeStage {
+    WorkerIdentity,
+    WorkspaceApiBinding,
+    CreateReservation,
     WorkerRegistry,
     TicketAssignmentBind,
     TicketAssignmentCurrent,
     TicketStateAccept,
     WorkdirRegistry,
     WorkdirAttachment,
-}
-
-impl WorkerSpawnFinalizeStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::WorkerRegistry => "worker_registry",
-            Self::TicketAssignmentBind => "ticket_assignment_bind",
-            Self::TicketAssignmentCurrent => "ticket_assignment_current",
-            Self::TicketStateAccept => "ticket_state_accept",
-            Self::WorkdirRegistry => "workdir_registry",
-            Self::WorkdirAttachment => "workdir_attachment",
-        }
-    }
 }
 
 struct WorkerSpawnCompensationContext<'a> {
@@ -36148,54 +36518,19 @@ fn finalize_worker_spawn_stage<T>(
     let Err(source) = result else {
         return result;
     };
-    let source_message = sanitize_backend_error(&source.error.to_string());
-    let operation_id = context
-        .assignment
-        .map(|assignment| assignment.operation_id.as_str())
-        .unwrap_or("none");
-    let mut diagnostics = vec![RuntimeDiagnostic {
-        workdir: None,
-        startup: None,
-        code: format!("worker_spawn_finalize_{}_failed", stage.as_str()),
-        severity: HostDiagnosticSeverity::Error,
-        message: format!(
-            "Worker spawn finalize failed at stage `{}` for Runtime Worker {}:{} (operation `{operation_id}`): {source_message}",
-            stage.as_str(),
-            worker.worker.runtime_id,
-            worker.worker.worker_id
-        ),
-    }];
-    diagnostics.extend(source.diagnostics);
-    let compensation_errors = compensate_failed_worker_spawn(api, worker, context);
-    let compensation_failed = !compensation_errors.is_empty();
-    diagnostics.extend(compensation_errors);
-    if !compensation_failed {
-        diagnostics.push(RuntimeDiagnostic {
-            workdir: None,
-            startup: None,
-            code: "worker_spawn_compensated".to_string(),
-            severity: HostDiagnosticSeverity::Info,
-            message: format!(
-                "Removed Runtime Worker {}:{} and rolled back Backend spawn state",
-                worker.worker.runtime_id, worker.worker.worker_id
-            ),
-        });
-    }
-    let compensation = if compensation_failed {
-        "compensation left residual state; inspect diagnostics"
-    } else {
-        "compensation completed"
-    };
+    let (compensation_diagnostics, compensation) =
+        compensate_failed_worker_spawn_observed(api, worker, context);
+    let failure = worker_startup::persist(
+        api,
+        &worker.worker,
+        worker_startup::finalize_failure(&source, stage, compensation),
+    );
+    let mut diagnostics = source.diagnostics;
+    diagnostics.extend(compensation_diagnostics);
     Err(ApiError::with_diagnostics(
-        Error::RuntimeOperationFailed {
-            runtime_id: worker.worker.runtime_id.clone(),
-            code: format!("worker_spawn_finalize_{}_failed", stage.as_str()),
-            message: format!(
-                "Worker spawn finalize failed at stage `{}` for Runtime Worker {}:{} (operation `{operation_id}`): {source_message}; {compensation}",
-                stage.as_str(),
-                worker.worker.runtime_id,
-                worker.worker.worker_id
-            ),
+        Error::WorkerCreateFailed {
+            failure: Box::new(failure),
+            source: Some(Box::new(source.error)),
         },
         diagnostics,
     ))
@@ -36207,16 +36542,14 @@ fn write_workspace_worker_create_failure(
     phase: &str,
     diagnostics: &[RuntimeDiagnostic],
 ) {
-    tracing::error!(
+    tracing::warn!(
         target: "yoi::worker_create",
-        event = "worker_create_failed",
+        event = "worker_create_compensation",
         component = "workspace_server",
-        runtime_id,
-        worker_id = %worker_id,
+        correlation = %worker_startup::correlation(runtime_id, &worker_id.to_string()),
         phase,
-        cleanup_succeeded = diagnostics.is_empty(),
-        cleanup_diagnostics = ?diagnostics,
-        "Worker creation failed"
+        cleanup_completed = diagnostics.is_empty(),
+        "Worker creation compensation observed"
     );
 }
 
@@ -36291,6 +36624,32 @@ fn compensate_failed_workspace_worker_create(
     context: &WorkerSpawnCompensationContext<'_>,
     attachment_reservations: &[(String, String, String, workdir::WorkdirSessionCapabilities)],
 ) -> Vec<RuntimeDiagnostic> {
+    compensate_failed_workspace_worker_create_observed(
+        api,
+        runtime_id,
+        reservation_worker_id,
+        create_fingerprint,
+        failure_phase,
+        worker,
+        context,
+        attachment_reservations,
+    )
+    .0
+}
+
+fn compensate_failed_workspace_worker_create_observed(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    reservation_worker_id: WorkerId,
+    create_fingerprint: &str,
+    failure_phase: &str,
+    worker: Option<&InternalWorkerSummary>,
+    context: &WorkerSpawnCompensationContext<'_>,
+    attachment_reservations: &[(String, String, String, workdir::WorkdirSessionCapabilities)],
+) -> (
+    Vec<RuntimeDiagnostic>,
+    runtime_api::startup::CompensationOutcome,
+) {
     let mut diagnostics = Vec::new();
     let reserved_worker_ref =
         RuntimeWorkerRef::new(runtime_id.to_string(), reservation_worker_id.to_string());
@@ -36360,18 +36719,31 @@ fn compensate_failed_workspace_worker_create(
         failure_phase,
         &diagnostics,
     );
-    diagnostics
+    let outcome = if !reserved_worker_absent {
+        runtime_api::startup::CompensationOutcome::Unknown
+    } else if diagnostics.is_empty() {
+        runtime_api::startup::CompensationOutcome::Completed
+    } else {
+        runtime_api::startup::CompensationOutcome::Residual
+    };
+    (diagnostics, outcome)
 }
 
-fn compensate_failed_worker_spawn(
+fn compensate_failed_worker_spawn_observed(
     api: &WorkspaceApi,
     worker: &InternalWorkerSummary,
     context: &WorkerSpawnCompensationContext<'_>,
-) -> Vec<RuntimeDiagnostic> {
+) -> (
+    Vec<RuntimeDiagnostic>,
+    runtime_api::startup::CompensationOutcome,
+) {
     let (runtime_deleted, mut diagnostics) =
         WorkerRemovalService::new(api).delete_spawn_compensation_runtime_worker(&worker.worker);
     if !runtime_deleted {
-        return diagnostics;
+        return (
+            diagnostics,
+            runtime_api::startup::CompensationOutcome::Unknown,
+        );
     }
     diagnostics.extend(finalize_spawn_compensation_after_worker_delete(
         api,
@@ -36392,7 +36764,12 @@ fn compensate_failed_worker_spawn(
             ),
         ));
     }
-    diagnostics
+    let outcome = if diagnostics.is_empty() {
+        runtime_api::startup::CompensationOutcome::Completed
+    } else {
+        runtime_api::startup::CompensationOutcome::Residual
+    };
+    (diagnostics, outcome)
 }
 
 fn finalize_spawn_compensation_after_worker_delete(
@@ -36509,6 +36886,7 @@ fn lifecycle_failure_detail(
 fn spawn_compensation_diagnostic(code: &str, message: String) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         workdir: None,
+        control: None,
         startup: None,
         code: code.to_string(),
         severity: HostDiagnosticSeverity::Error,
@@ -36669,6 +37047,7 @@ async fn create_runtime_worker_authenticated_on_host(
     {
         accept_queued_ticket_after_worker_spawn(&api, assignment)?;
         return Ok(Json(worker_spawn_result_to_api(WorkerSpawnResult {
+            failure: None,
             state: InternalWorkerOperationState::Accepted,
             worker: Some(worker),
             acceptance_evidence: Vec::new(),
@@ -37516,6 +37895,7 @@ fn project_workspace_worker_with_attachments(
             summary.worker_state = None;
             summary.diagnostics.push(RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "worker_singleton_fenced".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
@@ -37534,11 +37914,10 @@ fn project_workspace_worker_with_attachments(
                 summary.worker.worker_id
             ))
         })?;
-    Ok(workspace_worker_summary(
-        summary,
-        resource_key,
-        workdir_attachments,
-    ))
+    let removal = subjektiv_journal::removal_observation(api, &summary.worker)?;
+    let mut projected = workspace_worker_summary(summary, resource_key, workdir_attachments);
+    projected.removal = removal;
+    Ok(projected)
 }
 
 fn project_observed_workspace_workers(
@@ -38485,6 +38864,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
         workdir_attachments: Vec::new(),
         diagnostics: vec![RuntimeDiagnostic {
             workdir: None,
+            control: None,
             startup: None,
             code: "backend_worker_missing".to_string(),
             severity: HostDiagnosticSeverity::Info,
@@ -38531,6 +38911,7 @@ fn worker_summary_from_projection(
     } else {
         vec![RuntimeDiagnostic {
             workdir: None,
+            control: None,
             startup: None,
             code: "worker_observation_unavailable".to_string(),
             severity: HostDiagnosticSeverity::Info,
@@ -39187,6 +39568,7 @@ fn validate_working_directory_claims_for_browser(
                     vec![RuntimeDiagnostic {
             workdir: None,
             startup: None,
+            control: None,
                         code: "working_directory_relative_cwd_invalid".to_string(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "relative_cwd must be a relative path without parent traversal".to_string(),
@@ -39746,19 +40128,15 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 fn worker_create_not_accepted_error(
-    runtime_id: String,
-    mut diagnostics: Vec<RuntimeDiagnostic>,
+    _runtime_id: String,
+    failure: Option<runtime_api::startup::WorkerCreateFailure>,
+    diagnostics: Vec<RuntimeDiagnostic>,
 ) -> ApiError {
-    diagnostics.push(settings_diagnostic(
-        "workspace_worker_create_not_accepted",
-        HostDiagnosticSeverity::Error,
-        "Runtime did not accept worker creation; see diagnostics for sanitized Runtime compatibility details.",
-    ));
+    let failure = failure.unwrap_or_else(worker_startup::local_rejection);
     ApiError::with_diagnostics(
-        Error::RuntimeOperationFailed {
-            runtime_id,
-            code: "workspace_worker_create_failed".to_string(),
-            message: "Runtime did not accept worker creation".to_string(),
+        Error::WorkerCreateFailed {
+            failure: Box::new(failure),
+            source: None,
         },
         diagnostics,
     )
@@ -39782,6 +40160,7 @@ fn settings_diagnostic(
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         workdir: None,
+        control: None,
         startup: None,
         code: code.into(),
         severity,
@@ -39956,6 +40335,7 @@ fn workspace_id_mismatch_error() -> ApiError {
         Error::WorkspaceIdMismatch,
         vec![RuntimeDiagnostic {
             workdir: None,
+            control: None,
             startup: None,
             code: "workspace_id_mismatch".to_string(),
             severity: HostDiagnosticSeverity::Error,
@@ -40071,6 +40451,7 @@ impl ApiErrorLog {
                 .iter()
                 .map(|diagnostic| RuntimeDiagnostic {
                     workdir: None,
+                    control: None,
                     startup: None,
                     code: diagnostic.code.clone(),
                     severity: match diagnostic.severity {
@@ -40107,6 +40488,7 @@ impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
             Error::RepositoryLookup(cause) => vec![RuntimeDiagnostic {
+                control: None,
                 workdir: None,
                 startup: None,
                 code: match cause.details().reason {
@@ -40126,6 +40508,7 @@ impl From<Error> for ApiError {
             | Error::DbExecutorUnavailable
             | Error::DbOperationOutcomeUnknown => vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: match &error {
                     Error::DbCapacityExceeded => "db_capacity_exceeded",
@@ -40138,6 +40521,7 @@ impl From<Error> for ApiError {
             }],
             Error::WorkdirSessionOpenFailed { transport, .. } => vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "workdir_session_open_failed".to_string(),
                 severity: HostDiagnosticSeverity::Error,
@@ -40145,6 +40529,7 @@ impl From<Error> for ApiError {
             }],
             Error::RuntimeOperationFailed { code, message, .. } => vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: code.clone(),
                 severity: HostDiagnosticSeverity::Error,
@@ -40152,6 +40537,7 @@ impl From<Error> for ApiError {
             }],
             Error::WorkspaceSigningIdentity { code, message } => vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: code.clone(),
                 severity: HostDiagnosticSeverity::Error,
@@ -40159,6 +40545,7 @@ impl From<Error> for ApiError {
             }],
             Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: match ticket_error {
                     ticket::TicketError::NotFound(_) => "ticket_not_found",
@@ -40207,6 +40594,7 @@ impl From<Error> for ApiError {
                     .map(|code| {
                         vec![RuntimeDiagnostic {
                             workdir: None,
+                            control: None,
                             startup: None,
                             code: code.to_string(),
                             severity: HostDiagnosticSeverity::Error,
@@ -40248,6 +40636,7 @@ impl ApiError {
         Self::with_diagnostics(
             error,
             vec![RuntimeDiagnostic {
+                control: None,
                 code: reason.as_str().into(),
                 severity: HostDiagnosticSeverity::Error,
                 message: reason.explanation().into(),
@@ -40259,6 +40648,18 @@ impl ApiError {
             }],
         )
     }
+    fn into_worker_create_api_error(self) -> server_api::WorkerCreateApiError {
+        match self.error {
+            Error::WorkerCreateFailed { failure, .. } => server_api::WorkerCreateApiError::startup(
+                *failure,
+                &protocol::session_failure::SessionFailureVisibility {
+                    can_view_cause: true,
+                },
+            ),
+            _ => self.into_repository_api_error().into(),
+        }
+    }
+
     fn with_diagnostics(error: Error, diagnostics: Vec<RuntimeDiagnostic>) -> Self {
         Self {
             error,
@@ -40383,6 +40784,7 @@ impl ApiError {
     }
 
     fn into_repository_api_error(self) -> server_api::RepositoryApiError {
+        let control = api_control_cause(&self.error);
         let status = api_error_status(&self.error);
         let message = self
             .session_registration_cause
@@ -40400,6 +40802,10 @@ impl ApiError {
             message,
             working_directory_diagnostics(self.diagnostics),
         );
+        let response = match control {
+            Some(cause) => response.with_control(cause),
+            None => response,
+        };
         match self.session_registration_cause {
             Some(cause) => response.with_failure(
                 protocol::session_failure::session_registration_attachment(cause).expect(
@@ -40472,6 +40878,15 @@ fn api_error_status(error: &Error) -> StatusCode {
                 | RepositoryFailureReason::ProviderFailure => StatusCode::BAD_GATEWAY,
             }
         }
+        Error::BackendJobFailure {
+            primary, recording, ..
+        } => {
+            if recording.is_empty() {
+                api_error_status(primary)
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
         Error::RuntimeOperationFailed {
             runtime_id, code, ..
         } if runtime_id == "workspace-auth" && code == "auth_required" => StatusCode::FORBIDDEN,
@@ -40534,6 +40949,17 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::RuntimeOperationFailed { code, .. } if code == "skill_not_found" => {
             StatusCode::NOT_FOUND
         }
+        Error::RuntimeControlFailed { cause, .. } => {
+            use api_macros::http::ApiBoundary;
+            StatusCode::from_u16(
+                runtime_api::control_failure::ControlBoundary
+                    .classify(cause)
+                    .status
+                    .code(),
+            )
+            .expect("control boundary supplies an HTTP failure status")
+        }
+
         Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
         Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
             StatusCode::NOT_FOUND
@@ -40611,6 +41037,8 @@ fn api_error_response_message(error: &Error) -> String {
         Error::ExternalWorkdirObservationFailed { source, .. } => {
             api_error_response_message(source)
         }
+        Error::BackendJobFailure { primary, recording, .. } if recording.is_empty() => api_error_response_message(primary),
+        Error::BackendJobFailure { .. } => "Operation failed; its failure recording is unconfirmed. Reconcile the same operation before a new intent.".into(),
         Error::WorkdirSessionOpenFailed { transport, .. } => {
             format!("workdir_session_open_failed: {}", transport.message)
         }
@@ -40623,6 +41051,13 @@ fn api_error_response_message(error: &Error) -> String {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if matches!(&self.error, Error::WorkerCreateFailed { .. }) {
+            let error = self.into_worker_create_api_error();
+            return api_macros::axum::http_error_response(
+                api_macros::axum::status(api_macros::HttpError::status_code(&error)),
+                error,
+            );
+        }
         let status = api_error_status(&self.error);
         let response_message = api_error_response_message(&self.error);
         let log = ApiErrorLog {
@@ -40643,6 +41078,17 @@ impl IntoResponse for ApiError {
             message: response_message.clone(),
             diagnostics: self.diagnostics.clone(),
         };
+        if let Some(cause) = api_control_cause(&self.error) {
+            let error = runtime_api::RuntimeApiError::new(
+                status.as_u16(),
+                cause.reason(),
+                cause.explanation(),
+            )
+            .with_control(cause);
+            let mut response = runtime_api::server_support::http_error_response(status, error);
+            response.extensions_mut().insert(log);
+            return response;
+        }
         let mut response = (
             status,
             [(CONTENT_TYPE, "application/json")],
@@ -40656,6 +41102,135 @@ impl IntoResponse for ApiError {
             .into_response();
         response.extensions_mut().insert(log);
         response
+    }
+}
+
+#[cfg(test)]
+mod failure_boundary_tests {
+    use super::*;
+    #[tokio::test]
+    async fn control_http_projection_preserves_owner_cause_without_private_diagnostics() {
+        for cause in protocol::control_failure::RuntimeControlCause::ALL {
+            let error = Error::RuntimeControlFailed {
+                runtime_id: "private-runtime-canary".into(),
+                cause: *cause,
+            };
+            let response = ApiError::with_diagnostics(
+                error,
+                vec![RuntimeDiagnostic::new(
+                    "private-code-canary",
+                    "error",
+                    "private-message-canary",
+                )],
+            )
+            .into_response();
+            let status = response.status().as_u16();
+            let content_type = response.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("canary"));
+            let decoded = api_macros::http::decode_problem_response::<
+                protocol::control_failure::RuntimeControlCause,
+            >(
+                &body,
+                status,
+                &content_type,
+                &runtime_api::control_failure::ControlBoundary,
+                error_contract::Budget::new(16384, 16384),
+            );
+            match decoded {
+                error_contract::DecodeFailure::Known(value) => {
+                    assert_eq!(value.facts().cause(), cause)
+                }
+                _ => panic!("control cause lost at Server boundary"),
+            }
+        }
+    }
+    #[test]
+    fn control_result_primary_survives_diagnostic_order_and_wire_without_changing_disposition() {
+        let cause = protocol::control_failure::RuntimeControlCause::ExecutionUnavailable;
+        let mut primary =
+            RuntimeDiagnostic::new("arbitrary-code", "info", "untrusted diagnostic prose");
+        primary.control = Some(cause);
+        let extra = RuntimeDiagnostic::new(
+            "worker_not_found",
+            "error",
+            "misleading supplemental description",
+        );
+        for diagnostics in [
+            vec![primary.clone(), extra.clone()],
+            vec![extra.clone(), primary.clone()],
+        ] {
+            let result = worker_input_result_to_api(WorkerInputResult {
+                runtime_run_id: None,
+                worker: RuntimeWorkerRef::new("runtime", "worker"),
+                state: InternalWorkerOperationState::Rejected,
+                disposition: server_api::WorkerInputDisposition::Unknown,
+                diagnostics,
+            });
+            let value: server_api::RuntimeWorkerInputResult =
+                serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+            assert_eq!(value.control, Some(cause));
+            assert_eq!(
+                value.control_explanation.as_deref(),
+                Some(cause.explanation())
+            );
+            assert_eq!(
+                value.disposition,
+                server_api::WorkerInputDisposition::Unknown
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_wrapper_preserves_primary_http_class_but_never_certifies_an_unknown_save() {
+        for (primary, expected) in [
+            (
+                Error::InvalidInput("safe input refusal".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Error::WorkspacePermissionDenied("safe permission refusal".into()),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Error::UnknownRuntime("safe-runtime".into()),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let error = crate::backend_job::record_operation_failure(
+                primary,
+                crate::backend_job::BackgroundJobCause::DispatchFailed.storage(),
+                |_| Ok(()),
+            );
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), expected);
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("recording evidence is separate"));
+        }
+        let error = crate::backend_job::record_operation_failure::<()>(
+            Error::WorkspacePermissionDenied("private denied reason".into()),
+            crate::backend_job::BackgroundJobCause::DispatchFailed.storage(),
+            |_| Err(Error::DbOperationOutcomeUnknown),
+        );
+        assert!(
+            matches!(&error, Error::BackendJobFailure { primary, recording, .. }
+            if matches!(primary.as_ref(), Error::WorkspacePermissionDenied(_)) && recording.len()==1)
+        );
+        let response = ApiError::from(error).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("recording is unconfirmed"));
+        assert!(!body.contains("private denied reason"));
     }
 }
 
@@ -40725,6 +41300,7 @@ mod tests {
     mod protocol_backpressure_tests;
     mod restore_workdir_tests;
     mod restored_parent_control_tests;
+    mod startup_result_tests;
     mod subject_authorization_tests;
     mod subject_deletion_tests;
     mod notification_source_authorization_tests {
@@ -43795,15 +44371,16 @@ mod tests {
         }
 
         fn worker(&self, worker_id: &str) -> crate::hosts::WorkerLookupResult {
-            crate::hosts::WorkerLookupResult {
-                worker: self
-                    .workers
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .iter()
-                    .find(|worker| worker.worker.worker_id == worker_id)
-                    .cloned(),
-                diagnostics: Vec::new(),
+            match self
+                .workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|worker| worker.worker.worker_id == worker_id)
+                .cloned()
+            {
+                Some(worker) => crate::hosts::WorkerLookupResult::found(worker),
+                None => crate::hosts::WorkerLookupResult::missing(),
             }
         }
 
@@ -43845,11 +44422,13 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             ) {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![RuntimeDiagnostic {
                         workdir: None,
+                        control: None,
                         startup: None,
                         code: "fixture_runtime_rejected".to_string(),
                         severity: HostDiagnosticSeverity::Error,
@@ -43877,6 +44456,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(worker.clone());
             WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Accepted,
                 worker: Some(worker),
                 acceptance_evidence: Vec::new(),
@@ -43957,9 +44537,14 @@ mod tests {
             ),
             RuntimeDiagnostic,
         > {
-            if self.worker(worker_id).worker.is_none() {
+            if !matches!(
+                self.worker(worker_id).outcome,
+                crate::hosts::WorkerLookupOutcome::Found { .. }
+            ) {
                 return Ok((
                     Some(InternalWorkerRestoreResult {
+                        control: None,
+                        startup: None,
                         state: server_api::WorkerRestoreState::Rejected,
                         worker: None,
                         diagnostics: Vec::new(),
@@ -43979,8 +44564,13 @@ mod tests {
             if let Some(callback) = &self.lifecycle_callback {
                 callback(worker_id);
             }
-            let worker = self.worker(worker_id).worker;
+            let worker = self
+                .worker(worker_id)
+                .into_worker(Self::RUNTIME_ID, worker_id)
+                .ok();
             InternalWorkerRestoreResult {
+                control: None,
+                startup: None,
                 state: if let Some(outcome) = self.next_restore_outcome.lock().unwrap().take() {
                     outcome
                 } else if worker.is_some() {
@@ -44000,7 +44590,10 @@ mod tests {
         ) -> crate::hosts::WorkerWorkspaceApiResult {
             crate::hosts::WorkerWorkspaceApiResult {
                 state: InternalWorkerOperationState::Accepted,
-                worker: self.worker(worker_id).worker,
+                worker: self
+                    .worker(worker_id)
+                    .into_worker(Self::RUNTIME_ID, worker_id)
+                    .ok(),
                 diagnostics: Vec::new(),
             }
         }
@@ -44017,7 +44610,10 @@ mod tests {
             crate::hosts::RuntimeOperationResponse {
                 status: crate::hosts::RuntimeOperationStatus::Accepted,
                 cause: None,
-                worker: self.worker(worker_id).worker,
+                worker: self
+                    .worker(worker_id)
+                    .into_worker(Self::RUNTIME_ID, worker_id)
+                    .ok(),
                 diagnostics: Vec::new(),
             }
         }
@@ -45762,6 +46358,7 @@ mod tests {
             message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
             diagnostics: vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "ticket_backend_error".to_string(),
                 severity: HostDiagnosticSeverity::Error,
@@ -47976,7 +48573,18 @@ mod tests {
             guarded_spawn_payload(&fixture, "guarded-runtime-rejection"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(
+            response.into_body(),
+            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["yoi_failure"]["domain"], "worker_startup");
+        assert_eq!(body["yoi_failure"]["reason"], "failed");
+        assert_eq!(body["yoi_startup"]["operation"]["acceptance"], "rejected");
         assert_eq!(fixture.runtime.spawn_requests().len(), 1);
         assert_guarded_spawn_rolled_back(&fixture);
     }
@@ -48003,7 +48611,17 @@ mod tests {
             guarded_spawn_payload(&fixture, "guarded-post-create-failure"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(
+            response.into_body(),
+            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
+        )
+        .await
+        .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["yoi_startup"]["operation"]["acceptance"], "accepted");
+        assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
         assert_eq!(fixture.runtime.spawn_requests().len(), 1);
         assert_guarded_spawn_rolled_back(&fixture);
     }
@@ -52416,6 +53034,7 @@ mod tests {
     fn unrecoverable_pending_workspace_restore_is_typed_for_replacement() {
         let diagnostics = [RuntimeDiagnostic {
             workdir: None,
+            control: None,
             startup: None,
             code: "embedded_worker_execution_rejected".to_string(),
             severity: HostDiagnosticSeverity::Error,
@@ -52432,6 +53051,7 @@ mod tests {
                 operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                 reason: workdir::management_failure::WorkdirManagementReason::NotFound,
             }),
+            control: None,
             startup: None,
             code: "working_directory_not_found".to_string(),
             severity: HostDiagnosticSeverity::Warning,
@@ -52445,6 +53065,7 @@ mod tests {
 
         let unrelated = [RuntimeDiagnostic {
             workdir: None,
+            control: None,
             startup: None,
             code: "some_other_not_found".to_string(),
             severity: HostDiagnosticSeverity::Warning,
@@ -52622,6 +53243,8 @@ mod tests {
         >,
         materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
         spawn_failure: std::sync::Mutex<Option<String>>,
+        typed_spawn_failure:
+            std::sync::Mutex<Option<worker_runtime::execution::WorkerExecutionResult>>,
         subject_delete_failure: std::sync::Mutex<Option<String>>,
         recovery_failure: std::sync::Mutex<Option<String>>,
         recovery_requests: std::sync::Mutex<Vec<runtime_api::SubjectCreateRecoveryRequest>>,
@@ -52672,6 +53295,7 @@ mod tests {
                     std::env::temp_dir().join(unique),
                 ),
                 spawn_failure: std::sync::Mutex::new(None),
+                typed_spawn_failure: std::sync::Mutex::new(None),
                 subject_delete_failure: std::sync::Mutex::new(None),
                 recovery_failure: std::sync::Mutex::new(None),
                 recovery_requests: std::sync::Mutex::new(Vec::new()),
@@ -52836,6 +53460,9 @@ mod tests {
             &self,
             request: worker_runtime::execution::WorkerExecutionSpawnRequest,
         ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            if let Some(result) = self.typed_spawn_failure.lock().unwrap().take() {
+                return worker_runtime::execution::WorkerExecutionSpawnResult::Errored(result);
+            }
             if let Some(message) = self.spawn_failure.lock().unwrap().take() {
                 return worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
                     worker_runtime::execution::WorkerExecutionResult::errored(
@@ -54243,6 +54870,299 @@ mod tests {
         assert!(failed.is_err());
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(execution.take_inputs().is_empty());
+    }
+
+    fn cause_job_request(id: &str) -> BackendJobRequest {
+        BackendJobRequest {
+            job_id: id.into(),
+            purpose: "typed_cause_contract".into(),
+            input_ref: format!("test://cause/{id}"),
+            input: serde_json::json!({"frozen": true}),
+            instruction: "Return the structured result".into(),
+            profile: "builtin:backend-job".into(),
+            grants: Default::default(),
+            serialization_key: None,
+            source_worker: None,
+            notification_target: None,
+            limits: Default::default(),
+        }
+    }
+
+    fn cause_startup_result() -> worker_runtime::execution::WorkerExecutionResult {
+        use protocol::session_failure::{
+            SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
+        };
+        use worker_runtime::execution::{
+            WorkerExecutionOperation, WorkerExecutionOutcome, WorkerExecutionResult,
+        };
+        let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn);
+        result.outcome = WorkerExecutionOutcome::Errored;
+        result.startup_failure = Some(
+            session_registration_attachment(SessionRegistrationCause::denied(
+                SessionPrincipal::Subject,
+            ))
+            .unwrap(),
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_spawn_retains_startup_primary_in_terminal_save_and_reopen() {
+        use protocol::session_failure::SessionRegistrationCause;
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        *execution.typed_spawn_failure.lock().unwrap() = Some(cause_startup_result());
+        let request = cause_job_request("startup-primary");
+        let error = api.dispatch_backend_job(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::BackendJobFailure {
+                failure_cause: Some(_),
+                ..
+            }
+        ));
+        api.stop_backend_job_recovery().await;
+        let id = crate::backend_job::attempt_id(&request.job_id, 1);
+        let attempt = api
+            .store
+            .get_backend_job_attempt(api.workspace_id(), &request.job_id, &id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert!(matches!(
+            attempt
+                .failure_cause
+                .as_ref()
+                .unwrap()
+                .decode::<SessionRegistrationCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ));
+        assert_eq!(attempt.attempt, 1);
+        assert!(attempt.allocation_precluded_at.is_none());
+        assert!(execution.take_inputs().is_empty());
+        let reopened = SqliteWorkspaceStore::open_api_fixture(&api.config.database_path).unwrap();
+        let reloaded = reopened
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.failure_cause, attempt.failure_cause);
+        assert_eq!(reloaded.state, BackendJobState::Failed);
+        assert_eq!(reloaded.current_attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_spawn_save_failure_keeps_primary_and_recording_separate() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        *execution.typed_spawn_failure.lock().unwrap() = Some(cause_startup_result());
+        api.config_store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER fail_cause_save BEFORE UPDATE OF failure_cause ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'injected recording failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        let request = cause_job_request("startup-save-failed");
+        let error = api.dispatch_backend_job(&request).unwrap_err();
+        match error {
+            Error::BackendJobFailure {
+                primary,
+                failure_cause: Some(cause),
+                recording,
+            } => {
+                assert!(!matches!(primary.as_ref(), Error::Sqlite(_)));
+                assert!(
+                    recording
+                        .iter()
+                        .any(|error| matches!(error, Error::Sqlite(_)))
+                );
+                assert!(matches!(
+                    crate::backend_job::StoredFailure::from_storage(cause.as_storage_str().into())
+                        .decode::<protocol::session_failure::SessionRegistrationCause>(),
+                    error_contract::DecodeFailure::Known(_)
+                ));
+            }
+            error => panic!("missing separate startup/save observations: {error:?}"),
+        }
+        api.stop_backend_job_recovery().await;
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                api.workspace_id(),
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Dispatching);
+        assert!(
+            attempt.failure_cause.is_none(),
+            "failed save is not durable evidence"
+        );
+        assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_profile_rejection_records_dispatch_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let mut request = cause_job_request("profile-rejected");
+        request.profile = "builtin:missing-job-profile".into();
+        // Existing durable intent can outlive its configured profile. New intent
+        // rejection still occurs before reservation and must not invent a Job.
+        api.store
+            .reserve_backend_job(
+                api.workspace_id(),
+                &request,
+                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            )
+            .unwrap();
+        assert!(api.dispatch_backend_job(&request).is_err());
+        api.stop_backend_job_recovery().await;
+        let job = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, BackendJobState::Failed);
+        let projected = job
+            .failure_cause
+            .unwrap()
+            .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+            .unwrap();
+        assert_eq!(
+            *projected.details(),
+            crate::backend_job::BackgroundJobCause::DispatchFailed
+        );
+        assert!(execution.take_inputs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_input_rejection_records_attempt_and_job_cause() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        execution
+            .reject_input_definitively
+            .store(true, Ordering::SeqCst);
+        let request = cause_job_request("input-rejected-cause");
+        assert!(api.dispatch_backend_job(&request).is_err());
+        api.stop_backend_job_recovery().await;
+        let job = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                api.workspace_id(),
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, BackendJobState::Failed);
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(job.failure_cause, attempt.failure_cause);
+        assert_eq!(
+            *attempt
+                .failure_cause
+                .unwrap()
+                .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+                .unwrap()
+                .details(),
+            crate::backend_job::BackgroundJobCause::InputFailed
+        );
+        assert_eq!(attempt.attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_unconfirmed_input_keeps_attempt_and_never_resubmits() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        execution.reject_inputs("injected unconfirmed input operation");
+        let request = cause_job_request("input-unconfirmed-cause");
+        assert!(api.dispatch_backend_job(&request).is_err());
+        api.stop_backend_job_recovery().await;
+        let job = api
+            .store
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        let attempt = api
+            .store
+            .get_backend_job_attempt(
+                api.workspace_id(),
+                &request.job_id,
+                &crate::backend_job::attempt_id(&request.job_id, 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.state, BackendJobState::Pending);
+        assert_eq!(attempt.state, BackendJobAttemptState::Dispatched);
+        assert!(attempt.failure_cause.is_some());
+        assert_eq!(attempt.attempt, 1);
+        assert!(
+            api.submit_initial_backend_job_input(
+                &job,
+                &attempt,
+                request.worker_input(&attempt.attempt_id).unwrap()
+            )
+            .is_err()
+        );
+        let current = api
+            .store
+            .get_backend_job_attempt(api.workspace_id(), &request.job_id, &attempt.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.worker, attempt.worker);
+        assert_eq!(current.runtime_run_id, attempt.runtime_run_id);
+        assert_eq!(current.state, BackendJobAttemptState::Dispatched);
+        assert_eq!(
+            execution.take_inputs().len(),
+            1,
+            "same receipt lookup must never repeat Submit"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_production_deadline_records_cause_without_replacement_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let (api, execution) = test_api_with_recording_backend(temp.path()).await;
+        let mut request = cause_job_request("deadline-cause");
+        request.limits.timeout_seconds = 1;
+        let reservation = api.dispatch_backend_job(&request).unwrap();
+        let attempt = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let attempt = api
+                    .store
+                    .get_backend_job_attempt(
+                        api.workspace_id(),
+                        &request.job_id,
+                        &reservation.attempt.attempt_id,
+                    )
+                    .unwrap()
+                    .unwrap();
+                if attempt.state.terminal() {
+                    break attempt;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        api.stop_backend_job_recovery().await;
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        assert_eq!(attempt.worker, reservation.attempt.worker);
+        assert_eq!(attempt.runtime_run_id, reservation.attempt.runtime_run_id);
+        assert_eq!(attempt.attempt, 1);
+        assert_eq!(
+            *attempt
+                .failure_cause
+                .unwrap()
+                .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+                .unwrap()
+                .details(),
+            crate::backend_job::BackgroundJobCause::DeadlineExceeded
+        );
+        assert_eq!(execution.take_inputs().len(), 1);
     }
 
     mod backend_job_tests;
@@ -62692,7 +63612,7 @@ mod tests {
         sync_worker_observation(&api, &summary).unwrap();
         let mut subscriber = api.worker_projection.subscribe_ordered(10).unwrap();
         let _ = subscriber.take_snapshot();
-        let diagnostics = compensate_failed_worker_spawn(
+        let (diagnostics, _) = compensate_failed_worker_spawn_observed(
             &api,
             &summary,
             &WorkerSpawnCompensationContext {
@@ -63274,6 +64194,7 @@ mod tests {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                     reason: workdir::management_failure::WorkdirManagementReason::NotFound,
                 }),
+                control: None,
                 startup: None,
                 code: "working_directory_not_found".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
@@ -63302,6 +64223,7 @@ mod tests {
             unknown,
             &[RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "runtime_unavailable".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
@@ -65131,6 +66053,7 @@ mod tests {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                     reason: workdir::management_failure::WorkdirManagementReason::NotFound,
                 }),
+                control: None,
                 startup: None,
                 code: "working_directory_not_found".into(),
                 severity: HostDiagnosticSeverity::Warning,
@@ -65183,6 +66106,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic { workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy }),
+                    control: None,
                     startup: None,
                     code: "working_directory_cleanup_resource_busy".into(),
                     severity: HostDiagnosticSeverity::Warning,
@@ -65417,6 +66341,7 @@ mod tests {
                 operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                 reason: workdir::management_failure::WorkdirManagementReason::NotFound,
             }),
+            control: None,
             startup: None,
             code: "working_directory_not_found".to_string(),
             severity: HostDiagnosticSeverity::Error,
@@ -65454,6 +66379,7 @@ mod tests {
                 None,
                 vec![RuntimeDiagnostic {
                     workdir: None,
+                    control: None,
                     startup: None,
                     code: "working_directory_provider_timeout".to_string(),
                     severity: HostDiagnosticSeverity::Error,
@@ -65572,6 +66498,7 @@ mod tests {
                 None,
                 vec![RuntimeDiagnostic {
                     workdir: None,
+                    control: None,
                     startup: None,
                     code: "working_directory_unsupported".to_string(),
                     severity: HostDiagnosticSeverity::Error,
@@ -65626,6 +66553,7 @@ mod tests {
                         operation: Operation::Cleanup,
                         reason,
                     }),
+                    control: None,
                     startup: None,
                     code: "working_directory_cleanup_mount_present".into(),
                     severity: HostDiagnosticSeverity::Error,
@@ -65659,6 +66587,7 @@ mod tests {
                 None,
                 vec![RuntimeDiagnostic {
                     workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupMountPresent }),
+                    control: None,
                     startup: None,
                     code: "working_directory_cleanup_mount_present".into(),
                     severity: HostDiagnosticSeverity::Error,
@@ -65810,6 +66739,7 @@ mod tests {
                     InternalWorkerOperationState::Rejected,
                     None,
                     vec![RuntimeDiagnostic { workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Detail, reason: workdir::management_failure::WorkdirManagementReason::CleanupPermissionDenied }),
+                    control: None,
                         startup: None,
                         code: "working_directory_cleanup_permission_denied".into(),
                         severity: HostDiagnosticSeverity::Error,
@@ -66005,6 +66935,7 @@ mod tests {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                     reason: workdir::management_failure::WorkdirManagementReason::NotFound,
                 }),
+                control: None,
                 startup: None,
                 code: "working_directory_not_found".to_string(),
                 severity: HostDiagnosticSeverity::Error,
@@ -66030,6 +66961,7 @@ mod tests {
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "working_directory_provider_timeout".to_string(),
                 severity: HostDiagnosticSeverity::Error,
@@ -67233,6 +68165,7 @@ mod tests {
         ) -> server_api::WorkerSummary {
             server_api::WorkerSummary {
                 restore_observation_token: None,
+                removal: None,
                 runtime_id: "runtime-test".to_string(),
                 worker_id: worker_id.to_string(),
                 resource_key: key.to_string(),
@@ -67328,6 +68261,7 @@ mod tests {
         let discovered = workspace_worker_discovery_page(
             vec![server_api::WorkerSummary {
                 restore_observation_token: None,
+                removal: None,
                 runtime_id: target.runtime_id.clone(),
                 worker_id: target.worker_id.clone(),
                 resource_key: "W-2".to_string(),
@@ -67724,6 +68658,7 @@ mod tests {
         let diagnostics = vec![
             RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "runtime_capacity_warning".to_string(),
                 severity: HostDiagnosticSeverity::Warning,
@@ -67731,6 +68666,7 @@ mod tests {
             },
             RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "runtime_capacity_unavailable".to_string(),
                 severity: HostDiagnosticSeverity::Error,
@@ -67792,6 +68728,7 @@ mod tests {
             .unwrap();
         let diagnostics = vec![RuntimeDiagnostic {
             workdir: None,
+            control: None,
             startup: None,
             code: "runtime_capacity_unavailable".to_string(),
             severity: HostDiagnosticSeverity::Error,
@@ -69167,24 +70104,32 @@ mod tests {
         );
 
         let response = worker_create_not_accepted_error(
-            "unsupported-runtime".to_string(),
+            "unsupported-runtime".into(),
+            None,
             vec![settings_diagnostic(
                 "remote_runtime_unsupported",
                 HostDiagnosticSeverity::Warning,
-                "Remote Runtime provisioning is unsupported by this v0 worker launch path.",
+                "TEST_ONLY_DIAGNOSTIC_TEXT",
             )],
         )
         .into_response();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        let bytes = to_bytes(
+            response.into_body(),
+            runtime_api::startup::MAX_STARTUP_PROBLEM_BYTES,
+        )
+        .await
+        .unwrap();
         let response: Value = serde_json::from_slice(&bytes).unwrap();
-        let diagnostics = response["diagnostics"].as_array().unwrap();
-        assert!(diagnostics.len() >= 2);
+        assert_eq!(response["yoi_failure"]["domain"], "worker_startup");
+        assert!(response.get("diagnostics").is_none());
         assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| { diagnostic["code"] == "workspace_worker_create_not_accepted" })
+            !response
+                .to_string()
+                .contains("workspace_worker_create_not_accepted")
         );
+        assert!(!response.to_string().contains("TEST_ONLY_DIAGNOSTIC_TEXT"));
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains("http://"));
     }

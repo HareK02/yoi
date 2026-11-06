@@ -14,7 +14,7 @@ mod ticket_cli;
 mod worker_cleanup_cli;
 mod workspace_bootstrap;
 
-use yoi::workdir_share;
+use yoi::{config_cli, workdir_share};
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -66,6 +66,11 @@ enum Mode {
     Login {
         backend_url: String,
         no_wait: bool,
+    },
+    Config {
+        options: Option<config_cli::Options>,
+        backend: String,
+        workspace: String,
     },
     Init(InitOptions),
     WorkspaceHelp,
@@ -140,6 +145,42 @@ async fn run(mode: Mode) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Mode::Config {
+            options,
+            backend,
+            workspace,
+        } => {
+            let Some(options) = options else {
+                print!("{}", config_cli::HELP);
+                return ExitCode::SUCCESS;
+            };
+            let api = match client::BackendApiClient::from_stored_token(&backend) {
+                Ok(api) => api,
+                Err(_) => {
+                    eprintln!(
+                        "yoi config: cannot load Backend credentials; use yoi login for the selected Backend"
+                    );
+                    return ExitCode::from(5);
+                }
+            };
+            let api = match client::backend_configuration::configuration_adoption_client(&api) {
+                Ok(api) => api,
+                Err(_) => {
+                    eprintln!("yoi config: cannot construct Backend connection");
+                    return ExitCode::from(2);
+                }
+            };
+            match config_cli::run(&api, &backend, &workspace, &options).await {
+                Ok(output) => {
+                    print!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("yoi config: {error}");
+                    ExitCode::from(error.exit_code)
+                }
+            }
+        }
         Mode::Init(options) => match run_init(options).await {
             Ok(workspace) => {
                 println!("{}", workspace_creation_message(&workspace));
@@ -548,6 +589,43 @@ fn parse_args_slice_with_connection_resolver<R: CliConnectionResolver + ?Sized>(
             return Err(ParseError(
                 "direct Worker execution was removed; use `yoi --local serve --socket <PATH>` (legacy metadata cleanup: `yoi worker --help`)".to_owned(),
             ));
+        }
+        "config" => {
+            let options = config_cli::parse(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
+            if options.is_none() {
+                return Ok(Mode::Config {
+                    options,
+                    backend: String::new(),
+                    workspace: String::new(),
+                });
+            }
+            if target_selection.explicit_local {
+                return Err(ParseError(
+                    "yoi config requires a Backend, not --local".into(),
+                ));
+            }
+            let workspace = target_selection.workspace_id.as_deref().filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| ParseError("yoi config requires explicit --workspace-id; no Repository/Git discovery is used".into()))?;
+            let target = resolve_backend_cli_connection(
+                connection_resolver,
+                CliCommand::Config,
+                target_selection.backend_url.clone(),
+                Some(workspace),
+            )?;
+            let client::ResolvedTarget::Backend { base_url, .. } =
+                target.resolve().map_err(|e| ParseError(e.to_string()))?
+            else {
+                return Err(ParseError("yoi config requires a Backend".into()));
+            };
+            let backend = client::BackendOrigin::parse(&base_url)
+                .map_err(|_| ParseError("invalid Backend origin".into()))?
+                .as_str()
+                .to_owned();
+            return Ok(Mode::Config {
+                options,
+                backend,
+                workspace: workspace.to_owned(),
+            });
         }
         "objective" => {
             let cli = objective_cli::parse_objective_args(&args[1..])
@@ -2140,6 +2218,7 @@ Host commands:
   --local attach --socket <PATH> Connect a JSONL protocol client; EOF leaves Host running
   worker delete/prune          Safely clean up legacy Worker metadata only
   ticket <COMMAND>             Manage Tickets through a Backend target
+  config <COMMAND>             Pull/edit/validate/preview/push Workspace source (config --help)
   objective <COMMAND>          Manage Objectives through a Backend target
   plugin <COMMAND>             Author packages or manage Backend Plugin catalog
   mcp <COMMAND>                Inspect configured MCP servers
@@ -4162,6 +4241,49 @@ backend = "shared"
             } => assert_eq!(target.kind(), TargetKind::Backend),
             other => panic!("expected Backend Panel mode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_config_requires_explicit_workspace_and_never_uses_git_discovery() {
+        for args in [
+            vec!["config", "pull", "--dir=checkout"],
+            vec![
+                "--local",
+                "--workspace-id",
+                "w",
+                "config",
+                "pull",
+                "--dir=checkout",
+            ],
+        ] {
+            assert!(parse_args_from(args).is_err());
+        }
+        match parse_args_from([
+            "--backend",
+            "https://backend.example",
+            "--workspace-id",
+            "workspace-a",
+            "config",
+            "pull",
+            "--dir=checkout",
+        ])
+        .unwrap()
+        {
+            Mode::Config {
+                options: Some(options),
+                backend,
+                workspace,
+            } => {
+                assert_eq!(backend, "https://backend.example");
+                assert_eq!(workspace, "workspace-a");
+                assert_eq!(options.command, config_cli::Command::Pull);
+            }
+            other => panic!("unexpected config mode: {other:?}"),
+        }
+        assert!(matches!(
+            parse_args_from(["config", "--help"]).unwrap(),
+            Mode::Config { options: None, .. }
+        ));
     }
 
     #[test]

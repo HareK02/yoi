@@ -167,7 +167,10 @@ mod startup_binding_tests {
                 client |= current.is::<WorkspaceClientError>();
                 source = current.source();
             }
-            assert!(worker && host, "common factory binding step retains in-process domain sources");
+            assert!(
+                worker && host,
+                "common factory binding step retains in-process domain sources"
+            );
             assert_eq!(client, matches!(response, Response::Lost));
             assert!(!format!("{failure:?} {failure}").contains("response deliberately lost"));
         }
@@ -289,9 +292,15 @@ mod startup_binding_tests {
         let worker_ref = WorkerRef::new(WorkerId::now_v7());
         let mut request = create_request("internal factory source");
         request.worker_id = worker_ref.worker_id;
-        request.workspace_api = Some(WorkspaceApiRef { workspace_id: "adapter-test".into(), base_url: endpoint.clone() });
+        request.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: "adapter-test".into(),
+            base_url: endpoint.clone(),
+        });
         request.subjektiv_attached = true;
-        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot { workspace_id: "adapter-test".into(), language: "English".into() });
+        request.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: "adapter-test".into(),
+            language: "English".into(),
+        });
         let archive = crate::profile_archive::ProfileSourceArchive::build_evaluated_profile(
             "profile-source-archive:internal-source".into(), "builtin:companion".into(),
             serde_json::json!({"slug":"internal-source", "description":"internal source test", "scope":"workspace_read",
@@ -302,12 +311,17 @@ mod startup_binding_tests {
         bundle.profile_source_archive = Some(archive.clone());
         let bundle = bundle.with_computed_digest();
         request.profile_source = crate::catalog::ProfileSourceArchiveSource::Embedded { archive };
-        request.config_bundle = Some(ConfigBundleRef { id: bundle.metadata.id.clone(), digest: bundle.metadata.digest.clone() });
+        request.config_bundle = Some(ConfigBundleRef {
+            id: bundle.metadata.id.clone(),
+            digest: bundle.metadata.digest.clone(),
+        });
         let request = WorkerExecutionSpawnRequest {
-            worker_ref: worker_ref.clone(), request,
+            worker_ref: worker_ref.clone(),
+            request,
             workspace_scope: None,
             context: test_execution_context(worker_ref.clone()),
-            workdir_attachments: BTreeMap::new(), config_bundle: Some(bundle),
+            workdir_attachments: BTreeMap::new(),
+            config_bundle: Some(bundle),
         };
         // Direct internal caller, not a Browser handler or Runtime result decoder.
         // The real transport is refused at an unused loopback socket; only the model is replaced.
@@ -321,7 +335,9 @@ mod startup_binding_tests {
         };
         assert_eq!(failure.stage, RuntimeRestoreStage::Binding);
         let mut source = std::error::Error::source(&failure);
-        let mut worker = false; let mut host = false; let mut transport = false;
+        let mut worker = false;
+        let mut host = false;
+        let mut transport = false;
         while let Some(current) = source {
             worker |= current.is::<WorkerError>();
             host |= current.is::<worker::subjektiv::SubjektivHostError>();
@@ -331,16 +347,43 @@ mod startup_binding_tests {
             }
             source = current.source();
         }
-        assert!(worker && host && transport, "factory must retain original typed in-process source");
+        assert!(
+            worker && host && transport,
+            "factory must retain original typed in-process source"
+        );
         let result = failure.execution_result(WorkerExecutionOperation::Spawn);
-        let Some(error_contract::DecodeFailure::Known(cause)) = result.startup_failure::<SessionRegistrationCause>() else { panic!("Session cause must remain typed") };
-        assert_eq!(*cause.facts().cause(), SessionRegistrationCause::outcome_unknown());
-        assert_eq!(result.startup_failure_persistence, Some(StartupPersistenceOutcome::Persisted));
-        let aggregate = root.path().join("runtime/workers").join(worker_ref.worker_id.to_string());
+        let Some(error_contract::DecodeFailure::Known(cause)) =
+            result.startup_failure::<SessionRegistrationCause>()
+        else {
+            panic!("Session cause must remain typed")
+        };
+        assert_eq!(
+            *cause.facts().cause(),
+            SessionRegistrationCause::outcome_unknown()
+        );
+        assert_eq!(
+            result.startup_failure_persistence,
+            Some(StartupPersistenceOutcome::Persisted)
+        );
+        let aggregate = root
+            .path()
+            .join("runtime/workers")
+            .join(worker_ref.worker_id.to_string());
         let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
-        let metadata = WorkerAggregateStore::new(aggregate, &name).unwrap().read_by_name(&name).unwrap().unwrap();
-        let StartupFailureRead::Present(error_contract::DecodeFailure::Known(cause)) = metadata.decode_startup_failure::<SessionRegistrationCause>() else { panic!("saved factory cause must reopen") };
-        assert_eq!(*cause.facts().cause(), SessionRegistrationCause::outcome_unknown());
+        let metadata = WorkerAggregateStore::new(aggregate, &name)
+            .unwrap()
+            .read_by_name(&name)
+            .unwrap()
+            .unwrap();
+        let StartupFailureRead::Present(error_contract::DecodeFailure::Known(cause)) =
+            metadata.decode_startup_failure::<SessionRegistrationCause>()
+        else {
+            panic!("saved factory cause must reopen")
+        };
+        assert_eq!(
+            *cause.facts().cause(),
+            SessionRegistrationCause::outcome_unknown()
+        );
         assert!(!format!("{failure:?} {failure}").contains(&endpoint));
         assert!(!serde_json::to_string(&result).unwrap().contains(&endpoint));
     }

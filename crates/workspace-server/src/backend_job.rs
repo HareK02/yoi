@@ -31,12 +31,432 @@
 //! without rerunning the model. Execution reconciliation and resource release are separate from
 //! the accepted result; absence of a Worker or a response is not proof that its effects ended.
 //! Exactly-once execution of arbitrary external side effects is not guaranteed.
+//!
+//! # Structured failure recording / investigation
+//!
+//! Failure evidence is attached by the existing store transaction, never by a
+//! second write or notification. The `*_with_cause` store APIs add optional
+//! `BackgroundFailure` to reconciliation, terminal failure, cleanup preflight,
+//! and cleanup completion. Legacy calls remain reader-compatible with no facts.
+//! Terminal replay returns original evidence, never backfills historical prose.
+//!
+//! Dispatch/startup producers must convert the retained `WorkerStartupFailure`
+//! primary with `background_failure_from_startup` before reducing legacy details
+//! to text. A failed conversion is independent projection failure, not an excuse
+//! to replace a known domain cause with a generic local reason. Input/terminal
+//! producers without known domain facts can select `BackgroundJobCause` at the
+//! observation site. Cleanup uses `worker_cleanup_failure_cause`, never the Job's
+//! primary cause/result. Notification errors remain in the delivery ledger.
+//!
+//! To investigate, authorize access to the Workspace/Job first, then query the
+//! same Job/attempt/input digest/Worker/run and reproject `StoredFailure` with
+//! current domain visibility. Legacy absence, unsupported and corrupt attachments
+//! remain distinct and do not change the authoritative execution state. A start
+//! refusal requires the existing admission/allocation proof; uncertain admission
+//! requires the same receipt reconciliation; cleanup failure requires the exact
+//! owner/fence checks. No cause/retry hint/timeout authorizes a replacement run.
+//! A store error is not durable success: preserve the observed primary separately
+//! from the save error and use existing recovery, not a new Job or second write.
+//!
+//! Schema124 adds nullable bounded evidence only; schema123 and older migration
+//! receipts/results are unchanged. Writer rollback must retain the new reader
+//! while any structured records remain. It must not infer facts from old text or
+//! rerun the schema123 upgrade termination policy on new Jobs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use worker_runtime::identity::RuntimeWorkerRef;
 
 use crate::{Error, Result};
+
+pub use protocol::background_failure::{BackgroundFailure, StoredFailure};
+
+/// Preserve the retained Runtime primary via its domain Storage projector.
+/// Secondary cleanup/save facts remain independent; this is not a durable write.
+pub fn background_failure_from_startup(
+    failure: &runtime_api::WorkerStartupFailure,
+) -> std::result::Result<BackgroundFailure, error_contract::ContractError> {
+    BackgroundFailure::from_startup_primary(&failure.primary)
+}
+
+/// Select retained startup facts by type, never by diagnostic severity, prose or
+/// position. Conflicting typed primaries are projection failure, not permission
+/// to silently pick one or replace it with a generic Job cause.
+pub(crate) fn diagnostic_failure_cause(
+    diagnostics: &[crate::hosts::RuntimeDiagnostic],
+    fallback: BackgroundJobCause,
+) -> std::result::Result<BackgroundFailure, error_contract::ContractError> {
+    let mut primary = None;
+    for startup in diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.startup.as_ref())
+    {
+        let cause = background_failure_from_startup(startup)?;
+        if primary.as_ref().is_some_and(|known| known != &cause) {
+            return Err(error_contract::ContractError::ProjectionUnavailable);
+        }
+        primary = Some(cause);
+    }
+    match primary {
+        Some(primary) => Ok(primary),
+        None => fallback.storage(),
+    }
+}
+
+/// Preserve an already retained primary, including a failed projection. A known
+/// but unprojectable primary must not be replaced by a local fallback on recovery.
+pub(crate) fn operation_failure_cause(
+    error: &Error,
+    fallback: BackgroundJobCause,
+) -> std::result::Result<BackgroundFailure, error_contract::ContractError> {
+    match error {
+        Error::BackendJobFailure { failure_cause, .. } => failure_cause
+            .clone()
+            .ok_or(error_contract::ContractError::ProjectionUnavailable),
+        Error::RuntimeControlFailed { cause, .. } => {
+            let facts = error_contract::FailureFacts::new(cause.clone())?;
+            BackgroundFailure::from_projected(&error_contract::project_failure::<
+                error_contract::Storage,
+                _,
+            >(&facts, &())?)
+        }
+        _ => fallback.storage(),
+    }
+}
+
+/// Cleanup has its own cause; never copy the terminal Job/startup cause here.
+pub(crate) fn worker_cleanup_failure_cause(
+    error: &Error,
+) -> std::result::Result<BackgroundFailure, error_contract::ContractError> {
+    operation_failure_cause(error, BackgroundJobCause::CleanupFailed)
+}
+
+/// Preserve a retained supported startup/control primary across receipt/timeout updates.
+/// The new operation state still comes from its existing owner, not from this cause.
+pub(crate) fn prefer_retained_primary_cause(
+    retained: Option<&StoredFailure>,
+    new: Option<&BackgroundFailure>,
+) -> std::result::Result<Option<BackgroundFailure>, error_contract::ContractError> {
+    if let Some(retained) = retained {
+        if matches!(
+            retained.decode::<protocol::session_failure::SessionRegistrationCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ) {
+            return BackgroundFailure::from_projected(&retained.project_for::<error_contract::Storage,
+                protocol::session_failure::SessionRegistrationCause>(&())?).map(Some);
+        }
+        if matches!(
+            retained.decode::<protocol::startup_failure::RuntimeStartupCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ) {
+            return BackgroundFailure::from_projected(&retained.project_for::<error_contract::Storage,
+                protocol::startup_failure::RuntimeStartupCause>(&())?).map(Some);
+        }
+        if matches!(
+            retained.decode::<protocol::control_failure::RuntimeControlCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ) {
+            return BackgroundFailure::from_projected(&retained.project_for::<error_contract::Storage, protocol::control_failure::RuntimeControlCause>(&())?).map(Some);
+        }
+        if !matches!(
+            retained.decode::<BackgroundJobCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ) {
+            return Err(error_contract::ContractError::ProjectionUnavailable);
+        }
+    }
+    Ok(new.cloned())
+}
+
+/// Always return the observed operation failure. Projection and persistence are
+/// independent secondary observations, even when both fail. The caller supplies
+/// the existing transaction, so there is no second ledger or replacement write.
+pub(crate) fn record_operation_failure<T>(
+    primary: Error,
+    cause: std::result::Result<BackgroundFailure, error_contract::ContractError>,
+    record: impl FnOnce(Option<&BackgroundFailure>) -> Result<T>,
+) -> Error {
+    record_retained_operation_failure(std::sync::Arc::new(primary), cause, record)
+}
+
+pub(crate) fn record_retained_operation_failure<T>(
+    primary: std::sync::Arc<Error>,
+    cause: std::result::Result<BackgroundFailure, error_contract::ContractError>,
+    record: impl FnOnce(Option<&BackgroundFailure>) -> Result<T>,
+) -> Error {
+    let mut recording = Vec::new();
+    let failure_cause = match cause {
+        Ok(cause) => Some(cause),
+        Err(error) => {
+            recording.push(Error::BackendJobCauseProjection(error));
+            None
+        }
+    };
+    if let Err(error) = record(failure_cause.as_ref()) {
+        recording.push(error);
+    }
+    Error::BackendJobFailure {
+        primary,
+        failure_cause,
+        recording,
+    }
+}
+
+/// Save an observation without changing a caller's existing nonterminal control
+/// flow on successful recording. On failure, retain the original operation too.
+pub(crate) fn record_failure_observation<T>(
+    primary: Error,
+    cause: std::result::Result<BackgroundFailure, error_contract::ContractError>,
+    record: impl FnOnce(Option<&BackgroundFailure>) -> Result<T>,
+) -> Result<T> {
+    let mut saved = None;
+    let error = record_operation_failure(primary, cause, |cause| {
+        record(cause).map(|value| saved = Some(value))
+    });
+    match saved {
+        Some(value) if matches!(&error, Error::BackendJobFailure { recording, .. } if recording.is_empty()) => {
+            Ok(value)
+        }
+        _ => Err(error),
+    }
+}
+
+/// Owner-selected local evidence when no more specific domain cause exists.
+/// Never determines state, cleanup completion or retry safety.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundJobCause {
+    DispatchFailed,
+    InputFailed,
+    ExecutionFailed,
+    ReconciliationRequired,
+    JournalAttemptFenced,
+    DeadlineExceeded,
+    CleanupFailed,
+    CleanupAdmissionUnconfirmed,
+}
+
+impl BackgroundJobCause {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::DispatchFailed => "dispatch_failed",
+            Self::InputFailed => "input_failed",
+            Self::ExecutionFailed => "execution_failed",
+            Self::ReconciliationRequired => "reconciliation_required",
+            Self::JournalAttemptFenced => "journal_attempt_fenced",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::CleanupFailed => "cleanup_failed",
+            Self::CleanupAdmissionUnconfirmed => "cleanup_admission_unconfirmed",
+        }
+    }
+    fn explanation(self) -> &'static str {
+        match self {
+            Self::DispatchFailed => "Backend Job Worker dispatch failed.",
+            Self::InputFailed => "Backend Job input submission failed.",
+            Self::ExecutionFailed => "Backend Job execution failed.",
+            Self::JournalAttemptFenced => {
+                "Backend Journal attempt ended before all required recording completed; retained operations remain valid."
+            }
+            Self::ReconciliationRequired => {
+                "Backend Job execution evidence requires reconciliation."
+            }
+            Self::DeadlineExceeded => {
+                "Backend Job execution deadline elapsed; termination is not implied."
+            }
+            Self::CleanupFailed => "Backend Job Worker cleanup failed.",
+            Self::CleanupAdmissionUnconfirmed => {
+                "Backend Job cleanup Host admission could not be confirmed."
+            }
+        }
+    }
+    pub fn storage(self) -> std::result::Result<BackgroundFailure, error_contract::ContractError> {
+        let facts = error_contract::FailureFacts::new(self)?;
+        BackgroundFailure::from_projected(&error_contract::project_failure::<
+            error_contract::Storage,
+            _,
+        >(&facts, &())?)
+    }
+}
+impl error_contract::FailureCause for BackgroundJobCause {
+    fn identity(&self) -> error_contract::FailureIdentity {
+        error_contract::FailureIdentity {
+            domain: "backend_job",
+            reason: self.reason(),
+            details_version: 1,
+            category: match self {
+                Self::ReconciliationRequired => error_contract::Category::Unknown,
+                _ => error_contract::Category::Internal,
+            },
+        }
+    }
+    fn validate(&self) -> std::result::Result<(), error_contract::ContractError> {
+        Ok(())
+    }
+}
+impl error_contract::WireDetails for BackgroundJobCause {
+    fn supports(domain: &str, reason: &str, version: u16) -> bool {
+        domain == "backend_job"
+            && version == 1
+            && matches!(
+                reason,
+                "dispatch_failed"
+                    | "input_failed"
+                    | "execution_failed"
+                    | "reconciliation_required"
+                    | "journal_attempt_fenced"
+                    | "deadline_exceeded"
+                    | "cleanup_failed"
+                    | "cleanup_admission_unconfirmed"
+            )
+    }
+}
+/// Current query-boundary decision, never deserialized from retained evidence.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackgroundJobFailureVisibility {
+    pub can_view_cause: bool,
+}
+macro_rules! project_job_cause_internal {
+    ($($audience:ty),*) => {$(
+        impl error_contract::ProjectFor<$audience> for BackgroundJobCause {
+            type Authorization = ();
+            type Details = Self;
+            fn disclose(&self, _: &error_contract::FailureFacts<Self>, _: &())
+                -> std::result::Result<error_contract::Disclosure<Self>, error_contract::ContractError> {
+                Ok(error_contract::Disclosure::new(*self, self.explanation()))
+            }
+        }
+    )*};
+}
+project_job_cause_internal!(error_contract::Storage, error_contract::InternalTransfer);
+macro_rules! project_job_cause_public {
+    ($($audience:ty),*) => {$(
+        impl error_contract::ProjectFor<$audience> for BackgroundJobCause {
+            type Authorization = BackgroundJobFailureVisibility;
+            type Details = Self;
+            fn disclose(&self, _: &error_contract::FailureFacts<Self>, current: &Self::Authorization)
+                -> std::result::Result<error_contract::Disclosure<Self>, error_contract::ContractError> {
+                if !current.can_view_cause { return Err(error_contract::ContractError::ProjectionUnavailable); }
+                Ok(error_contract::Disclosure::new(*self, self.explanation()))
+            }
+        }
+    )*};
+}
+project_job_cause_public!(error_contract::Browser, error_contract::Tool);
+
+/// Query-time observations. Retained bytes never become a fresh disclosure capability.
+/// The existing owner must authorize the exact Job/attempt before supplying current visibility.
+pub enum BackendJobFailureObservation<A> {
+    LegacyWithoutFacts,
+    Job(error_contract::ProjectedFailure<A, BackgroundJobCause>),
+    Control(error_contract::ProjectedFailure<A, protocol::control_failure::RuntimeControlCause>),
+    Session(
+        error_contract::ProjectedFailure<A, protocol::session_failure::SessionRegistrationCause>,
+    ),
+    Startup(error_contract::ProjectedFailure<A, protocol::startup_failure::RuntimeStartupCause>),
+    Unsupported,
+    Corrupt,
+    NotVisible,
+}
+
+pub struct BackendJobFailureObservations<A> {
+    pub primary: BackendJobFailureObservation<A>,
+    pub cleanup: BackendJobFailureObservation<A>,
+}
+
+macro_rules! backend_query_projection {
+    ($method:ident, $audience:ty) => {
+        impl BackendJobRecord {
+            pub fn $method(
+                &self,
+                current: &BackgroundJobFailureVisibility,
+            ) -> BackendJobFailureObservation<$audience> {
+                project_background_failure::<$audience>(self.failure_cause.as_ref(), current)
+            }
+        }
+        impl BackendJobAttemptRecord {
+            pub fn $method(
+                &self,
+                current: &BackgroundJobFailureVisibility,
+            ) -> BackendJobFailureObservations<$audience> {
+                BackendJobFailureObservations {
+                    primary: project_background_failure::<$audience>(
+                        self.failure_cause.as_ref(),
+                        current,
+                    ),
+                    cleanup: project_background_failure::<$audience>(
+                        self.worker_cleanup_failure_cause.as_ref(),
+                        current,
+                    ),
+                }
+            }
+        }
+    };
+}
+backend_query_projection!(failure_for_browser, error_contract::Browser);
+backend_query_projection!(failure_for_tool, error_contract::Tool);
+
+fn project_background_failure<A: error_contract::Audience>(
+    stored: Option<&StoredFailure>,
+    current: &BackgroundJobFailureVisibility,
+) -> BackendJobFailureObservation<A>
+where
+    BackgroundJobCause: error_contract::ProjectFor<
+            A,
+            Authorization = BackgroundJobFailureVisibility,
+            Details = BackgroundJobCause,
+        >,
+    protocol::control_failure::RuntimeControlCause: error_contract::ProjectFor<
+            A,
+            Authorization = (),
+            Details = protocol::control_failure::RuntimeControlCause,
+        >,
+    protocol::startup_failure::RuntimeStartupCause: error_contract::ProjectFor<
+            A,
+            Authorization = (),
+            Details = protocol::startup_failure::RuntimeStartupCause,
+        >,
+    protocol::session_failure::SessionRegistrationCause: error_contract::ProjectFor<
+            A,
+            Authorization = protocol::session_failure::SessionFailureVisibility,
+            Details = protocol::session_failure::SessionRegistrationCause,
+        >,
+{
+    use BackendJobFailureObservation as O;
+    use error_contract::DecodeFailure;
+    if !current.can_view_cause {
+        return O::NotVisible;
+    }
+    let Some(stored) = stored else {
+        return O::LegacyWithoutFacts;
+    };
+    macro_rules! known {
+        ($domain:ty, $auth:expr, $variant:ident) => {
+            if matches!(stored.decode::<$domain>(), DecodeFailure::Known(_)) {
+                return match stored.project_for::<A, $domain>($auth) {
+                    Ok(projected) => O::$variant(projected),
+                    Err(_) => O::NotVisible,
+                };
+            }
+        };
+    }
+    known!(
+        protocol::session_failure::SessionRegistrationCause,
+        &protocol::session_failure::SessionFailureVisibility {
+            can_view_cause: true
+        },
+        Session
+    );
+    known!(protocol::startup_failure::RuntimeStartupCause, &(), Startup);
+    known!(protocol::control_failure::RuntimeControlCause, &(), Control);
+    match stored.decode::<BackgroundJobCause>() {
+        DecodeFailure::Known(_) => match stored.project_for::<A, BackgroundJobCause>(current) {
+            Ok(projected) => O::Job(projected),
+            Err(_) => O::NotVisible,
+        },
+        DecodeFailure::Unsupported(_) => O::Unsupported,
+        DecodeFailure::Corrupt(_) => O::Corrupt,
+    }
+}
 
 pub const BACKEND_JOB_RUNTIME_ID: &str = crate::hosts::EMBEDDED_RUNTIME_ID;
 pub use job::{
@@ -508,6 +928,9 @@ pub struct BackendJobRecord {
     pub result_digest: Option<String>,
     pub failure_category: Option<String>,
     pub failure_detail: Option<String>,
+    /// Internal evidence; public DTOs must explicitly reproject it.
+    #[serde(skip)]
+    pub failure_cause: Option<StoredFailure>,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -586,7 +1009,12 @@ pub struct BackendJobAttemptRecord {
     pub result_digest: Option<String>,
     pub failure_category: Option<String>,
     pub failure_detail: Option<String>,
+    #[serde(skip)]
+    pub failure_cause: Option<StoredFailure>,
     pub worker_cleanup_state: Option<BackendJobWorkerCleanupState>,
+    /// Cleanup never replaces the original result/cause.
+    #[serde(skip)]
+    pub worker_cleanup_failure_cause: Option<StoredFailure>,
     pub worker_cleanup_failure_category: Option<String>,
     pub worker_cleanup_failure_detail: Option<String>,
     pub worker_cleanup_updated_at: Option<String>,
@@ -701,6 +1129,83 @@ fn validate_identifier(field: &str, value: &str, max_bytes: usize) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_cause_uses_typed_primary_not_diagnostic_order_severity_or_prose() {
+        use crate::hosts::RuntimeDiagnostic;
+        use protocol::session_failure::{
+            SessionRegistrationCause, session_registration_attachment,
+        };
+        let mut typed =
+            RuntimeDiagnostic::new("irrelevant", "warning", "TEST_ONLY_SECRET /private/path");
+        typed.startup = Some(runtime_api::WorkerStartupFailure {
+            primary: session_registration_attachment(SessionRegistrationCause::binding_mismatch())
+                .unwrap(),
+            secondary: vec![],
+            persistence: None,
+            resources: None,
+            io_kind: None,
+        });
+        let unrelated = RuntimeDiagnostic::new("unknown_worker", "error", "not the primary");
+        let first = diagnostic_failure_cause(
+            &[unrelated.clone(), typed.clone()],
+            BackgroundJobCause::DispatchFailed,
+        )
+        .unwrap();
+        typed.severity = crate::hosts::HostDiagnosticSeverity::Info;
+        typed.message = "changed explanation".into();
+        let reordered = diagnostic_failure_cause(
+            &[typed.clone(), unrelated],
+            BackgroundJobCause::DispatchFailed,
+        )
+        .unwrap();
+        assert_eq!(first, reordered);
+        assert!(!first.as_storage_str().contains("TEST_ONLY_SECRET"));
+        let mut conflict = typed.clone();
+        conflict.startup.as_mut().unwrap().primary =
+            session_registration_attachment(SessionRegistrationCause::transport()).unwrap();
+        assert!(
+            diagnostic_failure_cause(
+                &[typed.clone(), conflict],
+                BackgroundJobCause::DispatchFailed
+            )
+            .is_err()
+        );
+        typed.startup.as_mut().unwrap().primary =
+            serde_json::from_value(serde_json::json!("corrupt attachment")).unwrap();
+        assert!(diagnostic_failure_cause(&[typed], BackgroundJobCause::DispatchFailed).is_err());
+    }
+
+    #[test]
+    fn producer_recording_keeps_primary_projection_and_save_failures_distinct_without_fallback() {
+        let primary = Error::InvalidInput("original operation refusal".into());
+        let error = record_operation_failure::<()>(
+            primary,
+            Err(error_contract::ContractError::ProjectionUnavailable),
+            |cause| {
+                assert!(
+                    cause.is_none(),
+                    "unprojectable primary must not mint generic Job facts"
+                );
+                Err(Error::DbOperationOutcomeUnknown)
+            },
+        );
+        assert!(operation_failure_cause(&error, BackgroundJobCause::ExecutionFailed).is_err());
+        assert!(!error.to_string().contains("original operation refusal"));
+        match error {
+            Error::BackendJobFailure {
+                primary,
+                failure_cause: None,
+                recording,
+            } => {
+                assert!(matches!(primary.as_ref(), Error::InvalidInput(_)));
+                assert_eq!(recording.len(), 2);
+                assert!(matches!(recording[0], Error::BackendJobCauseProjection(_)));
+                assert!(matches!(recording[1], Error::DbOperationOutcomeUnknown));
+            }
+            error => panic!("lost primary/recording separation: {error:?}"),
+        }
+    }
 
     fn request() -> BackendJobRequest {
         BackendJobRequest {

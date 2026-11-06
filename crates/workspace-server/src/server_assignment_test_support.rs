@@ -401,6 +401,7 @@ impl DeterministicExecutionBackend {
             binding_id: request.binding_id.clone(),
             operation_id: request.operation_id.clone(),
             state,
+            recording_scope: None,
         })
     }
 }

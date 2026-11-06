@@ -2,7 +2,6 @@ import {
   buildCreateWorkspaceWorkerRequest,
   defaultWorkerLaunchForm,
   genericLaunchProfiles,
-  workerLaunchOutcomeUnknown,
 } from "../sidebar/worker-launch.ts";
 import type { WorkerLaunchFormState } from "../sidebar/worker-launch.ts";
 import { emptyLaunchOptions } from "#lib/workspace/sidebar/worker-launch.test-fixtures.ts";
@@ -162,25 +161,4 @@ Deno.test("generic launch cannot select a trusted Reviewer profile or infer it f
     rejected = true;
   }
   equal(rejected, true);
-});
-
-Deno.test("OutcomeUnknown is distinguished from a definite permission rejection", () => {
-  for (const code of ["OutcomeUnknown", "worker_spawn_outcome_unknown"]) {
-    equal(
-      workerLaunchOutcomeUnknown({
-        error: "runtime_operation_failed",
-        message: "Uncertain launch",
-        diagnostics: [{ code, message: "Reconcile", severity: "error" }],
-      }),
-      true,
-    );
-  }
-  equal(
-    workerLaunchOutcomeUnknown({
-      error: "permission_denied",
-      message: "Read only",
-      diagnostics: [],
-    }),
-    false,
-  );
 });

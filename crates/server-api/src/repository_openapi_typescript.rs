@@ -295,6 +295,7 @@ fn validate_worker_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/workers",
             method: "get",
             operation_id: "workspace_worker_list_alias",
@@ -302,6 +303,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerListResponse")],
         },
         OperationContract {
+            error: "WorkerCreateApiError",
             path: "/api/workers",
             method: "post",
             operation_id: "workspace_worker_create_alias",
@@ -309,6 +311,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserCreateWorkerResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/orchestrator",
             method: "get",
             operation_id: "workspace_orchestrator_status",
@@ -316,6 +319,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserWorkspaceOrchestratorResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/orchestrator",
             method: "post",
             operation_id: "workspace_orchestrator_start",
@@ -323,6 +327,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserWorkspaceOrchestratorResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/workers",
             method: "get",
             operation_id: "workspace_worker_list",
@@ -330,6 +335,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerListResponse")],
         },
         OperationContract {
+            error: "WorkerCreateApiError",
             path: "/api/w/{workspace_id}/workers",
             method: "post",
             operation_id: "workspace_worker_create",
@@ -337,6 +343,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserCreateWorkerResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/workers/{worker_ref}",
             method: "get",
             operation_id: "workspace_worker_detail",
@@ -344,6 +351,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerSummary")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/workers/launch-options",
             method: "get",
             operation_id: "workspace_worker_launch_options_alias",
@@ -351,6 +359,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerLaunchOptionsResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/workers/launch-options",
             method: "get",
             operation_id: "workspace_worker_launch_options",
@@ -366,6 +375,7 @@ fn validate_companion_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/status",
             method: "get",
             operation_id: "companion_status_alias",
@@ -373,6 +383,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionStatusResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/status",
             method: "get",
             operation_id: "companion_status",
@@ -380,6 +391,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionStatusResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/transcript",
             method: "get",
             operation_id: "companion_transcript_alias",
@@ -387,6 +399,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionTranscriptProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/transcript",
             method: "get",
             operation_id: "companion_transcript",
@@ -394,6 +407,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionTranscriptProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/messages",
             method: "post",
             operation_id: "companion_message_alias",
@@ -401,6 +415,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionMessageResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/messages",
             method: "post",
             operation_id: "companion_message",
@@ -408,6 +423,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionMessageResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/cancel",
             method: "post",
             operation_id: "companion_cancel_alias",
@@ -415,6 +431,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionMessageResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/cancel",
             method: "post",
             operation_id: "companion_cancel",
@@ -430,6 +447,7 @@ fn validate_ticket_browser_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/link-summary",
             method: "get",
             operation_id: "ticket_link_summary_get",
@@ -437,6 +455,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketLinkSummary")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/parent",
             method: "get",
             operation_id: "ticket_parent_get",
@@ -444,6 +463,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketParentLink")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/parent",
             method: "put",
             operation_id: "ticket_parent_set",
@@ -451,6 +471,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketParentLink")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/children",
             method: "get",
             operation_id: "ticket_children_query",
@@ -458,6 +479,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketChildrenPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/ticket-tags",
             method: "get",
             operation_id: "workspace_ticket_tag_list",
@@ -465,6 +487,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "Array_of_WorkspaceTag")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/ticket-tags",
             method: "post",
             operation_id: "workspace_ticket_tag_mutate",
@@ -472,6 +495,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "WorkspaceTag")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/tags",
             method: "put",
             operation_id: "ticket_tags_set",
@@ -479,6 +503,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "Array_of_WorkspaceTag")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/browse",
             method: "post",
             operation_id: "ticket_browse",
@@ -486,6 +511,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketBrowseQueryResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/query",
             method: "post",
             operation_id: "ticket_query",
@@ -493,6 +519,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketQueryResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets",
             method: "get",
             operation_id: "ticket_list",
@@ -500,6 +527,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets",
             method: "post",
             operation_id: "ticket_create_record",
@@ -507,6 +535,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketRef")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}",
             method: "get",
             operation_id: "ticket_get",
@@ -514,6 +543,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}",
             method: "patch",
             operation_id: "ticket_edit",
@@ -521,6 +551,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}",
             method: "get",
             operation_id: "ticket_post_get",
@@ -528,6 +559,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketEventDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}",
             method: "patch",
             operation_id: "ticket_post_edit",
@@ -535,6 +567,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/assignments/{role}",
             method: "put",
             operation_id: "ticket_assignment_set",
@@ -542,6 +575,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketRoleAssignmentMutationResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/implementation-cancellations",
             method: "post",
             operation_id: "ticket_implementation_cancel",
@@ -549,6 +583,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/case",
             method: "post",
             operation_id: "ticket_case_update",
@@ -556,6 +591,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketSummary")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments",
             method: "get",
             operation_id: "ticket_assignments_page",
@@ -563,6 +599,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/notification-diagnostics",
             method: "get",
             operation_id: "notification_diagnostics",
@@ -570,6 +607,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "NotificationDiagnosticsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics",
             method: "get",
             operation_id: "ticket_assignment_diagnostics",
@@ -577,6 +615,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentDiagnosticsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results",
             method: "post",
             operation_id: "ticket_implementation_result",
@@ -584,6 +623,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketImplementationResultReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/implementation-results",
             method: "post",
             operation_id: "ticket_implementation_result_browser",
@@ -591,6 +631,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketImplementationResultReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results/{result_id}",
             method: "get",
             operation_id: "ticket_implementation_result_get",
@@ -598,6 +639,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketImplementationResultReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-answer",
             method: "post",
             operation_id: "ticket_assignment_answer",
@@ -605,6 +647,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentAnswerReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments",
             method: "get",
             operation_id: "ticket_assignments_page_browser",
@@ -612,6 +655,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics",
             method: "get",
             operation_id: "ticket_assignment_diagnostics_browser",
@@ -619,6 +663,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentDiagnosticsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-answer",
             method: "post",
             operation_id: "ticket_assignment_answer_browser",
@@ -626,6 +671,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentAnswerReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking",
             method: "get",
             operation_id: "ticket_assignment_tracking_get",
@@ -633,6 +679,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "Array_of_TicketAssignmentTrackingProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking",
             method: "post",
             operation_id: "ticket_assignment_tracking_update",
@@ -640,6 +687,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentTrackingProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/history",
             method: "get",
             operation_id: "ticket_assignment_tracking_history",
@@ -647,6 +695,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentTrackingHistoryPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/ready",
             method: "post",
             operation_id: "ticket_ready",
@@ -654,6 +703,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/events",
             method: "post",
             operation_id: "ticket_event_append",
@@ -661,6 +711,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/queue",
             method: "post",
             operation_id: "ticket_queue",
@@ -668,6 +719,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketQueueOutcome")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/objectives",
             method: "get",
             operation_id: "objective_list",
@@ -675,6 +727,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "ObjectiveListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/objectives/{objective_id}",
             method: "get",
             operation_id: "objective_get",
@@ -682,6 +735,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "ObjectiveDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/merge-requests",
             method: "get",
             operation_id: "merge_request_list",
@@ -689,6 +743,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "MergeRequestListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/merge-requests/{merge_request_id}",
             method: "get",
             operation_id: "merge_request_show",
@@ -704,6 +759,7 @@ fn validate_repository_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/repositories",
             method: "get",
             operation_id: "repository_list_alias",
@@ -711,6 +767,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/repositories/{repository_key}",
             method: "get",
             operation_id: "repository_detail_alias",
@@ -718,6 +775,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories",
             method: "get",
             operation_id: "repository_list",
@@ -725,6 +783,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories",
             method: "post",
             operation_id: "repository_create",
@@ -735,6 +794,7 @@ fn validate_repository_operations(
             ],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}",
             method: "get",
             operation_id: "repository_detail",
@@ -742,6 +802,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
             method: "post",
             operation_id: "repository_ssh_connection_probe",
@@ -749,6 +810,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositorySshConnectionProbeResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
             method: "put",
             operation_id: "repository_ssh_host_trust_confirm",
@@ -756,6 +818,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositorySshHostTrust")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}/log",
             method: "get",
             operation_id: "repository_log",
@@ -763,6 +826,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryLogResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/repositories/{repository_key}/log",
             method: "get",
             operation_id: "repository_log_alias",
@@ -770,6 +834,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryLogResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/hosts",
             method: "get",
             operation_id: "host_list",
@@ -777,6 +842,7 @@ fn validate_repository_operations(
             successes: &[("200", "HostListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/hosts",
             method: "get",
             operation_id: "host_list_alias",
@@ -784,6 +850,7 @@ fn validate_repository_operations(
             successes: &[("200", "HostListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/hosts/{host_id}/workers",
             method: "get",
             operation_id: "host_worker_list",
@@ -791,6 +858,7 @@ fn validate_repository_operations(
             successes: &[("200", "HostWorkerListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/hosts/{host_id}/workers",
             method: "get",
             operation_id: "host_worker_list_alias",
@@ -806,6 +874,7 @@ fn validate_workdir_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
             method: "get",
             operation_id: "runtime_workdir_list",
@@ -813,6 +882,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
             method: "post",
             operation_id: "runtime_workdir_create",
@@ -823,6 +893,7 @@ fn validate_workdir_operations(
             ],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
             method: "get",
             operation_id: "runtime_workdir_detail",
@@ -830,6 +901,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
             method: "delete",
             operation_id: "runtime_workdir_cleanup",
@@ -837,6 +909,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryRemovalResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/external-workdir-grants",
             method: "post",
             operation_id: "external_workdir_grant_create",
@@ -844,6 +917,7 @@ fn validate_workdir_operations(
             successes: &[("201", "ExternalWorkdirGrantResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
             method: "get",
             operation_id: "external_workdir_grant_get",
@@ -851,6 +925,7 @@ fn validate_workdir_operations(
             successes: &[("200", "ExternalWorkdirGrantResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
             method: "delete",
             operation_id: "external_workdir_grant_revoke",
@@ -858,6 +933,7 @@ fn validate_workdir_operations(
             successes: &[("200", "ExternalWorkdirGrantResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories",
             method: "get",
             operation_id: "workspace_workdir_list",
@@ -865,6 +941,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories",
             method: "post",
             operation_id: "workspace_workdir_create",
@@ -875,6 +952,7 @@ fn validate_workdir_operations(
             ],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories/{working_directory_id}",
             method: "get",
             operation_id: "workspace_workdir_detail",
@@ -882,6 +960,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories/{working_directory_id}",
             method: "delete",
             operation_id: "workspace_workdir_cleanup",
@@ -1257,6 +1336,9 @@ fn validate_runtime_operation_contracts(
                 operation.operation_id,
             )?;
             roots.insert(expected.to_owned());
+            if !successes.contains_key(status.as_str()) {
+                collect_problem_error_schema(response, operation.operation_id, &mut roots)?;
+            }
         }
         for (status, expected) in successes {
             if !responses.contains_key(status) {
@@ -1323,12 +1405,30 @@ fn validate_operation_contracts(
                 &format!("{} response {status}", operation.operation_id),
             )?;
             let schema = json_content_schema(response, operation.operation_id)?;
+            let startup_error = operation.error == "WorkerCreateApiError"
+                && !successes.contains_key(status.as_str());
             let expected = successes
                 .get(status.as_str())
                 .copied()
-                .unwrap_or("RepositoryApiError");
+                .unwrap_or(if startup_error {
+                    "RepositoryApiError"
+                } else {
+                    operation.error
+                });
             require_schema_ref(schema, expected, operation.operation_id)?;
             roots.insert(expected.to_owned());
+            if startup_error {
+                let content = object_field(response, "content", operation.operation_id)?;
+                let problem =
+                    object_field(content, "application/problem+json", operation.operation_id)?;
+                let schema = problem.get("schema").ok_or_else(|| {
+                    GenerationError::invalid("missing startup Problem Details schema")
+                })?;
+                require_schema_ref(schema, "StartupProblemDetails", operation.operation_id)?;
+                roots.insert("StartupProblemDetails".to_owned());
+            } else if !successes.contains_key(status.as_str()) {
+                collect_problem_error_schema(response, operation.operation_id, &mut roots)?;
+            }
         }
         for (status, expected) in successes {
             if !responses.contains_key(status) {
@@ -1343,11 +1443,36 @@ fn validate_operation_contracts(
 }
 
 struct OperationContract {
+    error: &'static str,
     path: &'static str,
     method: &'static str,
     operation_id: &'static str,
     request: Option<&'static str>,
     successes: &'static [(&'static str, &'static str)],
+}
+
+fn collect_problem_error_schema(
+    response: &Map<String, Value>,
+    context: &str,
+    roots: &mut BTreeSet<String>,
+) -> Result<(), GenerationError> {
+    let content = object_field(response, "content", context)?;
+    if let Some(problem) = content.get("application/problem+json") {
+        let problem = object(problem, context)?;
+        let schema = problem
+            .get("schema")
+            .ok_or_else(|| GenerationError::invalid("missing Problem Details schema"))?;
+        // The canonical operation owns its domain representation. Emit and validate
+        // its complete schema closure instead of treating every Problem as control.
+        let reference = schema_reference(schema, context)?;
+        let name = reference.strip_prefix(SCHEMA_REF_PREFIX).ok_or_else(|| {
+            GenerationError::invalid(format!(
+                "{context} contains unsupported Problem reference `{reference}`"
+            ))
+        })?;
+        roots.insert(name.to_owned());
+    }
+    Ok(())
 }
 
 fn validate_binary_request_body(
@@ -1667,6 +1792,14 @@ fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError
             }
         }
 
+        if outer_type.is_none() && disjoint_closed_object_union(branches) {
+            return branches
+                .iter()
+                .map(|branch| render_schema(branch, context))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|branches| branches.join(" | "));
+        }
+
         let mut rendered = Vec::with_capacity(branches.len());
         let mut seen_literals = BTreeSet::new();
         for branch in branches {
@@ -1742,6 +1875,56 @@ fn render_schema(value: &Value, context: &str) -> Result<String, GenerationError
     }
 }
 
+// Closed objects cannot overlap when one requires a field the other forbids.
+// Only object/string mixtures are admitted here; unsupported combinations still
+// fail through the ordinary renderer, including every nested schema constraint.
+fn disjoint_closed_object_union(branches: &[Value]) -> bool {
+    let schemas = branches
+        .iter()
+        .map(Value::as_object)
+        .collect::<Option<Vec<_>>>();
+    let Some(schemas) = schemas else { return false };
+    if !schemas.iter().all(|schema| {
+        matches!(
+            schema.get("type").and_then(Value::as_str),
+            Some("object" | "string")
+        )
+    }) {
+        return false;
+    }
+    let excludes_required = |closed: &Map<String, Value>, other: &Map<String, Value>| {
+        if closed.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return false;
+        }
+        let Some(properties) = closed.get("properties").and_then(Value::as_object) else {
+            return false;
+        };
+        other
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|name| !properties.contains_key(name))
+            })
+    };
+    for (index, left) in schemas.iter().enumerate() {
+        for right in &schemas[index + 1..] {
+            match (
+                left.get("type").and_then(Value::as_str),
+                right.get("type").and_then(Value::as_str),
+            ) {
+                (Some("object"), Some("string")) | (Some("string"), Some("object")) => {}
+                (Some("object"), Some("object"))
+                    if excludes_required(left, right) || excludes_required(right, left) => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
 fn render_nullable_union(value: &Value, context: &str) -> Result<String, GenerationError> {
     let branches = value
         .as_array()
@@ -1780,8 +1963,31 @@ fn render_typed_schema(
 ) -> Result<String, GenerationError> {
     match kind {
         "string" => {
-            ensure_schema_keywords(schema, &["type"], context)?;
-            Ok("string".to_owned())
+            ensure_schema_keywords(
+                schema,
+                &["type", "minLength", "maxLength", "pattern"],
+                context,
+            )?;
+            let mut constraints = Vec::new();
+            if schema.contains_key("minLength") || schema.contains_key("maxLength") {
+                let range =
+                    render_length_range(schema.get("minLength"), schema.get("maxLength"), context)?;
+                constraints.push(format!("readonly \"__yoiStringLength\": \"{range}\";"));
+            }
+            if let Some(pattern) = schema.get("pattern") {
+                let pattern = pattern.as_str().ok_or_else(|| {
+                    GenerationError::invalid(format!("{context} string pattern must be a string"))
+                })?;
+                constraints.push(format!(
+                    "readonly \"__yoiStringPattern\": {};",
+                    serde_json::to_string(pattern).expect("string encoding")
+                ));
+            }
+            if constraints.is_empty() {
+                Ok("string".to_owned())
+            } else {
+                Ok(format!("string & {{ {} }}", constraints.join(" ")))
+            }
         }
         "boolean" => {
             ensure_schema_keywords(schema, &["type"], context)?;
@@ -1871,9 +2077,12 @@ fn render_typed_schema(
                             .join(", ")
                     ))
                 }
-                _ => Err(GenerationError::invalid(format!(
-                    "{context} contains unsupported variable array bounds"
-                ))),
+                (minimum, maximum) => {
+                    let range = render_length_range(minimum, maximum, context)?;
+                    Ok(format!(
+                        "Array<{item}> & {{ readonly \"__yoiArrayLength\": \"{range}\"; }}"
+                    ))
+                }
             }
         }
         "object" => {
@@ -1888,6 +2097,36 @@ fn render_typed_schema(
             "{context} uses unsupported type `{other}`"
         ))),
     }
+}
+
+// Nominal markers preserve wire bounds in generated declarations; they are not
+// runtime validators. Only finite safe non-negative integer constraints are admitted.
+fn render_length_range(
+    minimum: Option<&Value>,
+    maximum: Option<&Value>,
+    context: &str,
+) -> Result<String, GenerationError> {
+    let bound = |value: &Value| {
+        value
+            .as_u64()
+            .filter(|value| *value <= MAX_SAFE_INTEGER as u64)
+            .ok_or_else(|| {
+                GenerationError::invalid(format!(
+                    "{context} length bound must be a safe non-negative integer"
+                ))
+            })
+    };
+    let minimum = minimum.map(bound).transpose()?.unwrap_or(0);
+    let maximum = maximum.map(bound).transpose()?;
+    if maximum.is_some_and(|maximum| minimum > maximum) {
+        return Err(GenerationError::invalid(format!(
+            "{context} length range is inverted"
+        )));
+    }
+    Ok(format!(
+        "{minimum}..{}",
+        maximum.map_or_else(|| "unbounded".into(), |maximum| maximum.to_string())
+    ))
 }
 
 fn render_object(schema: &Map<String, Value>, context: &str) -> Result<String, GenerationError> {
@@ -2040,6 +2279,34 @@ mod tests {
         assert!(
             generate_schema_closure_typescript(&schemas, &BTreeSet::from([name.into()])).is_err()
         );
+    }
+
+    #[test]
+    fn exclusive_closed_owner_shapes_render_but_open_or_overlapping_unions_fail() {
+        let management = serde_json::json!({"type":"object", "additionalProperties":false, "properties":{"reason":{"type":"string"}}, "required":["reason"]});
+        let session = serde_json::json!({"type":"object", "additionalProperties":false, "properties":{"classification":{"type":"string"}}, "required":["classification"]});
+        let roots = BTreeSet::from(["Cause".into()]);
+        let render = |branches: Value| {
+            generate_schema_closure_typescript(
+                &Map::from_iter([("Cause".into(), serde_json::json!({"oneOf":branches}))]),
+                &roots,
+            )
+        };
+        let output =
+            render(serde_json::json!([management, session, {"type":"string", "enum":["timeout"]}]))
+                .unwrap();
+        assert!(output.contains("reason: string"));
+        assert!(output.contains("classification: string"));
+        assert!(output.contains("\"timeout\""));
+        let mut open_management = management.clone();
+        let mut open_session = session.clone();
+        open_management["additionalProperties"] = Value::Bool(true);
+        open_session["additionalProperties"] = Value::Bool(true);
+        assert!(render(serde_json::json!([open_management, open_session])).is_err());
+        assert!(render(serde_json::json!([management, management])).is_err());
+        let mut invalid_session = session.clone();
+        invalid_session["properties"]["classification"]["unsupportedKeyword"] = Value::Bool(true);
+        assert!(render(serde_json::json!([management, invalid_session])).is_err());
     }
 
     const OPENAPI: &str = include_str!("../../../openapi/server-api.json");
@@ -2305,6 +2572,50 @@ mod tests {
     }
 
     #[test]
+    fn bounded_strings_and_variable_arrays_preserve_constraints_without_becoming_validators() {
+        assert_eq!(
+            render_schema(
+                &serde_json::json!({"type":"string", "minLength":1, "maxLength":128}),
+                "bounded"
+            )
+            .unwrap(),
+            "string & { readonly \"__yoiStringLength\": \"1..128\"; }"
+        );
+        assert_eq!(
+            render_schema(
+                &serde_json::json!({"type":"array", "items":{"type":"string"}, "maxItems":8}),
+                "bounded"
+            )
+            .unwrap(),
+            "Array<string> & { readonly \"__yoiArrayLength\": \"0..8\"; }"
+        );
+        assert_eq!(
+            render_schema(
+                &serde_json::json!({"type":"string", "pattern":"^[a-z]+$"}),
+                "pattern"
+            )
+            .unwrap(),
+            "string & { readonly \"__yoiStringPattern\": \"^[a-z]+$\"; }"
+        );
+        assert!(
+            render_schema(
+                &serde_json::json!({"type":"string", "pattern":42}),
+                "pattern"
+            )
+            .is_err()
+        );
+        for schema in [
+            serde_json::json!({"type":"string", "maxLength":-1}),
+            serde_json::json!({"type":"string", "minLength":2, "maxLength":1}),
+            serde_json::json!({"type":"string", "maxLength":1.5}),
+            serde_json::json!({"type":"array", "items":{"type":"string"}, "maxItems":9007199254740992u64}),
+            serde_json::json!({"type":"array", "items":{"type":"string"}, "minItems":9, "maxItems":8}),
+        ] {
+            assert!(render_schema(&schema, "bounded").is_err(), "{schema}");
+        }
+    }
+
+    #[test]
     fn generator_rejects_lossy_reference_siblings() {
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
         document["components"]["schemas"]["RepositorySummary"]["properties"]["source"]["maxLength"] =
@@ -2325,13 +2636,13 @@ mod tests {
     #[test]
     fn generator_rejects_unimplemented_ordinary_schema_keywords() {
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();
-        document["components"]["schemas"]["RepositorySource"]["properties"]["uri"]["maxLength"] =
-            serde_json::json!(1);
+        document["components"]["schemas"]["RepositorySource"]["properties"]["uri"]["format"] =
+            serde_json::json!("email");
         let error = generate_repository_typescript(&document.to_string()).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("unsupported schema keyword `maxLength`")
+                .contains("unsupported schema keyword `format`")
         );
 
         let mut document: Value = serde_json::from_str(OPENAPI).unwrap();

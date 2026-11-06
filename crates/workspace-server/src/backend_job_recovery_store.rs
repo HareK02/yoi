@@ -146,6 +146,7 @@ pub(super) fn record(
     cause: &str,
     detail: &str,
     next_action: &str,
+    failure_cause: Option<&crate::backend_job::BackgroundFailure>,
     now: &str,
 ) -> Result<BackendJobAttemptRecord> {
     if cause.trim().is_empty()
@@ -166,11 +167,14 @@ pub(super) fn record(
             return Err(Error::InvalidInput("Backend Job reconciliation owner changed".into()));
         }
         subject_deletion_store::require_job_admission(&tx,workspace,&job.request)?;
+        let failure_cause = crate::backend_job::prefer_retained_primary_cause(
+            current.failure_cause.as_ref(), failure_cause,
+        ).map_err(Error::BackendJobCauseProjection)?;
         let detail = bounded_failure_detail(detail);
         tx.execute("INSERT INTO backend_job_reconciliation(workspace_id,job_id,attempt_id,cause,detail,next_action,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(workspace_id,job_id,attempt_id) DO UPDATE SET cause=excluded.cause,detail=excluded.detail,next_action=excluded.next_action,updated_at=excluded.updated_at", params![workspace,expected.job_id,expected.attempt_id,cause,detail,next_action,now])?;
         // Do not change the attempt's last confirmed admission/dispatch state.
-        tx.execute("UPDATE backend_job_attempts SET failure_category=?4,failure_detail=?5,updated_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,cause,detail,now])?;
-        tx.execute("UPDATE backend_jobs SET failure_category=?3,failure_detail=?4,updated_at=?5 WHERE workspace_id=?1 AND job_id=?2",params![workspace,expected.job_id,cause,detail,now])?;
+        tx.execute("UPDATE backend_job_attempts SET failure_category=?4,failure_detail=?5,failure_cause=?7,updated_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,cause,detail,now,failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)])?;
+        tx.execute("UPDATE backend_jobs SET failure_category=?3,failure_detail=?4,failure_cause=?6,updated_at=?5 WHERE workspace_id=?1 AND job_id=?2",params![workspace,expected.job_id,cause,detail,now,failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)])?;
         let result = read_backend_job_attempt(&tx,workspace,&expected.job_id,&expected.attempt_id)?.ok_or_else(||Error::Store("Backend Job reconciliation attempt disappeared".into()))?;
         tx.commit()?;
         Ok(result)
@@ -195,7 +199,7 @@ pub(super) fn claim_cleanup_owned(
             tx.commit()?;
             return Ok((expected.clone(),false));
         }
-        tx.execute("UPDATE backend_job_attempts SET worker_cleanup_state='executing',worker_cleanup_failure_category=NULL,worker_cleanup_failure_detail=NULL,worker_cleanup_updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,now])?;
+        tx.execute("UPDATE backend_job_attempts SET worker_cleanup_state='executing',worker_cleanup_failure_category=NULL,worker_cleanup_failure_detail=NULL,worker_cleanup_failure_cause=NULL,worker_cleanup_updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,now])?;
         let result=read_backend_job_attempt(&tx,workspace,&expected.job_id,&expected.attempt_id)?.ok_or_else(||Error::Store("cleanup owner disappeared".into()))?;
         tx.commit()?;
         Ok((result,true))
@@ -211,6 +215,7 @@ pub(super) fn record_cleanup_preflight_failure(
     expected_history: &[BackendJobAttemptRecord],
     expected: &BackendJobAttemptRecord,
     detail: &str,
+    failure_cause: Option<&crate::backend_job::BackgroundFailure>,
     now: &str,
 ) -> Result<BackendJobAttemptRecord> {
     if detail.trim().is_empty() {
@@ -254,7 +259,7 @@ pub(super) fn record_cleanup_preflight_failure(
                 "Cleanup execution fence already recorded; preflight cannot overwrite progress".into(),
             ));
         }
-        tx.execute("UPDATE backend_job_attempts SET worker_cleanup_state=CASE WHEN worker_cleanup_state='executing' THEN 'executing' ELSE 'failed' END,worker_cleanup_failure_category='backend_job_cleanup_host_admission_unconfirmed',worker_cleanup_failure_detail=?4,worker_cleanup_updated_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3", params![workspace, expected.job_id, expected.attempt_id, bounded_failure_detail(detail), now])?;
+        tx.execute("UPDATE backend_job_attempts SET worker_cleanup_state=CASE WHEN worker_cleanup_state='executing' THEN 'executing' ELSE 'failed' END,worker_cleanup_failure_category='backend_job_cleanup_host_admission_unconfirmed',worker_cleanup_failure_detail=?4,worker_cleanup_failure_cause=?6,worker_cleanup_updated_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3", params![workspace, expected.job_id, expected.attempt_id, bounded_failure_detail(detail), now, failure_cause.map(crate::backend_job::BackgroundFailure::as_storage_str)])?;
         let result = read_backend_job_attempt(&tx, workspace, &expected.job_id, &expected.attempt_id)?
             .ok_or_else(|| Error::Store("Cleanup diagnostic owner disappeared".into()))?;
         tx.commit()?;
@@ -270,6 +275,7 @@ pub(super) fn finish_cleanup_owned(
     state: BackendJobWorkerCleanupState,
     cause: Option<&str>,
     detail: Option<&str>,
+    failure_cause: Option<&crate::backend_job::BackgroundFailure>,
     now: &str,
 ) -> Result<BackendJobAttemptRecord> {
     if !matches!(
@@ -278,6 +284,11 @@ pub(super) fn finish_cleanup_owned(
     ) {
         return Err(Error::InvalidInput(
             "cleanup result must be definitive".into(),
+        ));
+    }
+    if state == BackendJobWorkerCleanupState::Completed && failure_cause.is_some() {
+        return Err(Error::InvalidInput(
+            "completed cleanup cannot carry failure evidence".into(),
         ));
     }
     store.with_conn_mut(|conn| {
@@ -289,7 +300,7 @@ pub(super) fn finish_cleanup_owned(
         }
         // Caller supplies evidence from the execution owner. A terminal Job or
         // missing live map alone must never call this completion boundary.
-        tx.execute("UPDATE backend_job_attempts SET worker_cleanup_state=?4,worker_cleanup_failure_category=?5,worker_cleanup_failure_detail=?6,worker_cleanup_updated_at=?7,worker_cleanup_completed_at=?8 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,state.as_str(),cause,detail.map(bounded_failure_detail),now,(state==BackendJobWorkerCleanupState::Completed).then_some(now)])?;
+        tx.execute("UPDATE backend_job_attempts SET worker_cleanup_state=?4,worker_cleanup_failure_category=?5,worker_cleanup_failure_detail=?6,worker_cleanup_failure_cause=?9,worker_cleanup_updated_at=?7,worker_cleanup_completed_at=?8 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,state.as_str(),cause,detail.map(bounded_failure_detail),now,(state==BackendJobWorkerCleanupState::Completed).then_some(now),failure_cause.map(crate::backend_job::BackgroundFailure::as_storage_str)])?;
         let result=read_backend_job_attempt(&tx,workspace,&expected.job_id,&expected.attempt_id)?.ok_or_else(||Error::Store("cleanup owner disappeared".into()))?;
         tx.commit()?;
         Ok(result)
@@ -507,8 +518,8 @@ pub(super) fn reconcile_domain_result(
             return Err(Error::InvalidInput("saved non-Journal domain result requires a nonterminal exact current execution owner".into()));
         }
         let (digest,json) = result_digest(&submission.result,job.request.limits.max_result_bytes)?;
-        tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,worker_cleanup_state=COALESCE(worker_cleanup_state,'pending'),worker_cleanup_updated_at=CASE WHEN worker_cleanup_state IS NULL THEN ?6 ELSE worker_cleanup_updated_at END,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,json,digest,now])?;
-        tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2",params![workspace,expected.job_id,json,digest,now])?;
+        tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,worker_cleanup_state=COALESCE(worker_cleanup_state,'pending'),worker_cleanup_updated_at=CASE WHEN worker_cleanup_state IS NULL THEN ?6 ELSE worker_cleanup_updated_at END,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,expected.job_id,expected.attempt_id,json,digest,now])?;
+        tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2",params![workspace,expected.job_id,json,digest,now])?;
         notification_routing::jobs::capture(&tx,workspace,&expected.job_id,&expected.attempt_id)?;
         let result = read_backend_job_attempt(&tx,workspace,&expected.job_id,&expected.attempt_id)?.ok_or_else(||Error::Store("reconciled owner disappeared".into()))?;
         tx.commit()?;
@@ -558,6 +569,362 @@ mod tests {
             .reserve_backend_job("workspace", &request, NOW)
             .unwrap();
         (dir, store, reserved)
+    }
+
+    #[test]
+    fn retained_control_primary_survives_terminal_update_and_reprojects_for_current_query_viewer() {
+        use crate::backend_job::{
+            BackendJobFailureObservation as O, BackgroundJobCause,
+            BackgroundJobFailureVisibility as V,
+        };
+        use protocol::control_failure::RuntimeControlCause;
+        let (dir, store, reserved) = fixture();
+        let cause = RuntimeControlCause::PersistenceOutcomeUnknown;
+        let primary = crate::backend_job::operation_failure_cause(
+            &Error::RuntimeControlFailed {
+                runtime_id: "private runtime".into(),
+                cause,
+            },
+            BackgroundJobCause::DispatchFailed,
+        )
+        .unwrap();
+        let first = store
+            .record_backend_job_reconciliation_with_cause(
+                "workspace",
+                &reserved.attempt,
+                "same receipt",
+                "not a classifier",
+                "Read same identity",
+                Some(&primary),
+                NOW,
+            )
+            .unwrap();
+        let generic = BackgroundJobCause::DeadlineExceeded.storage().unwrap();
+        let finished = store
+            .finish_backend_job_attempt_with_cause(
+                "workspace",
+                &first.job_id,
+                &first.attempt_id,
+                BackendJobAttemptState::Failed,
+                "deadline",
+                "different text",
+                Some(&generic),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(finished.failure_cause, first.failure_cause);
+        drop(store);
+        let reopened =
+            SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+        let attempt = reopened
+            .get_backend_job_attempt("workspace", &first.job_id, &first.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.state, BackendJobAttemptState::Failed);
+        match attempt
+            .failure_for_tool(&V {
+                can_view_cause: true,
+            })
+            .primary
+        {
+            O::Control(value) => {
+                assert_eq!(value.details(), &cause);
+                assert_eq!(value.explanation(), cause.explanation());
+            }
+            _ => panic!("stored control cause was not queryable"),
+        }
+        assert!(matches!(
+            attempt
+                .failure_for_tool(&V {
+                    can_view_cause: false
+                })
+                .primary,
+            O::NotVisible
+        ));
+        assert!(matches!(
+            attempt
+                .failure_for_browser(&V {
+                    can_view_cause: true
+                })
+                .cleanup,
+            O::LegacyWithoutFacts
+        ));
+        let job = reopened
+            .get_backend_job("workspace", &first.job_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            job.failure_for_browser(&V {
+                can_view_cause: true
+            }),
+            O::Control(_)
+        ));
+        assert!(matches!(
+            job.failure_for_browser(&V {
+                can_view_cause: false
+            }),
+            O::NotVisible
+        ));
+    }
+
+    #[test]
+    fn future_or_corrupt_retained_cause_blocks_reclassification_without_losing_bytes_on_reopen() {
+        for future in [false, true] {
+            let (dir, store, reserved) = fixture();
+            let cause = crate::backend_job::BackgroundJobCause::ReconciliationRequired
+                .storage()
+                .unwrap();
+            let mut raw: serde_json::Value = serde_json::from_str(cause.as_storage_str()).unwrap();
+            raw["version"] = 99.into();
+            let raw = if future {
+                raw.to_string()
+            } else {
+                "{corrupt".into()
+            };
+            store
+                .with_conn(|conn| {
+                    conn.execute("UPDATE backend_job_attempts SET failure_cause=?1", [&raw])?;
+                    conn.execute("UPDATE backend_jobs SET failure_cause=?1", [&raw])?;
+                    Ok(())
+                })
+                .unwrap();
+            let before = store
+                .get_backend_job_attempt(
+                    "workspace",
+                    &reserved.job.request.job_id,
+                    &reserved.attempt.attempt_id,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                store.record_backend_job_reconciliation_with_cause(
+                    "workspace",
+                    &before,
+                    "uncertain",
+                    "safe",
+                    "same receipt",
+                    Some(&cause),
+                    NOW
+                ),
+                Err(Error::BackendJobCauseProjection(_))
+            ));
+            assert!(matches!(
+                store.finish_backend_job_attempt_with_cause(
+                    "workspace",
+                    &before.job_id,
+                    &before.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "deadline",
+                    "safe",
+                    Some(&cause),
+                    NOW
+                ),
+                Err(Error::BackendJobCauseProjection(_))
+            ));
+            drop(store);
+            let reopened =
+                SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+            assert_eq!(
+                reopened
+                    .get_backend_job_attempt("workspace", &before.job_id, &before.attempt_id)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            reopened.with_conn(|conn| {
+                let retained: (String,String) = conn.query_row("SELECT j.failure_cause,a.failure_cause FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id)", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+                assert_eq!(retained, (raw.clone(),raw.clone())); Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn structured_reconciliation_retains_startup_primary_across_local_updates_and_reopen() {
+        use protocol::session_failure::{
+            SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
+        };
+        let (dir, store, reserved) = fixture();
+        let primary = crate::backend_job::BackgroundFailure::from_startup_primary(
+            &session_registration_attachment(SessionRegistrationCause::denied(
+                SessionPrincipal::Subject,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let first = store
+            .record_backend_job_reconciliation_with_cause(
+                "workspace",
+                &reserved.attempt,
+                "allocation_response_lost",
+                "not a classifier",
+                "Read the same receipt",
+                Some(&primary),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(first.state, BackendJobAttemptState::Reserved);
+        let generic = crate::backend_job::BackgroundJobCause::ReconciliationRequired
+            .storage()
+            .unwrap();
+        let second = store
+            .record_backend_job_reconciliation_with_cause(
+                "workspace",
+                &first,
+                "different_label",
+                "different prose",
+                "Keep original owner",
+                Some(&generic),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(first.failure_cause, second.failure_cause);
+        assert!(
+            store
+                .record_backend_job_reconciliation_with_cause(
+                    "workspace",
+                    &reserved.attempt,
+                    "stale",
+                    "stale",
+                    "Read current",
+                    Some(&generic),
+                    NOW
+                )
+                .is_err()
+        );
+        drop(store);
+        let reopened =
+            SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+        let attempt = reopened
+            .get_backend_job_attempt("workspace", "accepted", &first.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt, second);
+        assert!(matches!(
+            attempt
+                .failure_cause
+                .unwrap()
+                .decode::<SessionRegistrationCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ));
+        assert_eq!(
+            reopened
+                .get_backend_job("workspace", "accepted")
+                .unwrap()
+                .unwrap()
+                .state,
+            BackendJobState::Pending
+        );
+    }
+
+    #[test]
+    fn structured_cleanup_preflight_and_completion_do_not_replace_terminal_primary() {
+        let (dir, store, reserved) = fixture();
+        let owner = bind_fixture_owner(&store, &reserved);
+        let primary = crate::backend_job::BackgroundJobCause::ExecutionFailed
+            .storage()
+            .unwrap();
+        let terminal = store
+            .finish_backend_job_attempt_with_cause(
+                "workspace",
+                "accepted",
+                &owner.attempt_id,
+                BackendJobAttemptState::Failed,
+                "execution_failed",
+                "Original failure",
+                Some(&primary),
+                NOW,
+            )
+            .unwrap();
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let cleanup = crate::backend_job::BackgroundJobCause::CleanupAdmissionUnconfirmed
+            .storage()
+            .unwrap();
+        let diagnosed = store
+            .record_backend_job_cleanup_preflight_failure_with_cause(
+                "workspace",
+                &history,
+                &terminal,
+                "Original admission fence unavailable",
+                Some(&cleanup),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(diagnosed.failure_cause, terminal.failure_cause);
+        assert_ne!(
+            diagnosed.worker_cleanup_failure_cause,
+            diagnosed.failure_cause
+        );
+        assert_eq!(
+            *diagnosed
+                .worker_cleanup_failure_cause
+                .as_ref()
+                .unwrap()
+                .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+                .unwrap()
+                .details(),
+            crate::backend_job::BackgroundJobCause::CleanupAdmissionUnconfirmed
+        );
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let (claimed, acquired) = store
+            .claim_backend_job_worker_cleanup_owned("workspace", &history, &diagnosed, NOW)
+            .unwrap();
+        assert!(acquired);
+        let history = store
+            .list_backend_job_attempts("workspace", "accepted")
+            .unwrap();
+        let cleanup = crate::backend_job::BackgroundJobCause::CleanupFailed
+            .storage()
+            .unwrap();
+        let failed = store
+            .finish_backend_job_worker_cleanup_owned_with_cause(
+                "workspace",
+                &history,
+                &claimed,
+                BackendJobWorkerCleanupState::Failed,
+                Some("cleanup_failed"),
+                Some("Stop unconfirmed"),
+                Some(&cleanup),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(failed.failure_cause, terminal.failure_cause);
+        assert_eq!(
+            *failed
+                .worker_cleanup_failure_cause
+                .as_ref()
+                .unwrap()
+                .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+                .unwrap()
+                .details(),
+            crate::backend_job::BackgroundJobCause::CleanupFailed
+        );
+        assert!(
+            !store
+                .has_backend_job_execution_fence("workspace", &failed)
+                .unwrap()
+        );
+        drop(store);
+        let reopened =
+            SqliteWorkspaceStore::open_for_test(&dir.path().join("recovery.sqlite")).unwrap();
+        assert_eq!(
+            reopened
+                .get_backend_job_attempt("workspace", "accepted", &failed.attempt_id)
+                .unwrap()
+                .unwrap(),
+            failed
+        );
+        assert_eq!(
+            reopened
+                .get_backend_job("workspace", "accepted")
+                .unwrap()
+                .unwrap()
+                .failure_cause,
+            terminal.failure_cause
+        );
     }
 
     #[test]

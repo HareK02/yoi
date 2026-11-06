@@ -2242,6 +2242,7 @@ fn external_grant_runtime_cleanup_retains_owner_cause_and_uses_outcome_not_prose
                     workdir: None,
                     startup: None,
                     code: "safe_to_retry".into(),
+                    control: None,
                     severity: HostDiagnosticSeverity::Error,
                     message: "/private/provider secret says no effects".into(),
                 }],

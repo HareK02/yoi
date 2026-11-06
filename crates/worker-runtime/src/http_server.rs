@@ -2358,6 +2358,7 @@ impl IntoResponse for RuntimeHttpWorkdirError {
 struct RuntimeHttpRestError {
     management: Option<workdir::management_failure::WorkdirManagementFailure>,
     control: Option<protocol::control_failure::RuntimeControlCause>,
+    create_failure: Option<runtime_api::startup::WorkerCreateFailure>,
     status: StatusCode,
     code: String,
     message: String,
@@ -2373,18 +2374,34 @@ impl RuntimeHttpRestError {
             startup: None,
             control: None,
             management: None,
+            create_failure: None,
         }
     }
 
     fn runtime(error: RuntimeError) -> Self {
+        // Working-directory refusal/cleanup classification is owned by that domain.
+        // Do not replace its existing 400/403/409/503 boundary with a generic control 502.
+        let control = if matches!(&error, RuntimeError::WorkingDirectory(_)) {
+            None
+        } else {
+            Some(error.control_cause())
+        };
         let status = status_for_runtime_error(&error);
         let code = code_for_runtime_error(&error);
+        let create_failure = error.create_failure();
         let startup = match &error {
             RuntimeError::WorkerExecutionRejected { result, .. } => startup_transfer(result),
             _ => None,
         };
+        let code = if startup.is_none() && control.is_some() {
+            error.control_cause().reason().to_owned()
+        } else {
+            code
+        };
         let message = if let Some(startup) = &startup {
             worker::startup_failure::internal_startup_failure_summary(&startup.primary).to_owned()
+        } else if control.is_some() {
+            error.control_cause().explanation().to_owned()
         } else {
             error.to_string()
         };
@@ -2393,8 +2410,9 @@ impl RuntimeHttpRestError {
             code,
             message,
             startup,
-            control: None,
+            control,
             management: None,
+            create_failure,
         }
     }
 
@@ -2460,6 +2478,13 @@ impl RuntimeHttpRestError {
 
 impl IntoResponse for RuntimeHttpRestError {
     fn into_response(self) -> Response {
+        if let Some(failure) = self.create_failure {
+            return runtime_api::server_support::http_error_response(
+                self.status,
+                runtime_api::RuntimeApiError::new(self.status.as_u16(), self.code, self.message)
+                    .with_create_failure(failure),
+            );
+        }
         if let Some(cause) = self.management {
             return runtime_api::server_support::http_error_response(
                 self.status,
@@ -2467,18 +2492,9 @@ impl IntoResponse for RuntimeHttpRestError {
                     .with_management(cause),
             );
         }
-
         if self.startup.is_none() {
             if let Some(cause) = self.control {
-                return runtime_api::server_support::http_error_response(
-                    self.status,
-                    runtime_api::RuntimeApiError::new(
-                        self.status.as_u16(),
-                        self.code,
-                        self.message,
-                    )
-                    .with_control(cause),
-                );
+                return api_macros_control_response(cause);
             }
         }
         let body = RuntimeHttpErrorResponse {
@@ -2512,6 +2528,7 @@ fn startup_transfer(
 
 fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
     match error {
+        RuntimeError::WorkerCreateFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
@@ -2566,11 +2583,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         {
             StatusCode::NOT_FOUND
         }
-        RuntimeError::InvalidRequest(message)
-            if message.contains("already created with a different fingerprint") =>
-        {
-            StatusCode::CONFLICT
-        }
+        RuntimeError::WorkerCreateConflict { .. } => StatusCode::CONFLICT,
         RuntimeError::RuntimeStopped
         | RuntimeError::RestoreObservationStale { .. }
         | RuntimeError::RestoreObservationConflict { .. }
@@ -2583,7 +2596,10 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
-        | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
+        | RuntimeError::WorkerExecutionRejected { .. }
+        | RuntimeError::RecordingSourceUnavailable { .. }
+        | RuntimeError::RecordingOwnershipUnknown { .. }
+        | RuntimeError::RecordingExecutionUnconfirmed { .. } => StatusCode::CONFLICT,
         RuntimeError::WorkspaceOwnerMismatch { .. } => StatusCode::FORBIDDEN,
         RuntimeError::LimitTooLarge { .. }
         | RuntimeError::InvalidRequest(_)
@@ -2603,6 +2619,9 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
 
 fn code_for_runtime_error(error: &RuntimeError) -> String {
     match error {
+        RuntimeError::RecordingSourceUnavailable { .. } => "source_unavailable".to_string(),
+        RuntimeError::RecordingOwnershipUnknown { .. } => "ownership_unknown".to_string(),
+        RuntimeError::RecordingExecutionUnconfirmed { .. } => "execution_unconfirmed".to_string(),
         RuntimeError::RuntimeStopped => "runtime_stopped".to_string(),
         RuntimeError::RestoreObservationStale { .. } => "restore_observation_stale".to_string(),
         RuntimeError::RestoreObservationConflict { .. } => {
@@ -2629,14 +2648,11 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::ExecutionBackendUnavailable { .. } => {
             "execution_backend_unavailable".to_string()
         }
+        RuntimeError::WorkerCreateFailed { .. } => "worker_create_failed".to_string(),
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected".to_string(),
         RuntimeError::WorkspaceOwnerMismatch { .. } => "workspace_owner_mismatch".to_string(),
         RuntimeError::LimitTooLarge { .. } => "limit_too_large".to_string(),
-        RuntimeError::InvalidRequest(message)
-            if message.contains("already created with a different fingerprint") =>
-        {
-            "worker_create_conflict".to_string()
-        }
+        RuntimeError::WorkerCreateConflict { .. } => "worker_create_conflict".to_string(),
         RuntimeError::InvalidRequest(_) => "invalid_request".to_string(),
         RuntimeError::WorkingDirectory(diagnostic) => diagnostic.code.clone(),
         RuntimeError::InvalidInitialInputKind { .. } => "invalid_initial_input_kind".to_string(),
@@ -2702,6 +2718,46 @@ mod tests {
     use runtime_api::WorkerRestoreState;
     use sha2::Digest as _;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn recording_holds_preserve_problem_causes_without_private_source_details() {
+        for (error, code) in [
+            (
+                RuntimeError::RecordingSourceUnavailable {
+                    message: "source detail".into(),
+                },
+                "recording_source_unavailable",
+            ),
+            (
+                RuntimeError::RecordingOwnershipUnknown {
+                    message: "owner detail".into(),
+                },
+                "recording_ownership_unknown",
+            ),
+            (
+                RuntimeError::RecordingExecutionUnconfirmed {
+                    message: "execution detail".into(),
+                },
+                "recording_execution_unconfirmed",
+            ),
+        ] {
+            let response = RuntimeHttpRestError::runtime(error).into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for private in ["source detail", "owner detail", "execution detail"] {
+                assert!(!text.contains(private));
+            }
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["yoi_failure"]["domain"], "runtime_control");
+            assert_eq!(body["yoi_failure"]["reason"], code);
+            assert_eq!(body["yoi_failure"]["details"], code);
+        }
+    }
 
     #[derive(Clone)]
     struct TestRuntimeAuthorizer(String);
@@ -3328,6 +3384,15 @@ mod tests {
 
     #[test]
     fn retention_routes_require_worker_delete_permission() {
+        for suffix in ["freeze", "capture"] {
+            assert_eq!(
+                required_runtime_permission(
+                    &Method::POST,
+                    &format!("/v1/workers/worker-1/retention/{suffix}")
+                ),
+                Some("workers:delete")
+            );
+        }
         assert_eq!(
             required_runtime_permission(&Method::GET, "/v1/workers/worker-1/retention/inventory",),
             Some("workers:delete")
@@ -3914,6 +3979,35 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    async fn read_control_cause(
+        response: Response,
+    ) -> protocol::control_failure::RuntimeControlCause {
+        let status = response.status().as_u16();
+        let media = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(media, "application/problem+json");
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let error_contract::DecodeFailure::Known(failure) =
+            error_contract::problem::decode_problem_details::<
+                protocol::control_failure::RuntimeControlCause,
+            >(
+                &body,
+                status,
+                &media,
+                &runtime_api::control_failure::ControlBoundary,
+                error_contract::Budget::new(16384, 16384),
+            )
+        else {
+            panic!("HTTP response did not preserve its typed cause and actual metadata")
+        };
+        *failure.facts().cause()
+    }
+
     #[tokio::test]
     async fn rest_feature_completions_echo_each_nonce_and_qualified_context() {
         let runtime =
@@ -4307,8 +4401,10 @@ mod tests {
         for uri in [&restore_uri, &coordinate_uri] {
             let response = authed_json_request(app.clone(), Method::POST, uri, token, &stale).await;
             assert_eq!(response.status(), StatusCode::CONFLICT);
-            let conflict: RuntimeHttpErrorResponse = read_json(response).await;
-            assert_eq!(conflict.error.code, "restore_observation_stale");
+            assert_eq!(
+                read_control_cause(response).await,
+                protocol::control_failure::RuntimeControlCause::RestoreObservationStale
+            );
         }
 
         let mut restore_request = runtime.test_restore_request(&created.worker.worker_ref);
@@ -4362,8 +4458,10 @@ mod tests {
             let response =
                 authed_json_request(app.clone(), Method::POST, uri, token, &mismatched_owner).await;
             assert_eq!(response.status(), StatusCode::CONFLICT);
-            let conflict: RuntimeHttpErrorResponse = read_json(response).await;
-            assert_eq!(conflict.error.code, "restore_observation_conflict");
+            assert_eq!(
+                read_control_cause(response).await,
+                protocol::control_failure::RuntimeControlCause::RestoreObservationConflict
+            );
         }
         assert_eq!(
             runtime.worker_detail(&created.worker.worker_ref).unwrap(),
@@ -4573,8 +4671,28 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "worker_execution_rejected");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let error_contract::DecodeFailure::Known(failure) =
+            error_contract::problem::decode_problem_details::<
+                protocol::control_failure::RuntimeControlCause,
+            >(
+                &body,
+                StatusCode::CONFLICT.as_u16(),
+                "application/problem+json",
+                &runtime_api::control_failure::ControlBoundary,
+                error_contract::Budget::new(16384, 16384),
+            )
+        else {
+            panic!("Input rejection must retain the owner-selected cause")
+        };
+        assert_eq!(
+            failure.facts().cause(),
+            &protocol::control_failure::RuntimeControlCause::ExecutionRejected
+        );
         assert_eq!(
             *backend.inputs.lock().unwrap(),
             vec![created.worker_ref.clone()]
@@ -4623,8 +4741,10 @@ mod tests {
         // even though automatic restore never connected a live execution.
         let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::InvalidRequest
+        );
         assert!(backend.stops.lock().unwrap().is_empty());
 
         let response = authed_empty_request(
@@ -4635,8 +4755,10 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "worker_execution_rejected");
+        assert_eq!(
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::ExecutionRejected
+        );
         let stops = backend.stops.lock().unwrap();
         assert_eq!(stops.len(), 1);
         assert_eq!(stops[0].worker_ref, created.worker_ref);
@@ -4668,8 +4790,10 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "pending unproven Stop must forbid removal"
         );
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::InvalidRequest
+        );
         assert_eq!(
             backend.stops.lock().unwrap().len(),
             1,
@@ -4948,9 +5072,14 @@ mod tests {
             authed_empty_request(app, Method::GET, &format!("/v1/workers/{missing}"), token).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "worker_not_found");
-        assert!(error.error.message.contains(&missing.to_string()));
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        let error: serde_json::Value = read_json(response).await;
+        assert_eq!(error["yoi_failure"]["reason"], "worker_missing");
+        assert_eq!(error["yoi_failure"]["details"], "worker_missing");
+        assert!(!error.to_string().contains(&missing.to_string()));
     }
 
     #[tokio::test]
@@ -6078,4 +6207,10 @@ mod ws_tests {
             protocol::Event::Error { .. }
         ));
     }
+}
+
+fn api_macros_control_response(cause: protocol::control_failure::RuntimeControlCause) -> Response {
+    let error = runtime_api::RuntimeApiError::new(500, cause.reason(), cause.explanation())
+        .with_control(cause);
+    runtime_api::server_support::http_error_response(StatusCode::INTERNAL_SERVER_ERROR, error)
 }

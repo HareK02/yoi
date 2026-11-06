@@ -1704,6 +1704,9 @@
           "persistence_failed",
           "persistence_outcome_unknown",
           "store_unavailable",
+          "recording_source_unavailable",
+          "recording_ownership_unknown",
+          "recording_execution_unconfirmed",
           "state_unavailable",
           "authorization_failed",
           "connection_failed",
@@ -1899,7 +1902,7 @@
   "info": {
     "title": "Workspace configuration adoption",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:bf96d45aa8bc319de9b1b1f9bd727f711a1a8425e82d33c771e3e0541f2dde37"
+    "x-yoi-source-digest": "sha256:7b515e5a0daafc1b0d65fcbd890f1d069439a1ec14933c648292dc0b83a23d6a"
   },
   "openapi": "3.1.0",
   "paths": {

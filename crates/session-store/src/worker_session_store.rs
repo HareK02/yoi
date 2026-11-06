@@ -52,6 +52,7 @@ pub struct WorkerSessionStore {
     session_id: Arc<Mutex<Option<SessionId>>>,
     append_lock: Arc<Mutex<()>>,
     retention: Option<crate::retention::SessionRetentionStore>,
+    owner: Option<crate::worker_sources::WorkerSessionSources>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -209,14 +210,40 @@ impl WorkerSessionStore {
         Ok(store)
     }
 
+    /// Attach the fixed Runtime producer identity before publishing original material.
+    pub fn with_runtime_owner(
+        mut self,
+        sources: crate::worker_sources::WorkerSessionSources,
+    ) -> Result<Self, StoreError> {
+        let _guard = sources.lock_publication()?;
+        if self.root != sources.worker_root().join("session") {
+            return Err(std::io::Error::other("Worker Session producer root mismatch").into());
+        }
+        self.owner = Some(sources);
+        Ok(self)
+    }
+
     fn lock_publication(
         &self,
         session: SessionId,
-    ) -> Result<Option<crate::retention::SessionRetentionGuard>, StoreError> {
-        self.retention
+    ) -> Result<
+        (
+            Option<File>,
+            Option<crate::retention::SessionRetentionGuard>,
+        ),
+        StoreError,
+    > {
+        let owner = self
+            .owner
+            .as_ref()
+            .map(|owner| owner.lock_publication())
+            .transpose()?;
+        let session = self
+            .retention
             .as_ref()
             .map(|store| store.lock_live(session))
-            .transpose()
+            .transpose()?;
+        Ok((owner, session))
     }
 
     /// Open the Session store rooted at `<worker-aggregate>/session`.
@@ -271,6 +298,7 @@ impl WorkerSessionStore {
             session_id: Arc::new(Mutex::new(session_id)),
             append_lock: Arc::new(Mutex::new(())),
             retention: None,
+            owner: None,
         })
     }
 
@@ -321,6 +349,7 @@ impl WorkerSessionStore {
             session_id: Arc::new(Mutex::new(Some(manifest.session_id))),
             append_lock: Arc::new(Mutex::new(())),
             retention: None,
+            owner: None,
         })
     }
 
@@ -1108,7 +1137,19 @@ impl Store for WorkerSessionStore {
     }
 
     fn delete_uncommitted_uploaded_files(&self, session_id: SessionId) -> Result<u64, StoreError> {
-        let _retention = self.lock_publication(session_id)?;
+        // Stop housekeeping cannot publish history or change selectors. Serialize
+        // with scope fixation, but do not require publication authority after a
+        // confirmed Subject disconnect. Referenced/pending-owner files stay live.
+        let _owner = self
+            .owner
+            .as_ref()
+            .map(|owner| owner.lock_exclusive())
+            .transpose()?;
+        let _retention = self
+            .retention
+            .as_ref()
+            .map(|retention| retention.lock_live(session_id))
+            .transpose()?;
         self.ensure_session(session_id, false)?;
         let _guard = self
             .append_lock
@@ -1373,7 +1414,7 @@ fn parse_legacy_jsonl(
         .collect()
 }
 
-fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+pub(crate) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     atomic_write_bytes(path, &bytes)

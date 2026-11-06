@@ -8,7 +8,6 @@ use server_api::ExternalWorkdirConnectionClosedReason;
 use crate::{Result, store::ExternalWorkdirGrantRecord};
 
 pub(crate) const SCHEMA: &str = include_str!("external_workdir_connection_observations.sql");
-pub(crate) const MIGRATION_NAME: &str = "Independent External Workdir connection failure observations";
 
 pub struct ConnectionObservation {
     pub grant_generation: u64,
@@ -53,7 +52,12 @@ pub(crate) fn read(
          WHERE g.workspace_id=?1 AND g.grant_id=?2 ORDER BY o.observation_id",
     )?;
     let rows = statement.query_map(params![workspace, grant], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
     })?;
     let mut observations = Vec::new();
     for row in rows {
@@ -62,8 +66,12 @@ pub(crate) fn read(
         let Ok(closed_reason) = serde_json::from_value(serde_json::Value::String(reason)) else {
             continue;
         };
-        let failures = raw.and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-            .unwrap_or_default().into_iter().map(StoredFailure::from_storage).collect();
+        let failures = raw
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(StoredFailure::from_storage)
+            .collect();
         observations.push(ConnectionObservation {
             grant_generation: grant_generation as u64,
             connection_generation: connection_generation as u64,

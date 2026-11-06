@@ -39,6 +39,7 @@ pub enum BackendWorkspaceClientError {
     Api(BackendApiClientError),
     Http(reqwest::Error),
     ServerApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
+    WorkerCreateApi(server_api::client_support::ClientError<server_api::WorkerCreateApiError>),
     RuntimeManagementApi(
         server_api::client_support::ClientError<server_api::RuntimeManagementApiError>,
     ),
@@ -51,6 +52,7 @@ impl fmt::Display for BackendWorkspaceClientError {
             Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
             Self::ServerApi(error) => write!(f, "{error}"),
+            Self::WorkerCreateApi(error) => write!(f, "{error}"),
             Self::RuntimeManagementApi(error) => write!(f, "{error}"),
         }
     }
@@ -126,9 +128,23 @@ pub(crate) fn runtime_management_client_error(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct ServerBearerAuthorizer {
     authorization: String,
+}
+
+impl ServerBearerAuthorizer {
+    pub(crate) fn new(backend: &BackendApiClient) -> Self {
+        Self {
+            authorization: backend.authorization_header_value(),
+        }
+    }
+}
+
+impl fmt::Debug for ServerBearerAuthorizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ServerBearerAuthorizer([REDACTED])")
+    }
 }
 
 impl server_api::client_support::RequestAuthorizer for ServerBearerAuthorizer {
@@ -137,17 +153,17 @@ impl server_api::client_support::RequestAuthorizer for ServerBearerAuthorizer {
         _request: server_api::client_support::AuthorizerRequest<'_>,
     ) -> Result<reqwest::header::HeaderMap, server_api::client_support::AuthorizationError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            self.authorization
-                .parse()
-                .map_err(|_| server_api::client_support::AuthorizationError::new())?,
-        );
+        let mut authorization: reqwest::header::HeaderValue = self
+            .authorization
+            .parse()
+            .map_err(|_| server_api::client_support::AuthorizationError::new())?;
+        authorization.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, authorization);
         Ok(headers)
     }
 }
 
-const SERVER_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+pub(crate) const SERVER_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
 pub(crate) fn server_api_client(
     backend: &BackendApiClient,
@@ -155,9 +171,7 @@ pub(crate) fn server_api_client(
     server_api::ServerApiClient::builder(backend.origin().as_str())
         .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?
         .client(backend.asynchronous_client())
-        .authorizer(ServerBearerAuthorizer {
-            authorization: backend.authorization_header_value(),
-        })
+        .authorizer(ServerBearerAuthorizer::new(backend))
         .response_body_limit(SERVER_RESPONSE_LIMIT)
         .build()
         .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))
@@ -452,5 +466,33 @@ mod tests {
         let retry = request.clone();
         assert_eq!(retry.operation_key, "workspace-create-1");
         assert_eq!(retry, request);
+    }
+}
+
+pub(crate) fn worker_create_client_error(
+    backend: &BackendApiClient,
+    error: server_api::client_support::ClientError<server_api::WorkerCreateApiError>,
+) -> BackendWorkspaceClientError {
+    use server_api::client_support::ClientError;
+    // Retain typed startup facts even for an operator denial. A Subject execution
+    // condition is not a refusal of this client's credential or a login prompt.
+    match &error {
+        ClientError::Public {
+            status,
+            error: response,
+        } if response.failure().is_none() && *status == reqwest::StatusCode::UNAUTHORIZED => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Unauthorized {
+                origin: backend.origin().clone(),
+            })
+        }
+        ClientError::Public {
+            status,
+            error: response,
+        } if response.failure().is_none() && *status == reqwest::StatusCode::FORBIDDEN => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Forbidden {
+                origin: backend.origin().clone(),
+            })
+        }
+        _ => BackendWorkspaceClientError::WorkerCreateApi(error),
     }
 }

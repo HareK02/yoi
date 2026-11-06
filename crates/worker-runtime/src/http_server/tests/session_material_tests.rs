@@ -1267,13 +1267,9 @@ async fn subject_delete_worker_signed_http_requires_delete_scope_without_inventi
         // Valid authorization reaches domain validation, but the arbitrary ID
         // has neither an original Stop nor a confirmed historical fence.
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "invalid_request");
-        let diagnostic = error.error.message.to_ascii_lowercase();
-        assert!(
-            diagnostic.contains("original") && diagnostic.contains("shutdown"),
-            "expected rejection for absent original shutdown proof, got: {}",
-            error.error.message
+        assert_eq!(
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::InvalidRequest
         );
         assert!(f.runtime.worker_detail(&f.worker).is_ok());
         assert!(

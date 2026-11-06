@@ -128,6 +128,31 @@ impl JobHostEffects {
         })
     }
 
+    /// A release consumer must not wait behind cleanup while holding its own
+    /// Subject/DB lock. The same original admission resource proves actual return;
+    /// a saved cleanup result by itself does not end accepted descendants.
+    pub(crate) fn try_fence_retained(
+        database: &Path,
+        attempt: &BackendJobAttemptRecord,
+    ) -> Result<JobHostDrain> {
+        if !attempt.state.terminal() {
+            return Err(Error::RepositoryConflict(
+                "Job Host admission is not closed".into(),
+            ));
+        }
+        let owner = JobHostOwner::try_from(attempt)?;
+        let file = open_admission(&admission_path(database, &owner)?, &owner)?;
+        file.try_lock().map_err(|error| {
+            Error::RepositoryConflict(format!(
+                "Job Host cleanup still owns its admission resource: {error}"
+            ))
+        })?;
+        Ok(JobHostDrain {
+            owner,
+            _admission: file,
+        })
+    }
+
     pub(crate) fn admit(self: &Arc<Self>, expected: &JobHostOwner) -> Result<JobHostRequestLease> {
         if &self.owner != expected {
             return Err(Error::InvalidInput(

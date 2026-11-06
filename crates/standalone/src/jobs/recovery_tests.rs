@@ -245,9 +245,13 @@ async fn restored_results_continue_after_wait_error_without_forging_cleanup() {
     );
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     assert_eq!(bad_model.requests.lock().unwrap().len(), 2);
+    let error = jobs.shutdown().await.unwrap_err();
+    let JobServiceError::SettlementFailure { source } = error else {
+        panic!("receipt persistence failure must not be relabeled as cleanup failure: {error:?}");
+    };
     assert!(matches!(
-        jobs.shutdown().await,
-        Err(JobServiceError::Cleanup(_))
+        source.as_ref(),
+        JobServiceError::Store(JobStoreError::Sqlite(_))
     ));
     assert!(jobs.store.lock().unwrap().is_some());
 }

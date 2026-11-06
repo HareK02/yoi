@@ -17,7 +17,6 @@ use crate::configuration_failure::ConfigurationFailureOperation;
 use crate::{Error, Result, SqliteWorkspaceStore};
 
 pub(crate) const SCHEMA: &str = include_str!("config_publication.sql");
-pub(crate) const MIGRATION_NAME: &str = "Independent configuration publication observations";
 
 #[derive(Clone)]
 pub(crate) struct PublicationIdentity {

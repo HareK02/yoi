@@ -398,6 +398,18 @@ async fn connected_wait_for_recording(
                             .is_none()
                     })
                 && !store.journal_retention_required(&host).unwrap()
+                && jobs.iter().all(|job| {
+                    subjektiv_journal::require_job_effects_ended(api, job).is_ok()
+                        && api.store.list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id)
+                            .unwrap().iter().all(|attempt| {
+                                attempt.worker.is_none() || (
+                                    attempt.worker_cleanup_state == Some(BackendJobWorkerCleanupState::Completed)
+                                    && crate::backend_job_host_effects::JobHostEffects::try_fence_retained(
+                                        &api.config.database_path, attempt,
+                                    ).is_ok()
+                                )
+                            })
+                })
                 && api
                     .runtime
                     .worker(&RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id))

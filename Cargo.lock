@@ -4330,9 +4330,11 @@ dependencies = [
  "manifest",
  "plugin-plan",
  "protocol",
+ "schemars",
  "serde",
  "serde_json",
  "session-store",
+ "sha2 0.11.0",
  "tokio",
  "workdir",
 ]
@@ -7341,6 +7343,7 @@ dependencies = [
  "minijinja",
  "protocol",
  "reqwest",
+ "runtime-api",
  "schemars",
  "secrets",
  "serde",
@@ -7377,6 +7380,7 @@ name = "worker-runtime"
 version = "0.1.0"
 dependencies = [
  "agen",
+ "api-macros",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -7494,6 +7498,8 @@ dependencies = [
  "chrono",
  "client",
  "error-contract",
+ "feature-permissions",
+ "fs4",
  "futures",
  "manifest",
  "project-record",

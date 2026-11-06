@@ -698,8 +698,16 @@ mod snapshot_inputs {
         f: &Fixture,
         bodies: &[String],
     ) -> (JournalHostContext, String, CaptureDto) {
-        let host = session_host(f.store(), &f.host.subject_id, "canonical-input-session");
-        let capture = canonical_capture("canonical-input-session", bodies);
+        admitted_capture_in_session(f, "canonical-input-session", bodies)
+    }
+
+    fn admitted_capture_in_session(
+        f: &Fixture,
+        session: &str,
+        bodies: &[String],
+    ) -> (JournalHostContext, String, CaptureDto) {
+        let host = session_host(f.store(), &f.host.subject_id, session);
+        let capture = canonical_capture(session, bodies);
         let mut journal_id = None;
         for ranges in recording::capture_ranges(&capture)
             .unwrap()
@@ -805,6 +813,137 @@ mod snapshot_inputs {
         service::execute_snapshot(f.store(), ctx, &request.input_digest().unwrap(), action)
     }
 
+    fn human_metadata(capture: &mut CaptureDto, account_id: &str) {
+        for entry in &mut capture.entries {
+            let origin = session_store::LoggedSessionHistoryOrigin::HumanInput {
+                account_id: account_id.into(),
+            };
+            entry.source.history_origin = Some(origin.clone());
+            let CaptureBody::CanonicalPublic { descriptor, .. } = &mut entry.body else {
+                unreachable!();
+            };
+            descriptor.origin = PublicMaterialOrigin::History { origin };
+        }
+    }
+
+    #[test]
+    fn admission_and_job_capture_keep_a_complete_body_larger_than_48_kib() {
+        let f = Fixture::new();
+        let body = "界".repeat(24_000);
+        let (host, id, capture) = admitted_capture(&f, std::slice::from_ref(&body));
+        let admitted = capture
+            .recording_slice(
+                RecordingPosition::default(),
+                MAX_JOURNAL_RANGES,
+                JournalInput::capture_budget(),
+            )
+            .unwrap();
+        assert!(admitted.next.is_none());
+        assert_eq!(admitted.capture.recording_text(0).unwrap().2, body);
+        let input = JournalInput::build(f.store(), &host, &id, |order, byte, budget| {
+            assert!(budget > 48 * 1024);
+            Ok(capture
+                .recording_slice(
+                    RecordingPosition {
+                        canonical_order: order,
+                        byte_offset: byte,
+                    },
+                    MAX_JOURNAL_RANGES,
+                    budget,
+                )
+                .unwrap()
+                .capture)
+        })
+        .unwrap();
+        assert_eq!(input.selected_ranges[0].bytes.end, body.len() as u64);
+        job_request("above-old-cutoff", &input);
+    }
+
+    #[test]
+    fn journal_job_limit_fits_the_maximal_prefix_with_escaped_utf8_metadata_and_body() {
+        for body in ["x".repeat(200_000), "🦀\u{1}\\\"界\n".repeat(30_000)] {
+            let f = Fixture::new();
+            let session = "資料\"\\🦀".repeat(10);
+            let (host, id, mut capture) =
+                admitted_capture_in_session(&f, &session, std::slice::from_ref(&body));
+            human_metadata(&mut capture, &"利用者\"\\\u{1}".repeat(2_000));
+            capture.validate(CaptureLimits::default()).unwrap();
+            let input = JournalInput::build(f.store(), &host, &id, |order, byte, budget| {
+                let slice = capture
+                    .recording_slice(
+                        RecordingPosition {
+                            canonical_order: order,
+                            byte_offset: byte,
+                        },
+                        MAX_JOURNAL_RANGES,
+                        budget,
+                    )
+                    .unwrap();
+                assert!(serde_json::to_vec(&slice).unwrap().len() <= budget);
+                Ok(slice.capture)
+            })
+            .unwrap();
+            let request = job_request("exact-job-boundary", &input);
+            let size = serde_json::to_vec(&request.input).unwrap().len();
+            if body.starts_with('x') {
+                assert_eq!(size, ::job::MAX_JOB_INPUT_BYTES);
+            }
+            assert!(size <= ::job::MAX_JOB_INPUT_BYTES);
+            let end = input.selected_ranges[0].bytes.end as usize;
+            assert!(end < body.len());
+            assert_eq!(input.capture.recording_text(0).unwrap().2, &body[..end]);
+            let mut one_more = input.clone();
+            let next = body[end..].chars().next().unwrap();
+            let CaptureBody::CanonicalPublic { text, .. } = &mut one_more.capture.entries[0].body
+            else {
+                unreachable!()
+            };
+            text.push(next);
+            one_more.selected_ranges[0].bytes.end += next.len_utf8() as u64;
+            let oversized = serde_json::to_value(&one_more).unwrap();
+            assert!(serde_json::to_vec(&oversized).unwrap().len() > ::job::MAX_JOB_INPUT_BYTES);
+            assert!(JournalInput::decode(&oversized).is_err());
+            assert!(
+                ::job::JobRequest {
+                    input: oversized,
+                    ..request
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn unfit_next_entry_metadata_preserves_the_earlier_complete_prefix() {
+        let f = Fixture::new();
+        let (host, id, mut capture) = admitted_capture(&f, &["first".into(), "🦀".into()]);
+        let mut next_only = capture.clone();
+        next_only.entries.remove(0);
+        human_metadata(&mut next_only, &"\\\"\u{1}界".repeat(8_000));
+        capture.entries[1] = next_only.entries.remove(0);
+        let input = JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture)).unwrap();
+        assert_eq!(input.selected_ranges.len(), 1);
+        assert_eq!(input.capture.recording_text(0).unwrap().2, "first");
+        job_request("metadata-does-not-drop-earlier-entry", &input);
+        let journal = f.store().read_journal(&host, &id).unwrap();
+        assert_eq!((journal.process_order, journal.process_byte), (0, 0));
+    }
+
+    #[test]
+    fn unfit_first_entry_metadata_errors_without_advancing_the_checkpoint() {
+        let f = Fixture::new();
+        let (host, id, mut capture) = admitted_capture(&f, &["🦀".into()]);
+        human_metadata(&mut capture, &"\\\"\u{1}界".repeat(8_000));
+        assert!(matches!(
+            JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture)),
+            Err(JournalError::InvalidInput(_))
+        ));
+        let journal = f.store().read_journal(&host, &id).unwrap();
+        assert_eq!((journal.process_order, journal.process_byte), (0, 0));
+        assert!(f.store().journal_retention_required(&host).unwrap());
+    }
+
     #[test]
     fn complete_input_budget_and_successive_canonical_prefixes_preserve_all_escaped_utf8_bytes() {
         let f = Fixture::new();
@@ -812,7 +951,8 @@ mod snapshot_inputs {
             .map(|i| format!("[user {i}] 公開原文\n\"\\\u{1}\t").repeat(8))
             .collect();
         bodies[60] = "[long public result] 日本語🦀\n\"\\\u{1}\t".repeat(14_000);
-        let (host, id, capture) = admitted_capture(&f, &bodies);
+        let (host, id, mut capture) = admitted_capture(&f, &bodies);
+        human_metadata(&mut capture, &"利用者\"\\\u{1}".repeat(80));
         let all_ranges = recording::capture_ranges(&capture).unwrap();
         seed_initial_state(&f, &host, &id, all_ranges[..1].to_vec());
         let mut reconstructed = vec![String::new(); bodies.len()];

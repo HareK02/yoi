@@ -1,13 +1,22 @@
 import type { WorkerRestoreRequest } from "#lib/generated/runtime-api.ts";
 import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import {
+  RuntimeControlHttpError,
+  runtimeControlHttpError as responseError,
+  runtimeControlMessage,
+} from "#lib/workspace/failure/runtime-control.ts";
+import {
   parseRuntimeCleanupExecution,
   parseRuntimeCleanupPlan,
   parseRuntimeWorkerLifecycleResult,
   parseWorkerRestoreResponse,
   type WorkdirCleanupReceipt,
 } from "#lib/workspace/api/runtime-workers.ts";
-import type { Diagnostic, Worker } from "./types";
+import type { Worker } from "./types";
+import {
+  type WorkerDeletionOutcome,
+  workerDeletionOutcome,
+} from "#lib/workspace/workers/worker-removal.ts";
 
 type FetchFn = typeof fetch;
 type WorkerActionTarget = Pick<Worker, "runtime_id" | "worker_id" | "state">;
@@ -19,40 +28,6 @@ function workerPath(workspaceId: string, worker: WorkerActionTarget): string {
       encodeURIComponent(worker.worker_id)
     }`,
   );
-}
-
-async function responseError(response: Response): Promise<string> {
-  const fallback = `${response.status} ${response.statusText}`.trim();
-  try {
-    const payload: unknown = await readBoundedJson(response, 64 * 1024);
-    if (
-      typeof payload !== "object" || payload === null || Array.isArray(payload)
-    ) {
-      return fallback;
-    }
-    const record = payload as Record<string, unknown>;
-    if (typeof record.message === "string") return record.message.slice(0, 512);
-    const nested = record.error;
-    if (
-      typeof nested === "object" && nested !== null && !Array.isArray(nested)
-    ) {
-      const message = (nested as Record<string, unknown>).message;
-      if (typeof message === "string") return message.slice(0, 512);
-    }
-    return fallback;
-  } catch {
-    return fallback;
-  }
-}
-
-function diagnosticMessage(
-  diagnostics: Diagnostic[] | undefined,
-  fallback: string,
-): string {
-  return diagnostics?.find((diagnostic) => diagnostic.severity === "error")
-    ?.message ??
-    diagnostics?.[0]?.message ??
-    fallback;
 }
 
 export function canRestoreWorker(worker: {
@@ -83,11 +58,7 @@ export function createRestoreRequest(
   };
 }
 
-export class WorkerActionHttpError extends Error {
-  constructor(public readonly status: number, message: string) {
-    super(message);
-  }
-}
+export { RuntimeControlHttpError as WorkerActionHttpError };
 
 export async function restoreWorkspaceWorker(
   workspaceId: string,
@@ -101,10 +72,7 @@ export async function restoreWorkspaceWorker(
     body: JSON.stringify(request),
   });
   if (!response.ok) {
-    throw new WorkerActionHttpError(
-      response.status,
-      await responseError(response),
-    );
+    throw await responseError(response);
   }
   const result = parseWorkerRestoreResponse(
     await readBoundedJson(response, 8 * 1024 * 1024),
@@ -144,9 +112,11 @@ export function restoreNotice(
   const pending = state === "reconciliation_required";
   return {
     level: pending ? "warning" : "error",
-    title: pending ? "Worker Restore needs reconciliation" : "Worker Restore failed",
-    message: diagnosticMessage(
-      result.result.diagnostics,
+    title: pending
+      ? "Worker Restore needs reconciliation"
+      : "Worker Restore failed",
+    message: runtimeControlMessage(
+      result.result,
       `Worker Restore was ${state}`,
     ) +
       (pending
@@ -157,9 +127,9 @@ export function restoreNotice(
 }
 
 export function restoreErrorNotice(cause: unknown): RestoreNotice {
-  const conflict = cause instanceof WorkerActionHttpError &&
+  const conflict = cause instanceof RuntimeControlHttpError &&
     cause.status === 409;
-  const uncertain = !(cause instanceof WorkerActionHttpError) ||
+  const uncertain = !(cause instanceof RuntimeControlHttpError) ||
     cause.status >= 500;
   return {
     level: conflict || uncertain ? "warning" : "error",
@@ -210,7 +180,7 @@ export async function stopSidebarWorker(
         : {}),
     }),
   });
-  if (!response.ok) throw new Error(await responseError(response));
+  if (!response.ok) throw await responseError(response);
 
   const result = parseRuntimeWorkerLifecycleResult(await readBoundedJson(response, 1024 * 1024));
   if (result.runtime_id !== worker.runtime_id || result.worker_id !== worker.worker_id) {
@@ -220,7 +190,7 @@ export async function stopSidebarWorker(
   }
   if (result.state !== "accepted") {
     throw new Error(
-      diagnosticMessage(result.diagnostics, `Worker stop was ${result.state}`),
+      runtimeControlMessage(result, `Worker stop was ${result.state}`),
     );
   }
   return result.cleanup_failures;
@@ -241,12 +211,12 @@ export async function deleteSidebarWorker(
   workspaceId: string,
   worker: WorkerActionTarget,
   fetchFn: FetchFn = fetch,
-): Promise<void> {
+): Promise<WorkerDeletionOutcome> {
   const runtimePath = `/runtimes/${encodeURIComponent(worker.runtime_id)}`;
   const planResponse = await fetchFn(
     workspaceApiPath(workspaceId, `${runtimePath}/cleanup-plan`),
   );
-  if (!planResponse.ok) throw new Error(await responseError(planResponse));
+  if (!planResponse.ok) throw await responseError(planResponse);
 
   const plan = parseRuntimeCleanupPlan(await planResponse.json());
   const candidate = plan.workers.find((item) =>
@@ -270,20 +240,14 @@ export async function deleteSidebarWorker(
     },
   );
   if (!executionResponse.ok) {
-    throw new Error(await responseError(executionResponse));
+    throw await responseError(executionResponse);
   }
 
   const execution = parseRuntimeCleanupExecution(
     await executionResponse.json(),
   );
-  const outcome = execution.results.find((result) => result.target_id === candidate.target_id);
-  if (!outcome || outcome.status !== "deleted") {
-    throw new Error(
-      outcome?.message ??
-        diagnosticMessage(
-          execution.diagnostics,
-          "Worker deletion was not completed",
-        ),
-    );
-  }
+  const outcome = execution.results.find((result) =>
+    result.target_id === candidate.target_id
+  );
+  return workerDeletionOutcome(outcome);
 }

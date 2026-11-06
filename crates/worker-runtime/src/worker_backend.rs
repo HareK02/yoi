@@ -944,7 +944,31 @@ pub(crate) fn open_session_public_material_reader(
     }
     let active = metadata.active.ok_or("Session active pointer is missing")?;
     if active.session_id.to_string() != expected_session_id {
-        return Err("Session identity does not match the authorized current Session".into());
+        let runtime_root = aggregate
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Worker aggregate root is unavailable")?;
+        let owner = session_store::worker_sources::WorkerSessionSources::new(
+            runtime_root,
+            session_store::worker_sources::WorkerSessionOwner {
+                workspace_id: workspace_id.into(),
+                worker_id: worker_ref.worker_id.to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let member = owner
+            .retained_bindings()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|member| member.session_id.to_string() == expected_session_id)
+            .ok_or("Session identity does not match an owned retained Session")?;
+        return Ok(SessionPublicMaterialReader::open_fs_with_retention(
+            &owner.retained_root(),
+            member.session_id,
+            member.active_segment_id,
+            PublicMaterialLimits::default(),
+            crate::session_retention::runtime_session_retention(runtime_root),
+        )?);
     }
     let reader = SessionPublicMaterialReader::open_worker_with_retention(
         &aggregate.join("session"),
@@ -2332,6 +2356,26 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                         session_dir.display()
                     )
                 })?;
+        let session_store = if let Some(workspace_id) = observation_workspace_id.as_ref() {
+            let runtime_root = worker_aggregate_dir
+                .parent()
+                .and_then(|root| root.parent())
+                .ok_or("Runtime aggregate root unavailable")?;
+            session_store
+                .with_runtime_owner(
+                    session_store::worker_sources::WorkerSessionSources::new(
+                        runtime_root,
+                        session_store::worker_sources::WorkerSessionOwner {
+                            workspace_id: workspace_id.clone(),
+                            worker_id: request.worker_ref.worker_id.to_string(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            session_store
+        };
         let worker_metadata_store =
             WorkerAggregateStore::new(&worker_aggregate_dir, worker_name.clone()).map_err(
                 |err| {
@@ -2684,6 +2728,26 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                     .map_err(|_| "Session retention unavailable")?,
             )
             .map_err(|_| "canonical Session store initialization failed")?;
+            let session_store = if let Some(api) = request.request.workspace_api.as_ref() {
+                let runtime_root = worker_aggregate_dir
+                    .parent()
+                    .and_then(|root| root.parent())
+                    .ok_or("Runtime aggregate root unavailable")?;
+                session_store
+                    .with_runtime_owner(
+                        session_store::worker_sources::WorkerSessionSources::new(
+                            runtime_root,
+                            session_store::worker_sources::WorkerSessionOwner {
+                                workspace_id: api.workspace_id.clone(),
+                                worker_id: request.worker_ref.worker_id.to_string(),
+                            },
+                        )
+                        .map_err(|_| "Worker Session producer binding failed")?,
+                    )
+                    .map_err(|_| "Worker Session producer binding failed")?
+            } else {
+                session_store
+            };
             let worker_metadata_store =
                 WorkerAggregateStore::open_read_only(&worker_aggregate_dir, worker_name.clone())
                     .map_err(|_| "canonical metadata store initialization failed")?;
@@ -3616,6 +3680,26 @@ impl RuntimeExecutionTaskScope {
         Ok(())
     }
 
+    fn retain_shutdown_report(
+        &self,
+        report: worker::controller::ControllerShutdownReport,
+    ) -> Result<(), String> {
+        *self
+            .shutdown_report
+            .lock()
+            .map_err(|_| "Controller shutdown report lock is poisoned".to_string())? = Some(
+            report
+                .feature_failures
+                .into_iter()
+                .map(|failure| crate::execution::WorkerFeatureShutdownFailure {
+                    category: failure.category,
+                    diagnostic: failure.diagnostic,
+                })
+                .collect(),
+        );
+        Ok(())
+    }
+
     async fn confirm_shutdown_and_join(
         &self,
         shutdown: &Arc<tokio::sync::Mutex<Option<worker::ShutdownReceiver>>>,
@@ -3626,23 +3710,12 @@ impl RuntimeExecutionTaskScope {
                 .lock()
                 .map_err(|_| "execution task registry lock is poisoned".to_string())?,
         );
-        let confirmation = {
+        let mut confirmation = {
             let mut guard = shutdown.lock().await;
             if let Some(receiver) = guard.as_mut() {
                 match tokio::time::timeout(Duration::from_secs(5), receiver).await {
                     Ok(Ok(report)) => {
-                        *self.shutdown_report.lock().map_err(|_| {
-                            "Controller shutdown report lock is poisoned".to_string()
-                        })? = Some(
-                            report
-                                .feature_failures
-                                .into_iter()
-                                .map(|failure| crate::execution::WorkerFeatureShutdownFailure {
-                                    category: failure.category,
-                                    diagnostic: failure.diagnostic,
-                                })
-                                .collect(),
-                        );
+                        self.retain_shutdown_report(report)?;
                         guard.take();
                         Ok(())
                     }
@@ -3666,6 +3739,30 @@ impl RuntimeExecutionTaskScope {
         // Drain bridges/relays even after an abnormal completion, while keeping
         // the failed completion and all timed-out handles in their owning scope.
         self.join().await?;
+        if confirmation.is_err() {
+            // Feature/child cleanup can finish after the report wait expires but
+            // during the existing task joins. Reobserve this exact receiver without
+            // another wait; joined handles alone never substitute for its report.
+            let mut guard = shutdown.lock().await;
+            if let Some(receiver) = guard.as_mut() {
+                match receiver.try_recv() {
+                    Ok(report) => {
+                        self.retain_shutdown_report(report)?;
+                        guard.take();
+                        confirmation = Ok(());
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        let message =
+                            "Worker shutdown completion channel closed; cleanup is unproven"
+                                .to_string();
+                        self.retain_completion_failure(message.clone())?;
+                        guard.take();
+                        confirmation = Err(message);
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
+        }
         confirmation?;
         match self
             .shutdown_report
@@ -6163,6 +6260,7 @@ where
                     },
                 );
                 return Ok(runtime_api::SubjectReleaseResponse {
+                    recording_scope: None,
                     operation_id: request.operation_id.clone(),
                     binding_id: request.binding_id.clone(),
                     state: State::Cancelled,
@@ -6214,7 +6312,24 @@ where
         }
         let saved = reservations.get_mut(&key).expect("reservation inserted");
         match (request.action, saved.state) {
-            (Action::Reserve, State::Reserved | State::Disconnected) => {}
+            (Action::Reserve, State::Reserved) => {
+                if saved.guard.is_none() {
+                    return Err("Controller reservation missing".into());
+                }
+                let workers = self
+                    .workers
+                    .lock()
+                    .map_err(|_| "worker registry poisoned")?;
+                let execution = workers
+                    .get(&worker_ref)
+                    .ok_or("Subject Controller is unavailable")?;
+                if execution.shutdown_requested.load(Ordering::Acquire)
+                    || execution.handle.protocol_is_closed()
+                {
+                    return Err("Subject Controller reservation is no longer live".into());
+                }
+            }
+            (Action::Reserve, State::Disconnected) => {}
             (Action::Disconnect, State::Reserved) => {
                 saved
                     .guard
@@ -6238,6 +6353,7 @@ where
             }
         }
         Ok(runtime_api::SubjectReleaseResponse {
+            recording_scope: None,
             operation_id: request.operation_id.clone(),
             binding_id: request.binding_id.clone(),
             state: saved.state,
@@ -8433,6 +8549,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
+    mod removal_tests {
+        include!("worker_backend/removal_tests.rs");
+    }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -8470,6 +8590,7 @@ mod tests {
 
     include!("subject_delete_backend_tests.rs");
     include!("worker_backend/startup_binding_tests.rs");
+    include!("worker_backend/spawn_tool_startup_tests.rs");
     include!("worker_backend/termination_persistence_tests.rs");
     include!("worker_backend/submission_termination_tests.rs");
     #[cfg(feature = "fs-store")]
@@ -11120,6 +11241,157 @@ mod tests {
         }
     }
 
+    // Isolate Runtime's report/join ordering with a gated task and its actual
+    // completion channel. This does not attest a real Controller's Feature cleanup;
+    // the connected removal suite supplies that integration boundary.
+    async fn report_during_scope_join(
+        feature_failures: Option<Vec<worker::hook::HookError>>,
+    ) -> (RuntimeExecutionTaskScope, Result<(), String>) {
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async move {
+            waiting.await.unwrap();
+            if let Some(feature_failures) = feature_failures {
+                report_tx
+                    .send(worker::controller::ControllerShutdownReport { feature_failures })
+                    .unwrap();
+            }
+        }));
+        let owned = scope.tasks.lock().unwrap()[0].clone();
+        let shutdown = Arc::new(tokio::sync::Mutex::new(Some(report_rx)));
+        let stopping_scope = scope.clone();
+        let stopping_receiver = shutdown.clone();
+        let stopping = tokio::spawn(async move {
+            stopping_scope
+                .confirm_shutdown_and_join(&stopping_receiver)
+                .await
+        });
+        while shutdown.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        // Advance precisely past the first report wait, not the separate join
+        // deadline. The task is still genuinely owned and cannot finish yet.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        while owned.completion.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!stopping.is_finished());
+        assert!(scope.shutdown_report.lock().unwrap().is_none());
+        release.send(()).unwrap();
+        (scope, stopping.await.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_report_arriving_during_join_is_consumed_before_stop_classification() {
+        let (scope, result) = report_during_scope_join(Some(Vec::new())).await;
+        result.unwrap();
+        assert!(scope.tasks.lock().unwrap().is_empty());
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        assert!(
+            scope
+                .termination(&worker_ref, operation_id)
+                .unwrap()
+                .confirms_scope_shutdown(&worker_ref, operation_id)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_report_arriving_during_join_preserves_feature_failure() {
+        let failure = worker::hook::HookError::new(
+            worker::hook::HookErrorCategory::Timeout,
+            "Feature cleanup did not complete",
+        );
+        let (scope, result) = report_during_scope_join(Some(vec![failure.clone()])).await;
+        assert!(result.unwrap_err().contains("Feature shutdown failures"));
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        let termination = scope.termination(&worker_ref, operation_id).unwrap();
+        assert!(!termination.confirms_scope_shutdown(&worker_ref, operation_id));
+        assert_eq!(termination.feature_failures[0].category, failure.category);
+        assert_eq!(
+            termination.feature_failures[0].diagnostic,
+            failure.diagnostic
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_channel_closing_during_join_retains_unproven_completion() {
+        let (scope, result) = report_during_scope_join(None).await;
+        assert!(result.unwrap_err().contains("completion channel closed"));
+        assert_eq!(scope.tasks.lock().unwrap().len(), 1);
+        assert!(
+            scope
+                .termination(
+                    &WorkerRef::new(WorkerId::now_v7()),
+                    crate::execution::WorkerLifecycleOperationId::new(),
+                )
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn joined_scope_with_unreceived_report_stays_unconfirmed_until_same_receiver_delivers() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async {}));
+        let shutdown = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let error = scope
+            .confirm_shutdown_and_join(&shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.contains("shutdown confirmation timed out"), "{error}");
+        assert!(scope.tasks.lock().unwrap().is_empty());
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        assert!(scope.termination(&worker_ref, operation_id).is_none());
+        assert!(shutdown.lock().await.is_some());
+        sender
+            .send(worker::controller::ControllerShutdownReport {
+                feature_failures: Vec::new(),
+            })
+            .unwrap();
+        scope.confirm_shutdown_and_join(&shutdown).await.unwrap();
+        assert!(
+            scope
+                .termination(&worker_ref, operation_id)
+                .unwrap()
+                .confirms_scope_shutdown(&worker_ref, operation_id)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn received_shutdown_report_does_not_release_unjoined_execution_task() {
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async move {
+            waiting.await.unwrap();
+        }));
+        let owned = scope.tasks.lock().unwrap()[0].clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(worker::controller::ControllerShutdownReport {
+                feature_failures: Vec::new(),
+            })
+            .unwrap();
+        let shutdown = Arc::new(tokio::sync::Mutex::new(Some(receiver)));
+        let error = scope
+            .confirm_shutdown_and_join(&shutdown)
+            .await
+            .unwrap_err();
+        assert!(error.contains("controller task did not stop"), "{error}");
+        assert!(Arc::ptr_eq(&scope.tasks.lock().unwrap()[0], &owned));
+        let worker_ref = WorkerRef::new(WorkerId::now_v7());
+        let operation_id = crate::execution::WorkerLifecycleOperationId::new();
+        assert!(scope.termination(&worker_ref, operation_id).is_none());
+        release.send(()).unwrap();
+        scope.confirm_shutdown_and_join(&shutdown).await.unwrap();
+        assert!(
+            scope
+                .termination(&worker_ref, operation_id)
+                .unwrap()
+                .confirms_scope_shutdown(&worker_ref, operation_id)
+        );
+    }
+
     #[tokio::test]
     async fn joined_tasks_without_controller_report_do_not_issue_termination() {
         let scope = RuntimeExecutionTaskScope::new(tokio::spawn(async {}));
@@ -11981,8 +12253,8 @@ mod tests {
         }
     }
 
-    fn wait_for_adapter_state(
-        backend: &WorkerRuntimeExecutionBackend<MockFactory>,
+    fn wait_for_adapter_state<F: RuntimeWorkerFactory>(
+        backend: &WorkerRuntimeExecutionBackend<F>,
         worker_ref: &WorkerRef,
         expected_status: WorkerStatus,
     ) {
@@ -14870,27 +15142,24 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "http-server")]
+    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
+    #[serial_test::serial(worker_allocation)]
     fn subject_release_reserves_real_controller_and_excludes_runtime_lifecycle() {
         use runtime_api::{SubjectReleaseAction as Action, SubjectReleaseState as State};
-        let runtime_base = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let backend = Arc::new(
-            WorkerRuntimeExecutionBackend::new(MockFactory {
+            WorkerRuntimeExecutionBackend::new(removal_tests::RemovalFactory {
+                root: store.path().into(),
                 client: MockClient::new(simple_text_events()),
-                runtime_base: runtime_base.path().to_path_buf(),
-                cwd: cwd.path().to_path_buf(),
-                store_dir: store.path().join("sessions"),
-                worker_metadata_dir: store.path().join("workers"),
-                observed_cwds: Arc::new(Mutex::new(Vec::new())),
-                observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
             })
             .unwrap(),
         );
-        let runtime =
-            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
-                .unwrap();
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            crate::FsRuntimeStoreOptions::new(store.path()).with_runtime_id("release-runtime"),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.bind_runtime_identity("release-runtime").unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let mut create = create_request("subject-release");
         create.workspace_api = Some(crate::catalog::WorkspaceApiRef {

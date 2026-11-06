@@ -34,8 +34,16 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
         .with_authorizations([
             expected_authorization("ticket.query", "workspace", None),
             expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
             expected_authorization("ticket.event.add", "ticket", Some(("ticket_id", "T-42"))),
         ]),
     );
@@ -966,7 +974,9 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
             FeatureDescriptor::builtin("late-failure", "Late failure")
         }
         fn install(&self, _: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-            Err(FeatureInstallError::InvalidDescriptor("late failure".into()))
+            Err(FeatureInstallError::InvalidDescriptor(
+                "late failure".into(),
+            ))
         }
     }
     for fail in [false, true] {
@@ -985,7 +995,10 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
         let objective = mounts.allocate_namespace("objective", "goals").unwrap();
         let mut features = FeatureRegistryBuilder::new();
         crate::feature::builtin::objective::composition::compose(
-            &mut features, true, client.clone(), Some((objective, None)),
+            &mut features,
+            true,
+            client.clone(),
+            Some((objective, None)),
         )
         .unwrap();
         if fail {
@@ -993,12 +1006,17 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
         }
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         let report = features.install_into_engine_with_wip(
-            &mut engine, &mut crate::hook::HookRegistryBuilder::default(), Some(&mut mounts),
+            &mut engine,
+            &mut crate::hook::HookRegistryBuilder::default(),
+            Some(&mut mounts),
         );
         assert_eq!(report.has_errors(), fail);
         let after = WipHost::new(mounts);
         assert_eq!(after.result_namespaces.root("ticket"), Some("/cases"));
-        assert_eq!(after.result_namespaces.root("objective"), (!fail).then_some("/goals"));
+        assert_eq!(
+            after.result_namespaces.root("objective"),
+            (!fail).then_some("/goals")
+        );
         assert_eq!(before.result_namespaces.root("objective"), None);
         assert_eq!(before.result_namespaces.root("ticket"), Some("/cases"));
         assert_eq!(after.observe("/goals", 1).is_ok(), !fail);
@@ -1019,8 +1037,16 @@ async fn host_overwrites_forged_result_context_and_omits_unpublished_cross_domai
         }])
         .with_authorizations([
             expected_authorization("ticket.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
-            expected_authorization("ticket.relation.read", "ticket", Some(("ticket_id", "T-42"))),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
+            expected_authorization(
+                "ticket.relation.read",
+                "ticket",
+                Some(("ticket_id", "T-42")),
+            ),
         ]),
     );
     let mut registry = WipMountRegistry::new();

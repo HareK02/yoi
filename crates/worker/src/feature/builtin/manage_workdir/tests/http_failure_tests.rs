@@ -712,7 +712,10 @@ impl WorkspaceClient for AttachmentHttpClient {
     fn is_available(&self) -> bool {
         true
     }
-    fn execute(&self, request: WorkspaceRequest) -> Result<WorkspaceResponse, WorkspaceClientError> {
+    fn execute(
+        &self,
+        request: WorkspaceRequest,
+    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         if request.path.ends_with("/authorization/check")
             || request.path.ends_with("/authorization/bound-check")
         {
@@ -732,7 +735,9 @@ impl WorkspaceClient for AttachmentHttpClient {
                 };
                 let mut builder = client.request(method, format!("{base_url}{}", request.path));
                 if let Some(body) = request.body {
-                    builder = builder.header("content-type", "application/json").body(body);
+                    builder = builder
+                        .header("content-type", "application/json")
+                        .body(body);
                 }
                 let response = builder.send()?;
                 Ok(WorkspaceResponse {
@@ -832,10 +837,8 @@ impl AttachmentHttpFixture {
             let calls = handler_calls.clone();
             async move {
                 calls.fetch_add(1, Ordering::SeqCst);
-                let response = server_api::server_support::http_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    error,
-                );
+                let response =
+                    server_api::server_support::http_error_response(StatusCode::BAD_GATEWAY, error);
                 let (mut parts, body) = response.into_parts();
                 let bytes = axum::body::to_bytes(body, error_contract::MAX_FAILURE_BYTES)
                     .await
@@ -867,10 +870,8 @@ impl AttachmentHttpFixture {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap();
-        let generated = server_api::ServerApiClient::with_client(
-            base_url.as_str().try_into().unwrap(),
-            http,
-        );
+        let generated =
+            server_api::ServerApiClient::with_client(base_url.as_str().try_into().unwrap(), http);
         Self {
             generated,
             workspace: Arc::new(AttachmentHttpClient {
@@ -1035,7 +1036,10 @@ async fn attachment_http_clients_reproject_runtime_and_session_with_independent_
                 &visibility,
             )
             .unwrap();
-            assert_eq!(report["failure"]["explanation"], fresh_primary.explanation());
+            assert_eq!(
+                report["failure"]["explanation"],
+                fresh_primary.explanation()
+            );
             let fresh_secondary = error_contract::project_failure::<error_contract::Tool, _>(
                 &error_contract::FailureFacts::new(secondary).unwrap(),
                 &visibility,
@@ -1043,8 +1047,10 @@ async fn attachment_http_clients_reproject_runtime_and_session_with_independent_
             .unwrap();
             assert_eq!(
                 secondary_attachment,
-                protocol::startup_failure::StartupFailureAttachment::from_projected(&fresh_secondary)
-                    .unwrap(),
+                protocol::startup_failure::StartupFailureAttachment::from_projected(
+                    &fresh_secondary
+                )
+                .unwrap(),
             );
             if let Some(previous) = &previous_report {
                 assert_eq!(previous, &report);
@@ -1085,7 +1091,11 @@ async fn attachment_http_clients_reproject_runtime_and_session_with_independent_
                 backend.session_router.begin_detach(&alias).await.unwrap();
                 backend.session_router.cancel_detach(&alias);
                 let requests = fixture.workspace.requests.lock().unwrap();
-                assert!(requests[0].path.ends_with("?expected_connection_id=fixture-connection"));
+                assert!(
+                    requests[0]
+                        .path
+                        .ends_with("?expected_connection_id=fixture-connection")
+                );
             } else {
                 assert!(backend.session_router.aliases().is_empty());
             }
@@ -1094,7 +1104,8 @@ async fn attachment_http_clients_reproject_runtime_and_session_with_independent_
 }
 
 #[tokio::test]
-async fn unavailable_compensation_attachments_preserve_primary_and_stage_without_fabricating_causes() {
+async fn unavailable_compensation_attachments_preserve_primary_and_stage_without_fabricating_causes()
+ {
     use protocol::control_failure::RuntimeControlCause as Runtime;
     use server_api::workdir_management_error::{
         WorkdirAttachmentFailureStage as Stage, WorkdirAttachmentRelatedFailure,
@@ -1113,7 +1124,8 @@ async fn unavailable_compensation_attachments_preserve_primary_and_stage_without
     });
     let valid = attachment_evidence(secondary, "provider-secret /private/path");
     let encoded = serde_json::to_value(&valid).unwrap();
-    let mut unsupported: serde_json::Value = serde_json::from_str(encoded.as_str().unwrap()).unwrap();
+    let mut unsupported: serde_json::Value =
+        serde_json::from_str(encoded.as_str().unwrap()).unwrap();
     unsupported["details_version"] = json!(999);
     let corrupt = serde_json::from_value(json!("{invalid provider-secret /private/path")).unwrap();
     let unsupported = serde_json::from_value(json!(unsupported.to_string())).unwrap();
@@ -1157,7 +1169,8 @@ async fn unavailable_compensation_attachments_preserve_primary_and_stage_without
     let ToolError::ExecutionFailure(output) = error else {
         panic!("primary lost with optional evidence")
     };
-    let report: serde_json::Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
     assert_eq!(
         report["failure"]["details"],
         serde_json::to_value(primary).unwrap(),
@@ -1243,7 +1256,8 @@ fn compensation_output_budget_does_not_displace_the_primary_failure() {
         false,
     );
     let output = error.report.unwrap();
-    let report: serde_json::Value = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
     assert_eq!(
         report["failure"]["details"],
         serde_json::to_value(primary).unwrap(),
@@ -1271,7 +1285,10 @@ async fn optional_http_metadata_loss_survives_generated_client_tool_and_saved_re
     let related = WorkdirAttachmentRelatedFailure {
         stage: Stage::SessionClose,
         http_status: 503,
-        failure: Some(attachment_evidence(secondary, "provider-secret /private/path")),
+        failure: Some(attachment_evidence(
+            secondary,
+            "provider-secret /private/path",
+        )),
     };
     for (fault, supplied_rows, retained_rows, unavailable) in [
         (AttachmentHttpFault::UnknownRelatedStage, 1, 0, true),
@@ -1306,7 +1323,11 @@ async fn optional_http_metadata_loss_survives_generated_client_tool_and_saved_re
         assert_eq!(status.as_u16(), 502);
         assert_eq!(error.cause(), Some(&primary));
         assert_eq!(error.related_failures().len(), retained_rows, "{fault:?}");
-        assert_eq!(error.related_failures_unavailable(), unavailable, "{fault:?}");
+        assert_eq!(
+            error.related_failures_unavailable(),
+            unavailable,
+            "{fault:?}"
+        );
         assert!(error.legacy().diagnostics.is_empty());
         let backend = WorkspaceHttpWorkdirBackend::new(fixture.workspace.clone());
         let (_, tool) = workdir_tool(
@@ -1338,7 +1359,10 @@ async fn optional_http_metadata_loss_survives_generated_client_tool_and_saved_re
         assert_eq!(report["result"]["http_status"], 502);
         assert_eq!(report["result"]["error_class"], "execution_failed");
         assert_eq!(report["result"]["mutation"], "not_reported");
-        assert_eq!(report["result"]["related_failures_unavailable"], unavailable);
+        assert_eq!(
+            report["result"]["related_failures_unavailable"],
+            unavailable
+        );
         let rows = report["result"]["related_failures"].as_array().unwrap();
         assert_eq!(rows.len(), retained_rows, "{fault:?}");
         for row in rows {
@@ -1355,7 +1379,8 @@ async fn optional_http_metadata_loss_survives_generated_client_tool_and_saved_re
             .unwrap();
             assert_eq!(
                 attachment,
-                protocol::startup_failure::StartupFailureAttachment::from_projected(&fresh).unwrap(),
+                protocol::startup_failure::StartupFailureAttachment::from_projected(&fresh)
+                    .unwrap(),
             );
         }
         let saved = crate::test_support::reopen_result(agen::tool::ToolResult::from_error(
@@ -1375,7 +1400,12 @@ async fn optional_http_metadata_loss_survives_generated_client_tool_and_saved_re
         assert!(summary.contains("do not resend automatically"));
         let reopened: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(reopened, report);
-        for secret in ["provider-secret", "/private/path", "future-private-stage", "private-provider"] {
+        for secret in [
+            "provider-secret",
+            "/private/path",
+            "future-private-stage",
+            "private-provider",
+        ] {
             assert!(!content.contains(secret));
             assert!(!summary.contains(secret));
         }
@@ -1386,7 +1416,8 @@ async fn optional_http_metadata_loss_survives_generated_client_tool_and_saved_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tolerant_optional_http_metadata_never_relaxes_primary_status_or_management_operation_checks() {
+async fn tolerant_optional_http_metadata_never_relaxes_primary_status_or_management_operation_checks()
+ {
     use protocol::control_failure::RuntimeControlCause as Runtime;
     use server_api::client_support::{ClientError, ClientFailure};
     use workdir::management_failure::{WorkdirManagementFailure, WorkdirManagementReason};
@@ -1398,7 +1429,12 @@ async fn tolerant_optional_http_metadata_never_relaxes_primary_status_or_managem
     for (primary, fault, expected_status, valid_primary) in [
         (runtime, AttachmentHttpFault::CorruptPrimary, 502, false),
         (runtime, AttachmentHttpFault::WrongHttpStatus, 403, false),
-        (wrong_operation, AttachmentHttpFault::MalformedRelatedList, 400, true),
+        (
+            wrong_operation,
+            AttachmentHttpFault::MalformedRelatedList,
+            400,
+            true,
+        ),
     ] {
         let fixture = AttachmentHttpFixture::with_fault(
             primary,
@@ -1424,7 +1460,9 @@ async fn tolerant_optional_http_metadata_never_relaxes_primary_status_or_managem
                 assert_eq!(error.cause(), Some(&wrong_operation));
                 assert!(error.related_failures_unavailable());
             }
-            ClientError::Failure(ClientFailure::ErrorResponseDecode { status }) if !valid_primary => {
+            ClientError::Failure(ClientFailure::ErrorResponseDecode { status })
+                if !valid_primary =>
+            {
                 assert_eq!(status, expected_status);
             }
             other => panic!("unexpected primary validation result: {other:?}"),
@@ -1450,7 +1488,13 @@ async fn tolerant_optional_http_metadata_never_relaxes_primary_status_or_managem
             "strict-attachment-call",
             error,
         ));
-        let agen::Item::ToolResult { is_error, summary, content, .. } = saved else {
+        let agen::Item::ToolResult {
+            is_error,
+            summary,
+            content,
+            ..
+        } = saved
+        else {
             panic!("saved strict rejection missing")
         };
         assert!(is_error);

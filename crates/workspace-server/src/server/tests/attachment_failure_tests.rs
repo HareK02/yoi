@@ -111,9 +111,15 @@ impl WorkspaceWorkerRuntime for AttachmentRuntime {
         RuntimeOperationResponse {
             status: self.status,
             cause: Some(self.cause),
-            worker: self.source.worker(worker_id).worker,
+            worker: Some(
+                self.source
+                    .worker(worker_id)
+                    .into_worker(self.source.runtime_id(), worker_id)
+                    .expect("fixture worker remains present"),
+            ),
             diagnostics: vec![RuntimeDiagnostic {
                 workdir: None,
+                control: None,
                 startup: None,
                 code: "private_attachment_diagnostic".into(),
                 severity: HostDiagnosticSeverity::Error,

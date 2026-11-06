@@ -30,6 +30,7 @@ impl Fixture {
         conn.execute_batch(ticket::service_outbox::OUTBOX_SCHEMA_SQL)
             .unwrap();
         conn.execute_batch(super::SCHEMA_SQL).unwrap();
+        conn.execute_batch(super::FAILURE_MIGRATION_SQL).unwrap();
         conn.execute(
             "INSERT INTO plugin_installations VALUES('w','i','alias','package','install',0)",
             [],
