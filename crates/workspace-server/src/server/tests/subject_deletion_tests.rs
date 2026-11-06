@@ -645,7 +645,7 @@ async fn pending_consolidation_is_purged_and_captured_dispatch_and_late_result_a
 }
 
 #[tokio::test]
-async fn unmaterialized_body_and_job_reservations_finish_only_with_runtime_storage_absence_proof() {
+async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pending() {
     let dir = tempfile::tempdir().unwrap();
     let (api, _) = test_api_with_recording_backend(dir.path()).await;
     let store = open_subjektiv_store(&api).unwrap();
@@ -716,10 +716,12 @@ async fn unmaterialized_body_and_job_reservations_finish_only_with_runtime_stora
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["completed"], true);
+        // A Backend-only reservation is not Runtime original-absence evidence.
+        // Keep the permanent exclusion, but never invent a Stop/Purge receipt.
+        assert_eq!(body["completed"], false, "{body}");
         assert!(subject_authorization::worker_permissions(&api, &worker).is_err());
         let proved = api.config_store.with_conn(|conn| Ok(conn.query_row("SELECT originals_absent FROM subject_deletion_workers WHERE workspace_id=?1 AND subject_id=?2 AND runtime_id=?3 AND worker_id=?4", rusqlite::params![TEST_WORKSPACE_ID,subject.id,worker.runtime_id,worker.worker_id], |row|row.get::<_,bool>(0))?)).unwrap();
-        assert!(proved);
+        assert!(!proved);
         assert!(
             api.config_store
                 .recover_worker_removal_execution(TEST_WORKSPACE_ID, &worker)
@@ -739,14 +741,23 @@ async fn unmaterialized_body_and_job_reservations_finish_only_with_runtime_stora
                 )
                 .is_err()
         );
-        if let Some(singleton) = singleton {
-            assert!(
-                api.store
-                    .current_worker_singleton_owner(TEST_WORKSPACE_ID, &singleton)
-                    .unwrap()
-                    .is_none()
-            );
-        }
+        assert!(
+            !store
+                .subject_deletion(&subject.id)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        let (status, replay) = delete_request(
+            &api,
+            &subject.id,
+            &format!("delete-reserved-{is_job}"),
+            Some(&owner),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay, body);
     }
 }
 

@@ -2988,7 +2988,11 @@ impl WorkerRemovalService {
             Ok(plan) => plan,
             Err(error) => return WorkerRemovalFailure::retention_response(error),
         };
-        if let Some(owner) = job_cleanup_owner {
+        // A Blocked diagnostic plan cannot pass prepare and has no Runtime child.
+        // Keep continuity pinned for every executable/uncertain child, not a Hold.
+        if let Some(owner) = job_cleanup_owner
+            .filter(|_| plan.state != crate::retention::WorkerRemovalPlanState::Blocked)
+        {
             *owner
                 .lock()
                 .map_err(|_| "Job cleanup child owner poisoned".to_string())? =
@@ -51949,7 +51953,8 @@ mod tests {
     }
 
     struct DeterministicExecutionBackend {
-        admissions: Mutex<HashMap<worker_runtime::identity::WorkerRef, DeterministicAdmission>>,
+        admissions:
+            Arc<Mutex<HashMap<worker_runtime::identity::WorkerRef, DeterministicAdmission>>>,
         subject_delete_checks: Mutex<Vec<runtime_api::SubjectDeleteWorkerRequest>>,
         receipts: Mutex<
             HashMap<
@@ -51960,10 +51965,12 @@ mod tests {
                 ),
             >,
         >,
-        terminations: Mutex<
-            HashMap<
-                worker_runtime::identity::WorkerRef,
-                worker_runtime::execution::WorkerExecutionTermination,
+        terminations: Arc<
+            Mutex<
+                HashMap<
+                    worker_runtime::identity::WorkerRef,
+                    worker_runtime::execution::WorkerExecutionTermination,
+                >,
             >,
         >,
         lose_input_ack: std::sync::atomic::AtomicBool,
@@ -52017,10 +52024,10 @@ mod tests {
                     .as_nanos()
             );
             Self {
-                admissions: Mutex::new(HashMap::new()),
+                admissions: Arc::default(),
                 subject_delete_checks: Mutex::new(Vec::new()),
                 receipts: Mutex::new(HashMap::new()),
-                terminations: Mutex::new(HashMap::new()),
+                terminations: Arc::default(),
                 lose_input_ack: std::sync::atomic::AtomicBool::new(false),
                 reject_input_definitively: std::sync::atomic::AtomicBool::new(false),
                 assignment_release_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -52050,6 +52057,16 @@ mod tests {
     }
 
     impl DeterministicExecutionBackend {
+        // Server-only reopen retains this substituted execution owner's genuine
+        // shutdown records. It does not attest a Runtime/provider process restart.
+        fn with_retained_stopped_executions(&self) -> Self {
+            Self {
+                admissions: self.admissions.clone(),
+                terminations: self.terminations.clone(),
+                ..Self::default()
+            }
+        }
+
         fn reject_inputs(&self, message: impl Into<String>) {
             *self.input_failure.lock().unwrap() = Some(message.into());
         }
@@ -52465,9 +52482,17 @@ mod tests {
         ) -> std::result::Result<(), String> {
             let worker = worker_runtime::identity::WorkerRef::new(request.worker_id);
             let admissions = self.admissions.lock().unwrap();
-            let admission = admissions
-                .get(&worker)
-                .ok_or("Fixture creation identity unavailable")?;
+            let Some(admission) = admissions.get(&worker) else {
+                // Runtime owns the never-materialized reservation/exclusion proof.
+                // An absent fixture resource alone cannot attest historical shutdown.
+                return if !self.contexts.lock().unwrap().contains_key(&worker)
+                    && !self.terminations.lock().unwrap().contains_key(&worker)
+                {
+                    Ok(())
+                } else {
+                    Err("Fixture creation identity unavailable".into())
+                };
+            };
             if admission.workspace_id.as_deref() != Some(request.workspace_id.as_str())
                 || admission.create_fingerprint != request.create_fingerprint
                 || admission
@@ -52488,8 +52513,12 @@ mod tests {
             self.admissions
                 .lock()
                 .unwrap()
-                .get_mut(&worker_runtime::identity::WorkerRef::new(request.worker_id))
-                .unwrap()
+                .entry(worker_runtime::identity::WorkerRef::new(request.worker_id))
+                .or_insert_with(|| DeterministicAdmission {
+                    workspace_id: Some(request.workspace_id.clone()),
+                    create_fingerprint: request.create_fingerprint.clone(),
+                    deletion: None,
+                })
                 .deletion = Some(request.clone());
             Ok(())
         }

@@ -53,6 +53,11 @@ impl RecoveryOwners {
     }
 
     #[cfg(test)]
+    pub(super) async fn pause_steps_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.step_admission.lock().await
+    }
+
+    #[cfg(test)]
     pub(super) fn recovery_owner_ids(&self) -> HashSet<String> {
         self.running.lock().unwrap().clone()
     }

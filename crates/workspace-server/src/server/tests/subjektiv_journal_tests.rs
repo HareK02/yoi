@@ -1300,18 +1300,20 @@ async fn terminal_journal_attempts_purge_real_tool_result_sessions_without_chang
     }
 }
 
-/// A real SQLite writer lock blocks Job completion while the separate Journal store
-/// can still save its checkpoint. Removing it does not drive recovery or resubmit input.
+/// A native SQLite writer fault; install after the intended preceding effects.
+/// Removing it does not drive recovery or resubmit input.
 struct JournalCompletionSaveFault(rusqlite::Connection);
 
 impl JournalCompletionSaveFault {
     fn install(f: &RuntimeFixture) -> Self {
-        f.job_store
-            .with_conn(|connection| {
-                connection.busy_timeout(std::time::Duration::ZERO)?;
-                Ok(())
-            })
-            .unwrap();
+        for store in [f.job_store.as_ref(), f.api.config_store.as_ref()] {
+            store
+                .with_conn(|connection| {
+                    connection.busy_timeout(std::time::Duration::ZERO)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
         let connection = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
         Self(connection)
@@ -1908,9 +1910,14 @@ async fn completion_save_fault_recovers_same_job_from_saved_checkpoint_without_u
             &Utc::now().to_rfc3339(),
         )
         .unwrap();
-    let fault = JournalCompletionSaveFault::install(&f);
+    // Fault the result-save phase, not the current-policy/catalog reads required
+    // to commit the Journal checkpoint. Hold the actual recovery step gate so it
+    // cannot settle the checkpoint before the storage fault is installed.
+    let recovery = f.api.backend_job_recovery.pause_steps_for_test().await;
     f.checkpoint(worker);
     let completion = subjektiv_journal::finish(&f.api, worker).unwrap();
+    let fault = JournalCompletionSaveFault::install(&f);
+    drop(recovery);
     let binding = subjektiv::api::JobAttemptBinding {
         job_id: f.request.job_id.clone(),
         attempt_id: dispatched.attempt.attempt_id.clone(),
@@ -3530,7 +3537,7 @@ async fn subject_release_never_substitutes_catalog_idle_or_stopped_for_controlle
 }
 
 #[tokio::test]
-async fn stopped_subject_removal_releases_occupancy_and_preserves_unfinished_history() {
+async fn stopped_subject_with_unfinished_job_does_not_release_occupancy_or_original_history() {
     let f = SubjectRemovalFixture::new().await;
     let reserved = f.pending_journal();
     let grant = reserved
@@ -3567,49 +3574,32 @@ async fn stopped_subject_removal_releases_occupancy_and_preserves_unfinished_his
     let response = f.remove();
     assert_eq!(
         response.status,
-        StatusCode::OK.as_u16(),
+        StatusCode::CONFLICT.as_u16(),
         "{}",
         response.body
     );
-    let archive = f.assert_removed_with_history();
-    let runtime_api::SessionMaterialCatalogAvailability::Page { page } = f
-        .api
-        .runtime
-        .session_material_catalog(
-            &f.target.runtime_id,
-            runtime_api::SessionMaterialCatalogRequest {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                source: runtime_api::SessionPublicSource::Archived {
-                    archive_id: archive,
-                },
-                expected_session_id: f.attr.session_id.clone(),
-                expected_catalog_sha256: None,
-                offset: 0,
-                limit: 100,
-            },
-        )
-        .unwrap()
-    else {
-        panic!("original history must remain readable")
-    };
-    assert_eq!(page.descriptors.len(), 2);
-    let after = f.store.read_journal(&f.host, &grant.journal_id).unwrap();
-    assert_eq!(before.process_order, after.process_order);
-    assert_eq!(before.process_byte, after.process_byte);
-    assert!(f.store.journal_retention_required(&f.host).unwrap());
+    assert!(response.body.contains("journal_handoff_incomplete"));
+    f.assert_occupied();
+    assert!(session_root(f.dir.path(), &f.target).exists());
     assert!(
-        f.store
-            .active_journal_generation(&f.host, &grant.journal_id)
-            .is_err()
+        !f.store
+            .journal_worker_was_released(
+                &f.attr.subject_id,
+                &f.target.runtime_id,
+                &f.target.worker_id
+            )
+            .unwrap()
     );
-    assert!(subjektiv_journal::prepare(&f.api, &reserved).is_err());
+    let after = f.store.read_journal(&f.host, &grant.journal_id).unwrap();
+    assert_eq!(before, after);
+    assert!(f.store.journal_retention_required(&f.host).unwrap());
     let job = f
         .api
         .store
         .get_backend_job(TEST_WORKSPACE_ID, &reserved.job.request.job_id)
         .unwrap()
         .unwrap();
-    assert_eq!(job.state, BackendJobState::Failed);
+    assert_eq!(job.state, BackendJobState::Pending);
     assert_eq!(
         job.load_executable_request().unwrap().input,
         reserved.job.request.input
@@ -3621,70 +3611,6 @@ async fn stopped_subject_removal_releases_occupancy_and_preserves_unfinished_his
             .unwrap()
             .unwrap(),
         purge
-    );
-
-    let Json(next) = scoped_create_workspace_worker(
-        State(f.api.clone()),
-        AxumPath(ScopedWorkspacePath {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        }),
-        HeaderMap::new(),
-        Json(CreateWorkspaceWorkerRequest {
-            runtime_id: f.target.runtime_id.clone(),
-            display_name: "replacement".into(),
-            singleton_key: None,
-            profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
-            initial_submit: vec![],
-            workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: f.attr.subject_id.clone(),
-                }),
-            },
-            control_operation_id: None,
-            execution_grant: None,
-        }),
-    )
-    .await
-    .unwrap();
-    assert_ne!(next.worker_id, f.target.worker_id);
-    let key = crate::subjektiv::subject_worker_singleton_key(&f.attr.subject_id).unwrap();
-    let successor = f
-        .api
-        .store
-        .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
-        .unwrap()
-        .unwrap();
-    assert_eq!(successor.worker.worker_id, next.worker_id);
-    let replay = WorkerRemovalService::new(&f.api)
-        .execute_target_removal_on_host(
-            f.api.runtime.as_ref(),
-            &f.target,
-            "repeat old deletion",
-            None,
-        )
-        .await
-        .unwrap();
-    assert_eq!(replay.status, StatusCode::OK.as_u16(), "{}", replay.body);
-    assert_eq!(
-        f.api
-            .store
-            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
-            .unwrap()
-            .unwrap(),
-        successor
-    );
-    assert!(subjektiv_journal::bind_host_session(&f.api, f.attr.clone()).is_err());
-    subjektiv_journal::drain_after_completion(&f.api, &reserved.job.request);
-    assert_eq!(
-        f.api
-            .store
-            .get_backend_job(TEST_WORKSPACE_ID, &reserved.job.request.job_id)
-            .unwrap()
-            .unwrap()
-            .current_attempt,
-        1
     );
 }
 
@@ -4186,7 +4112,7 @@ async fn subject_removal_prior_purge_receipt_recovers_without_inventing_erasure(
 }
 
 #[tokio::test]
-async fn subject_removal_prior_pending_purge_receipt_recovers_with_stale_runtime_catalog() {
+async fn subject_removal_missing_canonical_shutdown_never_adopts_stale_catalog_purge() {
     assert_prior_purge_receipt(true).await;
 }
 
@@ -4252,8 +4178,8 @@ async fn assert_prior_purge_receipt(stale_catalog: bool) {
         .prepare_worker_removal_execution(TEST_WORKSPACE_ID, &plan.plan_id, &plan.input_fingerprint)
         .unwrap();
     if stale_catalog {
-        // Fixture the Runtime delete-to-final-receipt crash window. Its live
-        // catalog deliberately remains stopped while the aggregate is gone.
+        // An old v1 pending result has no canonical shutdown/aggregate proof.
+        // A stopped catalog must not promote it into a successful Purge receipt.
         let request = &prepared.runtime_request;
         let pending = worker_runtime::retention::WorkerRetentionExecutionResult {
             operation_id: request.operation_id.clone(),
@@ -4300,6 +4226,36 @@ async fn assert_prior_purge_receipt(stale_catalog: bool) {
         .unwrap();
     let f = if stale_catalog { f } else { f.reopen().await };
     let response = f.remove();
+    if stale_catalog {
+        assert_eq!(
+            response.status,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            "{}",
+            response.body
+        );
+        assert!(response.body.contains("runtime_retention_failed"));
+        assert!(
+            f.api
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+                .unwrap()
+                .is_some()
+        );
+        let retained = f
+            .api
+            .config_store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.plan.operation_id, plan.operation_id);
+        assert_eq!(retained.plan.input_fingerprint, plan.input_fingerprint);
+        assert_ne!(
+            retained.plan.state,
+            crate::retention::WorkerRemovalPlanState::Succeeded
+        );
+        assert!(!f.store.journal_session_erased(&f.host).unwrap());
+        return;
+    }
     assert_eq!(
         response.status,
         StatusCode::OK.as_u16(),
@@ -4815,6 +4771,10 @@ impl SubjectRemovalFixture {
             store,
         } = self;
         let config = api.config.clone();
+        // Reopen the Server's stores/catalog while the external substituted
+        // execution owner retains its joined Stop receipts. A provider-process
+        // cold receipt reader is exercised by the production Runtime suites.
+        let retained_execution = Arc::new(execution.with_retained_stopped_executions());
         drop(api);
         drop(execution);
         drop(dispatcher);
@@ -4826,7 +4786,7 @@ impl SubjectRemovalFixture {
                 control.clone(),
             ),
         );
-        let execution = Arc::new(DeterministicExecutionBackend::default());
+        let execution = retained_execution;
         let api = WorkspaceApi::new_with_execution_backend_and_broker(
             config,
             control,
