@@ -261,10 +261,46 @@ fn job_operation(request: &JournalJobRequest) -> &'static str {
     }
 }
 
+enum JournalCaller<'a> {
+    Signed(&'a crate::worker_source::VerifiedRuntimeRequestSource),
+    #[cfg(test)]
+    Internal,
+}
+impl JournalCaller<'_> {
+    fn effect_store(
+        &self,
+        api: &WorkspaceApi,
+        worker: &RuntimeWorkerRef,
+        subject: &str,
+        operation: &str,
+    ) -> Result<crate::subjektiv::SubjektivStore> {
+        let store = store(api)?;
+        Ok(match self {
+            Self::Signed(source) => subject_authorization::authenticated_subject_effect_store(
+                api, &store, worker, subject, operation, source,
+            ),
+            #[cfg(test)]
+            Self::Internal => {
+                subject_authorization::subject_effect_store(api, &store, worker, subject, operation)
+            }
+        })
+    }
+}
+
+#[cfg(test)]
 pub(super) fn execute(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
     request: JournalJobRequest,
+) -> Result<JournalJobResponse> {
+    execute_for(api, worker, request, JournalCaller::Internal)
+}
+
+fn execute_for(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    request: JournalJobRequest,
+    caller: JournalCaller<'_>,
 ) -> Result<JournalJobResponse> {
     let (grant, _, _) = live(api, worker)?;
     let gate = lifecycle_lock(api, &grant.subject_id)?;
@@ -279,13 +315,7 @@ pub(super) fn execute(
     if let Some(observe) = &api.journal_before_effect {
         observe(job_operation(&request));
     }
-    let store = subject_authorization::subject_effect_store(
-        api,
-        &store(api)?,
-        worker,
-        &grant.subject_id,
-        job_operation(&request),
-    );
+    let store = caller.effect_store(api, worker, &grant.subject_id, job_operation(&request))?;
     let host = host(api, &store, &grant)?;
     let g = generation(&store, &host, &grant, &job, &attempt)?;
     let input = saved_input(&job.request, &grant)?;
@@ -368,9 +398,18 @@ pub(super) fn recover_delivery(
     reconcile_attempt_under_gate(api, &current_job, &current_attempt, true, guard)
 }
 
+#[cfg(test)]
 pub(super) fn finish(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+) -> Result<JournalJobCompletion> {
+    finish_for(api, worker, JournalCaller::Internal)
+}
+
+fn finish_for(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    caller: JournalCaller<'_>,
 ) -> Result<JournalJobCompletion> {
     let (grant, _, _) = live(api, worker)?;
     let gate = lifecycle_lock(api, &grant.subject_id)?;
@@ -385,13 +424,7 @@ pub(super) fn finish(
     if let Some(observe) = &api.journal_before_effect {
         observe("journal.finish");
     }
-    let store = subject_authorization::subject_effect_store(
-        api,
-        &store(api)?,
-        worker,
-        &grant.subject_id,
-        "journal.finish",
-    );
+    let store = caller.effect_store(api, worker, &grant.subject_id, "journal.finish")?;
     let host = host(api, &store, &grant)?;
     let input = saved_input(&job.request, &grant)?;
     // prepare is an exact binding lookup too, including the saved completion of a closed generation.
@@ -914,8 +947,16 @@ fn admit_sources(
     attribution: crate::subjektiv::SubjectSessionAttribution,
     dispatch_jobs: bool,
 ) -> Result<JournalRecordingResponse> {
+    admit_sources_in_store(api, attribution, dispatch_jobs, store(api)?)
+}
+
+fn admit_sources_in_store(
+    api: &WorkspaceApi,
+    attribution: crate::subjektiv::SubjectSessionAttribution,
+    dispatch_jobs: bool,
+    store: crate::subjektiv::SubjektivStore,
+) -> Result<JournalRecordingResponse> {
     authorize_source(api, &attribution, "journal.recording.request")?;
-    let store = store(api)?;
     let host =
         JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
     if store.journal_session_erased(&host).map_err(domain)? {
@@ -972,7 +1013,7 @@ pub(super) async fn startup_route(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
 ) -> ApiResult<Json<journal::startup::JournalStartupSnapshot>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
@@ -999,7 +1040,12 @@ pub(super) async fn startup_route(
                 subject,
                 "journal.startup.read",
             )?;
-            let store = store(&api)?;
+            let store = JournalCaller::Signed(&source).effect_store(
+                &api,
+                &worker,
+                subject,
+                "journal.startup.read",
+            )?;
             let reader = JournalHostContext::validated_reader(&store, subject).map_err(domain)?;
             let mut current_writer = None;
             for attr in store
@@ -1045,7 +1091,7 @@ pub(super) async fn compaction_route(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
     Json(input): Json<JournalCompactionRequest>,
 ) -> ApiResult<Json<journal::startup::JournalStartupSnapshot>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
@@ -1072,7 +1118,12 @@ pub(super) async fn compaction_route(
                 subject,
                 "journal.compaction.read",
             )?;
-            let store = store(&api)?;
+            let store = JournalCaller::Signed(&source).effect_store(
+                &api,
+                &worker,
+                subject,
+                "journal.compaction.read",
+            )?;
             let attribution = store
                 .session_attribution(&input.session_id)
                 .map_err(|error| Error::Store(error.to_string()))?
@@ -1514,7 +1565,7 @@ pub(super) async fn recording_route(
 ) -> ApiResult<Json<JournalRecordingResponse>> {
     // RunCommitted/restore may arrive while the parent holds Host. Admission uses the
     // independent lane, never queues recursively behind the waiting Runtime caller.
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
@@ -1543,7 +1594,12 @@ pub(super) async fn recording_route(
                 "journal.recording.request",
             )?;
             require_enabled(&api, &worker)?;
-            let store = store(&api)?;
+            let store = JournalCaller::Signed(&source).effect_store(
+                &api,
+                &worker,
+                subject,
+                "journal.recording.request",
+            )?;
             let attributions = store
                 .subject_session_attributions(subject)
                 .map_err(|e| Error::Store(e.to_string()))?;
@@ -1552,15 +1608,18 @@ pub(super) async fn recording_route(
                 .into_iter()
                 .filter(|a| a.runtime_id == worker.runtime_id && a.worker_id == worker.worker_id)
             {
-                response = admit(&api, attr)?;
+                response = admit_sources_in_store(&api, attr, true, store.clone())?;
             }
             Ok(Json(response))
         })
         .await
 }
-fn verified_worker(
+fn verified_source(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
-) -> ApiResult<RuntimeWorkerRef> {
+) -> ApiResult<(
+    crate::worker_source::VerifiedRuntimeRequestSource,
+    RuntimeWorkerRef,
+)> {
     let source = source
         .ok_or_else(|| {
             Error::WorkspacePermissionDenied(
@@ -1568,10 +1627,11 @@ fn verified_worker(
             )
         })?
         .0;
-    let worker = source.worker_id.ok_or_else(|| {
+    let worker = source.worker_id.as_ref().ok_or_else(|| {
         Error::WorkspacePermissionDenied("Journal requires main Worker identity".into())
     })?;
-    Ok(RuntimeWorkerRef::new(source.runtime_id, worker))
+    let worker = RuntimeWorkerRef::new(&source.runtime_id, worker);
+    Ok((source, worker))
 }
 
 pub(super) async fn job_route(
@@ -1580,12 +1640,16 @@ pub(super) async fn job_route(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
     Json(request): Json<JournalJobRequest>,
 ) -> ApiResult<Json<JournalJobResponse>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
+            #[cfg(test)]
+            if let Some(observe) = &api.journal_before_effect {
+                observe("journal.job.admission");
+            }
             validate_workspace_scope(&api, &path.workspace_id)?;
-            execute(&api, &worker, request)
+            execute_for(&api, &worker, request, JournalCaller::Signed(&source))
                 .map(Json)
                 .map_err(ApiError::from)
         })
@@ -2387,12 +2451,14 @@ pub(super) async fn finish_route(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
     Json(_request): Json<Empty>,
 ) -> ApiResult<Json<JournalJobCompletion>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            finish(&api, &worker).map(Json).map_err(ApiError::from)
+            finish_for(&api, &worker, JournalCaller::Signed(&source))
+                .map(Json)
+                .map_err(ApiError::from)
         })
         .await
 }

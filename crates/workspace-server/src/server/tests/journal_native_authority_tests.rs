@@ -122,6 +122,143 @@ fn signed_journal_domain_fences_case() {
     runtime.shutdown_timeout(Duration::from_secs(2));
 }
 
+#[test]
+fn signed_journal_rotated_binding_denies_waiting_mutation_and_protected_read() {
+    bounded("signed_journal_rotated_binding_case");
+}
+#[test]
+fn signed_journal_same_key_reactivation_denies_waiting_mutation_and_protected_read() {
+    bounded("signed_journal_reactivated_binding_case");
+}
+#[test]
+fn signed_journal_binding_aba_denies_waiting_mutation_and_protected_read() {
+    bounded("signed_journal_aba_binding_case");
+}
+
+#[test]
+#[ignore = "exact subprocess case run by bounded signed Journal parent"]
+fn signed_journal_rotated_binding_case() {
+    run_binding_change(TrustChange::Rotate);
+}
+#[test]
+#[ignore = "exact subprocess case run by bounded signed Journal parent"]
+fn signed_journal_reactivated_binding_case() {
+    run_binding_change(TrustChange::Reactivate);
+}
+#[test]
+#[ignore = "exact subprocess case run by bounded signed Journal parent"]
+fn signed_journal_aba_binding_case() {
+    run_binding_change(TrustChange::Aba);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TrustChange {
+    Rotate,
+    Reactivate,
+    Aba,
+}
+fn run_binding_change(change: TrustChange) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for (read, native) in [(false, false), (true, false), (false, true)] {
+            binding_change(change, read, native).await;
+        }
+    });
+    runtime.shutdown_timeout(Duration::from_secs(2));
+}
+
+async fn binding_change(change: TrustChange, read: bool, native: bool) {
+    let mut f = RemoteJournal::new().await;
+    let operation = f.create("binding-fenced-create");
+    let before = f.snapshot();
+    let (hook, pause, _) = pause_hook(
+        if native {
+            CREATE
+        } else {
+            "journal.job.admission"
+        },
+        if native { CREATE_MUTATION_ADMISSION } else { 1 },
+    );
+    if native {
+        f.policy.api.subject_effect_admission_observer = Some(hook);
+    } else {
+        f.policy.api.journal_before_effect = Some(hook);
+    }
+    let request = if read {
+        JournalJobRequest::ReadState
+    } else {
+        JournalJobRequest::Execute {
+            operation: operation.clone(),
+        }
+    };
+    let signed = f.signed_request(&request);
+    let api = f.policy.api.clone();
+    let pending = tokio::spawn(async move { response(&api, signed).await });
+    let resume = tokio::task::spawn_blocking(move || {
+        pause
+            .reached
+            .recv_timeout(WAIT)
+            .expect("signed request must finish authentication and reach held admission");
+        pause.resume
+    })
+    .await
+    .unwrap();
+    f.replace_trust(change);
+    resume.send(()).unwrap();
+    let (status, body) = tokio::time::timeout(WAIT, pending).await.unwrap().unwrap();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{change:?}, read={read}, native={native}: {body}"
+    );
+    assert!(
+        serde_json::from_value::<JournalJobResponse>(body).is_err(),
+        "refusal cannot return a protected result or receipt"
+    );
+    f.policy.api.journal_before_effect = None;
+    f.policy.api.subject_effect_admission_observer = None;
+    assert_eq!(
+        f.snapshot(),
+        before,
+        "stale authenticated request cannot change entry/cursor/generation/receipts"
+    );
+    f.assert_no_receipt(&operation.request_id);
+    // Sign again using B2 (or the restored same key with its NEW binding).
+    // The current request can reuse the unconsumed operation ID and CAS.
+    let (status, body) = response(&f.policy.api, f.signed_request(&request)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "current binding must remain usable: {body}"
+    );
+    let current: JournalJobResponse = serde_json::from_value(body).unwrap();
+    if read {
+        assert!(!matches!(current, JournalJobResponse::Saved(_)));
+        assert_eq!(f.snapshot(), before);
+        f.assert_no_receipt(&operation.request_id);
+    } else {
+        let JournalJobResponse::Saved(receipt) = current else {
+            panic!("current request must commit")
+        };
+        let store = open_subjektiv_store(&f.policy.api).unwrap();
+        assert_eq!(
+            store
+                .query_journal_operation(
+                    &f.host(&store),
+                    &f.grant().journal_id,
+                    &operation.request_id
+                )
+                .unwrap(),
+            Some(receipt)
+        );
+        assert_ne!(f.snapshot(), before);
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Change {
     Unchanged,
@@ -196,6 +333,59 @@ impl RemoteJournal {
             reservation,
             worker,
         }
+    }
+    fn replace_trust(&mut self, change: TrustChange) {
+        let catalog = &self.policy.api.config_store;
+        let original = catalog
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &self.worker.runtime_id)
+            .unwrap()
+            .unwrap();
+        let mut replacement = original.clone();
+        match change {
+            TrustChange::Rotate => {
+                self.policy.identity =
+                    Arc::new(RuntimeIdentityMaterial::generate(&self.worker.runtime_id).unwrap());
+                replacement.public_key = self.policy.identity.public_key.clone();
+                replacement.public_key_fingerprint.clear();
+            }
+            TrustChange::Reactivate => {
+                assert!(
+                    catalog
+                        .revoke_workspace_runtime_binding(
+                            TEST_WORKSPACE_ID,
+                            &self.worker.runtime_id,
+                            TEST_CREATED_AT
+                        )
+                        .unwrap()
+                );
+            }
+            TrustChange::Aba => {
+                replacement.display_name.push_str("-temporary");
+                catalog
+                    .upsert_workspace_runtime_binding(replacement, true)
+                    .unwrap();
+                replacement = original.clone();
+            }
+        }
+        catalog
+            .upsert_workspace_runtime_binding(replacement, true)
+            .unwrap();
+        let current = catalog
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &self.worker.runtime_id)
+            .unwrap()
+            .unwrap();
+        assert!(current.revoked_at.is_none());
+        assert_ne!(current.binding_id, original.binding_id);
+        assert_eq!(current.public_key, self.policy.identity.public_key);
+    }
+    fn signed_request(&self, request: &JournalJobRequest) -> Request<Body> {
+        runtime_source_request(
+            &self.policy.identity,
+            Some(&self.worker.worker_id),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/journal/job"),
+            serde_json::to_vec(request).unwrap(),
+        )
     }
     fn grant(&self) -> &crate::backend_job::SubjektivJournalGrant {
         self.reservation

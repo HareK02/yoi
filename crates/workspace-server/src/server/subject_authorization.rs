@@ -1492,6 +1492,7 @@ struct SubjectEffectAuthority {
     worker: RuntimeWorkerRef,
     subject: String,
     operation: String,
+    runtime_source: Option<crate::worker_source::VerifiedRuntimeRequestSource>,
     #[cfg(test)]
     before_registry: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -1539,6 +1540,23 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
         api.config_store = catalog.clone();
         api.store = catalog.clone();
         let authority = WorkerAuthorityView::from(&api);
+        if let Some(source) = &self.runtime_source {
+            catalog.with_conn(|connection| {
+                let current: bool = connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings WHERE workspace_id=?1 AND runtime_id=?2 AND binding_id=?3 AND revoked_at IS NULL)",
+                    rusqlite::params![api.workspace_id(), source.runtime_id, source.authentication_binding_id],
+                    |row| row.get(0),
+                )?;
+                if !current || source.runtime_id != self.worker.runtime_id
+                    || source.worker_id.as_deref() != Some(self.worker.worker_id.as_str())
+                {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Subject request authentication binding changed".into(),
+                    ));
+                }
+                Ok(())
+            }).map_err(|error| reject(error.into()))?;
+        }
         catalog
             .with_conn(|connection| {
                 catalog.sync_plugin_permission_registry_in_connection(
@@ -1635,6 +1653,30 @@ pub(super) fn subject_effect_store(
         worker: worker.clone(),
         subject: subject.into(),
         operation: operation.into(),
+        runtime_source: None,
+        #[cfg(test)]
+        before_registry: None,
+        #[cfg(test)]
+        after_reservation: None,
+    }))
+}
+
+/// Signed callers retain the original proof's binding; internal recovery uses
+/// subject_effect_store instead and must not synthesize a proof from live trust.
+pub(super) fn authenticated_subject_effect_store(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+    source: &crate::worker_source::VerifiedRuntimeRequestSource,
+) -> subjektiv::SubjektivStore {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+        runtime_source: Some(source.clone()),
         #[cfg(test)]
         before_registry: None,
         #[cfg(test)]
@@ -1656,6 +1698,7 @@ pub(super) fn memory_effect_store_before_registry(
         worker: worker.clone(),
         subject: subject.into(),
         operation: operation.into(),
+        runtime_source: None,
         before_registry: Some(observe),
         after_reservation: None,
     }))
@@ -1675,6 +1718,7 @@ pub(super) fn memory_effect_store_after_reservation(
         worker: worker.clone(),
         subject: subject.into(),
         operation: operation.into(),
+        runtime_source: None,
         before_registry: None,
         after_reservation: Some(observe),
     }))

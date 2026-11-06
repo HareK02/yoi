@@ -20003,7 +20003,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
             (83..=113)
-                .chain([122, 123, 124, 125, 126])
+                .chain([122, 123, 124, 125, 126, 127])
                 .collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -24428,7 +24428,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
             ((version + 1)..=113)
-                .chain([122, 123, 124, 125, 126])
+                .chain([122, 123, 124, 125, 126, 127])
                 .collect::<Vec<_>>()
         );
         drop(conn);
@@ -24469,7 +24469,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (123, backend_job_upgrade::MIGRATION_NAME.into()),
                          (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
                          (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
-                         (126, SERVICE_OUTCOME_MIGRATION_NAME.into())]);
+                         (126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
+                         (127, journal_removal_store::MIGRATION_NAME.into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
