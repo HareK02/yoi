@@ -227,6 +227,9 @@ fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
     let mut response =
         runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message);
     response.error.startup = error.startup;
+    if let Some(failure) = error.create_failure {
+        return response.with_create_failure(failure);
+    }
     response
 }
 

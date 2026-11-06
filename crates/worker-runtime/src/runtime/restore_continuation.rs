@@ -479,7 +479,7 @@ fn run(
             }
             Ok(Step::Waiting) | Ok(Step::Contended) => None,
             Ok(Step::Retry(reason)) => Some(reason),
-            Err(error) => Some(sanitize_worker_create_failure_message(&error.to_string())),
+            Err(error) => Some(sanitize_worker_restore_failure_message(&error.to_string())),
         };
         if let Some(reason) = &reason {
             repeated = repeated.saturating_add(1);

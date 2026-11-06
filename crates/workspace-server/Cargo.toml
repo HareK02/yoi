@@ -15,6 +15,7 @@ path = "src/main.rs"
 test-support = []
 
 [dependencies]
+error-contract.workspace = true
 api-macros = { workspace = true, features = ["axum"] }
 async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
@@ -70,7 +71,6 @@ webauthn-rs = { workspace = true, features = ["conditional-ui"] }
 webauthn-rs-proto = "0.5.5"
 
 [dev-dependencies]
-error-contract.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
 feature-storage = { workspace = true, features = ["test-support"] }
 native-tls = "0.2"

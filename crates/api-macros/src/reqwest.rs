@@ -482,6 +482,17 @@ pub fn encode_binary(value: crate::BinaryBody) -> EncodedBody {
     EncodedBody::binary(value)
 }
 
+/// Explicit decoder for APIs declared with `#[api(reqwest, client_error_hook)]` or an
+/// operation-level `client_error_hook = true` option.
+///
+/// There is deliberately no blanket `Deserialize` or `HttpError` bound: legacy client-only
+/// errors keep serde decoding without implementing this trait. Opted-in decoders receive the
+/// actual status/headers and bytes collected under the client's configured limit. Returning
+/// a failure does not imply anything about remote execution or authorize a new request.
+pub trait HttpClientError: Sized {
+    fn decode_error(response: &ReceivedResponse) -> Result<Self, ClientFailure>;
+}
+
 /// Response received under the configured byte limit. Its content is always redacted in Debug.
 pub struct ReceivedResponse {
     status: StatusCode,
@@ -492,6 +503,48 @@ pub struct ReceivedResponse {
 impl ReceivedResponse {
     pub fn status(&self) -> StatusCode {
         self.status
+    }
+
+    /// Borrow bytes already collected under the configured response limit.
+    pub fn body(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Require exactly one valid Content-Type header; ambiguous metadata must not select a codec.
+    pub fn content_type(&self) -> Result<&str, ClientFailure> {
+        let name = "content-type";
+        let mut values = self.headers.get_all(name).iter();
+        let value = values
+            .next()
+            .ok_or(ClientFailure::MissingResponseHeader { name })?;
+        if values.next().is_some() {
+            return Err(ClientFailure::DuplicateResponseHeader { name });
+        }
+        value
+            .to_str()
+            .map_err(|_| ClientFailure::InvalidResponseHeader { name })
+    }
+
+    /// Decode without promoting received data to a public projection or execution result.
+    /// Transport collection and contract budgets are enforced independently.
+    #[cfg(feature = "error-contract")]
+    pub fn decode_problem<D: error_contract::WireDetails>(
+        &self,
+        boundary: &impl crate::http::ApiBoundary<D>,
+        budget: error_contract::Budget,
+    ) -> error_contract::DecodeFailure<D> {
+        match self.content_type() {
+            Ok(content_type) => crate::http::decode_problem_response(
+                &self.bytes,
+                self.status.as_u16(),
+                content_type,
+                boundary,
+                budget,
+            ),
+            Err(_) => {
+                error_contract::DecodeFailure::Corrupt(error_contract::ContractError::Invalid)
+            }
+        }
     }
 
     pub fn parse_header<T>(&self, name: &'static str) -> Result<T, ClientFailure>
@@ -555,13 +608,32 @@ pub enum ClientFailure {
     Connect,
     Transport,
     Timeout,
-    ResponseTooLarge { limit: usize },
-    UnexpectedStatus { expected: u16, actual: u16 },
-    ErrorResponseDecode { status: u16 },
-    Decode { kind: DecodeKind },
-    MissingResponseHeader { name: &'static str },
-    DuplicateResponseHeader { name: &'static str },
-    InvalidResponseHeader { name: &'static str },
+    ResponseTooLarge {
+        limit: usize,
+    },
+    UnexpectedStatus {
+        expected: u16,
+        actual: u16,
+    },
+    ErrorResponseDecode {
+        status: u16,
+    },
+    /// A bounded, structurally valid error used an unsupported schema or reason.
+    UnsupportedErrorResponse {
+        status: u16,
+    },
+    Decode {
+        kind: DecodeKind,
+    },
+    MissingResponseHeader {
+        name: &'static str,
+    },
+    DuplicateResponseHeader {
+        name: &'static str,
+    },
+    InvalidResponseHeader {
+        name: &'static str,
+    },
     UnexpectedBody,
 }
 
@@ -586,6 +658,12 @@ impl fmt::Display for ClientFailure {
                 write!(
                     formatter,
                     "expected HTTP status {expected}, received {actual}"
+                )
+            }
+            Self::UnsupportedErrorResponse { status } => {
+                write!(
+                    formatter,
+                    "HTTP {status} error response contract was unsupported"
                 )
             }
             Self::ErrorResponseDecode { status } => {

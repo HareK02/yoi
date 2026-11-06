@@ -137,7 +137,10 @@ pub(crate) mod backend_job_upgrade;
 mod storage_formats;
 pub use backend_job_recovery_store::BackendJobReconciliation;
 
-const LATEST_SCHEMA_VERSION: i64 = 123;
+const LATEST_SCHEMA_VERSION: i64 = 124;
+const WORKER_CREATE_FAILURE_MIGRATION_NAME: &str =
+    "Worker create coordinator returned startup failure";
+pub(crate) const WORKER_CREATE_FAILURE_MAX_BYTES: usize = 32 * 1024;
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -519,6 +522,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 123,
         name: backend_job_upgrade::MIGRATION_NAME,
         apply: migrate_backend_job_execution_to_v123,
+    },
+    Migration {
+        version: 124,
+        name: WORKER_CREATE_FAILURE_MIGRATION_NAME,
+        apply: migrate_worker_create_failure_to_v124,
     },
 ];
 
@@ -16388,6 +16396,50 @@ fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn verify_worker_create_failure_schema(conn: &Connection) -> Result<()> {
+    let column = conn
+        .query_row(
+            "SELECT type, \"notnull\", dflt_value FROM pragma_table_info('worker_create_reservations') WHERE name='startup_failure_json'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, Option<String>>(2)?)),
+        )
+        .optional()?;
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='worker_create_reservations'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized: String = sql.chars().filter(|c| !c.is_whitespace()).collect();
+    let constraint = format!(
+        "CHECK(startup_failure_jsonISNULLOR(typeof(startup_failure_json)='text'ANDlength(CAST(startup_failure_jsonASBLOB))<={}))",
+        WORKER_CREATE_FAILURE_MAX_BYTES
+    );
+    if column != Some(("TEXT".into(), false, None)) || !normalized.contains(&constraint) {
+        return Err(Error::Store(
+            "Worker create startup failure column or byte bound is missing".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn migrate_worker_create_failure_to_v124(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 123 {
+        return Err(Error::Store(
+            "Worker create failure migration requires schema 123".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 123)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(124,?1)",
+        [WORKER_CREATE_FAILURE_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_backend_job_execution_to_v123(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 122 {
         return Err(Error::Store(
@@ -16537,6 +16589,8 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
     backend_job_upgrade::install_fresh(conn)?;
+    conn.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(conn)?;
     Ok(())
 }
 
@@ -16574,11 +16628,14 @@ fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure_from_sql(
-        conn,
-        &backend_job_upgrade::retained_checks(include_str!("latest_schema.sql")),
-        true,
-    )?;
+    // The pre-124 reference composition must not already contain the column
+    // added by migration 124. Fresh latest creation installs it after this prefix.
+    let retained_schema = backend_job_upgrade::retained_checks(include_str!("latest_schema.sql"))
+        .replace(
+            "            startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR\n                (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),\n",
+            "",
+        );
+    create_workspace_schema_structure_from_sql(conn, &retained_schema, true)?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
     conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
@@ -17671,6 +17728,10 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 #[path = "storage_owner_tests.rs"]
 mod storage_owner_tests;
+
+#[cfg(test)]
+#[path = "worker_create_failure_store_tests.rs"]
+mod worker_create_failure_store_tests;
 
 #[cfg(test)]
 #[path = "store_test_support.rs"]

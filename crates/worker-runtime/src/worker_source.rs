@@ -529,8 +529,8 @@ impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
 }
 
 #[cfg(feature = "http-server")]
-fn generated_workspace_response<T: serde::Serialize>(
-    response: Result<T, server_api::client_support::ClientError<server_api::RepositoryApiError>>,
+fn generated_workspace_response<T: serde::Serialize, E: serde::Serialize>(
+    response: Result<T, server_api::client_support::ClientError<E>>,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     match response {
         Ok(response) => Ok(WorkspaceResponse {
@@ -721,7 +721,19 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                         ),
                         WorkspaceServerOperation::WorkerControlSpawn(request) => {
                             generated_workspace_response(
-                                client.worker_control_spawn(workspace_id, request).await,
+                                client.worker_control_spawn(workspace_id, request).await.map_err(|error| match error {
+                                    server_api::client_support::ClientError::Public { status, error } => {
+                                        let error = match error.failure().cloned() {
+                                            // This already authenticated Worker control caller may
+                                            // receive the enum-only public startup cause. The domain
+                                            // allowlist reprojects it, never forwards upstream text.
+                                            Some(failure) => server_api::WorkerCreateApiError::startup(failure, &protocol::session_failure::SessionFailureVisibility { can_view_cause: true }),
+                                            None => error,
+                                        };
+                                        server_api::client_support::ClientError::Public { status, error }
+                                    }
+                                    other => other,
+                                }),
                             )
                         }
                         WorkspaceServerOperation::WorkerControlInput {

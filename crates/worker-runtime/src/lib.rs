@@ -31,6 +31,7 @@ mod session_material;
 mod session_public;
 mod session_retention;
 pub mod ssh_host_key_probe;
+mod startup_observation;
 pub mod worker_backend;
 pub mod worker_source;
 pub mod working_directory;

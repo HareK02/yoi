@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+pub mod startup;
+
 use std::collections::BTreeMap;
 
 use api_macros::api;
@@ -103,6 +105,9 @@ pub struct RuntimeApiError {
     pub error: RuntimeApiErrorDetail,
     #[serde(skip)]
     status: u16,
+    /// Local owner/normalized observations, never a second wire attachment.
+    #[serde(skip)]
+    create_failure: Option<startup::WorkerCreateFailure>,
 }
 
 /// Transient, allowlisted startup observations copied from the execution owner.
@@ -135,17 +140,36 @@ impl RuntimeApiError {
                 startup: None,
             },
             status,
+            create_failure: None,
         }
     }
 
     pub fn status(&self) -> u16 {
         self.status
     }
+
+    /// Retain owner-selected facts locally; the HTTP hook projects them afresh.
+    pub fn with_create_failure(mut self, failure: startup::WorkerCreateFailure) -> Self {
+        self.create_failure = Some(failure);
+        self
+    }
+
+    pub fn create_failure(&self) -> Option<&startup::WorkerCreateFailure> {
+        self.create_failure.as_ref()
+    }
+
+    pub fn into_create_failure(self) -> Option<startup::WorkerCreateFailure> {
+        self.create_failure
+    }
 }
 
 impl api_macros::HttpError for RuntimeApiError {
     fn status_code(&self) -> u16 {
         self.status
+    }
+
+    fn custom_response(&self) -> Option<api_macros::HttpErrorResponse> {
+        startup::http::runtime_error_response(self)
     }
 }
 
@@ -1305,7 +1329,7 @@ pub struct SubjectJobRemovalPurgeResponse {
     pub input_fingerprint: String,
 }
 
-#[api(reqwest, axum)]
+#[api(reqwest, axum, client_error_hook)]
 pub trait RuntimeApi {
     #[post("/v1/subject-job-removal-purge", status = 200, error_status = 400)]
     async fn purge_subject_job_removal(
@@ -1924,6 +1948,25 @@ mod tests {
         }
 
         async fn get_worker(&self, worker_id: String) -> Result<WorkerResponse, RuntimeApiError> {
+            if worker_id == "startup" {
+                use startup::*;
+                let failure = WorkerCreateFailure::from_cause(
+                    StartupCause::Session(
+                        protocol::session_failure::SessionRegistrationCause::denied(
+                            protocol::session_failure::SessionPrincipal::Subject,
+                        ),
+                    ),
+                    StartupOperationFacts {
+                        acceptance: CreationAcceptance::Unknown,
+                        execution: ExecutionOutcome::Unknown,
+                        finalize: None,
+                        backend_compensation: None,
+                        correlation: None,
+                    },
+                )
+                .unwrap();
+                return Err(test_error(500).with_create_failure(failure));
+            }
             assert_eq!(worker_id, "missing worker");
             Err(test_error(404))
         }
@@ -2232,6 +2275,34 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(error, client_support::ClientError::Public { status, .. } if status.as_u16() == 404)
+        );
+        let error = client.get_worker("startup".to_string()).await.unwrap_err();
+        let client_support::ClientError::Public { status, error } = error else {
+            panic!("expected a normalized public startup failure");
+        };
+        assert_eq!(status.as_u16(), 403);
+        assert_eq!(error.status(), 403);
+        let failure = error
+            .create_failure()
+            .expect("hook retains non-HTTP observations");
+        assert_eq!(
+            failure.operation().acceptance,
+            startup::CreationAcceptance::Unknown
+        );
+        let browser = failure
+            .problem(
+                startup::StartupBoundary::Browser,
+                &startup::SessionFailureVisibility {
+                    can_view_cause: true,
+                },
+                "",
+            )
+            .unwrap();
+        assert_eq!(browser.status, 409);
+        assert!(
+            std::str::from_utf8(browser.body())
+                .unwrap()
+                .contains("session.record")
         );
         server.abort();
     }

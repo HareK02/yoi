@@ -2326,6 +2326,7 @@ impl IntoResponse for RuntimeHttpWorkdirError {
 
 #[derive(Debug)]
 struct RuntimeHttpRestError {
+    create_failure: Option<runtime_api::startup::WorkerCreateFailure>,
     status: StatusCode,
     code: String,
     message: String,
@@ -2339,12 +2340,14 @@ impl RuntimeHttpRestError {
             code: code.into(),
             message: message.into(),
             startup: None,
+            create_failure: None,
         }
     }
 
     fn runtime(error: RuntimeError) -> Self {
         let status = status_for_runtime_error(&error);
         let code = code_for_runtime_error(&error);
+        let create_failure = error.create_failure();
         let startup = match &error {
             RuntimeError::WorkerExecutionRejected { result, .. } => startup_transfer(result),
             _ => None,
@@ -2359,6 +2362,7 @@ impl RuntimeHttpRestError {
             code,
             message,
             startup,
+            create_failure,
         }
     }
 
@@ -2391,6 +2395,13 @@ impl RuntimeHttpRestError {
 
 impl IntoResponse for RuntimeHttpRestError {
     fn into_response(self) -> Response {
+        if let Some(failure) = self.create_failure {
+            return runtime_api::server_support::http_error_response(
+                self.status,
+                runtime_api::RuntimeApiError::new(self.status.as_u16(), self.code, self.message)
+                    .with_create_failure(failure),
+            );
+        }
         let body = RuntimeHttpErrorResponse {
             error: RuntimeHttpErrorDetail {
                 code: self.code,
@@ -2422,6 +2433,7 @@ fn startup_transfer(
 
 fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
     match error {
+        RuntimeError::WorkerCreateFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
@@ -2531,6 +2543,7 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::ExecutionBackendUnavailable { .. } => {
             "execution_backend_unavailable".to_string()
         }
+        RuntimeError::WorkerCreateFailed { .. } => "worker_create_failed".to_string(),
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected".to_string(),
         RuntimeError::WorkspaceOwnerMismatch { .. } => "workspace_owner_mismatch".to_string(),
         RuntimeError::LimitTooLarge { .. } => "limit_too_large".to_string(),

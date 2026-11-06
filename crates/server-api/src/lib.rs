@@ -1,4 +1,6 @@
 #![doc = include_str!("../README.md")]
+mod worker_create_error;
+pub use worker_create_error::WorkerCreateApiError;
 
 use std::collections::BTreeMap;
 
@@ -1907,7 +1909,9 @@ pub trait ServerApi {
         "/api/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1915,7 +1919,7 @@ pub trait ServerApi {
         &self,
         #[extension] context: ServerRequestContext,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
 
     #[get(
         "/api/w/{workspace_id}/orchestrator",
@@ -1973,7 +1977,8 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/worker-control/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        client_error_hook = true,
         openapi = false,
     )]
     async fn worker_control_spawn(
@@ -1981,7 +1986,7 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
     #[post(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
         status = 200,
@@ -2098,7 +2103,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -2107,7 +2114,7 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
 
     #[get(
         "/api/w/{workspace_id}/workers/{worker_ref}",
@@ -11099,6 +11106,7 @@ pub struct BrowserWorkspaceOrchestratorResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerOperationState {
+    Unknown,
     Accepted,
     Unsupported,
     Rejected,
