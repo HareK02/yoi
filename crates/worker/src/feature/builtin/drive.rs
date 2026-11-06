@@ -31,6 +31,7 @@ pub(crate) mod delegation;
 pub mod failure;
 #[cfg(test)]
 mod tests;
+pub mod tool_failure;
 pub mod wip;
 #[cfg(test)]
 mod wip_tests;
@@ -133,6 +134,7 @@ impl DriveFeature {
                         Arc::new(DriveTool {
                             feature: feature.clone(),
                             name: spec.name,
+                            failure_operation: spec.failure_operation,
                         }) as Arc<dyn Tool>,
                     )
                 });
@@ -460,6 +462,7 @@ impl DriveOutput {
 struct DriveTool {
     feature: DriveFeature,
     name: &'static str,
+    failure_operation: failure::DriveClientFailureOperation,
 }
 #[async_trait]
 impl Tool for DriveTool {
@@ -468,21 +471,12 @@ impl Tool for DriveTool {
         input: &str,
         context: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
+        let request_id = self.feature.request_id(&context);
         self.feature
             .execute(self.name, input, &context, None)
             .await
-            .map_err(tool_error)?
+            .map_err(|error| tool_failure::tool_error(self.failure_operation, error, &request_id))?
             .tool(self.name)
-    }
-}
-fn tool_error(error: DriveError) -> ToolError {
-    match error {
-        DriveError::Conflict => ToolError::StructuredConflict {
-            code: "drive_conflict".into(),
-            message: error.to_string(),
-        },
-        DriveError::Invalid(_) | DriveError::Limit => ToolError::InvalidArgument(error.to_string()),
-        _ => ToolError::ExecutionFailed(error.to_string()),
     }
 }
 impl FeatureModule for DriveFeature {
@@ -654,6 +648,7 @@ fn mutation_value(response: DriveMutationResponse) -> Value {
 pub(super) struct Spec {
     pub name: &'static str,
     pub operation: &'static str,
+    pub failure_operation: failure::DriveClientFailureOperation,
     pub description: &'static str,
     pub schema: fn() -> Value,
 }
@@ -663,84 +658,98 @@ fn schema<T: JsonSchema>() -> Value {
 pub(super) const SPECS: &[Spec] = &[
     Spec {
         name: "DriveRoot",
+        failure_operation: failure::DriveClientFailureOperation::Root,
         operation: "root",
         description: "Discover the authorized Workspace Drive root. Profile activation is not a grant; no Workdir is required.",
         schema: schema::<EmptyArgs>,
     },
     Spec {
         name: "DriveMetadata",
+        failure_operation: failure::DriveClientFailureOperation::Metadata,
         operation: "metadata",
         description: "Inspect one Workspace-bound stable entry ID and retain its last committed request for mutation checks.",
         schema: schema::<EntryArgs>,
     },
     Spec {
         name: "DriveList",
+        failure_operation: failure::DriveClientFailureOperation::List,
         operation: "list",
         description: "List a bounded folder page (default root), up to 200 entries. Results do not expand the WIP tree or establish mutation preconditions.",
         schema: schema::<ListArgs>,
     },
     Spec {
         name: "DriveSearch",
+        failure_operation: failure::DriveClientFailureOperation::Search,
         operation: "search",
         description: "Search names and optionally bounded text through Backend paged search; no embedding/index. Use the returned cursor to continue.",
         schema: schema::<DriveSearchQuery>,
     },
     Spec {
         name: "DriveRead",
+        failure_operation: failure::DriveClientFailureOperation::Read,
         operation: "read",
         description: "Read up to 64 KiB UTF-8 text and retain the entry’s last committed request. Past Session text remains an immutable observation.",
         schema: schema::<ReadArgs>,
     },
     Spec {
         name: "DriveCreateFolder",
+        failure_operation: failure::DriveClientFailureOperation::CreateFolder,
         operation: "create_folder",
         description: "Create a folder through the explicit Drive write grant. Same-name conflicts are not overwritten.",
         schema: schema::<FolderArgs>,
     },
     Spec {
         name: "DriveCreateText",
+        failure_operation: failure::DriveClientFailureOperation::CreateText,
         operation: "create_text",
         description: "Create bounded UTF-8 text (default Markdown), <=64 KiB. Success means DB publication committed.",
         schema: schema::<CreateArgs>,
     },
     Spec {
         name: "DriveWrite",
+        failure_operation: failure::DriveClientFailureOperation::UpdateText,
         operation: "write",
         description: "Replace <=64 KiB text using a previously observed committed request. Conflicts are not retried with a newer observation.",
         schema: schema::<WriteArgs>,
     },
     Spec {
         name: "DriveEdit",
+        failure_operation: failure::DriveClientFailureOperation::UpdateText,
         operation: "edit",
         description: "Partial text edit using previously observed committed request and shared old_string rules. Require nonempty unique match unless replace_all. Truncated preimages cannot be edited.",
         schema: schema::<EditArgs>,
     },
     Spec {
         name: "DriveRelocate",
+        failure_operation: failure::DriveClientFailureOperation::Relocate,
         operation: "relocate",
         description: "Rename and/or move an observed entry only if its last committed request still matches the observation; stable ID and URL remain unchanged.",
         schema: schema::<RelocateArgs>,
     },
     Spec {
         name: "DriveDelete",
+        failure_operation: failure::DriveClientFailureOperation::Delete,
         operation: "delete",
         description: "Delete one observed entry only if its last committed request still matches the observation. A recreated name has a different ID; stale observations cannot target it.",
         schema: schema::<EntryArgs>,
     },
     Spec {
         name: "DriveViewImage",
+        failure_operation: failure::DriveClientFailureOperation::Bytes,
         operation: "view_image",
         description: "Attach committed-request-bound PNG/JPEG/GIF/WebP bytes (<=10 MiB) through durable ToolOutput history/capture; a URL alone is not image viewing.",
         schema: schema::<EntryArgs>,
     },
     Spec {
         name: "DriveSaveWorkdir",
+        failure_operation: failure::DriveClientFailureOperation::Upload,
         operation: "save_workdir",
         description: "Publish a <=16 MiB artifact using selected Workdir alias and logical path plus Drive parent/name. Both source read and destination write are required. No Bash/raw host path/base64 input.",
         schema: schema::<SaveArgs>,
     },
     Spec {
         name: "DriveRequestStatus",
+        failure_operation: failure::DriveClientFailureOperation::RequestStatus,
         operation: "request_status",
         description: "Query the same mutation request ID after OutcomeUnknown. Uncommitted snapshot is not proof of failure; never blindly recreate the request.",
         schema: schema::<StatusArgs>,

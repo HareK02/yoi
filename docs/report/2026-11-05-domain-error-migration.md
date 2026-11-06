@@ -18,7 +18,7 @@ T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/client�
 | Workdir deferred open / cleanup | `DeferredWorkdirSession` はopener task失敗、open失敗、identity mismatchを区別。失敗したcloseの所有者も保持する | openerは `Result<WorkdirSessionHandle, String>` のため、より具体的な原因は現契約から証明できない。identity mismatch後のcleanup理由はログだけ。元原因をcleanupで置換せず、別の副次結果として接続する作業が残る。 |
 | Workdir removal | `WorkdirRemovalOperation`、request fingerprint、attempt、disposition、failure category、既存reconciliation | `workdir_removal_response`、Web `workdir-removal.ts`、Worker lifecycle Tool。復旧は観測のみで削除を再実行しない。Backend/Worker/Webの説明表はdomain説明へ集約するが、結果・再実行条件はこの正本を利用する。 |
 | Drive storage / HTTP | `workspace_drive::failure::DriveFailure` が9variantの元errorを保持し、closed operation/reasonを共通coreへ投影する。metadata/receiptは既存同一transactionのまま | 実storageでconflict/CAS/grant/replay/fence/SQLite障害からcodecまで検証した。`server_drive.rs::domain_error` はまだ既存公開codeへ縮退し、共通HTTP/Toolへの接続は未完。storage原因はremote更新の確定/Unknownを証明しない。 |
-| Drive Worker / Tool | `DriveClientFailure` が実 `DriveError` を保持し、`workspace_drive_client` のclosed operation/reasonへ投影する | 既存Unavailable/Unknownから細かいtransport理由を捏造しない。Unknownの元request IDはlocal sourceに保持し、同ID照会と非再送を維持する。実Tool入口から共通envelopeへの接続は残る。 |
+| Drive Worker / Tool | `DriveClientFailure` が実 `DriveError` を保持し、`workspace_drive_client` のclosed operation/reasonへ投影する | 既存Unavailable/Unknownから細かいtransport理由を捏造しない。登録Tool入口を共有execution_failureへ接続し、元class/codeとUnknownの元Host request IDは原因と独立したresultへ保持する。既存Store再openとモデル入力の詳細枝刈り後もsummaryに元ID・非再送案内を残す。native WIP・HTTP・背景は別の未完接続。 |
 | config owner採用 | `ConfigurationFailure` が現 `ConfigTreeError` 15variantのsourceと、採用決定点のcatalog/head/export/source/owner/request理由を保持する | source helper、実SQLite採用、owner HTTPのsource/preview/adopt/reconcileへ接続した。非active/drainingもHTTPの決定点で付ける。T-838のwriter/transaction/receiptは変更せず、HTTP分類はtyped reasonから決定する。formatterのString診断、policy/contentの未型付け原因、共通応答/表示への接続は残る。 |
 | config Worker論理tree | `ConfigFailure` はBackend決定点のoperation/stage/reasonと元 `WipOperationError` を保持し、`workspace_config_client` へ投影する | content/attachment/Workdir管理の既存callerは元WIP結果へ明示変換する。Unknown/非再送、CAS、scope/connection再確認を維持するが、この旧経路だけの試験をowner採用の証拠にしない。T-814結果境界への最終接続は残る。 |
 | 内部 / 背景 | Drive maintenance、config採用後のRuntime publication、既存Job/Service結果 | configのpublicationはcommit後best effortで失敗を返却/保存していない。採用receiptをrollback/Unknownへ変更せず、T-814の共有保存/照会方式へ副次失敗を接続する。別ledgerは作らない。 |
@@ -127,6 +127,16 @@ WorkerのHost認可応答は、T-812の生成clientとは別の `WorkspaceClient
 - 最初のcaptureは共有fixtureの現permission field欠落で失敗した。製品の認可を変更せず、他の既存review harness同様に合成workspace応答へ `delete_subjects` fieldを補った。失敗artifactも保持し、成功画像と混同しない。旧表示がbodyをcancelする期待ERR_ABORTEDは変更前の当該mutationだけに限定して診断する。
 
 このcheckpointはRepository構成全域・Workdir・Drive/config・実Tool/history・背景正本保存再読・監査/cleanup副次結果の完了や正式reviewを示さない。広域Rustの追加再buildは容量上の親判断で一時繰延べ、既成功の未変更検証を重複実行しない。生成物変更と検証影響は最終候補で再評価する。
+
+## Drive登録Toolから既存Session履歴への接続checkpoint
+
+`bb4caeaaa` 後のslice。Tool登録factoryは実 `DriveBackend` を呼び、発生した `DriveError` を原sourceごと `DriveClientFailure` に保持してT-814の `tools::failure::execution_failure` へ渡す。closed resultの元class/codeとmutation観測は説明文から独立し、Unknownには当該Host callの64桁request IDだけを許す。具体的原因は既存Toolでも公開されていた当該callのenumに限り、保存causeや別resourceの可視性を昇格させない。provider本文・path・grant・raw認可本文は入れない。
+
+- `cargo test -p worker --lib feature::builtin::drive`: 66成功、exit 0、`target/t815-evidence/drive-tool-all-tests.log`。既存debug target、通常feature。HTTP応答喪失/期限超過/Unknown/CAS/権限境界もこの範囲で回帰確認した。
+- 詳細枝刈りassert追加後の `cargo test -p worker --lib registered_failure_contract`: 3成功、exit 0、build 30.4秒、`target/t815-evidence/drive-registered-history-tests-final.log`。production変更は上記66成功時と同一。新3テストは登録factory→本番backend→共有result→実WorkerSessionStore append/reopen→モデル入力cloneの `agen::prune::project` を接続する。代替はWorkspace transportのみで、mutation persistence自体の保証は既存real-HTTP試験と区別する。
+- Unknownは元POST1回・同ID照合1回のまま。Uncommitted snapshotを未実行とせず、枝刈り後summaryも元request ID・非再送案内・error dispositionを保持する。拒否はdata dispatchなし、競合code/class保持、説明変更で結果状態を変更せず、履歴正本のcontentを枝刈りしないことを確認した。
+
+このsliceはDrive native WIP、全HTTP/Web、背景store/query、Workdir/config経路や正式reviewの完了を示さない。既成功の未変更Server/root検証は再実行していない。測定時の空き47GiB、当checkout `target/debug` 約43GiB・`target/t815` 約16GiB。追加cleanや全体並列設定変更はしていない。
 
 ## 並行変更との結合点
 

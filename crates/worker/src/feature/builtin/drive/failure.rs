@@ -21,7 +21,7 @@
 //! reconciliation results. Recover the original error with `source_error` or
 //! `into_source` and follow the existing caller result and original-request receipt
 //! protocol. This adapter does not authorize, call, retry or reconcile an operation.
-//! T-814 owns integration with shared Tool/Job/Service boundaries and persistence.
+//! Shared Tool/Job/Service adapters belong to T-814; domain caller connections live here.
 
 use error_contract::{
     Browser, Category, ContractError, Disclosure, FailureCause, FailureFacts, FailureIdentity,
@@ -300,7 +300,9 @@ impl FailureCause for DriveClientFailure {
 }
 
 /// Boundary-supplied current Drive/resource AND diagnostic visibility, including
-/// on every reread. Not a cached grant or serialized capability. All audiences
+/// on every reread. The registered Tool may disclose its own current attempt
+/// through its explicit enum-only public-error policy, not another resource
+/// observation or a stored error. Not a cached grant or serialized capability. All audiences
 /// default to denial, including Storage and Telemetry.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DriveClientFailureVisibility {

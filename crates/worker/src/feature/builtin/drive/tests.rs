@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 
 #[path = "failure/client_tests.rs"]
 mod failure_projection;
+#[path = "tool_failure_tests.rs"]
+mod registered_failure_contract;
 
 #[derive(Debug)]
 struct Client {
