@@ -94,11 +94,14 @@ impl Harness {
             runtime: Runtime::new_memory(),
             local_token: None,
             workspace_auth: Some(Arc::new(workspace_test_auth(vec![trust.clone()]))),
+            closed_workdir_sessions: Default::default(),
             workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
                 "session-transport".into(),
                 RuntimeHttpWorkdirSession {
                     owner: RuntimeWorkspaceScope::new("workspace-a", "https://backend.test"),
                     session: session.clone(),
+                    owner_worker_id: None,
+                    operations: Default::default(),
                     close_attempt: None,
                 },
             )]))),

@@ -89,7 +89,10 @@ async fn remote_environment_matches_scoped_readonly_operations_without_rebasing_
             format!("http://{address}").parse().unwrap(),
             "fixture",
             session.workdir().id().clone(),
-            OpenWorkdirSessionRequest::default(),
+            OpenWorkdirSessionRequest {
+                session_id: WorkdirSessionId::new("environment-session").unwrap(),
+                owner_worker_id: None,
+            },
         )
         .await
         .unwrap(),

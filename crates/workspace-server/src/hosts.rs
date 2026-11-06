@@ -33,7 +33,7 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 use workdir::{
@@ -113,6 +113,40 @@ where
             .join()
             .expect("blocking HTTP thread panicked"),
         Err(_) => operation(),
+    }
+}
+
+fn close_abandoned_remote_sessions(
+    sessions: workdir::http::RemoteWorkdirSessionRegistry,
+    workdir_id: String,
+    timeout: Duration,
+) -> Result<(), WorkdirError> {
+    run_blocking_http(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| WorkdirError::Unavailable(error.to_string()))?
+            .block_on(async move {
+                tokio::time::timeout(timeout, sessions.close_abandoned(&workdir_id))
+                    .await
+                    .map_err(|_| {
+                        WorkdirError::Unavailable(
+                            "Workdir session cleanup is still unconfirmed".into(),
+                        )
+                    })?
+            })
+    })
+}
+
+fn unconfirmed_workdir_session_cleanup(error: WorkdirError) -> RuntimeWorkingDirectoryResult {
+    RuntimeWorkingDirectoryResult {
+        state: InternalWorkerOperationState::Rejected,
+        working_directory: None,
+        diagnostics: vec![diagnostic(
+            "working_directory_session_close_unconfirmed",
+            HostDiagnosticSeverity::Error,
+            error.to_string(),
+        )],
     }
 }
 
@@ -1034,6 +1068,10 @@ impl RuntimePingFailure {
 pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn runtime_id(&self) -> &str;
 
+    fn workdir_session_recovery(&self) -> Option<workdir::http::RemoteWorkdirSessionRegistry> {
+        None
+    }
+
     fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary;
 
     fn ping(&self) -> Result<RuntimeHttpPingResponse, RuntimePingFailure> {
@@ -1203,6 +1241,15 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 "Runtime does not expose Workdir operation sessions".to_string(),
             ))
         })
+    }
+
+    fn open_owned_workdir_session<'a>(
+        &'a self,
+        workdir_id: &'a str,
+        owner_worker_id: Option<&'a str>,
+        _owner: workdir::http::RemoteWorkdirSessionOwner,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkdirSessionHandle, WorkdirError>> + Send + 'a>> {
+        self.open_workdir_session(workdir_id, owner_worker_id)
     }
 
     fn cleanup_working_directory(
@@ -1665,6 +1712,8 @@ type RuntimeBindingGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct RuntimeRegistry {
     runtimes: Arc<RwLock<Vec<Arc<dyn WorkspaceWorkerRuntime>>>>,
     runtime_binding_gate: Arc<RwLock<Option<RuntimeBindingGate>>>,
+    retired_workdir_session_owners:
+        Arc<Mutex<Vec<(String, workdir::http::RemoteWorkdirSessionRegistry)>>>,
 }
 
 impl RuntimeRegistry {
@@ -1672,6 +1721,7 @@ impl RuntimeRegistry {
         Self {
             runtimes: Arc::new(RwLock::new(runtimes)),
             runtime_binding_gate: Arc::new(RwLock::new(None)),
+            retired_workdir_session_owners: Default::default(),
         }
     }
 
@@ -1720,6 +1770,21 @@ impl RuntimeRegistry {
             .runtimes
             .write()
             .expect("runtime registry lock poisoned");
+        let mut retired = self
+            .retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned");
+        for existing in runtimes
+            .iter()
+            .filter(|existing| existing.runtime_id() == runtime_id)
+        {
+            if let Some(sessions) = existing.workdir_session_recovery() {
+                if !sessions.is_empty() {
+                    retired.push((runtime_id.clone(), sessions));
+                }
+            }
+        }
+        retired.retain(|(_, sessions)| !sessions.is_empty());
         runtimes.retain(|existing| existing.runtime_id() != runtime_id);
         runtimes.push(runtime);
     }
@@ -1751,6 +1816,21 @@ impl RuntimeRegistry {
             .write()
             .expect("runtime registry lock poisoned");
         let before = runtimes.len();
+        let mut retired = self
+            .retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned");
+        for existing in runtimes
+            .iter()
+            .filter(|existing| existing.runtime_id() == runtime_id)
+        {
+            if let Some(sessions) = existing.workdir_session_recovery() {
+                if !sessions.is_empty() {
+                    retired.push((runtime_id.to_owned(), sessions));
+                }
+            }
+        }
+        retired.retain(|(_, sessions)| !sessions.is_empty());
         runtimes.retain(|runtime| runtime.runtime_id() != runtime_id);
         if runtimes.len() == before {
             Ok(RuntimeRegistryUnregisterResult::NotFound)
@@ -2131,6 +2211,50 @@ impl RuntimeRegistry {
             })
     }
 
+    pub async fn open_owned_workdir_session(
+        &self,
+        runtime_id: &str,
+        workdir_id: &str,
+        owner_worker_id: Option<&str>,
+        owner: workdir::http::RemoteWorkdirSessionOwner,
+    ) -> Result<WorkdirSessionHandle, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("working_directory_id", workdir_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .open_owned_workdir_session(workdir_id, owner_worker_id, owner)
+            .await
+            .map_err(|error| RuntimeRegistryError::WorkdirSessionOpenFailed {
+                runtime_id: runtime_id.into(),
+                transport: workdir::http::WorkdirTransportError::from_workdir_error(&error),
+            })
+    }
+
+    pub async fn close_owned_workdir_sessions(
+        &self,
+        worker: &RuntimeWorkerRef,
+        connection_id: Option<&str>,
+    ) -> Result<(), WorkdirError> {
+        let mut sessions = self
+            .runtimes_snapshot()
+            .into_iter()
+            .filter_map(|runtime| runtime.workdir_session_recovery())
+            .collect::<Vec<_>>();
+        sessions.extend(
+            self.retired_workdir_session_owners
+                .lock()
+                .expect("retired Workdir session owners poisoned")
+                .iter()
+                .map(|(_, sessions)| sessions.clone()),
+        );
+        for sessions in sessions {
+            sessions
+                .close_owned(&worker.runtime_id, &worker.worker_id, connection_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub fn cleanup_working_directory(
         &self,
         runtime_id: &str,
@@ -2139,6 +2263,27 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("working_directory_id", working_directory_id)?;
         let runtime = self.runtime(runtime_id)?;
+        let retired = self
+            .retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned")
+            .iter()
+            .filter(|(owner, _)| owner == runtime_id)
+            .map(|(_, sessions)| sessions.clone())
+            .collect::<Vec<_>>();
+        for sessions in retired {
+            if let Err(error) = close_abandoned_remote_sessions(
+                sessions,
+                working_directory_id.to_owned(),
+                Duration::from_secs(30),
+            ) {
+                return Ok(unconfirmed_workdir_session_cleanup(error));
+            }
+        }
+        self.retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned")
+            .retain(|(_, sessions)| !sessions.is_empty());
         Ok(runtime.cleanup_working_directory(working_directory_id))
     }
 
@@ -4641,6 +4786,7 @@ pub struct RemoteWorkerRuntime {
     http: BlockingHttpClient,
     async_http: AsyncHttpClient,
     request_timeout: Duration,
+    workdir_sessions: workdir::http::RemoteWorkdirSessionRegistry,
 }
 
 fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static str {
@@ -4850,6 +4996,7 @@ impl RemoteWorkerRuntime {
             http,
             async_http,
             request_timeout: timeout,
+            workdir_sessions: Default::default(),
         })
     }
 
@@ -4863,6 +5010,16 @@ impl RemoteWorkerRuntime {
         working_directory_id: &str,
         owner_worker_id: Option<&str>,
     ) -> Result<RemoteWorkdirSession, WorkdirError> {
+        self.open_owned_session(working_directory_id, owner_worker_id, None)
+            .await
+    }
+
+    async fn open_owned_session(
+        &self,
+        working_directory_id: &str,
+        owner_worker_id: Option<&str>,
+        owner: Option<workdir::http::RemoteWorkdirSessionOwner>,
+    ) -> Result<RemoteWorkdirSession, WorkdirError> {
         let base_url = Url::parse(&self.base_url)
             .map_err(|error| WorkdirError::InvalidArgument(error.to_string()))?;
         let workdir_id = Workdir::new(working_directory_id).id().clone();
@@ -4871,16 +5028,20 @@ impl RemoteWorkerRuntime {
                 workspace_authorization: self.workspace_authorization.clone(),
                 fallback_bearer_token: self.bearer_token.clone(),
             });
-        RemoteWorkdirSession::open_with_authorization(
-            self.async_http.clone(),
-            base_url,
-            authorization,
-            workdir_id,
-            OpenWorkdirSessionRequest {
-                owner_worker_id: owner_worker_id.map(str::to_string),
-            },
-        )
-        .await
+        self.workdir_sessions
+            .open_with_authorization(
+                self.async_http.clone(),
+                base_url,
+                authorization,
+                workdir_id,
+                OpenWorkdirSessionRequest {
+                    owner_worker_id: owner_worker_id.map(str::to_string),
+                    ..Default::default()
+                },
+                self.request_timeout,
+                owner,
+            )
+            .await
     }
 
     fn runtime_api_client(
@@ -5368,6 +5529,9 @@ impl RemoteWorkerRuntime {
 }
 
 impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
+    fn workdir_session_recovery(&self) -> Option<workdir::http::RemoteWorkdirSessionRegistry> {
+        Some(self.workdir_sessions.clone())
+    }
     fn runtime_id(&self) -> &str {
         &self.runtime_id
     }
@@ -5884,10 +6048,31 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         })
     }
 
+    fn open_owned_workdir_session<'a>(
+        &'a self,
+        workdir_id: &'a str,
+        owner_worker_id: Option<&'a str>,
+        owner: workdir::http::RemoteWorkdirSessionOwner,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkdirSessionHandle, WorkdirError>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(Arc::new(
+                self.open_owned_session(workdir_id, owner_worker_id, Some(owner))
+                    .await?,
+            ) as WorkdirSessionHandle)
+        })
+    }
+
     fn cleanup_working_directory(
         &self,
         working_directory_id: &str,
     ) -> RuntimeWorkingDirectoryResult {
+        if let Err(error) = close_abandoned_remote_sessions(
+            self.workdir_sessions.clone(),
+            working_directory_id.to_owned(),
+            self.request_timeout,
+        ) {
+            return unconfirmed_workdir_session_cleanup(error);
+        }
         match self.delete_json::<RuntimeHttpWorkingDirectoryResponse>(&format!(
             "/v1/working-directories/{working_directory_id}"
         )) {

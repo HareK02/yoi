@@ -1,7 +1,10 @@
 //! Backend registry/current-attachment/WorkerRemove integration with authenticated
 //! Runtime HTTP sessions and real Git materializer resource leases. Only Worker
-//! execution and the failing/held close transport are replaced. Ordinary library
-//! tests use LaunchFixture's isolated SQLite, materializations and loopback Runtime.
+//! execution and the failing/held transport are replaced. Attachment/operation
+//! cases invoke production Backend handlers with middleware-resolved Worker headers;
+//! Backend-to-Runtime requests still traverse real workspace authentication.
+//! Ordinary library tests use LaunchFixture's isolated SQLite, materializations
+//! and loopback Runtime.
 use super::ticket_worker_launch_tests::LaunchFixture;
 use super::*;
 use std::{future::Future, task::Poll};
@@ -80,10 +83,20 @@ enum CloseFault {
     RejectAfterRuntimeClose,
 }
 
+#[derive(Clone, Copy)]
+enum OpenFault {
+    RejectAfterRuntimeOpen,
+    HoldAfterRuntimeOpen,
+}
+
 struct CloseTransport {
     upstream: String,
     client: reqwest::Client,
     fault: Mutex<Option<CloseFault>>,
+    open_fault: Mutex<Option<OpenFault>>,
+    runtime_opens: Mutex<Vec<workdir::http::OpenWorkdirSessionResponse>>,
+    opened: Notify,
+    open_release: Semaphore,
     attempts: Mutex<Vec<String>>,
     runtime_closes: Mutex<Vec<(String, StatusCode)>>,
     direct_runtime: Mutex<Option<Router>>,
@@ -98,6 +111,14 @@ impl CloseTransport {
         let is_close = request.method() == Method::DELETE
             && request.uri().path().starts_with("/v1/workdir-sessions/");
         let path = request.uri().path().to_owned();
+        let is_open = request.method() == Method::POST
+            && path.starts_with("/v1/working-directories/")
+            && path.ends_with("/sessions");
+        let open_fault = if is_open {
+            state.open_fault.lock().unwrap().take()
+        } else {
+            None
+        };
         let fault = if is_close {
             state.attempts.lock().unwrap().push(path.clone());
             state.fault.lock().unwrap().take()
@@ -149,6 +170,23 @@ impl CloseTransport {
         let status = response.status();
         let headers = response.headers().clone();
         let bytes = response.bytes().await.unwrap();
+        if is_open && status.is_success() {
+            state
+                .runtime_opens
+                .lock()
+                .unwrap()
+                .push(serde_json::from_slice(&bytes).expect("real Runtime OPEN response"));
+            state.opened.notify_one();
+            match open_fault {
+                Some(OpenFault::RejectAfterRuntimeOpen) => {
+                    return StatusCode::BAD_GATEWAY.into_response();
+                }
+                Some(OpenFault::HoldAfterRuntimeOpen) => {
+                    state.open_release.acquire().await.unwrap().forget();
+                }
+                None => {}
+            }
+        }
         if is_close {
             state.runtime_closes.lock().unwrap().push((path, status));
         }
@@ -217,6 +255,10 @@ impl Fixture {
                 .build()
                 .unwrap(),
             fault: Mutex::new(None),
+            open_fault: Mutex::new(None),
+            runtime_opens: Mutex::new(Vec::new()),
+            opened: Notify::new(),
+            open_release: Semaphore::new(0),
             attempts: Mutex::new(Vec::new()),
             runtime_closes: Mutex::new(Vec::new()),
             direct_runtime: Mutex::new(None),
@@ -298,6 +340,193 @@ impl Fixture {
         .await
         .unwrap();
         RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+    }
+
+    fn worker_headers(worker: &RuntimeWorkerRef) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-yoi-runtime-id", worker.runtime_id.parse().unwrap());
+        headers.insert("x-yoi-worker-id", worker.worker_id.parse().unwrap());
+        headers
+    }
+
+    async fn attach(&self, worker: &RuntimeWorkerRef, alias: &str) -> WorkerWorkdirLinkRecord {
+        self.attach_workdir(worker, alias, &self.workdir_id).await
+    }
+
+    async fn attach_workdir(
+        &self,
+        worker: &RuntimeWorkerRef,
+        alias: &str,
+        workdir_id: &str,
+    ) -> WorkerWorkdirLinkRecord {
+        let Json(response) = scoped_attach_current_worker_workdir(
+            State(self.api().clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            Self::worker_headers(worker),
+            Json(AttachCurrentWorkerWorkdirRequest {
+                alias: alias.into(),
+                working_directory_id: workdir_id.to_owned(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(response.attached);
+        assert_eq!(response.alias, alias);
+        self.api()
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, worker)
+            .unwrap()
+            .into_iter()
+            .find(|link| link.alias == alias && link.unlinked_at.is_none())
+            .expect("production attach persisted its live connection")
+    }
+
+    async fn detach(&self, link: &WorkerWorkdirLinkRecord) {
+        let Json(response) = scoped_detach_current_worker_workdir(
+            State(self.api().clone()),
+            AxumPath((TEST_WORKSPACE_ID.into(), link.alias.clone())),
+            Self::worker_headers(&link.worker),
+            server_api::CurrentWorkerWorkdirDetachQuery {
+                expected_connection_id: Some(link.connection_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!response.attached);
+        assert!(
+            self.api()
+                .store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &link.worker)
+                .unwrap()
+                .iter()
+                .all(|saved| saved.connection_id != link.connection_id
+                    || saved.unlinked_at.is_some())
+        );
+    }
+
+    async fn operation(
+        &self,
+        link: &WorkerWorkdirLinkRecord,
+        operation: WorkdirSessionOperation,
+    ) -> WorkdirSessionOperationResult {
+        let Json(result) = scoped_execute_current_worker_workdir_operation(
+            State(self.api().clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            Self::worker_headers(&link.worker),
+            Json(WorkspaceWorkdirSessionOperationRequest {
+                target_workdir: link.alias.clone(),
+                operation,
+            }),
+        )
+        .await
+        .unwrap();
+        result
+    }
+
+    async fn stat_attachment(&self, link: &WorkerWorkdirLinkRecord) {
+        let result = self
+            .operation(
+                link,
+                WorkdirSessionOperation::Stat(workdir::StatRequest {
+                    path: workdir::WorkdirPath::new("README.md").unwrap(),
+                }),
+            )
+            .await;
+        assert!(matches!(result, WorkdirSessionOperationResult::Stat(_)));
+    }
+
+    async fn complete_command(&self, link: &WorkerWorkdirLinkRecord) -> CommandHandle {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let result = self
+                .operation(
+                    link,
+                    WorkdirSessionOperation::CommandStart(workdir::CommandRequest {
+                        command: "printf lifecycle".into(),
+                        timeout_secs: 5,
+                        transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+                        cwd: workdir::WorkdirPath::root(),
+                        tool_call_id: None,
+                    }),
+                )
+                .await;
+            let WorkdirSessionOperationResult::CommandStart(handle) = result else {
+                panic!("command start returned {result:?}");
+            };
+            let mut cursor = 0;
+            let mut stdout = Vec::new();
+            loop {
+                let result = self
+                    .operation(
+                        link,
+                        WorkdirSessionOperation::CommandOutput(workdir::CommandOutputRequest {
+                            handle: handle.clone(),
+                            cursor,
+                            limit: workdir::MAX_COMMAND_READ_BYTES,
+                            wait: true,
+                        }),
+                    )
+                    .await;
+                let WorkdirSessionOperationResult::CommandOutput(page) = result else {
+                    panic!("command output returned {result:?}");
+                };
+                for chunk in &page.chunks {
+                    assert_eq!(chunk.stream, workdir::CommandStream::Stdout);
+                    stdout.extend_from_slice(&chunk.bytes);
+                }
+                cursor = page.next_cursor;
+                if let Some(terminal) = page.terminal {
+                    assert_eq!(terminal.status, workdir::CommandStatus::Completed);
+                    assert_eq!(terminal.exit_code, Some(0));
+                    assert_eq!(stdout, b"lifecycle");
+                    break;
+                }
+            }
+            handle
+        })
+        .await
+        .expect("bounded command delivery through production Backend handler")
+    }
+
+    async fn remove_worker(&self, worker: &RuntimeWorkerRef) {
+        self.api()
+            .runtime
+            .stop_worker(
+                worker,
+                WorkerLifecycleRequest {
+                    stop_intent: None,
+                    reason: Some("prepare removal".into()),
+                    ticket_assignment: None,
+                },
+            )
+            .unwrap();
+        let summary = self.api().runtime.worker(worker).unwrap();
+        assert_eq!(summary.state, "stopped");
+        sync_worker_observation(self.api(), &summary).unwrap();
+        self.source.seed_remote_session_for_cleanup(worker);
+        let result = WorkerRemovalService::new(self.api())
+            .execute_target_removal(&self.api().runtime, worker, "remove stopped Worker", None)
+            .await
+            .unwrap();
+        assert_eq!(result.status, StatusCode::OK.as_u16(), "{}", result.body);
+        assert!(
+            self.api()
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, worker)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            self.api()
+                .store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, worker)
+                .unwrap()
+                .iter()
+                .all(|link| link.unlinked_at.is_some())
+        );
     }
 
     async fn open(&self) -> WorkdirSessionHandle {
@@ -909,4 +1138,488 @@ async fn worker_removal_close_failure_retains_attachment_and_retry_releases_runt
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0], attempts[1]);
     fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_detach_after_stat_and_delivered_command_allows_ordinary_workdir_delete() {
+    let fixture = Fixture::new().await;
+    let worker = fixture.create_worker().await;
+    let link = fixture.attach(&worker, "checkout").await;
+    fixture.stat_attachment(&link).await;
+    fixture.complete_command(&link).await;
+    fixture.detach(&link).await;
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_worker_removal_after_stat_and_delivered_command_allows_ordinary_workdir_delete() {
+    let fixture = Fixture::new().await;
+    let worker = fixture.create_worker().await;
+    let link = fixture.attach(&worker, "checkout").await;
+    fixture.stat_attachment(&link).await;
+    fixture.complete_command(&link).await;
+    fixture.remove_worker(&worker).await;
+    fixture.assert_removed().await;
+}
+
+async fn delivered_terminal_overflow_releases_sessions(remove_worker: bool) {
+    let fixture = Fixture::new().await;
+    let worker = fixture.create_worker().await;
+    let link = fixture.attach(&worker, "checkout").await;
+    let mut handles = Vec::new();
+    // Cross the production retry-retention bound using delivered terminal output,
+    // not injected registry entries or status-only completion observations.
+    for index in 0..132 {
+        if index == 128 {
+            fixture.transport.fail_next(CloseFault::Reject);
+        }
+        handles.push(fixture.complete_command(&link).await);
+    }
+    {
+        let registry = fixture.api().workdir_sessions.lock().unwrap();
+        assert_eq!(registry.active_command_count(&worker), 0);
+        assert!(registry.command(&worker, "checkout", &handles[0]).is_none());
+        assert!(
+            registry
+                .command(&worker, "checkout", handles.last().unwrap())
+                .is_some()
+        );
+    }
+    let attempts = fixture.transport.attempts();
+    assert!(
+        attempts.windows(2).any(|pair| pair[0] == pair[1]),
+        "failed eviction close must be retried without losing terminal delivery: {attempts:?}"
+    );
+    if remove_worker {
+        fixture.remove_worker(&worker).await;
+    } else {
+        fixture.detach(&link).await;
+    }
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_terminal_command_overflow_then_detach_has_no_cumulative_runtime_use() {
+    delivered_terminal_overflow_releases_sessions(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_terminal_command_overflow_then_worker_removal_has_no_cumulative_runtime_use() {
+    delivered_terminal_overflow_releases_sessions(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_repeated_attachment_switches_reject_old_detach_and_release_completed_lifetimes() {
+    let fixture = Fixture::new().await;
+    let worker = fixture.create_worker().await;
+    let unrelated = fixture.open().await;
+    let mut previous: Option<WorkerWorkdirLinkRecord> = None;
+    for _ in 0..4 {
+        let current = fixture.attach(&worker, "checkout").await;
+        if let Some(old) = &previous {
+            assert_ne!(old.connection_id, current.connection_id);
+            assert!(
+                scoped_detach_current_worker_workdir(
+                    State(fixture.api().clone()),
+                    AxumPath((TEST_WORKSPACE_ID.into(), old.alias.clone())),
+                    Fixture::worker_headers(&worker),
+                    server_api::CurrentWorkerWorkdirDetachQuery {
+                        expected_connection_id: Some(old.connection_id.clone()),
+                    },
+                )
+                .await
+                .is_err(),
+                "stale lifetime must not detach the new connection"
+            );
+        }
+        fixture.stat_attachment(&current).await;
+        fixture.complete_command(&current).await;
+        fixture.detach(&current).await;
+        fixture.assert_live(&unrelated).await;
+        fixture.assert_busy().await;
+        previous = Some(current);
+    }
+    unrelated.close().await.unwrap();
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_remote_close_failure_is_retried_by_delete_without_closing_new_live_attachment() {
+    let fixture = Fixture::new().await;
+    let abandoned = fixture.open().await;
+    fixture.assert_live(&abandoned).await;
+    fixture.transport.fail_next(CloseFault::HoldThenReject);
+    drop(abandoned);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.entered.notified(),
+    )
+    .await
+    .expect("last-handle Drop attempts real remote close");
+    let first = fixture.transport.attempts();
+    assert_eq!(first.len(), 1);
+    let worker = fixture.create_worker().await;
+    let link = fixture.attach(&worker, "checkout").await;
+    fixture.stat_attachment(&link).await;
+    fixture.transport.release.add_permits(1);
+    fixture.detach(&link).await;
+    // An unrelated live user has no Backend attachment record to guard it; only
+    // the real Runtime operation lease must keep ordinary Delete busy.
+    let live = fixture.open().await;
+    fixture.assert_busy().await;
+    fixture.assert_live(&live).await;
+    let attempts = fixture.transport.attempts();
+    assert!(
+        attempts.iter().filter(|path| *path == &first[0]).count() >= 2,
+        "ordinary Delete retries the failed orphan close: {attempts:?}"
+    );
+    live.close().await.unwrap();
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_successful_runtime_open_response_is_recovered_by_ordinary_workdir_delete() {
+    let fixture = Fixture::new().await;
+    *fixture.transport.open_fault.lock().unwrap() = Some(OpenFault::RejectAfterRuntimeOpen);
+    let result = fixture
+        .api()
+        .runtime
+        .open_workdir_session(&fixture.runtime_id, &fixture.workdir_id, None)
+        .await;
+    assert!(result.is_err(), "only the successful OPEN response is lost");
+    let opened = fixture.transport.runtime_opens.lock().unwrap().clone();
+    assert_eq!(opened.len(), 1, "upstream must actually create the session");
+    assert_eq!(opened[0].workdir_id.as_str(), fixture.workdir_id);
+    fixture.assert_removed().await;
+    assert!(
+        fixture
+            .transport
+            .runtime_closes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, status)| {
+                path.ends_with(opened[0].session_id.as_str()) && *status == StatusCode::NO_CONTENT
+            }),
+        "close must target the identity from the actual lost OPEN response"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_open_waiter_after_runtime_success_does_not_lose_close_identity() {
+    let fixture = Fixture::new().await;
+    *fixture.transport.open_fault.lock().unwrap() = Some(OpenFault::HoldAfterRuntimeOpen);
+    let api = fixture.api().clone();
+    let runtime_id = fixture.runtime_id.clone();
+    let workdir_id = fixture.workdir_id.clone();
+    let opening = tokio::spawn(async move {
+        api.runtime
+            .open_workdir_session(&runtime_id, &workdir_id, None)
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.opened.notified(),
+    )
+    .await
+    .expect("real authenticated Runtime OPEN succeeded before caller cancellation");
+    let opened = fixture.transport.runtime_opens.lock().unwrap().clone();
+    assert_eq!(opened.len(), 1);
+    opening.abort();
+    assert!(opening.await.unwrap_err().is_cancelled());
+    fixture.transport.fail_next(CloseFault::HoldThenReject);
+    fixture.transport.open_release.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.entered.notified(),
+    )
+    .await
+    .expect("cancelled caller's OPEN result still schedules its own close");
+    assert!(fixture.transport.attempts()[0].ends_with(opened[0].session_id.as_str()));
+    fixture.transport.release.add_permits(1);
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_unregistered_remote_session_does_not_strand_runtime_use_after_worker_removal() {
+    let fixture = Fixture::new().await;
+    let worker = fixture.create_worker().await;
+    fixture
+        .api()
+        .runtime
+        .stop_worker(
+            &worker,
+            WorkerLifecycleRequest {
+                stop_intent: None,
+                reason: Some("prepare removal".into()),
+                ticket_assignment: None,
+            },
+        )
+        .unwrap();
+    let summary = fixture.api().runtime.worker(&worker).unwrap();
+    sync_worker_observation(fixture.api(), &summary).unwrap();
+    fixture.source.seed_remote_session_for_cleanup(&worker);
+    // A Runtime session opened by the Backend need not have reached the
+    // attachment cache before the request is cancelled or its handle is dropped.
+    let source = fixture.open().await;
+    fixture.assert_live(&source).await;
+    fixture.assert_busy().await;
+    drop(source);
+    let removal = WorkerRemovalService::new(fixture.api());
+    let response = removal
+        .execute_target_removal(
+            &fixture.api().runtime,
+            &worker,
+            "remove stopped Worker",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status,
+        StatusCode::OK.as_u16(),
+        "{}",
+        response.body
+    );
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_remote_connection_retains_failed_orphan_close_at_its_original_destination() {
+    let fixture = Fixture::new().await;
+    let abandoned = fixture.open().await;
+    fixture.transport.fail_next(CloseFault::HoldThenReject);
+    drop(abandoned);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let first = fixture.transport.attempts();
+    let binding = fixture
+        .api()
+        .store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &fixture.runtime_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Normal binding refresh replaces the connection object, not the Runtime.
+    // Its current endpoint is direct; the orphan descriptor still uses the proxy.
+    fixture
+        .api()
+        .register_workspace_runtime_binding(binding)
+        .unwrap();
+    fixture.transport.release.add_permits(1);
+    let current = fixture.open().await;
+    fixture.assert_busy().await;
+    fixture.assert_live(&current).await;
+    assert!(
+        fixture
+            .transport
+            .attempts()
+            .iter()
+            .filter(|path| *path == &first[0])
+            .count()
+            >= 2
+    );
+    current.close().await.unwrap();
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_one_worker_keeps_another_workers_attachment_and_runtime_session_live() {
+    let fixture = Fixture::new().await;
+    let first = fixture.create_worker().await;
+    let second = fixture.create_worker().await;
+    let first_link = fixture.attach(&first, "checkout").await;
+    let (_, Json(created)) = create_workspace_working_directory(
+        fixture.api(),
+        TEST_WORKSPACE_ID,
+        Some(&fixture.runtime_id),
+        BrowserWorkingDirectoryCreateRequest {
+            runtime_id: Some(fixture.runtime_id.clone()),
+            display_name: None,
+            repository_key: "test-repository".into(),
+            selector: Some("HEAD".into()),
+            operation_id: Some("unrelated-worker-workdir".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let second_id = created.item.working_directory_id;
+    let second_link = fixture
+        .attach_workdir(&second, "checkout", &second_id)
+        .await;
+    fixture.stat_attachment(&first_link).await;
+    fixture.stat_attachment(&second_link).await;
+    fixture.remove_worker(&first).await;
+    fixture.stat_attachment(&second_link).await;
+    assert!(
+        fixture
+            .api()
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &second)
+            .unwrap()
+            .iter()
+            .any(|link| link.connection_id == second_link.connection_id
+                && link.unlinked_at.is_none())
+    );
+    fixture.assert_removed().await;
+    fixture.stat_attachment(&second_link).await;
+    fixture.detach(&second_link).await;
+    let api = fixture.api().clone();
+    let result = tokio::task::spawn_blocking(move || {
+        execute_workdir_removal(
+            &api,
+            &second_id,
+            "account:close-test",
+            "remove independent fixture",
+            &uuid::Uuid::now_v7().to_string(),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        result.disposition,
+        WorkingDirectoryRemovalDisposition::Removed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_detach_failure_and_worker_remove_retry_close_the_same_owned_session() {
+    let fixture = Fixture::new().await;
+    let worker = fixture.create_worker().await;
+    let link = fixture.attach(&worker, "checkout").await;
+    fixture.stat_attachment(&link).await;
+    fixture
+        .api()
+        .runtime
+        .stop_worker(
+            &worker,
+            WorkerLifecycleRequest {
+                stop_intent: None,
+                reason: Some("prepare concurrent teardown".into()),
+                ticket_assignment: None,
+            },
+        )
+        .unwrap();
+    sync_worker_observation(
+        fixture.api(),
+        &fixture.api().runtime.worker(&worker).unwrap(),
+    )
+    .unwrap();
+    fixture.source.seed_remote_session_for_cleanup(&worker);
+    let before = fixture.transport.attempts().len();
+    fixture.transport.fail_next(CloseFault::HoldThenReject);
+    let detach = {
+        let api = fixture.api().clone();
+        let link = link.clone();
+        tokio::spawn(async move {
+            scoped_detach_current_worker_workdir(
+                State(api),
+                AxumPath((TEST_WORKSPACE_ID.into(), link.alias)),
+                Fixture::worker_headers(&link.worker),
+                server_api::CurrentWorkerWorkdirDetachQuery {
+                    expected_connection_id: Some(link.connection_id),
+                },
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.entered.notified(),
+    )
+    .await
+    .unwrap();
+    let remove = {
+        let api = fixture.api().clone();
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            WorkerRemovalService::new(&api)
+                .execute_target_removal(&api.runtime, &worker, "concurrent teardown", None)
+                .await
+        })
+    };
+    fixture.transport.release.add_permits(1);
+    assert!(detach.await.unwrap().is_err());
+    let result = remove.await.unwrap().unwrap();
+    assert_eq!(result.status, StatusCode::OK.as_u16(), "{}", result.body);
+    let attempts = fixture.transport.attempts();
+    assert_eq!(attempts.len() - before, 2);
+    assert_eq!(attempts[before], attempts[before + 1]);
+    fixture.assert_removed().await;
+}
+
+async fn cancelled_attachment_open_is_drained_by_terminal_owner(remove: bool) {
+    let fixture = Fixture::new().await;
+    let worker = fixture.create_worker().await;
+    *fixture.transport.open_fault.lock().unwrap() = Some(OpenFault::HoldAfterRuntimeOpen);
+    let attach = {
+        let api = fixture.api().clone();
+        let worker = worker.clone();
+        let workdir_id = fixture.workdir_id.clone();
+        tokio::spawn(async move {
+            scoped_attach_current_worker_workdir(
+                State(api),
+                AxumPath(ScopedWorkspacePath {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                }),
+                Fixture::worker_headers(&worker),
+                Json(AttachCurrentWorkerWorkdirRequest {
+                    alias: "checkout".into(),
+                    working_directory_id: workdir_id,
+                }),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.opened.notified(),
+    )
+    .await
+    .unwrap();
+    let opened = fixture.transport.runtime_opens.lock().unwrap()[0].clone();
+    attach.abort();
+    assert!(attach.await.unwrap_err().is_cancelled());
+    let link = fixture
+        .api()
+        .store
+        .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+        .unwrap()
+        .into_iter()
+        .find(|link| link.unlinked_at.is_none())
+        .unwrap();
+    fixture.transport.open_release.add_permits(1);
+    if remove {
+        fixture.remove_worker(&worker).await;
+    } else {
+        fixture.detach(&link).await;
+    }
+    assert!(
+        fixture
+            .transport
+            .runtime_closes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, status)| path.ends_with(opened.session_id.as_str())
+                && *status == StatusCode::NO_CONTENT),
+        "terminal owner must confirm the otherwise-unregistered open before reporting success"
+    );
+    fixture.assert_removed().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detach_drains_a_cancelled_attachment_open_not_present_in_the_backend_session_cache() {
+    cancelled_attachment_open_is_drained_by_terminal_owner(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_remove_drains_a_cancelled_attachment_open_not_present_in_the_backend_session_cache()
+{
+    cancelled_attachment_open_is_drained_by_terminal_owner(true).await;
 }

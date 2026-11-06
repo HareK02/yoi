@@ -153,7 +153,10 @@ async fn pipe_and_wait_faults_cross_real_http_with_prefix_and_terminal_replay() 
                     base.parse().unwrap(),
                     "fixture-token",
                     crate::Workdir::new("fault-workdir").id().clone(),
-                    OpenWorkdirSessionRequest::default(),
+                    OpenWorkdirSessionRequest {
+                        session_id: WorkdirSessionId::new("fault-session").unwrap(),
+                        owner_worker_id: None,
+                    },
                 )
                 .await
                 .unwrap(),

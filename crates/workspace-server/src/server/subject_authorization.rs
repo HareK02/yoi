@@ -907,6 +907,8 @@ pub(super) async fn interrupt_subject_workers(
                 error.error
             )),
         }
+        let session_lock = current_worker_session_lock(api, &worker);
+        let _session_guard = session_lock.lock().await;
         match close_worker_workdir_sessions(&api.workdir_sessions, &worker).await {
             Ok(()) => evidence.backend_command_sessions_closed = true,
             Err(error) => evidence
