@@ -10758,11 +10758,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
-            for expected in responses {
+            let mut session_aliases = Vec::<(String, String)>::new();
+            for mut expected in responses {
                 let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut buffer = [0_u8; 8192];
                 let read = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..read]);
+                let mut request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                for (alias, actual) in &session_aliases {
+                    expected.path = expected.path.replace(alias, actual);
+                }
                 let first_line = request.lines().next().unwrap_or_default();
                 let expected_line = format!("{} {} ", expected.method, expected.path);
                 assert!(
@@ -10776,6 +10783,34 @@ mod tests {
                             .contains("authorization: bearer secret-token"),
                         "authorization header missing from request: {request}"
                     );
+                }
+                if let Ok(mut opened) = serde_json::from_str::<
+                    workdir::http::OpenWorkdirSessionResponse,
+                >(&expected.body)
+                {
+                    let body_start = request.find("\r\n\r\n").unwrap() + 4;
+                    let length: usize = request[..body_start]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    assert!(length <= buffer.len());
+                    while request.len() - body_start < length {
+                        let read = stream.read(&mut buffer).unwrap();
+                        assert_ne!(read, 0, "incomplete session open request");
+                        request.push_str(std::str::from_utf8(&buffer[..read]).unwrap());
+                    }
+                    let open: OpenWorkdirSessionRequest =
+                        serde_json::from_str(&request[body_start..]).unwrap();
+                    session_aliases.push((
+                        opened.session_id.as_str().to_owned(),
+                        open.session_id.as_str().to_owned(),
+                    ));
+                    opened.session_id = open.session_id;
+                    expected.body = serde_json::to_string(&opened).unwrap();
                 }
                 let status_text = match expected.status {
                     200 => "OK",

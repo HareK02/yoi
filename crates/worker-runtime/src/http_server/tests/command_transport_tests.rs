@@ -384,7 +384,10 @@ async fn real_http_spawn_failure_preserves_safe_cause_counts_and_terminal_replay
                 harness.operation_url.join("/").unwrap(),
                 harness.authorization.clone(),
                 Workdir::new("wd-transport").id().clone(),
-                OpenWorkdirSessionRequest::default(),
+                OpenWorkdirSessionRequest {
+                    session_id: WorkdirSessionId::new("session-transport").unwrap(),
+                    owner_worker_id: None,
+                },
             )
             .await
             .unwrap(),
