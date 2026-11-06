@@ -423,3 +423,99 @@ impl CaptureDto {
         }
     }
 }
+
+/// Metadata-only all-retained-Segment union under the caller's publication fence.
+/// The active lineage is an unchanged prefix; additional branch originals follow
+/// in deterministic Segment order and share the same original identity namespace.
+pub fn recording_union_catalog_worker_guarded(
+    root: &Path,
+    session: SessionId,
+    active: SegmentId,
+    limits: PublicMaterialLimits,
+    guard: &crate::retention::SessionRetentionGuard,
+) -> Result<Vec<PublicMaterialDescriptor>, PublicMaterialError> {
+    if guard.session_id() != session {
+        return Err(PublicMaterialError::Inconsistent);
+    }
+    let replay = CommittedPublicReplay::open_worker_guarded(
+        root,
+        active,
+        limits,
+        None,
+        PublicMaterialUse::Recording,
+    )?;
+    if replay.session_id() != session {
+        return Err(PublicMaterialError::Inconsistent);
+    }
+    Ok(replay.recording_union()?.into_recording_descriptors())
+}
+
+/// FsStore-layout counterpart of the Worker union catalog.
+pub fn recording_union_catalog_fs_guarded(
+    root: &Path,
+    session: SessionId,
+    active: SegmentId,
+    limits: PublicMaterialLimits,
+    guard: &crate::retention::SessionRetentionGuard,
+) -> Result<Vec<PublicMaterialDescriptor>, PublicMaterialError> {
+    if guard.session_id() != session {
+        return Err(PublicMaterialError::Inconsistent);
+    }
+    Ok(
+        CommittedPublicReplay::open_fs_guarded(root, session, active, limits)?
+            .recording_union()?
+            .into_recording_descriptors(),
+    )
+}
+
+/// Read a bounded body slice only if the complete union still matches the
+/// operation's fixed metadata. Never substitute a changed active lineage.
+pub fn capture_recording_union_worker_guarded(
+    root: &Path,
+    session: SessionId,
+    active: SegmentId,
+    limits: PublicMaterialLimits,
+    descriptors: &[PublicMaterialDescriptor],
+    start: RecordingPosition,
+    max_entries: usize,
+    max_serialized_bytes: usize,
+    guard: &crate::retention::SessionRetentionGuard,
+) -> Result<RecordingCaptureSlice, PublicMaterialError> {
+    if guard.session_id() != session {
+        return Err(PublicMaterialError::Inconsistent);
+    }
+    let replay = CommittedPublicReplay::open_worker_guarded(
+        root,
+        active,
+        limits,
+        None,
+        PublicMaterialUse::Recording,
+    )?;
+    if replay.session_id() != session {
+        return Err(PublicMaterialError::Inconsistent);
+    }
+    let replay = replay.recording_union()?;
+    replay.verify_recording_descriptors(descriptors)?;
+    replay.recording_slice(start, max_entries, max_serialized_bytes)
+}
+
+/// FsStore-layout counterpart of the fixed-union body reader.
+pub fn capture_recording_union_fs_guarded(
+    root: &Path,
+    session: SessionId,
+    active: SegmentId,
+    limits: PublicMaterialLimits,
+    descriptors: &[PublicMaterialDescriptor],
+    start: RecordingPosition,
+    max_entries: usize,
+    max_serialized_bytes: usize,
+    guard: &crate::retention::SessionRetentionGuard,
+) -> Result<RecordingCaptureSlice, PublicMaterialError> {
+    if guard.session_id() != session {
+        return Err(PublicMaterialError::Inconsistent);
+    }
+    let replay =
+        CommittedPublicReplay::open_fs_guarded(root, session, active, limits)?.recording_union()?;
+    replay.verify_recording_descriptors(descriptors)?;
+    replay.recording_slice(start, max_entries, max_serialized_bytes)
+}

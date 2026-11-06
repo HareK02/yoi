@@ -5,6 +5,28 @@
 use super::*;
 use rusqlite::{backup::Backup, params};
 
+#[test]
+fn table_declaration_normalization_is_idempotent_after_extension() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("CREATE TABLE sample(z TEXT CHECK (z IN ('x','y')), a INTEGER PRIMARY KEY);")
+        .unwrap();
+    let mut shape = snapshot(&connection).unwrap();
+    let tokens = &mut shape.get_mut("sample").unwrap().2;
+    assert_eq!(declarations(tokens.clone()).unwrap(), *tokens);
+    let start = tokens.iter().position(|token| token == "(").unwrap();
+    tokens.splice(
+        start + 1..start + 1,
+        ["word:middle".into(), "word:text".into(), ",".into()],
+    );
+    let extended = declarations(tokens.clone()).unwrap();
+    assert_eq!(declarations(extended.clone()).unwrap(), extended);
+    connection
+        .execute_batch("ALTER TABLE sample ADD COLUMN middle TEXT;")
+        .unwrap();
+    assert_eq!(snapshot(&connection).unwrap()["sample"].2, extended);
+}
+
 fn save_history(
     conn: &Connection,
     stage: Stage,
@@ -110,7 +132,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     verify_history(conn, current).unwrap();
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
-        assert_eq!(plan.migrations.len(), 2);
+        assert_eq!(plan.migrations.len(), 3);
         assert_eq!(plan.migrations[0].version, 122);
         assert_eq!(
             plan.migrations[0].name,
@@ -121,7 +143,12 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
             plan.migrations[1].name,
             super::super::backend_job_upgrade::MIGRATION_NAME
         );
-        assert_eq!(plan.target_schema_version, 123);
+        assert_eq!(plan.migrations[2].version, 124);
+        assert_eq!(
+            plan.migrations[2].name,
+            super::super::journal_removal_store::MIGRATION_NAME
+        );
+        assert_eq!(plan.target_schema_version, 124);
     }
     assert_eq!(rows, saved_rows(conn));
     assert_eq!(shape, snapshot(conn).unwrap());
@@ -230,7 +257,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
         let conn = Connection::open(&path).unwrap();
         // Actual production open/ordered runner, including the new migration.
         super::super::prepare_connection(&conn).unwrap();
-        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 123);
+        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 124);
         let actual = immutable_rows(&conn);
         for (table, rows) in &expected {
             assert_eq!(
@@ -252,6 +279,13 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
         assert_eq!(
             history.pop(),
             Some((
+                124,
+                super::super::journal_removal_store::MIGRATION_NAME.into()
+            ))
+        );
+        assert_eq!(
+            history.pop(),
+            Some((
                 123,
                 super::super::backend_job_upgrade::MIGRATION_NAME.into()
             ))
@@ -261,7 +295,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             Some((122, crate::config_adoption::MIGRATION_NAME.into()))
         );
         assert_eq!(history, original_receipts);
-        verify_history(&conn, 123).unwrap();
+        verify_history(&conn, 124).unwrap();
         let saved = saved_rows(&conn);
         if let Some(previous) = &committed_history {
             assert_eq!(previous, &saved);

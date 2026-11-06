@@ -136,7 +136,15 @@ export function workspaceWorkersStore(
         if (disposed) return false;
         try {
           workers = [...projection.workers.values()]
-            .map((worker) => projectWorker(worker, workdirs))
+            .map((worker) => ({
+              ...projectWorker(worker, workdirs),
+              // Removal is Workspace-owned. Runtime stream events only trigger
+              // a catalog refresh; they cannot clear or complete this intent.
+              removal: catalogWorkers?.find((summary) =>
+                summary.runtime_id === worker.runtime_id &&
+                summary.worker_id === worker.worker_id
+              )?.removal,
+            }))
             .sort(compareWorkersForSidebar);
           set({
             loading,

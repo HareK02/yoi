@@ -2267,6 +2267,7 @@ pub trait ServerApi {
     #[post(
         "/api/w/{workspace_id}/workers/remove",
         status = 200,
+        alternate_status = 202,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 503],
         openapi = false,
@@ -9978,6 +9979,8 @@ pub struct RuntimeCleanupExecutionResult {
     pub action: CleanupTargetKind,
     pub status: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal: Option<WorkerRemovalObservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10421,12 +10424,84 @@ pub struct WorkerRemoveRequest {
     pub reason: String,
 }
 
+/// A saved removal intent is not evidence of physical Worker deletion.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemovalState {
+    Waiting,
+    Held,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemovalPhase {
+    AwaitingQuiescence,
+    Recording,
+    AwaitingEffectsEnd,
+    Released,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemovalCause {
+    RecordingDisabled,
+    SourceUnavailable,
+    OwnershipUnknown,
+    JobPending,
+    JobFailed,
+    ExecutionUnconfirmed,
+    StorageUnavailable,
+}
+
+/// Observation of the current saved removal operation, not a retry or release grant.
+/// Even a completed Journal phase does not prove physical Worker deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalObservation {
+    pub operation_id: String,
+    pub state: WorkerRemovalState,
+    pub phase: WorkerRemovalPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub cause: Option<WorkerRemovalCause>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRemoveResponse {
     pub removed: bool,
     pub runtime_id: String,
     pub worker_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<WorkerRemovalState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<WorkerRemovalPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<WorkerRemovalCause>,
+}
+
+impl WorkerRemoveResponse {
+    pub fn observation(&self) -> Option<WorkerRemovalObservation> {
+        Some(WorkerRemovalObservation {
+            operation_id: self.operation_id.clone()?,
+            state: self.state?,
+            phase: self.phase?,
+            cause: self.cause,
+        })
+    }
+}
+
+impl api_macros::HttpSuccess for WorkerRemoveResponse {
+    fn status_code(&self) -> u16 {
+        if self.removed { 200 } else { 202 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10869,6 +10944,10 @@ pub struct RuntimeWorkerWorkdirAttachmentSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerSummary {
+    /// Saved removal progress remains observable across reloads and subscriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub removal: Option<WorkerRemovalObservation>,
     /// Opaque Runtime-owned observation fence used by explicit Restore intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
@@ -13537,6 +13616,53 @@ mod tests {
             serde_json::from_value::<MemoryEvidenceOrigin>(serde_json::json!({
                 "kind": "human_input",
                 "future_field": "not current schema"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_removal_wire_receipt_distinguishes_accepted_from_deleted() {
+        use api_macros::HttpSuccess;
+        let operation = ServerApiMetadata::OPERATIONS
+            .iter()
+            .find(|operation| operation.operation_id == "workspace_worker_remove")
+            .unwrap();
+        assert_eq!(
+            operation
+                .success_responses
+                .iter()
+                .map(|response| response.status)
+                .collect::<Vec<_>>(),
+            [200, 202]
+        );
+        for (state, cause) in [("waiting", "job_pending"), ("held", "job_failed")] {
+            let wire = serde_json::json!({
+                "removed": false, "runtime_id": "runtime-a", "worker_id": "worker-a",
+                "operation_id": "original-operation", "state": state,
+                "phase": "recording", "cause": cause,
+            });
+            let response: WorkerRemoveResponse = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(response.status_code(), 202);
+            assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+            assert_eq!(
+                response.observation().unwrap().operation_id,
+                "original-operation"
+            );
+        }
+        let wire = serde_json::json!({"removed": true, "runtime_id": "r", "worker_id": "w"});
+        let response: WorkerRemoveResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
+        assert!(
+            serde_json::from_value::<WorkerRemoveResponse>(serde_json::json!({
+                "removed": false, "runtime_id": "r", "worker_id": "w", "phase": "unknown",
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkerRemoveResponse>(serde_json::json!({
+                "removed": false, "runtime_id": "r", "worker_id": "w", "cause": "discard",
             }))
             .is_err()
         );

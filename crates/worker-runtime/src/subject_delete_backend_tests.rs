@@ -346,17 +346,12 @@ fn subject_delete_without_original_owner_retains_child_identity_but_never_issues
 fn subject_delete_terminal_release_history_consumes_prior_canonical_stop() {
     use runtime_api::{SubjectReleaseAction as Action, SubjectReleaseState as State};
     for (action, terminal) in [(Action::Cancel, State::Cancelled), (Action::Disconnect, State::Disconnected)] {
-    let temp = tempfile::tempdir_in(".").unwrap();
+    let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let backend = Arc::new(
-        WorkerRuntimeExecutionBackend::new(MockFactory {
+        WorkerRuntimeExecutionBackend::new(removal_tests::RemovalFactory {
             client: MockClient::new(vec![]),
-            runtime_base: PathBuf::from(temp.path().file_name().unwrap()).join("c"),
-            cwd: root.clone(),
-            store_dir: root.join("sessions"),
-            worker_metadata_dir: root.join("metadata"),
-            observed_cwds: Arc::default(),
-            observed_workspace_clients: Arc::default(),
+            root: root.join("catalog"),
         })
         .unwrap(),
     );
@@ -366,6 +361,7 @@ fn subject_delete_terminal_release_history_consumes_prior_canonical_stop() {
         backend.clone(),
     )
     .unwrap();
+    runtime.bind_runtime_identity("delete-prior-stop").unwrap();
     runtime.store_config_bundle(test_bundle()).unwrap();
     let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "server-test");
     let mut create = create_request("prior Stop Subject deletion");

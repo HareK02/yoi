@@ -490,6 +490,17 @@ impl WorkspaceApi {
                 #[cfg(test)]
                 api.backend_job_recovery.cleanup_stopped.notify_one();
             }
+            // run_backend_job_cleanup has actually returned and dropped its exact
+            // Host writer lease. Parent deletion must not mistake an earlier
+            // Completed row (or result callback) for that boundary.
+            if let Err(error) = subjektiv_journal::resume_recording_after_cleanup(&api, &expected) {
+                tracing::debug!(job_id=%expected.job_id, attempt_id=%expected.attempt_id, %error,
+                    "Bounded same-input Journal continuation remains retained");
+            }
+            if let Err(error) = subjektiv_journal::resume_removals(&api) {
+                tracing::warn!(job_id=%expected.job_id, attempt_id=%expected.attempt_id, %error,
+                    "Journal parent continuation remains retained");
+            }
         });
         true
     }
@@ -1019,6 +1030,8 @@ impl WorkspaceApi {
                 if transient_storage(&error) {
                     return Err(error);
                 }
+                tracing::debug!(job_id=%attempt.job_id, attempt_id=%attempt.attempt_id, %error,
+                    "Journal exact receipt reconciliation remains held");
                 // Incomplete generation/missing termination evidence is not a
                 // rejected dispatch or permission to reselect Journal input.
                 self.retain_backend_job_recovery(&attempt, "journal_receipt_reconciliation",
@@ -1348,22 +1361,10 @@ impl WorkspaceApi {
         ))
     }
 
-    pub(super) async fn fence_backend_job_effects(
+    pub(super) fn backend_job_scope_termination(
         &self,
         attempt: &BackendJobAttemptRecord,
-        drain: &JobHostDrain,
-    ) -> Result<()> {
-        if drain.owner() != &JobHostOwner::try_from(attempt)? {
-            return Err(Error::RepositoryConflict(
-                "Job cleanup admission owner changed".into(),
-            ));
-        }
-        if self
-            .store
-            .has_backend_job_execution_fence(self.workspace_id(), attempt)?
-        {
-            return Ok(());
-        }
+    ) -> Result<worker_runtime::execution::WorkerExecutionTermination> {
         let worker = attempt.worker.as_ref().ok_or_else(|| {
             Error::RepositoryConflict("Unbound allocation cannot prove execution ended".into())
         })?;
@@ -1387,6 +1388,26 @@ impl WorkspaceApi {
                     .into(),
             ));
         }
+        Ok(termination)
+    }
+
+    pub(super) async fn fence_backend_job_effects(
+        &self,
+        attempt: &BackendJobAttemptRecord,
+        drain: &JobHostDrain,
+    ) -> Result<()> {
+        if drain.owner() != &JobHostOwner::try_from(attempt)? {
+            return Err(Error::RepositoryConflict(
+                "Job cleanup admission owner changed".into(),
+            ));
+        }
+        if self
+            .store
+            .has_backend_job_execution_fence(self.workspace_id(), attempt)?
+        {
+            return Ok(());
+        }
+        let termination = self.backend_job_scope_termination(attempt)?;
         self.store.record_backend_job_execution_fence(
             self.workspace_id(),
             attempt,

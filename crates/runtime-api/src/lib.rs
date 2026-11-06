@@ -775,6 +775,52 @@ pub struct WorkerRetentionExecutionRequest {
     pub diagnostics_disposition: DiagnosticsDisposition,
 }
 
+/// Metadata-only, operation-bound inventory of all retained recording sources.
+/// This freezes original Worker ingress, not the authority of Journal Jobs reading
+/// these sources. Bodies remain at their producer-owned storage locations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalFreeze {
+    pub operation_id: String,
+    pub input_fingerprint: String,
+    pub workspace_id: String,
+    pub source_runtime_id: String,
+    pub worker_id: WorkerId,
+    pub members: Vec<WorkerRemovalSessionMember>,
+}
+
+/// One canonical union per retained Session. The active lineage is an unchanged
+/// prefix, followed by deduplicated branch originals in deterministic Segment order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalSessionMember {
+    pub session_id: session_store::SessionId,
+    /// The original active lineage endpoint; its descriptor order is preserved.
+    /// None is reserved for an attested not-yet-materialized Session.
+    pub active_segment_id: Option<session_store::SegmentId>,
+    pub materialized: bool,
+    /// Exclusive end in this member's recording view. Empty views end at zero.
+    pub end: session_store::capture::RecordingPosition,
+    /// Original identities/digests only, without bodies. Shared ancestors occur
+    /// once across members, keyed by Session plus original material identity.
+    /// Orders are contiguous within the selected member view, beginning at zero;
+    /// scoped capture uses exactly these orders, not the unfiltered source view.
+    pub descriptors: Vec<session_store::public_material::PublicMaterialDescriptor>,
+}
+
+/// Bounded capture from one Session union of the exact Worker removal operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalSessionCaptureRequest {
+    pub workspace_id: String,
+    pub operation_id: String,
+    pub session_id: session_store::SessionId,
+    pub active_segment_id: Option<session_store::SegmentId>,
+    pub start: session_store::capture::RecordingPosition,
+    pub max_entries: usize,
+    pub max_serialized_bytes: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerSessionArchiveManifest {
     pub schema_version: u32,
@@ -783,6 +829,8 @@ pub struct WorkerSessionArchiveManifest {
     pub source_runtime_id: String,
     pub source_worker_id: WorkerId,
     pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_sessions: Vec<session_store::worker_sources::RetainedSessionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_active_segment_id: Option<String>,
     pub segment_ids: Vec<String>,
@@ -1235,6 +1283,18 @@ pub struct SubjectReleaseResponse {
     pub operation_id: String,
     pub binding_id: String,
     pub state: SubjectReleaseState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_scope: Option<SubjectReleaseRecordingScope>,
+}
+
+/// Complete producer-owned inventory, fixed under the actual Controller reservation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectReleaseRecordingScope {
+    pub workspace_id: String,
+    pub source_runtime_id: String,
+    pub worker_id: WorkerId,
+    pub members: Vec<WorkerRemovalSessionMember>,
 }
 
 /// Irreversibly fence an unpublished failed Subject create. Exact retries must retain
@@ -1554,6 +1614,28 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[body] request: WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/freeze",
+        status = 200,
+        error_status = 400
+    )]
+    async fn freeze_worker_removal(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/capture",
+        status = 200,
+        error_status = 400
+    )]
+    async fn capture_worker_removal_session(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2140,6 +2222,25 @@ mod tests {
         ) -> Result<WorkerRetentionInventory, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn freeze_worker_removal(
+            &self,
+            _worker_id: String,
+            _request: WorkerRetentionExecutionRequest,
+        ) -> Result<WorkerRemovalFreeze, RuntimeApiError> {
+            assert_eq!(_worker_id, _request.worker_id.to_string());
+            Err(test_error(409))
+        }
+        async fn capture_worker_removal_session(
+            &self,
+            _worker_id: String,
+            _request: WorkerRemovalSessionCaptureRequest,
+        ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError> {
+            assert_eq!(_request.operation_id, "capture-operation");
+            assert_eq!(_request.start.canonical_order, 11);
+            assert_eq!(_request.start.byte_offset, 3);
+            Err(test_error(409))
+        }
+
         async fn execute_retention(
             &self,
             _worker_id: String,
@@ -2217,6 +2318,34 @@ mod tests {
         assert_eq!(receipt.worker_id, purge.removal.worker_id);
         assert_eq!(receipt.operation_id, purge.removal.operation_id);
         assert_eq!(receipt.input_fingerprint, purge.removal.input_fingerprint);
+        let freeze_error = client
+            .freeze_worker_removal(purge.removal.worker_id.to_string(), purge.removal.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(freeze_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
+        );
+        let capture_error = client
+            .capture_worker_removal_session(
+                purge.removal.worker_id.to_string(),
+                WorkerRemovalSessionCaptureRequest {
+                    workspace_id: purge.removal.workspace_id.clone(),
+                    operation_id: "capture-operation".into(),
+                    session_id: session_store::new_session_id(),
+                    active_segment_id: Some(session_store::new_segment_id()),
+                    start: session_store::capture::RecordingPosition {
+                        canonical_order: 11,
+                        byte_offset: 3,
+                    },
+                    max_entries: 3,
+                    max_serialized_bytes: 128 * 1024,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(capture_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
+        );
         let summary = client.runtime_summary().await.unwrap();
         assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));
         let workers = client

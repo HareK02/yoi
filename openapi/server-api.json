@@ -12643,6 +12643,16 @@
           "message": {
             "type": "string"
           },
+          "removal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerRemovalObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "status": {
             "type": "string"
           },
@@ -13560,6 +13570,17 @@
               "string",
               "null"
             ]
+          },
+          "removal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerRemovalObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Saved removal progress remains observable across reloads and subscriptions."
           },
           "resource_key": {
             "type": "string"
@@ -20799,6 +20820,67 @@
         ],
         "type": "string"
       },
+      "WorkerRemovalCause": {
+        "enum": [
+          "recording_disabled",
+          "source_unavailable",
+          "ownership_unknown",
+          "job_pending",
+          "job_failed",
+          "execution_unconfirmed",
+          "storage_unavailable"
+        ],
+        "type": "string"
+      },
+      "WorkerRemovalObservation": {
+        "additionalProperties": false,
+        "description": "Observation of the current saved removal operation, not a retry or release grant.\nEven a completed Journal phase does not prove physical Worker deletion.",
+        "properties": {
+          "cause": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerRemovalCause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/WorkerRemovalPhase"
+          },
+          "state": {
+            "$ref": "#/components/schemas/WorkerRemovalState"
+          }
+        },
+        "required": [
+          "operation_id",
+          "state",
+          "phase"
+        ],
+        "type": "object"
+      },
+      "WorkerRemovalPhase": {
+        "enum": [
+          "awaiting_quiescence",
+          "recording",
+          "awaiting_effects_end",
+          "released",
+          "completed"
+        ],
+        "type": "string"
+      },
+      "WorkerRemovalState": {
+        "description": "A saved removal intent is not evidence of physical Worker deletion.",
+        "enum": [
+          "waiting",
+          "held"
+        ],
+        "type": "string"
+      },
       "WorkerRestoreRequest": {
         "additionalProperties": false,
         "description": "One explicit Restore intent. Retries retain both fields; conflicts require a\nfresh observation and a deliberate new intent, not automatic token replacement.",
@@ -21041,6 +21123,17 @@
               "string",
               "null"
             ]
+          },
+          "removal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerRemovalObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Saved removal progress remains observable across reloads and subscriptions."
           },
           "resource_key": {
             "type": "string"
@@ -23363,7 +23456,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:894ccff36a463bec91b635956924114aa0db87d8b3f815230d6e8395511d2f6e"
+    "x-yoi-source-digest": "sha256:bfe5426d297c5eb52b8462c56eb9b9bff50ddab6491508584e5dc3a76e4904af"
   },
   "openapi": "3.1.0",
   "paths": {

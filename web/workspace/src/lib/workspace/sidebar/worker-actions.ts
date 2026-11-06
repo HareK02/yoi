@@ -7,6 +7,10 @@ import {
   parseWorkerRestoreResponse,
 } from "#lib/workspace/api/runtime-workers.ts";
 import type { Diagnostic, Worker } from "./types";
+import {
+  type WorkerDeletionOutcome,
+  workerDeletionOutcome,
+} from "#lib/workspace/workers/worker-removal.ts";
 
 type FetchFn = typeof fetch;
 type WorkerActionTarget = Pick<Worker, "runtime_id" | "worker_id" | "state">;
@@ -228,7 +232,7 @@ export async function deleteSidebarWorker(
   workspaceId: string,
   worker: WorkerActionTarget,
   fetchFn: FetchFn = fetch,
-): Promise<void> {
+): Promise<WorkerDeletionOutcome> {
   const runtimePath = `/runtimes/${encodeURIComponent(worker.runtime_id)}`;
   const planResponse = await fetchFn(
     workspaceApiPath(workspaceId, `${runtimePath}/cleanup-plan`),
@@ -266,13 +270,5 @@ export async function deleteSidebarWorker(
   const outcome = execution.results.find((result) =>
     result.target_id === candidate.target_id
   );
-  if (!outcome || outcome.status !== "deleted") {
-    throw new Error(
-      outcome?.message ??
-        diagnosticMessage(
-          execution.diagnostics,
-          "Worker deletion was not completed",
-        ),
-    );
-  }
+  return workerDeletionOutcome(outcome);
 }

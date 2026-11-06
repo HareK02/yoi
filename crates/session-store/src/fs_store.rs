@@ -49,6 +49,7 @@ pub struct FsStore {
     /// no sibling writer can append behind it.
     append_lock: Arc<Mutex<()>>,
     retention: crate::retention::SessionRetentionStore,
+    owner: Option<crate::worker_sources::WorkerSessionSources>,
 }
 
 impl FsStore {
@@ -90,7 +91,64 @@ impl FsStore {
             root,
             append_lock: Arc::new(Mutex::new(())),
             retention,
+            owner: None,
         })
+    }
+
+    /// Producer for additional retained Sessions, with a fixed Worker-owned layout.
+    /// This is a storage binding, not Workspace authorization or Subject attribution.
+    pub fn new_runtime_owned(
+        sources: crate::worker_sources::WorkerSessionSources,
+        retention: crate::retention::SessionRetentionStore,
+    ) -> Result<Self, StoreError> {
+        let _guard = sources.lock_publication()?;
+        sources.retained_bindings()?;
+        let mut store = Self::new_with_retention(sources.retained_root(), retention)?;
+        store.owner = Some(sources);
+        Ok(store)
+    }
+
+    pub fn select_recording_active_segment(
+        &self,
+        session: SessionId,
+        segment: SegmentId,
+    ) -> Result<(), StoreError> {
+        let owner = self
+            .owner
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Worker-owned producer required"))?;
+        let _owner = owner.lock_publication()?;
+        let _session = self.retention.lock_live(session)?;
+        if !self.exists(session, segment)? {
+            return Err(StoreError::NotFound(segment));
+        }
+        owner.select(session, segment)
+    }
+
+    fn lock_owner(&self) -> Result<Option<std::fs::File>, StoreError> {
+        self.owner
+            .as_ref()
+            .map(|owner| owner.lock_publication())
+            .transpose()
+    }
+
+    /// Read a retained FsStore Segment without opening a writer or migrating it.
+    pub fn read_retained_segment(
+        root: &Path,
+        session: SessionId,
+        segment: SegmentId,
+        max_bytes: u64,
+    ) -> Result<Vec<LogEntry>, StoreError> {
+        let bytes = crate::read_without_atime_bounded(
+            &root
+                .join(session.to_string())
+                .join(format!("{segment}.jsonl")),
+            max_bytes,
+        )?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(StoreError::ReadLimitExceeded);
+        }
+        Self::parse_jsonl(&bytes, session, segment)
     }
 
     /// Return the filesystem root used by this store.
@@ -362,7 +420,11 @@ impl Store for FsStore {
         entry: &LogEntry,
     ) -> Result<(), StoreError> {
         entry.validate_input_metadata()?;
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
+        if let Some(owner) = &self.owner {
+            owner.bind(session_id, segment_id)?;
+        }
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.log_path(session_id, segment_id), &line)
     }
@@ -452,7 +514,11 @@ impl Store for FsStore {
         for entry in entries {
             entry.validate_input_metadata()?;
         }
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
+        if let Some(owner) = &self.owner {
+            owner.bind(session_id, segment_id)?;
+        }
         let path = self.log_path(session_id, segment_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -503,6 +569,7 @@ impl Store for FsStore {
         content: &str,
         limits: PasteArtifactLimits,
     ) -> Result<PasteArtifactRef, StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -532,6 +599,7 @@ impl Store for FsStore {
         content: &[u8],
         limits: UploadedFileLimits,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -556,6 +624,7 @@ impl Store for FsStore {
         context: &UploadedFileUploadContext,
         limits: UploadedFileLimits,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -593,6 +662,7 @@ impl Store for FsStore {
         reference: &UploadedFileRef,
         source_entry_id: &str,
     ) -> Result<UploadedFileRef, StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -621,6 +691,7 @@ impl Store for FsStore {
         reference: &UploadedFileRef,
         owner_id: &str,
     ) -> Result<(), StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -635,6 +706,7 @@ impl Store for FsStore {
         artifact_id: &str,
         owner_id: &str,
     ) -> Result<(), StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -649,6 +721,7 @@ impl Store for FsStore {
         artifact_id: &str,
         source_entry_id: &str,
     ) -> Result<(), StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -666,6 +739,7 @@ impl Store for FsStore {
         session_id: SessionId,
         live_owner_ids: &[String],
     ) -> Result<u64, StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -679,6 +753,7 @@ impl Store for FsStore {
         session_id: SessionId,
         artifact_id: &str,
     ) -> Result<bool, StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -688,6 +763,7 @@ impl Store for FsStore {
     }
 
     fn delete_uncommitted_uploaded_files(&self, session_id: SessionId) -> Result<u64, StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let _guard = self
             .append_lock
@@ -744,6 +820,7 @@ impl Store for FsStore {
         segment_id: SegmentId,
         entry: &TraceEntry,
     ) -> Result<(), StoreError> {
+        let _owner = self.lock_owner()?;
         let _retention = self.retention().lock_live(session_id)?;
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.trace_path(session_id, segment_id), &line)

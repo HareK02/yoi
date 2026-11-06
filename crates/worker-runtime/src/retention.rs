@@ -125,6 +125,8 @@ pub struct WorkerRetentionExecutionRequest {
     pub diagnostics_disposition: DiagnosticsDisposition,
 }
 
+pub use runtime_api::{WorkerRemovalFreeze, WorkerRemovalSessionMember};
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSessionArchiveManifest {
     pub schema_version: u32,
@@ -133,6 +135,8 @@ pub struct WorkerSessionArchiveManifest {
     pub source_runtime_id: String,
     pub source_worker_id: WorkerId,
     pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_sessions: Vec<session_store::worker_sources::RetainedSessionBinding>,
     /// Older archives have no attested active lineage and cannot serve canonical scans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_active_segment_id: Option<session_store::SegmentId>,
@@ -278,6 +282,32 @@ pub(crate) fn aggregate_session_id(
     Ok(saved.or(active))
 }
 
+pub(crate) fn erase_archive_primary(session_root: &Path) -> Result<(), std::io::Error> {
+    let entries = match fs::read_dir(session_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if matches!(
+            entry.file_name().to_str(),
+            Some("retained-sessions" | "retained-session-bindings")
+        ) {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    if fs::read_dir(session_root)?.next().is_none() {
+        fs::remove_dir(session_root)?;
+    }
+    Ok(())
+}
+
 /// Called only while the common Session deletion lock is held. Include staged
 /// archives from interrupted transfers: erasure must not leave a second original.
 pub(crate) fn remove_archived_session_copies(
@@ -304,9 +334,25 @@ pub(crate) fn remove_archived_session_copies(
             Err(error) => return Err(error.into()),
         };
         if let Some(owner) = owner {
+            if owner
+                .retained_sessions
+                .iter()
+                .any(|binding| binding.session_id == session)
+            {
+                erase_archived_diagnostics(runtime_root, &owner)?;
+                match fs::remove_dir_all(
+                    session_root
+                        .join("retained-sessions")
+                        .join(session.to_string()),
+                ) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
             if owner.source_session_id == session.to_string() {
                 erase_archived_diagnostics(runtime_root, &owner)?;
-                match fs::remove_dir_all(&session_root) {
+                match erase_archive_primary(&session_root) {
                     Ok(()) => (),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
                     Err(error) => return Err(error.into()),
@@ -392,6 +438,8 @@ fn erase_removal_session_copies(
         if saved != *archive {
             return Err(std::io::Error::other("Removal archive copy identity mismatch").into());
         }
+        // This helper is only for explicit whole-Subject erasure of the exact
+        // completed removal, not erasure of the primary Session in isolation.
         match fs::remove_dir_all(entry.path().join("session")) {
             Ok(()) => (),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
@@ -477,30 +525,73 @@ pub(crate) fn retention_error(error: session_store::StoreError) -> RuntimeError 
     RuntimeError::InvalidRequest(format!("Session retention rejected operation: {error}"))
 }
 
+/// Hold every Session's retention lock in a stable order through physical
+/// cleanup. Resuming an existing tombstone never broadens the original intent
+/// to another Session; only explicit whole-owner erase may override its pins.
+fn delete_sessions<T>(
+    retention: &session_store::retention::SessionRetentionStore,
+    sessions: &[session_store::SessionId],
+    intent: session_store::retention::SessionDeletionIntent,
+    remove: impl FnOnce() -> Result<T, session_store::StoreError>,
+) -> Result<T, session_store::StoreError> {
+    match sessions.split_first() {
+        Some((session, rest)) => {
+            let session_intent = match retention.ensure_live(*session) {
+                Err(session_store::StoreError::SessionErased(_)) => {
+                    session_store::retention::SessionDeletionIntent::ErasePermanently
+                }
+                Err(error) => return Err(error),
+                Ok(()) => intent,
+            };
+            retention.delete(*session, session_intent, || {
+                delete_sessions(retention, rest, intent, remove)
+            })
+        }
+        None => remove(),
+    }
+}
+
 /// Direct Worker deletion cannot bypass pins. Purge policy is not erase intent.
 pub(crate) fn delete_worker_aggregate(
     runtime_root: &Path,
     worker_dir: &Path,
     intent: session_store::retention::SessionDeletionIntent,
 ) -> Result<(), RuntimeError> {
+    if !worker_dir.exists() {
+        return Ok(());
+    }
     let session = aggregate_session_id(worker_dir)?;
     let retention = runtime_session_retention(runtime_root);
-    // Ordinary policy never creates erase authority. A pre-existing permanent
-    // tombstone is an irrevocable decision whose physical cleanup may be resumed.
-    let intent = match session
-        .map(|session| retention.ensure_live(session))
-        .transpose()
-    {
-        Err(session_store::StoreError::SessionErased(_)) => {
-            session_store::retention::SessionDeletionIntent::ErasePermanently
+    let workspace = read_json::<WorkerAggregateSnapshot>(
+        &worker_dir.join("worker.json"),
+        "inspect retained Worker ownership",
+    )?
+    .workspace_id;
+    let mut sessions = match workspace.as_deref() {
+        Some(workspace) => retained_bindings(runtime_root, worker_dir, workspace)?
+            .into_iter()
+            .map(|binding| binding.session_id)
+            .collect::<Vec<_>>(),
+        None if worker_dir.join("retained-sessions").exists() => {
+            return Err(RuntimeError::InvalidRequest(
+                "Retained Session owner unavailable".into(),
+            ));
         }
-        Err(error) => return Err(retention_error(error)),
-        Ok(_) => intent,
+        None => Vec::new(),
     };
+    sessions.extend(session);
+    sessions.sort();
+    sessions.dedup();
     let remove = || -> Result<(), session_store::StoreError> {
-        if intent == session_store::retention::SessionDeletionIntent::ErasePermanently {
-            if let Some(session) = session {
-                remove_archived_session_copies(runtime_root, session)?;
+        for session in &sessions {
+            // Explicit whole-owner erase covers all copies. Resuming one
+            // Session's existing tombstone never grants erase authority over
+            // its live siblings (including siblings with Journal pins).
+            match retention.ensure_live(*session) {
+                Err(session_store::StoreError::SessionErased(_)) => {
+                    remove_archived_session_copies(runtime_root, *session)?;
+                }
+                result => result?,
             }
         }
         match fs::remove_dir_all(worker_dir) {
@@ -509,13 +600,7 @@ pub(crate) fn delete_worker_aggregate(
             Err(error) => Err(error.into()),
         }
     };
-    if let Some(session) = session {
-        runtime_session_retention(runtime_root)
-            .delete(session, intent, remove)
-            .map_err(retention_error)
-    } else {
-        remove().map_err(retention_error)
-    }
+    delete_sessions(&retention, &sessions, intent, remove).map_err(retention_error)
 }
 
 /// Filesystem provider for the canonical Runtime Worker aggregate.
@@ -529,6 +614,19 @@ impl FsWorkerRetentionProvider {
         Self {
             runtime_root: runtime_root.into(),
         }
+    }
+
+    pub(crate) fn has_no_retention_receipt(
+        &self,
+        request: &WorkerRetentionExecutionRequest,
+    ) -> Result<bool, RuntimeError> {
+        validate_request(request)?;
+        let receipt = read_operation_receipt(&self.operation_path(&request.operation_id)?)?;
+        if let Some(receipt) = receipt {
+            validate_receipt_request(&receipt, request)?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     pub(crate) fn completed_for(
@@ -587,7 +685,7 @@ impl FsWorkerRetentionProvider {
                 "Canonical removal is not an exact successful receipt".into(),
             ));
         }
-        let archive = if let Some(manifest) = &result.archive {
+        let mut sessions = if let Some(manifest) = &result.archive {
             if request.archive_id.as_ref() != Some(&manifest.archive_id)
                 || manifest.workspace_id != request.workspace_id
                 || manifest.source_runtime_id != request.source_runtime_id
@@ -611,10 +709,23 @@ impl FsWorkerRetentionProvider {
                 .map_err(|_| {
                     RuntimeError::InvalidRequest("Invalid removal Session identity".into())
                 })?;
-            Some(session)
+            let mut sessions = vec![session];
+            for binding in &manifest.retained_sessions {
+                if binding.owner.workspace_id != request.workspace_id
+                    || binding.owner.worker_id != request.worker_id.to_string()
+                {
+                    return Err(RuntimeError::InvalidRequest(
+                        "Removal retained Session owner mismatch".into(),
+                    ));
+                }
+                sessions.push(binding.session_id);
+            }
+            sessions
         } else {
-            None
+            Vec::new()
         };
+        sessions.sort();
+        sessions.dedup();
         let erase = || -> Result<(), session_store::StoreError> {
             erase_operation_diagnostics(
                 &self.runtime_root,
@@ -629,20 +740,17 @@ impl FsWorkerRetentionProvider {
             }
             Ok(())
         };
-        if let Some(session) = &archive {
-            runtime_session_retention(&self.runtime_root)
-                .delete(
-                    *session,
-                    session_store::retention::SessionDeletionIntent::ErasePermanently,
-                    erase,
-                )
-                .map_err(retention_error)?;
-        } else {
-            // Diagnostics-only old Purge operations have no archive Session ID.
-            // The existing permanent Worker fence plus immutable completed receipt
-            // prevents execution and re-publication; hold the retention lock here.
-            erase().map_err(retention_error)?;
-        }
+        // Diagnostics-only old Purge operations have no archive Session IDs.
+        // Their permanent Worker fence and immutable completed receipt still
+        // prevent execution/re-publication under this provider's retention lock.
+        // Archived operations fence every retained Session before erasing copies.
+        delete_sessions(
+            &runtime_session_retention(&self.runtime_root),
+            &sessions,
+            session_store::retention::SessionDeletionIntent::ErasePermanently,
+            erase,
+        )
+        .map_err(retention_error)?;
         Ok(())
     }
 
@@ -874,7 +982,15 @@ impl FsWorkerRetentionProvider {
         &self,
         request: &WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, RuntimeError> {
-        if self.worker_dir(request.worker_id).exists() {
+        if self
+            .worker_dir(request.worker_id)
+            .try_exists()
+            .map_err(|source| RuntimeError::StoreIo {
+                operation: "inspect original removal source",
+                path: self.worker_dir(request.worker_id),
+                source,
+            })?
+        {
             return Err(RuntimeError::WorkerNotFound {
                 worker_id: request.worker_id,
             });
@@ -1095,12 +1211,32 @@ impl FsWorkerRetentionProvider {
         // purge instead uses ordinary deletion and must reject outstanding pins.
         let retention = runtime_session_retention(&self.runtime_root);
         let transfer_guard = if request.session_disposition == SessionDisposition::Archive {
-            aggregate_session_id(&worker_dir)?
-                .map(|session| retention.lock_live(session))
-                .transpose()
+            let mut sessions =
+                retained_bindings(&self.runtime_root, &worker_dir, &request.workspace_id)?
+                    .into_iter()
+                    .map(|binding| binding.session_id)
+                    .collect::<Vec<_>>();
+            sessions.extend(aggregate_session_id(&worker_dir)?);
+            sessions.sort();
+            sessions.dedup();
+            sessions
+                .into_iter()
+                .map(|session| {
+                    if self
+                        .runtime_root
+                        .join("retention/removal-freezes")
+                        .join(format!("{}.json", request.worker_id))
+                        .exists()
+                    {
+                        retention.lock_unpinned(session)
+                    } else {
+                        retention.lock_live(session)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(retention_error)?
         } else {
-            None
+            Vec::new()
         };
         let archive = match request.session_disposition {
             SessionDisposition::Archive => {
@@ -1309,7 +1445,9 @@ fn bounded_diagnostic_id(value: &str) -> String {
     }
 }
 
-fn validate_request(request: &WorkerRetentionExecutionRequest) -> Result<(), RuntimeError> {
+pub(crate) fn validate_request(
+    request: &WorkerRetentionExecutionRequest,
+) -> Result<(), RuntimeError> {
     validate_id("operation_id", &request.operation_id)?;
     validate_id("workspace_id", &request.workspace_id)?;
     validate_id("source_runtime_id", &request.source_runtime_id)?;
@@ -1347,6 +1485,27 @@ fn validate_id(kind: &str, value: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
+fn retained_bindings(
+    runtime_root: &Path,
+    worker_dir: &Path,
+    workspace: &str,
+) -> Result<Vec<session_store::worker_sources::RetainedSessionBinding>, RuntimeError> {
+    let worker = worker_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| RuntimeError::InvalidRequest("Worker source identity unavailable".into()))?;
+    session_store::worker_sources::WorkerSessionSources::new(
+        runtime_root,
+        session_store::worker_sources::WorkerSessionOwner {
+            workspace_id: workspace.into(),
+            worker_id: worker.into(),
+        },
+    )
+    .map_err(retention_error)?
+    .retained_bindings()
+    .map_err(retention_error)
+}
+
 fn commit_session_archive(
     provider: &FsWorkerRetentionProvider,
     request: &WorkerRetentionExecutionRequest,
@@ -1364,7 +1523,28 @@ fn commit_session_archive(
     } else {
         read_json(&session_dir.join("session.json"), "archive Worker Session")?
     };
-    let source_files = collect_files(&session_dir, "archive Worker Session")?;
+    let mut source_files = collect_files(&session_dir, "archive Worker Session")?;
+    let retained_sessions = retained_bindings(
+        provider.runtime_root.as_path(),
+        worker_dir,
+        &request.workspace_id,
+    )?;
+    for (relative, path) in collect_files(
+        &worker_dir.join("retained-sessions"),
+        "archive retained Sessions",
+    )? {
+        source_files.push((PathBuf::from("retained-sessions").join(relative), path));
+    }
+    for (relative, path) in collect_files(
+        &worker_dir.join("retained-session-bindings"),
+        "archive retained Session ownership",
+    )? {
+        source_files.push((
+            PathBuf::from("retained-session-bindings").join(relative),
+            path,
+        ));
+    }
+    source_files.sort_by(|a, b| a.0.cmp(&b.0));
     let (checksum, bytes, count) = checksum_files(&source_files, "archive Worker Session")?;
     let mut segment_ids = BTreeSet::new();
     for (relative, _) in &source_files {
@@ -1403,6 +1583,7 @@ fn commit_session_archive(
             None
         },
         source_session_id: session.session_id,
+        retained_sessions,
         segment_ids: segment_ids.into_iter().collect(),
         source_created_at: request.source_created_at.clone(),
         removed_at: request.removed_at.clone(),
@@ -2103,7 +2284,7 @@ fn copy_files(
     Ok(())
 }
 
-fn atomic_write_json<T: Serialize>(
+pub(crate) fn atomic_write_json<T: Serialize>(
     path: &Path,
     value: &T,
     operation: &'static str,

@@ -1,3 +1,5 @@
+#[cfg(feature = "fs-store")]
+mod removal;
 mod subject_delete;
 pub(crate) use subject_delete::SubjectDeleteWorkerFence;
 #[cfg(feature = "restore-checkpoints")]
@@ -540,55 +542,116 @@ impl Runtime {
                 state.ensure_subject_not_reserved(&worker_ref, false)?;
             }
             state.execution_backend.clone().ok_or_else(|| {
-                RuntimeError::InvalidRequest("actual Controller reservation is unavailable".into())
+                RuntimeError::RecordingExecutionUnconfirmed {
+                    message: "actual Controller reservation is unavailable".into(),
+                }
             })?
         };
         let key = (request.worker_id, request.operation_id.clone());
-        {
+        let cancelled = {
             let mut state = self.lock()?;
-            if let Some((_, saved)) = state.subject_release_operations.get(&key) {
-                if *saved == runtime_api::SubjectReleaseState::Cancelled {
-                    if request.action != Action::Cancel {
-                        return Err(RuntimeError::InvalidRequest(
-                            "cancelled release cannot be rearmed; use a new operation".into(),
-                        ));
-                    }
-                    return Ok(runtime_api::SubjectReleaseResponse {
-                        operation_id: request.operation_id,
-                        binding_id: request.binding_id,
-                        state: *saved,
-                    });
-                }
-            } else {
-                // Persist admission exclusion before any Controller ACK, under the Worker op
-                // lock. Restart retains this fence without manufacturing disconnect proof.
+            let cancelled = state
+                .subject_release_operations
+                .get(&key)
+                .is_some_and(|(_, saved)| *saved == runtime_api::SubjectReleaseState::Cancelled);
+            if cancelled && request.action != Action::Cancel {
+                return Err(RuntimeError::InvalidRequest(
+                    "cancelled release cannot be rearmed; use a new operation".into(),
+                ));
+            }
+            if !state.subject_release_operations.contains_key(&key) {
+                // Admission intent survives restart but is not Controller-held proof.
                 state.subject_release_operations.insert(
                     key.clone(),
                     (request.clone(), runtime_api::SubjectReleaseState::Reserved),
                 );
             }
             state.persist_runtime_snapshot()?;
+            cancelled
+        };
+        // Cancellation must not let a resumed Controller race the publication fence.
+        // Reserve acquires this lock only AFTER the Controller ACK, so its final
+        // persistence can complete before the producer-exclusive inventory read.
+        let mut owner = if request.action == Action::Cancel {
+            self.subject_release_source_owner(&request)?
+        } else {
+            None
+        };
+        let mut publication = owner
+            .as_ref()
+            .map(|owner| owner.lock_exclusive())
+            .transpose()
+            .map_err(|error| RuntimeError::RecordingSourceUnavailable {
+                message: error.to_string(),
+            })?;
+        if cancelled {
+            if let Some(owner) = &owner {
+                self.cancel_subject_release_publication(owner, &request)?;
+            }
+            return Ok(runtime_api::SubjectReleaseResponse {
+                operation_id: request.operation_id,
+                binding_id: request.binding_id,
+                state: runtime_api::SubjectReleaseState::Cancelled,
+                recording_scope: None,
+            });
         }
-        let response = backend
+        let mut response = backend
             .subject_release(&request)
-            .map_err(RuntimeError::InvalidRequest)?;
+            .map_err(|message| RuntimeError::RecordingExecutionUnconfirmed { message })?;
         if response.binding_id != request.binding_id
             || response.operation_id != request.operation_id
+            || !matches!(
+                (request.action, response.state),
+                (
+                    Action::Reserve,
+                    runtime_api::SubjectReleaseState::Reserved
+                        | runtime_api::SubjectReleaseState::Disconnected
+                ) | (
+                    Action::Disconnect,
+                    runtime_api::SubjectReleaseState::Disconnected
+                ) | (Action::Cancel, runtime_api::SubjectReleaseState::Cancelled)
+            )
         {
-            return Err(RuntimeError::InvalidRequest(
-                "Subject release acknowledgment mismatch".into(),
-            ));
+            return Err(RuntimeError::RecordingExecutionUnconfirmed {
+                message: "Subject release acknowledgment mismatch".into(),
+            });
         }
-        let mut state = self.lock()?;
-        let before = state
-            .subject_release_operations
-            .insert(key.clone(), (request.clone(), response.state));
-        if let Err(error) = state.persist_runtime_snapshot() {
-            if let Some(before) = before {
-                state.subject_release_operations.insert(key, before);
+        response.recording_scope = if request.action != Action::Cancel {
+            owner = self.subject_release_source_owner(&request)?;
+            let owner = owner
+                .as_ref()
+                .ok_or_else(|| RuntimeError::RecordingSourceUnavailable {
+                    message:
+                        "Subject release recording scope requires producer-owned filesystem sources"
+                            .into(),
+                })?;
+            publication = Some(owner.lock_exclusive().map_err(|error| {
+                RuntimeError::RecordingSourceUnavailable {
+                    message: error.to_string(),
+                }
+            })?);
+            Some(self.subject_release_recording_scope(owner, &request)?)
+        } else {
+            None
+        };
+        {
+            let mut state = self.lock()?;
+            let before = state
+                .subject_release_operations
+                .insert(key.clone(), (request.clone(), response.state));
+            if let Err(error) = state.persist_runtime_snapshot() {
+                if let Some(before) = before {
+                    state.subject_release_operations.insert(key, before);
+                }
+                return Err(error);
             }
-            return Err(error);
         }
+        if response.state == runtime_api::SubjectReleaseState::Cancelled {
+            if let Some(owner) = &owner {
+                self.cancel_subject_release_publication(owner, &request)?;
+            }
+        }
+        drop(publication);
         Ok(response)
     }
 
@@ -1404,6 +1467,9 @@ impl Runtime {
             .map_err(|_| RuntimeError::StatePoisoned)?;
         self.lock()?
             .ensure_subject_create_not_fenced(request.worker_id)?;
+        #[cfg(feature = "fs-store")]
+        self.lock()?
+            .ensure_worker_removal_not_frozen(request.worker_id)?;
         if let Some(existing) = self.existing_worker_for_create(&request, scope)? {
             return Ok(existing);
         }
@@ -5614,6 +5680,26 @@ impl Runtime {
         expected_session_id: &str,
         pin: session_store::retention::SessionRetentionPin,
     ) -> Result<(), RuntimeError> {
+        let session = expected_session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid Session identity".into()))?;
+        if let Some((root, segment)) =
+            self.additional_session_binding_scoped(scope, source, session)?
+        {
+            return self
+                .session_retention_store()?
+                .pin(session, pin, || {
+                    session_store::FsStore::read_retained_segment(
+                        &root,
+                        session,
+                        segment,
+                        session_store::public_material::PublicMaterialLimits::default()
+                            .max_storage_bytes,
+                    )
+                    .map(|_| true)
+                })
+                .map_err(crate::retention::retention_error);
+        }
         let (root, _) = self.resolve_session_public_source(scope, source)?;
         let session = expected_session_id
             .parse::<session_store::SessionId>()
@@ -5642,6 +5728,18 @@ impl Runtime {
         expected_session_id: &str,
         pin: session_store::retention::SessionRetentionPin,
     ) -> Result<(), RuntimeError> {
+        let session = expected_session_id
+            .parse::<session_store::SessionId>()
+            .map_err(|_| RuntimeError::InvalidRequest("Invalid Session identity".into()))?;
+        if self
+            .additional_session_binding_scoped(scope, source, session)?
+            .is_some()
+        {
+            return self
+                .session_retention_store()?
+                .release(session, pin)
+                .map_err(crate::retention::retention_error);
+        }
         let (root, archive) =
             self.resolve_session_public_source_with_validation(scope, source, false)?;
         let session = expected_session_id
@@ -5676,6 +5774,14 @@ impl Runtime {
         expected_session_id: &str,
         intent: session_store::retention::SessionDeletionIntent,
     ) -> Result<(), RuntimeError> {
+        if self.delete_additional_session_source_scoped(
+            scope,
+            source,
+            expected_session_id,
+            intent,
+        )? {
+            return Ok(());
+        }
         let (root, archive) =
             self.resolve_session_public_source_with_validation(scope, source, false)?;
         let owner = match source {
@@ -5759,6 +5865,12 @@ impl Runtime {
                     {
                         std::fs::remove_dir_all(original)?;
                     }
+                }
+                if archive
+                    .as_ref()
+                    .is_some_and(|manifest| !manifest.retained_sessions.is_empty())
+                {
+                    return crate::retention::erase_archive_primary(&root).map_err(Into::into);
                 }
                 match std::fs::remove_dir_all(&root) {
                     Ok(()) => Ok(()),
@@ -5982,17 +6094,34 @@ impl Runtime {
             }
             (runtime_api::SessionPublicSource::Archived { .. }, Some(manifest)) => {
                 if manifest.source_session_id != expected_session_id {
-                    return Err(Source("Archive Session identity mismatch".into()));
+                    let member = manifest
+                        .retained_sessions
+                        .iter()
+                        .find(|member| {
+                            member.session_id.to_string() == expected_session_id
+                                && member.owner.workspace_id == scope.workspace_id
+                                && member.owner.worker_id == manifest.source_worker_id.to_string()
+                        })
+                        .ok_or_else(|| Source("Archive Session identity mismatch".into()))?;
+                    SessionPublicMaterialReader::open_fs_with_retention(
+                        &session_root.join("retained-sessions"),
+                        member.session_id,
+                        member.active_segment_id,
+                        PublicMaterialLimits::default(),
+                        self.session_retention_store()
+                            .map_err(|error| Source(error.to_string()))?,
+                    )?
+                } else {
+                    SessionPublicMaterialReader::open_worker_with_retention(
+                        &session_root,
+                        manifest
+                            .source_active_segment_id
+                            .ok_or("Archive has no canonical active Segment")?,
+                        PublicMaterialLimits::default(),
+                        self.session_retention_store()
+                            .map_err(|error| Source(error.to_string()))?,
+                    )?
                 }
-                SessionPublicMaterialReader::open_worker_with_retention(
-                    &session_root,
-                    manifest
-                        .source_active_segment_id
-                        .ok_or("Archive has no canonical active Segment")?,
-                    PublicMaterialLimits::default(),
-                    self.session_retention_store()
-                        .map_err(|error| Source(error.to_string()))?,
-                )?
             }
             _ => return Err(Source("Session source is unavailable".into())),
         };
@@ -6199,6 +6328,15 @@ impl Runtime {
                 "Worker canonical write outcome must be reconciled before retention effects".into(),
             ));
         }
+        removal::check_retention_freeze(
+            store.runtime_dir(),
+            request,
+            state
+                .workers
+                .get(&request.worker_id)
+                .and_then(|worker| worker.request.as_ref())
+                .map(|request| request.create_fingerprint.as_str()),
+        )?;
         if let Some(completed) = provider.completed_for(request)? {
             state.workers.remove(&request.worker_id);
             state.persist_runtime_snapshot()?;
@@ -6269,7 +6407,21 @@ impl Runtime {
                     "Canonical removal shutdown requires filesystem storage".into(),
                 )
             })?;
-            let (_, matches) = store.reconcile_worker_record(&expected)?;
+            let (_, matches) = match store.reconcile_worker_record(&expected) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    // The exact operation may have removed its source before
+                    // saving the final receipt while this catalog stayed live.
+                    // Only that provider-owned receipt can finish this window;
+                    // never upgrade its original shutdown or create a new one.
+                    let Ok(result) = provider.recover_after_source_removal(request) else {
+                        return Err(error);
+                    };
+                    state.workers.remove(&request.worker_id);
+                    state.persist_runtime_snapshot()?;
+                    return Ok(result);
+                }
+            };
             if !matches {
                 return Err(RuntimeError::InvalidRequest(
                     "Canonical removal shutdown source changed".into(),
@@ -6787,6 +6939,10 @@ impl RuntimeState {
                 .is_some_and(|fence| fence.response.is_some())
         {
             return Ok(());
+        }
+        #[cfg(feature = "fs-store")]
+        if !allow_disconnected {
+            self.ensure_worker_removal_not_frozen(worker.worker_id)?;
         }
         self.ensure_subject_create_not_fenced(worker.worker_id)?;
         use runtime_api::SubjectReleaseState as State;
@@ -8432,6 +8588,9 @@ fn runtime_worker_create_failure_fields(
             Some(format!("{operation:?}")),
             Some(format!("{outcome:?}")),
         ),
+        RuntimeError::RecordingSourceUnavailable { .. } => ("source_unavailable", None, None),
+        RuntimeError::RecordingOwnershipUnknown { .. } => ("ownership_unknown", None, None),
+        RuntimeError::RecordingExecutionUnconfirmed { .. } => ("execution_unconfirmed", None, None),
         RuntimeError::LimitTooLarge { .. } => ("limit_too_large", None, None),
         RuntimeError::InvalidRequest(_) => ("invalid_request", None, None),
         RuntimeError::WorkspaceOwnerMismatch { .. } => ("workspace_owner_mismatch", None, None),
@@ -10105,6 +10264,7 @@ mod tests {
             Ok(runtime_api::SubjectReleaseResponse {
                 operation_id: request.operation_id.clone(),
                 binding_id: request.binding_id.clone(),
+                recording_scope: None,
                 state: match request.action {
                     A::Reserve => S::Reserved,
                     A::Cancel => S::Cancelled,
@@ -16939,9 +17099,13 @@ mod tests {
             operation_id: "release-1".into(),
             action: runtime_api::SubjectReleaseAction::Reserve,
         };
-        runtime
-            .subject_release_scoped(&scoped, request.clone())
-            .unwrap();
+        assert!(
+            matches!(
+                runtime.subject_release_scoped(&scoped, request.clone()),
+                Err(RuntimeError::RecordingOwnershipUnknown { .. })
+            ),
+            "a backend-only ACK with missing producer identity must retain occupancy"
+        );
         drop(runtime);
         let backend = Arc::new(TestExecutionBackend::default());
         let reopened =

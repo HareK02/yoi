@@ -11,6 +11,7 @@
     "test:component": "deno run -A npm:vitest@5.0.3 run --config vitest.config.ts",
     "test:browser:activation": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/activation-browser/activation-shell.browser.test.ts",
     "test:browser:hosting": "mkdir -p ../../target/web-ux/tmp && TMPDIR=../../target/web-ux/tmp deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/hosting-browser/hosting-shell.browser.test.ts test/hosting-browser/setup-shell.browser.test.ts",
+    "test:browser:worker-removal": "deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/visual-review/worker-removal.browser.test.ts",
     "test:browser:empty-workspace": "deno test --config ../../tools/web-ux/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/visual-review/empty-workspace.browser.test.ts",
     "test:browser:drive": "deno test --config test/drive-browser/deno.json --allow-env --allow-net --allow-read --allow-write --allow-run --allow-sys test/drive-browser/drive.browser.test.ts",
     "test:browser:subject-navigation": "cd ../.. && deno run --config tools/web-ux/deno.json -A tools/web-ux/browser-tests/subject_navigation_review.ts web/workspace/build navigation-task",

@@ -76,6 +76,32 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
 
 fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
     verify_raw_capture_shape(conn, current, rows)?;
+    if current == 124 {
+        verify_journal_removal_shape(conn)?;
+        if rows == [(124, super::SCHEMA_BASELINE_NAME.to_owned())] {
+            verify_configuration_shape(conn)?;
+            verify_execution_shape(conn)?;
+            super::backend_job_upgrade::verify(conn)?;
+            require_shape(conn, Stage::Base)?;
+            return verify_103_features(conn, current, rows);
+        }
+        if rows.last().map(|(version, name)| (*version, name.as_str()))
+            != Some((124, super::journal_removal_store::MIGRATION_NAME))
+        {
+            return Err(invalid("unrecognized Journal removal receipt"));
+        }
+        let prefix = &rows[..rows.len() - 1];
+        if prefix.last().map(|row| row.0) != Some(123) {
+            return Err(invalid("missing Journal removal predecessor"));
+        }
+        return verify_history_records(conn, 123, prefix);
+    }
+    if current < 124
+        && super::current_schema_version(conn)? < 124
+        && super::column_exists(conn, "worker_removal_operations", "journal_removal_json")?
+    {
+        return Err(invalid("Journal removal scope before receipt 124"));
+    }
     if current == 123 {
         verify_execution_shape(conn)?;
         super::backend_job_upgrade::verify(conn)?;
@@ -236,10 +262,11 @@ pub(super) fn published_plan(
     verify_history(conn, current)?;
     Ok(Some(super::WorkspaceSchemaMigrationPlan {
         current_schema_version: current,
-        target_schema_version: 123,
+        target_schema_version: 124,
         migrations: [
             (122, crate::config_adoption::MIGRATION_NAME),
             (123, super::backend_job_upgrade::MIGRATION_NAME),
+            (124, super::journal_removal_store::MIGRATION_NAME),
         ]
         .into_iter()
         .filter(|(version, _)| *version > current)
@@ -464,8 +491,62 @@ fn legacy_shape(conn: &Connection) -> Result<Shape> {
     Ok(shape)
 }
 
+/// Validate the exact extension independently before interpreting predecessor
+/// receipts. Reference SQL runs only in a private DB, never on adopted data.
+fn journal_removal_extension() -> Result<(Shape, Vec<String>)> {
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch("CREATE TABLE worker_removal_operations(operation_id TEXT,plan_id TEXT,input_fingerprint TEXT,workspace_id TEXT,runtime_id TEXT,worker_id TEXT,state TEXT);")?;
+    reference.execute_batch(super::journal_removal_store::SCHEMA_SQL)?;
+    let mut shape = snapshot(&reference)?;
+    let table = shape
+        .remove("worker_removal_operations")
+        .ok_or_else(|| invalid("missing Journal reference table"))?;
+    let column = declaration(&table.2, "word:journal_removal_json")?;
+    Ok((shape, column))
+}
+
+fn declaration(tokens: &[String], name: &str) -> Result<Vec<String>> {
+    let start = tokens
+        .iter()
+        .position(|token| token == name)
+        .ok_or_else(|| invalid("missing Journal removal declaration"))?;
+    let mut depth = 0usize;
+    for i in start..tokens.len() {
+        match tokens[i].as_str() {
+            "(" => depth += 1,
+            ")" if depth == 0 => return Ok(tokens[start..i].to_vec()),
+            ")" => depth -= 1,
+            "," if depth == 0 => return Ok(tokens[start..i].to_vec()),
+            _ => {}
+        }
+    }
+    Err(invalid("unterminated Journal removal declaration"))
+}
+
+fn verify_journal_removal_shape(conn: &Connection) -> Result<()> {
+    let (expected, column) = journal_removal_extension()?;
+    let actual = snapshot(conn)?;
+    if expected
+        .iter()
+        .any(|(name, object)| actual.get(name) != Some(object))
+    {
+        return Err(invalid(
+            "Journal removal index/trigger receipt-shape mismatch",
+        ));
+    }
+    let table = actual
+        .get("worker_removal_operations")
+        .ok_or_else(|| invalid("missing removal table"))?;
+    if declaration(&table.2, "word:journal_removal_json")? != column {
+        return Err(invalid(
+            "Journal removal column/CHECK receipt-shape mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
-    if super::current_schema_version(conn)? != 123 {
+    if super::current_schema_version(conn)? < 123 {
         return Ok(shape);
     }
     for table in ["backend_jobs", "backend_job_attempts"] {
@@ -498,6 +579,20 @@ fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
                     }
                 }
             }
+        }
+    }
+    if super::current_schema_version(conn)? >= 124 {
+        let (extension, column) = journal_removal_extension()?;
+        shape.extend(extension);
+        if let Some((_, _, tokens)) = shape.get_mut("worker_removal_operations") {
+            let start = tokens
+                .iter()
+                .position(|token| token == "(")
+                .ok_or_else(|| invalid("missing removal declarations"))?;
+            let mut addition = column;
+            addition.push(",".into());
+            tokens.splice(start + 1..start + 1, addition);
+            *tokens = declarations(tokens.clone())?;
         }
     }
     Ok(shape)
@@ -800,9 +895,11 @@ fn declarations(tokens: Vec<String>) -> Result<Vec<String>> {
         if depth == 0 {
             fields.sort();
             let mut result = tokens[..=start].to_vec();
-            for field in fields {
+            for (index, field) in fields.into_iter().enumerate() {
+                if index != 0 {
+                    result.push(",".into());
+                }
                 result.extend(field);
-                result.push(",".into());
             }
             result.extend_from_slice(&tokens[i..]);
             return Ok(result);

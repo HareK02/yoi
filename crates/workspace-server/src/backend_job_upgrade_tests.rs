@@ -1497,7 +1497,10 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
         "SELECT version,name FROM __yoi_schema_migrations ORDER BY version",
     );
     assert_eq!(
-        receipts.last().unwrap(),
+        receipts
+            .iter()
+            .find(|row| row[0] == Value::Integer(123))
+            .unwrap(),
         &vec![Value::Integer(123), Value::Text(MIGRATION_NAME.into())]
     );
     assert_eq!(original, pre_content_values(&conn, true));

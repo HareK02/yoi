@@ -354,6 +354,18 @@ impl SqliteWorkspaceStore {
                     return Err(StoreError::InvalidInput(format!("stale:{plan_id}:Job cleanup must reconcile its existing canonical removal; a filtered child is not absence")));
                 }
             }
+            // A Journal intent owns the original removal operation even if registry
+            // observations move. Beginning it still rechecks policy, holds and work.
+            let journal_plan: Option<String> = tx.query_row(
+                "SELECT plan_id FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND journal_removal_json IS NOT NULL AND state IN ('planned','executing','failed')",
+                params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id], |row| row.get(0),
+            ).optional()?;
+            if let Some(plan_id) = journal_plan {
+                let plan = load_plan(&tx, &plan_id)?.ok_or_else(||StoreError::Store("Journal removal plan disappeared".into()))?;
+                require_current_subject_deletion_plan(&tx, &plan)?;
+                tx.commit()?;
+                return Ok(plan);
+            }
             let policy=load_removal_policy(&tx,&req.workspace_id,&req.worker,erased_journal,true)?.ok_or_else(|| StoreError::InvalidInput(format!("policy-missing:{}",req.workspace_id)))?;
             let worker=match load_worker(&tx,&req.workspace_id,&req.worker)? {
                 Some(v)=>v,
@@ -381,6 +393,12 @@ impl SqliteWorkspaceStore {
             if let Some((operation_id,ticket_id))=tx.query_row("SELECT operation_id,ticket_id FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign')",params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()? {
                 blockers.push(WorkerRemovalBlocker::PendingTicketClaim{operation_id,ticket_id});
             }
+            // Cleanup may bind its first canonical child only after admission.
+            // A hold/unfinished responsibility is not a child to execute or replace.
+            // Once a row exists the earlier canonical-child check still fences it.
+            if first_job_cleanup_child && !blockers.is_empty() {
+                return Err(StoreError::InvalidInput(format!("blocked:{}", serde_json::to_string(&blockers).map_err(|error| StoreError::Store(error.to_string()))?)));
+            }
             let fp=fingerprint(req,&worker.updated_at,inv,&policy,&blockers)?;
             let plan_id=stable("wrp",&fp); let operation_id=stable("wro",&fp);
             let archive_id=(policy.session_disposition==SessionDisposition::Archive).then(||stable("wra",&fp));
@@ -404,6 +422,7 @@ impl SqliteWorkspaceStore {
             if plan.workspace_id!=workspace_id{return Err(StoreError::InvalidInput("cross-workspace".into()));}
             if plan.input_fingerprint!=fp{return Err(StoreError::InvalidInput(format!("fingerprint:{}",plan.operation_id)));}
             require_current_subject_deletion_plan(&tx, &plan)?;
+            let journal_pinned = journal_removal_is_pinned(&tx, &plan.operation_id)?;
             if plan.state==WorkerRemovalPlanState::Succeeded{tx.commit()?;return Ok(plan);}
             if plan.state==WorkerRemovalPlanState::Blocked {
                 return Err(StoreError::InvalidInput(format!("blocked:{}",serde_json::to_string(&plan.blockers).unwrap())));
@@ -416,22 +435,22 @@ impl SqliteWorkspaceStore {
             if !reconciliation {
                 let policy=load_removal_policy(&tx,workspace_id,&plan.worker,plan.policy_id==ERASED_JOURNAL_POLICY_ID,plan.policy_id=="backend-subject-removal-archive-v1")?.ok_or_else(||StoreError::InvalidInput(format!("policy-missing:{workspace_id}")))?;
                 if policy.policy_id!=plan.policy_id||policy.policy_digest!=plan.policy_digest{
-                    mark_stale(&tx,&plan,"policy content changed")?;tx.commit()?;
+                    if !journal_pinned {mark_stale(&tx,&plan,"policy content changed")?;}tx.commit()?;
                     return Err(stale_error(&plan,"policy content changed"));
                 }
             }
             let worker=load_worker(&tx,workspace_id,&plan.worker)?.ok_or_else(||StoreError::InvalidInput(format!("stale:{plan_id}:Worker missing")))?;
-            if !reconciliation && worker.updated_at!=plan.worker_updated_at{
+            if !reconciliation && !journal_pinned && worker.updated_at!=plan.worker_updated_at{
                 mark_stale(&tx,&plan,"Worker updated_at changed")?;tx.commit()?;
                 return Err(stale_error(&plan,"Worker updated_at changed"));
             }
             if worker.retention_state=="pinned"{
-                if !reconciliation {mark_stale(&tx,&plan,"hold added")?;}tx.commit()?;
+                if !reconciliation && !journal_pinned {mark_stale(&tx,&plan,"hold added")?;}tx.commit()?;
                 return Err(stale_error(&plan,"hold added"));
             }
             let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 UNION ALL SELECT 1 FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign'))",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|r|r.get(0))?;
             if assigned{
-                if !reconciliation {mark_stale(&tx,&plan,"unfinished work added")?;}tx.commit()?;
+                if !reconciliation && !journal_pinned {mark_stale(&tx,&plan,"unfinished work added")?;}tx.commit()?;
                 return Err(stale_error(&plan,"unfinished work added"));
             }
             let now=Utc::now().to_rfc3339();
@@ -509,7 +528,7 @@ impl SqliteWorkspaceStore {
                  WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
                    AND state IN ('planned','executing','failed','succeeded')
                    AND (
-                     state='succeeded' OR EXISTS(
+                     state='succeeded' OR journal_removal_json IS NOT NULL OR EXISTS(
                        SELECT 1 FROM subject_deletion_removals d
                        WHERE d.workspace_id=worker_removal_operations.workspace_id
                          AND d.runtime_id=worker_removal_operations.runtime_id
@@ -520,7 +539,7 @@ impl SqliteWorkspaceStore {
                        WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3
                      )
                    )
-                 ORDER BY CASE WHEN EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.prior_removal_operation_id=worker_removal_operations.operation_id) THEN 0 WHEN EXISTS(SELECT 1 FROM subject_deletion_removals d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.operation_id=worker_removal_operations.operation_id) THEN 1 WHEN state='succeeded' THEN 2 ELSE 3 END,
+                 ORDER BY CASE WHEN EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.prior_removal_operation_id=worker_removal_operations.operation_id) THEN 0 WHEN EXISTS(SELECT 1 FROM subject_deletion_removals d WHERE d.workspace_id=worker_removal_operations.workspace_id AND d.runtime_id=worker_removal_operations.runtime_id AND d.worker_id=worker_removal_operations.worker_id AND d.operation_id=worker_removal_operations.operation_id) THEN 1 WHEN journal_removal_json IS NOT NULL AND state IN ('planned','executing','failed') THEN 2 WHEN state='succeeded' THEN 3 ELSE 4 END,
                           created_at DESC,operation_id DESC LIMIT 1",
                 params![workspace_id, worker.runtime_id, worker.worker_id],
                 |row| row.get::<_, String>(0),
@@ -601,6 +620,7 @@ impl SqliteWorkspaceStore {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let changed=tx.execute("UPDATE worker_removal_operations SET state='failed',failure_category=?1,updated_at=?2 WHERE workspace_id=?3 AND operation_id=?4 AND input_fingerprint=?5 AND state IN ('planned','executing','failed')",params![category,Utc::now().to_rfc3339(),workspace_id,operation_id,fp])?;
             if changed!=1{return Err(StoreError::InvalidInput("active operation mismatch".into()));}
+            crate::store::record_journal_removal_physical_failure(&tx, operation_id)?;
             tx.commit()?;Ok(())
         })?;
         Ok(())
@@ -742,6 +762,7 @@ impl SqliteWorkspaceStore {
             if plan.state != WorkerRemovalPlanState::Executing {
                 return Err(StoreError::InvalidInput(format!("stale:{}:plan state {} is not committable", plan.plan_id, state_s(plan.state))));
             }
+            let journal_pinned = journal_removal_is_pinned(&tx, &plan.operation_id)?;
             if result.worker_id.to_string() != plan.worker.worker_id
                 || result.session_disposition != plan.session_disposition
                 || result.diagnostics_disposition != plan.diagnostics_disposition
@@ -761,7 +782,7 @@ impl SqliteWorkspaceStore {
             // A pinned pre-deletion request is reconciled unchanged under the permanent
             // Subject/Runtime exclusion. Its Worker identity cannot be reused. Metadata
             // version movement must not discard an already-applied canonical result.
-            if !reconciliation && worker.updated_at!=plan.worker_updated_at{return Err(StoreError::InvalidInput(format!("stale:{}:Worker updated_at changed",plan.plan_id)));}
+            if !reconciliation && !journal_pinned && worker.updated_at!=plan.worker_updated_at{return Err(StoreError::InvalidInput(format!("stale:{}:Worker updated_at changed",plan.plan_id)));}
             if worker.retention_state=="pinned" { return Err(StoreError::InvalidInput(format!("stale:{}:hold added",plan.plan_id))); }
             let assigned:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM ticket_active_worker_assignments c JOIN ticket_worker_assignments a ON a.workspace_id=c.workspace_id AND a.ticket_id=c.ticket_id AND a.assignment_id=c.assignment_id WHERE a.workspace_id=?1 AND a.runtime_id=?2 AND a.worker_id=?3 UNION ALL SELECT 1 FROM ticket_assignment_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND claim_state='pending' AND action IN ('assign','reassign'))",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id],|row|row.get(0))?;
             if assigned { return Err(StoreError::InvalidInput(format!("stale:{}:unfinished work added",plan.plan_id))); }
@@ -833,10 +854,13 @@ impl SqliteWorkspaceStore {
                 tx.execute("INSERT OR IGNORE INTO worker_tombstones(workspace_id,runtime_id,worker_id,display_name,profile,worker_created_at,removed_at,archive_id,policy_id,policy_digest,operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,worker.display_name,worker.profile,worker.created_at,now,if erasure.is_some() { None } else { plan.archive_id.clone() },plan.policy_id,plan.policy_digest,operation_id])?;
             }
             tx.execute("UPDATE worker_workdir_links SET unlinked_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND unlinked_at IS NULL",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
-            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND (updated_at=?4 OR ?5)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_updated_at,reconciliation])?;
+            let deleted=tx.execute("DELETE FROM worker_registry WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND (updated_at=?4 OR ?5)",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,plan.worker_updated_at,reconciliation || journal_pinned])?;
             tx.execute("UPDATE worker_create_reservations SET state='removed',updated_at=?4 WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state IN ('reserved','created')",params![workspace_id,plan.worker.runtime_id,plan.worker.worker_id,now])?;
             if deleted!=1{return Err(StoreError::InvalidInput(format!("stale:{}:removal fence changed",plan.plan_id)));}
             let catalog=commit_worker_catalog_removal(&tx,workspace_id,&plan.worker)?;
+            // Explicit erasure retains any incomplete Journal observation; the
+            // physical erasure acknowledgement is not Journal completion proof.
+            if erasure.is_none() {crate::store::complete_journal_removal(&tx, operation_id)?;}
             tx.execute("UPDATE worker_removal_operations SET state='succeeded',failure_category=NULL,updated_at=?1 WHERE operation_id=?2",params![now,operation_id])?;
             if let Some(ack) = erasure {
                 insert_erasure_reconciliation_audit(&tx, &plan, ack, Some(result))?;
@@ -1528,6 +1552,13 @@ fn diag(v: DiagnosticsDisposition) -> &'static str {
         DiagnosticsDisposition::Retain => "retain",
     }
 }
+fn journal_removal_is_pinned(conn: &Connection, operation_id: &str) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT journal_removal_json IS NOT NULL FROM worker_removal_operations WHERE operation_id=?1",
+        [operation_id], |row| row.get(0),
+    )?)
+}
+
 fn state_s(v: WorkerRemovalPlanState) -> &'static str {
     match v {
         WorkerRemovalPlanState::Planned => "planned",
@@ -1640,6 +1671,704 @@ mod tests {
             journal_erasure: None,
         }
     }
+    fn journal_binding(root: &std::path::Path) -> crate::store::JournalRemovalBinding {
+        let manager = feature_storage::FeatureStorage::new(root);
+        let registration = manager
+            .register(feature_storage::FeatureRegistration::new(
+                "journal-test",
+                &[],
+            ))
+            .unwrap();
+        let database = manager.scope("w").unwrap().open(&registration).unwrap();
+        crate::store::JournalRemovalBinding {
+            subject_id: "subject".into(),
+            writer_session_id: "session".into(),
+            writer_binding_id: "binding".into(),
+            database: database.identity().clone(),
+        }
+    }
+
+    fn frozen_journal_member(root: &std::path::Path) -> crate::store::FrozenJournalRemovalMember {
+        use session_store::public_material::SessionPublicMaterialReader;
+        use session_store::{FsStore, LogEntry, Store};
+        let session_id = session_store::new_session_id();
+        let segment = session_store::new_segment_id();
+        let store = FsStore::new(root).unwrap();
+        store
+            .create_segment(
+                session_id,
+                segment,
+                &[LogEntry::AnnotatedSegmentStart {
+                    ts: 1,
+                    session_id,
+                    system_prompt: None,
+                    config: Default::default(),
+                    history: vec![session_store::LoggedHistoryEntry {
+                        item: session_store::LoggedItem::Message {
+                            role: session_store::LoggedRole::User,
+                            content: vec![session_store::LoggedContentPart::Text {
+                                text: "retained original body".into(),
+                            }],
+                        },
+                        metadata: session_store::LoggedSessionHistoryMetadata {
+                            input_metadata: None,
+                            entry_id: session_store::LoggedSessionHistoryEntryId(
+                                "original-input".into(),
+                            ),
+                            origin: session_store::LoggedSessionHistoryOrigin::LocalHumanInput,
+                            derivation: None,
+                        },
+                    }],
+                    forked_from: None,
+                    compacted_from: None,
+                }],
+            )
+            .unwrap();
+        let reader =
+            SessionPublicMaterialReader::open_fs(root, session_id, segment, Default::default())
+                .unwrap();
+        let descriptors: Vec<_> = reader.descriptors().cloned().collect();
+        assert_eq!(descriptors.len(), 1);
+        crate::store::FrozenJournalRemovalMember {
+            session_id: session_id.to_string(),
+            active_segment_id: Some(segment),
+            materialized: true,
+            end: session_store::capture::RecordingPosition {
+                canonical_order: descriptors.len() as u64,
+                byte_offset: 0,
+            },
+            descriptors,
+        }
+    }
+
+    #[test]
+    fn journal_removal_metadata_reopens_and_cas_fences_same_operation() {
+        use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("server.db");
+        let store = setup();
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        let prepared = store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        let binding = journal_binding(&temp.path().join("features"));
+        let authority: &dyn ControlPlaneStore = &store;
+        let initial = authority.init_journal_removal(&prepared, &binding).unwrap();
+        assert_eq!(initial.metadata.phase, Phase::AwaitingQuiescence);
+        assert_eq!(initial.metadata.members, None);
+        assert_eq!(
+            authority.init_journal_removal(&prepared, &binding).unwrap(),
+            initial
+        );
+        let mut replacement = binding.clone();
+        replacement.writer_session_id = "successor".into();
+        assert!(
+            authority
+                .init_journal_removal(&prepared, &replacement)
+                .is_err()
+        );
+        replacement = binding.clone();
+        replacement.writer_binding_id = "successor-binding".into();
+        assert!(
+            authority
+                .init_journal_removal(&prepared, &replacement)
+                .is_err()
+        );
+        replacement = journal_binding(&temp.path().join("replacement-features"));
+        assert_ne!(replacement.database, binding.database);
+        assert!(
+            authority
+                .init_journal_removal(&prepared, &replacement)
+                .is_err()
+        );
+        let mut wrong = prepared.clone();
+        wrong.plan.input_fingerprint = "changed".into();
+        assert!(authority.get_journal_removal(&wrong).is_err());
+        wrong = prepared.clone();
+        wrong.plan.worker.runtime_id = "another-runtime".into();
+        assert!(authority.get_journal_removal(&wrong).is_err());
+        wrong = prepared.clone();
+        wrong.plan.workspace_id = "another-workspace".into();
+        assert!(authority.init_journal_removal(&wrong, &binding).is_err());
+        let members = vec![frozen_journal_member(&temp.path().join("history"))];
+        let frozen = authority
+            .freeze_journal_removal(&prepared, &initial, &members)
+            .unwrap();
+        assert_eq!(frozen.operation_id, plan.operation_id);
+        assert_eq!(frozen.input_fingerprint, plan.input_fingerprint);
+        assert_eq!(frozen.metadata.phase, Phase::Recording);
+        assert!(
+            authority
+                .update_journal_removal_progress(
+                    &prepared,
+                    &initial,
+                    Phase::AwaitingQuiescence,
+                    Some(Cause::SourceUnavailable)
+                )
+                .is_err()
+        );
+        let held = authority
+            .update_journal_removal_progress(
+                &prepared,
+                &frozen,
+                Phase::Recording,
+                Some(Cause::JobPending),
+            )
+            .unwrap();
+        assert!(
+            authority
+                .update_journal_removal_progress(&prepared, &held, Phase::Completed, None)
+                .is_err()
+        );
+        assert!(
+            authority
+                .update_journal_removal_progress(&prepared, &held, Phase::Released, None)
+                .is_err()
+        );
+        store
+            .with_conn(|conn| {
+                let mut disk = Connection::open(&path)?;
+                rusqlite::backup::Backup::new(conn, &mut disk)?.run_to_completion(
+                    128,
+                    std::time::Duration::from_millis(1),
+                    None,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let concurrent = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert_eq!(
+            reopened.get_journal_removal(&prepared).unwrap(),
+            Some(held.clone())
+        );
+        assert_eq!(
+            reopened
+                .list_pending_journal_removals("w", None, 1)
+                .unwrap(),
+            vec![held.clone()]
+        );
+        assert!(
+            reopened
+                .list_pending_journal_removals("other", None, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .list_pending_journal_removals("w", Some(&held.operation_id), 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .list_pending_journal_removals("w", None, 101)
+                .is_err()
+        );
+        let next = concurrent
+            .update_journal_removal_progress(
+                &prepared,
+                &held,
+                Phase::AwaitingEffectsEnd,
+                Some(Cause::ExecutionUnconfirmed),
+            )
+            .unwrap();
+        assert!(
+            reopened
+                .update_journal_removal_progress(
+                    &prepared,
+                    &held,
+                    Phase::Recording,
+                    Some(Cause::JobFailed)
+                )
+                .is_err()
+        );
+        let mut changed = members.clone();
+        changed[0].end.byte_offset += 1;
+        assert!(
+            reopened
+                .freeze_journal_removal(&prepared, &next, &changed)
+                .is_err()
+        );
+        for mutate in [0, 1, 2, 3, 4] {
+            let mut changed = members.clone();
+            match mutate {
+                0 => changed[0].active_segment_id = Some(session_store::new_segment_id()),
+                1 => changed[0].materialized = false,
+                2 => changed[0].descriptors[0]
+                    .identity
+                    .entry_ref
+                    .push_str("-changed"),
+                3 => changed[0].descriptors[0].sha256 = "f".repeat(64),
+                _ => changed[0].descriptors[0].total_bytes += 1,
+            }
+            assert!(
+                reopened
+                    .freeze_journal_removal(&prepared, &next, &changed)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            reopened
+                .freeze_journal_removal(&prepared, &next, &members)
+                .unwrap(),
+            next
+        );
+        let json = serde_json::to_value(&next).unwrap();
+        assert_eq!(
+            serde_json::from_value::<crate::store::JournalRemovalProgress>(json).unwrap(),
+            next
+        );
+        let mut invalid_metadata = serde_json::to_value(&next.metadata).unwrap();
+        invalid_metadata["body"] = serde_json::json!("not admitted metadata");
+        assert!(
+            serde_json::from_value::<crate::store::JournalRemovalMetadata>(invalid_metadata)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn journal_removal_physical_failure_preserves_frozen_metadata_and_cas_atomically() {
+        use crate::store::{JournalRemovalCause as Cause, JournalRemovalPhase as Phase};
+        let temp = tempfile::tempdir().unwrap();
+        let store = setup();
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        let prepared = store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        let initial = store
+            .init_journal_removal(&prepared, &journal_binding(&temp.path().join("features")))
+            .unwrap();
+        let frozen = store
+            .freeze_journal_removal(
+                &prepared,
+                &initial,
+                &[frozen_journal_member(&temp.path().join("history"))],
+            )
+            .unwrap();
+        let effects = store
+            .update_journal_removal_progress(&prepared, &frozen, Phase::AwaitingEffectsEnd, None)
+            .unwrap();
+        // These are store observations only, not a Journal release or execution-end proof.
+        let released = store
+            .update_journal_removal_progress(&prepared, &effects, Phase::Released, None)
+            .unwrap();
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_failure_cause BEFORE UPDATE OF journal_removal_json ON worker_removal_operations WHEN json_extract(NEW.journal_removal_json,'$.cause')='execution_unconfirmed' BEGIN SELECT RAISE(ABORT,'injected cause save failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .fail_worker_removal(
+                    "w",
+                    &plan.operation_id,
+                    &plan.input_fingerprint,
+                    "runtime_remove"
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.get_journal_removal(&prepared).unwrap(),
+            Some(released.clone())
+        );
+        assert_eq!(
+            store
+                .recover_worker_removal_execution("w", &plan.worker)
+                .unwrap()
+                .unwrap()
+                .plan
+                .state,
+            WorkerRemovalPlanState::Executing
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_failure_cause;")?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .fail_worker_removal(
+                    "w",
+                    &plan.operation_id,
+                    "wrong-fingerprint",
+                    "runtime_remove"
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.get_journal_removal(&prepared).unwrap(),
+            Some(released.clone())
+        );
+        store
+            .fail_worker_removal(
+                "w",
+                &plan.operation_id,
+                &plan.input_fingerprint,
+                "runtime_remove",
+            )
+            .unwrap();
+        let held = store.get_journal_removal(&prepared).unwrap().unwrap();
+        assert_eq!(held.metadata.phase, Phase::Released);
+        assert_eq!(held.metadata.cause, Some(Cause::ExecutionUnconfirmed));
+        assert_eq!(held.metadata.binding, released.metadata.binding);
+        assert_eq!(held.metadata.members, released.metadata.members);
+        assert_eq!(
+            store
+                .recover_worker_removal_execution("w", &plan.worker)
+                .unwrap()
+                .unwrap()
+                .plan
+                .state,
+            WorkerRemovalPlanState::Failed
+        );
+        assert!(
+            store
+                .update_journal_removal_progress(&prepared, &released, Phase::Released, None)
+                .is_err(),
+            "failure annotation must fence the old full-progress CAS"
+        );
+        assert!(
+            store
+                .update_journal_removal_progress(&prepared, &held, Phase::Completed, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn journal_removal_pins_intent_without_weakening_policy_hold_or_ticket_blockers() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = setup();
+        let plan = store.plan_worker_removal(&req(), &inv()).unwrap();
+        let prepared = store
+            .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+            .unwrap();
+        store
+            .init_journal_removal(&prepared, &journal_binding(temp.path()))
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE worker_registry SET updated_at='later' WHERE workspace_id='w'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let recovered = store
+            .recover_worker_removal_execution("w", &plan.worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.plan.operation_id, plan.operation_id);
+        assert_eq!(
+            store
+                .plan_worker_removal(&req(), &inv())
+                .unwrap()
+                .operation_id,
+            plan.operation_id
+        );
+        assert_eq!(
+            store
+                .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+                .unwrap()
+                .plan
+                .input_fingerprint,
+            plan.input_fingerprint
+        );
+        let policy = store.worker_retention_policy("w").unwrap().unwrap();
+        let original = WorkerRetentionPolicyUpdate {
+            policy_id: policy.policy_id,
+            session_disposition: policy.session_disposition,
+            metadata_disposition: policy.metadata_disposition,
+            archive_retention: policy.archive_retention,
+            diagnostics_disposition: policy.diagnostics_disposition,
+            diagnostics_retention_seconds: policy.diagnostics_retention_seconds,
+        };
+        let mut changed_policy = original.clone();
+        changed_policy.metadata_disposition = MetadataDisposition::Purge;
+        let changed_policy = store
+            .update_worker_retention_policy("w", &policy.policy_digest, &changed_policy)
+            .unwrap();
+        assert!(
+            matches!(store.prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint), Err(WorkerRetentionError::StalePlan { reason, .. }) if reason == "policy content changed")
+        );
+        assert_eq!(
+            store
+                .plan_worker_removal(&req(), &inv())
+                .unwrap()
+                .operation_id,
+            plan.operation_id
+        );
+        store
+            .update_worker_retention_policy("w", &changed_policy.policy_digest, &original)
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE worker_registry SET retention_state='pinned' WHERE workspace_id='w'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            matches!(store.prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint), Err(WorkerRetentionError::StalePlan { reason, .. }) if reason == "hold added")
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE worker_registry SET retention_state='normal' WHERE workspace_id='w'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            install_current_assignment(&store, "journal-blocker").is_err(),
+            "the existing removal admission fence must reject new Ticket responsibility"
+        );
+        assert!(
+            store
+                .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+                .is_ok()
+        );
+        let pinned = store.plan_worker_removal(&req(), &inv()).unwrap();
+        assert_eq!(pinned.state, WorkerRemovalPlanState::Executing);
+        assert_eq!(pinned.operation_id, plan.operation_id);
+        assert_eq!(
+            store
+                .list_pending_journal_removals("w", None, 100)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    fn subject_removal_source(
+        store: &SqliteWorkspaceStore,
+        allocation: &str,
+        singleton: Option<&str>,
+    ) -> (WorkerRemovalPlanRequest, WorkerRetentionInventory) {
+        store.with_conn(|conn| {
+            conn.execute("INSERT OR IGNORE INTO workspace_memory_settings(workspace_id,language,created_at,updated_at) VALUES('w','English','created','observed')", [])?;
+            Ok(())
+        }).unwrap();
+        let memory = store.get_workspace_memory_settings("w").unwrap();
+        let reservation = store
+            .reserve_worker_create("w", "r", allocation, allocation, singleton, &memory)
+            .unwrap();
+        store
+            .complete_worker_create_reservation("w", reservation.worker_id)
+            .unwrap();
+        let worker = RuntimeWorkerRef::new("r", reservation.worker_id.to_string());
+        store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: "w".into(),
+                worker: worker.clone(),
+                display_name: allocation.into(),
+                profile: Some("builtin:coder".into()),
+                retention_state: "normal".into(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "created".into(),
+                updated_at: "observed".into(),
+            })
+            .unwrap();
+        let mut inventory = inv();
+        inventory.worker_id = reservation.worker_id;
+        (
+            WorkerRemovalPlanRequest {
+                workspace_id: "w".into(),
+                worker,
+                reason: "cleanup".into(),
+                journal_erasure: None,
+            },
+            inventory,
+        )
+    }
+
+    #[test]
+    fn journal_removal_pending_intents_find_pre_binding_save_failures_with_bounded_subject_scope() {
+        let store = setup();
+        let temp = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        for (allocation, singleton) in [
+            ("subject-a", Some("subjektiv:a")),
+            ("subject-b", Some("subjektiv:b")),
+            ("subject-c", Some("subjektiv:c")),
+            ("ordinary", None),
+            ("consolidation", Some("subjektiv-consolidation:a")),
+        ] {
+            let (request, inventory) = subject_removal_source(&store, allocation, singleton);
+            let plan = store.plan_worker_removal(&request, &inventory).unwrap();
+            let prepared = store
+                .prepare_worker_removal_execution("w", &plan.plan_id, &plan.input_fingerprint)
+                .unwrap();
+            if singleton.is_some_and(|key| key.starts_with("subjektiv:")) {
+                expected.push(prepared);
+            }
+        }
+        expected.sort_by(|a, b| a.plan.operation_id.cmp(&b.plan.operation_id));
+        assert_eq!(expected.len(), 3);
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER reject_journal_init BEFORE UPDATE OF journal_removal_json ON worker_removal_operations BEGIN SELECT RAISE(ABORT,'injected Journal init save failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .init_journal_removal(&expected[0], &journal_binding(temp.path()))
+                .is_err()
+        );
+        assert!(store.get_journal_removal(&expected[0]).unwrap().is_none());
+        let authority: &dyn ControlPlaneStore = &store;
+        let first = authority
+            .list_pending_worker_removal_intents("w", None, 2)
+            .unwrap();
+        assert_eq!(first, expected[..2]);
+        let second = authority
+            .list_pending_worker_removal_intents(
+                "w",
+                Some(&first.last().unwrap().plan.operation_id),
+                2,
+            )
+            .unwrap();
+        assert_eq!(second, expected[2..]);
+        assert!(
+            authority
+                .list_pending_worker_removal_intents(
+                    "w",
+                    Some(&second.last().unwrap().plan.operation_id),
+                    2
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            authority
+                .list_pending_worker_removal_intents("other", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            authority
+                .list_pending_worker_removal_intents("w", None, 0)
+                .is_err()
+        );
+        assert!(
+            authority
+                .list_pending_worker_removal_intents("w", None, 101)
+                .is_err()
+        );
+        assert!(
+            authority
+                .list_pending_journal_removals("w", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        let path = temp.path().join("server.db");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_journal_init;")?;
+                let mut disk = Connection::open(&path)?;
+                rusqlite::backup::Backup::new(conn, &mut disk)?.run_to_completion(
+                    128,
+                    std::time::Duration::from_millis(1),
+                    None,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert_eq!(
+            reopened
+                .list_pending_worker_removal_intents("w", None, 100)
+                .unwrap(),
+            expected
+        );
+        let row = &expected[0];
+        reopened.with_conn(|conn| {
+            conn.execute("UPDATE worker_registry SET retention_state='pinned' WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3", params![row.plan.workspace_id,row.plan.worker.runtime_id,row.plan.worker.worker_id])?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            reopened
+                .prepare_worker_removal_execution(
+                    "w",
+                    &row.plan.plan_id,
+                    &row.plan.input_fingerprint
+                )
+                .is_err(),
+            "discovery cannot waive current hold"
+        );
+    }
+
+    #[test]
+    fn journal_removal_pending_intents_reject_stale_or_ambiguous_pre_init_plans() {
+        let store = setup();
+        let (request, inventory) =
+            subject_removal_source(&store, "subject", Some("subjektiv:subject"));
+        let first = store.plan_worker_removal(&request, &inventory).unwrap();
+        assert_eq!(
+            store
+                .list_pending_worker_removal_intents("w", None, 100)
+                .unwrap()[0]
+                .plan
+                .operation_id,
+            first.operation_id
+        );
+        let mut registry = store
+            .get_worker_registry("w", &request.worker)
+            .unwrap()
+            .unwrap();
+        registry.updated_at = "changed".into();
+        store.upsert_worker_registry(&registry).unwrap();
+        assert!(
+            store
+                .list_pending_worker_removal_intents("w", None, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        let replacement = store.plan_worker_removal(&request, &inventory).unwrap();
+        assert_ne!(replacement.operation_id, first.operation_id);
+        assert!(
+            store
+                .list_pending_worker_removal_intents("w", None, 100)
+                .unwrap_err()
+                .to_string()
+                .contains("Ambiguous")
+        );
+        assert_eq!(
+            store
+                .get_journal_removal(
+                    &store
+                        .recover_worker_removal_execution("w", &request.worker)
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+            None
+        );
+        let count: u64 = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM worker_removal_operations WHERE workspace_id='w'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "discovery must not create or replace a canonical plan"
+        );
+    }
+
     #[test]
     fn conservative_seed_and_policy_conflict() {
         let s = setup();
@@ -1900,6 +2629,7 @@ mod tests {
                 source_session_id: "s".into(),
                 source_active_segment_id: None,
                 segment_ids: vec!["a".into()],
+                retained_sessions: Vec::new(),
                 source_created_at: "created".into(),
                 removed_at: "removed".into(),
                 archived_at_unix_seconds: 1,
@@ -2925,6 +3655,7 @@ mod tests {
                 source_session_id: "s".into(),
                 source_active_segment_id: None,
                 segment_ids: vec!["a".into()],
+                retained_sessions: Vec::new(),
                 source_created_at: "created".into(),
                 removed_at: "removed".into(),
                 archived_at_unix_seconds: 1,

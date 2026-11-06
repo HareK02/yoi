@@ -847,7 +847,7 @@ impl WorkerOperation {
                 "Restore a stopped Backend/Runtime Worker session in the current Workspace. Supply expected_observation_token from WorkerList; a conflict requires refreshing and deliberate new intent. New requests default to the durable Tool call ID. For explicit recovery of an unknown/pending outcome, supply the reported request_id and the original token unchanged; never create a new intent or automatically retry."
             }
             Self::Remove => {
-                "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Conclusion, stopping, retention/removal, attachment release, and Workdir deletion are separate decisions. Removal releases attachments but preserves Workdir materialization. Supply a bounded reason; Backend validation and retention are authoritative."
+                "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Conclusion, stopping, retention/removal, attachment release, and Workdir deletion are separate decisions. Removal releases attachments but preserves Workdir materialization. Supply a bounded reason; Backend validation and retention are authoritative. HTTP 202 / removed:false is a saved removal intent, not deletion: waiting or held retains the Worker, history and writer. Inspect operation_id, phase and typed cause in the result and current Worker observation; do not force discard, infer completion, or create a new removal intent to retry."
             }
         }
     }
@@ -1071,6 +1071,32 @@ fn tool_output(
             "Workspace Worker operation returned HTTP {}: {}",
             response.status, response.body
         )));
+    }
+    if operation == WorkerOperation::Remove {
+        let removed: server_api::WorkerRemoveResponse = serde_json::from_str(&response.body)
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("invalid WorkerRemove response: {error}"))
+            })?;
+        let summary = if removed.removed && response.status != 202 {
+            "WorkerRemove completed; Worker removed"
+        } else {
+            match removed.state {
+                Some(server_api::WorkerRemovalState::Waiting) => {
+                    "WorkerRemove accepted; removal waiting, Worker not removed. Inspect operation_id, phase and cause; acceptance is not completion"
+                }
+                Some(server_api::WorkerRemovalState::Held) => {
+                    "WorkerRemove accepted; removal held, Worker not removed. Inspect operation_id, phase and cause; no forced discard or automatic retry"
+                }
+                None => {
+                    "WorkerRemove accepted; deletion unconfirmed. Inspect the current saved operation; acceptance is not completion"
+                }
+            }
+        };
+        return Ok(ToolOutput {
+            summary: summary.into(),
+            content: Some(response.body),
+            attachments: Vec::new(),
+        });
     }
     if operation == WorkerOperation::Notify {
         let notified: server_api::RuntimeWorkerInputResult = serde_json::from_str(&response.body)
@@ -1371,7 +1397,12 @@ mod tests {
             ));
             Ok(WorkspaceResponse {
                 status: 200,
-                body: r#"{"removed":true}"#.to_string(),
+                body: serde_json::json!({
+                    "removed": true,
+                    "runtime_id": target_runtime_id,
+                    "worker_id": target_worker_id,
+                })
+                .to_string(),
             })
         }
     }
@@ -1910,6 +1941,51 @@ mod tests {
 
         assert!(matches!(error, ToolError::InvalidArgument(_)));
         assert!(client.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_remove_accepted_receipts_preserve_progress_without_claiming_completion() {
+        for (state, cause) in [("waiting", "job_pending"), ("held", "job_failed")] {
+            let body = serde_json::json!({
+                "removed": false, "runtime_id": "r", "worker_id": "w",
+                "operation_id": "saved-removal", "state": state,
+                "phase": "recording", "cause": cause,
+            })
+            .to_string();
+            let output = tool_output(
+                WorkerOperation::Remove,
+                WorkspaceResponse {
+                    status: 202,
+                    body: body.clone(),
+                },
+            )
+            .unwrap();
+            assert!(output.summary.contains(state));
+            assert!(output.summary.contains("not removed"));
+            assert!(!output.summary.contains("completed"));
+            assert_eq!(output.content.as_deref(), Some(body.as_str()));
+        }
+        let output = tool_output(
+            WorkerOperation::Remove,
+            WorkspaceResponse {
+                status: 200,
+                body: r#"{"removed":true,"runtime_id":"r","worker_id":"w"}"#.into(),
+            },
+        )
+        .unwrap();
+        assert!(output.summary.contains("completed"));
+        assert!(
+            tool_output(
+                WorkerOperation::Remove,
+                WorkspaceResponse {
+                    status: 202,
+                    body:
+                        r#"{"removed":false,"runtime_id":"r","worker_id":"w","phase":"invented"}"#
+                            .into(),
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

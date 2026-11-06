@@ -944,7 +944,31 @@ pub(crate) fn open_session_public_material_reader(
     }
     let active = metadata.active.ok_or("Session active pointer is missing")?;
     if active.session_id.to_string() != expected_session_id {
-        return Err("Session identity does not match the authorized current Session".into());
+        let runtime_root = aggregate
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("Worker aggregate root is unavailable")?;
+        let owner = session_store::worker_sources::WorkerSessionSources::new(
+            runtime_root,
+            session_store::worker_sources::WorkerSessionOwner {
+                workspace_id: workspace_id.into(),
+                worker_id: worker_ref.worker_id.to_string(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let member = owner
+            .retained_bindings()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|member| member.session_id.to_string() == expected_session_id)
+            .ok_or("Session identity does not match an owned retained Session")?;
+        return Ok(SessionPublicMaterialReader::open_fs_with_retention(
+            &owner.retained_root(),
+            member.session_id,
+            member.active_segment_id,
+            PublicMaterialLimits::default(),
+            crate::session_retention::runtime_session_retention(runtime_root),
+        )?);
     }
     let reader = SessionPublicMaterialReader::open_worker_with_retention(
         &aggregate.join("session"),
@@ -2332,6 +2356,26 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                         session_dir.display()
                     )
                 })?;
+        let session_store = if let Some(workspace_id) = observation_workspace_id.as_ref() {
+            let runtime_root = worker_aggregate_dir
+                .parent()
+                .and_then(|root| root.parent())
+                .ok_or("Runtime aggregate root unavailable")?;
+            session_store
+                .with_runtime_owner(
+                    session_store::worker_sources::WorkerSessionSources::new(
+                        runtime_root,
+                        session_store::worker_sources::WorkerSessionOwner {
+                            workspace_id: workspace_id.clone(),
+                            worker_id: request.worker_ref.worker_id.to_string(),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            session_store
+        };
         let worker_metadata_store =
             WorkerAggregateStore::new(&worker_aggregate_dir, worker_name.clone()).map_err(
                 |err| {
@@ -2684,6 +2728,26 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                     .map_err(|_| "Session retention unavailable")?,
             )
             .map_err(|_| "canonical Session store initialization failed")?;
+            let session_store = if let Some(api) = request.request.workspace_api.as_ref() {
+                let runtime_root = worker_aggregate_dir
+                    .parent()
+                    .and_then(|root| root.parent())
+                    .ok_or("Runtime aggregate root unavailable")?;
+                session_store
+                    .with_runtime_owner(
+                        session_store::worker_sources::WorkerSessionSources::new(
+                            runtime_root,
+                            session_store::worker_sources::WorkerSessionOwner {
+                                workspace_id: api.workspace_id.clone(),
+                                worker_id: request.worker_ref.worker_id.to_string(),
+                            },
+                        )
+                        .map_err(|_| "Worker Session producer binding failed")?,
+                    )
+                    .map_err(|_| "Worker Session producer binding failed")?
+            } else {
+                session_store
+            };
             let worker_metadata_store =
                 WorkerAggregateStore::open_read_only(&worker_aggregate_dir, worker_name.clone())
                     .map_err(|_| "canonical metadata store initialization failed")?;
@@ -6163,6 +6227,7 @@ where
                     },
                 );
                 return Ok(runtime_api::SubjectReleaseResponse {
+                    recording_scope: None,
                     operation_id: request.operation_id.clone(),
                     binding_id: request.binding_id.clone(),
                     state: State::Cancelled,
@@ -6214,7 +6279,24 @@ where
         }
         let saved = reservations.get_mut(&key).expect("reservation inserted");
         match (request.action, saved.state) {
-            (Action::Reserve, State::Reserved | State::Disconnected) => {}
+            (Action::Reserve, State::Reserved) => {
+                if saved.guard.is_none() {
+                    return Err("Controller reservation missing".into());
+                }
+                let workers = self
+                    .workers
+                    .lock()
+                    .map_err(|_| "worker registry poisoned")?;
+                let execution = workers
+                    .get(&worker_ref)
+                    .ok_or("Subject Controller is unavailable")?;
+                if execution.shutdown_requested.load(Ordering::Acquire)
+                    || execution.handle.protocol_is_closed()
+                {
+                    return Err("Subject Controller reservation is no longer live".into());
+                }
+            }
+            (Action::Reserve, State::Disconnected) => {}
             (Action::Disconnect, State::Reserved) => {
                 saved
                     .guard
@@ -6238,6 +6320,7 @@ where
             }
         }
         Ok(runtime_api::SubjectReleaseResponse {
+            recording_scope: None,
             operation_id: request.operation_id.clone(),
             binding_id: request.binding_id.clone(),
             state: saved.state,
@@ -8434,6 +8517,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
+    mod removal_tests {
+        include!("worker_backend/removal_tests.rs");
+    }
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -11981,8 +12068,8 @@ mod tests {
         }
     }
 
-    fn wait_for_adapter_state(
-        backend: &WorkerRuntimeExecutionBackend<MockFactory>,
+    fn wait_for_adapter_state<F: RuntimeWorkerFactory>(
+        backend: &WorkerRuntimeExecutionBackend<F>,
         worker_ref: &WorkerRef,
         expected_status: WorkerStatus,
     ) {
@@ -14870,27 +14957,24 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "http-server")]
+    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
+    #[serial_test::serial(worker_allocation)]
     fn subject_release_reserves_real_controller_and_excludes_runtime_lifecycle() {
         use runtime_api::{SubjectReleaseAction as Action, SubjectReleaseState as State};
-        let runtime_base = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let backend = Arc::new(
-            WorkerRuntimeExecutionBackend::new(MockFactory {
+            WorkerRuntimeExecutionBackend::new(removal_tests::RemovalFactory {
+                root: store.path().into(),
                 client: MockClient::new(simple_text_events()),
-                runtime_base: runtime_base.path().to_path_buf(),
-                cwd: cwd.path().to_path_buf(),
-                store_dir: store.path().join("sessions"),
-                worker_metadata_dir: store.path().join("workers"),
-                observed_cwds: Arc::new(Mutex::new(Vec::new())),
-                observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
             })
             .unwrap(),
         );
-        let runtime =
-            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), backend.clone())
-                .unwrap();
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            crate::FsRuntimeStoreOptions::new(store.path()).with_runtime_id("release-runtime"),
+            backend.clone(),
+        )
+        .unwrap();
+        runtime.bind_runtime_identity("release-runtime").unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let mut create = create_request("subject-release");
         create.workspace_api = Some(crate::catalog::WorkspaceApiRef {

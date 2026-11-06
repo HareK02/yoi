@@ -982,6 +982,75 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         }
     }
 
+    async fn freeze_worker_removal(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerRetentionExecutionRequest,
+    ) -> Result<runtime_api::WorkerRemovalFreeze, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &value.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        if value.worker_id != worker_ref.worker_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                400,
+                "worker_id_mismatch",
+                "Worker removal route identity mismatch",
+            ));
+        }
+        #[cfg(feature = "fs-store")]
+        {
+            let request: WorkerRetentionExecutionRequest = request(value)?;
+            self.state
+                .runtime
+                .freeze_worker_removal_scoped(&scope, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, value);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Worker removal requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn capture_worker_removal_session(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .capture_worker_removal_session_scoped(
+                    &scope,
+                    &request.operation_id,
+                    worker_ref.worker_id,
+                    request.session_id,
+                    request.active_segment_id,
+                    request.start,
+                    request.max_entries,
+                    request.max_serialized_bytes,
+                )
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, worker_ref, request);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Worker removal requires filesystem storage",
+            ))
+        }
+    }
+
     async fn execute_retention(
         &self,
         worker_id: String,
