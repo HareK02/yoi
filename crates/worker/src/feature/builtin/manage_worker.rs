@@ -2434,6 +2434,7 @@ mod tests {
                 WorkerOperation::Remove,
                 WorkspaceResponse {
                     status: 202,
+                    content_type: None,
                     body: body.clone(),
                 },
             )
@@ -2447,6 +2448,7 @@ mod tests {
             WorkerOperation::Remove,
             WorkspaceResponse {
                 status: 200,
+                content_type: None,
                 body: r#"{"removed":true,"runtime_id":"r","worker_id":"w"}"#.into(),
             },
         )
@@ -2457,6 +2459,7 @@ mod tests {
                 WorkerOperation::Remove,
                 WorkspaceResponse {
                     status: 202,
+                    content_type: None,
                     body:
                         r#"{"removed":false,"runtime_id":"r","worker_id":"w","phase":"invented"}"#
                             .into(),
