@@ -1252,6 +1252,7 @@ mod client {
                     workdir.id().clone(),
                     open_request.clone(),
                     std::time::Duration::from_secs(30),
+                    None,
                 )
                 .await
                 .unwrap_err();

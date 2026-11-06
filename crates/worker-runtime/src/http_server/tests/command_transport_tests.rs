@@ -157,7 +157,10 @@ impl Harness {
             base,
             authorization.clone(),
             Workdir::new("wd-transport").id().clone(),
-            OpenWorkdirSessionRequest::default(),
+            OpenWorkdirSessionRequest {
+                session_id: WorkdirSessionId::new("session-transport").unwrap(),
+                owner_worker_id: None,
+            },
         )
         .await
         .unwrap();
