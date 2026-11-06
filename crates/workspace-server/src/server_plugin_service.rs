@@ -165,11 +165,11 @@ fn with_current_service_effect<A, T>(
         validate_workspace_scope(current, workspace).map_err(|error| error.error)?;
         let worker =
             subject_authorization::source_from_context(context).map_err(|error| error.error)?;
-        current
-            .config_store
-            .get_workspace_runtime_binding(workspace, &worker.runtime_id)?
-            .filter(|binding| binding.revoked_at.is_none())
-            .ok_or_else(|| policy::failure(PluginHostErrorCode::Denied))?;
+        crate::server::service_authority::require_authenticated_runtime_binding(
+            tx,
+            workspace,
+            context.runtime_source.as_ref(),
+        )?;
         if current
             .store
             .get_worker_registry(workspace, &worker)?

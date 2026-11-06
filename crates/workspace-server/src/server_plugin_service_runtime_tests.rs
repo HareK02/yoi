@@ -1416,11 +1416,13 @@ mod service_connection {
         BodyOwnership,
         DelegationSource,
         Feature,
+        RuntimeTrust(RuntimeTrustChange),
     }
 
-    fn change_queued_authority(f: &Fixture, change: QueueChange) {
+    fn change_queued_authority(f: &mut Fixture, change: QueueChange) {
         match change {
             QueueChange::Unchanged => {}
+            QueueChange::RuntimeTrust(change) => replace_runtime_trust(f, change),
             QueueChange::ServiceGrant => {
                 let store = open_subjektiv_store(&f.api).unwrap();
                 let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
@@ -1505,7 +1507,7 @@ mod service_connection {
     async fn queued_authority_change(change: QueueChange) {
         for remote in [false, true] {
             for boundary in [
-                "acquire", "poll", "disclose", "complete", "consumer", "data",
+                "acquire", "poll", "disclose", "complete", "consumer", "data", "mutate",
             ] {
                 let peer = Peer::new(HOST, vec![]).await;
                 let mut f = fixture(&peer).await;
@@ -1526,7 +1528,7 @@ mod service_connection {
                     let lease = acquire(owner.as_ref(), &f).await;
                     let cursor = state(&f).unwrap().1;
                     comment(&f, &ticket);
-                    let operation = if matches!(boundary, "complete" | "consumer" | "data") {
+                    let operation = if matches!(boundary, "complete" | "consumer" | "data" | "mutate") {
                         let (event, invocation) = delivery(owner.as_ref(), &lease).await;
                         if boundary == "complete" {
                             PluginServiceRequest::Complete {
@@ -1535,6 +1537,27 @@ mod service_connection {
                                 result: PluginServiceEventResult::Ack,
                                 failure: None,
                             }
+                        } else if boundary == "mutate" {
+                            host_request(
+                                &lease,
+                                PluginInvocationRequest::DataMutate {
+                                    invocation_id: invocation,
+                                    ticket_id: ticket.clone(),
+                                    address: PluginDataAddress {
+                                        collection: PluginDataCollection {
+                                            collection: "notes".into(),
+                                            schema_id: "note".into(),
+                                            schema_version: "1".into(),
+                                        },
+                                        key: "queued".into(),
+                                    },
+                                    operation_key: "queued-write".into(),
+                                    mutation: PluginDataMutation::Put {
+                                        expected: PluginDataExpectation::NeverWritten,
+                                        value_json: "1".into(),
+                                    },
+                                },
+                            )
                         } else {
                             host_request(
                                 &lease,
@@ -1552,10 +1575,11 @@ mod service_connection {
                 let (entered, reached) = tokio::sync::oneshot::channel();
                 let (resume, resumed) = std::sync::mpsc::channel();
                 let gate = Mutex::new(Some((entered, resumed)));
+                let boundary_observed = if boundary == "mutate" { "data" } else { boundary };
                 let _registration = WorkspaceApi::observe_service_boundary(
                     f.plan.plan_id.clone(),
                     Arc::new(move |stage| {
-                        if stage == boundary {
+                        if stage == boundary_observed {
                             if let Some((entered, resumed)) = gate.lock().unwrap().take() {
                                 let _ = entered.send(());
                                 resumed
@@ -1565,12 +1589,13 @@ mod service_connection {
                         }
                     }),
                 );
+                let current_operation = operation.clone();
                 let pending = tokio::spawn(async move { request(owner.as_ref(), operation).await });
                 tokio::time::timeout(Duration::from_secs(15), reached)
                     .await
                     .expect("Service did not reach queued boundary")
                     .unwrap();
-                change_queued_authority(&f, change);
+                change_queued_authority(&mut f, change);
                 if matches!(change, QueueChange::ServiceGrant | QueueChange::Feature) {
                     // Ticket access is intentionally still valid: it cannot stand
                     // in for the callee's service namespace at disclosure.
@@ -1598,7 +1623,7 @@ mod service_connection {
                         match boundary {
                             "acquire" => matches!(response, PluginServiceResponse::Acquired { .. }),
                             "complete" => matches!(response, PluginServiceResponse::Completed),
-                            "consumer" | "data" =>
+                            "consumer" | "data" | "mutate" =>
                                 matches!(response, PluginServiceResponse::Host { .. }),
                             _ => matches!(response, PluginServiceResponse::Delivery { .. }),
                         },
@@ -1640,6 +1665,44 @@ mod service_connection {
                         );
                     }
                 }
+                if matches!(change, QueueChange::RuntimeTrust(_)) {
+                    if boundary == "disclose" {
+                        // Poll staged the delivery before the binding changed.
+                        // Make its retry due without altering authority, the
+                        // pending event, invocation, acknowledgement or cursor.
+                        f.api.config_store.with_immediate_transaction(|tx| {
+                            assert_eq!(tx.execute(
+                                "UPDATE plugin_service_consumers SET next_attempt_ms=0 WHERE plan_id=?1 AND current_event_id IS NOT NULL",
+                                [&f.plan.plan_id],
+                            )?, 1);
+                            Ok(())
+                        }).unwrap();
+                    }
+                    let (current, current_server) = if remote {
+                        let (owner, server) = remote_owner_for(
+                            &f, &f.source.worker_id, TEST_WORKSPACE_ID,
+                        ).await;
+                        (owner, Some(server))
+                    } else {
+                        (f.owner(None).await, None)
+                    };
+                    let response = request(current.as_ref(), current_operation).await
+                        .expect("current binding must retain the authorized operation");
+                    assert!(match boundary {
+                        "acquire" => matches!(response, PluginServiceResponse::Acquired { .. }),
+                        "complete" => matches!(response, PluginServiceResponse::Completed),
+                        "mutate" => matches!(response, PluginServiceResponse::Host { response }
+                            if matches!(*response, PluginInvocationResponse::DataMutated { .. })),
+                        "consumer" | "data" => matches!(response, PluginServiceResponse::Host { response }
+                            if matches!(*response, PluginInvocationResponse::TicketRead { .. })),
+                        _ => matches!(response, PluginServiceResponse::Delivery { .. }),
+                    }, "current binding response at {boundary}, remote={remote}");
+                    if boundary == "mutate" {
+                        assert_eq!(f.count("plugin_data_receipts"), 1);
+                        assert_eq!(f.count("plugin_data_cells"), 1);
+                    }
+                    drop(current_server);
+                }
                 assert_eq!(peer.connection_count(), 0);
                 drop(server);
                 drop(_registration);
@@ -1671,6 +1734,21 @@ mod service_connection {
     #[tokio::test]
     async fn service_feature_disabled_in_queue_denies_acquire_ack_and_disclosure() {
         queued_authority_change(QueueChange::Feature).await;
+    }
+
+    #[tokio::test]
+    async fn service_runtime_key_replaced_in_queue_denies_old_request_and_preserves_current_binding() {
+        queued_authority_change(QueueChange::RuntimeTrust(RuntimeTrustChange::KeyRotation)).await;
+    }
+
+    #[tokio::test]
+    async fn service_runtime_same_key_reactivated_in_queue_denies_old_binding_not_current_request() {
+        queued_authority_change(QueueChange::RuntimeTrust(RuntimeTrustChange::ReactivateSameKey)).await;
+    }
+
+    #[tokio::test]
+    async fn service_runtime_same_key_aba_in_queue_never_revives_the_authenticated_old_binding() {
+        queued_authority_change(QueueChange::RuntimeTrust(RuntimeTrustChange::SameKeyAba)).await;
     }
 
     #[tokio::test]

@@ -252,6 +252,11 @@ async fn check_tools(
                 )
                 .map_err(|e| e.error)?;
                 let admitted = api.config_store.with_immediate_transaction(|tx| {
+                    crate::server::service_authority::require_authenticated_runtime_binding(
+                        tx,
+                        &workspace,
+                        context.runtime_source.as_ref(),
+                    )?;
                     policy::authorize(
                         tx,
                         &workspace,
@@ -464,6 +469,7 @@ async fn execute_with_transport(
 ) -> std::result::Result<PluginHostResponse, PluginHostError> {
     // Human management and a Runtime-only (no Worker) source both fail closed.
     subject_authorization::source_from_context(&context).map_err(|_| denied())?;
+    let authentication_source = context.runtime_source.clone();
     match request {
         PluginHostRequest::Service { request } => {
             if service_lease().is_some() {
@@ -510,7 +516,7 @@ async fn execute_with_transport(
             let admitted = check(
                 api.clone(),
                 context,
-                workspace,
+                workspace.clone(),
                 plan_id,
                 installation_id.clone(),
                 consumer.clone(),
@@ -518,22 +524,28 @@ async fn execute_with_transport(
             )
             .await?;
             let store = api.config_store.clone();
-            let record = store
-                .db_executor()
-                .run(move || {
-                    store.with_immediate_transaction(|tx| {
-                        receipt::begin(
-                            tx,
-                            &admitted.plan,
-                            &installation_id,
-                            &consumer,
-                            now_ms(),
-                            RECEIPT_RETENTION_MS,
-                        )
+            let record =
+                store
+                    .db_executor()
+                    .run(move || {
+                        #[cfg(test)]
+                        service::boundary_observation::observe(&admitted.plan.plan_id, "begin");
+                        store.with_immediate_transaction(|tx| {
+                            crate::server::service_authority::require_authenticated_runtime_binding(
+                            tx, &workspace, authentication_source.as_ref(),
+                        )?;
+                            receipt::begin(
+                                tx,
+                                &admitted.plan,
+                                &installation_id,
+                                &consumer,
+                                now_ms(),
+                                RECEIPT_RETENTION_MS,
+                            )
+                        })
                     })
-                })
-                .await
-                .map_err(policy::map_error)?;
+                    .await
+                    .map_err(policy::map_error)?;
             if record.cancelled || record.expired || record.expires_at_ms <= now_ms() {
                 return Err(PluginHostError {
                     code: if record.cancelled {
@@ -579,6 +591,11 @@ async fn execute_with_transport(
                 .db_executor()
                 .run(move || {
                     store.with_immediate_transaction(|tx| {
+                        crate::server::service_authority::require_authenticated_runtime_binding(
+                            tx,
+                            &workspace,
+                            authentication_source.as_ref(),
+                        )?;
                         receipt::cancel(tx, &workspace, &invocation_id)
                     })
                 })
@@ -669,15 +686,22 @@ async fn execute_with_transport(
             let r = record.clone();
             let fp = fingerprint.clone();
             let key = request.effect_key.clone();
-            let admission = store
-                .db_executor()
-                .run(move || {
-                    store.with_immediate_transaction(|tx| {
-                        receipt::effect_admit(tx, &r, &key, &fp, now_ms())
+            let effect_workspace = workspace.clone();
+            let admission =
+                store
+                    .db_executor()
+                    .run(move || {
+                        #[cfg(test)]
+                        service::boundary_observation::observe(&r.plan_id, "effect");
+                        store.with_immediate_transaction(|tx| {
+                            crate::server::service_authority::require_authenticated_runtime_binding(
+                            tx, &effect_workspace, authentication_source.as_ref(),
+                        )?;
+                            receipt::effect_admit(tx, &r, &key, &fp, now_ms())
+                        })
                     })
-                })
-                .await
-                .map_err(policy::map_error)?;
+                    .await
+                    .map_err(policy::map_error)?;
             let result = match admission {
                 receipt::EffectAdmission::Replay(result) => result,
                 receipt::EffectAdmission::Dispatch => {

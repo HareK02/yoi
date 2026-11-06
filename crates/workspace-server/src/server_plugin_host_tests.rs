@@ -8,6 +8,8 @@
 mod authority_storage;
 #[path = "server_plugin_data_tests.rs"]
 mod data;
+#[path = "server_plugin_runtime_binding_tests.rs"]
+mod runtime_binding;
 
 use super::*;
 use crate::plugin_binding::PluginConnectionBinding;
@@ -49,6 +51,47 @@ struct Fixture {
     tool: &'static str,
     binding: Option<PluginConnectionBinding>,
     _directory: tempfile::TempDir,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeTrustChange {
+    KeyRotation,
+    ReactivateSameKey,
+    SameKeyAba,
+}
+
+fn replace_runtime_trust(f: &mut Fixture, change: RuntimeTrustChange) {
+    let store = &f.api.config_store;
+    let original = store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &f.source.runtime_id)
+        .unwrap()
+        .unwrap();
+    let mut replacement = original.clone();
+    match change {
+        RuntimeTrustChange::KeyRotation => {
+            f.identity = RuntimeIdentityMaterial::generate(&f.source.runtime_id).unwrap();
+            replacement.public_key = f.identity.public_key.clone();
+            replacement.public_key_fingerprint.clear();
+        }
+        RuntimeTrustChange::ReactivateSameKey => {
+            assert!(store.revoke_workspace_runtime_binding(
+                TEST_WORKSPACE_ID, &f.source.runtime_id, TEST_CREATED_AT,
+            ).unwrap());
+        }
+        RuntimeTrustChange::SameKeyAba => {
+            replacement.display_name.push_str("-replacement");
+            store.upsert_workspace_runtime_binding(replacement, true).unwrap();
+            replacement = original.clone();
+        }
+    }
+    store.upsert_workspace_runtime_binding(replacement, true).unwrap();
+    let current = store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &f.source.runtime_id)
+        .unwrap()
+        .unwrap();
+    assert!(current.revoked_at.is_none());
+    assert_ne!(current.binding_id, original.binding_id);
+    assert_eq!(current.public_key, f.identity.public_key);
 }
 
 impl Fixture {

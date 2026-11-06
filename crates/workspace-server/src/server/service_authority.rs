@@ -3,6 +3,26 @@
 //! transactions and original registry lease remain held through Host commit.
 use super::*;
 
+/// Retain the verified request's trust identity across executor/lock waits.
+/// Call on the reserved Host connection, not a detached current-binding lookup.
+pub(super) fn require_authenticated_runtime_binding(
+    conn: &rusqlite::Connection,
+    workspace: &str,
+    source: Option<&server_api::ServerRuntimeSource>,
+) -> crate::Result<()> {
+    let denied = || crate::plugin_host::failure(server_api::PluginHostErrorCode::Denied);
+    let source = source.ok_or_else(denied)?;
+    let current: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings WHERE workspace_id=?1 AND runtime_id=?2 AND binding_id=?3 AND revoked_at IS NULL)",
+        rusqlite::params![workspace, source.runtime_id, source.authentication_binding_id],
+        |row| row.get(0),
+    )?;
+    if !current {
+        return Err(denied());
+    }
+    Ok(())
+}
+
 pub(super) fn with_service_authority<T>(
     api: &WorkspaceApi,
     effect: impl FnOnce(&WorkspaceApi, &rusqlite::Transaction<'_>) -> crate::Result<T>,
