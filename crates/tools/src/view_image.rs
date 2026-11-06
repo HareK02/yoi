@@ -181,7 +181,7 @@ pub fn routed_view_image_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefiniti
         let tool: Arc<dyn Tool> = Arc::new(ViewImageTool {
             router: router.clone(),
         });
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }
 

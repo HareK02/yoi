@@ -159,7 +159,7 @@ pub(crate) fn routed_edit_tool(
             router: router.clone(),
             tracker: tracker.clone(),
         });
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }
 

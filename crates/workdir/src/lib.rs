@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod audit;
 pub mod checkout;
 pub use checkout::{
     CheckoutObservation, CheckoutOperation, CheckoutOutput, CheckoutRequest, CheckoutResult,

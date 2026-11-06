@@ -165,6 +165,6 @@ pub(crate) fn routed_grep_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinit
         let tool: Arc<dyn Tool> = Arc::new(GrepTool {
             router: router.clone(),
         });
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }

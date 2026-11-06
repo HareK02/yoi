@@ -460,6 +460,6 @@ pub(crate) fn routed_bash_tool(
             .description("Execute a shell command in one selected Workdir. Workdir owns launch, lossless bounded byte transport, timeout and cancel; Bash owns preview, quota-limited ephemeral output and read-only virtual references. This is not a sandbox.")
             .input_schema(BashTool::input_schema());
         let tool: Arc<dyn Tool> = Arc::new(BashTool::new(router.clone(), output.clone()));
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }

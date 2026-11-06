@@ -16,6 +16,7 @@ mod routing;
 mod search_target;
 pub mod view_image;
 mod web;
+pub mod workdir_audit;
 mod write;
 
 pub use bash::{BashResult, BashTool, bash_tool};

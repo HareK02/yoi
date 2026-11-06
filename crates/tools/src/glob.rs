@@ -111,6 +111,6 @@ pub(crate) fn routed_glob_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinit
         let tool: Arc<dyn Tool> = Arc::new(GlobTool {
             router: router.clone(),
         });
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }

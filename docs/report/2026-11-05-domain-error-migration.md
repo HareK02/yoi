@@ -14,7 +14,7 @@ T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/client�
 | Repository構成・SSH access | `scoped_create_repository` の同一intent replayと異intent競合、`require_workspace_owner`、`repository_access.rs` のcredential/trust/CAS検査 | 登録、SSH操作、Workdir materialization、Web repository-access。汎用 `RepositoryConflict(String)` / `WorkspacePermissionDenied(String)` の全発生元を一つのRepository理由と誤認せず、Repositoryの決定点でtyped causeを付ける。秘密の鍵やleaseをdetailsへ渡さない。 |
 | Workdir provider | `WorkdirError::classification_source`、`denial_reason`、`failure_reason`、`WorkdirTransportError` | 本差分の `workdir::failure` が既存型からT-810へ接続する。元sourceはローカルに保持し、Browser/Tool/transfer/storage/telemetryにはclosed detailsだけを投影する。既存HTTP/statusや操作実行は変更しない。 |
 | Workdir Runtime / Backend | `RuntimeHttpWorkdirError`、`RuntimeRegistryError::WorkdirSessionOpenFailed`、`InternalWorkdirOperationError::into_contract_error` | `WorkdirOperationApiError` は理由をserver-local metadataに保持するがwireではskipする。T-812の共通response/clientへの接続と生成型変更が残る。owner mismatchの404等、外側境界の秘匿分類を内側codeで上書きしない。 |
-| Workdir Tool / 監査 | `WorkspaceAttachedWorkdirSession::operate`、`WorkdirSessionOperationResponse`、`WorkdirAuditFailure` | Workerは監査receiptをtracingへ通知し、操作resultだけを返す。T-814の既存Tool envelopeへの接続で成功＋監査失敗を別々に保持する必要がある。成功を実行失敗へ変更したり、監査失敗で再送したりしない。 |
+| Workdir Tool / 監査 | `WorkspaceAttachedWorkdirSession::operate`、`WorkdirSessionOperationResponse`、`WorkdirAuditFailure` | Server既存のcall-local collectorを `workdir::audit` へ移し、Worker受信と登録7Toolへ共有接続した。T-814のstatus-neutral出力を使い、成功/content/attachments・元terminal dispositionと監査の閉鎖原因を別々に保持する。主原因・native WIP全体の移行とは別sliceである。 |
 | Workdir deferred open / cleanup | `DeferredWorkdirSession` はopener task失敗、open失敗、identity mismatchを区別。失敗したcloseの所有者も保持する | openerは `Result<WorkdirSessionHandle, String>` のため、より具体的な原因は現契約から証明できない。identity mismatch後のcleanup理由はログだけ。元原因をcleanupで置換せず、別の副次結果として接続する作業が残る。 |
 | Workdir removal | `WorkdirRemovalOperation`、request fingerprint、attempt、disposition、failure category、既存reconciliation | `workdir_removal_response`、Web `workdir-removal.ts`、Worker lifecycle Tool。復旧は観測のみで削除を再実行しない。Backend/Worker/Webの説明表はdomain説明へ集約するが、結果・再実行条件はこの正本を利用する。 |
 | Drive storage / HTTP | `workspace_drive::failure::DriveFailure` が9variantの元errorを保持し、closed operation/reasonを共通coreへ投影する。metadata/receiptは既存同一transactionのまま | 実storageでconflict/CAS/grant/replay/fence/SQLite障害からcodecまで検証した。`server_drive.rs::domain_error` はまだ既存公開codeへ縮退し、共通HTTP/Toolへの接続は未完。storage原因はremote更新の確定/Unknownを証明しない。 |
@@ -167,6 +167,30 @@ Rustは既存 `CARGO_TARGET_DIR=target/t815 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PRO
 - 最初のharness checkは既存generated TSの拡張子なしimportで失敗し、既存実WASM harnessに必要な `--sloppy-imports` でcheck/runした。最初のbefore captureは意図した409のconsole診断を未分類だったため失敗。許す診断を当該routeのHTTP409と正確なconsole文だけに限定して再撮影し、失敗artifactも保持した。
 
 このcheckpointはRepository構成全域、Drive HTTP/native WIP、Workdirの監査/cleanup、config背景publicationの保存/再読や正式reviewの完了ではない。測定時空39GiB、自debug43GiB/t81519GiB。新target・追加clean・全体並列設定変更なし。T-814所有の実Content-Type運搬/native cause hookは未公開時点では仮定せず、公開sourceと実検証を受けて接続する。
+
+## Workdir監査receiptの登録Tool接続checkpoint
+
+`82e388e6` 後のslice。Server既存のfuture-local audit collectorを `workdir::audit` へ移し、Server/Workerが同じcapture/notifyを使用する。共有sessionのlast-report欄や新しい監査ledgerは作らない。捕捉範囲はfutureごとで、並行call・nested capture・spawnされたtaskを混同せず、境界を跨ぐ既存receiptは明示的に受け渡す。即時運用ログは従来の所有境界に残す。
+
+T-814の公開 `c2223322034758e68a8d03fef00c53beda81f7c4` をfetch/照合し、`tools::failure::failure_output` を同一内容で再利用した。既存coreの `validate_json_input` と互換であり、core全体の上書きや別formatter/codecは追加しない。全caller検索で外部 `check_json_bounds` 利用がなくなったことを確認後、codecの公開範囲も同じ共有sourceへ合わせ、再度root checkを通した。guardの実装・制限は不変なので、機能試験は同一条件の先行証拠を再利用する。登録Read/Write/Edit/Glob/Grep/Bash/ViewImageはcurrent callのreceiptを捕捉し、元content/attachmentsを残して共有出力を追記する。成功をError化せず、Cancelled/Interruptedも維持する。Errorの元class/conflict codeと監査outcomeは独立した公開resultに保持する。過大な副次出力は共有fallbackに従い、元content/attachmentsと非再送説明を失わせない。
+
+`WorkdirAuditFailureDetails` の公開fieldはclosed stage/reason/operation_outcomeだけで、受信operation_idやprovider本文をコピーしない。現在の認可済み操作から受けた当該callの閉鎖事実に限り投影する。正本receipt/operation identityは引き続きBackendと既存HTTP応答が所有し、運用相関は元receiptとWorkerログのoperation ID hash/stageを使用する。Tool summaryから検索用identityや未実行を捏造しない。
+
+### 実行証拠と限界
+
+Rustは既存debug target、Workdir全suiteだけは既存 `CARGO_TARGET_DIR=target/t815` を再利用。通常feature（Workdir全suiteは `--features http-client`）。logは `target/t815-evidence/`、コマンドとexitはsession記録を参照する。
+
+| 検証 | 結果 / log |
+| --- | --- |
+| `cargo test -p workdir --lib audit::` | 新規2成功、`workdir-audit-capture-tests.log`。並行/nested/unscopedの分離、Browser/Tool意味一致、現在可視性、受信identity非露出。 |
+| `cargo test -p workdir --features http-client` | lib163、integration31、doctest0成功、`workdir-audit-all-workdir.log`。deny/unknown/HTTP/秘密境界も含む。 |
+| `cargo test -p tools` | lib116・integration10+42・doctest0成功、`workdir-audit-all-tools.log`。新規3は過大出力、並行分離、error/cancel/interrupted不変。 |
+| `cargo test -p worker --lib feature::builtin::manage_workdir` | 43成功、`workdir-audit-manage-regression.log`。新規登録Read/Writeは本番session/adapterから実Session append/reopen/pruneまで接続。Read成功とcontent、Write Unknown・audit Unknownを別々に保持、Writeはstat1+write1で再送なし。代替はWorkspace transportであり、DB効果回数の証拠とは区別する。 |
+| `cargo test -p worker --lib registered_failure_contract` | 共有Session fixture抽出後3成功、`workdir-audit-drive-history-regression-all.log`。最初の過度に限定したfilterは0件のため検証証拠にせず、実module filterへ修正した。 |
+| `cargo test -p yoi-workspace-server --lib server::tests::workspace_admission_tests::audit_tests` | 実HTTP/SQLite 13成功、`workdir-audit-http-regression.log`。collector抽出後の成功＋監査失敗、元拒否、応答喪失、timeout、dispatch前失敗、既存効果回数を検証。隔離起動環境は `target/restore-test-environment/t815-audit/{config,data,run}`。後続のTool decoratorだけの変更ではこのHTTP/audit codeは不変のため証拠を再利用する。 |
+| `cargo check` | 成功、`workdir-audit-root-check-final.log`。TUI/Serverを含む通常root compile closure。既存dead-code警告あり。 |
+
+これは監査通知の登録Tool接続であり、Workdir主原因・全HTTP/Web・cleanup、native WIP、Drive HTTP/native、config背景の保存/照会、最終全scope reviewの完成ではない。追加clean・全体並列設定変更なし。
 
 ## 並行変更との結合点
 

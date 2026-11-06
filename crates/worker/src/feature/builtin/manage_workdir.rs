@@ -352,6 +352,7 @@ impl WorkspaceAttachedWorkdirSession {
 fn notify_workdir_audit_failures(failures: &[workdir::http::WorkdirAuditFailure]) {
     use sha2::Digest;
     for failure in failures {
+        workdir::audit::notify(failure.clone());
         // Response strings are untrusted. Never copy them into the receiving process log.
         let operation_id_hash = sha2::Sha256::digest(failure.operation_id.as_bytes())
             .iter()
@@ -1381,6 +1382,8 @@ struct WorkdirDeleteInput {
 
 #[cfg(test)]
 mod tests {
+    mod audit_tool_tests;
+
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2064,17 +2067,21 @@ mod tests {
         }
         let client = Arc::new(RecordingWorkspaceClient::new(responses));
         let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "checkout");
-        let handle = session
-            .start_command(CommandRequest {
-                command: "true".into(),
-                timeout_secs: 1,
-                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
-                cwd: workdir::WorkdirPath::root(),
-                tool_call_id: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(handle.0, "retained-command");
+        let (handle, notices) = workdir::audit::capture(session.start_command(CommandRequest {
+            command: "true".into(),
+            timeout_secs: 1,
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+            cwd: workdir::WorkdirPath::root(),
+            tool_call_id: None,
+        }))
+        .await;
+        assert_eq!(handle.unwrap().0, "retained-command");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].operation_id, "op-safe-id");
+        assert_eq!(
+            notices[0].operation_outcome,
+            workdir::http::WorkdirAuditOperationOutcome::Succeeded
+        );
         let request = workdir::CheckoutRequest {
             target: workdir::WorkdirPath::new("file.txt").unwrap(),
             validator: vec![1],
@@ -2083,18 +2090,30 @@ mod tests {
                 expected_hash: [0; 32],
             },
         };
-        assert!(matches!(
-            session.checkout_execute(request.clone()).await,
-            Err(WorkdirError::Denied(_))
-        ));
-        assert!(matches!(
-            session.checkout_execute(request.clone()).await,
-            Err(WorkdirError::OutcomeUnknown(_))
-        ));
-        assert!(matches!(
-            session.checkout_execute(request).await,
-            Err(WorkdirError::NotDispatched)
-        ));
+        for expected_outcome in [
+            workdir::http::WorkdirAuditOperationOutcome::Failed {
+                code: workdir::http::WorkdirTransportErrorCode::Denied,
+            },
+            workdir::http::WorkdirAuditOperationOutcome::Unknown,
+            workdir::http::WorkdirAuditOperationOutcome::NotDispatched,
+        ] {
+            let (result, notices) =
+                workdir::audit::capture(session.checkout_execute(request.clone())).await;
+            match expected_outcome {
+                workdir::http::WorkdirAuditOperationOutcome::Failed { .. } => {
+                    assert!(matches!(result, Err(WorkdirError::Denied(_))))
+                }
+                workdir::http::WorkdirAuditOperationOutcome::Unknown => {
+                    assert!(matches!(result, Err(WorkdirError::OutcomeUnknown(_))))
+                }
+                workdir::http::WorkdirAuditOperationOutcome::NotDispatched => {
+                    assert!(matches!(result, Err(WorkdirError::NotDispatched)))
+                }
+                workdir::http::WorkdirAuditOperationOutcome::Succeeded => unreachable!(),
+            }
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].operation_outcome, expected_outcome);
+        }
         assert_eq!(
             client.requests().len(),
             4,
