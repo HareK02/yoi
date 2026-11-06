@@ -40,6 +40,7 @@ impl Budget {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", schemars(rename = "FailureEnvelope_{D}"))]
 pub struct FailureEnvelope<D> {
     #[cfg_attr(feature = "json-schema", schemars(range(min = 1)))]
     pub version: u16,
@@ -163,7 +164,9 @@ fn validate_envelope_common(raw: &ReaderEnvelope) -> Result<(), ContractError> {
 }
 
 /// Validate byte and lexical depth limits before parsing an enclosing JSON DTO.
-/// This resource guard grants no disclosure or encoding authority.
+///
+/// This is a resource guard only: callers must still use their typed JSON parser
+/// to validate grammar and schema. It grants no disclosure or encoding authority.
 pub fn validate_json_input(input: &[u8], budget: Budget) -> Result<(), ContractError> {
     check_json_bounds(input, budget)
 }

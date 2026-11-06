@@ -1,4 +1,6 @@
 #![doc = include_str!("../README.md")]
+mod worker_create_error;
+pub use worker_create_error::WorkerCreateApiError;
 
 use std::collections::BTreeMap;
 
@@ -2003,7 +2005,7 @@ pub trait ServerApi {
         &self,
         #[extension] context: ServerRequestContext,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
 
     #[get(
         "/api/w/{workspace_id}/orchestrator",
@@ -2066,7 +2068,7 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
     #[post(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
         status = 200,
@@ -2185,7 +2187,7 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
 
     #[get(
         "/api/w/{workspace_id}/workers/{worker_ref}",
@@ -11158,6 +11160,7 @@ pub struct BrowserWorkspaceOrchestratorResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerOperationState {
+    Unknown,
     Accepted,
     Unsupported,
     Rejected,

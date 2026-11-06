@@ -2,7 +2,7 @@
 
 ## 対象と保証の境界
 
-本記録は `4de62650dad111dc6c96c450a8a31fe4c6b1c4ac` を起点にしたT-814候補の移行点と調査手順を示す。T-812の公開共有HTTP/client・生成器とT-813の共通Web受信・表示を再利用した。起動domain本体・他branchのDB migrationを一括採用したものではなく、親の統合時にはcatalog migrationの処理内容・ledger identityを別途照合する。
+本記録は `4de62650dad111dc6c96c450a8a31fe4c6b1c4ac` を起点にしたT-814候補の移行点と調査手順を示す。結合適応では公開target `5c19bfbad03086c9fda79039ca138b604bc56c09` を同じsource branchへ通常mergeし、T-812の起動domain・保存・HTTP/client・生成器とT-813の共通Web受信・表示を保持して制御・背景consumerを接続した。旧sourceの承認は結合候補の承認ではなく、親の採用判断と最新MR sourceへの独立reviewは別に行う。
 
 失敗原因は既存操作の確定状態と別情報である。要求受理、配送、Controller受付、実処理、停止、cleanup、通知、結果保存を同一視しない。再試行hintや過去の原因を、新しいoperation、Job試行、Worker作成の許可として使わない。
 
@@ -16,6 +16,7 @@
 | Worker lookup | Embedded型付きerror / Remote client型付きfailure → `WorkerLookupOutcome` → registry | 不存在と観測失敗を別variantへ。severity・診断順・説明から選ばない。Remoteの未対応HTTP bodyをdomain拒否と推測しない。 |
 | Worker制御Tool | 既存入力disposition、command acknowledgement、Restore/Stop domain結果 → 共通Tool投影 | 受付と処理・終了を分離。旧入力応答でdisposition不明ならUnknown。Runtime/ServerのProblem投影とtyped receiver、Toolの主原因保持を接続。T-815公開認可ownerのactual status型を再利用し、拒否文面から分類しない。 |
 | Runtime/Server HTTP・Web | ownerの`RuntimeError::control_cause` → `ControlBoundary` → T-812 HTTP hooks → T-813 receiver | raw非2xxは実status/media/byte上限で検証し、受信説明を再公開せず原因から再投影。2xx制御結果は主`control`とBrowser投影`control_explanation`を保持し、Webは診断順・severity・文面を選ばない。state/dispositionは説明の有無で変更しない。Restoreは既存startup domain primaryをBrowserへ再投影し、粗いcontrol拒否・cleanup・保存不明と別に運ぶ。実Serde応答を共有fixtureへ固定し、strict Web parserとbrowser表示へ接続する。 |
+| Runtime Prompt通知 | Embeddedの型付きRuntime原因 / Remoteの実HTTP status・media・bound検証 → `RuntimePromptProjectionObservation` | registryはbindingで絞った全Runtimeの成功・失敗を返す。未対応はUnsupportedであり通知成功にしない。成功もhandlerの即時応答観測でありWorkerの実反映ではない。元config adoptionへ束縛する永続記録・現在認可queryはT-815のowner範囲で、Service consumerや偽Jobへ流用しない。 |
 | Backend Job dispatch/input/recovery/deadline | `backend_job`のproducer変換 → 既存store transactionの`*_with_cause` | 元のattempt/Job状態と原因を同じtransactionで保存。型付きstartup primaryを保持し、conflicting/投影不能を汎用原因で上書きしない。保存失敗は`Error::BackendJobFailure`のprimaryとrecordingに分離。 |
 | Backend Job cleanup | 既存admission resource・owner/run/history fence → cleanup専用原因列 | 実行結果や成功したJobをcleanup失敗で再分類しない。通知deliveryは従来の別ledgerに残る。 |
 | Standalone Job | `JobExecutionError` variant → 既存settlement・attempt保存 | primary、結果受領不明、結果後Worker失敗、cleanupを別slotで記録。元のowned reportとcallback/finalizer所有を保持する。 |
@@ -26,11 +27,11 @@ Tool終了の正本はcommit済みSession Tool結果であり、ログ通知は�
 
 ## 保存schemaの結合接点
 
-Workspace側は `SqliteWorkspaceStore` が管理するWorkspace catalog DBで、構成上のDB identityは `WorkspaceApi.config.database_path`。JobとPlugin Serviceは同じcatalogの順序付きmigration ledgerを使用する。候補は既存schema123の後にJob原因のnullable・byte上限付き列、続いてService outcome列を追加し、fresh compositionとretained schema verifierを揃える。旧結果、intent、attempt、resource、cleanup/notification identityを変換目的で再生成しない。
+Workspace側は `SqliteWorkspaceStore` が管理するWorkspace catalog DBで、構成上のDB identityは `WorkspaceApi.config.database_path`。JobとPlugin Serviceは同じcatalogの順序付きmigration ledgerを使用する。結合候補はtarget公開済みStartup migrationを保持し、その後へJobのnullable・byte上限付き原因列とService outcome列を登録する。旧sourceで公開済みのJob/Service receiptは別lineageとして正確な名前と物理schemaで認識し、plannerと実行dispatchの両方が不足分をversioned更新する。旧receipt・applied_at・結果・intent・attempt・resource・cleanup/notification identityを書き換えない。実装の正本は `store.rs` のmigration登録と `storage_formats.rs` の履歴・物理検証であり、単なる番号一致は互換判定にしない。
 
 Standalone側は `StandaloneJobs::open` に渡される専用Job DB（製品では `jobs.sqlite3`）。Workspace catalogとは別owner/ledgerで、既存version8の後にattempt-localな原因保存列を追加する。古いfailure文章を解析して構造化原因へ昇格しない。
 
-T-812のreservation結果、T-842のWorker removal進捗もWorkspace catalogの後続migrationを持つため、branch-local番号の一致だけで同じmigrationとみなさない。統合候補は親が処理内容・ledger名・依存順を選び、既存receiptを失わないchain、最古対応baseline、rollback、reopen、freshとの差分を再検証する。未公開の別branch DDLを推測してこの候補へ複製しない。
+結合回帰では最古対応baseline、旧公開source履歴、target既存Startup履歴、rollback、再開・reopen、freshとの制約一致を確認する。Startup列はSQL文字列の包含ではなく、完全なtable/index/triggerのtoken化shapeで照合する。旧更新経路とbaseline-only履歴に残るtrigger-only singleton制約形も、同じ公開物理定義全体として保持する。T-837/T-842の未採用sliceは取り込まず、そのmigrationを番号だけから推測しない。
 
 ## 調査runbook
 

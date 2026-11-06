@@ -236,6 +236,9 @@ fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
         }
     }
     response.error.startup = error.startup;
+    if let Some(failure) = error.create_failure {
+        return response.with_create_failure(failure);
+    }
     response
 }
 

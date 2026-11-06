@@ -1423,6 +1423,14 @@
         ],
         "type": "object"
       },
+      "CompensationOutcome": {
+        "enum": [
+          "completed",
+          "residual",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "CompiledFlowDefinition": {
         "additionalProperties": false,
         "properties": {
@@ -1923,7 +1931,7 @@
             "type": "string"
           },
           "yoi_failure": {
-            "$ref": "#/components/schemas/FailureEnvelope"
+            "$ref": "#/components/schemas/FailureEnvelope_RuntimeControlCause"
           }
         },
         "required": [
@@ -2147,6 +2155,14 @@
           "operation_id"
         ],
         "type": "object"
+      },
+      "CreationAcceptance": {
+        "enum": [
+          "rejected",
+          "accepted",
+          "unknown"
+        ],
+        "type": "string"
       },
       "DefaultIntakeReadyBodyRequest": {
         "additionalProperties": false,
@@ -3300,6 +3316,17 @@
         ],
         "type": "object"
       },
+      "ExecutionOutcome": {
+        "enum": [
+          "accepted",
+          "busy",
+          "rejected",
+          "errored",
+          "unsupported",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "ExtensibleTicketStatus": {
         "oneOf": [
           {
@@ -3599,7 +3626,7 @@
         ],
         "type": "object"
       },
-      "FailureEnvelope": {
+      "FailureEnvelope_RuntimeControlCause": {
         "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
         "properties": {
           "category": {
@@ -3750,6 +3777,39 @@
             "type": "string"
           }
         ]
+      },
+      "FinalizeFacts": {
+        "additionalProperties": false,
+        "properties": {
+          "compensation": {
+            "$ref": "#/components/schemas/CompensationOutcome"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/FinalizeStage"
+          }
+        },
+        "required": [
+          "stage",
+          "compensation"
+        ],
+        "type": "object"
+      },
+      "FinalizeStage": {
+        "enum": [
+          "worker_identity",
+          "workspace_api_binding",
+          "create_reservation",
+          "worker_registry",
+          "workdir_attachment",
+          "workdir_registry",
+          "ticket_assignment_bind",
+          "ticket_assignment_current",
+          "ticket_state_accept",
+          "session_registration",
+          "initial_input",
+          "publication"
+        ],
+        "type": "string"
       },
       "FindingSeverity": {
         "enum": [
@@ -13825,6 +13885,42 @@
         ],
         "type": "object"
       },
+      "RuntimeStartupCause": {
+        "additionalProperties": false,
+        "description": "Safe local Runtime cause when no more specific domain attachment was supplied.\nThe primary cause is selected where the failure occurs, not parsed from its diagnostic.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/RuntimeStartupReason"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/StartupStage"
+          }
+        },
+        "required": [
+          "stage",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "RuntimeStartupReason": {
+        "description": "Coarse local causes do not claim a domain authorization verdict.",
+        "enum": [
+          "startup_failed",
+          "segment_empty",
+          "system_prompt_missing",
+          "metadata_pending",
+          "metadata_missing",
+          "metadata_inactive",
+          "manifest_missing",
+          "allocation_failed",
+          "session_read_failed",
+          "metadata_read_failed",
+          "provider_failed",
+          "attribution_failed",
+          "feature_failed"
+        ],
+        "type": "string"
+      },
       "RuntimeSummary": {
         "properties": {
           "arch": {
@@ -15087,6 +15183,52 @@
         "minimum": 0,
         "type": "integer"
       },
+      "SessionOperation": {
+        "enum": [
+          "session.record"
+        ],
+        "type": "string"
+      },
+      "SessionPrincipal": {
+        "enum": [
+          "operator",
+          "subject",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "SessionRegistrationCause": {
+        "additionalProperties": false,
+        "description": "No account/session identifiers, paths, or free-form diagnostics are retained.",
+        "properties": {
+          "principal": {
+            "$ref": "#/components/schemas/SessionPrincipal"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/SessionRegistrationReason"
+          },
+          "required_operation": {
+            "$ref": "#/components/schemas/SessionOperation"
+          }
+        },
+        "required": [
+          "reason",
+          "principal",
+          "required_operation"
+        ],
+        "type": "object"
+      },
+      "SessionRegistrationReason": {
+        "enum": [
+          "permission_denied",
+          "attribution_missing",
+          "binding_mismatch",
+          "transport",
+          "outcome_unknown",
+          "invalid_response"
+        ],
+        "type": "string"
+      },
       "SetCookieHeader": {
         "description": "Sensitive `Set-Cookie` response header value.\n\nFormatting is available only for transport encoding; `Debug` always redacts the value.",
         "type": "string"
@@ -15572,6 +15714,32 @@
         ],
         "type": "object"
       },
+      "StartupBoundaryCause": {
+        "additionalProperties": false,
+        "description": "An observation at the receiving/finalizing boundary, not a reported Runtime\nexecution result. It deliberately cannot hold raw transport or error text.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/StartupBoundaryReason"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "StartupBoundaryReason": {
+        "enum": [
+          "timeout",
+          "transport",
+          "decode",
+          "invalid_response",
+          "too_large",
+          "unsupported_version",
+          "unsupported_reason",
+          "finalize_failed"
+        ],
+        "type": "string"
+      },
       "StartupCleanup": {
         "oneOf": [
           {
@@ -15605,6 +15773,13 @@
           "feature",
           "unsupported"
         ],
+        "type": "string"
+      },
+      "StartupCorrelation": {
+        "description": "Opaque, caller-selected lookup token, not an operation identity or capability.\nNo whitespace, URI/path/query syntax or control characters are accepted.",
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._-]+$",
         "type": "string"
       },
       "StartupFailureAttachment": {
@@ -15700,6 +15875,54 @@
         ],
         "type": "string"
       },
+      "StartupOperationFacts": {
+        "additionalProperties": false,
+        "description": "Explicit owner observations. There is deliberately no Default and no conversion\nfrom HTTP status, retry hints, resource facts or failure reason into these fields.",
+        "properties": {
+          "acceptance": {
+            "$ref": "#/components/schemas/CreationAcceptance"
+          },
+          "backend_compensation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CompensationOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Backend compensation can occur before/without finalization; never infer\nthis observation from Runtime cleanup, resources or finalize compensation."
+          },
+          "correlation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupCorrelation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution": {
+            "$ref": "#/components/schemas/ExecutionOutcome"
+          },
+          "finalize": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FinalizeFacts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "acceptance",
+          "execution"
+        ],
+        "type": "object"
+      },
       "StartupPersistenceOutcome": {
         "description": "Persisted is evidence only for this attachment/record write, not execution completion.",
         "enum": [
@@ -15709,6 +15932,299 @@
           "outcome_unknown"
         ],
         "type": "string"
+      },
+      "StartupProblemDetails": {
+        "description": "Public generator/reader DTO. Deserialization does not grant disclosure authority.",
+        "properties": {
+          "detail": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "instance": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "status": {
+            "format": "uint16",
+            "maximum": 599,
+            "minimum": 400,
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "yoi_failure": {
+            "oneOf": [
+              {
+                "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+                "properties": {
+                  "category": {
+                    "$ref": "#/components/schemas/Category"
+                  },
+                  "context": {
+                    "$ref": "#/components/schemas/FailureContext"
+                  },
+                  "details": {
+                    "$ref": "#/components/schemas/SessionRegistrationCause"
+                  },
+                  "details_version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "domain": {
+                    "const": "session_registration",
+                    "type": "string"
+                  },
+                  "explanation": {
+                    "maxLength": 2048,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "reason": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "required_extensions": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "required_extensions",
+                  "domain",
+                  "reason",
+                  "category",
+                  "details_version",
+                  "details",
+                  "explanation",
+                  "context"
+                ],
+                "type": "object"
+              },
+              {
+                "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+                "properties": {
+                  "category": {
+                    "$ref": "#/components/schemas/Category"
+                  },
+                  "context": {
+                    "$ref": "#/components/schemas/FailureContext"
+                  },
+                  "details": {
+                    "$ref": "#/components/schemas/RuntimeStartupCause"
+                  },
+                  "details_version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "domain": {
+                    "const": "worker_startup",
+                    "type": "string"
+                  },
+                  "explanation": {
+                    "maxLength": 2048,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "reason": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "required_extensions": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "required_extensions",
+                  "domain",
+                  "reason",
+                  "category",
+                  "details_version",
+                  "details",
+                  "explanation",
+                  "context"
+                ],
+                "type": "object"
+              },
+              {
+                "description": "DTO/schema source only. Deserialization does not produce a ProjectedFailure.",
+                "properties": {
+                  "category": {
+                    "$ref": "#/components/schemas/Category"
+                  },
+                  "context": {
+                    "$ref": "#/components/schemas/FailureContext"
+                  },
+                  "details": {
+                    "$ref": "#/components/schemas/StartupBoundaryCause"
+                  },
+                  "details_version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "domain": {
+                    "const": "startup_boundary",
+                    "type": "string"
+                  },
+                  "explanation": {
+                    "maxLength": 2048,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "reason": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "required_extensions": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "version": {
+                    "format": "uint16",
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "version",
+                  "required_extensions",
+                  "domain",
+                  "reason",
+                  "category",
+                  "details_version",
+                  "details",
+                  "explanation",
+                  "context"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "yoi_startup": {
+            "$ref": "#/components/schemas/StartupProblemFacts"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail",
+          "instance",
+          "yoi_failure",
+          "yoi_startup"
+        ],
+        "type": "object"
+      },
+      "StartupProblemFacts": {
+        "additionalProperties": false,
+        "description": "The extension contains only typed allowlisted observations; never the attachment.",
+        "properties": {
+          "backend_result_persistence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupPersistenceOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Backend-owned result write only; never evidence of Session metadata persistence."
+          },
+          "io_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupIoKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "operation": {
+            "$ref": "#/components/schemas/StartupOperationFacts"
+          },
+          "persistence": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupPersistenceOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session metadata persistence, independent of the Backend reservation result."
+          },
+          "resources": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupResourceFacts"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "secondary": {
+            "items": {
+              "$ref": "#/components/schemas/StartupSecondaryFailure"
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "version": {
+            "format": "uint16",
+            "maximum": 1,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "operation",
+          "secondary"
+        ],
+        "type": "object"
       },
       "StartupResourceFacts": {
         "properties": {
@@ -15794,6 +16310,20 @@
             "type": "object"
           }
         ]
+      },
+      "StartupStage": {
+        "description": "Owner-selected startup stage; independent of resource cleanup disposition.",
+        "enum": [
+          "preflight",
+          "metadata",
+          "reconstruction",
+          "recovery",
+          "binding",
+          "feature",
+          "activation_effects",
+          "controller"
+        ],
+        "type": "string"
       },
       "SubjectBodyApiError": {
         "additionalProperties": false,
@@ -21783,6 +22313,7 @@
       },
       "WorkerOperationState": {
         "enum": [
+          "unknown",
           "accepted",
           "unsupported",
           "rejected"
@@ -24379,7 +24910,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:8c8607630989d8e6847c7423a9049301cb3ac11e944f826a61f6adde88ed6958"
+    "x-yoi-source-digest": "sha256:123645a6a796d581a6412a4a393216bea679a375210f7d91f360c67e7daf2d11"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -52079,7 +52610,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52094,7 +52625,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52109,7 +52640,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52124,7 +52655,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52139,7 +52670,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52154,7 +52685,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52169,7 +52700,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52184,7 +52715,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -52199,7 +52730,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53556,7 +54087,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53571,7 +54102,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53586,7 +54117,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53601,7 +54132,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53616,7 +54147,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53631,7 +54162,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53646,7 +54177,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53661,7 +54192,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },
@@ -53676,7 +54207,7 @@
               },
               "application/problem+json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ControlProblemPublicationSchema"
+                  "$ref": "#/components/schemas/StartupProblemDetails"
                 }
               }
             },

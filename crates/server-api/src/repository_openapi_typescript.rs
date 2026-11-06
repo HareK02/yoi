@@ -304,6 +304,7 @@ fn validate_worker_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/workers",
             method: "get",
             operation_id: "workspace_worker_list_alias",
@@ -311,6 +312,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerListResponse")],
         },
         OperationContract {
+            error: "WorkerCreateApiError",
             path: "/api/workers",
             method: "post",
             operation_id: "workspace_worker_create_alias",
@@ -318,6 +320,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserCreateWorkerResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/orchestrator",
             method: "get",
             operation_id: "workspace_orchestrator_status",
@@ -325,6 +328,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserWorkspaceOrchestratorResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/orchestrator",
             method: "post",
             operation_id: "workspace_orchestrator_start",
@@ -332,6 +336,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserWorkspaceOrchestratorResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/workers",
             method: "get",
             operation_id: "workspace_worker_list",
@@ -339,6 +344,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerListResponse")],
         },
         OperationContract {
+            error: "WorkerCreateApiError",
             path: "/api/w/{workspace_id}/workers",
             method: "post",
             operation_id: "workspace_worker_create",
@@ -346,6 +352,7 @@ fn validate_worker_operations(
             successes: &[("200", "BrowserCreateWorkerResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/workers/{worker_ref}",
             method: "get",
             operation_id: "workspace_worker_detail",
@@ -353,6 +360,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerSummary")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/workers/launch-options",
             method: "get",
             operation_id: "workspace_worker_launch_options_alias",
@@ -360,6 +368,7 @@ fn validate_worker_operations(
             successes: &[("200", "WorkerLaunchOptionsResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/workers/launch-options",
             method: "get",
             operation_id: "workspace_worker_launch_options",
@@ -375,6 +384,7 @@ fn validate_companion_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/status",
             method: "get",
             operation_id: "companion_status_alias",
@@ -382,6 +392,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionStatusResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/status",
             method: "get",
             operation_id: "companion_status",
@@ -389,6 +400,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionStatusResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/transcript",
             method: "get",
             operation_id: "companion_transcript_alias",
@@ -396,6 +408,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionTranscriptProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/transcript",
             method: "get",
             operation_id: "companion_transcript",
@@ -403,6 +416,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionTranscriptProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/messages",
             method: "post",
             operation_id: "companion_message_alias",
@@ -410,6 +424,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionMessageResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/messages",
             method: "post",
             operation_id: "companion_message",
@@ -417,6 +432,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionMessageResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/companion/cancel",
             method: "post",
             operation_id: "companion_cancel_alias",
@@ -424,6 +440,7 @@ fn validate_companion_operations(
             successes: &[("200", "CompanionMessageResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/companion/cancel",
             method: "post",
             operation_id: "companion_cancel",
@@ -439,6 +456,7 @@ fn validate_ticket_browser_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/link-summary",
             method: "get",
             operation_id: "ticket_link_summary_get",
@@ -446,6 +464,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketLinkSummary")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/parent",
             method: "get",
             operation_id: "ticket_parent_get",
@@ -453,6 +472,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketParentLink")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/parent",
             method: "put",
             operation_id: "ticket_parent_set",
@@ -460,6 +480,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketParentLink")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/children",
             method: "get",
             operation_id: "ticket_children_query",
@@ -467,6 +488,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketChildrenPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/ticket-tags",
             method: "get",
             operation_id: "workspace_ticket_tag_list",
@@ -474,6 +496,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "Array_of_WorkspaceTag")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/ticket-tags",
             method: "post",
             operation_id: "workspace_ticket_tag_mutate",
@@ -481,6 +504,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "WorkspaceTag")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/tags",
             method: "put",
             operation_id: "ticket_tags_set",
@@ -488,6 +512,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "Array_of_WorkspaceTag")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/browse",
             method: "post",
             operation_id: "ticket_browse",
@@ -495,6 +520,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketBrowseQueryResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/query",
             method: "post",
             operation_id: "ticket_query",
@@ -502,6 +528,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketQueryResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets",
             method: "get",
             operation_id: "ticket_list",
@@ -509,6 +536,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets",
             method: "post",
             operation_id: "ticket_create_record",
@@ -516,6 +544,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketRef")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}",
             method: "get",
             operation_id: "ticket_get",
@@ -523,6 +552,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}",
             method: "patch",
             operation_id: "ticket_edit",
@@ -530,6 +560,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}",
             method: "get",
             operation_id: "ticket_post_get",
@@ -537,6 +568,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketEventDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/posts/{event_ref}",
             method: "patch",
             operation_id: "ticket_post_edit",
@@ -544,6 +576,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/assignments/{role}",
             method: "put",
             operation_id: "ticket_assignment_set",
@@ -551,6 +584,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketRoleAssignmentMutationResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/implementation-cancellations",
             method: "post",
             operation_id: "ticket_implementation_cancel",
@@ -558,6 +592,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/case",
             method: "post",
             operation_id: "ticket_case_update",
@@ -565,6 +600,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketSummary")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments",
             method: "get",
             operation_id: "ticket_assignments_page",
@@ -572,6 +608,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/notification-diagnostics",
             method: "get",
             operation_id: "notification_diagnostics",
@@ -579,6 +616,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "NotificationDiagnosticsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics",
             method: "get",
             operation_id: "ticket_assignment_diagnostics",
@@ -586,6 +624,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentDiagnosticsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results",
             method: "post",
             operation_id: "ticket_implementation_result",
@@ -593,6 +632,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketImplementationResultReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/implementation-results",
             method: "post",
             operation_id: "ticket_implementation_result_browser",
@@ -600,6 +640,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketImplementationResultReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/implementation-results/{result_id}",
             method: "get",
             operation_id: "ticket_implementation_result_get",
@@ -607,6 +648,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketImplementationResultReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-answer",
             method: "post",
             operation_id: "ticket_assignment_answer",
@@ -614,6 +656,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentAnswerReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-tracking/assignments",
             method: "get",
             operation_id: "ticket_assignments_page_browser",
@@ -621,6 +664,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-diagnostics",
             method: "get",
             operation_id: "ticket_assignment_diagnostics_browser",
@@ -628,6 +672,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentDiagnosticsPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{ticket_id}/assignment-answer",
             method: "post",
             operation_id: "ticket_assignment_answer_browser",
@@ -635,6 +680,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentAnswerReceipt")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking",
             method: "get",
             operation_id: "ticket_assignment_tracking_get",
@@ -642,6 +688,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "Array_of_TicketAssignmentTrackingProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking",
             method: "post",
             operation_id: "ticket_assignment_tracking_update",
@@ -649,6 +696,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentTrackingProjection")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/workspaces/{workspace_id}/tickets/{ticket_id}/assignment-tracking/history",
             method: "get",
             operation_id: "ticket_assignment_tracking_history",
@@ -656,6 +704,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketAssignmentTrackingHistoryPage")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/ready",
             method: "post",
             operation_id: "ticket_ready",
@@ -663,6 +712,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/events",
             method: "post",
             operation_id: "ticket_event_append",
@@ -670,6 +720,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/tickets/{id}/queue",
             method: "post",
             operation_id: "ticket_queue",
@@ -677,6 +728,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "TicketQueueOutcome")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/objectives",
             method: "get",
             operation_id: "objective_list",
@@ -684,6 +736,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "ObjectiveListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/objectives/{objective_id}",
             method: "get",
             operation_id: "objective_get",
@@ -691,6 +744,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "ObjectiveDetail")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/merge-requests",
             method: "get",
             operation_id: "merge_request_list",
@@ -698,6 +752,7 @@ fn validate_ticket_browser_operations(
             successes: &[("200", "MergeRequestListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/merge-requests/{merge_request_id}",
             method: "get",
             operation_id: "merge_request_show",
@@ -713,6 +768,7 @@ fn validate_repository_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/repositories",
             method: "get",
             operation_id: "repository_list_alias",
@@ -720,6 +776,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/repositories/{repository_key}",
             method: "get",
             operation_id: "repository_detail_alias",
@@ -727,6 +784,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories",
             method: "get",
             operation_id: "repository_list",
@@ -734,6 +792,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories",
             method: "post",
             operation_id: "repository_create",
@@ -744,6 +803,7 @@ fn validate_repository_operations(
             ],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}",
             method: "get",
             operation_id: "repository_detail",
@@ -751,6 +811,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
             method: "post",
             operation_id: "repository_ssh_connection_probe",
@@ -758,6 +819,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositorySshConnectionProbeResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}/ssh-connection-test",
             method: "put",
             operation_id: "repository_ssh_host_trust_confirm",
@@ -765,6 +827,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositorySshHostTrust")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/repositories/{repository_key}/log",
             method: "get",
             operation_id: "repository_log",
@@ -772,6 +835,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryLogResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/repositories/{repository_key}/log",
             method: "get",
             operation_id: "repository_log_alias",
@@ -779,6 +843,7 @@ fn validate_repository_operations(
             successes: &[("200", "RepositoryLogResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/hosts",
             method: "get",
             operation_id: "host_list",
@@ -786,6 +851,7 @@ fn validate_repository_operations(
             successes: &[("200", "HostListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/hosts",
             method: "get",
             operation_id: "host_list_alias",
@@ -793,6 +859,7 @@ fn validate_repository_operations(
             successes: &[("200", "HostListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/hosts/{host_id}/workers",
             method: "get",
             operation_id: "host_worker_list",
@@ -800,6 +867,7 @@ fn validate_repository_operations(
             successes: &[("200", "HostWorkerListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/hosts/{host_id}/workers",
             method: "get",
             operation_id: "host_worker_list_alias",
@@ -815,6 +883,7 @@ fn validate_workdir_operations(
 ) -> Result<BTreeSet<String>, GenerationError> {
     let operations = [
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
             method: "get",
             operation_id: "runtime_workdir_list",
@@ -822,6 +891,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
             method: "post",
             operation_id: "runtime_workdir_create",
@@ -832,6 +902,7 @@ fn validate_workdir_operations(
             ],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
             method: "get",
             operation_id: "runtime_workdir_detail",
@@ -839,6 +910,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
             method: "delete",
             operation_id: "runtime_workdir_cleanup",
@@ -846,6 +918,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryRemovalResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/external-workdir-grants",
             method: "post",
             operation_id: "external_workdir_grant_create",
@@ -853,6 +926,7 @@ fn validate_workdir_operations(
             successes: &[("201", "ExternalWorkdirGrantResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
             method: "get",
             operation_id: "external_workdir_grant_get",
@@ -860,6 +934,7 @@ fn validate_workdir_operations(
             successes: &[("200", "ExternalWorkdirGrantResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
             method: "delete",
             operation_id: "external_workdir_grant_revoke",
@@ -867,6 +942,7 @@ fn validate_workdir_operations(
             successes: &[("200", "ExternalWorkdirGrantResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories",
             method: "get",
             operation_id: "workspace_workdir_list",
@@ -874,6 +950,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryListResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories",
             method: "post",
             operation_id: "workspace_workdir_create",
@@ -884,6 +961,7 @@ fn validate_workdir_operations(
             ],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories/{working_directory_id}",
             method: "get",
             operation_id: "workspace_workdir_detail",
@@ -891,6 +969,7 @@ fn validate_workdir_operations(
             successes: &[("200", "WorkingDirectoryDetailResponse")],
         },
         OperationContract {
+            error: "RepositoryApiError",
             path: "/api/w/{workspace_id}/working-directories/{working_directory_id}",
             method: "delete",
             operation_id: "workspace_workdir_cleanup",
@@ -1335,13 +1414,28 @@ fn validate_operation_contracts(
                 &format!("{} response {status}", operation.operation_id),
             )?;
             let schema = json_content_schema(response, operation.operation_id)?;
+            let startup_error = operation.error == "WorkerCreateApiError"
+                && !successes.contains_key(status.as_str());
             let expected = successes
                 .get(status.as_str())
                 .copied()
-                .unwrap_or("RepositoryApiError");
+                .unwrap_or(if startup_error {
+                    "RepositoryApiError"
+                } else {
+                    operation.error
+                });
             require_schema_ref(schema, expected, operation.operation_id)?;
             roots.insert(expected.to_owned());
-            if !successes.contains_key(status.as_str()) {
+            if startup_error {
+                let content = object_field(response, "content", operation.operation_id)?;
+                let problem =
+                    object_field(content, "application/problem+json", operation.operation_id)?;
+                let schema = problem.get("schema").ok_or_else(|| {
+                    GenerationError::invalid("missing startup Problem Details schema")
+                })?;
+                require_schema_ref(schema, "StartupProblemDetails", operation.operation_id)?;
+                roots.insert("StartupProblemDetails".to_owned());
+            } else if !successes.contains_key(status.as_str()) {
                 collect_control_error_schema(response, operation.operation_id, &mut roots)?;
             }
         }
@@ -1358,6 +1452,7 @@ fn validate_operation_contracts(
 }
 
 struct OperationContract {
+    error: &'static str,
     path: &'static str,
     method: &'static str,
     operation_id: &'static str,

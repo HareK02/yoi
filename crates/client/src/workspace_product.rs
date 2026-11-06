@@ -82,6 +82,23 @@ impl BackendWorkspaceProductClient {
                 >,
             >,
     {
+        self.generated_normalized(operation, crate::backend_workspace::server_client_error)
+    }
+
+    fn generated_normalized<T, E, F, Fut>(
+        &self,
+        operation: F,
+        normalize: impl FnOnce(
+            &BackendApiClient,
+            server_api::client_support::ClientError<E>,
+        ) -> BackendWorkspaceClientError,
+    ) -> Result<T, BackendWorkspaceClientError>
+    where
+        F: FnOnce(
+            server_api::ServerApiClient<crate::backend_workspace::ServerBearerAuthorizer>,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<T, server_api::client_support::ClientError<E>>>,
+    {
         let client = crate::backend_workspace::server_api_client(&self.api)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -89,7 +106,7 @@ impl BackendWorkspaceProductClient {
             .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
         runtime
             .block_on(operation(client))
-            .map_err(|error| crate::backend_workspace::server_client_error(&self.api, error))
+            .map_err(|error| normalize(&self.api, error))
     }
 
     pub fn read_ticket_link_summary(
@@ -584,9 +601,9 @@ impl BackendWorkspaceProductClient {
             execution_grant: None,
         };
         let workspace_id = self.workspace_id.clone();
-        let response: BrowserCreateWorkerResponse = self.generated(move |client| async move {
+        let response: BrowserCreateWorkerResponse = self.generated_normalized(move |client| async move {
             client.workspace_worker_create(workspace_id, request).await
-        })?;
+        }, crate::backend_workspace::worker_create_client_error)?;
         Ok(format!(
             "Started Intake Worker {}/{} for Ticket {ticket_id}",
             response.runtime_id, response.worker_id

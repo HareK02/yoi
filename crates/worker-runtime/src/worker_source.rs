@@ -545,8 +545,11 @@ impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
 }
 
 #[cfg(feature = "http-server")]
-fn generated_workspace_response<T: serde::Serialize>(
-    response: Result<T, server_api::client_support::ClientError<server_api::RepositoryApiError>>,
+fn generated_workspace_response<
+    T: serde::Serialize,
+    E: serde::Serialize + api_macros::HttpError,
+>(
+    response: Result<T, server_api::client_support::ClientError<E>>,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     match response {
         Ok(response) => Ok(WorkspaceResponse {
@@ -556,21 +559,19 @@ fn generated_workspace_response<T: serde::Serialize>(
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
         }),
         Err(server_api::client_support::ClientError::Public { status, error }) => {
-            // The generated receiver already validated the actual status, media type and
-            // envelope. Reproject its typed cause instead of serializing skipped state
-            // or relabeling a legacy JSON body as a received Problem response.
-            if let Some(cause) = error.control_cause() {
-                let problem =
-                    server_api::control_failure::control_problem(cause).map_err(|_| {
-                        WorkspaceClientError::Request(
-                            "control failure projection unavailable".into(),
-                        )
-                    })?;
+            // Resolve each typed boundary projection, including Startup and Control.
+            // Never forward a legacy body under a fabricated Problem media type.
+            if let Some(problem) = error.custom_response() {
+                if problem.status != status.as_u16() {
+                    return Err(WorkspaceClientError::Request(
+                        "error projection status mismatch".into(),
+                    ));
+                }
                 return Ok(WorkspaceResponse {
                     status: status.as_u16(),
                     content_type: Some(problem.content_type.to_owned()),
                     body: String::from_utf8(problem.body.to_vec()).map_err(|_| {
-                        WorkspaceClientError::Request("control failure encoding unavailable".into())
+                        WorkspaceClientError::Request("failure encoding unavailable".into())
                     })?,
                 });
             }
@@ -757,7 +758,19 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                         ),
                         WorkspaceServerOperation::WorkerControlSpawn(request) => {
                             generated_workspace_response(
-                                client.worker_control_spawn(workspace_id, request).await,
+                                client.worker_control_spawn(workspace_id, request).await.map_err(|error| match error {
+                                    server_api::client_support::ClientError::Public { status, error } => {
+                                        let error = match error.failure().cloned() {
+                                            // This already authenticated Worker control caller may
+                                            // receive the enum-only public startup cause. The domain
+                                            // allowlist reprojects it, never forwards upstream text.
+                                            Some(failure) => server_api::WorkerCreateApiError::startup(failure, &protocol::session_failure::SessionFailureVisibility { can_view_cause: true }),
+                                            None => error,
+                                        };
+                                        server_api::client_support::ClientError::Public { status, error }
+                                    }
+                                    other => other,
+                                }),
                             )
                         }
                         WorkspaceServerOperation::WorkerControlInput {

@@ -39,6 +39,7 @@ pub enum BackendWorkspaceClientError {
     Api(BackendApiClientError),
     Http(reqwest::Error),
     ServerApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
+    WorkerCreateApi(server_api::client_support::ClientError<server_api::WorkerCreateApiError>),
     RuntimeManagementApi(
         server_api::client_support::ClientError<server_api::RuntimeManagementApiError>,
     ),
@@ -51,6 +52,7 @@ impl fmt::Display for BackendWorkspaceClientError {
             Self::Api(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
             Self::ServerApi(error) => write!(f, "{error}"),
+            Self::WorkerCreateApi(error) => write!(f, "{error}"),
             Self::RuntimeManagementApi(error) => write!(f, "{error}"),
         }
     }
@@ -452,5 +454,33 @@ mod tests {
         let retry = request.clone();
         assert_eq!(retry.operation_key, "workspace-create-1");
         assert_eq!(retry, request);
+    }
+}
+
+pub(crate) fn worker_create_client_error(
+    backend: &BackendApiClient,
+    error: server_api::client_support::ClientError<server_api::WorkerCreateApiError>,
+) -> BackendWorkspaceClientError {
+    use server_api::client_support::ClientError;
+    // Retain typed startup facts even for an operator denial. A Subject execution
+    // condition is not a refusal of this client's credential or a login prompt.
+    match &error {
+        ClientError::Public {
+            status,
+            error: response,
+        } if response.failure().is_none() && *status == reqwest::StatusCode::UNAUTHORIZED => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Unauthorized {
+                origin: backend.origin().clone(),
+            })
+        }
+        ClientError::Public {
+            status,
+            error: response,
+        } if response.failure().is_none() && *status == reqwest::StatusCode::FORBIDDEN => {
+            BackendWorkspaceClientError::Api(BackendApiClientError::Forbidden {
+                origin: backend.origin().clone(),
+            })
+        }
+        _ => BackendWorkspaceClientError::WorkerCreateApi(error),
     }
 }

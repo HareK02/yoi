@@ -137,7 +137,13 @@ pub(crate) mod backend_job_upgrade;
 mod storage_formats;
 pub use backend_job_recovery_store::BackendJobReconciliation;
 
-const LATEST_SCHEMA_VERSION: i64 = 125;
+const LATEST_SCHEMA_VERSION: i64 = 126;
+const WORKER_CREATE_FAILURE_MIGRATION_NAME: &str =
+    "Worker create coordinator returned startup failure";
+pub(crate) const WORKER_CREATE_FAILURE_MAX_BYTES: usize = 32 * 1024;
+const SERVICE_OUTCOME_MIGRATION_NAME: &str = "Plugin Service retained outcomes and causes";
+const RETAINED_STARTUP_MIGRATION_NAME: &str =
+    "Worker create coordinator returned startup failure after retained Job and Service causes";
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -522,13 +528,18 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 124,
-        name: backend_job_recovery_store::CAUSE_MIGRATION_NAME,
-        apply: migrate_backend_job_causes_v123_to_v124,
+        name: WORKER_CREATE_FAILURE_MIGRATION_NAME,
+        apply: migrate_worker_create_failure_to_v124,
     },
     Migration {
         version: 125,
-        name: "Plugin Service retained outcomes and causes",
-        apply: migrate_plugin_service_outcomes_v124_to_v125,
+        name: backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+        apply: migrate_backend_job_causes_v124_to_v125,
+    },
+    Migration {
+        version: 126,
+        name: SERVICE_OUTCOME_MIGRATION_NAME,
+        apply: migrate_plugin_service_outcomes_v125_to_v126,
     },
 ];
 
@@ -16531,40 +16542,105 @@ fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Reader-first additive migration: old prose is deliberately not promoted to facts.
-fn migrate_backend_job_causes_v123_to_v124(conn: &Connection) -> Result<()> {
+fn verify_worker_create_failure_schema(conn: &Connection) -> Result<()> {
+    storage_formats::verify_startup_shape(conn)
+}
+
+fn migrate_worker_create_failure_to_v124(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 123 {
         return Err(Error::Store(
-            "Backend Job cause migration requires schema 123".into(),
+            "Worker create failure migration requires schema 123".into(),
         ));
     }
     storage_formats::verify_history(conn, 123)?;
     let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
+    tx.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(124,?1)",
-        [backend_job_recovery_store::CAUSE_MIGRATION_NAME],
+        [WORKER_CREATE_FAILURE_MIGRATION_NAME],
     )?;
     tx.commit()?;
     Ok(())
 }
 
-fn migrate_plugin_service_outcomes_v124_to_v125(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 124 {
-        return Err(Error::Store(
-            "Plugin Service outcome migration requires schema 124".into(),
-        ));
+// Retain the two actually published source receipts. They are alternatives to,
+// not aliases for, Startup-124 / Job-125 / Service-126.
+const RETAINED_FAILURE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 125,
+        name: SERVICE_OUTCOME_MIGRATION_NAME,
+        apply: migrate_retained_service_outcomes_to_v125,
+    },
+    Migration {
+        version: 126,
+        name: RETAINED_STARTUP_MIGRATION_NAME,
+        apply: migrate_retained_startup_to_v126,
+    },
+];
+
+fn migrate_failure_extension(
+    conn: &Connection,
+    previous: i64,
+    version: i64,
+    name: &str,
+    sql: &str,
+) -> Result<()> {
+    if current_schema_version(conn)? != previous {
+        return Err(Error::Store(format!(
+            "failure migration requires schema {previous}"
+        )));
     }
-    storage_formats::verify_history(conn, 124)?;
+    storage_formats::verify_history(conn, previous)?;
     let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
+    tx.execute_batch(sql)?;
     tx.execute(
-        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(125,?1)",
-        ["Plugin Service retained outcomes and causes"],
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+        params![version, name],
     )?;
-    storage_formats::verify_history(&tx, 125)?;
+    storage_formats::verify_history(&tx, version)?;
     tx.commit()?;
     Ok(())
+}
+
+fn migrate_backend_job_causes_v124_to_v125(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        124,
+        125,
+        backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+        backend_job_recovery_store::CAUSE_SCHEMA,
+    )
+}
+
+fn migrate_plugin_service_outcomes_v125_to_v126(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        125,
+        126,
+        SERVICE_OUTCOME_MIGRATION_NAME,
+        crate::plugin_service::FAILURE_MIGRATION_SQL,
+    )
+}
+
+fn migrate_retained_service_outcomes_to_v125(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        124,
+        125,
+        SERVICE_OUTCOME_MIGRATION_NAME,
+        crate::plugin_service::FAILURE_MIGRATION_SQL,
+    )
+}
+
+fn migrate_retained_startup_to_v126(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        125,
+        126,
+        RETAINED_STARTUP_MIGRATION_NAME,
+        include_str!("worker_create_failure_schema.sql"),
+    )
 }
 
 fn migrate_backend_job_execution_to_v123(conn: &Connection) -> Result<()> {
@@ -16717,6 +16793,8 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
     backend_job_upgrade::install_fresh(conn)?;
+    conn.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(conn)?;
     conn.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
     conn.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
     Ok(())
@@ -16756,11 +16834,14 @@ fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
 fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure_from_sql(
-        conn,
-        &backend_job_upgrade::retained_checks(include_str!("latest_schema.sql")),
-        true,
-    )?;
+    // The pre-124 reference composition must not already contain the column
+    // added by migration 124. Fresh latest creation installs it after this prefix.
+    let retained_schema = backend_job_upgrade::retained_checks(include_str!("latest_schema.sql"))
+        .replace(
+            "            startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR\n                (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),\n",
+            "",
+        );
+    create_workspace_schema_structure_from_sql(conn, &retained_schema, true)?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
     conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
@@ -17799,7 +17880,8 @@ fn apply_migrations_with_secret_source(
         for step in &plan.migrations {
             let migration = MIGRATIONS
                 .iter()
-                .find(|migration| migration.version == step.version)
+                .chain(RETAINED_FAILURE_MIGRATIONS.iter())
+                .find(|migration| migration.version == step.version && migration.name == step.name)
                 .ok_or_else(|| {
                     Error::Store(format!(
                         "migration implementation for schema version {} is missing",
@@ -17853,6 +17935,14 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 #[path = "storage_owner_tests.rs"]
 mod storage_owner_tests;
+
+#[cfg(test)]
+#[path = "combined_failure_migration_tests.rs"]
+mod combined_failure_migration_tests;
+
+#[cfg(test)]
+#[path = "worker_create_failure_store_tests.rs"]
+mod worker_create_failure_store_tests;
 
 #[cfg(test)]
 #[path = "store_test_support.rs"]
@@ -28305,7 +28395,7 @@ INSERT INTO worker_registry (
     }
 
     #[tokio::test]
-    async fn backend_job_cause_migration_124_is_additive_atomic_and_reopens_like_fresh() {
+    async fn backend_job_cause_migration_125_is_additive_atomic_and_reopens_like_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cause-migration.sqlite");
         let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
@@ -28358,23 +28448,23 @@ INSERT INTO worker_registry (
             // Fixture-only reconstruction of the previous additive schema. No
             // production downgrade API or mutation of historical receipts ships.
             conn.execute_batch("ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json;
-                UPDATE __yoi_schema_migrations SET version=124 WHERE version=125;
+                UPDATE __yoi_schema_migrations SET version=125 WHERE version=126;
                 ALTER TABLE backend_jobs DROP COLUMN failure_cause;
                 ALTER TABLE backend_job_attempts DROP COLUMN failure_cause;
                 ALTER TABLE backend_job_attempts DROP COLUMN worker_cleanup_failure_cause;
-                UPDATE __yoi_schema_migrations SET version=123 WHERE version=124;")?;
-            storage_formats::verify_history(conn, 123)?;
-            conn.execute_batch("CREATE TRIGGER inject_cause_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=124 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")?;
-            assert!(migrate_backend_job_causes_v123_to_v124(conn).is_err());
-            assert_eq!(current_schema_version(conn)?, 123);
+                UPDATE __yoi_schema_migrations SET version=124 WHERE version=125;")?;
+            storage_formats::verify_history(conn, 124)?;
+            conn.execute_batch("CREATE TRIGGER inject_cause_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=125 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")?;
+            assert!(migrate_backend_job_causes_v124_to_v125(conn).is_err());
+            assert_eq!(current_schema_version(conn)?, 124);
             let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('backend_jobs') WHERE name='failure_cause')", [], |row| row.get(0))?;
             assert!(!present, "ALTER TABLE must roll back with receipt failure");
             let attempt_present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('backend_job_attempts') WHERE name IN ('failure_cause','worker_cleanup_failure_cause'))", [], |row| row.get(0))?;
             assert!(!attempt_present);
             conn.execute_batch("DROP TRIGGER inject_cause_migration")?;
-            migrate_backend_job_causes_v123_to_v124(conn)?;
-            assert_eq!(current_schema_version(conn)?, 124);
-            assert!(migrate_backend_job_causes_v123_to_v124(conn).is_err(), "not applied twice");
+            migrate_backend_job_causes_v124_to_v125(conn)?;
+            assert_eq!(current_schema_version(conn)?, 125);
+            assert!(migrate_backend_job_causes_v124_to_v125(conn).is_err(), "not applied twice");
             Ok(())
         }).unwrap();
         for (job, attempts) in &before {

@@ -54,6 +54,7 @@ mod ticket_browse_performance_tests;
 mod ticket_item_checker;
 pub mod workdir_create_operations;
 mod workdir_removal;
+mod worker_create_failure_store;
 mod worker_projection;
 pub mod worker_source;
 pub mod workspace_catalog;
@@ -128,6 +129,15 @@ pub enum Error {
     RuntimeControlFailed {
         runtime_id: String,
         cause: protocol::control_failure::RuntimeControlCause,
+    },
+    /// Typed startup result; HTTP and other callers project this without parsing Display.
+    #[error(
+        "Worker creation failed; the typed result retains its cause and operation observations"
+    )]
+    WorkerCreateFailed {
+        failure: Box<runtime_api::startup::WorkerCreateFailure>,
+        #[source]
+        source: Option<Box<Error>>,
     },
     #[error("runtime `{runtime_id}` operation failed ({code}): {message}")]
     RuntimeOperationFailed {

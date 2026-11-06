@@ -22,8 +22,8 @@ const FALLBACKS = {
 
 // 原因の説明/秘匿はServerの公開projectionが所有する。UIでreasonを翻訳したり
 // details/sourceを走査しない。相関参照は問い合わせ用で、再送keyではない。
-export function failureNotice<D>(
-  receipt: FailureReceipt<D>,
+export function failureNotice<D, E = undefined>(
+  receipt: FailureReceipt<D, E>,
 ): FailureNoticeModel {
   if (receipt.kind !== "problem") {
     return {

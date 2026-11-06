@@ -64,8 +64,8 @@ pub fn control_problem(
         .map(Into::into)
 }
 
-impl api_macros::reqwest::HttpClientError for super::RuntimeApiError {
-    fn decode_error(
+impl super::RuntimeApiError {
+    pub(crate) fn decode_control_error(
         response: &api_macros::reqwest::ReceivedResponse,
     ) -> Result<Self, api_macros::reqwest::ClientFailure> {
         use api_macros::reqwest::ClientFailure;

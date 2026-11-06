@@ -5,8 +5,8 @@
 //! receipts). Published 114..121 databases retain their version, receipt names,
 //! policy, Job states, root records and erasure fences. They need no domain DDL
 //! merely to acquire the common storage identity/lifetime owned by the caller.
-//! Ordered 122..125 receipts add configuration, Job execution, bounded Job
-//! causes and Service outcomes; each intermediate/fresh baseline stays exact.
+//! Ordered 122..126 receipts add configuration, Job execution, startup results,
+//! bounded Job causes and Service outcomes; each intermediate/fresh baseline stays exact.
 //! This does not attest policy transfer, execution termination or Journal release.
 //!
 //! Frozen SQL below is a physical reference: it runs ONLY on empty, private
@@ -73,13 +73,53 @@ fn invalid(message: impl std::fmt::Display) -> Error {
 /// Every other row, gap, mixed family, unknown suffix and missing object fails.
 pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     let rows = super::workspace_schema_migration_history(conn)?;
-    verify_failure_shape(conn, current)?;
-    verify_history_records(conn, current, &rows)
+    let tail = failure_tail(conn, current, &rows)?;
+    verify_failure_shape(conn, current, tail)?;
+    if current < 124 {
+        return verify_history_records(conn, current, &rows);
+    }
+    verify_execution_shape(conn)?;
+    super::backend_job_upgrade::verify(conn)?;
+    let baseline = rows
+        .first()
+        .ok_or_else(|| invalid("missing migration receipts"))?;
+    // A fresh published baseline has no fabricated predecessor receipts.
+    if baseline.0 >= 124 {
+        if baseline.1 != super::SCHEMA_BASELINE_NAME {
+            return Err(invalid("unrecognized failure baseline"));
+        }
+        verify_configuration_shape(conn)?;
+        require_shape(conn, Stage::Base)?;
+        verify_103_features(conn, current, &rows)?;
+    } else {
+        let prefix: Vec<_> = rows.iter().filter(|row| row.0 < 124).cloned().collect();
+        if prefix.last().map(|row| row.0) != Some(123) {
+            return Err(invalid("missing failure migration predecessor"));
+        }
+        verify_history_records(conn, 123, &prefix)?;
+    }
+    let expected: Vec<_> = tail
+        .migrations()
+        .into_iter()
+        .filter(|(version, _)| *version >= 124 && *version > baseline.0 && *version <= current)
+        .map(|(version, name)| (version, name.to_owned()))
+        .collect();
+    let actual: Vec<_> = rows
+        .iter()
+        .filter(|row| row.0 >= 124 && row.0 > baseline.0)
+        .cloned()
+        .collect();
+    if expected != actual || rows.last().map(|row| row.0) != Some(current) {
+        return Err(invalid(
+            "mixed, missing or unrecognized failure migration receipts",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
     verify_raw_capture_shape(conn, current, rows)?;
-    if (123..=125).contains(&current) {
+    if current == 123 {
         verify_execution_shape(conn)?;
         super::backend_job_upgrade::verify(conn)?;
         if rows == [(current, super::SCHEMA_BASELINE_NAME.to_owned())] {
@@ -239,20 +279,24 @@ pub(super) fn published_plan(
     verify_history(conn, current)?;
     Ok(Some(super::WorkspaceSchemaMigrationPlan {
         current_schema_version: current,
-        target_schema_version: 125,
-        migrations: (122..=125)
-            .filter(|version| *version > current)
-            .map(|version| {
-                Ok(super::WorkspaceSchemaMigrationStep {
-                    version,
-                    name: tail_migration_name(version)?.to_owned(),
-                })
-            })
-            .collect::<Result<_>>()?,
+        target_schema_version: super::LATEST_SCHEMA_VERSION,
+        migrations: failure_tail(
+            conn,
+            current,
+            &super::workspace_schema_migration_history(conn)?,
+        )?
+        .migrations()
+        .into_iter()
+        .filter(|(version, _)| *version > current)
+        .map(|(version, name)| super::WorkspaceSchemaMigrationStep {
+            version,
+            name: name.to_owned(),
+        })
+        .collect(),
     }))
 }
 
-// Receipt names come from the ordered owner, including the Service-125 hook.
+// Receipt names come from the ordered owner, including the Service-126 hook.
 // A missing registration is an integration error, never a fabricated receipt.
 fn tail_migration_name(version: i64) -> Result<&'static str> {
     super::MIGRATIONS
@@ -262,29 +306,194 @@ fn tail_migration_name(version: i64) -> Result<&'static str> {
         .ok_or_else(|| invalid(format!("missing registered schema-{version} migration")))
 }
 
-// Run once for the actual saved version, not again for recursively checked
-// receipt prefixes. An old receipt checked inside a 125 history sees 125 DDL.
-fn verify_failure_shape(conn: &Connection, current: i64) -> Result<()> {
+// The two published histories share numbers, not identities. Fresh branch-local
+// baselines are recognized by the exact physical shape checked below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureTail {
+    Canonical,
+    Retained,
+}
+impl FailureTail {
+    fn migrations(self) -> Vec<(i64, &'static str)> {
+        let mut tail = vec![
+            (122, crate::config_adoption::MIGRATION_NAME),
+            (123, super::backend_job_upgrade::MIGRATION_NAME),
+        ];
+        tail.extend(match self {
+            Self::Canonical => vec![
+                (124, super::WORKER_CREATE_FAILURE_MIGRATION_NAME),
+                (125, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
+                (126, super::SERVICE_OUTCOME_MIGRATION_NAME),
+            ],
+            Self::Retained => vec![
+                (124, super::backend_job_recovery_store::CAUSE_MIGRATION_NAME),
+                (125, super::SERVICE_OUTCOME_MIGRATION_NAME),
+                (126, super::RETAINED_STARTUP_MIGRATION_NAME),
+            ],
+        });
+        tail
+    }
+    fn startup(self, current: i64) -> bool {
+        current >= if self == Self::Canonical { 124 } else { 126 }
+    }
+    fn jobs(self, current: i64) -> bool {
+        current >= if self == Self::Canonical { 125 } else { 124 }
+    }
+    fn service(self, current: i64) -> bool {
+        current >= if self == Self::Canonical { 126 } else { 125 }
+    }
+}
+
+fn failure_tail(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<FailureTail> {
+    if current > super::LATEST_SCHEMA_VERSION {
+        return Err(invalid("unsupported future failure history"));
+    }
     if current < 124 {
-        for (table, column) in [
-            ("backend_jobs", "failure_cause"),
-            ("backend_job_attempts", "failure_cause"),
-            ("backend_job_attempts", "worker_cleanup_failure_cause"),
-        ] {
-            if super::column_exists(conn, table, column)? {
-                return Err(invalid(format!("{table}.{column} before receipt 124")));
+        return Ok(FailureTail::Canonical);
+    }
+    if let Some((_, name)) = rows
+        .iter()
+        .find(|row| row.0 == 124 && row.1 != super::SCHEMA_BASELINE_NAME)
+    {
+        return match name.as_str() {
+            super::WORKER_CREATE_FAILURE_MIGRATION_NAME => Ok(FailureTail::Canonical),
+            super::backend_job_recovery_store::CAUSE_MIGRATION_NAME => Ok(FailureTail::Retained),
+            _ => Err(invalid("unrecognized schema-124 identity")),
+        };
+    }
+    let baseline = rows
+        .first()
+        .ok_or_else(|| invalid("missing failure baseline"))?
+        .0;
+    // A retained baseline after completion is identified by its 126 receipt.
+    if baseline < 126
+        && rows
+            .iter()
+            .any(|row| row.0 == 126 && row.1 == super::RETAINED_STARTUP_MIGRATION_NAME)
+    {
+        return Ok(FailureTail::Retained);
+    }
+    if baseline == 124
+        && rows
+            .iter()
+            .any(|row| row.0 == 125 && row.1 == super::SERVICE_OUTCOME_MIGRATION_NAME)
+    {
+        return Ok(FailureTail::Retained);
+    }
+    if current < 126
+        && !super::column_exists(conn, "worker_create_reservations", "startup_failure_json")?
+    {
+        return Ok(FailureTail::Retained);
+    }
+    Ok(FailureTail::Canonical)
+}
+
+// Compare tokenized complete table/index/trigger programs, not a substring that
+// a comment or a second weaker constraint could counterfeit.
+pub(super) fn verify_startup_shape(conn: &Connection) -> Result<()> {
+    verify_startup_shape_for(conn, true)
+}
+
+fn verify_startup_shape_for(conn: &Connection, present: bool) -> Result<()> {
+    static WITH_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    static WITHOUT_RESULT: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let select = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(_, object)| object.1 == "worker_create_reservations")
+            .collect()
+    };
+    let expected = if present {
+        &WITH_RESULT
+    } else {
+        &WITHOUT_RESULT
+    }
+    .get_or_init(|| {
+        (|| -> Result<Shape> {
+            let reference = reference_base()?;
+            if present {
+                reference.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
             }
+            Ok(select(snapshot(&reference)?))
+        })()
+        .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map_err(invalid)?;
+    let actual = select(snapshot(conn)?);
+    if actual == *expected {
+        return Ok(());
+    }
+    // Real 53 -> 73 upgrades used the exact singleton triggers without the
+    // redundant fresh-baseline table CHECK. Keep that exact published form,
+    // including supported baseline-only histories that omit predecessor receipts.
+    // The full table and both enforcing trigger programs still have to match.
+    let history = super::workspace_schema_migration_history(conn)?;
+    let retained_upgrade = history.first().is_some_and(|row| row.0 < 73)
+        && history.iter().any(|row| {
+            row.0 == 73
+                && super::MIGRATIONS
+                    .iter()
+                    .any(|migration| migration.version == 73 && migration.name == row.1)
+        });
+    let retained_baseline = history.first().is_some_and(|row| {
+        (73..=super::LATEST_SCHEMA_VERSION).contains(&row.0) && row.1 == super::SCHEMA_BASELINE_NAME
+    });
+    if retained_upgrade || retained_baseline {
+        let mut upgraded = expected.clone();
+        let (_, _, table) = upgraded
+            .get_mut("worker_create_reservations")
+            .ok_or_else(|| invalid("missing startup reference table"))?;
+        let mut declaration =
+            tokens("CHECK ((singleton_key IS NULL) = (singleton_generation IS NULL))")?;
+        declaration.push(",".into());
+        if let Some(start) = table
+            .windows(declaration.len())
+            .position(|part| part == declaration)
+        {
+            table.drain(start..start + declaration.len());
+            if actual == upgraded {
+                return Ok(());
+            }
+        }
+    }
+    let changed: BTreeSet<_> = actual
+        .keys()
+        .chain(expected.keys())
+        .filter(|key| actual.get(*key) != expected.get(*key))
+        .collect();
+    Err(invalid(format!(
+        "Worker create startup failure physical schema mismatch: {changed:?}"
+    )))
+}
+
+// Run only for the saved version, not recursively against historical prefixes.
+fn verify_failure_shape(conn: &Connection, current: i64, tail: FailureTail) -> Result<()> {
+    let startup = super::column_exists(conn, "worker_create_reservations", "startup_failure_json")?;
+    if startup != tail.startup(current) {
+        return Err(invalid("startup failure receipt/shape mismatch"));
+    }
+    if current >= 124 {
+        verify_startup_shape_for(conn, startup)?;
+    }
+    for (table, column) in [
+        ("backend_jobs", "failure_cause"),
+        ("backend_job_attempts", "failure_cause"),
+        ("backend_job_attempts", "worker_cleanup_failure_cause"),
+    ] {
+        if super::column_exists(conn, table, column)? != tail.jobs(current) {
+            return Err(invalid(format!("{table}.{column} receipt/shape mismatch")));
         }
     }
     if current < 112 {
         if super::column_exists(conn, "plugin_service_consumers", "last_outcome_json")? {
-            return Err(invalid("Service outcome before receipt 125"));
+            return Err(invalid("Service outcome before its receipt"));
         }
         return Ok(());
     }
     let reference = Connection::open_in_memory()?;
     reference.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
-    if current >= 125 {
+    if tail.service(current) {
         reference.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
     }
     let expected = snapshot(&reference)?;
@@ -514,7 +723,7 @@ fn legacy_shape(conn: &Connection) -> Result<Shape> {
 
 fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
     let current = super::current_schema_version(conn)?;
-    if !(123..=125).contains(&current) {
+    if current < 123 {
         return Ok(shape);
     }
     for table in ["backend_jobs", "backend_job_attempts"] {
@@ -549,7 +758,7 @@ fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
             }
         }
     }
-    if current >= 124 {
+    if super::column_exists(conn, "backend_jobs", "failure_cause")? {
         for (table, column) in [
             ("backend_jobs", "failure_cause"),
             ("backend_job_attempts", "failure_cause"),
@@ -1005,7 +1214,7 @@ mod failure_format_tests {
             Stage::Converged(121),
         ] {
             let conn = fixture_123(stage);
-            for current in 123..=125 {
+            for current in 123..=126 {
                 if current > 123 {
                     apply(&conn, current).unwrap();
                 }
@@ -1013,13 +1222,13 @@ mod failure_format_tests {
                 let history = store::workspace_schema_migration_history(&conn).unwrap();
                 let plan = published_plan(&conn, current).unwrap().unwrap();
                 assert_eq!(plan.current_schema_version, current);
-                assert_eq!(plan.target_schema_version, 125);
+                assert_eq!(plan.target_schema_version, 126);
                 assert_eq!(
                     plan.migrations
                         .iter()
                         .map(|step| (step.version, step.name.as_str()))
                         .collect::<Vec<_>>(),
-                    ((current + 1)..=125)
+                    ((current + 1)..=126)
                         .map(|version| (version, tail_migration_name(version).unwrap()))
                         .collect::<Vec<_>>()
                 );
@@ -1032,7 +1241,7 @@ mod failure_format_tests {
         }
         // Fresh composition has the Base shape, not fabricated published-family
         // receipts. Each supported additive intermediate is a real baseline.
-        for current in 123..=125 {
+        for current in 123..=126 {
             let conn = fixture_123(Stage::Base);
             for version in 124..=current {
                 apply(&conn, version).unwrap();
@@ -1066,11 +1275,11 @@ mod failure_format_tests {
                 "UPDATE __yoi_schema_migrations SET name='wrong service receipt' WHERE version=125",
             ),
             (
-                125,
+                126,
                 "ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json",
             ),
             (
-                125,
+                126,
                 "ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json; ALTER TABLE plugin_service_consumers ADD COLUMN last_outcome_json BLOB",
             ),
             (
@@ -1082,7 +1291,7 @@ mod failure_format_tests {
                 "CREATE TRIGGER unexpected_service_trigger AFTER UPDATE ON plugin_service_consumers BEGIN SELECT 1; END",
             ),
             (
-                124,
+                125,
                 "ALTER TABLE backend_jobs DROP COLUMN failure_cause; ALTER TABLE backend_jobs ADD COLUMN failure_cause TEXT",
             ),
             (
@@ -1144,7 +1353,7 @@ mod failure_format_tests {
         let mut old_columns = columns(&conn);
         old_columns.remove("__yoi_schema_migrations");
         let retained = values(&conn, &old_columns);
-        for version in 124..=125 {
+        for version in 124..=126 {
             conn.execute_batch(&format!("CREATE TRIGGER inject_failure_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version={version} BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")).unwrap();
             let before = snapshot(&conn).unwrap();
             let rollback_columns = columns(&conn);
@@ -1192,7 +1401,7 @@ mod failure_format_tests {
     }
 
     #[test]
-    fn oldest_supported_baseline_reaches_125_through_real_runner_and_reopens() {
+    fn oldest_supported_baseline_reaches_126_through_real_runner_and_reopens() {
         assert_eq!(store::OLDEST_SCHEMA_VERSION, 50);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oldest.db");
@@ -1223,15 +1432,15 @@ mod failure_format_tests {
         drop(conn);
         let plan = store::SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 50);
-        assert_eq!(plan.target_schema_version, 125);
+        assert_eq!(plan.target_schema_version, 126);
         assert_eq!(
             plan.migrations
                 .iter()
                 .rev()
-                .take(2)
+                .take(3)
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![125, 124]
+            vec![126, 125, 124]
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(snapshot(&conn).unwrap(), shape, "dry-run changed DDL");
@@ -1246,7 +1455,7 @@ mod failure_format_tests {
             plan
         );
         let conn = Connection::open(&path).unwrap();
-        verify_history(&conn, 125).unwrap();
+        verify_history(&conn, 126).unwrap();
         assert_eq!(values(&conn, &identity_columns), identities);
         let history = store::workspace_schema_migration_history(&conn).unwrap();
         assert_eq!(
@@ -1254,10 +1463,11 @@ mod failure_format_tests {
             Some(&(50, store::SCHEMA_BASELINE_NAME.to_owned()))
         );
         assert_eq!(
-            &history[history.len() - 2..],
+            &history[history.len() - 3..],
             &[
                 (124, tail_migration_name(124).unwrap().to_owned()),
                 (125, tail_migration_name(125).unwrap().to_owned()),
+                (126, tail_migration_name(126).unwrap().to_owned()),
             ]
         );
         let upgraded_shape = snapshot(&conn).unwrap();

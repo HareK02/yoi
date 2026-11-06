@@ -86,6 +86,7 @@ pub trait ApiBoundary<D> {
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[cfg_attr(feature = "json-schema", schemars(rename = "ProblemDetails_{D}"))]
 pub struct ProblemDetails<D> {
     #[serde(rename = "type")]
     #[cfg_attr(feature = "json-schema", schemars(length(max = 2048)))]
