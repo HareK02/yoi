@@ -1,12 +1,11 @@
-//! Short synchronous service scopes retain Feature, catalog and Host authority.
+//! Short synchronous Plugin scopes retain Feature, catalog and Host authority.
 //! Nested checks use independent query-only connections while the original native
 //! transactions and original registry lease remain held through Host commit.
 use super::*;
 
-pub(super) fn with_service_authority<A, T>(
+pub(super) fn with_service_authority<T>(
     api: &WorkspaceApi,
-    check: impl FnOnce(&WorkspaceApi) -> crate::Result<A>,
-    effect: impl FnOnce(&rusqlite::Transaction<'_>, A) -> crate::Result<T>,
+    effect: impl FnOnce(&WorkspaceApi, &rusqlite::Transaction<'_>) -> crate::Result<T>,
 ) -> crate::Result<T> {
     let feature = api.feature_storage.open(&api.subjektiv_registration)?;
     feature.try_transaction::<_, Error>(|_| {
@@ -30,8 +29,7 @@ pub(super) fn with_service_authority<A, T>(
             // may refresh/read this coherent private view without recursive locks.
             rebound.permission_registry = Arc::new(RwLock::new(registry.clone()));
             rebound.subject_authority_store = Some(subjects);
-            let admitted = check(&rebound)?;
-            effect(tx, admitted)
+            effect(&rebound, tx)
         })
     })
 }

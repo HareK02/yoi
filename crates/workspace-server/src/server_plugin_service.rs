@@ -120,67 +120,16 @@ fn with_service_effect<A, T>(
         A,
     ) -> crate::Result<T>,
 ) -> crate::Result<T> {
-    crate::server::service_authority::with_service_authority(
+    with_current_service_effect(
         api,
-        |current| {
-            validate_workspace_scope(current, workspace).map_err(|error| error.error)?;
-            let worker =
-                subject_authorization::source_from_context(context).map_err(|error| error.error)?;
-            current
-                .config_store
-                .get_workspace_runtime_binding(workspace, &worker.runtime_id)?
-                .filter(|binding| binding.revoked_at.is_none())
-                .ok_or_else(|| policy::failure(PluginHostErrorCode::Denied))?;
-            if current
-                .store
-                .get_worker_registry(workspace, &worker)?
-                .is_none()
-                && !current
-                    .store
-                    .has_active_worker_create_reservation(workspace, &worker)?
-            {
-                return Err(policy::failure(PluginHostErrorCode::Denied));
-            }
-            let execution = subject_authorization::plugin_execution_identity(current, &worker)
-                .map_err(|error| match error.error {
-                    // A fenced/replaced singleton is a failed current identity
-                    // decision here, not infrastructure unavailability. Other
-                    // domain conflicts (lease/event/CAS) retain their own codes.
-                    Error::RepositoryConflict(_) => policy::failure(PluginHostErrorCode::Denied),
-                    error => error,
-                })?;
-            if &execution != previous.plan.plan.execution() {
-                return Err(policy::failure(PluginHostErrorCode::Denied));
-            }
-            for op in ["plugin.service.consume", operation_name(operation)] {
-                subject_authorization::authorize_scope(
-                    current,
-                    &worker,
-                    &OperationAuthorizationRequest {
-                        operation: op.into(),
-                        resource: PermissionResource::PluginInstallation {
-                            workspace_id: workspace.into(),
-                            installation_id: previous.pin.installation_id().into(),
-                        },
-                    },
-                )
-                .map_err(|error| error.error)?;
-            }
-            // This immutable pin selects the entry, not its permission. The
-            // writable callback must match it against fresh catalog admission.
-            current.authorize_plugin_entry(&worker, previous, &[], Some(name))?;
-            Ok((execution, check(current, &worker)?))
-        },
-        |tx, (execution, checked)| {
-            let admitted = policy::authorize_service(
-                tx,
-                workspace,
-                &execution,
-                &previous.plan.plan_id,
-                previous.pin.installation_id(),
-                name,
-                operation,
-            )?;
+        context,
+        workspace,
+        &previous.plan.plan_id,
+        previous.pin.installation_id(),
+        name,
+        operation,
+        check,
+        |tx, admitted, checked| {
             if admitted.plan != previous.plan
                 || admitted.pin != previous.pin
                 || admitted.binding != previous.binding
@@ -192,6 +141,80 @@ fn with_service_effect<A, T>(
             effect(tx, admitted, checked)
         },
     )
+}
+
+// Receipt checks enter this current authority scope directly. An earlier
+// preflight is useful only to select/compare a pin, never as a second detached
+// permission decision before acquiring the same owners again.
+fn with_current_service_effect<A, T>(
+    api: &WorkspaceApi,
+    context: &ServerRequestContext,
+    workspace: &str,
+    plan_id: &str,
+    installation: &str,
+    name: &str,
+    operation: &PluginHostOperation,
+    check: impl FnOnce(&WorkspaceApi, &RuntimeWorkerRef) -> crate::Result<A>,
+    effect: impl FnOnce(
+        &rusqlite::Transaction<'_>,
+        policy::AdmittedPluginOperation,
+        A,
+    ) -> crate::Result<T>,
+) -> crate::Result<T> {
+    crate::server::service_authority::with_service_authority(api, |current, tx| {
+        validate_workspace_scope(current, workspace).map_err(|error| error.error)?;
+        let worker =
+            subject_authorization::source_from_context(context).map_err(|error| error.error)?;
+        current
+            .config_store
+            .get_workspace_runtime_binding(workspace, &worker.runtime_id)?
+            .filter(|binding| binding.revoked_at.is_none())
+            .ok_or_else(|| policy::failure(PluginHostErrorCode::Denied))?;
+        if current
+            .store
+            .get_worker_registry(workspace, &worker)?
+            .is_none()
+            && !current
+                .store
+                .has_active_worker_create_reservation(workspace, &worker)?
+        {
+            return Err(policy::failure(PluginHostErrorCode::Denied));
+        }
+        let execution = subject_authorization::plugin_execution_identity(current, &worker)
+            .map_err(|error| match error.error {
+                // A fenced/replaced singleton is a failed current identity
+                // decision here, not infrastructure unavailability. Other
+                // domain conflicts (lease/event/CAS) retain their own codes.
+                Error::RepositoryConflict(_) => policy::failure(PluginHostErrorCode::Denied),
+                error => error,
+            })?;
+        for op in ["plugin.service.consume", operation_name(operation)] {
+            subject_authorization::authorize_scope(
+                current,
+                &worker,
+                &OperationAuthorizationRequest {
+                    operation: op.into(),
+                    resource: PermissionResource::PluginInstallation {
+                        workspace_id: workspace.into(),
+                        installation_id: installation.into(),
+                    },
+                },
+            )
+            .map_err(|error| error.error)?;
+        }
+        let admitted = policy::authorize_service(
+            tx,
+            workspace,
+            &execution,
+            plan_id,
+            installation,
+            name,
+            operation,
+        )?;
+        current.authorize_plugin_entry(&worker, &admitted, &[], Some(name))?;
+        let checked = check(current, &worker)?;
+        effect(tx, admitted, checked)
+    })
 }
 
 fn fence_service_consumer(
@@ -229,17 +252,6 @@ pub(super) async fn check_consumer(
     if lease.consumer_id != consumer_id {
         return Err(denied());
     }
-    let admitted = check_service(
-        api.clone(),
-        context.clone(),
-        workspace.clone(),
-        plan.clone(),
-        installation,
-        name.into(),
-        operation.clone(),
-        false,
-    )
-    .await?;
     let executor = api.config_store.db_executor();
     let name = name.to_owned();
     let event = event_id.to_owned();
@@ -247,11 +259,12 @@ pub(super) async fn check_consumer(
         .run(move || {
             #[cfg(test)]
             boundary_observation::observe(&plan, "consumer");
-            with_service_effect(
+            with_current_service_effect(
                 &api,
                 &context,
                 &workspace,
-                &admitted,
+                &plan,
+                &installation,
                 &name,
                 &operation,
                 |_, _| Ok(()),

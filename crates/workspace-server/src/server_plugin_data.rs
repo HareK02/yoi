@@ -296,7 +296,7 @@ pub(super) async fn execute(
         #[cfg(test)]
         service::boundary_observation::observe(&record.plan_id, "data");
         let access = action.access();
-        crate::server::service_authority::with_service_authority(&api, |current| {
+        crate::server::service_authority::with_service_authority(&api, |current, tx| {
             validate_workspace_scope(current, &workspace).map_err(|error| error.error)?;
             let worker = subject_authorization::source_from_context(&context).map_err(|error| error.error)?;
             current.config_store.get_workspace_runtime_binding(&workspace, &worker.runtime_id)?
@@ -328,8 +328,7 @@ pub(super) async fn execute(
                 }).map_err(|error| error.error)?;
             }
             current.authorize_plugin_entry(&worker, &admitted, &tools, service)?;
-            authorize_ticket(current, &context, &workspace, &selector, access)
-        }, |tx, ticket_id| {
+            let ticket_id = authorize_ticket(current, &context, &workspace, &selector, access)?;
             let record = receipt::verify_record(tx, &record)?;
             let admitted = match &record.consumer {
                 PluginConsumer::ToolCall { tool_name, .. } => policy::authorize(tx, &workspace, &record.execution, &record.plan_id, &record.installation_id, &[tool_name.clone()], &PluginHostOperation::Admit)?,
