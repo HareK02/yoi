@@ -6,12 +6,44 @@ import {
   stopOwnedProcesses,
 } from "../../../../tools/web-ux/src/processes.ts";
 import { startupFixture } from "../../src/lib/workspace/workers/startup-failure.test-fixtures.ts";
+import { verifyStartupHttpCaptures } from "../worker-startup-backend-contract.ts";
 
 // production build + exact T812 HTTP fixtures。派生故障・操作結果はWeb試験用でありServer保証ではない。
 // beforeは旧production buildで同fixtureを撮影するためだけに明示選択し、afterの成功と混同しない。
 Deno.test("Worker failure cause, independent outcomes, keyboard details and safe reconciliation", async () => {
   const before = Deno.env.get("T813_PHASE") === "before";
-  const phase = before ? "before-real-contract" : "after";
+  const captureInput = Deno.env.get("T813_HTTP_CAPTURE_LOG");
+  const captureLog = captureInput
+    ? await Deno.readTextFile(captureInput)
+    : null;
+  const captureSha256 = captureLog
+    ? Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(captureLog),
+        ),
+      ),
+    ).map((b) => b.toString(16).padStart(2, "0")).join("")
+    : null;
+  const captures = captureLog
+    ? (await verifyStartupHttpCaptures(captureLog)).captures
+    : null;
+  function fixture(name: Parameters<typeof startupFixture>[0]) {
+    if (captures && (name === "denial" || name === "lost")) {
+      const capture = captures.find((item) =>
+        item.status === (name === "denial" ? 409 : 502)
+      );
+      assert(capture, "Expected both validated real HTTP captures");
+      return JSON.parse(capture.body);
+    }
+    return startupFixture(name);
+  }
+  const phase = before
+    ? "before-real-contract"
+    : captureInput
+    ? "after-connected"
+    : "after";
   const scenarioPath =
     new URL("./optional-repository.json", import.meta.url).pathname;
   const scenario = await loadScenario(scenarioPath);
@@ -115,7 +147,7 @@ Deno.test("Worker failure cause, independent outcomes, keyboard details and safe
                 },
               });
             });
-            let body = JSON.parse(JSON.stringify(startupFixture("denial")));
+            let body = JSON.parse(JSON.stringify(fixture("denial")));
             await page.route("**/api/w/home-empty/workers", async (route) => {
               if (route.request().method() !== "POST") return route.continue();
               submissions++;
@@ -144,7 +176,7 @@ Deno.test("Worker failure cause, independent outcomes, keyboard details and safe
               ]
             ) {
               body = JSON.parse(
-                JSON.stringify(startupFixture(
+                JSON.stringify(fixture(
                   name === "lost"
                     ? "lost"
                     : name === "rejected"
@@ -294,8 +326,12 @@ Deno.test("Worker failure cause, independent outcomes, keyboard details and safe
                 route: "/w/home-empty/workers/new",
                 persona: "synthetic owner",
                 name,
+                captureInput,
+                captureSha256,
                 fixture: ["denial", "lost"].includes(name)
-                  ? "T812 exact real HTTP body"
+                  ? captureInput
+                    ? "forwarded exact T812 corrected-source HTTP capture"
+                    : "T812 exact real HTTP body"
                   : "synthetic derivative/fault",
                 width,
                 theme: colorScheme,

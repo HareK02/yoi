@@ -1,6 +1,6 @@
 // 実認可・Runtime・保存を通したRust connected試験の公開HTTP捕捉だけを受ける。
 // Web送信/受信/表示modelへの接続であり、このprocess自体は認可や保存を代替証明しない。
-import { buildCreateWorkspaceWorkerRequest } from "../src/lib/workspace/sidebar/worker-launch.ts";
+import type { CreateWorkspaceWorkerRequest } from "../src/lib/generated/worker-launch-api.ts";
 import {
   submitWorkerLaunch,
   workerLaunchNeedsReconciliation,
@@ -14,17 +14,18 @@ export async function verifyStartupHttpCaptures(log: string) {
   if (new TextEncoder().encode(log).length > maxLogBytes) {
     throw new Error("Startup capture log exceeds the test input limit");
   }
-  const request = buildCreateWorkspaceWorkerRequest({
+  const request: CreateWorkspaceWorkerRequest = {
     runtime_id: "embedded",
     display_name: "HTTP contract check",
-    profile: "",
-    subjektiv_subject_id: "",
-    initial_text: "",
+    profile: null,
+    ticket_assignment: null,
+    initial_submit: [],
     workdir_attachments: [],
-    working_directory_repository_key: "",
-    working_directory_selector: "HEAD",
-  });
+    feature_connections: {},
+    control_operation_id: null,
+  };
   const cases = new Set<string>();
+  const captures: { status: number; contentType: string; body: string }[] = [];
   let records = 0;
   for (const line of log.split("\n")) {
     if (!line.includes(marker)) continue;
@@ -99,6 +100,7 @@ export async function verifyStartupHttpCaptures(log: string) {
         "Web cause presentation or uncertain-result gating differs from the connected HTTP result",
       );
     }
+    captures.push({ status: Number(status), contentType, body });
     records++;
   }
   if (!cases.has("denial") || !cases.has("response_lost")) {
@@ -106,7 +108,7 @@ export async function verifyStartupHttpCaptures(log: string) {
       "Missing real denial or response-loss Startup HTTP capture",
     );
   }
-  return { records, cases: cases.size };
+  return { records, cases: cases.size, captures };
 }
 
 if (import.meta.main) {
