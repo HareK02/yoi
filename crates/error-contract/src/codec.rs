@@ -162,10 +162,14 @@ fn validate_envelope_common(raw: &ReaderEnvelope) -> Result<(), ContractError> {
     raw.context.validate()
 }
 
+/// Validate byte and lexical depth limits before parsing an enclosing JSON DTO.
+/// This resource guard grants no disclosure or encoding authority.
+pub fn validate_json_input(input: &[u8], budget: Budget) -> Result<(), ContractError> {
+    check_json_bounds(input, budget)
+}
+
 /// Linear lexical depth guard runs before serde allocates any JSON tree. Serde validates grammar.
-/// Boundary envelopes reuse this guard for their entire result, not just the nested cause.
-/// Passing this check is neither schema validation nor a trusted failure projection.
-pub fn check_json_bounds(input: &[u8], budget: Budget) -> Result<(), ContractError> {
+pub(crate) fn check_json_bounds(input: &[u8], budget: Budget) -> Result<(), ContractError> {
     if input.len() > budget.bytes() {
         return Err(ContractError::TooLarge);
     }

@@ -59,7 +59,20 @@ pub fn execution_failure<D: WireDetails, R: Serialize>(
     result: &R,
     output_budget: usize,
 ) -> ToolError {
-    let output = match encode_report(failure, boundary, result, output_budget) {
+    ToolError::ExecutionFailure(failure_output(failure, boundary, result, output_budget))
+}
+
+/// Encode a disclosed cause beside a domain result without assigning a Tool disposition.
+/// The caller retains its authoritative success/error/unknown result; a secondary audit,
+/// cleanup or notification failure must not turn a successful operation into an error.
+/// Encoding failure preserves the explanation but emits no partial JSON or retry grant.
+pub fn failure_output<D: WireDetails, R: Serialize>(
+    failure: &ProjectedFailure<Tool, D>,
+    boundary: ToolFailureBoundary,
+    result: &R,
+    output_budget: usize,
+) -> ToolOutput {
+    match encode_report(failure, boundary, result, output_budget) {
         Ok(content) => ToolOutput {
             summary: failure.explanation().to_owned(),
             content: Some(content),
@@ -71,8 +84,7 @@ pub fn execution_failure<D: WireDetails, R: Serialize>(
             content: None,
             attachments: Vec::new(),
         },
-    };
-    ToolError::ExecutionFailure(output)
+    }
 }
 
 fn encode_report<D: WireDetails, R: Serialize>(
@@ -100,10 +112,7 @@ fn encode_report<D: WireDetails, R: Serialize>(
         limit: output_budget,
     };
     serde_json::to_writer(&mut writer, &report).map_err(|_| ContractError::Encoding)?;
-    error_contract::codec::check_json_bounds(
-        &writer.bytes,
-        Budget::new(output_budget, output_budget),
-    )?;
+    error_contract::validate_json_input(&writer.bytes, Budget::new(output_budget, output_budget))?;
     String::from_utf8(writer.bytes).map_err(|_| ContractError::Encoding)
 }
 
@@ -187,6 +196,37 @@ mod tests {
             cause.facts().cause().required_operation,
             RequiredOperation::SessionRecord
         );
+    }
+
+    #[test]
+    fn secondary_failure_output_preserves_success_and_uses_the_shared_report() {
+        let failure = projected();
+        let domain =
+            serde_json::json!({"operation_state":"completed", "request_id":"same-request"});
+        let output = failure_output(&failure, ToolFailureBoundary::Observation, &domain, 65536);
+        let result = ToolResult::from_output("call-success", output.clone());
+        assert_eq!(result.disposition, ToolResultDisposition::Success);
+        assert!(!result.is_error);
+        let wire: serde_json::Value =
+            serde_json::from_str(result.content.as_ref().unwrap()).unwrap();
+        assert_eq!(wire["result"], domain);
+        assert_eq!(wire["boundary"], "observation");
+        let ToolError::ExecutionFailure(error_output) =
+            execution_failure(&failure, ToolFailureBoundary::Observation, &domain, 65536)
+        else {
+            panic!("failure wrapper lost its disposition")
+        };
+        assert_eq!(error_output.summary, output.summary);
+        assert_eq!(error_output.content, output.content);
+        assert_eq!(error_output.attachments, output.attachments);
+        let bounded = ToolResult::from_output(
+            "call-success",
+            failure_output(&failure, ToolFailureBoundary::Observation, &domain, 1),
+        );
+        assert_eq!(bounded.disposition, ToolResultDisposition::Success);
+        assert!(!bounded.is_error);
+        assert!(bounded.content.is_none());
+        assert!(bounded.summary.starts_with(failure.explanation()));
     }
 
     #[test]

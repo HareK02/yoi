@@ -10,7 +10,10 @@ pub mod schema;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
-pub use codec::{Budget, DecodeFailure, ReceivedFailure, decode_failure, encode_projected_failure};
+pub use codec::{
+    Budget, DecodeFailure, ReceivedFailure, decode_failure, encode_projected_failure,
+    validate_json_input,
+};
 pub use facts::*;
 pub use projection::*;
 
