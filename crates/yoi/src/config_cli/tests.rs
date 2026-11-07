@@ -2,7 +2,8 @@
 //! The real catalog/authentication/SQLite connection is covered in workspace-server.
 use super::*;
 use server_api::{
-    ConfigurationPreviewResponse, RuntimePolicyApplication, client_support::NoAuthorizer,
+    ConfigurationPreviewResponse, RepositoryApiError, RuntimePolicyApplication,
+    client_support::NoAuthorizer,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -231,6 +232,142 @@ fn http(status: u16, body: &str) -> String {
         body.len()
     )
 }
+fn configuration_problem(
+    operation: server_api::configuration_failure::ConfigurationFailureOperation,
+    reason: server_api::configuration_failure::ConfigurationFailureReason,
+) -> serde_json::Value {
+    use server_api::configuration_failure::{
+        ConfigurationFailureDetails, ConfigurationFailureVisibility,
+    };
+    let facts =
+        error_contract::FailureFacts::new(ConfigurationFailureDetails { operation, reason })
+            .unwrap();
+    let projected = error_contract::project_failure::<error_contract::Browser, _>(
+        &facts,
+        &ConfigurationFailureVisibility {
+            can_view_cause: true,
+        },
+    )
+    .unwrap();
+    let mut problem = serde_json::to_value(ConfigurationApiError::projected(projected)).unwrap();
+    problem["detail"] = "raw provider /private/config token=do-not-expose".into();
+    problem["yoi_failure"]["explanation"] =
+        "raw provider /private/config token=do-not-expose".into();
+    problem
+}
+fn problem_http(status: u16, problem: &serde_json::Value) -> String {
+    http(status, &problem.to_string()).replacen(
+        "Content-Type: application/json",
+        "Content-Type: application/problem+json",
+        1,
+    )
+}
+
+#[tokio::test]
+async fn typed_configuration_refusal_explains_cause_without_settling_an_earlier_request() {
+    use server_api::configuration_failure::{
+        ConfigurationFailureOperation as Op, ConfigurationFailureReason as Reason,
+    };
+    for (reason, status, exit) in [
+        (Reason::InvalidImport, 400, 3),
+        (Reason::EditingHeadChanged, 409, 4),
+        (Reason::OwnerRequired, 403, 5),
+    ] {
+        for retry in [false, true] {
+            let (_temp, dir) = checkout();
+            let pending = if retry {
+                let mut checkout =
+                    LockedCheckout::open(&dir, "http://backend.test", "workspace-test").unwrap();
+                let request = checkout.request().unwrap();
+                checkout.state.pending = Some(request.clone());
+                checkout.save().unwrap();
+                Some(request)
+            } else {
+                None
+            };
+            let mut responses = Vec::new();
+            if !retry {
+                responses.push(Some(http(200, &preview())));
+            }
+            responses.push(Some(problem_http(
+                status,
+                &configuration_problem(Op::Adopt, reason),
+            )));
+            if retry {
+                responses.push(Some(http(200, r#"{"status":"not_observed"}"#)));
+            }
+            let server = Script::new(responses).await;
+            let error = invoke(
+                &server.api(),
+                &dir,
+                if retry { Command::Retry } else { Command::Push },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.exit_code, exit);
+            assert!(
+                error.message.contains(reason.explanation()),
+                "{}",
+                error.message
+            );
+            assert!(error.message.contains(Op::Adopt.description()));
+            assert!(!error.message.contains("raw provider"));
+            assert!(!error.message.contains("/private/"));
+            assert!(!error.message.contains("do-not-expose"));
+            assert_eq!(loaded(&dir).pending, pending);
+            if retry {
+                assert!(error.message.contains("earlier outcome still unresolved"));
+                let unconfirmed = invoke(&server.api(), &dir, Command::Reconcile)
+                    .await
+                    .unwrap_err();
+                assert_eq!(unconfirmed.exit_code, 7);
+                assert!(unconfirmed.message.contains("NotObserved"));
+                assert_eq!(loaded(&dir).pending, pending);
+                let requests = server.received.lock().unwrap();
+                for (_, body) in requests.iter() {
+                    assert_eq!(
+                        serde_json::from_str::<ConfigurationAdoptionRequest>(body).unwrap(),
+                        pending.clone().unwrap()
+                    );
+                }
+            }
+            assert!(dir.join("source/main.dcdl").exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsupported_or_corrupt_configuration_problem_keeps_original_commit_unknown() {
+    use server_api::configuration_failure::{
+        ConfigurationFailureOperation as Op, ConfigurationFailureReason as Reason,
+    };
+    for future in [false, true] {
+        let (_temp, dir) = checkout();
+        let mut problem = configuration_problem(Op::Adopt, Reason::EditingHeadChanged);
+        if future {
+            problem["yoi_failure"]["details_version"] = 999.into();
+        } else {
+            problem["yoi_failure"]["details"]["reason"] = "owner_required".into();
+        }
+        let server = Script::new(vec![
+            Some(http(200, &preview())),
+            Some(problem_http(409, &problem)),
+        ])
+        .await;
+        let error = invoke(&server.api(), &dir, Command::Push)
+            .await
+            .unwrap_err();
+        assert_eq!(error.exit_code, 7);
+        assert!(!error.message.contains("raw provider"));
+        let requests = server.received.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<ConfigurationAdoptionRequest>(&requests[1].1).unwrap(),
+            loaded(&dir).pending.unwrap()
+        );
+    }
+}
+
 async fn invoke(
     api: &ConfigurationAdoptionApiClient<NoAuthorizer>,
     dir: &Path,

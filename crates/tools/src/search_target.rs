@@ -4,13 +4,13 @@
 //! routing and read-only response kinds. Only native search uses `checkout_search`; provider
 //! wrappers restrict its request scope and output coordinates. Tools neither create scopes
 //! nor reinterpret rendered paths.
-use agen::tool::ToolError;
+use workdir::failure::WorkdirFailureOperation as Operation;
 use workdir::{
     CheckoutSearchOperation, CheckoutSearchRequest, CheckoutSearchResult, GlobRequest, GlobResult,
     GrepRequest, GrepResult, WorkdirSessionHandle,
 };
 
-use crate::{ToolsError, file_target::checked_error};
+use crate::{WorkdirToolError, file_target::checked_error_for};
 
 pub(crate) struct SearchTarget {
     session: WorkdirSessionHandle,
@@ -32,7 +32,7 @@ impl SearchTarget {
         }
     }
 
-    pub async fn glob(&self, request: GlobRequest) -> Result<GlobResult, ToolError> {
+    pub async fn glob(&self, request: GlobRequest) -> Result<GlobResult, WorkdirToolError> {
         if self.checkout {
             let result = self
                 .session
@@ -40,17 +40,17 @@ impl SearchTarget {
                     request,
                 )))
                 .await
-                .map_err(checked_error)?;
+                .map_err(|error| checked_error_for(Operation::Glob, error))?;
             glob_result(result)
         } else {
             self.session
                 .glob(request)
                 .await
-                .map_err(|error| ToolsError::from(error).into())
+                .map_err(|error| WorkdirToolError::operation(Operation::Glob, error))
         }
     }
 
-    pub async fn grep(&self, request: GrepRequest) -> Result<GrepResult, ToolError> {
+    pub async fn grep(&self, request: GrepRequest) -> Result<GrepResult, WorkdirToolError> {
         if self.checkout {
             let result = self
                 .session
@@ -58,25 +58,25 @@ impl SearchTarget {
                     request,
                 )))
                 .await
-                .map_err(checked_error)?;
+                .map_err(|error| checked_error_for(Operation::Grep, error))?;
             grep_result(result)
         } else {
             self.session
                 .grep(request)
                 .await
-                .map_err(|error| ToolsError::from(error).into())
+                .map_err(|error| WorkdirToolError::operation(Operation::Grep, error))
         }
     }
 }
 
-pub(crate) fn glob_result(result: CheckoutSearchResult) -> Result<GlobResult, ToolError> {
+pub(crate) fn glob_result(result: CheckoutSearchResult) -> Result<GlobResult, WorkdirToolError> {
     match result {
         CheckoutSearchResult::Glob(result) => Ok(result),
         _ => Err(crate::file_target::readonly_result_error("Glob")),
     }
 }
 
-pub(crate) fn grep_result(result: CheckoutSearchResult) -> Result<GrepResult, ToolError> {
+pub(crate) fn grep_result(result: CheckoutSearchResult) -> Result<GrepResult, WorkdirToolError> {
     match result {
         CheckoutSearchResult::Grep(result) => Ok(result),
         _ => Err(crate::file_target::readonly_result_error("Grep")),

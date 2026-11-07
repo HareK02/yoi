@@ -1127,7 +1127,7 @@ mod tests {
                 "package_id":"example", "name":"Example", "version":"1.0.0", "description":null,
                 "package_digest":"sha256:logical", "artifact_digest":"sha256:archive", "artifact_size":19,
                 "schema_version":2, "world":"yoi:plugin/tool-plugin@2.0.0", "required_imports":[], "tools":[],
-                "connections":[], "requested_grants":[], "config_schema":{"identity":"example", "version":"1", "digest":"sha256:schema", "namespace":"example", "dcdl":"schema"},
+                "connections":[], "data_collections":[], "requested_grants":[], "config_schema":{"identity":"example", "version":"1", "digest":"sha256:schema", "namespace":"example", "dcdl":"schema"},
                 "revoked":false, "revocation_reason":null
             }});
             let cases = vec![

@@ -88,7 +88,7 @@ pub(crate) async fn execute_grep(
     target: crate::search_target::SearchTarget,
     path: WorkdirPath,
     params: GrepParams,
-) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+) -> Result<crate::checkout::CheckoutToolOutput, crate::WorkdirToolError> {
     let mode = match params.output_mode.unwrap_or_default() {
         OutputMode::FilesWithMatches => GrepOutputMode::FilesWithMatches,
         OutputMode::Content => GrepOutputMode::Content,
@@ -165,6 +165,6 @@ pub(crate) fn routed_grep_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinit
         let tool: Arc<dyn Tool> = Arc::new(GrepTool {
             router: router.clone(),
         });
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }

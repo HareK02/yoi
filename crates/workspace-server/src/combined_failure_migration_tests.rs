@@ -35,17 +35,27 @@ enum Tail {
 }
 
 impl Tail {
-    fn steps(self) -> [(i64, &'static str, &'static str); 3] {
+    fn steps(self) -> [(i64, &'static str, &'static str); 4] {
         match self {
             Self::Canonical => [
                 (124, WORKER_CREATE_FAILURE_MIGRATION_NAME, STARTUP_DDL),
                 (125, OLD_JOB_NAME, OLD_JOB_DDL),
                 (126, OLD_SERVICE_NAME, OLD_SERVICE_DDL),
+                (
+                    127,
+                    journal_removal_store::MIGRATION_NAME,
+                    journal_removal_store::SCHEMA_SQL,
+                ),
             ],
             Self::Published => [
                 (124, OLD_JOB_NAME, OLD_JOB_DDL),
                 (125, OLD_SERVICE_NAME, OLD_SERVICE_DDL),
                 (126, RETAINED_STARTUP_MIGRATION_NAME, STARTUP_DDL),
+                (
+                    127,
+                    journal_removal_store::MIGRATION_NAME,
+                    journal_removal_store::SCHEMA_SQL,
+                ),
             ],
         }
     }
@@ -75,7 +85,7 @@ fn retained_step(conn: &Connection, version: i64, name: &str, ddl: &str) {
 }
 
 fn fixture(path: &Path, tail: Tail, current: i64, origin: Origin) {
-    assert!((123..=126).contains(&current));
+    assert!((123..=127).contains(&current));
     let conn = match origin {
         Origin::Ordered => {
             tests::prepare_retained_schema(path, 123);
@@ -267,7 +277,7 @@ fn program_signature(sql: &str) -> String {
 // Column order can differ across additive histories, but types, defaults, keys,
 // foreign keys, indexes and trigger programs must match the fresh owner. Bounds
 // are exercised separately against populated rows (not inferred from SQL text).
-fn failure_signature(conn: &Connection) -> Vec<Vec<Value>> {
+pub(super) fn failure_signature(conn: &Connection) -> Vec<Vec<Value>> {
     let mut signature = Vec::new();
     for table in [
         "worker_create_reservations",
@@ -275,6 +285,8 @@ fn failure_signature(conn: &Connection) -> Vec<Vec<Value>> {
         "backend_job_attempts",
         "plugin_service_consumers",
         "worker_removal_operations",
+        "workspace_configuration_publication_observations",
+        "external_workdir_connection_observations",
     ] {
         signature.extend(rows(conn, &format!("SELECT '{table}',name,type,\"notnull\",dflt_value,pk FROM pragma_table_info('{table}') ORDER BY name")));
         signature.extend(rows(
@@ -341,13 +353,13 @@ fn assert_plan(plan: &WorkspaceSchemaMigrationPlan, tail: Tail, current: i64) {
         tail.steps()
             .into_iter()
             .chain(std::iter::once((
-                127,
-                journal_removal_store::MIGRATION_NAME,
-                journal_removal_store::SCHEMA_SQL
-            )))
-            .chain(std::iter::once((
                 128,
                 TICKET_PLAN_RETIREMENT_MIGRATION_NAME,
+                ""
+            )))
+            .chain(std::iter::once((
+                129,
+                DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME,
                 ""
             )))
             .filter(|(version, _, _)| *version > current)
@@ -362,7 +374,7 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
     let expected = fresh.with_conn(|conn| Ok(failure_signature(conn))).unwrap();
     for tail in [Tail::Canonical, Tail::Published] {
         for origin in [Origin::Fresh, Origin::Ordered, Origin::Fresh124Prefix] {
-            for current in 123..=126 {
+            for current in 123..=127 {
                 if matches!(origin, Origin::Fresh124Prefix) && current < 124 {
                     continue;
                 }
@@ -435,6 +447,13 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
                         .unwrap();
                 }
                 let conn = Connection::open(&path).unwrap();
+                assert!(
+                    rows(
+                        &conn,
+                        "SELECT * FROM external_workdir_connection_observations"
+                    )
+                    .is_empty()
+                );
                 let final_receipts = receipts(&conn);
                 assert_eq!(
                     final_receipts.len(),
@@ -499,9 +518,9 @@ fn combined_failure_receipt_126_abort_rolls_back_ddl_and_data_then_retries_once(
             assert!(column_exists(&conn, missing.0, missing.1).unwrap());
             assert_old_receipts(&conn, &saved_receipts);
             let after = receipts(&conn);
-            assert_eq!(after.len(), saved_receipts.len() + 3);
+            assert_eq!(after.len(), saved_receipts.len() + 4);
             assert_eq!(
-                after[after.len() - 3][1],
+                after[saved_receipts.len()][1],
                 Value::Text(tail.steps()[2].1.into())
             );
             apply_migrations(&conn).unwrap();
@@ -690,7 +709,7 @@ fn published_journal(path: &Path, sql: &str) -> Connection {
 
 fn assert_journal_bridge_plan(plan: &WorkspaceSchemaMigrationPlan) {
     assert_eq!(plan.current_schema_version, 124);
-    assert_eq!(plan.target_schema_version, 128);
+    assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
     assert_eq!(
         plan.migrations
             .iter()
@@ -698,7 +717,8 @@ fn assert_journal_bridge_plan(plan: &WorkspaceSchemaMigrationPlan) {
             .collect::<Vec<_>>(),
         [
             (127, journal_removal_store::RETAINED_BRIDGE_NAME),
-            (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME)
+            (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME),
+            (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME)
         ]
     );
 }
@@ -741,12 +761,12 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
         for _ in 0..2 {
             let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
             store.with_conn(|conn| {
-                assert_eq!(current_schema_version(conn)?, 128);
+                assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                 assert_old_receipts(conn, &old_receipts);
-                assert_eq!(receipts(conn).len(), old_receipts.len()+2, "no empty intermediate receipts");
+                assert_eq!(receipts(conn).len(), old_receipts.len()+3, "no empty intermediate receipts");
                 assert_eq!(values(conn, &old_columns), retained, "all old columns and values must remain exact");
                 assert_eq!(failure_signature(conn), expected, "all changed tables, keys and programs match fresh composition");
-                storage_formats::verify_history(conn, 128)?;
+                storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
                 assert_eq!(rows(conn, "SELECT j.state,a.state,j.failure_cause FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id) WHERE j.job_id='after-retirement'"),
                     vec![vec![Value::Text("pending".into()),Value::Text("reserved".into()),Value::Null]], "Job-123 must not sweep a post-retirement Job again");
                 assert!(rows(conn, "PRAGMA foreign_key_check").is_empty());
@@ -798,8 +818,11 @@ fn journal_bridge_failure_rolls_back_all_extensions_and_receipt_and_retries_same
             .unwrap();
         let plan = SqliteWorkspaceStore::migrate_database(&path).unwrap();
         assert_journal_bridge_plan(&plan);
-        storage_formats::verify_history(&conn, 128).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 128);
+        storage_formats::verify_history(&conn, LATEST_SCHEMA_VERSION).unwrap();
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
     }
 }
 
@@ -839,4 +862,81 @@ fn journal_bridge_rejects_mixed_prefix_receipts_and_shape_without_repair() {
             assert_eq!(values(&conn, &columns), before);
         }
     }
+}
+
+#[test]
+fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_changing_adoption_data()
+ {
+    for tail in [Tail::Canonical, Tail::Published] {
+        for origin in [Origin::Fresh, Origin::Ordered, Origin::Fresh124Prefix] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("publication-rollback.sqlite");
+            fixture(&path, tail, 126, origin);
+            let conn = Connection::open(&path).unwrap();
+            configure_sqlite(&conn).unwrap();
+            journal_removal_store::migrate_to_v127(&conn).unwrap();
+            migrate_ticket_plan_retirement_v127_to_v128(&conn).unwrap();
+            conn.execute_batch("CREATE TRIGGER interrupt_publication_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=129 BEGIN SELECT RAISE(ABORT,'injected publication receipt interruption'); END;").unwrap();
+            let before_schema = schema(&conn);
+            let columns = all_columns(&conn);
+            let before = values(&conn, &columns);
+            let retained_receipts = receipts(&conn);
+            assert!(SqliteWorkspaceStore::migration_plan(&path).is_err());
+            assert!(apply_migrations(&conn).is_err());
+            assert_eq!(current_schema_version(&conn).unwrap(), 128);
+            assert_eq!(schema(&conn), before_schema);
+            assert_eq!(values(&conn, &columns), before);
+            conn.execute_batch("DROP TRIGGER interrupt_publication_receipt")
+                .unwrap();
+            apply_migrations(&conn).unwrap();
+            assert_eq!(
+                current_schema_version(&conn).unwrap(),
+                LATEST_SCHEMA_VERSION
+            );
+            let mut retained_columns = columns.clone();
+            retained_columns.remove("__yoi_schema_migrations");
+            assert_eq!(
+                values(&conn, &retained_columns),
+                values_from_before(&before, &retained_columns)
+            );
+            assert_old_receipts(&conn, &retained_receipts);
+            assert_eq!(receipts(&conn).len(), retained_receipts.len() + 1);
+            assert!(
+                rows(
+                    &conn,
+                    "SELECT * FROM workspace_configuration_publication_observations"
+                )
+                .is_empty()
+            );
+            assert!(
+                rows(
+                    &conn,
+                    "SELECT * FROM external_workdir_connection_observations"
+                )
+                .is_empty()
+            );
+            let final_receipts = receipts(&conn);
+            apply_migrations(&conn).unwrap();
+            assert_eq!(receipts(&conn), final_receipts);
+            drop(conn);
+            let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+            reopened
+                .with_conn(|conn| {
+                    assert_eq!(receipts(conn), final_receipts);
+                    assert_eq!(
+                        values(conn, &retained_columns),
+                        values_from_before(&before, &retained_columns)
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+}
+
+fn values_from_before(saved: &SavedRows, columns: &Columns) -> SavedRows {
+    columns
+        .keys()
+        .map(|table| (table.clone(), saved[table].clone()))
+        .collect()
 }

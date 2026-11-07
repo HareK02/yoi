@@ -129,6 +129,38 @@ pub fn request_fingerprint_for_replay(
     ))
 }
 
+impl WorkdirCreateOperationRecord {
+    /// Reader-only evidence from the existing failure column. Older codes remain
+    /// opaque/corrupt to the shared codec; they never manufacture a domain cause.
+    /// Publication must reproject with current authorization, not serialize this record.
+    pub fn failure_evidence(&self) -> Option<protocol::background_failure::StoredFailure> {
+        self.failure
+            .clone()
+            .map(protocol::background_failure::StoredFailure::from_storage)
+    }
+}
+
+fn same_failure_observation(a: Option<&str>, b: Option<&str>) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(a), Some(b)) = (a, b) else {
+        return false;
+    };
+    use error_contract::DecodeFailure;
+    use protocol::background_failure::StoredFailure;
+    use workdir::management_failure::WorkdirManagementFailure;
+    match (
+        StoredFailure::from_storage(a.into()).decode::<WorkdirManagementFailure>(),
+        StoredFailure::from_storage(b.into()).decode::<WorkdirManagementFailure>(),
+    ) {
+        (DecodeFailure::Known(a), DecodeFailure::Known(b)) => {
+            a.facts().cause() == b.facts().cause()
+        }
+        _ => false,
+    }
+}
+
 impl SqliteWorkspaceStore {
     pub fn reserve_workdir_create_operation(
         &self,
@@ -391,7 +423,9 @@ impl SqliteWorkspaceStore {
                 ));
             }
             if operation.state != "pending" {
-                if operation.state == target_state && operation.failure.as_deref() == failure {
+                if operation.state == target_state
+                    && same_failure_observation(operation.failure.as_deref(), failure)
+                {
                     return Ok(operation);
                 }
                 return Err(Error::WorkdirAttachmentConflict(

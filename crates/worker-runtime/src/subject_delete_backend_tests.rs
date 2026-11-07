@@ -345,140 +345,150 @@ fn subject_delete_without_original_owner_retains_child_identity_but_never_issues
 #[cfg(feature = "fs-store")]
 fn subject_delete_terminal_release_history_consumes_prior_canonical_stop() {
     use runtime_api::{SubjectReleaseAction as Action, SubjectReleaseState as State};
-    for (action, terminal) in [(Action::Cancel, State::Cancelled), (Action::Disconnect, State::Disconnected)] {
-    let temp = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(temp.path()).unwrap();
-    let backend = Arc::new(
-        WorkerRuntimeExecutionBackend::new(removal_tests::RemovalFactory {
-            client: MockClient::new(vec![]),
-            root: root.join("catalog"),
-        })
-        .unwrap(),
-    );
-    let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
-        crate::fs_store::FsRuntimeStoreOptions::new(root.join("catalog"))
-            .with_runtime_id("delete-prior-stop"),
-        backend.clone(),
-    )
-    .unwrap();
-    runtime.bind_runtime_identity("delete-prior-stop").unwrap();
-    runtime.store_config_bundle(test_bundle()).unwrap();
-    let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "server-test");
-    let mut create = create_request("prior Stop Subject deletion");
-    create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
-        workspace_id: scope.workspace_id.clone(),
-        language: "English".into(),
-    });
-    create.workspace_api = Some(WorkspaceApiRef {
-        workspace_id: scope.workspace_id.clone(),
-        base_url: "https://workspace.invalid".into(),
-    });
-    let worker = runtime
-        .create_worker_scoped(&scope, create.clone())
+    for (action, terminal) in [
+        (Action::Cancel, State::Cancelled),
+        (Action::Disconnect, State::Disconnected),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let backend = Arc::new(
+            WorkerRuntimeExecutionBackend::new(removal_tests::RemovalFactory {
+                client: MockClient::new(vec![]),
+                root: root.join("catalog"),
+            })
+            .unwrap(),
+        );
+        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions::new(root.join("catalog"))
+                .with_runtime_id("delete-prior-stop"),
+            backend.clone(),
+        )
         .unwrap();
-    let mut release = runtime_api::SubjectReleaseRequest {
-        workspace_id: scope.workspace_id.clone(),
-        worker_id: worker.worker_ref.worker_id,
-        binding_id: "cancelled-binding".into(),
-        operation_id: "release-before-stop".into(),
-        action: runtime_api::SubjectReleaseAction::Reserve,
-    };
-    assert_eq!(
-        runtime
-            .subject_release_scoped(&scope, release.clone())
-            .unwrap()
-            .state,
-        runtime_api::SubjectReleaseState::Reserved
-    );
-    assert!(
+        runtime.bind_runtime_identity("delete-prior-stop").unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let scope = crate::runtime::RuntimeWorkspaceScope::new("ws-test", "server-test");
+        let mut create = create_request("prior Stop Subject deletion");
+        create.memory_settings = Some(manifest::WorkspaceMemorySettingsSnapshot {
+            workspace_id: scope.workspace_id.clone(),
+            language: "English".into(),
+        });
+        create.workspace_api = Some(WorkspaceApiRef {
+            workspace_id: scope.workspace_id.clone(),
+            base_url: "https://workspace.invalid".into(),
+        });
+        let worker = runtime
+            .create_worker_scoped(&scope, create.clone())
+            .unwrap();
+        let mut release = runtime_api::SubjectReleaseRequest {
+            workspace_id: scope.workspace_id.clone(),
+            worker_id: worker.worker_ref.worker_id,
+            binding_id: "cancelled-binding".into(),
+            operation_id: "release-before-stop".into(),
+            action: runtime_api::SubjectReleaseAction::Reserve,
+        };
+        assert_eq!(
+            runtime
+                .subject_release_scoped(&scope, release.clone())
+                .unwrap()
+                .state,
+            runtime_api::SubjectReleaseState::Reserved
+        );
+        assert!(
+            runtime
+                .stop_worker_scoped(&scope, &worker.worker_ref, None)
+                .is_err()
+        );
+        release.action = action;
+        assert_eq!(
+            runtime
+                .subject_release_scoped(&scope, release.clone())
+                .unwrap()
+                .state,
+            terminal
+        );
+        {
+            let reservations = backend.subject_reservations.lock().unwrap();
+            let saved = &reservations[&(worker.worker_ref.clone(), release.operation_id.clone())];
+            assert_eq!(saved.state, terminal);
+            assert!(saved.guard.is_none());
+        }
+        if terminal == State::Disconnected {
+            assert!(
+                runtime
+                    .send_input(
+                        &worker.worker_ref,
+                        WorkerInput::user("must not resume a disconnected body")
+                    )
+                    .is_err()
+            );
+        }
         runtime
             .stop_worker_scoped(&scope, &worker.worker_ref, None)
-            .is_err()
-    );
-    release.action = action;
-    assert_eq!(
-        runtime
-            .subject_release_scoped(&scope, release.clone())
+            .unwrap();
+        let original = runtime
+            .execution_termination(&worker.worker_ref)
             .unwrap()
-            .state,
-        terminal
-    );
-    {
-        let reservations = backend.subject_reservations.lock().unwrap();
-        let saved = &reservations[&(worker.worker_ref.clone(), release.operation_id.clone())];
-        assert_eq!(saved.state, terminal);
-        assert!(saved.guard.is_none());
-    }
-    if terminal == State::Disconnected {
-        assert!(runtime.send_input(&worker.worker_ref, WorkerInput::user("must not resume a disconnected body")).is_err());
-    }
-    runtime
-        .stop_worker_scoped(&scope, &worker.worker_ref, None)
-        .unwrap();
-    let original = runtime
-        .execution_termination(&worker.worker_ref)
-        .unwrap()
-        .unwrap();
-    let deletion = runtime_api::SubjectDeleteWorkerRequest {
-        workspace_id: scope.workspace_id.clone(),
-        worker_id: create.worker_id,
-        create_fingerprint: create.create_fingerprint,
-        operation_id: "delete-prior-stop".into(),
-    };
-    // Retained non-terminal state still blocks canonical consumption even if
-    // its local guard is unavailable; only the terminal no-guard row is harmless.
-    let key = (worker.worker_ref.clone(), release.operation_id);
-    backend
-        .subject_reservations
-        .lock()
-        .unwrap()
-        .get_mut(&key)
-        .unwrap()
-        .state = runtime_api::SubjectReleaseState::Reserved;
-    assert_eq!(
+            .unwrap();
+        let deletion = runtime_api::SubjectDeleteWorkerRequest {
+            workspace_id: scope.workspace_id.clone(),
+            worker_id: create.worker_id,
+            create_fingerprint: create.create_fingerprint,
+            operation_id: "delete-prior-stop".into(),
+        };
+        // Retained non-terminal state still blocks canonical consumption even if
+        // its local guard is unavailable; only the terminal no-guard row is harmless.
+        let key = (worker.worker_ref.clone(), release.operation_id);
         backend
-            .reconcile_termination_receipt(&worker.worker_ref, &original)
-            .unwrap(),
-        None
-    );
-    assert!(
+            .subject_reservations
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .state = runtime_api::SubjectReleaseState::Reserved;
+        assert_eq!(
+            backend
+                .reconcile_termination_receipt(&worker.worker_ref, &original)
+                .unwrap(),
+            None
+        );
+        assert!(
+            backend
+                .subject_delete_worker_stop(
+                    &deletion,
+                    WorkerExecutionStopRequest {
+                        worker_ref: worker.worker_ref.clone(),
+                        operation_id: original.stop_operation_id,
+                    },
+                    Some(&original),
+                )
+                .is_err()
+        );
         backend
-            .subject_delete_worker_stop(
-                &deletion,
-                WorkerExecutionStopRequest {
-                    worker_ref: worker.worker_ref.clone(),
-                    operation_id: original.stop_operation_id,
-                },
-                Some(&original),
-            )
-            .is_err()
-    );
-    backend
-        .subject_reservations
-        .lock()
-        .unwrap()
-        .get_mut(&key)
-        .unwrap()
-        .state = terminal;
-    runtime
-        .subject_delete_worker_scoped(&scope, deletion.clone())
-        .unwrap();
-    backend.subject_delete_worker(&deletion).unwrap();
-    assert_eq!(
-        backend.termination_receipt(&worker.worker_ref).unwrap(),
-        Some(original.clone())
-    );
-    assert_eq!(
-        backend.admissions.lock().unwrap()[&worker.worker_ref].deletion_stop_operation_id,
-        Some(original.stop_operation_id)
-    );
-    assert_eq!(
-        runtime.execution_termination(&worker.worker_ref).unwrap(),
-        Some(original)
-    );
-    assert!(backend.workers.lock().unwrap().is_empty());
-    assert!(backend.pending_spawns.lock().unwrap().is_empty());
-    assert!(backend.pending_restores.lock().unwrap().is_empty());
+            .subject_reservations
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .state = terminal;
+        runtime
+            .subject_delete_worker_scoped(&scope, deletion.clone())
+            .unwrap();
+        backend.subject_delete_worker(&deletion).unwrap();
+        assert_eq!(
+            backend.termination_receipt(&worker.worker_ref).unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            backend.admissions.lock().unwrap()[&worker.worker_ref].deletion_stop_operation_id,
+            Some(original.stop_operation_id)
+        );
+        assert_eq!(
+            runtime.execution_termination(&worker.worker_ref).unwrap(),
+            Some(original)
+        );
+        assert!(backend.workers.lock().unwrap().is_empty());
+        assert!(backend.pending_spawns.lock().unwrap().is_empty());
+        assert!(backend.pending_restores.lock().unwrap().is_empty());
     }
 }
 
@@ -1047,6 +1057,7 @@ fn subject_delete_stopped_catalog_without_original_never_certifies_empty_backend
     runtime
         .test_runtime_store()
         .write_worker_record(&crate::fs_store::PersistedWorkerRecord {
+            workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard::default(),
             restore_guard: crate::runtime::RestoreGuard::default(),
             worker_ref: worker_ref.clone(),
             worker_id: create.worker_id,

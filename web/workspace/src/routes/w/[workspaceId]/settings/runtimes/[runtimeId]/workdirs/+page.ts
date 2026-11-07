@@ -2,7 +2,7 @@ import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import { parseWorkspaceRuntimeList } from "#lib/workspace/api/runtime-management.ts";
 import { parseRuntimeCleanupPlan } from "#lib/workspace/api/runtime-workers.ts";
-import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
+import { loadWorkdirJson, parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
 import type { PageLoad } from "./$types";
 
 export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
@@ -14,13 +14,12 @@ export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0])
       undefined,
       parseWorkspaceRuntimeList,
     ),
-    loadJson(
+    loadWorkdirJson(
       fetch,
       workspaceApiPath(
         params.workspaceId,
         `/runtimes/${encodeURIComponent(runtimeId)}/working-directories`,
       ),
-      undefined,
       parseWorkingDirectoryListResponse,
     ),
     loadJson(

@@ -233,6 +233,7 @@ impl ProfileFailureFixture {
             runtime
                 .test_runtime_store()
                 .write_worker_record(&PersistedWorkerRecord {
+                    workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard::default(),
                     restore_guard: crate::runtime::RestoreGuard::default(),
                     worker_ref: worker_ref.clone(),
                     worker_id: request.worker_id,
@@ -972,6 +973,79 @@ fn profile_restore_prior_effects_survive_rebuilt_candidate_pre_effect_activation
     assert_eq!(metadata.read_by_name(&name).unwrap().unwrap(), changed);
     assert_eq!(persisted_files(&artifacts), effected);
     fixture.resume_same_operation(request, pending.request.operation_id);
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn registered_attachment_replace_fault_keeps_canonical_outcome_without_resend() {
+    use crate::fs_store::AtomicWriteFault;
+    use protocol::control_failure::RuntimeControlCause as C;
+    for fault in [
+        AtomicWriteFault::BeforeRename,
+        AtomicWriteFault::AfterRename,
+    ] {
+        let fixture = ProfileFailureFixture::new(Duration::from_secs(2));
+        let worker_ref = &fixture.worker.worker_ref;
+        let store = fixture.runtime.test_runtime_store();
+        let before = store.read_worker_record(worker_ref).unwrap();
+        assert!(!before.logical_workdir_attachments.is_empty());
+        assert!(!before.workdir_attachments.is_empty());
+        let aggregate = fixture
+            .backend
+            .factory
+            .worker_aggregate_dir(worker_ref)
+            .unwrap();
+        let session_before = persisted_files(&aggregate.join("session"));
+        store.fail_next_worker_write(fault);
+        let error = fixture
+            .runtime
+            .replace_worker_workdir_attachments(worker_ref, Vec::new())
+            .unwrap_err();
+        let renamed = matches!(fault, AtomicWriteFault::AfterRename);
+        assert_eq!(
+            error.control_cause(),
+            if renamed {
+                C::PersistenceOutcomeUnknown
+            } else {
+                C::PersistenceFailed
+            }
+        );
+        // Memory restoration is not canonical rollback. An implicit retry would
+        // consume the one-shot fault and erase this error and divergence.
+        assert_eq!(
+            fixture
+                .runtime
+                .worker_detail(worker_ref)
+                .unwrap()
+                .workdir_attachments,
+            before.workdir_attachments
+        );
+        let canonical = store.read_worker_record(worker_ref).unwrap();
+        if renamed {
+            assert!(canonical.logical_workdir_attachments.is_empty());
+            assert!(canonical.workdir_attachments.is_empty());
+        } else {
+            assert_eq!(
+                canonical.logical_workdir_attachments,
+                before.logical_workdir_attachments
+            );
+            assert_eq!(canonical.workdir_attachments, before.workdir_attachments);
+        }
+        assert_eq!(canonical.status, before.status);
+        let canonical_path = fixture
+            .root
+            .path()
+            .join("s/workers")
+            .join(worker_ref.worker_id.to_string())
+            .join("worker.json");
+        let canonical_bytes = fs::read(&canonical_path).unwrap();
+        fixture.runtime.worker_detail(worker_ref).unwrap();
+        store.read_worker_record(worker_ref).unwrap();
+        assert_eq!(fs::read(canonical_path).unwrap(), canonical_bytes);
+        assert_eq!(persisted_files(&aggregate.join("session")), session_before);
+        assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+    }
 }
 
 #[test]

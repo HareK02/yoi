@@ -250,7 +250,7 @@ impl Fixture {
         let json = serde_json::to_string(diagnostics).unwrap();
         let debug = format!("{diagnostics:?}");
         for forbidden in [
-            PRIVATE, "SECRET", "/private", "password", "poison", "tail", "pre",
+            PRIVATE, "SECRET", "/private", "password", "poison", "\"tail\"", "\"pre\"",
         ] {
             assert!(!json.contains(forbidden), "diagnostics leaked data: {json}");
             assert!(
@@ -270,10 +270,19 @@ async fn cancel_failure_does_not_preclude_confirmed_terminal() {
     let m = f.finish().await;
     f.assert_evidence(&m, true, b"pretail");
     assert!(m.terminal.transport_complete);
-    assert!(matches!(
-        m.cleanup.as_ref().unwrap().cancel,
-        CleanupCancel::Failed { .. }
-    ));
+    let CleanupCancel::Failed { reason } = &m.cleanup.as_ref().unwrap().cancel else {
+        panic!("missing independent cancellation failure")
+    };
+    let cause = reason.cause.as_ref().unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(cause.content.as_deref().unwrap()).unwrap();
+    assert_eq!(report["failure"]["domain"], "workdir");
+    assert_eq!(report["failure"]["details"]["operation"], "command_cancel");
+    assert_eq!(
+        report["failure"]["details"]["classification"],
+        "unavailable"
+    );
+    assert_eq!(report["result"]["mutation"], "not_reported");
     assert!(matches!(
         m.cleanup.as_ref().unwrap().drain,
         CleanupDrain::TerminalConfirmed

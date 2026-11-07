@@ -111,18 +111,34 @@ struct LegacyDetail {
 
 impl HttpClientError for RuntimeApiError {
     fn decode_error(response: &ReceivedResponse) -> Result<Self, ClientFailure> {
-        let status = response.status().as_u16();
+        Self::decode_http_error(
+            response.status().as_u16(),
+            response.content_type().ok(),
+            response.body(),
+        )
+    }
+}
+
+impl RuntimeApiError {
+    /// Decode an already bounded response using its actual transport metadata.
+    /// Blocking callers pass None for missing, invalid or duplicate Content-Type.
+    /// Decoded causes remain observations, never dispatch or retry authority.
+    pub fn decode_http_error(
+        status: u16,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<Self, ClientFailure> {
         if !(400..=599).contains(&status) {
             return Err(ClientFailure::ErrorResponseDecode { status });
         }
         // The generated client has already bounded collection; enforce this
         // smaller contract limit independently before any schema allocation.
-        if response.body().len() > MAX_STARTUP_PROBLEM_BYTES {
+        if body.len() > MAX_STARTUP_PROBLEM_BYTES {
             return local_observation(status, StartupBoundaryReason::TooLarge);
         }
-        let content_type = match response.content_type() {
-            Ok(content_type) => content_type,
-            Err(_) => return local_observation(status, StartupBoundaryReason::InvalidResponse),
+        let content_type = match content_type {
+            Some(content_type) => content_type,
+            None => return local_observation(status, StartupBoundaryReason::InvalidResponse),
         };
         let media_type = content_type.split(';').next().unwrap_or("").trim();
         if media_type.eq_ignore_ascii_case(PROBLEM_CONTENT_TYPE) {
@@ -133,13 +149,23 @@ impl HttpClientError for RuntimeApiError {
                 #[serde(rename = "type")]
                 type_uri: String,
             }
-            if serde_json::from_slice::<ProblemHeader>(response.body())
-                .is_ok_and(|header| header.type_uri == "urn:yoi:problem:runtime-control")
-            {
-                return RuntimeApiError::decode_control_error(response);
+            if let Ok(header) = serde_json::from_slice::<ProblemHeader>(body) {
+                match header.type_uri.as_str() {
+                    "urn:yoi:problem:runtime-control" => {
+                        return RuntimeApiError::decode_control_error(status, content_type, body);
+                    }
+                    "urn:yoi:problem:workdir-management" => {
+                        return RuntimeApiError::decode_management_error(
+                            status,
+                            content_type,
+                            body,
+                        );
+                    }
+                    _ => {}
+                }
             }
             return match decode_startup_problem(
-                response.body(),
+                body,
                 status,
                 content_type,
                 StartupBoundary::Runtime,
@@ -164,7 +190,7 @@ impl HttpClientError for RuntimeApiError {
         }
         // The typed legacy parser has fixed nesting and rejects unknown fields.
         // Its total allocation/opaque attachment size is capped by the byte limit.
-        let legacy = match serde_json::from_slice::<LegacyError>(response.body()) {
+        let legacy = match serde_json::from_slice::<LegacyError>(body) {
             Ok(legacy) => legacy.error,
             Err(_) => return local_observation(status, StartupBoundaryReason::Decode),
         };

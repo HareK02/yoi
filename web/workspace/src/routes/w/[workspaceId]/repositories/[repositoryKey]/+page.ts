@@ -1,62 +1,51 @@
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
-import { loadWorkspaceRepositoryDetail } from "#lib/workspace/api/repositories.ts";
+import {
+  loadWorkspaceRepositoryDetail,
+  loadWorkspaceRepositoryLog,
+} from "#lib/workspace/api/repositories.ts";
 import { parseWorkspaceRuntimeList } from "#lib/workspace/api/runtime-management.ts";
-import { parseRepositoryLogResponse } from "#lib/workspace/api/workspace-model.ts";
 import type { PageLoad } from "./$types";
 import { deferPage } from "#lib/workspace/navigation/deferred.ts";
 
-export const load = deferPage(async ({ fetch, params }: Parameters<PageLoad>[0]) => {
-  const workspaceId = params.workspaceId;
-  const repositoryKey = params.repositoryKey;
-  const [repositoryResult, logResult, runtimesResult] = await Promise.all([
-    loadWorkspaceRepositoryDetail(fetch, workspaceId, repositoryKey),
-    loadJson<unknown>(
-      fetch,
-      workspaceApiPath(
-        workspaceId,
-        `/repositories/${encodeURIComponent(repositoryKey)}/log`,
+export const load = deferPage(
+  async ({ fetch, params }: Parameters<PageLoad>[0]) => {
+    const workspaceId = params.workspaceId;
+    const repositoryKey = params.repositoryKey;
+    const [repositoryResult, logResult, runtimesResult] = await Promise.all([
+      loadWorkspaceRepositoryDetail(fetch, workspaceId, repositoryKey),
+      loadWorkspaceRepositoryLog(fetch, workspaceId, repositoryKey),
+      loadJson<unknown>(
+        fetch,
+        workspaceApiPath(workspaceId, "/runtimes"),
       ),
-    ),
-    loadJson<unknown>(
-      fetch,
-      workspaceApiPath(workspaceId, "/runtimes"),
-    ),
-  ]);
+    ]);
 
-  const repository = repositoryResult.data;
-  const repositoryError = repositoryResult.error;
+    const repository = repositoryResult.data;
+    const repositoryError = repositoryResult.error;
 
-  let log = null;
-  let logError = logResult.error;
-  if (logResult.data !== null) {
-    try {
-      log = parseRepositoryLogResponse(logResult.data);
-    } catch (cause) {
-      logError = cause instanceof Error
-        ? cause.message
-        : "invalid repository log response";
+    const log = logResult.data;
+    const logError = logResult.error;
+
+    let runtimes = null;
+    let runtimesError = runtimesResult.error;
+    if (runtimesResult.data !== null) {
+      try {
+        runtimes = parseWorkspaceRuntimeList(runtimesResult.data);
+      } catch (cause) {
+        runtimesError = cause instanceof Error
+          ? cause.message
+          : "invalid Runtime summary response";
+      }
     }
-  }
 
-  let runtimes = null;
-  let runtimesError = runtimesResult.error;
-  if (runtimesResult.data !== null) {
-    try {
-      runtimes = parseWorkspaceRuntimeList(runtimesResult.data);
-    } catch (cause) {
-      runtimesError = cause instanceof Error
-        ? cause.message
-        : "invalid Runtime summary response";
-    }
-  }
-
-  return {
-    repositoryKey,
-    repository,
-    repositoryError,
-    repositoryLog: log,
-    repositoryLogError: logError,
-    runtimes,
-    runtimesError,
-  };
-});
+    return {
+      repositoryKey,
+      repository,
+      repositoryError,
+      repositoryLog: log,
+      repositoryLogError: logError,
+      runtimes,
+      runtimesError,
+    };
+  },
+);

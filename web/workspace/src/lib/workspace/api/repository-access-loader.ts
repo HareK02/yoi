@@ -1,4 +1,5 @@
 import { error } from "@sveltejs/kit";
+import { repositoryAccessResponseError } from "./repository-access-error.ts";
 import { readBoundedJson } from "./http.ts";
 import {
   REPOSITORY_ACCESS_MAX_RESPONSE_BYTES,
@@ -77,11 +78,23 @@ export async function loadRepositoryAccessJson<T>(
       message: "Repository Access is unavailable for this account.",
     });
   }
-  if (!response.ok) {
+  if (
+    !response.ok &&
+    response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !==
+      "application/problem+json"
+  ) {
+    await response.body?.cancel();
     error(502, {
       message:
         `Repository Access request failed with status ${response.status}.`,
     });
+  }
+  if (!response.ok) {
+    const failure = await repositoryAccessResponseError(
+      response,
+      "load Repository Access",
+    );
+    error(502, { message: failure.message });
   }
 
   let payload: unknown;

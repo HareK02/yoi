@@ -1610,6 +1610,7 @@ mod tests {
                     .unwrap()
                 } else if is_worker_lifecycle {
                     serde_json::to_string(&server_api::RuntimeWorkerLifecycleResult {
+                        cleanup_failures: vec![],
                         control_explanation: None,
                         control: None,
                         replayed: false,

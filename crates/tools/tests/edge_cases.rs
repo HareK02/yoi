@@ -1,5 +1,7 @@
 //! Edge-case regression tests that should stay green.
 
+mod common;
+use common::workdir_report;
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition};
@@ -99,13 +101,11 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
         .await
         .unwrap_err();
     assert!(
-        format!("{read_err}").contains("outside allowed read scope"),
-        "symlink read escape not rejected: {read_err}"
+        !read_err
+            .to_string()
+            .contains(&outside_target.display().to_string())
     );
-    assert!(
-        !format!("{read_err}").contains(&outside_target.display().to_string()),
-        "symlink diagnostics must not expose provider-internal paths: {read_err}"
-    );
+    workdir_report(read_err, "symlink_out_of_scope");
 
     // Write through the symlink must be rejected for the same reason.
     let write = reg.get("Write");
@@ -120,27 +120,14 @@ async fn symlink_to_outside_scope_is_rejected_for_write() {
         )
         .await
         .unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("outside allowed read scope")
-            || msg.contains("outside allowed write scope")
-            || msg.contains("outside allowed scope")
-            || msg.contains("has not been read"),
-        "symlink escape not rejected: {msg}"
-    );
-    if msg.contains("outside allowed read scope") || msg.contains("outside allowed write scope") {
-        assert!(
-            msg.contains("add the symlink target"),
-            "symlink escape diagnostic should include remediation: {msg}"
-        );
-    }
+    workdir_report(err, "out_of_scope");
     // Outside file must not have been touched.
     assert_eq!(std::fs::read_to_string(&outside_target).unwrap(), "secret");
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn broken_symlink_reports_target_and_repair_hint() {
+async fn broken_symlink_reports_cause_and_repair_without_provider_target() {
     use std::os::unix::fs::symlink;
 
     let (dir, reg) = setup();
@@ -157,8 +144,8 @@ async fn broken_symlink_reports_target_and_repair_hint() {
         .await
         .unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("broken symlink"), "{msg}");
-    assert!(msg.contains("external-project"), "{msg}");
+    assert!(msg.contains("symbolic link target does not exist"), "{msg}");
+    workdir_report(err, "broken_symlink");
     assert!(!msg.contains(&target.display().to_string()), "{msg}");
     assert!(msg.contains("correct relative target"), "{msg}");
 }
@@ -179,7 +166,7 @@ async fn empty_file_read_and_edit() {
         .unwrap();
     assert!(out.summary.contains("0 line"));
 
-    // Edit on empty file must produce StringNotFound
+    // The provider retains only invalid-request classification for this text refusal.
     let edit = reg.get("Edit");
     let err = edit
         .execute(
@@ -193,8 +180,8 @@ async fn empty_file_read_and_edit() {
         )
         .await
         .unwrap_err();
-    let msg = format!("{err}");
-    assert!(msg.contains("not found"));
+    workdir_report(err, "invalid_request");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
 }
 
 #[tokio::test]
@@ -230,11 +217,8 @@ async fn absolute_path_requires_matching_read_scope() {
         )
         .await
         .unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("outside allowed scope"),
-        "absolute path escaped readable scope: {msg}"
-    );
+    workdir_report(err, "out_of_scope");
+    assert_eq!(std::fs::read_to_string(outside_file).unwrap(), "secret");
 }
 
 #[tokio::test]

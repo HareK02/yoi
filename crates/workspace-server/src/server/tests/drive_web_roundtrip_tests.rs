@@ -278,7 +278,7 @@ impl RealDriveFixture {
                 StatusCode::FORBIDDEN,
             )
             .await;
-        assert_eq!(denied["code"], "denied");
+        assert_eq!(denied["yoi_failure"]["details"]["code"], "denied");
         let saved = self
             .worker(
                 &identity,
@@ -343,7 +343,7 @@ impl RealDriveFixture {
                 StatusCode::FORBIDDEN,
             )
             .await;
-        assert_eq!(revoked["code"], "denied");
+        assert_eq!(revoked["yoi_failure"]["details"]["code"], "denied");
         let web = self
             .user(reqwest::Method::GET, &read_path, None, StatusCode::OK)
             .await;

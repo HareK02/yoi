@@ -59,8 +59,9 @@ mod ticket_plan_retirement {
                 let host_before = workspace_schema_migration_history(&conn).unwrap();
                 drop(conn);
                 let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
-                assert_eq!(plan.target_schema_version, 128);
-                assert_eq!(plan.migrations.last().unwrap().version, 128);
+                assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
+                assert_eq!(plan.migrations.iter().find(|step| step.version == 128).unwrap().name, TICKET_PLAN_RETIREMENT_MIGRATION_NAME);
+                assert_eq!(plan.migrations.last().unwrap().version, LATEST_SCHEMA_VERSION);
                 let conn = Connection::open(&path).unwrap();
                 assert_eq!(saved(&conn), before, "dry-run preserves authority");
                 assert_eq!(
@@ -81,7 +82,7 @@ mod ticket_plan_retirement {
                     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
                     store
                         .with_conn(|conn| {
-                            assert_eq!(current_schema_version(conn)?, 128);
+                            assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                             assert!(!table_exists(conn, "typed_ticket_orchestration_plans")?);
                             assert_eq!(
                                 saved(conn),
@@ -177,7 +178,7 @@ mod ticket_plan_retirement {
                 .with_conn(|conn| {
                     assert!(!table_exists(conn, "typed_ticket_orchestration_plans")?);
                     ticket::verify_sqlite_ticket_schema(conn).unwrap();
-                    storage_formats::verify_history(conn, 128)?;
+                    storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
                     Ok(())
                 })
                 .unwrap();

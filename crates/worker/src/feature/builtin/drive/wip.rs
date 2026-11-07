@@ -138,12 +138,26 @@ impl WipSubtreeProvider for DriveProvider {
         };
         let entry = match result {
             Ok(entry) => entry,
-            Err(DriveError::Denied | DriveError::NotFound) => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.classification_source(),
+                    DriveError::Denied | DriveError::NotFound
+                ) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(protocol(error)),
         };
         let capabilities = match self.feature.backend.capabilities().await {
             Ok(capabilities) => capabilities,
-            Err(DriveError::Denied | DriveError::NotFound) => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.classification_source(),
+                    DriveError::Denied | DriveError::NotFound
+                ) =>
+            {
+                return Ok(None);
+            }
             Err(error) => return Err(protocol(error)),
         };
         let root = path == ROOT;
@@ -573,7 +587,13 @@ impl WipOperationHandler for DriveHandler {
                 Some(&self.entry),
             )
             .await
-            .map_err(map_error)?;
+            .map_err(|error| {
+                call_error(
+                    spec.failure_operation,
+                    error,
+                    &self.feature.request_id(&context.execution),
+                )
+            })?;
         if common_text {
             let content = complete_text(&output.value)?;
             let value = crate::file_operation::text_result(operation, arguments, content)?;
@@ -658,8 +678,8 @@ fn failure(code: ProtocolErrorCode, message: &str) -> WipOperationError {
         message: message.into(),
     })
 }
-fn map_error(error: DriveError) -> WipOperationError {
-    let code = match &error {
+fn protocol_code(error: &DriveError) -> Option<ProtocolErrorCode> {
+    Some(match error {
         DriveError::Denied | DriveError::Authorization { denied: true, .. } => {
             ProtocolErrorCode::PermissionDenied
         }
@@ -669,14 +689,46 @@ fn map_error(error: DriveError) -> WipOperationError {
         DriveError::Invalid(_) => ProtocolErrorCode::InvalidArguments,
         DriveError::Limit => ProtocolErrorCode::ResourceLimitExceeded,
         DriveError::Unavailable => ProtocolErrorCode::Internal,
-        DriveError::OutcomeUnknown(_) => {
-            return WipOperationError::OutcomeUnknown(error.to_string());
-        }
-    };
-    WipOperationError::Protocol(ProtocolError {
-        code,
-        message: error.to_string(),
+        DriveError::OutcomeUnknown(_) => return None,
+        DriveError::Remote { result, .. } => return protocol_code(result),
     })
+}
+fn map_error(error: DriveError) -> WipOperationError {
+    match protocol_code(&error) {
+        Some(code) => WipOperationError::Protocol(ProtocolError {
+            code,
+            message: error.to_string(),
+        }),
+        None => WipOperationError::OutcomeUnknown(error.to_string()),
+    }
+}
+
+// Only an executed current call uses this disclosure path. Publication denial
+// remains nonexistence, and protocol classification is independent of the cause.
+fn call_error(
+    operation: super::failure::DriveClientFailureOperation,
+    error: DriveError,
+    expected_request_id: &str,
+) -> WipOperationError {
+    let code = protocol_code(&error);
+    let output = match super::tool_failure::tool_error(operation, error, expected_request_id) {
+        agen::tool::ToolError::ExecutionFailure(output) => output,
+        error => agen::tool::ToolOutput {
+            summary: error.to_string(),
+            content: None,
+            attachments: Vec::new(),
+        },
+    };
+    match code {
+        Some(code) => WipOperationError::protocol_with_failure(
+            ProtocolError {
+                code,
+                message: output.summary.clone(),
+            },
+            output,
+        ),
+        None => WipOperationError::outcome_unknown_with_failure(output.summary.clone(), output),
+    }
 }
 fn protocol(error: DriveError) -> ProtocolError {
     match map_error(error) {

@@ -10,6 +10,7 @@ http-client = ["dep:reqwest"]
 
 [dependencies]
 async-trait.workspace = true
+error-contract.workspace = true
 fs-operation.workspace = true
 libc.workspace = true
 manifest.workspace = true

@@ -132,7 +132,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     verify_history(conn, current).unwrap();
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
-        assert_eq!(plan.migrations.len(), 7);
+        assert_eq!(plan.migrations.len(), 8);
         assert_eq!(plan.migrations[0].version, 122);
         assert_eq!(
             plan.migrations[0].name,
@@ -143,7 +143,19 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
             plan.migrations[1].name,
             super::super::backend_job_upgrade::MIGRATION_NAME
         );
-        assert_eq!(plan.target_schema_version, 128);
+        assert_eq!(
+            plan.target_schema_version,
+            super::super::LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            plan.migrations[6].name,
+            super::super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME
+        );
+        assert_eq!(plan.migrations[7].version, 129);
+        assert_eq!(
+            plan.migrations[7].name,
+            super::super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME
+        );
     }
     assert_eq!(rows, saved_rows(conn));
     assert_eq!(shape, snapshot(conn).unwrap());
@@ -284,7 +296,21 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
         let conn = Connection::open(&path).unwrap();
         // Actual production open/ordered runner, including the new migration.
         super::super::prepare_connection(&conn).unwrap();
-        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 128);
+        assert_eq!(
+            super::super::current_schema_version(&conn).unwrap(),
+            super::super::LATEST_SCHEMA_VERSION
+        );
+        let allocation_precluded: Option<String> = conn
+            .query_row(
+                "SELECT allocation_precluded_at FROM backend_job_attempts WHERE attempt_id='saved-attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            allocation_precluded.is_none(),
+            "migration must not invent allocation proof"
+        );
         let actual = immutable_rows(&conn);
         for (table, rows) in &expected {
             assert_eq!(
@@ -303,7 +329,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             )
         );
         let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
-        for version in [128, 127, 126, 125, 124] {
+        for version in [129, 128, 127, 126, 125, 124] {
             assert_eq!(
                 history.pop(),
                 Some((version, tail_migration_name(version).unwrap().into()))
@@ -321,7 +347,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             Some((122, crate::config_adoption::MIGRATION_NAME.into()))
         );
         assert_eq!(history, original_receipts);
-        verify_history(&conn, 128).unwrap();
+        verify_history(&conn, super::super::LATEST_SCHEMA_VERSION).unwrap();
         let saved = saved_rows(&conn);
         if let Some(previous) = &committed_history {
             assert_eq!(previous, &saved);

@@ -50,6 +50,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "backend_job_deliveries",
     "backend_job_attempts",
     "backend_jobs",
+    "external_workdir_connection_observations",
     "external_workdir_grants",
     "flow_source_contents",
     "flow_sources",
@@ -150,6 +151,7 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_tombstones",
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",
+    "workspace_configuration_publication_observations",
     "workspace_configuration_receipts",
     "workspace_configuration_policies",
     "workspace_configuration_authorities",
@@ -569,6 +571,7 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ("typed_ticket_case_history", "typed_ticket_case_history_no_delete"),
                 ("typed_ticket_legacy_workflow_snapshot", "typed_ticket_legacy_workflow_no_delete"),
                 ("workspace_configuration_authorities", "workspace_configuration_authorities_no_delete"),
+                ("workspace_configuration_publication_observations", "workspace_configuration_publication_no_delete"),
                 ("workspace_configuration_receipts", "workspace_configuration_receipts_no_delete"),
             ] {
                 let definition: String = tx.query_row(
@@ -1190,6 +1193,7 @@ mod tests {
                         conn.execute("INSERT INTO workspace_configuration_authorities VALUES(?1,'transfer','physical','export')", [workspace])?;
                         conn.execute("INSERT INTO workspace_configuration_policies VALUES(?1,'retained-subject',?2)", params![workspace, serde_json::to_string(&policy).unwrap()])?;
                         conn.execute("INSERT INTO workspace_configuration_receipts VALUES(?1,'adopt','fingerprint','{}')", [workspace])?;
+                        conn.execute("INSERT INTO workspace_configuration_publication_observations(workspace_id,operation_id,stage,runtime_id,outcome) VALUES(?1,'adopt','dispatch','','observed')", [workspace])?;
                         Ok(())
                     })
                     .unwrap();
@@ -1202,6 +1206,7 @@ mod tests {
                     }
                     for (table, column) in [
                         ("workspace_configuration_authorities", "transfer_identity"),
+                        ("workspace_configuration_publication_observations", "stage"),
                         ("workspace_configuration_receipts", "request_fingerprint"),
                     ] {
                         assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
@@ -1232,6 +1237,7 @@ mod tests {
                 .unwrap()
                 .operation;
             let tables = [
+                "workspace_configuration_publication_observations",
                 "workspace_configuration_authorities",
                 "workspace_configuration_policies",
                 "workspace_configuration_receipts",

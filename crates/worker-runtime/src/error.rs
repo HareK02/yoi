@@ -36,6 +36,14 @@ pub enum RuntimeError {
     )]
     StopAdmissionBusy { worker_id: WorkerId },
 
+    #[error(
+        "worker {worker_id} attachment operation request ID is bound to different input or pending authority"
+    )]
+    WorkdirAttachmentsRequestConflict { worker_id: WorkerId },
+
+    #[error("worker {worker_id} attachment generation is stale; request was not accepted")]
+    WorkdirAttachmentsGenerationStale { worker_id: WorkerId },
+
     #[error("worker {worker_id} was not found")]
     WorkerNotFound { worker_id: WorkerId },
 
@@ -218,7 +226,9 @@ impl RuntimeError {
             E::WorkerExecutionUnavailable { .. } | E::ExecutionBackendUnavailable { .. } => {
                 C::ExecutionUnavailable
             }
-            E::WorkerExecutionRejected { .. } => C::ExecutionRejected,
+            E::WorkerExecutionRejected { .. }
+            | E::WorkdirAttachmentsRequestConflict { .. }
+            | E::WorkdirAttachmentsGenerationStale { .. } => C::ExecutionRejected,
             E::WorkerDeletePersistenceFailed { .. } | E::StoreIo { .. } => C::PersistenceFailed,
             E::StoreCommitOutcomeUnknown { .. } => C::PersistenceOutcomeUnknown,
             E::WorkspaceOwnerMismatch { .. } => C::WorkspaceBindingMismatch,

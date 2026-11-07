@@ -4,6 +4,9 @@
 import type { ConfigCommitRequest, WorkspaceConfigTreeResponse } from "./legacy-server-api.ts";
 import type { ScopedPermission, SubjectPermissions } from "./memory-api.ts";
 import type { PermissionAssignment, PermissionCatalog, PermissionResolution } from "./feature-permissions.generated.ts";
+import type { FailureEnvelope } from "./error-contract.ts";
+import type { ConfigurationFailureDetails } from "./domain-failures.ts";
+import type { RuntimeControlCause } from "./protocol.ts";
 
 export type ConfigurationAdoptionRequest = { operation_id: string, expected_head: string | null, expected_catalog_digest: string, expected_legacy_export: string | null, source: ConfigCommitRequest, };
 
@@ -34,3 +37,15 @@ state: WorkspaceConfigTreeResponse, history_head: string | null, source_stored: 
 export type ConfigurationPreviewResponse = { expected_head: string | null, state: WorkspaceConfigTreeResponse, changed_paths: Array<string>, changed_subjects: Array<string>, };
 
 export type ConfigurationReconciliation = { "status": "adopted", receipt: ConfigurationAdoptionReceipt, } | { "status": "pending_transfer", transfer_identity: string, export_digest: string, } | { "status": "not_observed" };
+
+export type ConfigurationPublicationStage = "dispatch" | "projection" | "runtime";
+
+export type ConfigurationPublicationOutcome = "observed" | "unconfirmed";
+
+export type ConfigurationPublicationFailure = { "kind": "configuration", failure: FailureEnvelope<ConfigurationFailureDetails>, } | { "kind": "runtime", failure: FailureEnvelope<RuntimeControlCause>, } | { "kind": "unavailable" };
+
+export type ConfigurationPublicationObservation = { stage: ConfigurationPublicationStage, runtime_id: string | null, projection_digest: string | null, outcome: ConfigurationPublicationOutcome, failure: ConfigurationPublicationFailure | null, };
+
+export type ConfigurationPublicationResponse = { workspace_id: string, operation_id: string, request_fingerprint: string, history_head: string, source_digest: string, observations: Array<ConfigurationPublicationObservation>, };
+
+export type ConfigurationPublicationLookup = { publication: ConfigurationPublicationResponse | null, };

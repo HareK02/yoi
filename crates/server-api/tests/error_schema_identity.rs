@@ -4,11 +4,35 @@
 
 use api_macros::openapi::{OpenApiBuilder, OpenApiInfo, OpenApiSchema};
 use error_contract::{codec::FailureEnvelope, problem::ProblemDetails};
+use schemars::JsonSchema;
+use serde_json::Value;
+use server_api::{
+    configuration_failure::ConfigurationFailureDetails,
+    repository_access_failure::RepositoryAccessDetails,
+};
+use workdir::failure::WorkdirFailureDetails;
+
+#[derive(JsonSchema)]
+struct RepositoryDocument {
+    failure: FailureEnvelope<RepositoryAccessDetails>,
+    problem: ProblemDetails<RepositoryAccessDetails>,
+}
+impl OpenApiSchema for RepositoryDocument {}
+#[derive(JsonSchema)]
+struct ConfigurationDocument {
+    failure: FailureEnvelope<ConfigurationFailureDetails>,
+    problem: ProblemDetails<ConfigurationFailureDetails>,
+}
+impl OpenApiSchema for ConfigurationDocument {}
+#[derive(JsonSchema)]
+struct WorkdirDocument {
+    failure: FailureEnvelope<WorkdirFailureDetails>,
+    problem: ProblemDetails<WorkdirFailureDetails>,
+}
+impl OpenApiSchema for WorkdirDocument {}
 use protocol::control_failure::RuntimeControlCause;
 use protocol::session_failure::SessionRegistrationCause;
 use protocol::startup_failure::RuntimeStartupCause;
-use schemars::JsonSchema;
-use serde_json::Value;
 
 #[derive(JsonSchema)]
 struct StartupDocument {
@@ -48,6 +72,13 @@ fn component_name(reference: &Value) -> &str {
 #[test]
 fn mixed_domains_keep_distinct_details_references_and_same_domain_registration_is_idempotent() {
     let mut builder = builder();
+    let repository = builder.schema_ref::<RepositoryDocument>().unwrap();
+    assert_eq!(
+        repository,
+        builder.schema_ref::<RepositoryDocument>().unwrap()
+    );
+    let configuration = builder.schema_ref::<ConfigurationDocument>().unwrap();
+    let workdir = builder.schema_ref::<WorkdirDocument>().unwrap();
     let startup = builder.schema_ref::<StartupDocument>().unwrap();
     assert_eq!(startup, builder.schema_ref::<StartupDocument>().unwrap());
     let control = builder.schema_ref::<ControlDocument>().unwrap();
@@ -58,6 +89,9 @@ fn mixed_domains_keep_distinct_details_references_and_same_domain_registration_i
     let mut envelope_refs = Vec::new();
     let mut problem_refs = Vec::new();
     for (reference, details_name) in [
+        (repository, "RepositoryAccessDetails"),
+        (configuration, "ConfigurationFailureDetails"),
+        (workdir, "WorkdirFailureDetails"),
         (startup, "RuntimeStartupCause"),
         (control, "RuntimeControlCause"),
         (session, "SessionRegistrationCause"),
@@ -86,7 +120,7 @@ fn mixed_domains_keep_distinct_details_references_and_same_domain_registration_i
 }
 
 #[derive(JsonSchema)]
-#[schemars(rename = "SessionRegistrationCause")]
+#[schemars(rename = "WorkdirFailureDetails")]
 struct ConflictingDetails {
     unrelated: bool,
 }
@@ -95,11 +129,11 @@ impl OpenApiSchema for ConflictingDetails {}
 #[test]
 fn a_real_same_name_different_schema_collision_is_still_rejected() {
     let mut builder = builder();
-    builder.schema_ref::<SessionDocument>().unwrap();
+    builder.schema_ref::<WorkdirDocument>().unwrap();
     let error = builder.schema_ref::<ConflictingDetails>().unwrap_err();
     assert!(
         error
             .to_string()
-            .contains("component name collision for `SessionRegistrationCause`")
+            .contains("component name collision for `WorkdirFailureDetails`")
     );
 }

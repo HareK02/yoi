@@ -217,6 +217,7 @@ impl AuditHttpFixture {
 
     fn start_operation(&self, operation: WorkdirSessionOperation) -> PendingHttpWrite {
         let path = format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-session/operations");
+        let expected_operation = workdir::failure::WorkdirFailureOperation::from(&operation);
         let body = serde_json::to_vec(&WorkspaceWorkdirSessionOperationRequest {
             target_workdir: "attachment".into(),
             operation,
@@ -245,8 +246,27 @@ impl AuditHttpFixture {
                 .await
                 .unwrap();
             let status = response.status();
-            assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+            let content_type = response.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .to_owned();
             let bytes = response.bytes().await.unwrap();
+            if status.is_success() {
+                assert_eq!(content_type, "application/json");
+            } else {
+                assert_eq!(content_type, error_contract::problem::PROBLEM_CONTENT_TYPE);
+                let decoded = server_api::WorkdirHttpApiError::decode_received(
+                    status.as_u16(),
+                    &content_type,
+                    &bytes,
+                )
+                .unwrap();
+                assert_eq!(decoded.details().unwrap().operation, expected_operation);
+                assert_eq!(
+                    decoded.legacy().code.unwrap().http_status(),
+                    status.as_u16()
+                );
+            }
             (status, serde_json::from_slice(&bytes).unwrap())
         });
         PendingHttpWrite { task, proof }
@@ -405,8 +425,21 @@ fn assert_operational_failure(
     message: &str,
 ) {
     assert_failure_reason(events, reason, stage);
-    assert_eq!(body["code"], code, "{body}");
-    assert_eq!(body["message"], message, "{body}");
+    assert_eq!(
+        body["yoi_failure"]["details"]["classification"], code,
+        "{body}"
+    );
+    assert_eq!(
+        body["yoi_failure"]["details"]["failure_reason"], reason,
+        "{body}"
+    );
+    assert_eq!(body["yoi_failure"]["reason"], reason, "{body}");
+    assert!(body["detail"].as_str().is_some_and(|text| !text.is_empty()));
+    let logged = events
+        .iter()
+        .find(|event| event["event"] == "api_error")
+        .unwrap();
+    assert_eq!(logged["message"], message);
     for field in ["failure_reason", "failure_stage"] {
         assert!(
             body.get(field).is_none(),
@@ -453,8 +486,15 @@ async fn denied_write_after_audit_failure_preserves_provider_error_and_separate_
     original.message = PROVIDER_SECRET.into();
     reply.send(Err(original)).unwrap();
     let (body, events) = h.finish(pending, StatusCode::FORBIDDEN).await;
-    assert_eq!(body["code"], "denied");
-    assert_eq!(body["message"], expected_message);
+    assert_eq!(body["yoi_failure"]["details"]["classification"], "denied");
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event["event"] == "api_error")
+            .unwrap()["message"],
+        expected_message
+    );
+    assert_eq!(body["yoi_failure"]["reason"], "denied");
     let receipt_id = assert_audit_failure(
         &body,
         &events,
@@ -508,7 +548,10 @@ async fn before_write_audit_failure_is_not_dispatched_and_has_no_provider_effect
     let (body, events) = h
         .finish(h.start_write(), StatusCode::SERVICE_UNAVAILABLE)
         .await;
-    assert_eq!(body["code"], "not_dispatched");
+    assert_eq!(
+        body["yoi_failure"]["details"]["classification"],
+        "not_dispatched"
+    );
     assert_audit_failure(
         &body,
         &events,
@@ -535,7 +578,10 @@ async fn rejected_write_send_with_audit_failure_is_not_dispatched_not_unknown() 
     let (body, events) = h
         .finish(h.start_write(), StatusCode::SERVICE_UNAVAILABLE)
         .await;
-    assert_eq!(body["code"], "not_dispatched");
+    assert_eq!(
+        body["yoi_failure"]["details"]["classification"],
+        "not_dispatched"
+    );
     let receipt_id = assert_audit_failure(
         &body,
         &events,
@@ -704,7 +750,10 @@ async fn provider_reported_unknown_preserves_received_response_and_unknown_effec
         )))
         .unwrap();
     let (body, events) = h.finish(pending, StatusCode::INTERNAL_SERVER_ERROR).await;
-    assert_eq!(body["code"], "outcome_unknown");
+    assert_eq!(
+        body["yoi_failure"]["details"]["classification"],
+        "outcome_unknown"
+    );
     let receipt_id = assert_audit_failure(
         &body,
         &events,
@@ -796,10 +845,22 @@ async fn assert_checkout_unknown_audit(fault: CheckoutReplyFault, fail_completio
     };
     reply.send(result).unwrap();
     let (body, events) = h.finish(pending, StatusCode::INTERNAL_SERVER_ERROR).await;
-    assert_eq!(body["code"], "outcome_unknown", "{fault:?}: {body}");
     assert_eq!(
-        body["message"],
+        body["yoi_failure"]["details"]["classification"], "outcome_unknown",
+        "{fault:?}: {body}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event["event"] == "api_error")
+            .unwrap()["message"],
         "Workdir operation may have effects; inspect before retrying"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("do not automatically resend")
     );
     if !matches!(
         fault,

@@ -7,7 +7,7 @@ import {
 } from "#lib/workspace/alerts/store.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import { parseWorkerListResponse } from "#lib/workspace/api/workers.ts";
-import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
+import { loadWorkdirJson, parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
 import {
   workspaceMultiplexer,
   type WorkspaceMultiplexerFailure,
@@ -240,11 +240,11 @@ export function workspaceWorkersStore(
         void refreshCatalog();
       };
       const loadWorkdirs = async () => {
-        const result = await loadJson(
+        const result = await loadWorkdirJson(
           fetch,
           workspaceApiPath(workspaceId, "/working-directories"),
-          { signal: workdirRequest.signal },
           parseWorkingDirectoryListResponse,
+          { signal: workdirRequest.signal },
         );
         if (disposed) return;
         if (!result.data) {

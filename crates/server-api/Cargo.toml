@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = []
-typescript = ["dep:ts-rs", "protocol/typescript"]
+typescript = ["dep:ts-rs", "protocol/typescript", "error-contract/typescript"]
 
 [dependencies]
 error-contract = { workspace = true, features = ["json-schema"] }
@@ -27,6 +27,7 @@ ts-rs = { version = "12.0.1", optional = true }
 url.workspace = true
 webauthn-rs-proto = "0.5.5"
 workdir.workspace = true
+workspace-drive.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

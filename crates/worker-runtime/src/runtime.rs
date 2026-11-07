@@ -75,7 +75,9 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+mod workdir_attachments;
 mod workdir_session;
+pub(crate) use workdir_attachments::WorkdirAttachmentsGuard;
 
 #[derive(Debug)]
 enum WorkdirOperation {
@@ -127,8 +129,8 @@ fn workdir_operation_busy(id: &str, action: &str, blocking: &WorkdirOperation) -
         active_use_count,
         "Workdir operation blocked by busy resource");
     RuntimeError::WorkingDirectory(
-        crate::working_directory::WorkingDirectoryDiagnostic::rejected(
-            "working_directory_cleanup_resource_busy",
+        crate::working_directory::WorkingDirectoryDiagnostic::for_reason(
+            workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy,
             "Workdir has an in-progress operation; retry after it finishes",
         ),
     )
@@ -1093,8 +1095,8 @@ impl Runtime {
                     });
                 if !owns_workdir {
                     return Err(RuntimeError::WorkingDirectory(
-                        crate::working_directory::WorkingDirectoryDiagnostic::rejected(
-                            "working_directory_not_found",
+                        crate::working_directory::WorkingDirectoryDiagnostic::for_reason(
+                            workdir::management_failure::WorkdirManagementReason::NotFound,
                             "working directory was not assigned to the authorized owner Worker",
                         ),
                     ));
@@ -1465,6 +1467,7 @@ impl Runtime {
 
             let durable_request = durable_create_worker_request(&request);
             let record = WorkerRecord {
+                workdir_attachments_guard: WorkdirAttachmentsGuard::default(),
                 restore_guard: RestoreGuard::default(),
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
@@ -2054,22 +2057,89 @@ impl Runtime {
         attachments.sort_by(|left, right| left.alias.cmp(&right.alias));
 
         let mut state = self.lock()?;
+        state.refresh_uncertain_worker_write(worker_ref)?;
         if !restoring {
             for attachment in &attachments {
                 state.ensure_workdir_not_removing(&attachment.working_directory_id)?;
             }
         }
-        let previous = state.worker(worker_ref)?.clone();
-        {
-            let worker = state.worker_mut(worker_ref)?;
-            worker.apply_logical_workdir_attachments(attachments)?;
-        }
-        if let Err(error) = state.persist_worker(&worker_ref.worker_id) {
-            state.workers.insert(worker_ref.worker_id, previous);
-            return Err(error);
-        }
+        let mut candidate = state.worker(worker_ref)?.clone();
+        candidate.apply_logical_workdir_attachments(attachments)?;
+        state.persist_worker_record_with_fence(&candidate)?;
+        state.workers.insert(worker_ref.worker_id, candidate);
         state.publish_worker_upsert(worker_ref.worker_id)?;
         Ok(state.worker(worker_ref)?.detail())
+    }
+
+    /// Observe the exact logical request under the same lifecycle/Workspace fence
+    /// as replacement. A post-rename error can leave memory and durable authority
+    /// different; neither a summary nor one matching copy confirms settlement.
+    pub fn observe_worker_workdir_attachments(
+        &self,
+        worker_ref: &WorkerRef,
+        attachments: Vec<LogicalWorkdirAttachment>,
+    ) -> Result<runtime_api::WorkerWorkdirAttachmentsMatch, RuntimeError> {
+        self.observe_worker_workdir_attachments_with_scope(worker_ref, attachments, None)
+            .map(|observation| observation.result)
+    }
+
+    pub fn observe_worker_workdir_attachments_scoped(
+        &self,
+        scope: &RuntimeWorkspaceScope,
+        worker_ref: &WorkerRef,
+        attachments: Vec<LogicalWorkdirAttachment>,
+    ) -> Result<runtime_api::WorkerWorkdirAttachmentsMatch, RuntimeError> {
+        self.observe_worker_workdir_attachments_with_scope(worker_ref, attachments, Some(scope))
+            .map(|observation| observation.result)
+    }
+
+    fn observe_worker_workdir_attachments_with_scope(
+        &self,
+        worker_ref: &WorkerRef,
+        mut attachments: Vec<LogicalWorkdirAttachment>,
+        scope: Option<&RuntimeWorkspaceScope>,
+    ) -> Result<runtime_api::WorkerWorkdirAttachmentsObservation, RuntimeError> {
+        use runtime_api::WorkerWorkdirAttachmentsMatch as Observation;
+        let operation_lock = self.worker_operation_lock(worker_ref.worker_id)?;
+        let _operation_guard = operation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StatePoisoned)?;
+        validate_logical_workdir_attachments(&attachments)?;
+        let request = runtime_api::WorkerWorkdirAttachmentsRequest {
+            logical_workdir_attachments: attachments
+                .iter()
+                .map(|attachment| runtime_api::LogicalWorkdirAttachment {
+                    alias: attachment.alias.clone(),
+                    working_directory_id: attachment.working_directory_id.clone(),
+                    capabilities: attachment.capabilities,
+                })
+                .collect(),
+        };
+        attachments.sort_by(|left, right| left.alias.cmp(&right.alias));
+        let mut state = self.lock()?;
+        state.check_attachment_scope(worker_ref, scope)?;
+        let worker = state.worker(worker_ref)?;
+        let mut consistent = true;
+        #[cfg(feature = "fs-store")]
+        if let Some(store) = state.fs_store() {
+            // Read and sync without adopting canonical memory or an owner.
+            consistent = store.reconcile_worker_record(&worker.persisted_record())?.1;
+        }
+        Ok(runtime_api::WorkerWorkdirAttachmentsObservation {
+            worker_ref: runtime_api::WorkerRef {
+                worker_id: worker_ref.worker_id,
+            },
+            request,
+            result: if !consistent {
+                Observation::Unconfirmed
+            } else if worker.logical_workdir_attachments == attachments {
+                Observation::Matching
+            } else {
+                Observation::Different
+            },
+            current_generation: consistent
+                .then(|| worker.workdir_attachments_guard.generation.clone()),
+        })
     }
 
     /// Observe a Worker's live protocol availability or its retained Session.
@@ -4158,31 +4228,37 @@ impl Runtime {
         persistence_phase: &mut Option<StartupFailurePhase>,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
-        let detail = {
-            let worker = state.worker_mut(worker_ref)?;
-
-            worker.execution_metadata_available = true;
-            worker.execution_bound = true;
-            worker.status = WorkerStatus::Idle;
-            let _ = worker.apply_worker_state(&initial_worker_state);
-            if let Some(snapshot) = result.worker_state.as_ref() {
-                let _ = worker.apply_worker_state(snapshot);
-            }
-            worker.restore_intent = restore_intent_for_status(worker.status);
-            let claims = worker
-                .request
-                .as_ref()
-                .map(|request| request.workdir_attachments.as_slice())
-                .unwrap_or_default();
-            worker.logical_workdir_attachments =
-                logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
-            worker.workdir_attachments = workdir_attachments;
-            worker.detail()
-        };
+        state.refresh_uncertain_worker_write(worker_ref)?;
+        let mut candidate = state.worker(worker_ref)?.clone();
+        candidate.execution_metadata_available = true;
+        candidate.execution_bound = true;
+        candidate.status = WorkerStatus::Idle;
+        let _ = candidate.apply_worker_state(&initial_worker_state);
+        if let Some(snapshot) = result.worker_state.as_ref() {
+            let _ = candidate.apply_worker_state(snapshot);
+        }
+        candidate.restore_intent = restore_intent_for_status(candidate.status);
+        let claims = candidate
+            .request
+            .as_ref()
+            .map(|request| request.workdir_attachments.as_slice())
+            .unwrap_or_default();
+        candidate.logical_workdir_attachments =
+            logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
+        candidate.workdir_attachments = workdir_attachments;
+        candidate.workdir_attachments_guard.rotate();
         *persistence_phase = Some(StartupFailurePhase::RuntimeSnapshotSave);
         state.persist_runtime_snapshot()?;
         *persistence_phase = Some(StartupFailurePhase::RuntimeReconciliationRecordSave);
-        state.persist_worker(&worker_ref.worker_id)?;
+        if let Err(error) = state.persist_worker_record_with_fence(&candidate) {
+            #[cfg(feature = "fs-store")]
+            if matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. }) {
+                state.reconcile_failed_create_publication(&candidate);
+            }
+            return Err(error);
+        }
+        let detail = candidate.detail();
+        state.workers.insert(worker_ref.worker_id, candidate);
         *persistence_phase = None;
         state.publish_worker_upsert(worker_ref.worker_id)?;
         Ok(detail)
@@ -4756,7 +4832,7 @@ impl Runtime {
                     },
                 );
             }
-            state.persist_stop_worker_record(&worker)?;
+            state.persist_worker_record_with_fence(&worker)?;
             state.workers.insert(worker_ref.worker_id, worker);
             state.publish_worker_upsert(worker_ref.worker_id)?;
             return Ok(StopAdmission::Stopped(ack));
@@ -4784,7 +4860,7 @@ impl Runtime {
                             },
                         );
                         state.preflight_stop_owner_growth(&candidate)?;
-                        state.persist_stop_worker_record(&candidate)?;
+                        state.persist_worker_record_with_fence(&candidate)?;
                         state.workers.insert(worker_ref.worker_id, candidate);
                     }
                 }
@@ -5473,7 +5549,7 @@ impl Runtime {
             );
         }
         state.preflight_stop_owner_growth(&candidate)?;
-        match state.persist_stop_worker_record(&candidate) {
+        match state.persist_worker_record_with_fence(&candidate) {
             Ok(()) => {
                 state.workers.insert(worker_ref.worker_id, candidate);
                 Ok(())
@@ -5508,7 +5584,7 @@ impl Runtime {
                 let mut state = self.lock()?;
                 let mut candidate = state.worker(worker_ref)?.clone();
                 candidate.retain_stop_termination(operation_id, termination)?;
-                state.persist_stop_worker_record(&candidate)?;
+                state.persist_worker_record_with_fence(&candidate)?;
                 state.workers.insert(worker_ref.worker_id, candidate);
             }
             if result.is_accepted() {
@@ -5541,7 +5617,7 @@ impl Runtime {
         candidate
             .retain_stop_termination(operation_id, termination.expect("validated termination"))?;
         let (candidate, ack) = candidate.stopped_candidate(operation_id);
-        state.persist_stop_worker_record(&candidate)?;
+        state.persist_worker_record_with_fence(&candidate)?;
         state.workers.insert(worker_ref.worker_id, candidate);
         state.publish_worker_upsert(worker_ref.worker_id)?;
         if let Err(error) = state.persist_runtime_snapshot() {
@@ -5700,6 +5776,7 @@ impl Runtime {
         }
         candidate.restore_intent = restore_intent_for_status(candidate.status);
         candidate.workdir_attachments = workdir_attachments;
+        candidate.workdir_attachments_guard.rotate();
 
         // Validate the exact subscription projection before persistence. The
         // subsequent publish uses the same pure projection while the Worker
@@ -5741,8 +5818,9 @@ impl Runtime {
         candidate.apply_worker_state(&worker_state);
         candidate.restore_intent = WorkerRestoreIntent::Automatic;
         candidate.workdir_attachments = workdir_attachments;
+        candidate.workdir_attachments_guard.rotate();
         state
-            .persist_worker_record(&candidate)
+            .persist_worker_record_with_fence(&candidate)
             .map_err(record_error)?;
         state.workers.insert(worker_ref.worker_id, candidate);
         state
@@ -5787,10 +5865,11 @@ impl Runtime {
         candidate.logical_workdir_attachments =
             logical_workdir_attachments_from_statuses(&workdir_attachments, claims);
         candidate.workdir_attachments = workdir_attachments;
-        state.workers.insert(worker_ref.worker_id, candidate);
+        candidate.workdir_attachments_guard.rotate();
         state
-            .persist_worker(&worker_ref.worker_id)
+            .persist_worker_record_with_fence(&candidate)
             .map_err(record_error)?;
+        state.workers.insert(worker_ref.worker_id, candidate);
         state
             .publish_worker_upsert(worker_ref.worker_id)
             .map_err(|error| (StartupFailurePhase::RuntimeReconciliationPublish, error))?;
@@ -6913,21 +6992,31 @@ impl RuntimeState {
         Ok(())
     }
 
-    /// An unknown Stop write fences later mutations until a canonical reread.
-    fn persist_stop_worker_record(&mut self, worker: &WorkerRecord) -> Result<(), RuntimeError> {
-        let result = self.persist_worker_record(worker);
+    /// Unknown aggregate publication fences all later writes until canonical refresh.
+    fn fence_worker_write_outcome(
+        &mut self,
+        worker_id: WorkerId,
+        result: Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
         if matches!(&result, Err(RuntimeError::StoreCommitOutcomeUnknown { .. })) {
-            self.unreconciled_worker_writes.insert(worker.worker_id);
+            self.unreconciled_worker_writes.insert(worker_id);
         }
         result
+    }
+
+    fn persist_worker_record_with_fence(
+        &mut self,
+        worker: &WorkerRecord,
+    ) -> Result<(), RuntimeError> {
+        let result = self.persist_worker_record(worker);
+        self.fence_worker_write_outcome(worker.worker_id, result)
     }
 
     /// An uncertain Restore write is resolved only from the locked canonical
     /// aggregate and a successful durability barrier, never a second blind write.
     fn persist_restore_worker_record(&mut self, worker: &WorkerRecord) -> Result<(), RuntimeError> {
-        match self.persist_worker_record(worker) {
+        match self.persist_worker_record_with_fence(worker) {
             Err(error @ RuntimeError::StoreCommitOutcomeUnknown { .. }) => {
-                self.unreconciled_worker_writes.insert(worker.worker_id);
                 #[cfg(feature = "fs-store")]
                 if let RuntimePersistence::Fs(store) = &self.persistence {
                     match store.reconcile_worker_record(&worker.persisted_record()) {
@@ -6946,6 +7035,30 @@ impl RuntimeState {
                 Err(error)
             }
             outcome => outcome,
+        }
+    }
+
+    /// The create owner still holds the Worker operation lock and the exact
+    /// failed publication candidate. Only a durable full-aggregate match can
+    /// discharge its write fence; a different receipt, owner, Stop or attachment
+    /// generation is not this creation. This does not authorize rollback: the
+    /// caller retains its original error and separately requires scope shutdown.
+    #[cfg(feature = "fs-store")]
+    fn reconcile_failed_create_publication(&mut self, candidate: &WorkerRecord) {
+        if let RuntimePersistence::Fs(store) = &self.persistence {
+            match store.reconcile_worker_record(&candidate.persisted_record()) {
+                Ok((observed, true)) => {
+                    if let Err(error) = self.apply_canonical_worker_record(observed) {
+                        tracing::warn!(worker_id = %candidate.worker_id, error = %error,
+                            "Failed-create publication remains uncertain after canonical reconciliation");
+                    }
+                }
+                Ok((_, false)) => {}
+                Err(error) => {
+                    tracing::warn!(worker_id = %candidate.worker_id, error = %error,
+                        "Failed-create publication remains uncertain after canonical reconciliation");
+                }
+            }
         }
     }
 
@@ -7003,7 +7116,7 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "fs-store")]
-    fn persist_worker(&self, worker_id: &WorkerId) -> Result<(), RuntimeError> {
+    fn persist_worker(&mut self, worker_id: &WorkerId) -> Result<(), RuntimeError> {
         if self.fs_store().is_some() {
             let worker =
                 self.workers
@@ -7011,7 +7124,8 @@ impl RuntimeState {
                     .ok_or_else(|| RuntimeError::WorkerNotFound {
                         worker_id: *worker_id,
                     })?;
-            self.persist_worker_record(worker)?;
+            let result = self.persist_worker_record(worker);
+            self.fence_worker_write_outcome(*worker_id, result)?;
         }
         Ok(())
     }
@@ -7030,10 +7144,11 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "fs-store")]
-    fn persist_workers(&self) -> Result<(), RuntimeError> {
+    fn persist_workers(&mut self) -> Result<(), RuntimeError> {
         if self.fs_store().is_some() {
-            for worker_id in self.workers.keys() {
-                self.persist_worker(worker_id)?;
+            let worker_ids = self.workers.keys().copied().collect::<Vec<_>>();
+            for worker_id in worker_ids {
+                self.persist_worker(&worker_id)?;
             }
         }
         Ok(())
@@ -7520,7 +7635,7 @@ impl RuntimeState {
         candidate.status = WorkerStatus::Stopped;
         candidate.restore_intent = WorkerRestoreIntent::Explicit;
         candidate.internal_workers.clear();
-        self.persist_worker_record(&candidate)?;
+        self.persist_worker_record_with_fence(&candidate)?;
 
         self.next_diagnostic_id += 1;
         eprintln!(
@@ -8029,6 +8144,7 @@ impl RestoreGuard {
 
 #[derive(Debug, Clone)]
 struct WorkerRecord {
+    workdir_attachments_guard: WorkdirAttachmentsGuard,
     restore_guard: RestoreGuard,
     worker_ref: WorkerRef,
     worker_id: WorkerId,
@@ -8189,6 +8305,7 @@ impl WorkerRecord {
                 .is_some_and(|workdir_id| workdir_id == &local.working_directory_id)
         });
         self.logical_workdir_attachments = attachments;
+        self.workdir_attachments_guard.rotate();
         Ok(())
     }
 
@@ -8367,16 +8484,12 @@ impl WorkerRecord {
                 None,
             ),
         };
-        let logical_workdir_attachments = if worker.logical_workdir_attachments.is_empty() {
-            let claims = request
-                .as_ref()
-                .map(|request| request.workdir_attachments.as_slice())
-                .unwrap_or_default();
-            logical_workdir_attachments_from_statuses(&worker.workdir_attachments, claims)
-        } else {
-            worker.logical_workdir_attachments
-        };
+        // Current-schema authority is canonical, including an explicitly empty
+        // logical set. Legacy local-to-logical derivation belongs to migration,
+        // never to a reopen or a read-only operation observation.
+        let logical_workdir_attachments = worker.logical_workdir_attachments;
         Self {
+            workdir_attachments_guard: worker.workdir_attachments_guard,
             restore_guard: worker.restore_guard,
             worker_ref: worker.worker_ref,
             worker_id: worker.worker_id,
@@ -8462,6 +8575,7 @@ impl WorkerRecord {
             }
         };
         PersistedWorkerRecord {
+            workdir_attachments_guard: self.workdir_attachments_guard.clone(),
             restore_guard: self.restore_guard.clone(),
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
@@ -8577,7 +8691,7 @@ fn requested_workdir_ids(request: &CreateWorkerRequest) -> Vec<&str> {
         .collect()
 }
 
-fn logical_workdir_attachments_from_statuses(
+pub(crate) fn logical_workdir_attachments_from_statuses(
     attachments: &[crate::catalog::WorkingDirectoryAttachmentStatus],
     claims: &[crate::catalog::WorkingDirectoryAttachmentClaim],
 ) -> Vec<LogicalWorkdirAttachment> {
@@ -8830,6 +8944,12 @@ fn runtime_worker_create_failure_fields(
         RuntimeError::StopObservationConflict { .. } => ("stop_observation_conflict", None, None),
         RuntimeError::StopRequestConflict { .. } => ("stop_request_conflict", None, None),
         RuntimeError::StopAdmissionBusy { .. } => ("stop_admission_busy", None, None),
+        RuntimeError::WorkdirAttachmentsRequestConflict { .. } => {
+            ("workdir_attachments_request_conflict", None, None)
+        }
+        RuntimeError::WorkdirAttachmentsGenerationStale { .. } => {
+            ("workdir_attachments_generation_stale", None, None)
+        }
         RuntimeError::RuntimeStopped => ("runtime_stopped", None, None),
         RuntimeError::RuntimeStoreAlreadyOpen { .. } => ("runtime_store_already_open", None, None),
         RuntimeError::InvalidInitialInputKind { .. } => ("invalid_initial_input_kind", None, None),
@@ -10519,8 +10639,8 @@ mod tests {
                     "the target Workdir must remain reserved during physical cleanup"
                 );
             }
-            Err(WorkingDirectoryDiagnostic::rejected(
-                "working_directory_cleanup_resource_busy",
+            Err(WorkingDirectoryDiagnostic::for_reason(
+                workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy,
                 "Retry removal after releasing the resource",
             ))
         }
@@ -11999,6 +12119,505 @@ mod tests {
                 .and_then(|request| request.workspace_api.clone()),
             Some(replacement)
         );
+    }
+
+    #[test]
+    fn attachment_observation_uses_current_workspace_owner_without_claiming_it() {
+        let runtime = runtime_with_backend();
+        let workspace_scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &workspace_scope,
+                scoped_task_request("observe attachment", "workspace-a"),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .observe_worker_workdir_attachments_scoped(
+                    &workspace_scope,
+                    &worker.worker_ref,
+                    Vec::new(),
+                )
+                .unwrap(),
+            runtime_api::WorkerWorkdirAttachmentsMatch::Matching
+        );
+        assert!(matches!(
+            runtime.observe_worker_workdir_attachments_scoped(
+                &scope("workspace-b", "server-a"),
+                &worker.worker_ref,
+                Vec::new(),
+            ),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
+        assert!(matches!(
+            runtime.observe_worker_workdir_attachments_scoped(
+                &scope("workspace-a", "server-b"),
+                &worker.worker_ref,
+                Vec::new(),
+            ),
+            Err(RuntimeError::WorkspaceOwnerMismatch { .. })
+        ));
+        let owners = runtime.lock().unwrap().workspace_owners.clone();
+        runtime
+            .lock()
+            .unwrap()
+            .workspace_owners
+            .remove("workspace-a");
+        assert!(matches!(
+            runtime.observe_worker_workdir_attachments_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                Vec::new(),
+            ),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
+        assert!(runtime.lock().unwrap().workspace_owners.is_empty());
+        runtime.lock().unwrap().workspace_owners = owners;
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn attachment_operation_commit_prunes_local_restore_claims_with_receipt_in_same_aggregate() {
+        // Runtime/FsStore component fixture. The execution backend is substituted;
+        // local bindings below are projection input, not a materialization claim.
+        let temp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            FsRuntimeStoreOptions::new(temp.path().join("runtime"))
+                .with_runtime_id("attachment-pruning"),
+            backend,
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let owner = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &owner,
+                scoped_task_request("prune local attachment", "workspace-a"),
+            )
+            .unwrap();
+        let alias = workdir::WorkdirAttachmentAlias::new("checkout").unwrap();
+        {
+            let mut state = runtime.lock().unwrap();
+            let record = state.worker_mut(&worker.worker_ref).unwrap();
+            record.workdir_attachments = vec![
+                serde_json::from_value(serde_json::json!({
+                    "alias": alias,
+                    "working_directory": {"summary": {
+                        "working_directory_id": "local-workdir", "repository_id": "repo",
+                        "materializer_kind": "runtime_git_clone", "status": "active"
+                    }}
+                }))
+                .unwrap(),
+            ];
+            record.logical_workdir_attachments = vec![LogicalWorkdirAttachment {
+                alias: alias.clone(),
+                working_directory_id: "local-workdir".into(),
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            }];
+            let request = record.request.as_mut().unwrap();
+            request.workdir_attachments = vec![WorkingDirectoryAttachmentClaim {
+                alias: alias.clone(),
+                working_directory_id: "local-workdir".into(),
+                relative_cwd: None,
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            }];
+            request.workdir_attachment_requests =
+                vec![crate::catalog::WorkingDirectoryAttachmentRequest {
+                    alias,
+                    working_directory: workdir_effect_request(Some("local-workdir")),
+                }];
+            record.workdir_attachments_guard.rotate();
+            state.persist_worker(&worker.worker_id).unwrap();
+        }
+        let generation = runtime
+            .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+            .unwrap()
+            .current_generation
+            .unwrap();
+        let operation = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "remove-local-claims".into(),
+            expected_generation: generation,
+            logical_workdir_attachments: Vec::new(),
+        };
+        let receipt = runtime
+            .apply_worker_workdir_attachments_operation_scoped(
+                &owner,
+                &worker.worker_ref,
+                operation.clone(),
+            )
+            .unwrap();
+        let store = runtime.test_runtime_store();
+        let saved = store.read_worker_record(&worker.worker_ref).unwrap();
+        assert!(saved.workdir_attachments.is_empty());
+        assert!(saved.logical_workdir_attachments.is_empty());
+        assert_eq!(
+            saved.workdir_attachments_guard.generation,
+            receipt.resulting_generation
+        );
+        let PersistedWorkerExecutionState::Available(execution) = saved.execution_state else {
+            panic!("lost restore request")
+        };
+        assert!(execution.request.workdir_attachments.is_empty());
+        assert!(execution.request.workdir_attachment_requests.is_empty());
+        let observed = runtime
+            .observe_worker_workdir_attachments_operation_scoped(
+                &owner,
+                &worker.worker_ref,
+                operation,
+            )
+            .unwrap();
+        assert_eq!(
+            observed.result,
+            runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Receipt { receipt }
+        );
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn attachment_operation_receipt_is_fenced_after_unrelated_aggregate_write_is_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            FsRuntimeStoreOptions::new(temp.path().join("runtime"))
+                .with_runtime_id("attachment-fence"),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let owner = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &owner,
+                scoped_task_request("attachment unrelated write", "workspace-a"),
+            )
+            .unwrap();
+        let operation = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "retained-before-unknown-write".into(),
+            expected_generation: runtime
+                .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+                .unwrap()
+                .current_generation
+                .unwrap(),
+            logical_workdir_attachments: Vec::new(),
+        };
+        let receipt = runtime
+            .apply_worker_workdir_attachments_operation_scoped(
+                &owner,
+                &worker.worker_ref,
+                operation.clone(),
+            )
+            .unwrap();
+        let store = runtime.test_runtime_store();
+        store.fail_next_worker_write(crate::fs_store::AtomicWriteFault::AfterRename);
+        assert!(matches!(
+            runtime.replace_worker_workspace_api_scoped(
+                &owner,
+                &worker.worker_ref,
+                WorkspaceApiRef {
+                    workspace_id: "workspace-a".into(),
+                    base_url: "https://workspace.example/workspace-a/".into(),
+                }
+            ),
+            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+        ));
+        {
+            let mut state = runtime.lock().unwrap();
+            assert!(state.unreconciled_worker_writes.contains(&worker.worker_id));
+            assert!(state.persist_worker(&worker.worker_id).is_err());
+        }
+        let observed = runtime
+            .observe_worker_workdir_attachments_operation_scoped(
+                &owner,
+                &worker.worker_ref,
+                operation.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            observed.result,
+            runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Receipt {
+                receipt: receipt.clone()
+            }
+        );
+        assert_eq!(observed.current_generation, None);
+        // Query did not adopt canonical memory or discharge the write fence.
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .unreconciled_worker_writes
+                .contains(&worker.worker_id)
+        );
+        assert_eq!(
+            runtime
+                .apply_worker_workdir_attachments_operation_scoped(
+                    &owner,
+                    &worker.worker_ref,
+                    operation
+                )
+                .unwrap(),
+            receipt
+        );
+        let saved = store.read_worker_record(&worker.worker_ref).unwrap();
+        let PersistedWorkerExecutionState::Available(execution) = saved.execution_state else {
+            panic!("lost execution request")
+        };
+        assert_eq!(
+            execution.request.workspace_api.unwrap().base_url,
+            "https://workspace.example/workspace-a/"
+        );
+        assert_eq!(
+            runtime
+                .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+                .unwrap()
+                .current_generation,
+            Some(receipt.resulting_generation)
+        );
+    }
+
+    #[test]
+    fn attachment_operation_generation_rejects_worker_aba_without_affecting_replacement() {
+        let runtime = runtime_with_backend();
+        let workspace_scope = scope("workspace-a", "server-a");
+        let create = scoped_task_request("attachment incarnation", "workspace-a");
+        let worker = runtime
+            .create_worker_scoped(&workspace_scope, create.clone())
+            .unwrap();
+        let initial = runtime
+            .observe_worker_workdir_attachments_state_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                Vec::new(),
+            )
+            .unwrap()
+            .current_generation
+            .unwrap();
+        let operation = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "old-incarnation-operation".into(),
+            expected_generation: initial.clone(),
+            logical_workdir_attachments: Vec::new(),
+        };
+        runtime
+            .apply_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                operation.clone(),
+            )
+            .unwrap();
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        runtime
+            .delete_worker_scoped(&workspace_scope, &worker.worker_ref)
+            .unwrap();
+        let replacement = runtime
+            .create_worker_scoped(&workspace_scope, create)
+            .unwrap();
+        assert_eq!(replacement.worker_ref, worker.worker_ref);
+        let now = runtime
+            .observe_worker_workdir_attachments_state_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                Vec::new(),
+            )
+            .unwrap()
+            .current_generation
+            .unwrap();
+        assert_ne!(now, initial);
+        let observed = runtime
+            .observe_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                operation.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            observed.result,
+            runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Absent
+        );
+        assert_eq!(observed.current_generation, Some(now.clone()));
+        assert!(matches!(
+            runtime.apply_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                operation
+            ),
+            Err(RuntimeError::WorkdirAttachmentsGenerationStale { .. })
+        ));
+        assert_eq!(
+            runtime
+                .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+                .unwrap()
+                .current_generation,
+            Some(now)
+        );
+    }
+
+    #[test]
+    fn attachment_operation_legacy_same_set_and_restore_preparation_invalidate_generation() {
+        let runtime = runtime_with_backend();
+        let workspace_scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &workspace_scope,
+                scoped_task_request("attachment restore", "workspace-a"),
+            )
+            .unwrap();
+        let first = runtime
+            .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+            .unwrap()
+            .current_generation
+            .unwrap();
+        let original = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "original-attachment-operation".into(),
+            expected_generation: first.clone(),
+            logical_workdir_attachments: Vec::new(),
+        };
+        let receipt = runtime
+            .apply_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                original.clone(),
+            )
+            .unwrap();
+        runtime
+            .replace_worker_workdir_attachments_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                Vec::new(),
+            )
+            .unwrap();
+        let after_legacy = runtime
+            .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+            .unwrap()
+            .current_generation
+            .unwrap();
+        assert_ne!(after_legacy, receipt.resulting_generation);
+        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        let mut restore = runtime.test_restore_request(&worker.worker_ref);
+        restore.preparation = Some(runtime_api::WorkerRestorePreparation {
+            workdir_attachments: Some(Vec::new()),
+            ..Default::default()
+        });
+        runtime
+            .restore_worker_scoped(&workspace_scope, &worker.worker_ref, restore)
+            .unwrap();
+        let after_restore = runtime
+            .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+            .unwrap()
+            .current_generation
+            .unwrap();
+        assert_ne!(after_restore, after_legacy);
+        let stale = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "pre-restore-attempt".into(),
+            expected_generation: after_legacy,
+            logical_workdir_attachments: Vec::new(),
+        };
+        assert!(matches!(
+            runtime.apply_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                stale
+            ),
+            Err(RuntimeError::WorkdirAttachmentsGenerationStale { .. })
+        ));
+        let observed = runtime
+            .observe_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                original.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            observed.result,
+            runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Receipt {
+                receipt: receipt.clone()
+            }
+        );
+        assert_eq!(observed.current_generation, Some(after_restore.clone()));
+        assert_eq!(
+            runtime
+                .apply_worker_workdir_attachments_operation_scoped(
+                    &workspace_scope,
+                    &worker.worker_ref,
+                    original
+                )
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            runtime
+                .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+                .unwrap()
+                .current_generation,
+            Some(after_restore)
+        );
+    }
+
+    #[test]
+    fn attachment_operation_scope_checks_do_not_adopt_workspace_owner_or_disclose_receipt() {
+        let runtime = runtime_with_backend();
+        let workspace_scope = scope("workspace-a", "server-a");
+        let worker = runtime
+            .create_worker_scoped(
+                &workspace_scope,
+                scoped_task_request("operation scope", "workspace-a"),
+            )
+            .unwrap();
+        let operation = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "scope-attempt".into(),
+            expected_generation: runtime
+                .observe_worker_workdir_attachments_state(&worker.worker_ref, Vec::new())
+                .unwrap()
+                .current_generation
+                .unwrap(),
+            logical_workdir_attachments: Vec::new(),
+        };
+        runtime
+            .apply_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                operation.clone(),
+            )
+            .unwrap();
+        for bad_scope in [
+            scope("workspace-b", "server-a"),
+            scope("workspace-a", "server-b"),
+        ] {
+            assert!(
+                runtime
+                    .observe_worker_workdir_attachments_operation_scoped(
+                        &bad_scope,
+                        &worker.worker_ref,
+                        operation.clone()
+                    )
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .apply_worker_workdir_attachments_operation_scoped(
+                        &bad_scope,
+                        &worker.worker_ref,
+                        operation.clone()
+                    )
+                    .is_err()
+            );
+        }
+        runtime.lock().unwrap().workspace_owners.clear();
+        assert!(matches!(
+            runtime.observe_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                operation.clone()
+            ),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
+        assert!(matches!(
+            runtime.apply_worker_workdir_attachments_operation_scoped(
+                &workspace_scope,
+                &worker.worker_ref,
+                operation
+            ),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
+        assert!(runtime.lock().unwrap().workspace_owners.is_empty());
     }
 
     #[test]
@@ -18427,6 +19046,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&worker_path).expect("worker aggregate"))
                 .expect("worker aggregate json");
         worker_identity["schema_version"] = serde_json::json!(7);
+        worker_identity
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard");
         worker_identity
             .as_object_mut()
             .unwrap()

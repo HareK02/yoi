@@ -3658,8 +3658,8 @@ impl ConnectedWorkerHarness {
                                     .unwrap()
                                     .push(failure.startup().clone());
                             } else {
-                                // Cleanup probes can return Control Problems too. Validate
-                                // that boundary without recording a second startup failure.
+                                // Cleanup probes also use Control and Workdir management
+                                // Problems; validate them without counting another startup failure.
                                 assert!(
                                     matches!(
                                         api_macros::http::decode_problem_response::<
@@ -3672,8 +3672,19 @@ impl ConnectedWorkerHarness {
                                             error_contract::Budget::new(16384, 16384),
                                         ),
                                         error_contract::DecodeFailure::Known(_)
+                                    ) || matches!(
+                                        api_macros::http::decode_problem_response::<
+                                            workdir::management_failure::WorkdirManagementFailure,
+                                        >(
+                                            &bytes,
+                                            parts.status.as_u16(),
+                                            content_type,
+                                            &runtime_api::management_failure::ManagementBoundary,
+                                            error_contract::Budget::new(16384, 16384),
+                                        ),
+                                        error_contract::DecodeFailure::Known(_)
                                     ),
-                                    "RuntimeHTTP must emit a valid Startup or Control Problem"
+                                    "RuntimeHTTP must emit a valid Startup, Control or Workdir management Problem"
                                 );
                             }
                             body["detail"].as_str().expect("Problem detail")

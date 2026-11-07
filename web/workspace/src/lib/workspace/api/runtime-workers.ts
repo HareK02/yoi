@@ -15,6 +15,8 @@ import type {
   WorkerRetentionResponse,
 } from "#lib/generated/runtime-api.ts";
 
+import type { DomainFailureDetails } from "#lib/generated/domain-failures.ts";
+import { decodeDomainFailureDetails } from "#lib/workspace/failure/domains.ts";
 import type {
   StartupCleanup,
   StartupCleanupFailure,
@@ -27,13 +29,21 @@ import type {
   StartupSecondaryFailure,
 } from "#lib/generated/protocol.ts";
 import { FAILURE_LIMITS } from "#lib/generated/error-contract.ts";
-import { failureString } from "#lib/workspace/failure/receive.ts";
+import { decodeFailure, failureString } from "#lib/workspace/failure/receive.ts";
 import { parseRuntimeControl } from "#lib/workspace/failure/runtime-control.ts";
 import type { RuntimeControlEvidence } from "#lib/workspace/failure/runtime-control.ts";
 import {
   parseWorkerRemovalObservation,
   parseWorkerSummary,
 } from "#lib/workspace/api/workers.ts";
+
+export type WorkdirCleanupReceipt = ReturnType<
+  typeof decodeFailure<DomainFailureDetails>
+>;
+export type ParsedRuntimeWorkerLifecycleResult =
+  & Omit<RuntimeWorkerLifecycleResult, "cleanup_failures">
+  & RuntimeControlEvidence
+  & { cleanup_failures: WorkdirCleanupReceipt[] };
 
 const MAX_STRING_BYTES = 4_096;
 const MAX_CANDIDATES = 1_000;
@@ -333,12 +343,12 @@ const WORKER_OPERATION_STATES = new Set<WorkerOperationState>([
 
 export function parseRuntimeWorkerLifecycleResult(
   value: unknown,
-): RuntimeWorkerLifecycleResult & RuntimeControlEvidence {
+): ParsedRuntimeWorkerLifecycleResult {
   const item = object(value, "Runtime Worker lifecycle result");
   exactKeys(
     item,
     ["state", "runtime_id", "worker_id", "diagnostics"],
-    ["replayed", "control", "control_explanation"],
+    ["replayed", "cleanup_failures", "control", "control_explanation"],
     "Runtime Worker lifecycle result",
   );
   const state = boundedString(
@@ -348,7 +358,23 @@ export function parseRuntimeWorkerLifecycleResult(
   if (!WORKER_OPERATION_STATES.has(state as WorkerOperationState)) {
     fail("Runtime Worker lifecycle result.state", "has an unknown value");
   }
+  // Unreadable optional evidence must not overwrite the authoritative Stop result.
+  const cleanup = item.cleanup_failures;
+  const cleanup_failures: WorkdirCleanupReceipt[] = cleanup === undefined
+    ? []
+    : !Array.isArray(cleanup)
+    ? [{ kind: "invalid" }]
+    : cleanup.length > MAX_DIAGNOSTICS
+    ? [{ kind: "too_large" }]
+    : cleanup.map((attachment): WorkdirCleanupReceipt => {
+      if (typeof attachment !== "string") return { kind: "invalid" };
+      const decoded = decodeFailure(attachment, decodeDomainFailureDetails);
+      return decoded.kind === "known" && decoded.failure.domain !== "workdir"
+        ? { kind: "unsupported" }
+        : decoded;
+    });
   return {
+    cleanup_failures,
     ...parseRuntimeControl(item.control, item.control_explanation),
     replayed: item.replayed === undefined
       ? false
@@ -654,16 +680,14 @@ export function parseRuntimeCleanupPlan(
     digest: boundedString(item.digest, "Runtime cleanup plan.digest"),
     workers: array(item.workers, "Runtime cleanup plan.workers", MAX_CANDIDATES)
       .map(
-        (entry, index) =>
-          workerCandidate(entry, `Runtime cleanup plan.workers[${index}]`),
+        (entry, index) => workerCandidate(entry, `Runtime cleanup plan.workers[${index}]`),
       ),
     workdirs: array(
       item.workdirs,
       "Runtime cleanup plan.workdirs",
       MAX_CANDIDATES,
     ).map(
-      (entry, index) =>
-        workdirCandidate(entry, `Runtime cleanup plan.workdirs[${index}]`),
+      (entry, index) => workdirCandidate(entry, `Runtime cleanup plan.workdirs[${index}]`),
     ),
     diagnostics: diagnostics(
       item.diagnostics,
@@ -729,8 +753,7 @@ export function parseRuntimeCleanupExecution(
       "Runtime cleanup execution.results",
       MAX_RESULTS,
     ).map(
-      (entry, index) =>
-        executionResult(entry, `Runtime cleanup execution.results[${index}]`),
+      (entry, index) => executionResult(entry, `Runtime cleanup execution.results[${index}]`),
     ),
     plan_after: parseRuntimeCleanupPlan(item.plan_after),
     diagnostics: diagnostics(

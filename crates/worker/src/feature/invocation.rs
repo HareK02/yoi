@@ -86,6 +86,17 @@ pub(crate) fn invocation_result_is_bounded(result: &FeatureInvocationResult) -> 
             .is_none_or(|context| context.len() <= MAX_INVOCATION_CONTEXT_BYTES)
 }
 
+fn failure_attachment_is_bounded(
+    failure: Option<&protocol::startup_failure::StartupFailureAttachment>,
+) -> bool {
+    failure.is_none_or(|failure| {
+        serde_json::to_value(failure)
+            .ok()
+            .and_then(|value| value.as_str().map(str::len))
+            .is_some_and(|len| len <= error_contract::MAX_FAILURE_BYTES)
+    })
+}
+
 fn truncate_display(text: &mut String, max_bytes: usize) {
     let mut end = text.len().min(max_bytes);
     while !text.is_char_boundary(end) {
@@ -161,6 +172,15 @@ pub trait FeatureInvocationHandler: Send + Sync {
         Ok(())
     }
 
+    /// Redisclose retained evidence through the domain projector after validation.
+    /// Unknown/corrupt evidence and handlers without a projector disclose nothing.
+    fn project_failure(
+        &self,
+        _failure: &protocol::startup_failure::StartupFailureAttachment,
+    ) -> Option<(String, protocol::startup_failure::StartupFailureAttachment)> {
+        None
+    }
+
     async fn invoke(
         &self,
         context: FeatureInvocationContext,
@@ -175,6 +195,7 @@ pub struct FeatureInvocationHandlerError {
     /// True only when the handler cannot determine whether its business-side
     /// effect committed. The Worker never automatically retries this outcome.
     pub outcome_unknown: bool,
+    pub failure: Option<protocol::startup_failure::StartupFailureAttachment>,
 }
 
 impl FeatureInvocationHandlerError {
@@ -182,6 +203,7 @@ impl FeatureInvocationHandlerError {
         Self {
             message: message.into(),
             outcome_unknown: false,
+            failure: None,
         }
     }
 
@@ -189,6 +211,7 @@ impl FeatureInvocationHandlerError {
         Self {
             message: message.into(),
             outcome_unknown: true,
+            failure: None,
         }
     }
 }
@@ -407,6 +430,9 @@ impl FeatureInvocationRegistry {
                 // Validation is side-effect-free; bound its diagnostic before
                 // any start, without claiming an uncertain business outcome.
                 truncate_display(&mut error.message, MAX_INVOCATION_MESSAGE_BYTES);
+                if !failure_attachment_is_bounded(error.failure.as_ref()) {
+                    error.failure = None;
+                }
                 error
             })
     }
@@ -417,7 +443,7 @@ impl FeatureInvocationRegistry {
     ) -> Result<FeatureInvocationResult, FeatureInvocationHandlerError> {
         self.validate(invocation)?;
         let entry = &self.entries[&invocation.identity];
-        let result = entry
+        let mut result = entry
             .handler
             .invoke(
                 FeatureInvocationContext {
@@ -426,7 +452,10 @@ impl FeatureInvocationRegistry {
                 invocation,
             )
             .await
-            .map_err(|error| {
+            .map_err(|mut error| {
+                if !failure_attachment_is_bounded(error.failure.as_ref()) {
+                    error.failure = None;
+                }
                 if error.message.len() > MAX_INVOCATION_MESSAGE_BYTES {
                     FeatureInvocationHandlerError::outcome_unknown(
                         "handler error exceeded the result byte limit; do not retry automatically",
@@ -435,6 +464,9 @@ impl FeatureInvocationRegistry {
                     error
                 }
             })?;
+        if !failure_attachment_is_bounded(result.failure.as_ref()) {
+            result.failure = None;
+        }
         if !invocation_result_is_bounded(&result) {
             return Err(FeatureInvocationHandlerError::outcome_unknown(
                 "handler result exceeded the message/context byte limit; do not retry automatically",
@@ -461,6 +493,34 @@ impl FeatureInvocationRegistry {
             ));
         }
         Ok(result)
+    }
+
+    pub(crate) fn redisclose_failure(
+        &self,
+        invocation: &FeatureInvocation,
+        result: &mut FeatureInvocationResult,
+    ) {
+        let Some(failure) = &result.failure else {
+            return;
+        };
+        let projected = self.validate(invocation).ok().and_then(|()| {
+            self.entries
+                .get(&invocation.identity)?
+                .handler
+                .project_failure(failure)
+        });
+        if let Some((message, failure)) = projected {
+            if message.len() <= MAX_INVOCATION_MESSAGE_BYTES
+                && failure_attachment_is_bounded(Some(&failure))
+            {
+                result.message = message;
+                result.failure = Some(failure);
+                return;
+            }
+        }
+        // Optional evidence cannot rewrite an existing failure/Unknown settlement.
+        result.failure = None;
+        result.message = "Recorded invocation outcome retained; cause unavailable under current authority or unsupported evidence".into();
     }
 
     pub(crate) fn register(
@@ -645,6 +705,7 @@ mod tests {
                 identity: invocation.identity.clone(),
                 status: FeatureInvocationStatus::Succeeded,
                 message: "done".into(),
+                failure: None,
                 context: Some("prepared".into()),
             })
         }

@@ -1350,7 +1350,9 @@ async fn orchestrator_running_to_idle_recovers_unreceived_input_without_notifica
         )),
         "unexpected notification body: {content:?}"
     );
-    assert!(content.contains("Reread the current Ticket state before acting"));
+    assert!(content.contains("Reread the current Ticket body, discussion and typed relations"));
+    assert!(content.contains("current assignment/event identity"));
+    assert!(!content.contains("TicketOrchestrationPlan"));
     assert!(!content.contains(TEST_WORKSPACE_ID));
     assert!(!content.contains("bounded"));
     assert!(!content.contains("omitted"));

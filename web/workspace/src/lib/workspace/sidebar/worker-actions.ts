@@ -10,8 +10,9 @@ import {
   parseRuntimeCleanupPlan,
   parseRuntimeWorkerLifecycleResult,
   parseWorkerRestoreResponse,
+  type WorkdirCleanupReceipt,
 } from "#lib/workspace/api/runtime-workers.ts";
-import type { Diagnostic, Worker } from "./types";
+import type { Worker } from "./types";
 import {
   type WorkerDeletionOutcome,
   workerDeletionOutcome,
@@ -137,10 +138,7 @@ export function restoreErrorNotice(cause: unknown): RestoreNotice {
       : uncertain
       ? "Worker Restore outcome unknown"
       : "Worker Restore failed",
-    message:
-      (cause instanceof Error
-        ? cause.message
-        : "Worker Restore request failed") +
+    message: (cause instanceof Error ? cause.message : "Worker Restore request failed") +
       (conflict
         ? ". Workers refreshed; review the latest state and explicitly try again."
         : uncertain
@@ -166,7 +164,7 @@ export async function stopSidebarWorker(
   workspaceId: string,
   worker: WorkerActionTarget & { restore_observation_token?: string | null },
   fetchFn: FetchFn = fetch,
-): Promise<void> {
+): Promise<WorkdirCleanupReceipt[]> {
   const response = await fetchFn(`${workerPath(workspaceId, worker)}/stop`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -184,12 +182,29 @@ export async function stopSidebarWorker(
   });
   if (!response.ok) throw await responseError(response);
 
-  const result = parseRuntimeWorkerLifecycleResult(await response.json());
+  const result = parseRuntimeWorkerLifecycleResult(await readBoundedJson(response, 1024 * 1024));
+  if (result.runtime_id !== worker.runtime_id || result.worker_id !== worker.worker_id) {
+    throw new Error(
+      "Worker Stop response identity does not match the requested Worker; inspect current state before recovery",
+    );
+  }
   if (result.state !== "accepted") {
     throw new Error(
       runtimeControlMessage(result, `Worker stop was ${result.state}`),
     );
   }
+  return result.cleanup_failures;
+}
+
+export function stopCleanupMessage(receipts: WorkdirCleanupReceipt[]): string {
+  const explanations = receipts.map((receipt) =>
+    receipt.kind === "known"
+      ? receipt.failure.explanation
+      : "Cleanup failure details could not be interpreted safely"
+  );
+  return `${
+    [...new Set(explanations)].join("; ")
+  }. Stop remains accepted. Inspect retained Workdir sessions before recovery; do not repeat Stop to retry cleanup.`;
 }
 
 export async function deleteSidebarWorker(

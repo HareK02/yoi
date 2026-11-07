@@ -573,14 +573,23 @@ mod tests {
             VALUES('op','plan','fp','w','r','worker','observed','policy','digest','archive','tombstone','forever','purge','[]','failed','cleanup','execution_unconfirmed','t','t');").unwrap();
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 123);
-        assert_eq!(plan.migrations.len(), 5);
+        assert_eq!(
+            plan.migrations
+                .iter()
+                .map(|step| step.version)
+                .collect::<Vec<_>>(),
+            vec![124, 125, 126, 127, 128, 129]
+        );
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             123,
             "preflight must not change source"
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 128);
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            super::LATEST_SCHEMA_VERSION
+        );
         let saved = conn.query_row(
             "SELECT plan_id,input_fingerprint,state,failure_category,journal_removal_json FROM worker_removal_operations WHERE operation_id='op'", [],
             |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?)),

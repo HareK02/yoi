@@ -25,10 +25,13 @@
 //! This coordinates notifications, not a general event queue or worktree layout policy.
 
 use subjektiv::api::*;
+mod attachment_failure;
 mod backend_job_profile;
 mod backend_job_recovery;
 mod chat;
+mod external_grant_failure;
 mod external_operation_audit;
+mod grant_cleanup;
 mod service_authority;
 mod session_registration;
 mod subject_authorization;
@@ -867,7 +870,7 @@ impl Drop for UnconfirmedWorkdirSessionCloses<'_> {
 async fn close_registered_workdir_sessions(
     registry: &Arc<Mutex<WorkdirSessionRegistry>>,
     registered: Vec<RegisteredWorkdirSession>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), crate::workdir_cleanup_failure::WorkdirCleanupFailure> {
     let mut unconfirmed = UnconfirmedWorkdirSessionCloses {
         registry,
         registered,
@@ -885,7 +888,7 @@ async fn close_registered_workdir_sessions(
                 unconfirmed.registered.remove(index);
             }
             Err(error) => {
-                errors.push(error.to_string());
+                errors.push(error);
                 index += 1;
             }
         }
@@ -893,17 +896,17 @@ async fn close_registered_workdir_sessions(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(errors.join("; "))
+        Err(crate::workdir_cleanup_failure::WorkdirCleanupFailure::SessionCloses(errors))
     }
 }
 
 async fn close_observed_worker_workdir_sessions(
     registry: &Arc<Mutex<WorkdirSessionRegistry>>,
     observed: &[RegisteredWorkdirSession],
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), crate::workdir_cleanup_failure::WorkdirCleanupFailure> {
     let registered = registry
         .lock()
-        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+        .map_err(|_| crate::workdir_cleanup_failure::WorkdirCleanupFailure::RegistryUnavailable)?
         .take_observed(observed);
     close_registered_workdir_sessions(registry, registered).await
 }
@@ -911,10 +914,10 @@ async fn close_observed_worker_workdir_sessions(
 async fn close_worker_workdir_sessions(
     registry: &Arc<Mutex<WorkdirSessionRegistry>>,
     worker: &RuntimeWorkerRef,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), crate::workdir_cleanup_failure::WorkdirCleanupFailure> {
     let registered = registry
         .lock()
-        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+        .map_err(|_| crate::workdir_cleanup_failure::WorkdirCleanupFailure::RegistryUnavailable)?
         .take_worker(worker);
     close_registered_workdir_sessions(registry, registered).await
 }
@@ -923,10 +926,10 @@ async fn close_worker_workdir_command_sessions_for_alias(
     registry: &Arc<Mutex<WorkdirSessionRegistry>>,
     worker: &RuntimeWorkerRef,
     attachment_alias: &str,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), crate::workdir_cleanup_failure::WorkdirCleanupFailure> {
     let registered = registry
         .lock()
-        .map_err(|_| "Workdir session registry was poisoned".to_string())?
+        .map_err(|_| crate::workdir_cleanup_failure::WorkdirCleanupFailure::RegistryUnavailable)?
         .take_worker_commands_for_alias(worker, attachment_alias);
     close_registered_workdir_sessions(registry, registered).await
 }
@@ -5122,9 +5125,11 @@ impl WorkspaceApi {
             })
             .await?;
         for workdir_id in expired_external_workdirs {
-            cleanup_external_workdir_attachments(&api, &workdir_id)
-                .await
-                .map_err(|error| error.error)?;
+            if let Err(error) = cleanup_external_workdir_attachments(&api, &workdir_id).await {
+                // An unresolved child is retained for observation, not a fatal
+                // Workspace startup requirement or permission to resend it.
+                external_grant_failure::cleanup_telemetry(&error);
+            }
         }
         let grant_api = api.clone();
         let grants = api
@@ -8973,7 +8978,24 @@ fn worker_input_result_to_api(result: WorkerInputResult) -> server_api::RuntimeW
 fn worker_lifecycle_result_to_api(
     result: WorkerLifecycleResult,
 ) -> server_api::RuntimeWorkerLifecycleResult {
+    let visibility = workdir::failure::WorkdirFailureVisibility {
+        can_view_cause: true,
+    };
+    let cleanup_failures = result
+        .cleanup_failures
+        .into_iter()
+        .map(|details| {
+            let facts = error_contract::FailureFacts::new(details)
+                .expect("local typed cleanup facts satisfy the Workdir contract");
+            let projected =
+                error_contract::project_failure::<error_contract::Browser, _>(&facts, &visibility)
+                    .expect("authorized closed Workdir cleanup facts can be disclosed");
+            protocol::startup_failure::StartupFailureAttachment::from_projected(&projected)
+                .expect("closed Workdir cleanup facts fit the shared attachment budget")
+        })
+        .collect();
     server_api::RuntimeWorkerLifecycleResult {
+        cleanup_failures,
         control: retained_control_cause(&result.diagnostics),
         control_explanation: retained_control_explanation(&result.diagnostics),
         replayed: result.replayed,
@@ -9809,7 +9831,7 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         actor: RequestActor,
         workspace_id: String,
-    ) -> std::result::Result<RepositoryAccessProjection, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositoryAccessProjection, server_api::RepositoryAccessApiError> {
         scoped_get_repository_access_projection(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -9817,7 +9839,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_list(
@@ -9826,7 +9848,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
     ) -> std::result::Result<
         server_api::RepositorySshCredentialListResponse,
-        server_api::RepositoryApiError,
+        server_api::RepositoryAccessApiError,
     > {
         scoped_list_repository_ssh_credentials(
             State(self.workspace_api()?.clone()),
@@ -9835,7 +9857,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| server_api::RepositorySshCredentialListResponse(response))
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_create(
@@ -9843,7 +9865,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         request: CreateRepositorySshCredentialRequest,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_create_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -9852,7 +9874,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|(_status, Json(response))| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_generate(
@@ -9860,7 +9882,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         request: GenerateRepositorySshCredentialRequest,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_generate_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -9869,7 +9891,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|(_status, Json(response))| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_get(
@@ -9877,7 +9899,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         credential_id: String,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_get_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9888,7 +9910,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_delete(
@@ -9897,7 +9919,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         credential_id: String,
         request: DeleteRepositorySshCredentialRequest,
-    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+    ) -> std::result::Result<(), server_api::RepositoryAccessApiError> {
         scoped_delete_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9909,7 +9931,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|_| ())
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_public_key(
@@ -9917,7 +9939,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         credential_id: String,
-    ) -> std::result::Result<RepositorySshPublicKey, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshPublicKey, server_api::RepositoryAccessApiError> {
         scoped_get_repository_ssh_public_key(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9928,7 +9950,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_credential_rotate(
@@ -9937,7 +9959,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         credential_id: String,
         request: RotateRepositorySshCredentialRequest,
-    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshCredential, server_api::RepositoryAccessApiError> {
         scoped_rotate_repository_ssh_credential(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryCredentialPath {
@@ -9949,7 +9971,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_list(
@@ -9958,7 +9980,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
     ) -> std::result::Result<
         server_api::RepositorySshHostTrustListResponse,
-        server_api::RepositoryApiError,
+        server_api::RepositoryAccessApiError,
     > {
         scoped_list_repository_ssh_host_trusts(
             State(self.workspace_api()?.clone()),
@@ -9967,7 +9989,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| server_api::RepositorySshHostTrustListResponse(response))
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_put(
@@ -9977,7 +9999,7 @@ impl server_api::ServerApi for ServerApiContractService {
         request: PutRepositorySshHostTrustRequest,
     ) -> std::result::Result<
         server_api::RepositorySshHostTrustMutationResponse,
-        server_api::RepositoryApiError,
+        server_api::RepositoryAccessApiError,
     > {
         let created = request.expected_fingerprint.is_none();
         scoped_put_repository_ssh_host_trust(
@@ -9993,7 +10015,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 created,
             },
         )
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_get(
@@ -10001,7 +10023,7 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         host_trust_id: String,
-    ) -> std::result::Result<RepositorySshHostTrust, server_api::RepositoryApiError> {
+    ) -> std::result::Result<RepositorySshHostTrust, server_api::RepositoryAccessApiError> {
         scoped_get_repository_ssh_host_trust(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryHostTrustPath {
@@ -10012,7 +10034,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|Json(response)| response)
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn repository_ssh_host_trust_delete(
@@ -10021,7 +10043,7 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         host_trust_id: String,
         request: DeleteRepositorySshHostTrustRequest,
-    ) -> std::result::Result<(), server_api::RepositoryApiError> {
+    ) -> std::result::Result<(), server_api::RepositoryAccessApiError> {
         scoped_delete_repository_ssh_host_trust(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRepositoryHostTrustPath {
@@ -10033,7 +10055,7 @@ impl server_api::ServerApi for ServerApiContractService {
         )
         .await
         .map(|_| ())
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(ApiError::into_repository_access_api_error)
     }
 
     async fn workspace_config_tree(
@@ -14456,8 +14478,10 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         workspace_id: String,
         runtime_id: String,
-    ) -> std::result::Result<server_api::WorkingDirectoryListResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryListResponse,
+        server_api::WorkdirManagementApiError,
+    > {
         let Json(response) = scoped_list_runtime_working_directories(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedRuntimePath {
@@ -14466,7 +14490,11 @@ impl server_api::ServerApi for ServerApiContractService {
             }),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::List,
+            )
+        })?;
         Ok(response)
     }
 
@@ -14477,7 +14505,7 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::WorkingDirectoryCreateRequest,
     ) -> std::result::Result<
         server_api::WorkingDirectoryCreateResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         let (_, Json(response)) = scoped_create_runtime_working_directory(
             State(self.workspace_api()?.clone()),
@@ -14488,7 +14516,11 @@ impl server_api::ServerApi for ServerApiContractService {
             Json(request),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Create,
+            )
+        })?;
         Ok(response)
     }
 
@@ -14499,7 +14531,7 @@ impl server_api::ServerApi for ServerApiContractService {
         working_directory_id: String,
     ) -> std::result::Result<
         server_api::WorkingDirectoryDetailResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         let Json(response) = scoped_runtime_working_directory_detail(
             State(self.workspace_api()?.clone()),
@@ -14510,7 +14542,11 @@ impl server_api::ServerApi for ServerApiContractService {
             }),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Detail,
+            )
+        })?;
         Ok(response)
     }
 
@@ -14523,7 +14559,7 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::WorkingDirectoryRemovalRequest,
     ) -> std::result::Result<
         server_api::WorkingDirectoryRemovalResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         cleanup_runtime_working_directory_contract(
             self.workspace_api()?.clone(),
@@ -14534,7 +14570,11 @@ impl server_api::ServerApi for ServerApiContractService {
             request,
         )
         .await
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Cleanup,
+            )
+        })
     }
 
     async fn plugin_host(
@@ -14735,62 +14775,76 @@ impl server_api::ServerApi for ServerApiContractService {
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
-    ) -> std::result::Result<server_api::DriveEntry, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveEntry, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::root(api, &context, &workspace_id).await
+        drive::root(api, &context, &workspace_id)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::Root))
     }
     async fn drive_capabilities(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
-    ) -> std::result::Result<server_api::DriveCapabilities, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveCapabilities, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::capabilities(api, &context, &workspace_id).await
+        drive::capabilities(api, &context, &workspace_id)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::Capabilities))
     }
     async fn drive_metadata(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         query: server_api::DriveEntryQuery,
-    ) -> std::result::Result<server_api::DriveEntry, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveEntry, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::metadata(api, &context, &workspace_id, query).await
+        drive::metadata(api, &context, &workspace_id, query)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::Metadata))
     }
     async fn drive_list(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         query: server_api::DriveListQuery,
-    ) -> std::result::Result<server_api::DriveListResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveListResponse, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::list(api, &context, &workspace_id, query).await
+        drive::list(api, &context, &workspace_id, query)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::List))
     }
     async fn drive_search(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         query: server_api::DriveSearchQuery,
-    ) -> std::result::Result<server_api::DriveListResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveListResponse, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::search(api, &context, &workspace_id, query).await
+        drive::search(api, &context, &workspace_id, query)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::Search))
     }
     async fn drive_read_text(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         query: server_api::DriveReadTextQuery,
-    ) -> std::result::Result<server_api::DriveReadTextResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveReadTextResponse, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::read_text(api, &context, &workspace_id, query).await
+        drive::read_text(api, &context, &workspace_id, query)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::ReadText))
     }
     async fn drive_read_chunk(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         query: server_api::DriveReadChunkQuery,
-    ) -> std::result::Result<server_api::BinaryBody, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::BinaryBody, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::read_chunk(api, &context, &workspace_id, query).await
+        drive::read_chunk(api, &context, &workspace_id, query)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::ReadChunk))
     }
     async fn drive_download(
         &self,
@@ -14799,19 +14853,23 @@ impl server_api::ServerApi for ServerApiContractService {
         query: server_api::DriveDownloadQuery,
     ) -> std::result::Result<
         server_api::server_api_responses::DriveDownload,
-        server_api::DriveApiError,
+        server_api::DriveHttpApiError,
     > {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::download(api, &context, &workspace_id, query).await
+        drive::download(api, &context, &workspace_id, query)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::Download))
     }
     async fn drive_mutate(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::DriveMutationRequest,
-    ) -> std::result::Result<server_api::DriveMutationResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveMutationResponse, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::mutate(api, &context, &workspace_id, request).await
+        drive::mutate(api, &context, &workspace_id, request)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::Mutate))
     }
     async fn drive_upload(
         &self,
@@ -14819,46 +14877,59 @@ impl server_api::ServerApi for ServerApiContractService {
         workspace_id: String,
         query: server_api::DriveUploadQuery,
         body: server_api::BinaryBody,
-    ) -> std::result::Result<server_api::DriveMutationResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveMutationResponse, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::upload(api, &context, &workspace_id, query, body).await
+        drive::upload(api, &context, &workspace_id, query, body)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::Upload))
     }
     async fn drive_request_status(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         request_id: String,
-    ) -> std::result::Result<server_api::DriveRequestStatusResponse, server_api::DriveApiError>
+    ) -> std::result::Result<server_api::DriveRequestStatusResponse, server_api::DriveHttpApiError>
     {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive::request_status(api, &context, &workspace_id, request_id).await
+        drive::request_status(api, &context, &workspace_id, request_id)
+            .await
+            .map_err(|error| {
+                drive::http_error(error, server_api::DriveHttpOperation::RequestStatus)
+            })
     }
     async fn drive_grant_create(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::DriveGrantCreateRequest,
-    ) -> std::result::Result<server_api::DriveGrantResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveGrantResponse, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive_grants::create_grant(api, &context, &workspace_id, request).await
+        drive_grants::create_grant(api, &context, &workspace_id, request)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::GrantCreate))
     }
     async fn drive_grant_revoke(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         grant_id: String,
-    ) -> std::result::Result<server_api::DriveGrantResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveGrantResponse, server_api::DriveHttpApiError> {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive_grants::revoke_grant(api, &context, &workspace_id, &grant_id).await
+        drive_grants::revoke_grant(api, &context, &workspace_id, &grant_id)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::GrantRevoke))
     }
     async fn drive_grant_list(
         &self,
         context: server_api::ServerRequestContext,
         workspace_id: String,
         query: server_api::DriveGrantListQuery,
-    ) -> std::result::Result<server_api::DriveGrantListResponse, server_api::DriveApiError> {
+    ) -> std::result::Result<server_api::DriveGrantListResponse, server_api::DriveHttpApiError>
+    {
         let api = self.workspace_api().map_err(|_| drive::failure(404))?;
-        drive_grants::list_grants(api, &context, &workspace_id, query).await
+        drive_grants::list_grants(api, &context, &workspace_id, query)
+            .await
+            .map_err(|error| drive::http_error(error, server_api::DriveHttpOperation::GrantList))
     }
 
     async fn current_worker_workspace_config_get(
@@ -15044,7 +15115,7 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CurrentWorkerWorkdirAttachRequest,
     ) -> std::result::Result<
         server_api::CurrentWorkerWorkdirAttachmentResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         let Json(response) = scoped_attach_current_worker_workdir(
             State(self.workspace_api()?.clone()),
@@ -15056,7 +15127,11 @@ impl server_api::ServerApi for ServerApiContractService {
             }),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Attach,
+            )
+        })?;
         Ok(response)
     }
 
@@ -15068,7 +15143,7 @@ impl server_api::ServerApi for ServerApiContractService {
         query: server_api::CurrentWorkerWorkdirDetachQuery,
     ) -> std::result::Result<
         server_api::CurrentWorkerWorkdirAttachmentResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         let Json(response) = scoped_detach_current_worker_workdir(
             State(self.workspace_api()?.clone()),
@@ -15077,7 +15152,11 @@ impl server_api::ServerApi for ServerApiContractService {
             query,
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Detach,
+            )
+        })?;
         Ok(response)
     }
 
@@ -15088,8 +15167,9 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::CurrentWorkerWorkdirOperationRequest,
     ) -> std::result::Result<
         server_api::CurrentWorkerWorkdirOperationResponse,
-        server_api::WorkdirOperationApiError,
+        server_api::WorkdirHttpApiError,
     > {
+        let operation = workdir::failure::WorkdirFailureOperation::from(&request.operation);
         let fallback_log = server_api::WorkdirOperationLogContext {
             operation: workdir_operation_label(&request.operation),
             stage: "worker_identity",
@@ -15110,7 +15190,7 @@ impl server_api::ServerApi for ServerApiContractService {
                 current_worker_contract_headers(&context).map_err(|error| {
                     let mut error = server_api::WorkdirOperationApiError::api(error);
                     error.workdir_log = Some(fallback_log);
-                    error
+                    server_api::WorkdirHttpApiError::from(error)
                 })?,
                 Json(WorkspaceWorkdirSessionOperationRequest {
                     target_workdir: request.target_workdir,
@@ -15128,7 +15208,7 @@ impl server_api::ServerApi for ServerApiContractService {
             Err(error) => {
                 let mut error = error.into_contract_error();
                 error.audit_failures = audit_failures;
-                Err(error)
+                Err(project_workdir_http_error(error, operation))
             }
         }
     }
@@ -15138,8 +15218,10 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         request: server_api::ExternalWorkdirGrantCreateRequest,
-    ) -> std::result::Result<server_api::ExternalWorkdirGrantResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::ExternalWorkdirGrantResponse,
+        server_api::WorkdirManagementApiError,
+    > {
         let (_, Json(response)) = scoped_create_external_workdir_grant(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
@@ -15147,7 +15229,11 @@ impl server_api::ServerApi for ServerApiContractService {
             Json(request),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::GrantCreate,
+            )
+        })?;
         Ok(response)
     }
 
@@ -15156,15 +15242,21 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         grant_id: String,
-    ) -> std::result::Result<server_api::ExternalWorkdirGrantResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::ExternalWorkdirGrantResponse,
+        server_api::WorkdirManagementApiError,
+    > {
         let Json(response) = scoped_get_external_workdir_grant(
             State(self.workspace_api()?.clone()),
             Extension(actor),
             AxumPath((workspace_id, grant_id)),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::GrantInspect,
+            )
+        })?;
         Ok(response)
     }
 
@@ -15173,29 +15265,41 @@ impl server_api::ServerApi for ServerApiContractService {
         actor: RequestActor,
         workspace_id: String,
         grant_id: String,
-    ) -> std::result::Result<server_api::ExternalWorkdirGrantResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::ExternalWorkdirGrantResponse,
+        server_api::WorkdirManagementApiError,
+    > {
         let Json(response) = scoped_revoke_external_workdir_grant(
             State(self.workspace_api()?.clone()),
             Extension(actor),
             AxumPath((workspace_id, grant_id)),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::GrantRevoke,
+            )
+        })?;
         Ok(response)
     }
 
     async fn workspace_workdir_list(
         &self,
         workspace_id: String,
-    ) -> std::result::Result<server_api::WorkingDirectoryListResponse, server_api::RepositoryApiError>
-    {
+    ) -> std::result::Result<
+        server_api::WorkingDirectoryListResponse,
+        server_api::WorkdirManagementApiError,
+    > {
         let Json(response) = scoped_list_working_directories(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::List,
+            )
+        })?;
         Ok(response)
     }
 
@@ -15205,7 +15309,7 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::WorkingDirectoryCreateRequest,
     ) -> std::result::Result<
         server_api::WorkingDirectoryCreateResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         let (_, Json(response)) = scoped_create_working_directory(
             State(self.workspace_api()?.clone()),
@@ -15213,7 +15317,11 @@ impl server_api::ServerApi for ServerApiContractService {
             Json(request),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Create,
+            )
+        })?;
         Ok(response)
     }
 
@@ -15223,7 +15331,7 @@ impl server_api::ServerApi for ServerApiContractService {
         working_directory_id: String,
     ) -> std::result::Result<
         server_api::WorkingDirectoryDetailResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         let Json(response) = scoped_working_directory_detail(
             State(self.workspace_api()?.clone()),
@@ -15233,7 +15341,11 @@ impl server_api::ServerApi for ServerApiContractService {
             }),
         )
         .await
-        .map_err(ApiError::into_repository_api_error)?;
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Detail,
+            )
+        })?;
         Ok(response)
     }
 
@@ -15245,7 +15357,7 @@ impl server_api::ServerApi for ServerApiContractService {
         request: server_api::WorkingDirectoryRemovalRequest,
     ) -> std::result::Result<
         server_api::WorkingDirectoryRemovalResponse,
-        server_api::RepositoryApiError,
+        server_api::WorkdirManagementApiError,
     > {
         cleanup_working_directory_contract(
             self.workspace_api()?.clone(),
@@ -15255,7 +15367,11 @@ impl server_api::ServerApi for ServerApiContractService {
             request,
         )
         .await
-        .map_err(ApiError::into_repository_api_error)
+        .map_err(|error| {
+            error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::Cleanup,
+            )
+        })
     }
 }
 
@@ -15441,8 +15557,8 @@ async fn log_failed_api_response(request: Request, next: Next) -> Response {
             .or_else(|| {
                 response
                     .extensions()
-                    .get::<Arc<server_api::WorkdirOperationApiError>>()
-                    .map(|error| ApiErrorLog::from_workdir_operation_error(error, status))
+                    .get::<Arc<server_api::WorkdirHttpApiError>>()
+                    .map(|error| ApiErrorLog::from_workdir_operation_error(error.legacy(), status))
             });
         let error = response
             .extensions()
@@ -17170,7 +17286,7 @@ async fn compensate_manual_ticket_worker_binding(
         .runtime
         .replace_worker_workdir_attachments(worker, original_attachments)
     {
-        Ok(result) if result.state == InternalWorkerOperationState::Accepted => {}
+        Ok(result) if result.status == crate::hosts::RuntimeOperationStatus::Accepted => {}
         Ok(result) => {
             diagnostics.push(spawn_compensation_diagnostic(
                 "manual_worker_runtime_attachment_rollback_failed",
@@ -17470,7 +17586,16 @@ async fn start_manual_ticket_worker_assignment_on_host(
         .replace_worker_workdir_attachments(&worker, binding.runtime_attachments.clone())
         .map_err(|error| error.into_error());
     match replacement {
-        Ok(result) if result.state == InternalWorkerOperationState::Accepted => {}
+        Ok(result) if result.status == crate::hosts::RuntimeOperationStatus::Accepted => {}
+        Ok(result) if result.status == crate::hosts::RuntimeOperationStatus::Unknown => {
+            // The Runtime may have committed. Keep the pending binding and never
+            // start a compensation restore on an unconfirmed attachment mutation.
+            return Err(Error::WorkdirAttachmentSyncFailed {
+                runtime_id: worker.runtime_id.clone(),
+                observation: Box::new(result),
+            }
+            .into());
+        }
         Ok(result) => {
             let diagnostics = compensate_manual_ticket_worker_binding(
                 api,
@@ -19869,6 +19994,7 @@ fn remap_source_ref_error(error: ApiError) -> ApiError {
         diagnostics,
         session_registration_cause,
         session_registration_source,
+        attachment_failures,
     } = error;
     match error {
         Error::RuntimeOperationFailed {
@@ -19886,6 +20012,7 @@ fn remap_source_ref_error(error: ApiError) -> ApiError {
             diagnostics,
             session_registration_cause,
             session_registration_source,
+            attachment_failures,
         },
     }
 }
@@ -19957,6 +20084,7 @@ fn require_assigned_workdir_source(
     }
     let diagnostic = last_diagnostic.unwrap_or_else(|| {
         worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+            reason: None,
             code: "merge_request_source_workdir_unavailable".to_string(),
             message: "No attached Coder Workdir could be observed".to_string(),
         }
@@ -19978,6 +20106,7 @@ fn validate_assigned_workdir_source(
     if workdir.repository_id != repository_id {
         return Err(
             worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                reason: None,
                 code: "source_workdir_repository_mismatch".to_string(),
                 message: "Current Coder Workdir belongs to a different Repository".to_string(),
             },
@@ -19986,6 +20115,7 @@ fn validate_assigned_workdir_source(
     if workdir.cleanliness.as_deref() != Some("clean") {
         return Err(
             worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                reason: None,
                 code: "source_workdir_dirty".to_string(),
                 message: "Current Coder Workdir must be clean".to_string(),
             },
@@ -20005,6 +20135,7 @@ fn validate_assigned_workdir_source(
     if !workdir_selector_matches || workdir.current_ref.as_deref() != Some(resolved_ref) {
         return Err(
             worker_runtime::working_directory::WorkingDirectoryDiagnostic {
+                reason: None,
                 code: "source_workdir_ref_mismatch".to_string(),
                 message: "Current Coder Workdir selector and HEAD do not match the provider-published source ref".to_string(),
             },
@@ -20014,8 +20145,9 @@ fn validate_assigned_workdir_source(
 }
 
 fn repository_merge_evidence_error(error: RepositoryLookupError) -> ApiError {
-    Error::InvalidInput(format!(
-        "repository merge evidence validation failed: {error:?}"
+    Error::from(crate::repository_failure::RepositoryFailure::new(
+        crate::repository_failure::RepositoryFailureOperation::ObserveMergeTarget,
+        error,
     ))
     .into()
 }
@@ -22240,26 +22372,52 @@ async fn open_current_worker_workdir_session_locked(
             })
             .await?;
         let expired = external_workdir_grant_is_expired(&grant)?;
+        let mut audit = None;
         if expired {
-            grant = fence_external_workdir_grant_expired(api, grant_id)
+            (grant, audit) = fence_external_workdir_grant_expired(api, grant_id)
                 .await
                 .map_err(|error| error.error)?;
         }
-        if matches!(grant.status.as_str(), "revoked" | "expired") {
-            cleanup_external_workdir_attachments_with_lock(
+        let cleanup = if matches!(grant.status.as_str(), "revoked" | "expired") {
+            let cleanup = cleanup_external_workdir_attachments_with_lock(
                 api,
                 &grant.workdir_id,
                 Some((worker, session_guard)),
+                audit,
             )
-            .await
-            .map_err(|error| error.error)?;
-            cancel_external_workdir_expiry(api, grant_id);
-        }
+            .await;
+            if cleanup.is_ok() {
+                cancel_external_workdir_expiry(api, grant_id);
+            }
+            cleanup.err()
+        } else {
+            None
+        };
         if grant.status != "online" {
-            return Err(Error::RuntimeOperationFailed {
+            let source = Error::RuntimeOperationFailed {
                 runtime_id: "workspace-backend".to_string(),
                 code: format!("external_workdir_provider_{}", grant.status),
                 message: "External Workdir provider is not online".to_string(),
+            };
+            let refusal = if matches!(grant.status.as_str(), "revoked" | "expired") {
+                Error::ExternalWorkdirObservationFailed {
+                    operation: workdir::management_failure::WorkdirManagementOperation::Attach,
+                    reason: if grant.status == "expired" {
+                        workdir::management_failure::WorkdirManagementReason::GrantExpired
+                    } else {
+                        workdir::management_failure::WorkdirManagementReason::GrantRevoked
+                    },
+                    source: Box::new(source),
+                }
+            } else {
+                source
+            };
+            return Err(match cleanup {
+                Some(cleanup) => Error::ExternalWorkdirCleanupFailed {
+                    primary: Box::new(refusal),
+                    supplementary: vec![cleanup.error],
+                },
+                None => refusal,
             });
         }
         let connection = api
@@ -22418,10 +22576,11 @@ async fn open_current_worker_workdir_session_locked(
         replaced
             .close()
             .await
-            .map_err(|error| Error::RuntimeOperationFailed {
+            .map_err(|error| Error::WorkdirSessionCloseFailed {
                 runtime_id: worker.runtime_id.clone(),
-                code: "duplicate_workdir_session_close_failed".to_string(),
-                message: error.to_string(),
+                failure: crate::workdir_cleanup_failure::WorkdirCleanupFailure::SessionCloses(
+                    vec![error],
+                ),
             })?;
     }
     Ok(session)
@@ -22445,10 +22604,9 @@ async fn close_current_worker_attachment_session_locked(
             }],
         )
         .await
-        .map_err(|message| Error::RuntimeOperationFailed {
+        .map_err(|failure| Error::WorkdirSessionCloseFailed {
             runtime_id: worker.runtime_id.clone(),
-            code: "workdir_session_close_failed".to_string(),
-            message,
+            failure,
         })?;
     }
     Ok(())
@@ -22461,10 +22619,9 @@ async fn close_current_worker_command_sessions_for_alias_locked(
 ) -> Result<()> {
     close_worker_workdir_command_sessions_for_alias(&api.workdir_sessions, worker, attachment_alias)
         .await
-        .map_err(|message| Error::RuntimeOperationFailed {
+        .map_err(|failure| Error::WorkdirSessionCloseFailed {
             runtime_id: worker.runtime_id.clone(),
-            code: "workdir_session_close_failed".to_string(),
-            message,
+            failure,
         })
 }
 
@@ -22474,10 +22631,9 @@ async fn close_current_worker_session_locked(
 ) -> Result<()> {
     close_worker_workdir_sessions(&api.workdir_sessions, worker)
         .await
-        .map_err(|message| Error::RuntimeOperationFailed {
+        .map_err(|failure| Error::WorkdirSessionCloseFailed {
             runtime_id: worker.runtime_id.clone(),
-            code: "workdir_session_close_failed".to_string(),
-            message,
+            failure,
         })
 }
 
@@ -22515,11 +22671,21 @@ fn prepare_runtime_worker_workdir_attachments(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<Vec<LogicalWorkdirAttachment>> {
+    prepare_runtime_worker_workdir_attachments_excluding(api, worker, None)
+}
+
+fn prepare_runtime_worker_workdir_attachments_excluding(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    excluded_workdir: Option<&str>,
+) -> ApiResult<Vec<LogicalWorkdirAttachment>> {
     let attachments = api
         .store
         .list_worker_workdir_links(&api.config.workspace_id, worker)?
         .into_iter()
-        .filter(|link| link.unlinked_at.is_none())
+        .filter(|link| {
+            link.unlinked_at.is_none() && Some(link.workdir_id.as_str()) != excluded_workdir
+        })
         .filter(|link| {
             api.store
                 .get_workdir_registry(&api.config.workspace_id, &link.workdir_id)
@@ -22569,15 +22735,10 @@ fn replace_runtime_worker_workdir_attachments(
         .runtime
         .replace_worker_workdir_attachments(worker, attachments)
         .map_err(RuntimeRegistryError::into_error)?;
-    if result.state != InternalWorkerOperationState::Accepted {
-        return Err(Error::RuntimeOperationFailed {
+    if result.status != crate::hosts::RuntimeOperationStatus::Accepted {
+        return Err(Error::WorkdirAttachmentSyncFailed {
             runtime_id: worker.runtime_id.clone(),
-            code: "worker_workdir_attachments_replace_failed".to_string(),
-            message: result
-                .diagnostics
-                .first()
-                .map(|diagnostic| diagnostic.message.clone())
-                .unwrap_or_else(|| "Runtime rejected Workdir attachment persistence".to_string()),
+            observation: Box::new(result),
         }
         .into());
     }
@@ -22712,25 +22873,6 @@ async fn scoped_submit_backend_job_result(
         .await
 }
 
-async fn detach_worker_workdir_stage_locked(
-    api: &WorkspaceApi,
-    worker: &RuntimeWorkerRef,
-    workdir_id: &str,
-    session_guard: &Arc<tokio::sync::OwnedMutexGuard<()>>,
-) -> Result<Option<WorkerWorkdirLinkRecord>> {
-    let worker = worker.clone();
-    let workdir_id = workdir_id.to_string();
-    run_worker_workdir_db_stage_locked(api, session_guard, move |api| {
-        api.store.detach_worker_workdir(
-            &api.config.workspace_id,
-            &worker,
-            Some(&workdir_id),
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        )
-    })
-    .await
-}
-
 async fn import_current_worker_workdir_observation(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -22832,6 +22974,9 @@ async fn scoped_attach_current_worker_workdir(
     headers: HeaderMap,
     Json(request): Json<AttachCurrentWorkerWorkdirRequest>,
 ) -> ApiResult<Json<server_api::CurrentWorkerWorkdirAttachmentResponse>> {
+    use workdir::management_failure::{
+        WorkdirManagementOperation as Op, WorkdirManagementReason as Reason,
+    };
     let stage_api = api.clone();
     let worker = api
         .host_executors
@@ -22866,10 +23011,16 @@ async fn scoped_attach_current_worker_workdir(
                 .list_workdir_registry(&api.config.workspace_id, 10_000)?
                 .into_iter()
                 .find(|workdir| workdir.workdir_id == workdir_id)
-                .ok_or_else(|| Error::RuntimeOperationFailed {
-                    runtime_id: worker.runtime_id.clone(),
-                    code: "working_directory_not_found".to_string(),
-                    message: format!("unknown Workdir `{workdir_id}`"),
+                .ok_or_else(|| {
+                    ApiError::workdir_management_source(
+                        Error::RuntimeOperationFailed {
+                            runtime_id: worker.runtime_id.clone(),
+                            code: "working_directory_not_found".to_string(),
+                            message: format!("unknown Workdir `{workdir_id}`"),
+                        },
+                        Op::Attach,
+                        Reason::AttachmentRegistryNotFound,
+                    )
                 })?;
             // A failed removal must not prevent its owner from attaching a still usable
             // repository checkout to resolve current blockers. Runtime binding validates
@@ -22878,28 +23029,40 @@ async fn scoped_attach_current_worker_workdir(
             let repository_retry = workdir.materialization_status == "pending"
                 && matches!(workdir.source, WorkdirRegistrySource::Repository { .. });
             if workdir.materialization_status != "present" && !repository_retry {
-                return Err(Error::WorkdirAttachmentConflict(format!(
-                    "Workdir `{workdir_id}` is not available for attachment ({})",
-                    workdir.materialization_status
-                ))
-                .into());
+                return Err(ApiError::workdir_management_source(
+                    Error::WorkdirAttachmentConflict(format!(
+                        "Workdir `{workdir_id}` is not available for attachment ({})",
+                        workdir.materialization_status
+                    )),
+                    Op::Attach,
+                    Reason::AttachmentNotAvailable,
+                ));
             }
             match &workdir.source {
                 WorkdirRegistrySource::Repository { .. } => {}
                 WorkdirRegistrySource::WorkspaceConfig { .. } => {
-                    return Err(Error::WorkspacePermissionDenied(
-                        "Use the grant-bound Workspace config attachment operation".into(),
-                    )
-                    .into());
+                    return Err(ApiError::workdir_management_source(
+                        Error::WorkspacePermissionDenied(
+                            "Use the grant-bound Workspace config attachment operation".into(),
+                        ),
+                        Op::Attach,
+                        Reason::AttachmentGrantBoundRequired,
+                    ));
                 }
                 WorkdirRegistrySource::ExternalGrant { grant_id } => {
                     let grant = api
                         .store
                         .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
-                        .ok_or_else(|| Error::RuntimeOperationFailed {
-                            runtime_id: "external-workdir-provider".to_string(),
-                            code: "external_workdir_unavailable".to_string(),
-                            message: "External Workdir grant is unavailable".to_string(),
+                        .ok_or_else(|| {
+                            ApiError::workdir_management_source(
+                                Error::RuntimeOperationFailed {
+                                    runtime_id: "external-workdir-provider".to_string(),
+                                    code: "external_workdir_unavailable".to_string(),
+                                    message: "External Workdir grant is unavailable".to_string(),
+                                },
+                                Op::Attach,
+                                Reason::ExternalGrantUnavailable,
+                            )
                         })?;
                     let grant_expired = external_workdir_grant_is_expired(&grant)?;
                     let online = api
@@ -22916,12 +23079,16 @@ async fn scoped_attach_current_worker_workdir(
                                     .is_none_or(|expires_at| expires_at > Utc::now())
                         });
                     if grant.status != "online" || grant_expired || !online {
-                        return Err(Error::RuntimeOperationFailed {
-                            runtime_id: "external-workdir-provider".to_string(),
-                            code: "external_workdir_unavailable".to_string(),
-                            message: "External Workdir provider is offline or expired".to_string(),
-                        }
-                        .into());
+                        return Err(ApiError::workdir_management_source(
+                            Error::RuntimeOperationFailed {
+                                runtime_id: "external-workdir-provider".to_string(),
+                                code: "external_workdir_unavailable".to_string(),
+                                message: "External Workdir provider is offline or expired"
+                                    .to_string(),
+                            },
+                            Op::Attach,
+                            Reason::ExternalGrantUnavailable,
+                        ));
                     }
                 }
             }
@@ -22984,7 +23151,7 @@ async fn scoped_attach_current_worker_workdir(
         api.worker_projection
             .refresh_async(&worker)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(|error| ApiError::attachment_projection_failure(error, Op::Attach))?;
         return Ok(Json(server_api::CurrentWorkerWorkdirAttachmentResponse {
             workspace_id: api.config.workspace_id.clone(),
             alias: link.alias.clone(),
@@ -23023,9 +23190,17 @@ async fn scoped_attach_current_worker_workdir(
     if let Err(error) =
         sync_runtime_worker_workdir_attachments_locked(&api, &worker, &_session_guard).await
     {
-        let _ =
-            detach_worker_workdir_stage_locked(&api, &worker, workdir_id, &_session_guard).await;
-        return Err(error);
+        return Err(attachment_failure::compensate_attachment(
+            &api,
+            &worker,
+            &link,
+            &_session_guard,
+            attachment_failure::Compensation::DetachNewLink,
+            false,
+            false,
+            error,
+        )
+        .await);
     }
     let environment = match current_worker_attachment_environment_locked(
         &api,
@@ -23039,23 +23214,36 @@ async fn scoped_attach_current_worker_workdir(
     {
         Ok(environment) => environment,
         Err(error) => {
-            let _ = detach_worker_workdir_stage_locked(&api, &worker, workdir_id, &_session_guard)
-                .await;
-            let _ = sync_runtime_worker_workdir_attachments_locked(&api, &worker, &_session_guard)
-                .await;
-            return Err(error.into());
+            return Err(attachment_failure::compensate_attachment(
+                &api,
+                &worker,
+                &link,
+                &_session_guard,
+                attachment_failure::Compensation::DetachNewLink,
+                true,
+                false,
+                error.into(),
+            )
+            .await);
         }
     };
     if let Err(error) = api
         .worker_projection
         .refresh_async(&worker)
         .await
-        .map_err(ApiError::from)
+        .map_err(|error| ApiError::attachment_projection_failure(error, Op::Attach))
     {
-        detach_worker_workdir_stage_locked(&api, &worker, workdir_id, &_session_guard).await?;
-        sync_runtime_worker_workdir_attachments_locked(&api, &worker, &_session_guard).await?;
-        refresh_current_worker_session_locked(&api, &worker, &_session_guard).await?;
-        return Err(error);
+        return Err(attachment_failure::compensate_attachment(
+            &api,
+            &worker,
+            &link,
+            &_session_guard,
+            attachment_failure::Compensation::DetachNewLink,
+            true,
+            true,
+            error,
+        )
+        .await);
     }
     Ok(Json(server_api::CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -23256,10 +23444,11 @@ async fn detach_current_worker_workdir(
     api.runtime
         .close_owned_workdir_sessions(worker, Some(&link.connection_id))
         .await
-        .map_err(|error| Error::RuntimeOperationFailed {
+        .map_err(|error| Error::WorkdirSessionCloseFailed {
             runtime_id: worker.runtime_id.clone(),
-            code: "workdir_session_close_unconfirmed".into(),
-            message: error.to_string(),
+            failure: crate::workdir_cleanup_failure::WorkdirCleanupFailure::SessionCloses(vec![
+                error,
+            ]),
         })?;
     close_current_worker_attachment_session_locked(api, worker).await?;
     close_current_worker_command_sessions_for_alias_locked(api, worker, alias).await?;
@@ -23279,8 +23468,17 @@ async fn detach_current_worker_workdir(
     if let Err(error) =
         sync_runtime_worker_workdir_attachments_locked(api, worker, &_session_guard).await
     {
-        restore_worker_workdir_connection_stage_locked(api, &link, &_session_guard).await?;
-        return Err(error);
+        return Err(attachment_failure::compensate_attachment(
+            api,
+            worker,
+            &link,
+            &_session_guard,
+            attachment_failure::Compensation::RestorePreviousLink,
+            false,
+            false,
+            error,
+        )
+        .await);
     }
     let stage_api = api.clone();
     let stage_worker = worker.clone();
@@ -23294,20 +23492,40 @@ async fn detach_current_worker_workdir(
             open_current_worker_workdir_session_locked(api, worker, &remaining[0], &_session_guard)
                 .await
     {
-        restore_worker_workdir_connection_stage_locked(api, &link, &_session_guard).await?;
-        let _ = sync_runtime_worker_workdir_attachments_locked(api, worker, &_session_guard).await;
-        return Err(error.into());
+        return Err(attachment_failure::compensate_attachment(
+            api,
+            worker,
+            &link,
+            &_session_guard,
+            attachment_failure::Compensation::RestorePreviousLink,
+            true,
+            false,
+            error.into(),
+        )
+        .await);
     }
     if let Err(error) = api
         .worker_projection
         .refresh_async(&worker)
         .await
-        .map_err(ApiError::from)
+        .map_err(|error| {
+            ApiError::attachment_projection_failure(
+                error,
+                workdir::management_failure::WorkdirManagementOperation::Detach,
+            )
+        })
     {
-        restore_worker_workdir_connection_stage_locked(api, &link, &_session_guard).await?;
-        sync_runtime_worker_workdir_attachments_locked(api, worker, &_session_guard).await?;
-        refresh_current_worker_session_locked(api, worker, &_session_guard).await?;
-        return Err(error);
+        return Err(attachment_failure::compensate_attachment(
+            api,
+            worker,
+            &link,
+            &_session_guard,
+            attachment_failure::Compensation::RestorePreviousLink,
+            true,
+            true,
+            error,
+        )
+        .await);
     }
     Ok(server_api::CurrentWorkerWorkdirAttachmentResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -23371,18 +23589,22 @@ impl InternalWorkdirOperationError {
     fn into_contract_error(self) -> server_api::WorkdirOperationApiError {
         match self {
             Self::Api(error) => {
-                let reason = match &error.error {
-                    Error::WorkdirSessionOpenFailed { transport, .. } => transport.denial_reason,
-                    _ => None,
-                };
-                let failure_reason = match &error.error {
-                    Error::WorkdirSessionOpenFailed { transport, .. } => transport.failure_reason,
+                let failure_details = match &error.error {
+                    Error::WorkdirSessionOpenFailed { transport, .. } => {
+                        Some(workdir::failure::WorkdirFailureDetails {
+                            operation: workdir::failure::WorkdirFailureOperation::SessionOpen,
+                            classification: transport.code,
+                            denial_reason: transport.denial_reason,
+                            failure_reason: transport.failure_reason,
+                        })
+                    }
                     _ => None,
                 };
                 let mut error =
                     server_api::WorkdirOperationApiError::api(error.into_repository_api_error());
-                error.denial_reason = reason;
-                error.failure_reason = failure_reason;
+                error.denial_reason = failure_details.and_then(|details| details.denial_reason);
+                error.failure_reason = failure_details.and_then(|details| details.failure_reason);
+                error.failure_details = failure_details;
                 error
             }
             Self::Provider(error) => server_api::WorkdirOperationApiError::provider(error),
@@ -23410,6 +23632,39 @@ impl From<Error> for InternalWorkdirOperationError {
 impl From<WorkdirTransportError> for InternalWorkdirOperationError {
     fn from(error: WorkdirTransportError) -> Self {
         Self::Provider(error)
+    }
+}
+
+fn project_workdir_http_error(
+    error: server_api::WorkdirOperationApiError,
+    operation: workdir::failure::WorkdirFailureOperation,
+) -> server_api::WorkdirHttpApiError {
+    use workdir::failure::{WorkdirFailureDetails, WorkdirFailureVisibility};
+    let details = match error.failure_details {
+        Some(details) => details,
+        None => {
+            let Some(classification) = error.code else {
+                return error.into();
+            };
+            WorkdirFailureDetails {
+                operation,
+                classification,
+                denial_reason: error.denial_reason,
+                failure_reason: error.failure_reason,
+            }
+        }
+    };
+    let projected = error_contract::FailureFacts::new(details).and_then(|facts| {
+        error_contract::project_failure::<error_contract::Browser, _>(
+            &facts,
+            &WorkdirFailureVisibility {
+                can_view_cause: true,
+            },
+        )
+    });
+    match projected {
+        Ok(projected) => server_api::WorkdirHttpApiError::projected(error, projected),
+        Err(_) => error.into(),
     }
 }
 
@@ -27558,6 +27813,8 @@ fn skill_api_error(error: skills::SkillError) -> ApiError {
                 message: format!("unknown Skill `{name}`"),
             },
             vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "skill_not_found".to_string(),
@@ -27769,10 +28026,7 @@ async fn scoped_create_repository(
                     (StatusCode::OK, true)
                 }
                 RepositoryInsertOutcome::Existing(_) => {
-                    return Err(Error::RepositoryConflict(format!(
-                "Repository key {repository_key} already exists with different registration intent"
-            ))
-            .into());
+                    return Err(Error::RepositoryRegistrationConflict { repository_key }.into());
                 }
             };
 
@@ -29294,6 +29548,56 @@ fn working_directory_diagnostics(
         .collect()
 }
 
+fn workdir_management_diagnostics(
+    diagnostics: Vec<RuntimeDiagnostic>,
+) -> Vec<server_api::WorkingDirectoryManagementDiagnostic> {
+    use error_contract::{Browser, FailureFacts, project_failure};
+    use protocol::startup_failure::StartupFailureAttachment;
+    use workdir::management_failure::WorkdirManagementVisibility;
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            use server_api::workdir_management_error::WorkdirManagementCause;
+            let cause = diagnostic
+                .workdir
+                .map(WorkdirManagementCause::Management)
+                .or_else(|| diagnostic.session.map(WorkdirManagementCause::Session));
+            let projected = cause.and_then(|cause| {
+                FailureFacts::new(cause)
+                    .and_then(|facts| {
+                        project_failure::<Browser, _>(
+                            &facts,
+                            &WorkdirManagementVisibility {
+                                can_view_cause: true,
+                            },
+                        )
+                    })
+                    .ok()
+            });
+            server_api::WorkingDirectoryManagementDiagnostic {
+                code: projected
+                    .as_ref()
+                    .map_or("workdir_diagnostic_unavailable", |p| p.identity().reason)
+                    .into(),
+                severity: match diagnostic.severity {
+                    HostDiagnosticSeverity::Info => server_api::DiagnosticSeverity::Info,
+                    HostDiagnosticSeverity::Warning => server_api::DiagnosticSeverity::Warning,
+                    HostDiagnosticSeverity::Error => server_api::DiagnosticSeverity::Error,
+                },
+                message: projected
+                    .as_ref()
+                    .map_or("Workdir diagnostic evidence is unavailable", |p| {
+                        p.explanation()
+                    })
+                    .into(),
+                failure: projected
+                    .as_ref()
+                    .and_then(|p| StartupFailureAttachment::from_projected(p).ok()),
+            }
+        })
+        .collect()
+}
+
 async fn require_active_workspace_runtime_binding(
     api: &WorkspaceApi,
     runtime_id: &str,
@@ -29323,7 +29627,7 @@ async fn scoped_list_runtime_working_directories(
             Ok(Json(BrowserWorkingDirectoryListResponse {
                 workspace_id: api.config.workspace_id.clone(),
                 items,
-                diagnostics: working_directory_diagnostics(diagnostics),
+                diagnostics: workdir_management_diagnostics(diagnostics),
             }))
         })
         .await
@@ -29518,7 +29822,12 @@ fn schedule_external_workdir_expiry(
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
                 Err(error) => {
-                    tracing::error!(grant_id = %task_grant_id, error = ?error, "Backend External Workdir expiry cleanup requires retry");
+                    external_grant_failure::cleanup_telemetry(&error);
+                    if external_grant_failure::outcome_unknown(&error) {
+                        // An unknown fence/observation mutation is not permission
+                        // to resend expiry or infer that cleanup is admitted.
+                        break;
+                    }
                     let stage_api = task_api.clone();
                     let stage_grant_id = task_grant_id.clone();
                     let retryable = task_api
@@ -29531,7 +29840,7 @@ fn schedule_external_workdir_expiry(
                             )
                         })
                         .await
-                        .map_or(true, |grant| grant.is_some());
+                        .map_or(false, |grant| grant.is_some());
                     if !retryable {
                         break;
                     }
@@ -29595,7 +29904,7 @@ async fn stop_external_workdir_provider(
 async fn fence_external_workdir_grant_expired(
     api: &WorkspaceApi,
     grant_id: &str,
-) -> ApiResult<ExternalWorkdirGrantRecord> {
+) -> ApiResult<(ExternalWorkdirGrantRecord, Option<ApiError>)> {
     let stage_api = api.clone();
     let grant_id = grant_id.to_string();
     api.store
@@ -29607,20 +29916,20 @@ async fn fence_external_workdir_grant_expired(
 fn fence_external_workdir_grant_expired_stage(
     api: &WorkspaceApi,
     grant_id: &str,
-) -> ApiResult<ExternalWorkdirGrantRecord> {
+) -> ApiResult<(ExternalWorkdirGrantRecord, Option<ApiError>)> {
     loop {
         let mut grant = api
             .store
             .get_external_workdir_grant(&api.config.workspace_id, grant_id)?
             .ok_or_else(|| Error::InvalidInput("Unknown External Workdir grant".to_string()))?;
         if matches!(grant.status.as_str(), "revoked" | "expired") {
-            return Ok(grant);
+            return Ok((grant, None));
         }
         let Some(expires_at) = external_workdir_expires_at(&grant)? else {
-            return Ok(grant);
+            return Ok((grant, None));
         };
         if expires_at > Utc::now() {
-            return Ok(grant);
+            return Ok((grant, None));
         }
         let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
         if !api.store.update_external_workdir_grant_state(
@@ -29634,32 +29943,42 @@ fn fence_external_workdir_grant_expired_stage(
             // A reconnect may advance generation between the read and fence.
             continue;
         }
-        api.store.record_external_workdir_audit(
-            &grant.workspace_id,
-            "system",
-            "workspace-backend",
-            "external_workdir_grant_expired",
-            &grant.grant_id,
-            None,
-            "expired",
-            &format!(
-                "workdir_id={} generation={}",
-                grant.workdir_id, grant.generation
-            ),
-            &updated_at,
-        )?;
+        let audit = api
+            .store
+            .record_external_workdir_audit(
+                &grant.workspace_id,
+                "system",
+                "workspace-backend",
+                "external_workdir_grant_expired",
+                &grant.grant_id,
+                None,
+                "expired",
+                &format!(
+                    "workdir_id={} generation={}",
+                    grant.workdir_id, grant.generation
+                ),
+                &updated_at,
+            )
+            .err()
+            .map(|error| {
+                external_grant_failure::attributed(
+                    error,
+                    workdir::management_failure::WorkdirManagementReason::GrantAuditFailed,
+                )
+            });
         grant.status = "expired".to_string();
         grant.updated_at = updated_at;
-        return Ok(grant);
+        return Ok((grant, audit));
     }
 }
 
 async fn expire_external_workdir_grant(api: &WorkspaceApi, grant_id: &str) -> ApiResult<bool> {
-    let grant = fence_external_workdir_grant_expired(api, grant_id).await?;
+    let (grant, audit) = fence_external_workdir_grant_expired(api, grant_id).await?;
     if !matches!(grant.status.as_str(), "revoked" | "expired") {
         return Ok(false);
     }
-    let cleanup = cleanup_external_workdir_attachments(api, &grant.workdir_id).await;
+    let cleanup =
+        cleanup_external_workdir_attachments_with_lock(api, &grant.workdir_id, None, audit).await;
     stop_external_workdir_provider(
         api,
         &grant,
@@ -29684,21 +30003,16 @@ async fn scoped_create_external_workdir_grant(
         || display_name.len() > 100
         || display_name.chars().any(char::is_control)
     {
-        return Err(Error::InvalidInput(
-            "External Workdir display name must be between 1 and 100 bytes and contain no control characters".to_string(),
-        ).into());
+        return Err(ApiError::workdir_management_source(Error::InvalidInput("Invalid External Workdir display name".into()), workdir::management_failure::WorkdirManagementOperation::GrantCreate, workdir::management_failure::WorkdirManagementReason::GrantDisplayNameInvalid));
     }
     if request
         .ttl_seconds
         .is_some_and(|ttl_seconds| !(60..=86_400).contains(&ttl_seconds))
     {
-        return Err(Error::InvalidInput(
-            "External Workdir ttl_seconds must be omitted or between 60 and 86400".to_string(),
-        )
-        .into());
+        return Err(ApiError::workdir_management_source(Error::InvalidInput("Invalid External Workdir expiry duration".into()), workdir::management_failure::WorkdirManagementOperation::GrantCreate, workdir::management_failure::WorkdirManagementReason::GrantTtlInvalid));
     }
     ExternalProviderInstanceId::new(request.provider_instance_id.clone())
-        .map_err(Error::InvalidInput)?;
+        .map_err(|message| ApiError::workdir_management_source(Error::InvalidInput(message), workdir::management_failure::WorkdirManagementOperation::GrantCreate, workdir::management_failure::WorkdirManagementReason::GrantProviderIdentityInvalid))?;
     let now = Utc::now();
     let created_at = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
     let expires_at = request
@@ -29745,15 +30059,26 @@ async fn scoped_create_external_workdir_grant(
     schedule_external_workdir_expiry(&api, &grant)?;
     Ok((
         StatusCode::CREATED,
-        Json(external_workdir_grant_response(&grant)?),
+        Json(external_workdir_grant_response(&api, &grant)?),
     ))
 
     }).await
 }
 
 fn external_workdir_grant_response(
+    api: &WorkspaceApi,
     grant: &ExternalWorkdirGrantRecord,
 ) -> Result<ExternalWorkdirGrantResponse> {
+    let fresh = api
+        .store
+        .get_external_workdir_grant(&grant.workspace_id, &grant.grant_id)?
+        .ok_or_else(|| {
+            Error::RegistryInconsistency(
+                "External Workdir grant disappeared during observation".into(),
+            )
+        })?;
+    let grant = &fresh;
+    let (cleanup_state, cleanup_failures) = external_grant_failure::observation(api, grant);
     Ok(ExternalWorkdirGrantResponse {
         grant_id: grant.grant_id.clone(),
         workspace_id: grant.workspace_id.clone(),
@@ -29764,10 +30089,34 @@ fn external_workdir_grant_response(
         expires_at: grant.expires_at.clone(),
         generation: grant.generation,
         status: grant.status.clone(),
+        cleanup_state,
+        cleanup_failures,
+        connection_observations: external_grant_failure::connection_observations(api, grant),
     })
 }
 
 async fn scoped_external_workdir_provider_ws(
+    api: State<WorkspaceApi>,
+    actor: Extension<RequestActor>,
+    path: AxumPath<(String, String)>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    match external_workdir_provider_upgrade(api, actor, path, ws).await {
+        Ok(response) => response,
+        Err(error) => {
+            let error = error.into_workdir_management_api_error(
+                workdir::management_failure::WorkdirManagementOperation::GrantConnect,
+            );
+            api_macros::axum::http_error_response(
+                StatusCode::from_u16(api_macros::HttpError::status_code(&error))
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                error,
+            )
+        }
+    }
+}
+
+async fn external_workdir_provider_upgrade(
     State(api): State<WorkspaceApi>,
     Extension(actor): Extension<RequestActor>,
     AxumPath((workspace_id, grant_id)): AxumPath<(String, String)>,
@@ -29780,24 +30129,41 @@ async fn scoped_external_workdir_provider_ws(
         validate_workspace_scope(&stage_api, &stage_workspace_id)?;
         let grant = stage_api.store
             .get_external_workdir_grant(&stage_workspace_id, &stage_grant_id)?
-            .ok_or_else(|| Error::InvalidInput("Unknown External Workdir grant".to_string()))?;
+            .ok_or_else(|| ApiError::workdir_management_source(Error::InvalidInput("Unknown External Workdir grant".into()), workdir::management_failure::WorkdirManagementOperation::GrantConnect, workdir::management_failure::WorkdirManagementReason::GrantNotFound))?;
         if grant.created_by != actor.account_id {
-            return Err(Error::WorkspacePermissionDenied(
-                "External Workdir provider connection must use the grant creator's authenticated client".to_string(),
-            ).into());
+            return Err(ApiError::workdir_management_source(Error::WorkspacePermissionDenied("External Workdir provider connection must use the grant creator's authenticated client".into()), workdir::management_failure::WorkdirManagementOperation::GrantConnect, workdir::management_failure::WorkdirManagementReason::GrantCreatorRequired));
         }
         Ok(grant)
     }).await?;
     let expired = external_workdir_grant_is_expired(&grant)?;
+    let mut audit = None;
     if expired {
-        grant = fence_external_workdir_grant_expired(&api, &grant_id).await?;
+        (grant, audit) = fence_external_workdir_grant_expired(&api, &grant_id).await?;
     }
     if matches!(grant.status.as_str(), "revoked" | "expired") {
-        cleanup_external_workdir_attachments(&api, &grant.workdir_id).await?;
-        cancel_external_workdir_expiry(&api, &grant_id);
-        return Err(
-            Error::InvalidInput(format!("External Workdir grant is {}", grant.status)).into(),
+        let cleanup =
+            cleanup_external_workdir_attachments_with_lock(&api, &grant.workdir_id, None, audit)
+                .await;
+        if cleanup.is_ok() {
+            cancel_external_workdir_expiry(&api, &grant_id);
+        }
+        let reason = if grant.status == "expired" {
+            workdir::management_failure::WorkdirManagementReason::GrantExpired
+        } else {
+            workdir::management_failure::WorkdirManagementReason::GrantRevoked
+        };
+        let mut refusal = ApiError::workdir_management_source(
+            Error::InvalidInput(format!("External Workdir grant is {}", grant.status)),
+            workdir::management_failure::WorkdirManagementOperation::GrantConnect,
+            reason,
         );
+        if let Err(error) = cleanup {
+            refusal.attachment_failures.push((
+                server_api::workdir_management_error::WorkdirAttachmentFailureStage::GrantCleanup,
+                error,
+            ));
+        }
+        return Err(refusal);
     }
     Ok(ws
         .max_message_size(workdir::external::MAX_EXTERNAL_PROVIDER_FRAME_BYTES)
@@ -29808,18 +30174,15 @@ async fn scoped_external_workdir_provider_ws(
 async fn send_external_workdir_server_frame(
     socket: &mut WebSocket,
     frame: &ExternalWorkdirServerFrame,
-) -> bool {
-    let Ok(text) = serde_json::to_string(frame) else {
-        return false;
-    };
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            socket.send(WsMessage::Text(text.into())),
-        )
-        .await,
-        Ok(Ok(()))
+) -> Result<()> {
+    let text = serde_json::to_string(frame).map_err(Error::ExternalWorkdirFrameEncoding)?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.send(WsMessage::Text(text.into())),
     )
+    .await
+    .map_err(Error::ExternalWorkdirTransportTimeout)?
+    .map_err(Error::ExternalWorkdirTransport)
 }
 
 async fn reject_external_workdir_provider(socket: &mut WebSocket, code: u16, mut reason: String) {
@@ -29857,10 +30220,30 @@ async fn serve_external_workdir_provider(
     initial_grant: ExternalWorkdirGrantRecord,
     mut socket: WebSocket,
 ) {
+    use server_api::ExternalWorkdirConnectionClosedReason as Closed;
+    use workdir::management_failure::WorkdirManagementReason as Reason;
     let registration_text =
         match tokio::time::timeout(std::time::Duration::from_secs(10), socket.next()).await {
             Ok(Some(Ok(WsMessage::Text(text)))) if text.len() <= 64 * 1024 => text,
-            _ => {
+            result => {
+                let error = match result {
+                    Err(error) => Error::ExternalWorkdirTransportTimeout(error),
+                    Ok(Some(Err(error))) => Error::ExternalWorkdirTransport(error),
+                    _ => Error::ExternalWorkdirConnectionClosed {
+                        reason: Reason::GrantConnectionProtocolFailed,
+                    },
+                };
+                external_grant_failure::observe_connection(
+                    &api,
+                    &initial_grant,
+                    initial_grant.generation,
+                    Closed::InvalidFrame,
+                    external_grant_failure::connection_error(
+                        error,
+                        Reason::GrantConnectionProtocolFailed,
+                    ),
+                )
+                .await;
                 reject_external_workdir_provider(
                     &mut socket,
                     1008,
@@ -29873,7 +30256,18 @@ async fn serve_external_workdir_provider(
     let registration_frame =
         match serde_json::from_str::<ExternalWorkdirProviderFrame>(&registration_text) {
             Ok(frame) => frame,
-            Err(_) => {
+            Err(error) => {
+                external_grant_failure::observe_connection(
+                    &api,
+                    &initial_grant,
+                    initial_grant.generation,
+                    Closed::InvalidFrame,
+                    external_grant_failure::connection_error(
+                        Error::ExternalWorkdirFrameDecoding(error),
+                        Reason::GrantConnectionProtocolFailed,
+                    ),
+                )
+                .await;
                 let reason = external_workdir_registration_parse_error(&registration_text);
                 reject_external_workdir_provider(&mut socket, 1002, reason).await;
                 return;
@@ -29884,6 +30278,17 @@ async fn serve_external_workdir_provider(
         ..
     } = registration_frame
     else {
+        external_grant_failure::observe_connection(
+            &api,
+            &initial_grant,
+            initial_grant.generation,
+            Closed::InvalidFrame,
+            Error::ExternalWorkdirConnectionClosed {
+                reason: Reason::GrantConnectionProtocolFailed,
+            }
+            .into(),
+        )
+        .await;
         reject_external_workdir_provider(
             &mut socket,
             1008,
@@ -29894,7 +30299,15 @@ async fn serve_external_workdir_provider(
     };
     let expected_capabilities = match external_workdir_capabilities(&initial_grant.permissions) {
         Ok(capabilities) => capabilities,
-        Err(_) => {
+        Err(error) => {
+            external_grant_failure::observe_connection(
+                &api,
+                &initial_grant,
+                initial_grant.generation,
+                Closed::ActivationFailed,
+                external_grant_failure::connection_error(error, Reason::GrantActivationFailed),
+            )
+            .await;
             reject_external_workdir_provider(
                 &mut socket,
                 1011,
@@ -29905,6 +30318,17 @@ async fn serve_external_workdir_provider(
         }
     };
     if registration.read_limits != workdir::BoundedReadLimits::EXTERNAL_DEFAULT {
+        external_grant_failure::observe_connection(
+            &api,
+            &initial_grant,
+            initial_grant.generation,
+            Closed::InvalidFrame,
+            Error::ExternalWorkdirConnectionClosed {
+                reason: Reason::GrantConnectionProtocolFailed,
+            }
+            .into(),
+        )
+        .await;
         let required = workdir::BoundedReadLimits::EXTERNAL_DEFAULT;
         reject_external_workdir_provider(
             &mut socket,
@@ -29926,6 +30350,17 @@ async fn serve_external_workdir_provider(
         || registration.capabilities != expected_capabilities
         || registration.generation == 0
     {
+        external_grant_failure::observe_connection(
+            &api,
+            &initial_grant,
+            initial_grant.generation,
+            Closed::InvalidFrame,
+            Error::ExternalWorkdirConnectionClosed {
+                reason: Reason::GrantConnectionProtocolFailed,
+            }
+            .into(),
+        )
+        .await;
         reject_external_workdir_provider(
             &mut socket,
             1008,
@@ -29945,18 +30380,45 @@ async fn serve_external_workdir_provider(
             let api = stage_api;
             let initial_grant = stage_grant;
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-            if !api
-                .store
-                .activate_external_workdir_grant(
-                    &initial_grant.workspace_id,
-                    &initial_grant.grant_id,
-                    &initial_grant.provider_instance_id,
-                    registration_generation,
-                    &now,
-                )
-                .unwrap_or(false)
-            {
-                return Ok(None);
+            let expires_at = match external_workdir_expires_at(&initial_grant) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _retained = external_grant_failure::save_connection(
+                        &api,
+                        &initial_grant,
+                        registration_generation,
+                        Closed::ActivationFailed,
+                        Some(external_grant_failure::connection_error(
+                            error,
+                            Reason::GrantActivationFailed,
+                        )),
+                    );
+                    return Ok(None);
+                }
+            };
+            let activated = api.store.activate_external_workdir_grant(
+                &initial_grant.workspace_id,
+                &initial_grant.grant_id,
+                &initial_grant.provider_instance_id,
+                registration_generation,
+                &now,
+            );
+            match activated {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) => {
+                    let _retained = external_grant_failure::save_connection(
+                        &api,
+                        &initial_grant,
+                        registration_generation,
+                        Closed::ActivationFailed,
+                        Some(external_grant_failure::connection_error(
+                            error,
+                            Reason::GrantActivationFailed,
+                        )),
+                    );
+                    return Ok(None);
+                }
             }
             if let Err(error) = api.store.record_external_workdir_audit(
                 &initial_grant.workspace_id,
@@ -29972,26 +30434,33 @@ async fn serve_external_workdir_provider(
                 ),
                 &now,
             ) {
-                let _ = api.store.update_external_workdir_grant_state(
+                let mut primary =
+                    external_grant_failure::connection_error(error, Reason::GrantAuditFailed);
+                if let Err(error) = api.store.update_external_workdir_grant_state(
                     &initial_grant.workspace_id,
                     &initial_grant.grant_id,
                     &initial_grant.provider_instance_id,
                     registration_generation,
                     "offline",
                     &now,
-                );
-                tracing::error!(
-                    grant_id = %initial_grant.grant_id,
-                    generation = registration_generation,
-                    %error,
-                    "failed to audit External Workdir provider activation"
+                ) {
+                    primary = external_grant_failure::combine(
+                        primary,
+                        external_grant_failure::connection_error(
+                            error,
+                            Reason::GrantConnectionStateFailed,
+                        ),
+                    );
+                }
+                let _retained = external_grant_failure::save_connection(
+                    &api,
+                    &initial_grant,
+                    registration_generation,
+                    Closed::ActivationFailed,
+                    Some(primary),
                 );
                 return Ok(None);
             }
-            let expires_at = match external_workdir_expires_at(&initial_grant) {
-                Ok(value) => value,
-                Err(_) => return Ok(None),
-            };
             let (sender, commands) = tokio::sync::mpsc::channel(32);
             let connection = Arc::new(ExternalProviderConnection {
                 grant_id: initial_grant.grant_id.clone(),
@@ -30012,6 +30481,18 @@ async fn serve_external_workdir_provider(
                 .connected(connection.clone())
                 .is_some()
             {
+                let _retained = external_grant_failure::save_connection(
+                    &api,
+                    &initial_grant,
+                    registration_generation,
+                    Closed::ActivationFailed,
+                    Some(external_grant_failure::connection_error(
+                        Error::WorkdirAttachmentConflict(
+                            "External provider registry already has a connection".into(),
+                        ),
+                        Reason::AttachmentConflict,
+                    )),
+                );
                 return Ok(None);
             }
             Ok(Some((connection, commands)))
@@ -30024,8 +30505,18 @@ async fn serve_external_workdir_provider(
             return;
         }
         Err(error) => {
-            tracing::error!(grant_id = %initial_grant.grant_id, %error,
-                "External Workdir provider activation stage failed");
+            api.external_workdir_providers
+                .lock()
+                .expect("External Workdir provider registry poisoned")
+                .disconnect(&initial_grant.grant_id, registration_generation);
+            external_grant_failure::observe_connection(
+                &api,
+                &initial_grant,
+                registration_generation,
+                Closed::ActivationFailed,
+                external_grant_failure::connection_error(error, Reason::GrantActivationFailed),
+            )
+            .await;
             let _ = socket.close().await;
             return;
         }
@@ -30036,43 +30527,49 @@ async fn serve_external_workdir_provider(
             heartbeat_interval_ms: 10_000,
             max_in_flight_operations: 16,
         });
-    if !send_external_workdir_server_frame(&mut socket, &registered).await {
+    if let Err(error) = send_external_workdir_server_frame(&mut socket, &registered).await {
+        let primary = Arc::new(error);
+        let stage_primary = primary.clone();
         let stage_api = api.clone();
         let stage_grant = initial_grant.clone();
         let stage_connection = connection.clone();
         if let Err(error) = api
             .store
             .db_executor()
-            .run(move || {
-                stage_api
-                    .external_workdir_providers
-                    .lock()
-                    .expect("External Workdir provider registry poisoned")
-                    .disconnect(&stage_connection.grant_id, stage_connection.generation);
-                stage_api.store.update_external_workdir_grant_state(
-                    &stage_grant.workspace_id,
-                    &stage_grant.grant_id,
-                    &stage_connection.provider_instance_id,
-                    stage_connection.generation,
-                    "offline",
-                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                )
+            .run(move || -> Result<()> {
+                let _retained = external_grant_failure::registration_failed(
+                    &stage_api,
+                    &stage_grant,
+                    &stage_connection,
+                    stage_primary,
+                );
+                Ok(())
             })
             .await
         {
-            // Rejected admission must not leave a dead socket discoverable.
-            // The generation-bound in-memory fence is safe even for an unknown
-            // DB outcome; it neither guesses nor retries the durable mutation.
+            // A generation-bound in-memory fence is safe for Unknown. Never
+            // guess or resend the rejected durable state mutation.
             api.external_workdir_providers
                 .lock()
                 .expect("External Workdir provider registry poisoned")
                 .disconnect(&connection.grant_id, connection.generation);
-            tracing::error!(
-                grant_id = %initial_grant.grant_id,
-                generation = connection.generation,
-                %error,
-                "failed to persist External Workdir provider registration disconnect"
-            );
+            external_grant_failure::observe_connection(
+                &api,
+                &initial_grant,
+                connection.generation,
+                Closed::RegistrationSendFailed,
+                external_grant_failure::combine(
+                    external_grant_failure::connection_error(
+                        Error::ExternalWorkdirConnectionSource(primary),
+                        Reason::GrantConnectionTransportFailed,
+                    ),
+                    external_grant_failure::connection_error(
+                        error,
+                        Reason::GrantConnectionStateFailed,
+                    ),
+                ),
+            )
+            .await;
         }
         return;
     }
@@ -30088,19 +30585,21 @@ async fn serve_external_workdir_provider(
     let mut heartbeat_sequence = 0_u64;
     let mut last_heartbeat_ack = tokio::time::Instant::now();
     let mut revoking = false;
-    let terminal_status = loop {
+    let (terminal_status, closed_reason, terminal_error) = loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 if last_heartbeat_ack.elapsed() > std::time::Duration::from_secs(30) {
-                    break "offline";
+                    break ("offline", Closed::HeartbeatTimeout, Some(Error::ExternalWorkdirConnectionClosed {
+                        reason: Reason::GrantConnectionTransportFailed,
+                    }));
                 }
                 heartbeat_sequence = heartbeat_sequence.saturating_add(1);
                 let frame = ExternalWorkdirServerFrame::current(ExternalWorkdirServerMessage::Heartbeat {
                     generation: connection.generation,
                     sequence: heartbeat_sequence,
                 });
-                if !send_external_workdir_server_frame(&mut socket, &frame).await {
-                    break "offline";
+                if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
+                    break ("offline", Closed::SendFailed, Some(error));
                 }
             }
             command = commands.recv() => match command {
@@ -30147,9 +30646,9 @@ async fn serve_external_workdir_provider(
                         operation,
                     });
                     pending.insert(id.clone(), response);
-                    if !send_external_workdir_server_frame(&mut socket, &frame).await {
+                    if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
                         pending.remove(&id);
-                        break "offline";
+                        break ("offline", Closed::SendFailed, Some(error));
                     }
                 }
                 Some(ExternalProviderCommand::Cancel { operation_id }) => {
@@ -30158,8 +30657,8 @@ async fn serve_external_workdir_provider(
                         generation: connection.generation,
                         operation_id,
                     });
-                    if !send_external_workdir_server_frame(&mut socket, &frame).await {
-                        break "offline";
+                    if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
+                        break ("offline", Closed::SendFailed, Some(error));
                     }
                 }
                 Some(ExternalProviderCommand::Revoke { reason }) => {
@@ -30170,17 +30669,22 @@ async fn serve_external_workdir_provider(
                         generation: connection.generation,
                         reason,
                     });
-                    if !send_external_workdir_server_frame(&mut socket, &frame).await {
-                        break "offline";
+                    if let Err(error) = send_external_workdir_server_frame(&mut socket, &frame).await {
+                        break ("offline", Closed::SendFailed, Some(error));
                     }
                     revoking = true;
                 }
-                None => break "offline",
+                None => break ("offline", Closed::CommandChannelClosed, Some(Error::ExternalWorkdirConnectionClosed {
+                    reason: Reason::GrantConnectionTransportFailed,
+                })),
             },
             incoming = socket.next() => match incoming {
                 Some(Ok(WsMessage::Text(text)))
                     if text.len() <= workdir::external::MAX_EXTERNAL_PROVIDER_FRAME_BYTES => {
-                    let Ok(frame) = serde_json::from_str::<ExternalWorkdirProviderFrame>(&text) else { break "offline"; };
+                    let frame = match serde_json::from_str::<ExternalWorkdirProviderFrame>(&text) {
+                        Ok(frame) => frame,
+                        Err(error) => break ("offline", Closed::InvalidFrame, Some(Error::ExternalWorkdirFrameDecoding(error))),
+                    };
                     match frame.message {
                         ExternalWorkdirProviderMessage::OperationResult { generation, operation_id, outcome }
                             if generation == connection.generation => {
@@ -30207,24 +30711,33 @@ async fn serve_external_workdir_provider(
                         ExternalWorkdirProviderMessage::RevokeAcknowledged { generation }
                             if revoking && generation == connection.generation => {
                                 connection.shutdown_confirmed.store(true, Ordering::Release);
-                                break "revoked";
+                                break ("revoked", Closed::RevokeAcknowledged, None);
                             }
-                        _ => break "offline",
+                        _ => break ("offline", Closed::InvalidFrame, Some(Error::ExternalWorkdirConnectionClosed {
+                            reason: Reason::GrantConnectionProtocolFailed,
+                        })),
                     }
                 }
                 Some(Ok(WsMessage::Ping(bytes))) => {
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        socket.send(WsMessage::Pong(bytes)),
-                    )
-                    .await;
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5), socket.send(WsMessage::Pong(bytes)),
+                    ).await {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => break ("offline", Closed::SendFailed, Some(Error::ExternalWorkdirTransport(error))),
+                        Err(error) => break ("offline", Closed::SendFailed, Some(Error::ExternalWorkdirTransportTimeout(error))),
+                    }
                 }
-                Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break "offline",
-                _ => {}
+                Some(Ok(WsMessage::Close(_))) | None => break ("offline", Closed::PeerClosed,
+                    Some(Error::ExternalWorkdirConnectionClosed { reason: Reason::GrantConnectionTransportFailed })),
+                Some(Err(error)) => break ("offline", Closed::PeerClosed, Some(Error::ExternalWorkdirTransport(error))),
+                _ => break ("offline", Closed::InvalidFrame,
+                    Some(Error::ExternalWorkdirConnectionClosed { reason: Reason::GrantConnectionProtocolFailed })),
             }
         }
     };
     pending.clear();
+    let terminal_error = terminal_error.map(Arc::new);
+    let stage_error = terminal_error.clone();
     let stage_api = api.clone();
     let stage_grant = initial_grant.clone();
     let stage_connection = connection.clone();
@@ -30235,11 +30748,20 @@ async fn serve_external_workdir_provider(
             let api = stage_api;
             let initial_grant = stage_grant;
             let connection = stage_connection;
-            let _ = api
-                .external_workdir_providers
+            api.external_workdir_providers
                 .lock()
                 .expect("External Workdir provider registry poisoned")
                 .disconnect(&connection.grant_id, connection.generation);
+            let mut primary = stage_error.map(|error| {
+                external_grant_failure::connection_error(
+                    Error::ExternalWorkdirConnectionSource(error),
+                    if closed_reason == Closed::InvalidFrame {
+                        Reason::GrantConnectionProtocolFailed
+                    } else {
+                        Reason::GrantConnectionTransportFailed
+                    },
+                )
+            });
             let state_updated = match api.store.update_external_workdir_grant_state(
                 &initial_grant.workspace_id,
                 &initial_grant.grant_id,
@@ -30250,13 +30772,14 @@ async fn serve_external_workdir_provider(
             ) {
                 Ok(updated) => updated,
                 Err(error) => {
-                    tracing::error!(
-                        grant_id = %initial_grant.grant_id,
-                        generation = connection.generation,
-                        status = terminal_status,
-                        %error,
-                        "failed to persist External Workdir provider terminal state"
+                    let followup = external_grant_failure::connection_error(
+                        error,
+                        Reason::GrantConnectionStateFailed,
                     );
+                    primary = Some(match primary {
+                        Some(error) => external_grant_failure::combine(error, followup),
+                        None => followup,
+                    });
                     false
                 }
             };
@@ -30276,41 +30799,81 @@ async fn serve_external_workdir_provider(
                     &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
                 )
             {
-                tracing::error!(
-                    grant_id = %initial_grant.grant_id,
-                    generation = connection.generation,
-                    status = terminal_status,
-                    %error,
-                    "failed to audit External Workdir provider terminal state"
-                );
+                let followup =
+                    external_grant_failure::connection_error(error, Reason::GrantAuditFailed);
+                primary = Some(match primary {
+                    Some(error) => external_grant_failure::combine(error, followup),
+                    None => followup,
+                });
             }
-            Ok(state_updated)
+            let primary = external_grant_failure::save_connection(
+                &api,
+                &initial_grant,
+                connection.generation,
+                closed_reason,
+                primary,
+            );
+            Ok((state_updated, primary))
         })
         .await;
-    let state_updated = match terminal_update {
-        Ok(updated) => updated,
+    let (state_updated, primary) = match terminal_update {
+        Ok(result) => result,
         Err(error) => {
             api.external_workdir_providers
                 .lock()
                 .expect("External Workdir provider registry poisoned")
                 .disconnect(&connection.grant_id, connection.generation);
-            tracing::error!(grant_id = %initial_grant.grant_id,
-                generation = connection.generation, status = terminal_status, %error,
-                "External Workdir provider terminal stage failed");
-            false
+            let followup =
+                external_grant_failure::connection_error(error, Reason::GrantConnectionStateFailed);
+            let primary = match terminal_error {
+                Some(error) => external_grant_failure::combine(
+                    external_grant_failure::connection_error(
+                        Error::ExternalWorkdirConnectionSource(error),
+                        if closed_reason == Closed::InvalidFrame {
+                            Reason::GrantConnectionProtocolFailed
+                        } else {
+                            Reason::GrantConnectionTransportFailed
+                        },
+                    ),
+                    followup,
+                ),
+                None => followup,
+            };
+            external_grant_failure::observe_connection(
+                &api,
+                &initial_grant,
+                connection.generation,
+                closed_reason,
+                primary,
+            )
+            .await;
+            (false, None)
         }
     };
+    // Only a confirmed terminal authority update admits cleanup. Unknown and
+    // evidence/audit failures do not authorize another mutation or release.
     if state_updated
         && matches!(terminal_status, "expired" | "revoked")
         && let Err(error) =
             cleanup_external_workdir_attachments(&api, &initial_grant.workdir_id).await
     {
-        tracing::error!(
-            grant_id = %initial_grant.grant_id,
-            workdir_id = %initial_grant.workdir_id,
-            error = ?error,
-            "External Workdir terminal attachment cleanup requires retry"
+        let mut release = external_grant_failure::connection_error(
+            error.error,
+            Reason::GrantAttachmentReleaseFailed,
         );
+        release.diagnostics = error.diagnostics;
+        let error = match primary {
+            Some(primary) => external_grant_failure::combine(primary, release),
+            None => release,
+        };
+        external_grant_failure::observe_connection(
+            &api,
+            &initial_grant,
+            connection.generation,
+            closed_reason,
+            error,
+        )
+        .await;
     }
 }
 
@@ -30322,7 +30885,7 @@ async fn scoped_get_external_workdir_grant(
     let stage_api = api.clone();
     let stage_workspace_id = workspace_id.clone();
     let stage_grant_id = grant_id.clone();
-    let mut grant = api
+    let grant = api
         .store
         .db_executor()
         .run(move || -> ApiResult<_> {
@@ -30330,35 +30893,29 @@ async fn scoped_get_external_workdir_grant(
             let grant = stage_api
                 .store
                 .get_external_workdir_grant(&stage_workspace_id, &stage_grant_id)?
-                .ok_or_else(|| Error::InvalidInput("Unknown External Workdir grant".to_string()))?;
+                .ok_or_else(|| {
+                    ApiError::workdir_management_source(
+                        Error::InvalidInput("Unknown External Workdir grant".into()),
+                        workdir::management_failure::WorkdirManagementOperation::GrantInspect,
+                        workdir::management_failure::WorkdirManagementReason::GrantNotFound,
+                    )
+                })?;
             if grant.created_by != actor.account_id {
-                return Err(Error::WorkspacePermissionDenied(
-                    "External Workdir grant inspection requires the grant creator".to_string(),
-                )
-                .into());
+                return Err(ApiError::workdir_management_source(
+                    Error::WorkspacePermissionDenied(
+                        "External Workdir grant inspection requires the grant creator".into(),
+                    ),
+                    workdir::management_failure::WorkdirManagementOperation::GrantInspect,
+                    workdir::management_failure::WorkdirManagementReason::GrantCreatorRequired,
+                ));
             }
             Ok(grant)
         })
         .await?;
-    let expired = !matches!(grant.status.as_str(), "revoked" | "expired")
-        && external_workdir_grant_is_expired(&grant)?;
-    if expired {
-        grant = fence_external_workdir_grant_expired(&api, &grant_id).await?;
-    }
-    // Terminal cleanup is retryable: a prior expiry/revoke may have committed
-    // its fence before Runtime/session projection completed.
-    if matches!(grant.status.as_str(), "expired" | "revoked") {
-        let cleanup = cleanup_external_workdir_attachments(&api, &grant.workdir_id).await;
-        let reason = if grant.status == "expired" {
-            workdir::external::ExternalWorkdirRevokeReason::Expired
-        } else {
-            workdir::external::ExternalWorkdirRevokeReason::UserRequested
-        };
-        stop_external_workdir_provider(&api, &grant, reason).await;
-        cleanup?;
-        cancel_external_workdir_expiry(&api, &grant_id);
-    }
-    Ok(Json(external_workdir_grant_response(&grant)?))
+    // Inspection publishes retained evidence only. Expiry and cleanup owners
+    // fence authority and reconcile effects through their explicit drivers.
+    let response = external_workdir_grant_response(&api, &grant)?;
+    Ok(Json(response))
 }
 
 async fn scoped_revoke_external_workdir_grant(
@@ -30369,7 +30926,7 @@ async fn scoped_revoke_external_workdir_grant(
     let stage_api = api.clone();
     let stage_workspace_id = workspace_id.clone();
     let stage_grant_id = grant_id.clone();
-    let grant = api
+    let (grant, audit) = api
         .store
         .db_executor()
         .run(move || -> ApiResult<_> {
@@ -30377,180 +30934,204 @@ async fn scoped_revoke_external_workdir_grant(
             let workspace_id = stage_workspace_id;
             let grant_id = stage_grant_id;
             validate_workspace_scope(&api, &workspace_id)?;
-            let mut grant = api
-                .store
-                .get_external_workdir_grant(&workspace_id, &grant_id)?
-                .ok_or_else(|| Error::InvalidInput("Unknown External Workdir grant".to_string()))?;
-            if grant.created_by != actor.account_id {
-                return Err(Error::WorkspacePermissionDenied(
-                    "External Workdir revoke requires the grant creator".to_string(),
-                )
-                .into());
-            }
-            let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-            if !matches!(grant.status.as_str(), "revoked" | "expired") {
-                api.store.update_external_workdir_grant_state(
+            loop {
+                let mut grant = api
+                    .store
+                    .get_external_workdir_grant(&workspace_id, &grant_id)?
+                    .ok_or_else(|| {
+                        ApiError::workdir_management_source(
+                            Error::InvalidInput("Unknown External Workdir grant".into()),
+                            workdir::management_failure::WorkdirManagementOperation::GrantRevoke,
+                            workdir::management_failure::WorkdirManagementReason::GrantNotFound,
+                        )
+                    })?;
+                if grant.created_by != actor.account_id {
+                    return Err(ApiError::workdir_management_source(
+                        Error::WorkspacePermissionDenied(
+                            "External Workdir revoke requires the grant creator".into(),
+                        ),
+                        workdir::management_failure::WorkdirManagementOperation::GrantRevoke,
+                        workdir::management_failure::WorkdirManagementReason::GrantCreatorRequired,
+                    ));
+                }
+                let updated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
+                if matches!(grant.status.as_str(), "revoked" | "expired") {
+                    return Ok((grant, None));
+                }
+                if !api.store.update_external_workdir_grant_state(
                     &workspace_id,
                     &grant_id,
                     &grant.provider_instance_id,
                     grant.generation,
                     "revoked",
                     &updated_at,
-                )?;
+                )? {
+                    continue;
+                }
                 grant.status = "revoked".to_string();
                 grant.updated_at = updated_at;
-                api.store.record_external_workdir_audit(
-                    &workspace_id,
-                    "account",
-                    &actor.account_id,
-                    "external_workdir_grant_revoked",
-                    &grant_id,
-                    None,
-                    "revoked",
-                    &format!(
-                        "workdir_id={} generation={}",
-                        grant.workdir_id, grant.generation
-                    ),
-                    &grant.updated_at,
-                )?;
+                let audit =
+                    api.store
+                        .record_external_workdir_audit(
+                            &workspace_id,
+                            "account",
+                            &actor.account_id,
+                            "external_workdir_grant_revoked",
+                            &grant_id,
+                            None,
+                            "revoked",
+                            &format!(
+                                "workdir_id={} generation={}",
+                                grant.workdir_id, grant.generation
+                            ),
+                            &grant.updated_at,
+                        )
+                        .err()
+                        .map(|error| {
+                            external_grant_failure::attributed(error,
+                    workdir::management_failure::WorkdirManagementReason::GrantAuditFailed)
+                        });
+                return Ok((grant, audit));
             }
-            Ok(grant)
         })
         .await?;
     // Cleanup is deliberately retried for terminal grants. A prior revoke may
     // have committed its fence before a Runtime/session projection failure.
-    let cleanup = cleanup_external_workdir_attachments(&api, &grant.workdir_id).await;
+    let cleanup =
+        cleanup_external_workdir_attachments_with_lock(&api, &grant.workdir_id, None, audit).await;
     stop_external_workdir_provider(
         &api,
         &grant,
         workdir::external::ExternalWorkdirRevokeReason::UserRequested,
     )
     .await;
-    cleanup?;
-    cancel_external_workdir_expiry(&api, &grant_id);
-    Ok(Json(external_workdir_grant_response(&grant)?))
+    if cleanup.is_ok() {
+        cancel_external_workdir_expiry(&api, &grant_id);
+    }
+    let mut response = external_workdir_grant_response(&api, &grant)?;
+    if let Err(error) = cleanup {
+        external_grant_failure::append_live(&mut response, &error);
+    }
+    Ok(Json(response))
 }
 
 async fn cleanup_external_workdir_attachments(
     api: &WorkspaceApi,
     workdir_id: &str,
 ) -> ApiResult<()> {
-    cleanup_external_workdir_attachments_with_lock(api, workdir_id, None).await
+    cleanup_external_workdir_attachments_with_lock(api, workdir_id, None, None).await
 }
 
 async fn cleanup_external_workdir_attachments_with_lock(
     api: &WorkspaceApi,
     workdir_id: &str,
     already_locked_worker: Option<(&RuntimeWorkerRef, &Arc<tokio::sync::OwnedMutexGuard<()>>)>,
+    preceding: Option<ApiError>,
 ) -> ApiResult<()> {
     let stage_api = api.clone();
     let stage_workdir_id = workdir_id.to_string();
-    let stage_guard = already_locked_worker.map(|(_, guard)| guard.clone());
-    let grant_id = api
+    let target = api
         .store
         .db_executor()
-        .run(move || -> Result<_> {
-            let _session_guard = stage_guard;
-            let workdir = stage_api
+        .run(move || {
+            stage_api
                 .store
-                .get_workdir_registry(&stage_api.config.workspace_id, &stage_workdir_id)?
-                .ok_or_else(|| Error::InvalidInput("Unknown External Workdir".to_string()))?;
-            let grant_id = workdir
-                .source
-                .external_grant_id()
-                .ok_or_else(|| {
-                    Error::InvalidInput("Workdir is not backed by an External grant".to_string())
-                })?
-                .to_string();
-            stage_api.store.update_external_workdir_cleanup_state(
-                &stage_api.config.workspace_id,
-                &grant_id,
-                "pending",
-                None,
-                &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            )?;
-            Ok(grant_id)
+                .latest_workdir_worker_link(&stage_api.config.workspace_id, &stage_workdir_id)
         })
-        .await?;
-
-    let release =
-        release_external_workdir_attachments(api, workdir_id, already_locked_worker).await;
-    let stage_api = api.clone();
-    let stage_workdir_id = workdir_id.to_string();
-    let succeeded = release.is_ok();
-    let stage_guard = already_locked_worker.map(|(_, guard)| guard.clone());
-    api.store
-        .db_executor()
-        .run(move || -> Result<()> {
-            let _session_guard = stage_guard;
-            let now = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
-            let (state, category, event, outcome, detail) = if succeeded {
-                (
-                    "completed",
-                    None,
-                    "external_workdir_cleanup_completed",
-                    "completed",
-                    format!("workdir_id={stage_workdir_id}"),
-                )
-            } else {
-                (
-                    "retry_required",
-                    Some("attachment_release_failed"),
-                    "external_workdir_cleanup_attention_required",
-                    "attention_required",
-                    format!("workdir_id={stage_workdir_id} category=attachment_release_failed"),
-                )
+        .await;
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            let query = external_grant_failure::attributed(
+                error,
+                workdir::management_failure::WorkdirManagementReason::GrantCleanupQueryFailed,
+            );
+            let error = match preceding {
+                Some(audit) => external_grant_failure::combine(query, audit),
+                None => query,
             };
-            stage_api.store.update_external_workdir_cleanup_state(
-                &stage_api.config.workspace_id,
-                &grant_id,
-                state,
-                category,
-                &now,
-            )?;
-            stage_api.store.record_external_workdir_audit(
-                &stage_api.config.workspace_id,
-                "system",
-                "workspace-backend",
-                event,
-                &grant_id,
-                None,
-                outcome,
-                &detail,
-                &now,
-            )?;
-            Ok(())
-        })
-        .await?;
-    release
+            external_grant_failure::cleanup_telemetry(&error);
+            return Err(error);
+        }
+    };
+    let guard = if let Some(target) = &target {
+        if let Some((worker, guard)) = already_locked_worker {
+            if worker != &target.worker {
+                let conflict = ApiError::from(Error::WorkdirAttachmentConflict(
+                    "External cleanup attachment owner changed".into(),
+                ));
+                return Err(match preceding {
+                    Some(audit) => external_grant_failure::combine(conflict, audit),
+                    None => conflict,
+                });
+            }
+            Some(guard.clone())
+        } else {
+            Some(Arc::new(
+                current_worker_session_lock(api, &target.worker)
+                    .lock_owned()
+                    .await,
+            ))
+        }
+    } else {
+        None
+    };
+    // Keep the ordinary Worker lock through the owner reread and settlement,
+    // not only detach/Runtime dispatch. A queued inspection must see completion
+    // before it can replace pending state and discard independent audit causes.
+    let locked_worker = target
+        .as_ref()
+        .zip(guard.as_ref())
+        .map(|(target, guard)| (&target.worker, guard));
+    cleanup_external_workdir_attachments_settle_locked(
+        api,
+        workdir_id,
+        locked_worker,
+        target.as_ref(),
+        preceding,
+    )
+    .await
+}
+
+async fn cleanup_external_workdir_attachments_settle_locked(
+    api: &WorkspaceApi,
+    workdir_id: &str,
+    already_locked_worker: Option<(&RuntimeWorkerRef, &Arc<tokio::sync::OwnedMutexGuard<()>>)>,
+    expected_target: Option<&WorkerWorkdirLinkRecord>,
+    preceding: Option<ApiError>,
+) -> ApiResult<()> {
+    grant_cleanup::execute(
+        api,
+        workdir_id,
+        already_locked_worker,
+        expected_target,
+        preceding,
+    )
+    .await
 }
 
 #[cfg(test)]
-fn external_workdir_cleanup_failure_slot() -> &'static Mutex<Option<String>> {
+fn external_workdir_cleanup_failure_slot() -> &'static Mutex<HashSet<String>> {
     use std::sync::OnceLock;
 
-    static INJECTED_WORKDIR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    INJECTED_WORKDIR.get_or_init(|| Mutex::new(None))
+    static INJECTED_WORKDIRS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    INJECTED_WORKDIRS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 #[cfg(test)]
 fn inject_external_workdir_cleanup_failure(workdir_id: &str) {
-    *external_workdir_cleanup_failure_slot()
+    external_workdir_cleanup_failure_slot()
         .lock()
-        .expect("External cleanup injection lock poisoned") = Some(workdir_id.to_string());
+        .expect("External cleanup injection lock poisoned")
+        .insert(workdir_id.to_string());
 }
 
 #[cfg(test)]
 fn take_external_workdir_cleanup_failure(workdir_id: &str) -> bool {
-    let mut injected = external_workdir_cleanup_failure_slot()
+    external_workdir_cleanup_failure_slot()
         .lock()
-        .expect("External cleanup injection lock poisoned");
-    if injected.as_deref() == Some(workdir_id) {
-        *injected = None;
-        true
-    } else {
-        false
-    }
+        .expect("External cleanup injection lock poisoned")
+        .remove(workdir_id)
 }
 
 #[cfg(test)]
@@ -30579,89 +31160,6 @@ fn external_workdir_cleanup_reconciliation_count(workdir_id: &str) -> usize {
         .unwrap_or_default()
 }
 
-async fn release_external_workdir_attachment_locked(
-    api: &WorkspaceApi,
-    workdir_id: &str,
-    link: &WorkerWorkdirLinkRecord,
-    session_guard: &Arc<tokio::sync::OwnedMutexGuard<()>>,
-) -> ApiResult<()> {
-    if link.unlinked_at.is_none() {
-        close_current_worker_attachment_session_locked(api, &link.worker).await?;
-        close_current_worker_command_sessions_for_alias_locked(api, &link.worker, &link.alias)
-            .await?;
-        let stage_api = api.clone();
-        let stage_worker = link.worker.clone();
-        let stage_workdir_id = workdir_id.to_string();
-        let stage_guard = session_guard.clone();
-        api.store
-            .db_executor()
-            .run(move || {
-                let _session_guard = stage_guard;
-                stage_api.store.detach_worker_workdir(
-                    &stage_api.config.workspace_id,
-                    &stage_worker,
-                    Some(&stage_workdir_id),
-                    &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-                )
-            })
-            .await?;
-        #[cfg(test)]
-        if take_external_workdir_cleanup_failure(workdir_id) {
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: "workspace-backend".to_string(),
-                code: "injected_external_workdir_cleanup_failure".to_string(),
-                message: "injected External Workdir attachment cleanup failure".to_string(),
-            }
-            .into());
-        }
-    }
-    // Reconcile even an already-unlinked durable link. A previous cleanup may
-    // have committed detach before Runtime persistence or projection failed.
-    #[cfg(test)]
-    record_external_workdir_cleanup_reconciliation(workdir_id);
-    sync_runtime_worker_workdir_attachments_locked(api, &link.worker, session_guard).await?;
-    api.worker_projection
-        .refresh_async(&link.worker)
-        .await
-        .map_err(ApiError::from)?;
-    Ok(())
-}
-
-async fn release_external_workdir_attachments(
-    api: &WorkspaceApi,
-    workdir_id: &str,
-    already_locked_worker: Option<(&RuntimeWorkerRef, &Arc<tokio::sync::OwnedMutexGuard<()>>)>,
-) -> ApiResult<()> {
-    let stage_api = api.clone();
-    let stage_workdir_id = workdir_id.to_string();
-    let Some(link) = api
-        .store
-        .db_executor()
-        .run(move || {
-            stage_api
-                .store
-                .latest_workdir_worker_link(&stage_api.config.workspace_id, &stage_workdir_id)
-        })
-        .await?
-    else {
-        return Ok(());
-    };
-    // The newest link is the only possible active attachment and remains the
-    // durable reconciliation target if detach committed before Runtime update.
-    // Missing/ambiguous Runtime state remains a retryable cleanup failure.
-    if let Some((worker, guard)) =
-        already_locked_worker.filter(|(worker, _)| *worker == &link.worker)
-    {
-        debug_assert_eq!(worker, &link.worker);
-        release_external_workdir_attachment_locked(api, workdir_id, &link, guard).await?;
-    } else {
-        let lock = current_worker_session_lock(api, &link.worker);
-        let guard = Arc::new(lock.lock_owned().await);
-        release_external_workdir_attachment_locked(api, workdir_id, &link, &guard).await?;
-    }
-    Ok(())
-}
-
 async fn scoped_list_working_directories(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -30675,7 +31173,7 @@ async fn scoped_list_working_directories(
             Ok(Json(BrowserWorkingDirectoryListResponse {
                 workspace_id: api.config.workspace_id.clone(),
                 items,
-                diagnostics: working_directory_diagnostics(diagnostics),
+                diagnostics: workdir_inventory_diagnostics(diagnostics),
             }))
         })
         .await
@@ -30795,16 +31293,11 @@ fn workdir_runtime_failure_code(error: &RuntimeRegistryError) -> String {
 fn workdir_rejection_failure_code(diagnostics: &[RuntimeDiagnostic]) -> String {
     diagnostics
         .iter()
-        .find(|diagnostic| {
-            diagnostic.severity == HostDiagnosticSeverity::Error
-                && !diagnostic.code.is_empty()
-                && diagnostic.code.len() <= 128
-                && diagnostic
-                    .code
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        .filter_map(|diagnostic| diagnostic.workdir)
+        .find(|failure| {
+            failure.operation == workdir::management_failure::WorkdirManagementOperation::Create
         })
-        .map(|diagnostic| diagnostic.code.clone())
+        .map(|failure| failure.reason.as_str().to_string())
         .unwrap_or_else(|| "runtime_workdir_create_failed".to_string())
 }
 
@@ -30817,12 +31310,39 @@ fn finish_rejected_workdir_create_operation(
     updated_at: &str,
 ) -> Result<String> {
     let failure_code = workdir_rejection_failure_code(diagnostics);
+    use error_contract::{FailureFacts, Storage, project_failure};
+    use protocol::background_failure::BackgroundFailure;
+    use workdir::management_failure::{WorkdirManagementOperation, WorkdirManagementVisibility};
+    let evidence = diagnostics
+        .iter()
+        .filter_map(|d| d.workdir)
+        .find(|cause| cause.operation == WorkdirManagementOperation::Create)
+        .map(|cause| {
+            FailureFacts::new(cause)
+                .and_then(|facts| {
+                    project_failure::<Storage, _>(
+                        &facts,
+                        &WorkdirManagementVisibility {
+                            can_view_cause: true,
+                        },
+                    )
+                })
+                .and_then(|projected| BackgroundFailure::from_projected(&projected))
+        })
+        .transpose()
+        .map_err(|_| {
+            Error::Store("Workdir creation failure evidence could not be projected".into())
+        })?;
     store.finish_workdir_create_operation(
         workspace_id,
         operation_id,
         request_fingerprint,
         false,
-        Some(&failure_code),
+        Some(
+            evidence
+                .as_ref()
+                .map_or(failure_code.as_str(), |e| e.as_storage_str()),
+        ),
         updated_at,
     )?;
     Ok(failure_code)
@@ -30983,8 +31503,10 @@ fn prepare_workspace_workdir_create(
                             .to_string(),
                     ),
                     vec![RuntimeDiagnostic {
-                        control: None,
-                        startup: None,
+            session: None,
+            workdir: None,
+            startup: None,
+            control: None,
                         code: "default_runtime_not_configured".to_string(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "Workspace default Runtime is not configured".to_string(),
@@ -31139,6 +31661,8 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 Error::UnknownRuntime(reserved.resolved_runtime_id),
                 vec![RuntimeDiagnostic {
+                    session: None,
+                    workdir: None,
                     control: None,
                     startup: None,
                     code: "runtime_unavailable".to_string(),
@@ -31164,6 +31688,8 @@ async fn create_workspace_working_directory(
                 message: "Selected Runtime is not connected".to_string(),
             },
             vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "runtime_unavailable".to_string(),
@@ -31222,6 +31748,8 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 error.into_error(),
                 vec![RuntimeDiagnostic {
+                    session: None,
+                    workdir: None,
                     control: None,
                     startup: None,
                     code: failure_code,
@@ -31262,6 +31790,8 @@ async fn create_workspace_working_directory(
                 return Err(ApiError::with_diagnostics(
                     error.into_error(),
                     vec![RuntimeDiagnostic {
+                        session: None,
+                        workdir: None,
                         control: None,
                         startup: None,
                         code: failure_code,
@@ -31303,6 +31833,8 @@ async fn create_workspace_working_directory(
             diagnostics.insert(
                 0,
                 RuntimeDiagnostic {
+                    session: None,
+                    workdir: None,
                     control: None,
                     startup: None,
                     code: failure_code.clone(),
@@ -31349,7 +31881,7 @@ async fn create_workspace_working_directory(
             workspace_id: workspace_id.to_string(),
             runtime_id: reserved.resolved_runtime_id,
             item: summary.into(),
-            diagnostics: working_directory_diagnostics(result.diagnostics),
+            diagnostics: workdir_management_diagnostics(result.diagnostics),
             http_status: StatusCode::CREATED.as_u16(),
         }),
     ))
@@ -31391,14 +31923,14 @@ fn working_directory_detail_for_runtime(
             workspace_id: api.config.workspace_id.clone(),
             runtime_id: Some(runtime_id.to_string()),
             item: summary.into(),
-            diagnostics: working_directory_diagnostics(result.diagnostics),
+            diagnostics: workdir_management_diagnostics(result.diagnostics),
         }));
     }
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtime_id: Some(runtime_id.to_string()),
         item: projected_workdir_summary_from_record(&api, &existing)?.into(),
-        diagnostics: working_directory_diagnostics(result.diagnostics),
+        diagnostics: workdir_management_diagnostics(result.diagnostics),
     }))
 }
 
@@ -31421,22 +31953,14 @@ fn workdir_removal_response(
 }
 
 fn runtime_reports_workdir_not_found(result: &crate::hosts::RuntimeWorkingDirectoryResult) -> bool {
-    result.working_directory.is_none()
-        && result
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "working_directory_not_found")
+    result.working_directory.is_none() && workdir_runtime_miss_is_not_found(&result.diagnostics)
 }
 
 fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static str, bool) {
     match error {
-        RuntimeRegistryError::WorkdirSessionOpenFailed { .. } => ("provider_unavailable", true),
+        RuntimeRegistryError::WorkdirSessionOpenFailed { .. }
+        | RuntimeRegistryError::RuntimeOperationFailed { .. } => ("provider_unavailable", true),
         RuntimeRegistryError::UnknownRuntime(_) => ("runtime_unavailable", true),
-        RuntimeRegistryError::RuntimeOperationFailed { code, .. } => {
-            let category =
-                workdir_cleanup_diagnostic_category(code).unwrap_or("provider_unavailable");
-            (category, category != "unsupported_target")
-        }
         RuntimeRegistryError::RuntimeControlFailed { cause, .. } => {
             use protocol::control_failure::RuntimeControlCause as C;
             match cause {
@@ -31455,37 +31979,52 @@ fn classify_workdir_provider_error(error: &RuntimeRegistryError) -> (&'static st
     }
 }
 
-// Only bounded classifications cross the public removal boundary. Provider
-// messages may contain OS paths or credentials and are never persisted here.
 fn workdir_cleanup_failure_category(
     result: &crate::hosts::RuntimeWorkingDirectoryResult,
 ) -> &'static str {
+    use workdir::management_failure::{
+        WorkdirManagementOperation as Operation, WorkdirManagementReason as Reason,
+    };
+    if result.state == InternalWorkerOperationState::Unsupported {
+        return "unsupported_target";
+    }
+    if result
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.session)
+        .any(|cause| cause.operation == workdir::failure::WorkdirFailureOperation::SessionClose)
+    {
+        return "session_close_unconfirmed";
+    }
     result
         .diagnostics
         .iter()
-        .find_map(|diagnostic| workdir_cleanup_diagnostic_category(&diagnostic.code))
+        .filter_map(|diagnostic| diagnostic.workdir)
+        .filter(|cause| matches!(cause.operation, Operation::Detail | Operation::Cleanup))
+        .find_map(|cause| {
+            Some(match cause.reason {
+                Reason::CleanupMountPresent => "mount_present",
+                Reason::CleanupMountCheckUnavailable => "mount_check_unavailable",
+                Reason::CleanupPermissionDenied => "permission_denied",
+                Reason::CleanupResourceBusy => "resource_busy",
+                Reason::CleanupStorageUnavailable => "storage_unavailable",
+                Reason::CleanupOwnershipUnknown => "ownership_unknown",
+                Reason::CleanupChangesPresent => "changes_present",
+                Reason::CleanupChangesUnknown => "changes_unknown",
+                Reason::EmbeddedWorkdirUnsupported | Reason::MaterializerUnsupported => {
+                    "unsupported_target"
+                }
+                _ => return None,
+            })
+        })
         .unwrap_or("provider_cleanup_failed")
-}
-
-fn workdir_cleanup_diagnostic_category(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "working_directory_unsupported" => "unsupported_target",
-        "working_directory_cleanup_mount_present" => "mount_present",
-        "working_directory_cleanup_mount_check_unavailable" => "mount_check_unavailable",
-        "working_directory_cleanup_permission_denied" => "permission_denied",
-        "working_directory_cleanup_resource_busy" => "resource_busy",
-        "working_directory_cleanup_storage_unavailable" => "storage_unavailable",
-        "working_directory_cleanup_ownership_unknown" => "ownership_unknown",
-        "working_directory_cleanup_changes_present" => "changes_present",
-        "working_directory_cleanup_changes_unknown" => "changes_unknown",
-        "working_directory_cleanup_target_invalid"
-        | "working_directory_cleanup_escape_rejected" => "ownership_unknown",
-        _ => return None,
-    })
 }
 
 fn workdir_removal_failure_guidance(category: &str) -> &'static str {
     match category {
+        "session_close_unconfirmed" => {
+            "Workdir removal was not dispatched because closing a retained operation session is unconfirmed. Restore session-provider access and use normal cleanup with the retained close identity; do not assume that the session or its use guard was released."
+        }
         "mount_present" => {
             "A mount remains inside the Workdir. Confirm its owner and usage, have that owner safely release it, then retry deletion. Yoi does not unmount external resources."
         }
@@ -31797,18 +32336,9 @@ fn execute_reserved_workdir_removal_with_provider(
     let deleted = provider.cleanup_workdir(&operation.runtime_id, &operation.working_directory_id);
     let deleted = match deleted {
         Ok(deleted) => deleted,
-        Err(error) => {
-            if let RuntimeRegistryError::RuntimeOperationFailed { code, .. } = &error
-                && let Some(category) = workdir_cleanup_diagnostic_category(code)
-            {
-                return api.config_store.fail_workdir_removal_operation(
-                    &operation,
-                    category,
-                    category != "unsupported_target",
-                );
-            }
-            return api.config_store.record_workdir_removal_unknown(&operation);
-        }
+        // A failed call after dispatch is not an authoritative rejection, even
+        // when legacy diagnostic prose/code resembles a known cleanup reason.
+        Err(_) => return api.config_store.record_workdir_removal_unknown(&operation),
     };
     let deletion_confirmed = runtime_reports_workdir_not_found(&deleted)
         || (deleted.state == InternalWorkerOperationState::Accepted
@@ -32071,6 +32601,8 @@ fn build_runtime_cleanup_plan(
                 let mut diagnostics = error.diagnostics;
                 if diagnostics.is_empty() {
                     diagnostics.push(RuntimeDiagnostic {
+                        session: None,
+                        workdir: None,
                         control: None,
                         startup: None,
                         code: "workspace_cleanup_runtime_observation_unavailable".to_string(),
@@ -34388,6 +34920,7 @@ async fn repository_detail(
             let item = repository_lookup(
                 api.live_repository_reader()?
                     .summary_by_key(&repository_key),
+                crate::repository_failure::RepositoryFailureOperation::SummaryByKey,
             )?;
             Ok(Json(RepositoryDetailResponse {
                 workspace_id: api.config.workspace_id.clone(),
@@ -34420,6 +34953,7 @@ async fn repository_log(
             } = repository_lookup(
                 api.live_repository_reader()?
                     .recent_log(&repository_key, query.limit),
+                crate::repository_failure::RepositoryFailureOperation::RecentLog,
             )?;
             Ok(Json(RepositoryLogResponse {
                 workspace_id: api.config.workspace_id,
@@ -36203,6 +36737,8 @@ fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> A
             message: "The embedded Runtime does not accept working directories".to_string(),
         },
         vec![RuntimeDiagnostic {
+            session: None,
+            workdir: None,
             control: None,
             startup: None,
             code: "embedded_worker_workdir_unsupported".to_string(),
@@ -36646,6 +37182,8 @@ fn lifecycle_failure_detail(
 
 fn spawn_compensation_diagnostic(code: &str, message: String) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        session: None,
+        workdir: None,
         control: None,
         startup: None,
         code: code.to_string(),
@@ -37654,6 +38192,8 @@ fn project_workspace_worker_with_attachments(
             summary.state = "unavailable".to_string();
             summary.worker_state = None;
             summary.diagnostics.push(RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "worker_singleton_fenced".to_string(),
@@ -38346,10 +38886,68 @@ fn legacy_external_workdir_grant_id(
     )
 }
 
+enum WorkdirInventoryDiagnostic {
+    Runtime(RuntimeDiagnostic),
+    LegacyExternalGrantPermissions(
+        crate::workdir_inventory_failure::LegacyExternalGrantPermissions,
+    ),
+}
+
+fn workdir_inventory_diagnostics(
+    diagnostics: Vec<WorkdirInventoryDiagnostic>,
+) -> Vec<server_api::WorkingDirectoryManagementDiagnostic> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| match diagnostic {
+            WorkdirInventoryDiagnostic::Runtime(diagnostic) => {
+                workdir_management_diagnostics(vec![diagnostic]).remove(0)
+            }
+            WorkdirInventoryDiagnostic::LegacyExternalGrantPermissions(cause) => {
+                use error_contract::{Browser, FailureFacts, project_failure};
+                use workdir::management_failure::WorkdirManagementVisibility;
+                let projected = FailureFacts::new(cause)
+                    .and_then(|facts| {
+                        project_failure::<Browser, _>(
+                            &facts,
+                            &WorkdirManagementVisibility {
+                                can_view_cause: true,
+                            },
+                        )
+                    })
+                    .ok();
+                server_api::WorkingDirectoryManagementDiagnostic {
+                    code: projected
+                        .as_ref()
+                        .map_or("workdir_diagnostic_unavailable", |p| {
+                            p.details().reason.as_str()
+                        })
+                        .into(),
+                    severity: server_api::DiagnosticSeverity::Warning,
+                    message: projected
+                        .as_ref()
+                        .map_or("Workdir inventory omission evidence is unavailable", |p| {
+                            p.explanation()
+                        })
+                        .into(),
+                    failure: projected.as_ref().and_then(|p| {
+                        protocol::startup_failure::StartupFailureAttachment::from_projected(p).ok()
+                    }),
+                }
+            }
+        })
+        .collect()
+}
+
 fn working_directory_summaries(
     api: &WorkspaceApi,
-) -> ApiResult<(Vec<WorkingDirectorySummary>, Vec<RuntimeDiagnostic>)> {
-    let mut diagnostics = sync_all_runtime_workdir_observations(api);
+) -> ApiResult<(
+    Vec<WorkingDirectorySummary>,
+    Vec<WorkdirInventoryDiagnostic>,
+)> {
+    let mut diagnostics = sync_all_runtime_workdir_observations(api)
+        .into_iter()
+        .map(WorkdirInventoryDiagnostic::Runtime)
+        .collect::<Vec<_>>();
     let records = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 200)?;
@@ -38359,16 +38957,12 @@ fn working_directory_summaries(
             continue;
         }
         if let Some(grant_id) = legacy_external_workdir_grant_id(api, &record)? {
-            diagnostics.push(RuntimeDiagnostic {
-                control: None,
-                startup: None,
-                code: "external_workdir_legacy_permissions".to_string(),
-                severity: HostDiagnosticSeverity::Warning,
-                message: format!(
-                    "Workdir {} was omitted because External grant {} uses legacy non-hierarchical permissions; revoke the old grant and share again with READ, WRITE, or COMMAND",
-                    record.workdir_id, grant_id,
-                ),
-            });
+            diagnostics.push(WorkdirInventoryDiagnostic::LegacyExternalGrantPermissions(
+                crate::workdir_inventory_failure::LegacyExternalGrantPermissions {
+                    workdir_id: record.workdir_id,
+                    grant_id,
+                },
+            ));
             continue;
         }
         items.push(projected_workdir_summary_from_record(api, &record)?);
@@ -38568,6 +39162,8 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
         },
         workdir_attachments: Vec::new(),
         diagnostics: vec![RuntimeDiagnostic {
+            session: None,
+            workdir: None,
             control: None,
             startup: None,
             code: "backend_worker_missing".to_string(),
@@ -38614,6 +39210,8 @@ fn worker_summary_from_projection(
         Vec::new()
     } else {
         vec![RuntimeDiagnostic {
+            session: None,
+            workdir: None,
             control: None,
             startup: None,
             code: "worker_observation_unavailable".to_string(),
@@ -38849,9 +39447,16 @@ fn sync_runtime_workdir_observations(
 }
 
 fn workdir_runtime_miss_is_not_found(diagnostics: &[RuntimeDiagnostic]) -> bool {
+    use workdir::management_failure::{
+        WorkdirManagementOperation as Operation, WorkdirManagementReason as Reason,
+    };
     diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "working_directory_not_found")
+        .filter_map(|diagnostic| diagnostic.workdir)
+        .any(|cause| {
+            cause.reason == Reason::NotFound
+                && matches!(cause.operation, Operation::Detail | Operation::Cleanup)
+        })
 }
 
 fn workdir_status_from_runtime_miss(diagnostics: &[RuntimeDiagnostic]) -> &'static str {
@@ -39262,8 +39867,10 @@ fn validate_working_directory_claims_for_browser(
                         message: "working directory relative_cwd must stay inside the Runtime-owned working directory".to_string(),
                     },
                     vec![RuntimeDiagnostic {
-                        control: None,
-                        startup: None,
+            session: None,
+            workdir: None,
+            startup: None,
+            control: None,
                         code: "working_directory_relative_cwd_invalid".to_string(),
                         severity: HostDiagnosticSeverity::Error,
                         message: "relative_cwd must be a relative path without parent traversal".to_string(),
@@ -39854,6 +40461,8 @@ fn settings_diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        session: None,
+        workdir: None,
         control: None,
         startup: None,
         code: code.into(),
@@ -39866,61 +40475,14 @@ fn sanitize_backend_error(message: &str) -> String {
     message.to_string()
 }
 
-fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -> ApiResult<T> {
-    result.map_err(|error| match error {
-        RepositoryLookupError::UnknownRepository { id } => {
-            let message = format!("repository `{id}` is not configured for this workspace");
-            ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: "workspace-repository-registry".to_string(),
-                    code: "repository_not_configured".to_string(),
-                    message: message.clone(),
-                },
-                vec![RuntimeDiagnostic {
-                    control: None,
-                    startup: None,
-                    code: "repository_not_configured".to_string(),
-                    severity: HostDiagnosticSeverity::Error,
-                    message,
-                }],
-            )
-        }
-        RepositoryLookupError::UnsupportedProvider { id, provider } => {
-            let message = format!(
-                "repository `{id}` uses unsupported provider `{provider}` for this operation"
-            );
-            ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: "workspace-repository-registry".to_string(),
-                    code: "repository_provider_unsupported".to_string(),
-                    message: message.clone(),
-                },
-                vec![RuntimeDiagnostic {
-                    control: None,
-                    startup: None,
-                    code: "repository_provider_unsupported".to_string(),
-                    severity: HostDiagnosticSeverity::Error,
-                    message,
-                }],
-            )
-        }
-        other => {
-            let message = format!("repository evidence validation failed: {other:?}");
-            ApiError::with_diagnostics(
-                Error::RuntimeOperationFailed {
-                    runtime_id: "workspace-repository-registry".to_string(),
-                    code: "repository_evidence_invalid".to_string(),
-                    message: message.clone(),
-                },
-                vec![RuntimeDiagnostic {
-                    control: None,
-                    startup: None,
-                    code: "repository_evidence_invalid".to_string(),
-                    severity: HostDiagnosticSeverity::Error,
-                    message,
-                }],
-            )
-        }
+fn repository_lookup<T>(
+    result: std::result::Result<T, RepositoryLookupError>,
+    operation: crate::repository_failure::RepositoryFailureOperation,
+) -> ApiResult<T> {
+    result.map_err(|error| {
+        ApiError::from(Error::from(
+            crate::repository_failure::RepositoryFailure::new(operation, error),
+        ))
     })
 }
 
@@ -40075,6 +40637,8 @@ fn workspace_id_mismatch_error() -> ApiError {
     ApiError::with_diagnostics(
         Error::WorkspaceIdMismatch,
         vec![RuntimeDiagnostic {
+            session: None,
+            workdir: None,
             control: None,
             startup: None,
             code: "workspace_id_mismatch".to_string(),
@@ -40090,6 +40654,10 @@ struct ApiError {
     diagnostics: Vec<RuntimeDiagnostic>,
     session_registration_cause: Option<protocol::session_failure::SessionRegistrationCause>,
     session_registration_source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    attachment_failures: Vec<(
+        server_api::workdir_management_error::WorkdirAttachmentFailureStage,
+        ApiError,
+    )>,
 }
 
 #[derive(Debug, Clone)]
@@ -40186,6 +40754,8 @@ impl ApiErrorLog {
                 .diagnostics
                 .iter()
                 .map(|diagnostic| RuntimeDiagnostic {
+                    session: None,
+                    workdir: None,
                     control: None,
                     startup: None,
                     code: diagnostic.code.clone(),
@@ -40222,9 +40792,29 @@ impl From<Error> for server_api::RuntimeManagementApiError {
 impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
+            Error::RepositoryLookup(cause) => vec![RuntimeDiagnostic {
+                session: None,
+                control: None,
+                workdir: None,
+                startup: None,
+                code: match cause.details().reason {
+                    crate::repository_failure::RepositoryFailureReason::UnknownRepository => {
+                        "repository_not_configured"
+                    }
+                    crate::repository_failure::RepositoryFailureReason::UnsupportedProvider => {
+                        "repository_provider_unsupported"
+                    }
+                    _ => "repository_evidence_invalid",
+                }
+                .into(),
+                severity: HostDiagnosticSeverity::Error,
+                message: cause.to_string(),
+            }],
             Error::DbCapacityExceeded
             | Error::DbExecutorUnavailable
             | Error::DbOperationOutcomeUnknown => vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: match &error {
@@ -40237,6 +40827,8 @@ impl From<Error> for ApiError {
                 message: error.to_string(),
             }],
             Error::WorkdirSessionOpenFailed { transport, .. } => vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "workdir_session_open_failed".to_string(),
@@ -40244,6 +40836,8 @@ impl From<Error> for ApiError {
                 message: transport.message.clone(),
             }],
             Error::RuntimeOperationFailed { code, message, .. } => vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: code.clone(),
@@ -40251,6 +40845,8 @@ impl From<Error> for ApiError {
                 message: sanitize_backend_error(message),
             }],
             Error::WorkspaceSigningIdentity { code, message } => vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: code.clone(),
@@ -40258,6 +40854,8 @@ impl From<Error> for ApiError {
                 message: sanitize_backend_error(message),
             }],
             Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: match ticket_error {
@@ -40306,6 +40904,8 @@ impl From<Error> for ApiError {
                 subjektiv_diagnostic_code(message)
                     .map(|code| {
                         vec![RuntimeDiagnostic {
+                            session: None,
+                            workdir: None,
                             control: None,
                             startup: None,
                             code: code.to_string(),
@@ -40322,6 +40922,7 @@ impl From<Error> for ApiError {
             diagnostics,
             session_registration_cause: None,
             session_registration_source: None,
+            attachment_failures: Vec::new(),
         }
     }
 }
@@ -40338,6 +40939,28 @@ fn subjektiv_diagnostic_code(message: &str) -> Option<&'static str> {
 }
 
 impl ApiError {
+    // Called only at the actual local producer; diagnostic text/severity are not facts.
+    fn workdir_management_source(
+        error: Error,
+        operation: workdir::management_failure::WorkdirManagementOperation,
+        reason: workdir::management_failure::WorkdirManagementReason,
+    ) -> Self {
+        Self::with_diagnostics(
+            error,
+            vec![RuntimeDiagnostic {
+                session: None,
+                control: None,
+                code: reason.as_str().into(),
+                severity: HostDiagnosticSeverity::Error,
+                message: reason.explanation().into(),
+                startup: None,
+                workdir: Some(workdir::management_failure::WorkdirManagementFailure {
+                    operation,
+                    reason,
+                }),
+            }],
+        )
+    }
     fn into_worker_create_api_error(self) -> server_api::WorkerCreateApiError {
         match self.error {
             Error::WorkerCreateFailed { failure, .. } => server_api::WorkerCreateApiError::startup(
@@ -40356,10 +40979,163 @@ impl ApiError {
             diagnostics,
             session_registration_cause: None,
             session_registration_source: None,
+            attachment_failures: Vec::new(),
         }
     }
 
+    // Only the management handlers above use this conversion. They run the current
+    // owner-only secret-management check before producing any access-owner cause.
+    // Preflight/authentication errors stay legacy and receive no cause visibility.
+    fn into_repository_access_api_error(self) -> server_api::RepositoryAccessApiError {
+        if let Error::RepositoryAccess(failure) = &self.error {
+            use error_contract::{Browser, FailureFacts};
+            let visibility = crate::repository_access_failure::RepositoryAccessVisibility {
+                can_view_cause: true,
+            };
+            if let Ok(projected) = FailureFacts::new(*failure.details()).and_then(|facts| {
+                error_contract::project_failure::<Browser, _>(&facts, &visibility)
+            }) {
+                return server_api::RepositoryAccessApiError::projected(projected);
+            }
+        }
+        self.into_repository_api_error().into()
+    }
+
+    fn into_workdir_management_api_error(
+        self,
+        operation: workdir::management_failure::WorkdirManagementOperation,
+    ) -> server_api::WorkdirManagementApiError {
+        use error_contract::{Browser, FailureFacts};
+        use workdir::management_failure::WorkdirManagementVisibility;
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation as Op,
+            WorkdirManagementReason as Reason,
+        };
+        if matches!(operation, Op::Attach | Op::Detach) {
+            return self.into_workdir_attachment_api_error(operation);
+        }
+        let local = if matches!(operation, Op::Attach | Op::Detach) {
+            match &self.error {
+                Error::WorkdirOccupied { .. } => Some(Reason::Occupied),
+                Error::WorkdirAttachmentConflict(_) => Some(Reason::AttachmentConflict),
+                _ => None,
+            }
+        } else if matches!(
+            operation,
+            Op::GrantCreate | Op::GrantInspect | Op::GrantRevoke | Op::GrantConnect
+        ) && matches!(self.error, Error::DbOperationOutcomeUnknown)
+        {
+            Some(Reason::GrantStateOutcomeUnknown)
+        } else {
+            None
+        };
+        // Optional evidence must come from the typed producer and the current
+        // operation. Historical code/message/severity never manufactures it.
+        if let Some(cause) = self
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.workdir)
+            .find(|cause| cause.operation == operation)
+            .or_else(|| local.map(|reason| WorkdirManagementFailure { operation, reason }))
+        {
+            if let Ok(projected) = FailureFacts::new(cause).and_then(|facts| {
+                error_contract::project_failure::<Browser, _>(
+                    &facts,
+                    &WorkdirManagementVisibility {
+                        can_view_cause: true,
+                    },
+                )
+            }) {
+                if !self.attachment_failures.is_empty() {
+                    use server_api::workdir_management_error::{
+                        WorkdirAttachmentRelatedFailure, WorkdirManagementCause,
+                    };
+                    let related = self
+                        .attachment_failures
+                        .iter()
+                        .flat_map(|(stage, error)| {
+                            external_grant_failure::public_error(
+                                error,
+                                Reason::GrantAttachmentReleaseFailed,
+                            )
+                            .into_iter()
+                            .map(move |failure| {
+                                WorkdirAttachmentRelatedFailure {
+                                    stage: *stage,
+                                    http_status: api_error_status(&error.error).as_u16(),
+                                    failure: Some(failure),
+                                }
+                            })
+                        })
+                        .collect();
+                    if let Ok(primary) = FailureFacts::new(WorkdirManagementCause::Management(
+                        cause,
+                    ))
+                    .and_then(|facts| {
+                        error_contract::project_failure::<Browser, _>(
+                            &facts,
+                            &WorkdirManagementVisibility {
+                                can_view_cause: true,
+                            },
+                        )
+                    }) {
+                        let legacy = server_api::RepositoryApiError::new(
+                            400,
+                            "workdir_management",
+                            primary.explanation(),
+                            Vec::new(),
+                        );
+                        return server_api::WorkdirManagementApiError::projected_attachment(
+                            legacy, primary, related,
+                        );
+                    }
+                }
+                return server_api::WorkdirManagementApiError::projected(projected);
+            }
+        }
+        self.into_repository_api_error().into()
+    }
+
     fn into_repository_api_error(self) -> server_api::RepositoryApiError {
+        use crate::repository_failure::{
+            RepositoryFailureDetails, RepositoryFailureOperation, RepositoryFailureReason,
+            RepositoryFailureVisibility,
+        };
+        let repository = match &self.error {
+            Error::RepositoryLookup(failure) => Some(*failure.details()),
+            Error::RepositoryRegistrationConflict { .. } => Some(RepositoryFailureDetails {
+                operation: RepositoryFailureOperation::Register,
+                reason: RepositoryFailureReason::RegistrationIntentConflict,
+            }),
+            _ => None,
+        };
+        if let Some(cause) = repository {
+            // The lookup/registration handlers have passed their existing current
+            // admission checks. Only closed cause fields cross either boundary.
+            let facts = error_contract::FailureFacts::new(cause).expect("closed Repository cause");
+            let visibility = RepositoryFailureVisibility {
+                can_view_cause: true,
+            };
+            let browser =
+                error_contract::project_failure::<error_contract::Browser, _>(&facts, &visibility)
+                    .expect("authorized closed Repository Browser cause");
+            let transfer = error_contract::project_failure::<error_contract::InternalTransfer, _>(
+                &facts,
+                &visibility,
+            )
+            .expect("authorized closed Repository transfer cause");
+            return server_api::RepositoryApiError::new(
+                api_error_status(&self.error).as_u16(),
+                cause.reason.as_str(),
+                browser.explanation(),
+                Vec::new(),
+            )
+            .with_failure(
+                protocol::startup_failure::StartupFailureAttachment::from_projected(&transfer)
+                    .expect("bounded closed Repository cause"),
+            )
+            .with_repository_projection(browser);
+        }
         let control = api_control_cause(&self.error);
         let status = api_error_status(&self.error);
         let message = self
@@ -40395,6 +41171,68 @@ impl ApiError {
 
 fn api_error_status(error: &Error) -> StatusCode {
     match error {
+        Error::ExternalWorkdirCleanupFailed { primary, .. } => api_error_status(primary),
+        Error::ExternalWorkdirObservationFailed { source, .. } => api_error_status(source),
+        Error::RepositoryAccess(failure) => match failure.source_error() {
+            // Preserve the access owner's existing boundary classes, not the
+            // public Category or source prose (unknown repositories here were
+            // InvalidInput, unlike repository lookup's NotFound boundary).
+            Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
+            Error::InvalidRecordId(_) => StatusCode::NOT_FOUND,
+            Error::WorkspaceConfigConflict(_) | Error::RepositoryConflict(_) => {
+                StatusCode::CONFLICT
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        },
+        Error::Configuration(failure) => {
+            use crate::configuration_failure::ConfigurationFailureReason as Reason;
+            match failure.details().reason {
+                Reason::OwnerRequired => StatusCode::FORBIDDEN,
+                Reason::PublicationDispatchUnavailable
+                | Reason::PublicationProjectionUnavailable
+                | Reason::PublicationRegistryUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
+                Reason::CatalogChanged
+                | Reason::EditingHeadChanged
+                | Reason::LegacyExportChanged
+                | Reason::SourceContentChanged
+                | Reason::WorkspaceInactive
+                | Reason::WorkspaceDraining
+                | Reason::RequestIdentityConflict => StatusCode::CONFLICT,
+                Reason::InvalidPath
+                | Reason::BuiltinReadOnly
+                | Reason::InvalidImport
+                | Reason::ImportEscape
+                | Reason::AlreadyExists
+                | Reason::NotFound
+                | Reason::EntryConflict
+                | Reason::EntryDigestMismatch
+                | Reason::EntryPathMismatch
+                | Reason::TreeDigestMismatch
+                | Reason::PathChangedMoreThanOnce
+                | Reason::DuplicatePath
+                | Reason::DuplicateSchemaProvider
+                | Reason::DuplicateSchemaNamespace
+                | Reason::InvalidSchemaContribution
+                | Reason::LimitExceeded => StatusCode::BAD_REQUEST,
+            }
+        }
+        Error::RepositoryLookup(failure) => {
+            use crate::repository_failure::{RepositoryFailureOperation, RepositoryFailureReason};
+            // Preserve the merge-validation endpoint client-error boundary.
+            if failure.details().operation == RepositoryFailureOperation::ObserveMergeTarget {
+                return StatusCode::BAD_REQUEST;
+            }
+            match failure.details().reason {
+                RepositoryFailureReason::UnknownRepository => StatusCode::NOT_FOUND,
+                RepositoryFailureReason::UnsupportedProvider => StatusCode::BAD_REQUEST,
+                RepositoryFailureReason::RegistrationIntentConflict => StatusCode::CONFLICT,
+                RepositoryFailureReason::MissingDefaultSelector
+                | RepositoryFailureReason::InvalidSelector
+                | RepositoryFailureReason::CommitNotFound
+                | RepositoryFailureReason::InvalidCommitRelation
+                | RepositoryFailureReason::ProviderFailure => StatusCode::BAD_GATEWAY,
+            }
+        }
         Error::BackendJobFailure {
             primary, recording, ..
         } => {
@@ -40413,7 +41251,8 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::BrowserReopenConfirmationRequired | Error::WorkspacePermissionDenied(_) => {
             StatusCode::FORBIDDEN
         }
-        Error::TicketAssignmentConflict(_)
+        Error::RepositoryRegistrationConflict { .. }
+        | Error::TicketAssignmentConflict(_)
         | Error::WorkdirAttachmentConflict(_)
         | Error::WorkdirOccupied { .. }
         | Error::WorkspaceConfigConflict(_)
@@ -40540,15 +41379,20 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::DbCapacityExceeded | Error::DbExecutorUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         Error::DbOperationOutcomeUnknown => StatusCode::SERVICE_UNAVAILABLE,
         Error::WorkspaceSigningIdentity { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        Error::WorkdirSessionOpenFailed { .. } | Error::RuntimeOperationFailed { .. } => {
-            StatusCode::BAD_GATEWAY
-        }
+        Error::WorkdirAttachmentSyncFailed { .. }
+        | Error::WorkdirSessionCloseFailed { .. }
+        | Error::WorkdirSessionOpenFailed { .. }
+        | Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 fn api_error_response_message(error: &Error) -> String {
     match error {
+        Error::ExternalWorkdirCleanupFailed { primary, .. } => api_error_response_message(primary),
+        Error::ExternalWorkdirObservationFailed { source, .. } => {
+            api_error_response_message(source)
+        }
         Error::BackendJobFailure { primary, recording, .. } if recording.is_empty() => api_error_response_message(primary),
         Error::BackendJobFailure { .. } => "Operation failed; its failure recording is unconfirmed. Reconcile the same operation before a new intent.".into(),
         Error::WorkdirSessionOpenFailed { transport, .. } => {
@@ -40590,6 +41434,15 @@ impl IntoResponse for ApiError {
             message: response_message.clone(),
             diagnostics: self.diagnostics.clone(),
         };
+        if matches!(
+            &self.error,
+            Error::RepositoryLookup(_) | Error::RepositoryRegistrationConflict { .. }
+        ) {
+            let error = self.into_repository_api_error();
+            let mut response = api_macros::axum::http_error_response(status, error);
+            response.extensions_mut().insert(log);
+            return response;
+        }
         if let Some(cause) = api_control_cause(&self.error) {
             let error = runtime_api::RuntimeApiError::new(
                 status.as_u16(),
@@ -40801,6 +41654,7 @@ mod tests {
     }
 
     mod api_logging_tests;
+    mod attachment_failure_tests;
     mod auth_logging_tests;
     mod command_transport_tests;
     mod drive_api_tests;
@@ -40809,6 +41663,7 @@ mod tests {
     mod embedded_owned_execution_tests;
     mod external_checkout_tests;
     mod protocol_backpressure_tests;
+    mod repository_http_contract_tests;
     mod restore_workdir_tests;
     mod restored_parent_control_tests;
     mod startup_result_tests;
@@ -41181,6 +42036,7 @@ mod tests {
             );
         }
     }
+    mod external_grant_failure_tests;
     mod subject_spawn_tests;
     mod subjektiv_jobs_tests;
     mod subjektiv_journal_tests;
@@ -42392,11 +43248,18 @@ mod tests {
         .await
         .expect("session-open expiry cleanup must not reacquire its Worker lock")
         .expect_err("injected attachment cleanup must surface");
-        assert!(matches!(
-            error,
-            Error::RuntimeOperationFailed { ref code, .. }
-                if code == "injected_external_workdir_cleanup_failure"
-        ));
+        let refusal = ApiError::from(error).into_workdir_attachment_api_error(
+            workdir::management_failure::WorkdirManagementOperation::Attach,
+        );
+        assert_eq!(
+            refusal.details().unwrap().reason,
+            workdir::management_failure::WorkdirManagementReason::GrantExpired
+        );
+        assert_eq!(refusal.related_failures().len(), 1);
+        assert_eq!(
+            refusal.related_failures()[0].stage,
+            server_api::workdir_management_error::WorkdirAttachmentFailureStage::GrantCleanup
+        );
         let (status, cleanup_state, cleanup_error): (String, String, Option<String>) = api
             .config_store
             .with_conn(|conn| {
@@ -42409,8 +43272,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "expired");
-        assert_eq!(cleanup_state, "retry_required");
-        assert_eq!(cleanup_error.as_deref(), Some("attachment_release_failed"));
+        assert_eq!(cleanup_state, "pending");
+        assert!(cleanup_error.is_some());
+        let owner = api
+            .store
+            .external_workdir_cleanup_operation(TEST_WORKSPACE_ID, &grant.grant_id)
+            .unwrap()
+            .unwrap();
+        assert!(owner.operation().release_confirmed);
+        assert!(!owner.operation().runtime_dispatched);
+        let saved = owner.operation().failures()[0].clone();
+        let projected = saved.project_for::<error_contract::Tool, workdir::management_failure::WorkdirManagementFailure>(
+            &workdir::management_failure::WorkdirManagementVisibility { can_view_cause: true },
+        ).unwrap();
+        assert_eq!(
+            projected.details().reason,
+            workdir::management_failure::WorkdirManagementReason::GrantAttachmentReleaseFailed
+        );
         assert!(
             api.external_workdir_expiry_tasks
                 .lock()
@@ -42451,7 +43329,18 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cleanup_state, "completed");
-        assert_eq!(cleanup_error, None);
+        assert!(
+            cleanup_error.is_some(),
+            "settlement retains the frozen request and historical diagnostics"
+        );
+        let settled = api
+            .store
+            .external_workdir_cleanup_operation(TEST_WORKSPACE_ID, &grant.grant_id)
+            .unwrap()
+            .unwrap();
+        assert!(settled.operation().settled);
+        assert_eq!(settled.operation().request, owner.operation().request);
+        assert_eq!(settled.operation().failures(), owner.operation().failures());
         assert!(
             api.store
                 .list_workdir_worker_links(TEST_WORKSPACE_ID, &grant.workdir_id)
@@ -43916,6 +44805,8 @@ mod tests {
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![RuntimeDiagnostic {
+                        session: None,
+                        workdir: None,
                         control: None,
                         startup: None,
                         code: "fixture_runtime_rejected".to_string(),
@@ -43961,6 +44852,7 @@ mod tests {
                 callback();
             }
             WorkerLifecycleResult {
+                cleanup_failures: Vec::new(),
                 replayed: false,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
@@ -43974,6 +44866,7 @@ mod tests {
             _request: WorkerLifecycleRequest,
         ) -> WorkerLifecycleResult {
             WorkerLifecycleResult {
+                cleanup_failures: Vec::new(),
                 replayed: false,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(Self::RUNTIME_ID, worker_id),
@@ -44088,13 +44981,14 @@ mod tests {
             &self,
             worker_id: &str,
             attachments: Vec<LogicalWorkdirAttachment>,
-        ) -> crate::hosts::WorkerWorkspaceApiResult {
+        ) -> crate::hosts::RuntimeOperationResponse {
             self.logical_attachments
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(worker_id.to_string(), attachments);
-            crate::hosts::WorkerWorkspaceApiResult {
-                state: InternalWorkerOperationState::Accepted,
+            crate::hosts::RuntimeOperationResponse {
+                status: crate::hosts::RuntimeOperationStatus::Accepted,
+                cause: None,
                 worker: self
                     .worker(worker_id)
                     .into_worker(Self::RUNTIME_ID, worker_id)
@@ -45842,6 +46736,8 @@ mod tests {
             kind: "ticket_backend_error".to_string(),
             message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
             diagnostics: vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "ticket_backend_error".to_string(),
@@ -52525,6 +53421,8 @@ mod tests {
     #[test]
     fn unrecoverable_pending_workspace_restore_is_typed_for_replacement() {
         let diagnostics = [RuntimeDiagnostic {
+            session: None,
+            workdir: None,
             control: None,
             startup: None,
             code: "embedded_worker_execution_rejected".to_string(),
@@ -52538,6 +53436,11 @@ mod tests {
     #[test]
     fn workdir_runtime_miss_uses_exact_typed_code() {
         let typed_not_found = [RuntimeDiagnostic {
+            session: None,
+            workdir: Some(workdir::management_failure::WorkdirManagementFailure {
+                operation: workdir::management_failure::WorkdirManagementOperation::Detail,
+                reason: workdir::management_failure::WorkdirManagementReason::NotFound,
+            }),
             control: None,
             startup: None,
             code: "working_directory_not_found".to_string(),
@@ -52551,6 +53454,8 @@ mod tests {
         assert!(workdir_runtime_miss_is_not_found(&typed_not_found));
 
         let unrelated = [RuntimeDiagnostic {
+            session: None,
+            workdir: None,
             control: None,
             startup: None,
             code: "some_other_not_found".to_string(),
@@ -62282,6 +63187,88 @@ mod tests {
             StatusCode::CREATED,
         )
         .await;
+        // Access causes wrap the prior boundary error. Real route decisions must
+        // keep the prior 404/409 classes, independent of public cause Category.
+        let missing = request_json(app.clone(), "POST", &format!("{base}/private-missing/rotate"), Some(json!({
+            "operation_id": "private-missing-operation", "expected_public_key_fingerprint": created["public_key_fingerprint"],
+            "private_key": private_key(12),
+        })), StatusCode::NOT_FOUND).await;
+        let duplicate = request_json(app.clone(), "POST", &base, Some(json!({
+            "operation_id": "private-duplicate-operation", "credential_id": "http-key", "name": "HTTP key",
+            "private_key": private_key(12),
+        })), StatusCode::CONFLICT).await;
+        assert_eq!(
+            missing,
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../../../web/workspace/test/repository-access/fixtures/credential-not-found.json"
+            ))
+            .unwrap()
+        );
+        assert_eq!(
+            duplicate["yoi_failure"]["reason"],
+            "credential_already_exists"
+        );
+        for response in [missing, duplicate] {
+            let text = response.to_string();
+            for private in [
+                "private-missing",
+                "private-duplicate",
+                "BEGIN OPENSSH",
+                "SHA256:",
+            ] {
+                assert!(
+                    !text.contains(private),
+                    "access cause leaked source identity: {text}"
+                );
+            }
+            assert!(
+                response["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("SSH credential")
+            );
+        }
+        // The production generated client decodes the real router's typed body,
+        // not just a fabricated receiver DTO. A receipt is not a projection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let network_app = app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, network_app).await.unwrap();
+        });
+        let generated = server_api::ServerApiClient::builder(&origin)
+            .unwrap()
+            .build()
+            .unwrap();
+        let received = generated
+            .repository_ssh_credential_rotate(
+                TEST_WORKSPACE_ID.to_owned(),
+                "private-missing".to_owned(),
+                RotateRepositorySshCredentialRequest {
+                    operation_id: "private-client-operation".into(),
+                    expected_public_key_fingerprint: created["public_key_fingerprint"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    private_key: private_key(12),
+                    passphrase: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        let server_api::client_support::ClientError::Public { status, error } = received else {
+            panic!("generated decoder rejected the production Problem response: {received:?}")
+        };
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            error.details().unwrap().reason,
+            server_api::repository_access_failure::RepositoryAccessReason::CredentialNotFound
+        );
+        assert!(
+            api_macros::HttpError::custom_response(&error).is_none(),
+            "received details are not encoder authority"
+        );
         let original_fingerprint = created["public_key_fingerprint"].clone();
         let rotate_path = format!("{base}/http-key/rotate");
         let reseal = json!({"operation_id":"http-key-reseal", "expected_public_key_fingerprint":original_fingerprint, "private_key":private_key(11)});
@@ -63810,6 +64797,11 @@ mod tests {
             &api,
             deleted,
             &[RuntimeDiagnostic {
+                session: None,
+                workdir: Some(workdir::management_failure::WorkdirManagementFailure {
+                    operation: workdir::management_failure::WorkdirManagementOperation::Detail,
+                    reason: workdir::management_failure::WorkdirManagementReason::NotFound,
+                }),
                 control: None,
                 startup: None,
                 code: "working_directory_not_found".to_string(),
@@ -63838,6 +64830,8 @@ mod tests {
             &api,
             unknown,
             &[RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "runtime_unavailable".to_string(),
@@ -64845,10 +65839,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let error: server_api::RepositoryApiError =
-            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+        let media = response.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(media, error_contract::problem::PROBLEM_CONTENT_TYPE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error =
+            server_api::WorkdirManagementApiError::decode_received(409, &media, &body).unwrap();
+        let cause = error.details().unwrap();
+        assert_eq!(
+            cause.operation,
+            workdir::management_failure::WorkdirManagementOperation::Attach
+        );
+        assert_eq!(
+            cause.reason,
+            workdir::management_failure::WorkdirManagementReason::Occupied
+        );
+        let tool = error_contract::project_failure::<error_contract::Tool, _>(
+            &error_contract::FailureFacts::new(*cause).unwrap(),
+            &workdir::management_failure::WorkdirManagementVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["detail"], tool.explanation());
+        assert!(!String::from_utf8_lossy(&body).contains("private"));
+        assert_eq!(
+            api.store
+                .list_workdir_worker_links(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+                .unwrap()[0]
+                .worker
+                .worker_id,
+            "another-owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_worker_attach_registry_causes_keep_original_gateway_and_conflict_results() {
+        use workdir::management_failure::{
+            WorkdirManagementOperation as Op, WorkdirManagementReason as Reason,
+        };
+        let mut fixture = manual_worker_assignment_fixture().await;
+        let identity =
+            worker_runtime::auth::RuntimeIdentityMaterial::generate(&fixture.worker.runtime_id)
                 .unwrap();
-        assert_eq!(error.error, "workdir_occupied");
+        configure_runtime_request_auth(&mut fixture.api, &identity, &fixture.worker.runtime_id);
+        let api = &fixture.api;
+        let original = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+            .unwrap();
+        let mut unavailable = api
+            .store
+            .get_workdir_registry(TEST_WORKSPACE_ID, &fixture.docs_workdir_id)
+            .unwrap()
+            .unwrap();
+        unavailable.workdir_id = "unavailable-attachment-target".into();
+        unavailable.materialization_status = "corrupted".into();
+        api.store.upsert_workdir_registry(&unavailable).unwrap();
+        for (target, status, reason) in [
+            (
+                "missing-attachment-target",
+                StatusCode::BAD_GATEWAY,
+                Reason::AttachmentRegistryNotFound,
+            ),
+            (
+                "unavailable-attachment-target",
+                StatusCode::CONFLICT,
+                Reason::AttachmentNotAvailable,
+            ),
+        ] {
+            let response = build_router(api.clone())
+                .oneshot(runtime_source_request(
+                    &identity,
+                    Some(&fixture.worker.worker_id),
+                    "POST",
+                    &format!("/api/w/{TEST_WORKSPACE_ID}/workers/self/workdir-attachments"),
+                    serde_json::to_vec(
+                        &json!({"alias":"new-target", "working_directory_id":target}),
+                    )
+                    .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let media = response.headers()[axum::http::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let decoded = server_api::WorkdirManagementApiError::decode_received(
+                status.as_u16(),
+                &media,
+                &body,
+            )
+            .unwrap();
+            assert_eq!(decoded.details().unwrap().operation, Op::Attach);
+            assert_eq!(decoded.details().unwrap().reason, reason);
+            let tool = error_contract::project_failure::<error_contract::Tool, _>(
+                &error_contract::FailureFacts::new(*decoded.details().unwrap()).unwrap(),
+                &workdir::management_failure::WorkdirManagementVisibility {
+                    can_view_cause: true,
+                },
+            )
+            .unwrap();
+            let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(problem["detail"], tool.explanation());
+            assert_eq!(
+                api.store
+                    .list_worker_workdir_links(TEST_WORKSPACE_ID, &fixture.worker)
+                    .unwrap(),
+                original
+            );
+        }
     }
 
     #[tokio::test]
@@ -64983,6 +66088,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let media = response.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(media, error_contract::problem::PROBLEM_CONTENT_TYPE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error =
+            server_api::WorkdirManagementApiError::decode_received(409, &media, &body).unwrap();
+        assert_eq!(
+            error.details().unwrap().operation,
+            workdir::management_failure::WorkdirManagementOperation::Detach
+        );
+        assert_eq!(
+            error.details().unwrap().reason,
+            workdir::management_failure::WorkdirManagementReason::AttachmentConflict
+        );
+
         assert!(
             api.workdir_sessions
                 .lock()
@@ -65536,6 +66658,11 @@ mod tests {
             InternalWorkerOperationState::Rejected,
             None,
             vec![RuntimeDiagnostic {
+                session: None,
+                workdir: Some(workdir::management_failure::WorkdirManagementFailure {
+                    operation: workdir::management_failure::WorkdirManagementOperation::Detail,
+                    reason: workdir::management_failure::WorkdirManagementReason::NotFound,
+                }),
                 control: None,
                 startup: None,
                 code: "working_directory_not_found".into(),
@@ -65588,7 +66715,7 @@ mod tests {
             workdir_removal_result(
                 InternalWorkerOperationState::Rejected,
                 None,
-                vec![RuntimeDiagnostic {
+                vec![RuntimeDiagnostic { session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy }),
                     control: None,
                     startup: None,
                     code: "working_directory_cleanup_resource_busy".into(),
@@ -65820,6 +66947,11 @@ mod tests {
 
         let (missing_operation, _) = reserve_removal_fixture(&api, "provider-not-found");
         let not_found = RuntimeDiagnostic {
+            session: None,
+            workdir: Some(workdir::management_failure::WorkdirManagementFailure {
+                operation: workdir::management_failure::WorkdirManagementOperation::Detail,
+                reason: workdir::management_failure::WorkdirManagementReason::NotFound,
+            }),
             control: None,
             startup: None,
             code: "working_directory_not_found".to_string(),
@@ -65857,6 +66989,8 @@ mod tests {
                 InternalWorkerOperationState::Accepted,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
+                    workdir: None,
                     control: None,
                     startup: None,
                     code: "working_directory_provider_timeout".to_string(),
@@ -65975,6 +67109,8 @@ mod tests {
                 InternalWorkerOperationState::Unsupported,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
+                    workdir: None,
                     control: None,
                     startup: None,
                     code: "working_directory_unsupported".to_string(),
@@ -66001,45 +67137,39 @@ mod tests {
 
     #[test]
     fn workdir_cleanup_failure_classification_is_bounded_and_guides_normal_retry() {
-        for (code, category) in [
-            ("working_directory_cleanup_mount_present", "mount_present"),
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation as Operation,
+            WorkdirManagementReason as Reason,
+        };
+        for (reason, category) in [
+            (Some(Reason::CleanupMountPresent), "mount_present"),
             (
-                "working_directory_cleanup_mount_check_unavailable",
+                Some(Reason::CleanupMountCheckUnavailable),
                 "mount_check_unavailable",
             ),
+            (Some(Reason::CleanupPermissionDenied), "permission_denied"),
+            (Some(Reason::CleanupResourceBusy), "resource_busy"),
             (
-                "working_directory_cleanup_permission_denied",
-                "permission_denied",
-            ),
-            ("working_directory_cleanup_resource_busy", "resource_busy"),
-            (
-                "working_directory_cleanup_storage_unavailable",
+                Some(Reason::CleanupStorageUnavailable),
                 "storage_unavailable",
             ),
-            (
-                "working_directory_cleanup_ownership_unknown",
-                "ownership_unknown",
-            ),
-            (
-                "working_directory_cleanup_changes_present",
-                "changes_present",
-            ),
-            (
-                "working_directory_cleanup_changes_unknown",
-                "changes_unknown",
-            ),
-            (
-                "arbitrary provider text /private/path",
-                "provider_cleanup_failed",
-            ),
+            (Some(Reason::CleanupOwnershipUnknown), "ownership_unknown"),
+            (Some(Reason::CleanupChangesPresent), "changes_present"),
+            (Some(Reason::CleanupChangesUnknown), "changes_unknown"),
+            (None, "provider_cleanup_failed"),
         ] {
             let result = workdir_removal_result(
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
+                    workdir: reason.map(|reason| WorkdirManagementFailure {
+                        operation: Operation::Cleanup,
+                        reason,
+                    }),
                     control: None,
                     startup: None,
-                    code: code.into(),
+                    code: "working_directory_cleanup_mount_present".into(),
                     severity: HostDiagnosticSeverity::Error,
                     message: "secret /private/path".into(),
                 }],
@@ -66070,6 +67200,8 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
+                    workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupMountPresent }),
                     control: None,
                     startup: None,
                     code: "working_directory_cleanup_mount_present".into(),
@@ -66221,8 +67353,8 @@ mod tests {
                 workdir_removal_result(
                     InternalWorkerOperationState::Rejected,
                     None,
-                    vec![RuntimeDiagnostic {
-                        control: None,
+                    vec![RuntimeDiagnostic { session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Detail, reason: workdir::management_failure::WorkdirManagementReason::CleanupPermissionDenied }),
+                    control: None,
                         startup: None,
                         code: "working_directory_cleanup_permission_denied".into(),
                         severity: HostDiagnosticSeverity::Error,
@@ -66244,7 +67376,11 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 result.failure_category.as_deref(),
-                Some("permission_denied")
+                Some(if transport_error {
+                    "provider_unavailable"
+                } else {
+                    "permission_denied"
+                })
             );
             assert!(result.retryable);
             assert_eq!(provider.cleanup_calls(), 0);
@@ -66410,6 +67546,11 @@ mod tests {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                session: None,
+                workdir: Some(workdir::management_failure::WorkdirManagementFailure {
+                    operation: workdir::management_failure::WorkdirManagementOperation::Detail,
+                    reason: workdir::management_failure::WorkdirManagementReason::NotFound,
+                }),
                 control: None,
                 startup: None,
                 code: "working_directory_not_found".to_string(),
@@ -66418,11 +67559,25 @@ mod tests {
             }],
         };
         assert!(runtime_reports_workdir_not_found(&not_found));
+        let mut legacy = not_found.clone();
+        legacy.diagnostics[0].workdir = None;
+        assert!(!runtime_reports_workdir_not_found(&legacy));
+        let mut unrelated = not_found.clone();
+        unrelated.diagnostics[0].workdir.as_mut().unwrap().operation =
+            workdir::management_failure::WorkdirManagementOperation::Create;
+        assert!(!runtime_reports_workdir_not_found(&unrelated));
+        let mut reworded = not_found.clone();
+        reworded.diagnostics[0].code = "different_display_code".into();
+        reworded.diagnostics[0].severity = HostDiagnosticSeverity::Info;
+        reworded.diagnostics[0].message = "success; retry automatically".into();
+        assert!(runtime_reports_workdir_not_found(&reworded));
 
         let unknown = crate::hosts::RuntimeWorkingDirectoryResult {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "working_directory_provider_timeout".to_string(),
@@ -68116,9 +69271,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_rejection_classification_prefers_stable_error_diagnostic() {
+    fn provider_rejection_ignores_opaque_code_and_severity() {
         let diagnostics = vec![
             RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "runtime_capacity_warning".to_string(),
@@ -68126,6 +69283,8 @@ mod tests {
                 message: "capacity is low".to_string(),
             },
             RuntimeDiagnostic {
+                session: None,
+                workdir: None,
                 control: None,
                 startup: None,
                 code: "runtime_capacity_unavailable".to_string(),
@@ -68135,7 +69294,7 @@ mod tests {
         ];
         assert_eq!(
             workdir_rejection_failure_code(&diagnostics),
-            "runtime_capacity_unavailable"
+            "runtime_workdir_create_failed"
         );
         assert_eq!(
             workdir_rejection_failure_code(&[]),
@@ -68144,7 +69303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_rejection_persists_stable_failure_classification() {
+    async fn provider_rejection_persists_unknown_without_manufacturing_typed_cause() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
@@ -68187,6 +69346,8 @@ mod tests {
             })
             .unwrap();
         let diagnostics = vec![RuntimeDiagnostic {
+            session: None,
+            workdir: None,
             control: None,
             startup: None,
             code: "runtime_capacity_unavailable".to_string(),
@@ -68204,7 +69365,7 @@ mod tests {
                 &now_registry_timestamp(),
             )
             .unwrap(),
-            "runtime_capacity_unavailable"
+            "runtime_workdir_create_failed"
         );
         let operation = api
             .config_store
@@ -68214,7 +69375,7 @@ mod tests {
         assert_eq!(operation.state, "failed");
         assert_eq!(
             operation.failure.as_deref(),
-            Some("runtime_capacity_unavailable")
+            Some("runtime_workdir_create_failed")
         );
     }
 
@@ -68540,10 +69701,23 @@ mod tests {
             StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(response["error"], "Bad Request");
+        assert_eq!(response["status"], 400);
+        assert_eq!(response["yoi_failure"]["domain"], "workdir_management");
+        assert_eq!(response["yoi_failure"]["details"]["operation"], "create");
         assert_eq!(
-            response["diagnostics"][0]["code"],
+            response["yoi_failure"]["reason"],
             "embedded_worker_workdir_unsupported"
+        );
+        assert!(
+            response["detail"]
+                .as_str()
+                .unwrap()
+                .contains("non-embedded Runtime")
+        );
+        assert!(
+            !response
+                .to_string()
+                .contains(&dir.path().display().to_string())
         );
         set_test_default_runtime(&api, "not-a-registered-runtime");
         request_json_authenticated(
@@ -68567,9 +69741,60 @@ mod tests {
             .unwrap();
         assert_eq!(operation.resolved_runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
         assert_eq!(operation.state, "failed");
+        use workdir::management_failure::{WorkdirManagementFailure, WorkdirManagementVisibility};
+        let reopened = SqliteWorkspaceStore::open_for_test(&api.config.database_path).unwrap();
+        let saved = reopened
+            .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved, operation);
+        let evidence = saved.failure_evidence().unwrap();
+        assert!(
+            evidence
+                .project_for::<error_contract::Browser, WorkdirManagementFailure>(
+                    &WorkdirManagementVisibility {
+                        can_view_cause: false
+                    }
+                )
+                .is_err()
+        );
+        let projected = evidence
+            .project_for::<error_contract::Browser, WorkdirManagementFailure>(
+                &WorkdirManagementVisibility {
+                    can_view_cause: true,
+                },
+            )
+            .unwrap();
         assert_eq!(
-            operation.failure.as_deref(),
-            Some("embedded_worker_workdir_unsupported")
+            serde_json::to_value(projected.details()).unwrap(),
+            response["yoi_failure"]["details"]
+        );
+        assert_eq!(
+            projected.explanation(),
+            response["detail"].as_str().unwrap()
+        );
+        // Retained text is not authority or the new public explanation.
+        let mut historical: serde_json::Value =
+            serde_json::from_str(saved.failure.as_deref().unwrap()).unwrap();
+        historical["explanation"] =
+            serde_json::json!("SUCCESS; retry automatically /private/provider");
+        let edited =
+            protocol::background_failure::StoredFailure::from_storage(historical.to_string());
+        let fresh = edited
+            .project_for::<error_contract::Tool, WorkdirManagementFailure>(
+                &WorkdirManagementVisibility {
+                    can_view_cause: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(fresh.details(), projected.details());
+        assert_eq!(fresh.explanation(), projected.explanation());
+        assert_eq!(
+            reopened
+                .load_workdir_create_operation(TEST_WORKSPACE_ID, operation_id)
+                .unwrap()
+                .unwrap(),
+            saved
         );
         assert_eq!(
             operation.config_projection_digest,
@@ -70649,57 +71874,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_log_rejects_unknown_or_unsupported_configured_repository() {
-        let root = tempfile::tempdir().unwrap();
-        let mut config = test_server_config(root.path());
-        config.repositories = vec![ConfiguredRepository {
-            id: "files".to_string(),
-            repository_key: "files".to_string(),
-            provider: "local_fs".to_string(),
-            source: server_api::RepositorySource {
-                kind: server_api::RepositorySourceKind::LocalPath,
-                uri: root.path().display().to_string(),
-            },
-            source_fingerprint: "sha256:test".to_string(),
-            observed_status: server_api::RepositoryObservedStatus::Unverified,
-            observed_at: None,
-            path: Some(root.path().to_path_buf()),
-            default_selector: None,
-        }];
-        let store = test_control_store(&config);
-        let api = WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap();
-        let app = build_inner_router(api);
-
-        let unknown = request_json(
-            app.clone(),
-            "GET",
-            "/api/repositories/test-repository/log",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-        assert_eq!(
-            unknown["diagnostics"][0]["code"],
-            "repository_not_configured"
-        );
-
-        let unsupported = request_json(
-            app,
-            "GET",
-            "/api/repositories/files/log",
-            None,
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-        assert_eq!(
-            unsupported["diagnostics"][0]["code"],
-            "repository_provider_unsupported"
-        );
+        repository_http_contract_tests::assert_lookup_and_registration_contract().await;
     }
 
     #[tokio::test]

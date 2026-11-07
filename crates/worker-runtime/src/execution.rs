@@ -1112,8 +1112,8 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         &self,
         _request: &RepositoryRefObservationRequest,
     ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
-        Err(WorkingDirectoryDiagnostic::rejected(
-            "repository_ref_provider_unavailable",
+        Err(WorkingDirectoryDiagnostic::for_reason(
+            workdir::management_failure::WorkdirManagementReason::RefProviderUnavailable,
             "Worker execution backend does not support Repository ref observation",
         ))
     }

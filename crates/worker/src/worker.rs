@@ -678,6 +678,9 @@ pub struct WorkspaceBinaryRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBinaryResponse {
     pub status: u16,
+    /// Received media type, with the same absent/invalid semantics as JSON transport.
+    /// Binary failures may be Problem Details; body shape never supplies metadata.
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -2054,6 +2057,7 @@ mod reviewer_client_tests {
         ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push((request, None));
             Ok(WorkspaceBinaryResponse {
+                content_type: None,
                 status: 200,
                 body: vec![0, 255],
             })
@@ -2065,6 +2069,7 @@ mod reviewer_client_tests {
         ) -> Result<WorkspaceBinaryResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push((request, Some(timeout)));
             Ok(WorkspaceBinaryResponse {
+                content_type: None,
                 status: 200,
                 body: vec![0, 255],
             })
@@ -6958,6 +6963,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 identity: invocation.identity.clone(),
                 status,
                 message,
+                failure: None,
                 context: None,
             };
             let handle = self.pending_submission_handle();
@@ -6995,13 +7001,15 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                         "invocation id was already used with a different payload".into(),
                     )
                 } else {
-                    let replay = receipt.result.clone().unwrap_or_else(|| {
+                    let mut replay = receipt.result.clone().unwrap_or_else(|| {
                         failed(
                             FeatureInvocationStatus::OutcomeUnknown,
                             "a durable invocation start has no result; do not retry automatically"
                                 .into(),
                         )
                     });
+                    self.feature_invocations
+                        .redisclose_failure(invocation, &mut replay);
                     if replay.status == FeatureInvocationStatus::Succeeded {
                         // Recorded success is reusable context, not authority to
                         // resurrect a removed capability or revoked argument
@@ -7015,7 +7023,9 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                     }
                 }
             } else if let Err(error) = self.feature_invocations.validate(invocation) {
-                failed(FeatureInvocationStatus::Failed, error.message)
+                let mut result = failed(FeatureInvocationStatus::Failed, error.message);
+                result.failure = error.failure;
+                result
             } else {
                 let started = {
                     let _append = handle
@@ -7048,14 +7058,18 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
                 } else {
                     match self.feature_invocations.invoke(invocation).await {
                         Ok(result) => result,
-                        Err(error) => failed(
-                            if error.outcome_unknown {
-                                FeatureInvocationStatus::OutcomeUnknown
-                            } else {
-                                FeatureInvocationStatus::Failed
-                            },
-                            error.message,
-                        ),
+                        Err(error) => {
+                            let mut result = failed(
+                                if error.outcome_unknown {
+                                    FeatureInvocationStatus::OutcomeUnknown
+                                } else {
+                                    FeatureInvocationStatus::Failed
+                                },
+                                error.message,
+                            );
+                            result.failure = error.failure;
+                            result
+                        }
                     }
                 }
             };
@@ -19738,6 +19752,7 @@ permission = "write"
                 identity: invocation.identity.clone(),
                 status: protocol::FeatureInvocationStatus::Succeeded,
                 message: "done".into(),
+                failure: None,
                 context: Some("prepared recovery context".into()),
             })
         }
@@ -20539,6 +20554,7 @@ permission = "write"
                 identity: invocation.identity.clone(),
                 status: protocol::FeatureInvocationStatus::Succeeded,
                 message: "done".into(),
+                failure: None,
                 context: None,
             })
             .unwrap();
@@ -20550,6 +20566,7 @@ permission = "write"
                 identity: invocation.identity.clone(),
                 status: protocol::FeatureInvocationStatus::Succeeded,
                 message: "done".into(),
+                failure: None,
                 context: Some("x".repeat(16385)),
             })
             .unwrap();

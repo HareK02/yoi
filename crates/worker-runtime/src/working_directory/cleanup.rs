@@ -31,46 +31,24 @@
 use super::*;
 use std::io;
 
-fn cause(kind: &str) -> WorkingDirectoryDiagnostic {
-    let message = match kind {
-        "mount_present" => {
-            "A mounted resource remains. Its owner must safely release it before retrying removal; Runtime will not unmount external or unknown resources."
-        }
-        "mount_check_unavailable" => {
-            "Mount-safe removal is unavailable. Restore Runtime mount-check support and retry."
-        }
-        "permission_denied" => {
-            "Removal was denied by filesystem permissions. Ask the resource owner to resolve permissions and retry."
-        }
-        "resource_busy" => {
-            "A filesystem resource is busy or changed during removal. Release the resource and retry."
-        }
-        "storage_unavailable" => {
-            "Cleanup storage is unavailable. Restore storage access and retry."
-        }
-        "ownership_unknown" => {
-            "The remaining directory cannot be matched to Runtime removal authority. Verify its identity and ownership before removal."
-        }
-        "changes_present" => {
-            "New or changed content is present. Preserve or resolve those changes before retrying removal."
-        }
-        _ => {
-            "Remaining entries cannot be authorized from saved entry metadata and a usable clean checkout. Preserve residual content outside this Workdir and restore the same usable checkout, or ask its owner to remove verified residual content before retrying. Do not edit removal metadata."
-        }
-    };
-    WorkingDirectoryDiagnostic::new(format!("working_directory_cleanup_{kind}"), message)
+fn cause(reason: WorkdirManagementReason) -> WorkingDirectoryDiagnostic {
+    WorkingDirectoryDiagnostic::new(reason, reason.explanation())
 }
 
 pub(super) fn os_failure(id: &str, action: &str, error: io::Error) -> WorkingDirectoryDiagnostic {
     let kind = match error.raw_os_error() {
-        Some(libc::EXDEV) => "mount_present",
-        Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => "mount_check_unavailable",
-        Some(libc::EACCES | libc::EPERM) => "permission_denied",
-        Some(libc::EBUSY | libc::ENOTEMPTY | libc::EAGAIN) => "resource_busy",
-        _ => "storage_unavailable",
+        Some(libc::EXDEV) => WorkdirManagementReason::CleanupMountPresent,
+        Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL) => {
+            WorkdirManagementReason::CleanupMountCheckUnavailable
+        }
+        Some(libc::EACCES | libc::EPERM) => WorkdirManagementReason::CleanupPermissionDenied,
+        Some(libc::EBUSY | libc::ENOTEMPTY | libc::EAGAIN) => {
+            WorkdirManagementReason::CleanupResourceBusy
+        }
+        _ => WorkdirManagementReason::CleanupStorageUnavailable,
     };
     tracing::warn!(target: "yoi::workdir_cleanup", working_directory_id = id,
-        action, cause = kind, raw_os_error = ?error.raw_os_error(), error = %error,
+        action, cause = kind.as_str(), raw_os_error = ?error.raw_os_error(), error = %error,
         "Runtime-private working directory cleanup failure");
     cause(kind)
 }
@@ -123,7 +101,7 @@ fn remove_checked(
     _id: &str,
 ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
     // No fallback to remove_dir_all: mount safety is a precondition.
-    Err(cause("mount_check_unavailable"))
+    Err(cause(WorkdirManagementReason::CleanupMountCheckUnavailable))
 }
 
 #[cfg(target_os = "linux")]
@@ -162,7 +140,7 @@ fn remove_with_checks(
         Ok(parent) => parent,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_found",
+                WorkdirManagementReason::NotFound,
                 "Runtime working directory was not found",
             ));
         }
@@ -172,19 +150,19 @@ fn remove_with_checks(
         Ok(tree) => tree,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_found",
+                WorkdirManagementReason::NotFound,
                 "Runtime working directory was not found",
             ));
         }
         Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
-            return Err(cause("ownership_unknown"));
+            return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
         }
         Err(error) => return Err(os_failure(id, "open_cleanup_root", error)),
     };
     let root_identity = identity(&tree).map_err(|e| os_failure(id, "identify_root", e))?;
     let saved = load_authority(&parent, id).map_err(|error| {
         if error.kind() == io::ErrorKind::InvalidData {
-            cause("ownership_unknown")
+            cause(WorkdirManagementReason::CleanupOwnershipUnknown)
         } else {
             os_failure(id, "read_removal_authority", error)
         }
@@ -195,13 +173,13 @@ fn remove_with_checks(
         &materializer.working_directory_root(id),
         &mount_info().map_err(|e| {
             let _ = os_failure(id, "read_mountinfo", e);
-            cause("mount_check_unavailable")
+            cause(WorkdirManagementReason::CleanupMountCheckUnavailable)
         })?,
     )?;
     let authority = if let Some(saved) = saved {
         validate_directory_owner(id, &saved.working_directory)?;
         if saved.root_identity != root_identity {
-            return Err(cause("ownership_unknown"));
+            return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
         }
         let entries = retry_inventory(materializer, id, &tree, &saved)?;
         if !saved.legacy && verify_remaining(&saved.entries, &entries).is_ok() {
@@ -228,14 +206,15 @@ fn remove_with_checks(
             check_clean_checkout(id, &binding, &before, None)?;
         }
         if inventory(&tree).map_err(|e| os_failure(id, "recheck_inspected_tree", e))? != before {
-            return Err(cause("changes_present"));
+            return Err(cause(WorkdirManagementReason::CleanupChangesPresent));
         }
         binding.working_directory.status = WorkingDirectoryStatusKind::CleanupPending;
         let record = WorkingDirectoryMaterializationRecord {
             working_directory: binding.working_directory.clone(),
             root: binding.root.clone(),
         };
-        let raw = serde_json::to_vec_pretty(&record).map_err(|_| cause("storage_unavailable"))?;
+        let raw = serde_json::to_vec_pretty(&record)
+            .map_err(|_| cause(WorkdirManagementReason::CleanupStorageUnavailable))?;
         rewrite_record(&tree, &raw, before.get(Path::new(MATERIALIZATION_RECORD)))
             .map_err(|e| os_failure(id, "write_cleanup_pending", e))?;
         let entries = inventory(&tree).map_err(|e| os_failure(id, "capture_entry_metadata", e))?;
@@ -246,7 +225,7 @@ fn remove_with_checks(
         let mut before_without_record = before;
         before_without_record.remove(Path::new(MATERIALIZATION_RECORD));
         if without_record != before_without_record {
-            return Err(cause("changes_present"));
+            return Err(cause(WorkdirManagementReason::CleanupChangesPresent));
         }
         let authority = Authority {
             working_directory: binding.working_directory.clone(),
@@ -265,7 +244,7 @@ fn remove_with_checks(
     // recursion into a replaced entry, even if a mount arrives after preflight.
     erase_tree(&tree, Path::new(""), &authority.entries).map_err(|e| match e {
         EraseError::Io(e) => os_failure(id, "unlink_remaining_tree", e),
-        EraseError::Changed => cause("changes_present"),
+        EraseError::Changed => cause(WorkdirManagementReason::CleanupChangesPresent),
     })?;
     check_live_root(&parent, id, authority.root_identity)?;
     unlink(&parent, std::ffi::OsStr::new(id), true)
@@ -292,10 +271,10 @@ fn check_live_root(
     id: &str,
     expected: (u64, u64),
 ) -> Result<(), WorkingDirectoryDiagnostic> {
-    let live =
-        open_directory(parent, std::ffi::OsStr::new(id)).map_err(|_| cause("ownership_unknown"))?;
+    let live = open_directory(parent, std::ffi::OsStr::new(id))
+        .map_err(|_| cause(WorkdirManagementReason::CleanupOwnershipUnknown))?;
     if identity(&live).map_err(|e| os_failure(id, "recheck_root_identity", e))? != expected {
-        return Err(cause("ownership_unknown"));
+        return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
     }
     Ok(())
 }
@@ -317,13 +296,13 @@ fn read_cleanup_binding(
         if e.kind() == io::ErrorKind::InvalidData
             || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
         {
-            cause("ownership_unknown")
+            cause(WorkdirManagementReason::CleanupOwnershipUnknown)
         } else {
             os_failure(id, "read_cleanup_record", e)
         }
     })?;
-    let record: WorkingDirectoryMaterializationRecord =
-        serde_json::from_slice(&raw).map_err(|_| cause("ownership_unknown"))?;
+    let record: WorkingDirectoryMaterializationRecord = serde_json::from_slice(&raw)
+        .map_err(|_| cause(WorkdirManagementReason::CleanupOwnershipUnknown))?;
     Ok(WorkingDirectoryBinding {
         working_directory: record.working_directory,
         root: record.root.clone(),
@@ -372,7 +351,7 @@ fn retry_inventory(
     for required in [Path::new(CHECKOUT_DIR), Path::new("checkout/.git")] {
         if let Some(entry) = before.get(required) {
             if saved.entries.get(required) != Some(entry) {
-                return Err(cause("ownership_unknown"));
+                return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
             }
         }
     }
@@ -380,7 +359,7 @@ fn retry_inventory(
         let binding = read_cleanup_binding(materializer, id, tree)?;
         validate_binding(materializer, id, &binding)?;
         if !same_materialization(&saved.working_directory, &binding.working_directory) {
-            return Err(cause("ownership_unknown"));
+            return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
         }
         Some(binding)
     } else {
@@ -396,7 +375,7 @@ fn retry_inventory(
         // identity and saved ownership are still required; validate any record.
         return Ok(before);
     }
-    let binding = binding.ok_or_else(|| cause("changes_unknown"))?;
+    let binding = binding.ok_or_else(|| cause(WorkdirManagementReason::CleanupChangesUnknown))?;
     check_clean_checkout(id, &binding, &before, Some(saved))?;
     let parent = fs::File::open(&materializer.runtime_root)
         .map_err(|e| os_failure(id, "reopen_runtime_root", e))?;
@@ -405,10 +384,10 @@ fn retry_inventory(
     if identity(&live).map_err(|e| os_failure(id, "recheck_retry_identity", e))?
         != saved.root_identity
     {
-        return Err(cause("ownership_unknown"));
+        return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
     }
     if inventory(tree).map_err(|e| os_failure(id, "recheck_retry_metadata", e))? != before {
-        return Err(cause("changes_present"));
+        return Err(cause(WorkdirManagementReason::CleanupChangesPresent));
     }
     Ok(before)
 }
@@ -425,11 +404,11 @@ fn check_clean_checkout(
             .get(required)
             .filter(|entry| entry.mode & libc::S_IFMT == libc::S_IFDIR)
         else {
-            return Err(cause("changes_unknown"));
+            return Err(cause(WorkdirManagementReason::CleanupChangesUnknown));
         };
         if let Some(saved) = saved {
             if saved.entries.get(required) != Some(entry) {
-                return Err(cause("ownership_unknown"));
+                return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
             }
         }
     }
@@ -452,14 +431,14 @@ fn check_clean_checkout(
             .output()
             .map_err(|e| os_failure(id, "inspect_changes", e))?;
         if !output.status.success() {
-            return Err(cause("changes_unknown"));
+            return Err(cause(WorkdirManagementReason::CleanupChangesUnknown));
         }
         Ok(output.stdout)
     };
     // An empty/unborn index is not a usable committed checkout.
     run(&["rev-parse", "--verify", "HEAD^{tree}"])?;
     if !run(&["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
-        return Err(cause("changes_present"));
+        return Err(cause(WorkdirManagementReason::CleanupChangesPresent));
     }
     if let Some(saved) = saved {
         use std::os::unix::ffi::OsStrExt;
@@ -481,10 +460,10 @@ fn check_clean_checkout(
                 // Old digests cannot establish current ignored/outside-tree
                 // safety without body reads. Never renew uncertain residue.
                 if saved.legacy {
-                    return Err(cause("changes_unknown"));
+                    return Err(cause(WorkdirManagementReason::CleanupChangesUnknown));
                 }
                 if saved.entries.get(path) != Some(entry) {
-                    return Err(cause("changes_present"));
+                    return Err(cause(WorkdirManagementReason::CleanupChangesPresent));
                 }
             }
         }
@@ -503,20 +482,22 @@ pub(super) fn validate_recovery_binding(
         let parent = fs::File::open(&materializer.runtime_root)
             .map_err(|e| os_failure(id, "open_bind_root", e))?;
         let tree = open_directory(&parent, std::ffi::OsStr::new(id))
-            .map_err(|_| cause("ownership_unknown"))?;
+            .map_err(|_| cause(WorkdirManagementReason::CleanupOwnershipUnknown))?;
         let checkout = open_directory(&tree, std::ffi::OsStr::new(CHECKOUT_DIR))
-            .map_err(|_| cause("changes_unknown"))?;
+            .map_err(|_| cause(WorkdirManagementReason::CleanupChangesUnknown))?;
         let git = open_directory(&checkout, std::ffi::OsStr::new(".git"))
-            .map_err(|_| cause("changes_unknown"))?;
+            .map_err(|_| cause(WorkdirManagementReason::CleanupChangesUnknown))?;
         if inspect(&tree, std::ffi::OsStr::new(MATERIALIZATION_RECORD))
-            .map_err(|_| cause("ownership_unknown"))?
+            .map_err(|_| cause(WorkdirManagementReason::CleanupOwnershipUnknown))?
             .mode
             & libc::S_IFMT
             != libc::S_IFREG
         {
-            return Err(cause("ownership_unknown"));
+            return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
         }
-        if let Some(saved) = load_authority(&parent, id).map_err(|_| cause("ownership_unknown"))? {
+        if let Some(saved) = load_authority(&parent, id)
+            .map_err(|_| cause(WorkdirManagementReason::CleanupOwnershipUnknown))?
+        {
             if saved.working_directory.id != id
                 || !same_materialization(&saved.working_directory, &binding.working_directory)
                 || identity(&tree).ok() != Some(saved.root_identity)
@@ -531,7 +512,7 @@ pub(super) fn validate_recovery_binding(
                     .map(|entry| entry.identity)
                     != identity(&git).ok()
             {
-                return Err(cause("ownership_unknown"));
+                return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
             }
         }
     }
@@ -540,7 +521,7 @@ pub(super) fn validate_recovery_binding(
     if !binding_paths_are_available(binding)
         || git_stdout(binding.root(), ["rev-parse", "--verify", "HEAD^{tree}"]).is_err()
     {
-        return Err(cause("changes_unknown"));
+        return Err(cause(WorkdirManagementReason::CleanupChangesUnknown));
     }
     Ok(())
 }
@@ -552,7 +533,7 @@ pub(super) fn validate_binding(
 ) -> Result<(), WorkingDirectoryDiagnostic> {
     validate_directory_owner(id, &binding.working_directory)?;
     if binding.root != materializer.working_directory_root(id).join(CHECKOUT_DIR) {
-        return Err(cause("ownership_unknown"));
+        return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
     }
     Ok(())
 }
@@ -569,7 +550,7 @@ fn validate_directory_owner(
         || directory.cleanup_target.repository_id != directory.repository_id
         || directory.cleanup_target.kind != "runtime_git_clone"
     {
-        return Err(cause("ownership_unknown"));
+        return Err(cause(WorkdirManagementReason::CleanupOwnershipUnknown));
     }
     Ok(())
 }
@@ -661,7 +642,7 @@ fn verify_remaining(
         .iter()
         .any(|(name, entry)| expected.get(name) != Some(entry))
     {
-        return Err(cause("changes_present"));
+        return Err(cause(WorkdirManagementReason::CleanupChangesPresent));
     }
     Ok(())
 }
@@ -673,14 +654,14 @@ fn check_mounts(root: &Path, raw: &[u8]) -> Result<(), WorkingDirectoryDiagnosti
     use std::os::unix::ffi::OsStringExt;
     let root = root
         .canonicalize()
-        .map_err(|_| cause("ownership_unknown"))?;
+        .map_err(|_| cause(WorkdirManagementReason::CleanupOwnershipUnknown))?;
     if raw.is_empty() {
-        return Err(cause("mount_check_unavailable"));
+        return Err(cause(WorkdirManagementReason::CleanupMountCheckUnavailable));
     }
     for line in raw.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
         let fields: Vec<_> = line.split(|b| *b == b' ').collect();
         if fields.len() < 10 || !fields.contains(&b"-".as_slice()) {
-            return Err(cause("mount_check_unavailable"));
+            return Err(cause(WorkdirManagementReason::CleanupMountCheckUnavailable));
         }
         let mut path = Vec::new();
         let mut i = 0;
@@ -688,14 +669,18 @@ fn check_mounts(root: &Path, raw: &[u8]) -> Result<(), WorkingDirectoryDiagnosti
             if fields[4][i] == b'\\' {
                 let digits = fields[4]
                     .get(i + 1..i + 4)
-                    .ok_or_else(|| cause("mount_check_unavailable"))?;
+                    .ok_or_else(|| cause(WorkdirManagementReason::CleanupMountCheckUnavailable))?;
                 if !digits.iter().all(|b| (b'0'..=b'7').contains(b)) {
-                    return Err(cause("mount_check_unavailable"));
+                    return Err(cause(WorkdirManagementReason::CleanupMountCheckUnavailable));
                 }
                 let value = (digits[0] - b'0') as u16 * 64
                     + (digits[1] - b'0') as u16 * 8
                     + (digits[2] - b'0') as u16;
-                path.push(u8::try_from(value).map_err(|_| cause("mount_check_unavailable"))?);
+                path.push(
+                    u8::try_from(value).map_err(|_| {
+                        cause(WorkdirManagementReason::CleanupMountCheckUnavailable)
+                    })?,
+                );
                 i += 4;
             } else {
                 path.push(fields[4][i]);
@@ -704,10 +689,10 @@ fn check_mounts(root: &Path, raw: &[u8]) -> Result<(), WorkingDirectoryDiagnosti
         }
         let mount = PathBuf::from(std::ffi::OsString::from_vec(path));
         if !mount.is_absolute() {
-            return Err(cause("mount_check_unavailable"));
+            return Err(cause(WorkdirManagementReason::CleanupMountCheckUnavailable));
         }
         if mount.starts_with(&root) {
-            return Err(cause("mount_present"));
+            return Err(cause(WorkdirManagementReason::CleanupMountPresent));
         }
     }
     Ok(())

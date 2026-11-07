@@ -2,7 +2,7 @@
 //! before reading source, previewing, sealing migration data, adopting or reconciling.
 //! A result lookup is not a new adoption and absence is not proof of failure.
 use crate::{
-    ConfigCommitRequest, RepositoryApiError, ServerRequestContext, WorkspaceConfigTreeResponse,
+    ConfigCommitRequest, ConfigurationApiError, ServerRequestContext, WorkspaceConfigTreeResponse,
 };
 use feature_permissions::{PermissionAssignment, PermissionCatalog, PermissionResolution};
 use schemars::JsonSchema;
@@ -116,33 +116,40 @@ pub enum ConfigurationReconciliation {
 
 #[api_macros::api(reqwest, axum, openapi)]
 pub trait ConfigurationAdoptionApi {
-    #[get("/api/w/{workspace_id}/config/adoption",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],bearer_auth=true,browser_auth=true)]
+    #[get("/api/w/{workspace_id}/config/adoption/publication/{operation_id}",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],additional_error_content_types=["application/problem+json"],client_error_hook=true,bearer_auth=true,browser_auth=true)]
+    async fn configuration_publication(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] operation_id: String,
+    ) -> Result<crate::ConfigurationPublicationLookup, ConfigurationApiError>;
+    #[get("/api/w/{workspace_id}/config/adoption",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],additional_error_content_types=["application/problem+json"],client_error_hook=true,bearer_auth=true,browser_auth=true)]
     async fn configuration_source(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
-    ) -> Result<ConfigurationSourceResponse, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/config/adoption/preview",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],bearer_auth=true,browser_auth=true,normalize_body_errors=true)]
+    ) -> Result<ConfigurationSourceResponse, ConfigurationApiError>;
+    #[post("/api/w/{workspace_id}/config/adoption/preview",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],additional_error_content_types=["application/problem+json"],client_error_hook=true,bearer_auth=true,browser_auth=true,normalize_body_errors=true)]
     async fn configuration_preview(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: ConfigurationAdoptionRequest,
-    ) -> Result<ConfigurationPreviewResponse, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/config/adoption/commit",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],bearer_auth=true,browser_auth=true,normalize_body_errors=true)]
+    ) -> Result<ConfigurationPreviewResponse, ConfigurationApiError>;
+    #[post("/api/w/{workspace_id}/config/adoption/commit",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],additional_error_content_types=["application/problem+json"],client_error_hook=true,bearer_auth=true,browser_auth=true,normalize_body_errors=true)]
     async fn configuration_adopt(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: ConfigurationAdoptionRequest,
-    ) -> Result<ConfigurationAdoptionReceipt, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/config/adoption/reconcile",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],bearer_auth=true,browser_auth=true,normalize_body_errors=true)]
+    ) -> Result<ConfigurationAdoptionReceipt, ConfigurationApiError>;
+    #[post("/api/w/{workspace_id}/config/adoption/reconcile",status=200,error_status=400,additional_error_statuses=[401,403,404,409,500],additional_error_content_types=["application/problem+json"],client_error_hook=true,bearer_auth=true,browser_auth=true,normalize_body_errors=true)]
     async fn configuration_reconcile(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: ConfigurationAdoptionRequest,
-    ) -> Result<ConfigurationReconciliation, RepositoryApiError>;
+    ) -> Result<ConfigurationReconciliation, ConfigurationApiError>;
 }
 
 impl api_macros::openapi::OpenApiSchema for ConfigurationSourceResponse {}
@@ -184,9 +191,15 @@ pub fn configuration_typescript() -> String {
         ConfigurationSourceResponse::decl(&config),
         ConfigurationPreviewResponse::decl(&config),
         ConfigurationReconciliation::decl(&config),
+        crate::ConfigurationPublicationStage::decl(&config),
+        crate::ConfigurationPublicationOutcome::decl(&config),
+        crate::ConfigurationPublicationFailure::decl(&config),
+        crate::ConfigurationPublicationObservation::decl(&config),
+        crate::ConfigurationPublicationResponse::decl(&config),
+        crate::ConfigurationPublicationLookup::decl(&config),
     ];
     format!(
-        "// Generated by `cargo run -p server-api --features typescript --example generate_configuration_adoption_types`.\n// Do not edit manually.\n\nimport type {{ ConfigCommitRequest, WorkspaceConfigTreeResponse }} from \"./legacy-server-api.ts\";\nimport type {{ ScopedPermission, SubjectPermissions }} from \"./memory-api.ts\";\nimport type {{ PermissionAssignment, PermissionCatalog, PermissionResolution }} from \"./feature-permissions.generated.ts\";\n\n{}\n",
+        "// Generated by `cargo run -p server-api --features typescript --example generate_configuration_adoption_types`.\n// Do not edit manually.\n\nimport type {{ ConfigCommitRequest, WorkspaceConfigTreeResponse }} from \"./legacy-server-api.ts\";\nimport type {{ ScopedPermission, SubjectPermissions }} from \"./memory-api.ts\";\nimport type {{ PermissionAssignment, PermissionCatalog, PermissionResolution }} from \"./feature-permissions.generated.ts\";\nimport type {{ FailureEnvelope }} from \"./error-contract.ts\";\nimport type {{ ConfigurationFailureDetails }} from \"./domain-failures.ts\";\nimport type {{ RuntimeControlCause }} from \"./protocol.ts\";\n\n{}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))

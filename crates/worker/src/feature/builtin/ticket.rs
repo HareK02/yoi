@@ -2878,7 +2878,7 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 response: crate::worker::WorkspaceResponse {
                     content_type: None,
-status,
+                    status,
                     body: json!({
                         "error": "Rejected",
                         "message": "Verified actor is required; unrelated HTTP status 401",

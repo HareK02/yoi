@@ -1,0 +1,285 @@
+//! Configuration-owned causes and disclosure, not adoption outcomes or HTTP policy.
+//!
+//! Original tree errors stay local. Only closed operation/reason values and local
+//! explanations may cross the shared codec. All audiences need current visibility;
+//! received text, paths, imports, source content and arbitrary context are not copied.
+//! Source/preview/adopt/reconcile results, request identity, receipts and recovery
+//! remain owned by the existing configuration adoption boundary.
+
+use error_contract::{
+    Browser, Category, ContractError, Disclosure, FailureCause, FailureFacts, FailureIdentity,
+    InternalTransfer, OperationContext, ProjectFor, Storage, Telemetry, Tool, WireDetails,
+    compose_explanation,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationFailureOperation {
+    Source,
+    Preview,
+    Adopt,
+    Reconcile,
+    Publication,
+}
+
+impl ConfigurationFailureOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Preview => "preview",
+            Self::Adopt => "adopt",
+            Self::Reconcile => "reconcile",
+            Self::Publication => "publication",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Source => "source retrieval",
+            Self::Preview => "change preview",
+            Self::Adopt => "source and policy adoption",
+            Self::Reconcile => "adoption result reconciliation",
+            Self::Publication => "post-adoption publication observation",
+        }
+    }
+}
+
+/// Observed causes only. These do not grant retries or establish an adoption result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationFailureReason {
+    InvalidPath,
+    BuiltinReadOnly,
+    InvalidImport,
+    ImportEscape,
+    AlreadyExists,
+    NotFound,
+    EntryConflict,
+    EntryDigestMismatch,
+    EntryPathMismatch,
+    TreeDigestMismatch,
+    PathChangedMoreThanOnce,
+    DuplicatePath,
+    DuplicateSchemaProvider,
+    DuplicateSchemaNamespace,
+    InvalidSchemaContribution,
+    LimitExceeded,
+    CatalogChanged,
+    EditingHeadChanged,
+    LegacyExportChanged,
+    SourceContentChanged,
+    OwnerRequired,
+    WorkspaceInactive,
+    WorkspaceDraining,
+    RequestIdentityConflict,
+    PublicationDispatchUnavailable,
+    PublicationProjectionUnavailable,
+    PublicationRegistryUnavailable,
+}
+
+impl ConfigurationFailureReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidPath => "invalid_path",
+            Self::BuiltinReadOnly => "builtin_read_only",
+            Self::InvalidImport => "invalid_import",
+            Self::ImportEscape => "import_escape",
+            Self::AlreadyExists => "already_exists",
+            Self::NotFound => "not_found",
+            Self::EntryConflict => "entry_conflict",
+            Self::EntryDigestMismatch => "entry_digest_mismatch",
+            Self::EntryPathMismatch => "entry_path_mismatch",
+            Self::TreeDigestMismatch => "tree_digest_mismatch",
+            Self::PathChangedMoreThanOnce => "path_changed_more_than_once",
+            Self::DuplicatePath => "duplicate_path",
+            Self::DuplicateSchemaProvider => "duplicate_schema_provider",
+            Self::DuplicateSchemaNamespace => "duplicate_schema_namespace",
+            Self::InvalidSchemaContribution => "invalid_schema_contribution",
+            Self::LimitExceeded => "limit_exceeded",
+            Self::CatalogChanged => "catalog_changed",
+            Self::EditingHeadChanged => "editing_head_changed",
+            Self::LegacyExportChanged => "legacy_export_changed",
+            Self::SourceContentChanged => "source_content_changed",
+            Self::OwnerRequired => "owner_required",
+            Self::WorkspaceInactive => "workspace_inactive",
+            Self::WorkspaceDraining => "workspace_draining",
+            Self::RequestIdentityConflict => "request_identity_conflict",
+            Self::PublicationDispatchUnavailable => "publication_dispatch_unavailable",
+            Self::PublicationProjectionUnavailable => "publication_projection_unavailable",
+            Self::PublicationRegistryUnavailable => "publication_registry_unavailable",
+        }
+    }
+
+    fn category(self) -> Category {
+        match self {
+            Self::OwnerRequired => Category::Authorization,
+            Self::EntryConflict
+            | Self::CatalogChanged
+            | Self::EditingHeadChanged
+            | Self::LegacyExportChanged
+            | Self::SourceContentChanged
+            | Self::WorkspaceInactive
+            | Self::WorkspaceDraining
+            | Self::RequestIdentityConflict => Category::Conflict,
+            Self::PublicationDispatchUnavailable
+            | Self::PublicationProjectionUnavailable
+            | Self::PublicationRegistryUnavailable => Category::Internal,
+            Self::DuplicateSchemaProvider
+            | Self::DuplicateSchemaNamespace
+            | Self::InvalidSchemaContribution => Category::Internal,
+            Self::InvalidPath
+            | Self::BuiltinReadOnly
+            | Self::InvalidImport
+            | Self::ImportEscape
+            | Self::AlreadyExists
+            | Self::NotFound
+            | Self::EntryDigestMismatch
+            | Self::EntryPathMismatch
+            | Self::TreeDigestMismatch
+            | Self::PathChangedMoreThanOnce
+            | Self::DuplicatePath
+            | Self::LimitExceeded => Category::InvalidInput,
+        }
+    }
+
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::InvalidPath => "a virtual configuration path is invalid",
+            Self::BuiltinReadOnly => "the builtin namespace is read-only",
+            Self::InvalidImport => "a virtual configuration import is invalid",
+            Self::ImportEscape => "a configuration import escapes the virtual source tree",
+            Self::AlreadyExists => "a configuration entry already exists at the requested path",
+            Self::NotFound => "a requested configuration entry was not found",
+            Self::EntryConflict => "a configuration entry changed since its content was observed",
+            Self::EntryDigestMismatch => "a configuration entry does not match its content digest",
+            Self::EntryPathMismatch => "a configuration entry path does not match its tree key",
+            Self::TreeDigestMismatch => {
+                "the configuration source tree does not match its content digest"
+            }
+            Self::PathChangedMoreThanOnce => {
+                "a configuration path is changed more than once in one candidate"
+            }
+            Self::DuplicatePath => "the configuration source tree contains a duplicate path",
+            Self::DuplicateSchemaProvider => {
+                "a configuration schema provider is registered more than once"
+            }
+            Self::DuplicateSchemaNamespace => {
+                "a configuration schema namespace has more than one owner"
+            }
+            Self::InvalidSchemaContribution => {
+                "a configuration schema provider supplied an invalid contribution"
+            }
+            Self::LimitExceeded => {
+                "the configuration source exceeds a supported size or count limit"
+            }
+            Self::CatalogChanged => "the permission catalog changed since it was observed",
+            Self::EditingHeadChanged => {
+                "the configuration editing history head changed since it was observed"
+            }
+            Self::LegacyExportChanged => {
+                "the legacy configuration migration source or permission export no longer matches the observed baseline"
+            }
+            Self::SourceContentChanged => {
+                "the configuration source content changed since it was observed"
+            }
+            Self::OwnerRequired => "configuration management requires the current Workspace owner",
+            Self::WorkspaceInactive => "the Workspace is not active for configuration management",
+            Self::WorkspaceDraining => "Workspace deletion is draining configuration requests",
+            Self::PublicationDispatchUnavailable => {
+                "the configuration was adopted, but the Host did not admit Runtime publication"
+            }
+            Self::PublicationRegistryUnavailable => {
+                "the configuration was adopted, but its current Feature permission catalog could not be refreshed"
+            }
+            Self::PublicationProjectionUnavailable => {
+                "the configuration was adopted, but its Runtime prompt projection could not be resolved"
+            }
+            Self::RequestIdentityConflict => {
+                "the configuration operation identity is already bound to a different request"
+            }
+        }
+    }
+}
+
+/// The complete wire allowlist. No path, import, identifier or diagnostic is a field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationFailureDetails {
+    pub operation: ConfigurationFailureOperation,
+    pub reason: ConfigurationFailureReason,
+}
+
+impl ConfigurationFailureDetails {
+    pub fn disclosure(&self) -> Result<Disclosure<Self>, ContractError> {
+        let impact = format!(
+            "Configuration {} could not complete",
+            self.operation.description()
+        );
+        let mut disclosure = Disclosure::new(
+            *self,
+            compose_explanation(self.reason.explanation(), &impact)?,
+        );
+        disclosure.context.operations.push(OperationContext::new(
+            self.operation.as_str(),
+            "configuration",
+        )?);
+        Ok(disclosure)
+    }
+}
+
+impl FailureCause for ConfigurationFailureDetails {
+    fn identity(&self) -> FailureIdentity {
+        FailureIdentity {
+            domain: "configuration",
+            reason: self.reason.as_str(),
+            category: self.reason.category(),
+            details_version: 1,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ContractError> {
+        Ok(())
+    }
+}
+
+impl WireDetails for ConfigurationFailureDetails {
+    fn supports(domain: &str, reason: &str, details_version: u16) -> bool {
+        domain == "configuration"
+            && details_version == 1
+            && serde_json::from_value::<ConfigurationFailureReason>(serde_json::Value::String(
+                reason.to_owned(),
+            ))
+            .is_ok()
+    }
+}
+
+/// A current authenticated boundary decision, not a serialized capability.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ConfigurationFailureVisibility {
+    pub can_view_cause: bool,
+}
+
+macro_rules! project_for {
+    ($($audience:ty),+ $(,)?) => {$ (
+        impl ProjectFor<$audience> for ConfigurationFailureDetails {
+            type Authorization = ConfigurationFailureVisibility;
+            type Details = Self;
+            fn disclose(
+                &self,
+                _: &FailureFacts<Self>,
+                visibility: &ConfigurationFailureVisibility,
+            ) -> Result<Disclosure<Self>, ContractError> {
+                if !visibility.can_view_cause {
+                    return Err(ContractError::ProjectionUnavailable);
+                }
+                self.disclosure()
+            }
+        }
+    )+};
+}
+project_for!(Browser, Tool, InternalTransfer, Storage, Telemetry);

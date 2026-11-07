@@ -578,7 +578,10 @@ async fn provider_timeout_releases_admission_without_wall_clock_wait() {
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     let body = assert_json(long.await.unwrap(), StatusCode::INTERNAL_SERVER_ERROR).await;
-    assert_eq!(body["code"], "outcome_unknown");
+    assert_eq!(
+        body["yoi_failure"]["details"]["classification"], "outcome_unknown",
+        "{body}"
+    );
     tokio::time::resume();
     let gate = f.server.admission_for_workspace(TEST_WORKSPACE_ID).await;
     drop(
@@ -613,11 +616,8 @@ async fn same_workdir_attachment_conflict_is_preserved_while_owner_operation_run
         StatusCode::CONFLICT,
     )
     .await;
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap()
-            .contains("already attached"),
+    assert_eq!(
+        body["yoi_failure"]["details"]["reason"], "workdir_occupied",
         "{body}"
     );
     assert!(!first.is_finished());

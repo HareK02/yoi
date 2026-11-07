@@ -487,7 +487,9 @@ fn format_candidate_sources(
     let mut entries = Vec::with_capacity(snapshot.entries.len());
     for entry in snapshot.entries.into_values() {
         if paths.contains(&entry.path) && entry.content_type == ConfigContentType::Decodal {
-            let formatted = environment.format(&entry.content).map_err(config_error)?;
+            let formatted = environment
+                .format(&entry.content)
+                .map_err(Error::InvalidInput)?;
             entries.push(
                 ConfigEntry::new(entry.path, entry.content_type, formatted)
                     .map_err(config_error)?,
@@ -886,8 +888,12 @@ fn parse_content_type(value: &str) -> Result<ConfigContentType> {
     }
 }
 
-fn config_error(error: impl std::fmt::Display) -> Error {
-    Error::InvalidInput(error.to_string())
+fn config_error(error: config_source::ConfigTreeError) -> Error {
+    crate::configuration_failure::ConfigurationFailure::from_tree(
+        crate::configuration_failure::ConfigurationFailureOperation::Source,
+        error,
+    )
+    .into()
 }
 
 fn config_conflict(message: impl Into<String>) -> Error {

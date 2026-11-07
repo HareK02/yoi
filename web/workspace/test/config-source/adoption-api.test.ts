@@ -1,5 +1,7 @@
 /// <reference lib="deno.ns" />
 
+import catalogChanged from "./fixtures/catalog-changed.json" with { type: "json" };
+
 import { assertEquals, assertRejects, assertThrows } from "jsr:@std/assert";
 import {
   commitConfigTree,
@@ -139,5 +141,101 @@ Deno.test("lost or invalid responses do not retry or change request identity ins
     assertEquals(calls, 1);
     assertEquals(request.operation_id, "operation:one");
     assertEquals(request.expected_head, "head:A-after-B");
+  }
+});
+
+Deno.test("adoption consumes the exact real HTTP fixture and preserves the full request without resending", async () => {
+  const calls: unknown[] = [];
+  const fetcher = ((_input: string | URL | Request, init?: RequestInit) => {
+    calls.push(JSON.parse(String(init?.body)));
+    return Promise.resolve(
+      new Response(JSON.stringify(catalogChanged), {
+        status: 409,
+        headers: { "content-type": "application/problem+json" },
+      }),
+    );
+  }) as typeof fetch;
+  const error = await assertRejects(
+    () => commitConfigTree("w", request, fetcher),
+    ConfigSourceApiError,
+  );
+  assertEquals(error.message, catalogChanged.detail);
+  assertEquals(error.status, 409);
+  assertEquals(error.receipt?.kind, "problem");
+  if (error.receipt?.kind !== "problem") {
+    throw new Error("typed configuration cause missing");
+  }
+  assertEquals<unknown>(
+    error.receipt.problem.yoi_failure,
+    catalogChanged.yoi_failure,
+  );
+  assertEquals(calls, [request]);
+});
+
+Deno.test("adoption cause is independent of explanation and unsupported or malformed causes are not invented", async () => {
+  for (
+    const explanation of [
+      "The catalog changed; adoption did not complete.",
+      "Different translated public explanation.",
+    ]
+  ) {
+    let calls = 0;
+    const body = {
+      ...catalogChanged,
+      detail: explanation,
+      yoi_failure: { ...catalogChanged.yoi_failure, explanation },
+    };
+    const fetcher = (() => {
+      calls++;
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 409,
+          headers: { "content-type": "application/problem+json" },
+        }),
+      );
+    }) as typeof fetch;
+    const error = await assertRejects(
+      () => commitConfigTree("w", request, fetcher),
+      ConfigSourceApiError,
+    );
+    assertEquals(error.message, explanation);
+    assertEquals(error.receipt?.kind, "problem");
+    if (error.receipt?.kind === "problem") {
+      assertEquals<unknown>(
+        error.receipt.problem.yoi_failure.details,
+        catalogChanged.yoi_failure.details,
+      );
+    }
+    assertEquals(calls, 1);
+  }
+  for (
+    const [patch, kind] of [
+      [{ version: 2 }, "unsupported"],
+      [{ reason: "future_configuration_reason" }, "unsupported"],
+      [{
+        details: {
+          ...catalogChanged.yoi_failure.details,
+          secret_path: "/private/source",
+        },
+      }, "invalid"],
+    ] as const
+  ) {
+    const body = {
+      ...catalogChanged,
+      yoi_failure: { ...catalogChanged.yoi_failure, ...patch },
+    };
+    const fetcher = (() =>
+      Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 409,
+          headers: { "content-type": "application/problem+json" },
+        }),
+      )) as typeof fetch;
+    const error = await assertRejects(
+      () => commitConfigTree("w", request, fetcher),
+      ConfigSourceApiError,
+    );
+    assertEquals(error.receipt?.kind, kind);
+    assertEquals(error.message.includes("/private/source"), false);
   }
 });

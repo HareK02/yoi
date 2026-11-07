@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod blob;
+pub mod failure;
 mod migrations;
 use migrations::MIGRATIONS;
 

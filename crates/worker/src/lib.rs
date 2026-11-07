@@ -31,6 +31,8 @@ pub mod shared_state;
 mod shutdown_after_idle;
 mod subject_release;
 mod subjektiv_metadata;
+#[cfg(test)]
+mod test_support;
 pub use subject_release::SubjectReleaseReservation;
 pub mod skill;
 pub mod spawn;

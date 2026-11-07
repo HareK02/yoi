@@ -57,6 +57,29 @@ pub enum DriveError {
         "Drive mutation outcome unknown; request_id={0}; query request_status; do not blindly repeat"
     )]
     OutcomeUnknown(String),
+    /// The caller result remains independent of the received, closed-enum cause.
+    /// No received explanation, context or request identity is retained here.
+    #[error("{result}")]
+    Remote {
+        result: Box<DriveError>,
+        details: DriveHttpFailureDetails,
+    },
+}
+
+impl DriveError {
+    pub(super) fn classification_source(&self) -> &Self {
+        match self {
+            Self::Remote { result, .. } => result.classification_source(),
+            source => source,
+        }
+    }
+
+    pub(super) fn remote_details(&self) -> Option<DriveHttpFailureDetails> {
+        match self {
+            Self::Remote { details, .. } => Some(*details),
+            _ => None,
+        }
+    }
 }
 
 impl DriveBackend {
@@ -182,6 +205,7 @@ impl DriveBackend {
         if !response.is_success() {
             return Err(classify(
                 response.status,
+                response.content_type.as_deref(),
                 response.body.as_bytes(),
                 mutation,
                 request_id,
@@ -409,6 +433,7 @@ impl DriveBackend {
             if !(200..300).contains(&response.status) {
                 return Err(classify(
                     response.status,
+                    response.content_type.as_deref(),
                     &response.body,
                     false,
                     "",
@@ -440,31 +465,35 @@ impl DriveBackend {
             Ok(response)
         });
         match result {
-            Err(DriveError::OutcomeUnknown(_)) => match self
-                .status_with_diagnostic(id, &diagnostic.at_stage(Stage::Reconcile))
-                .await
+            Err(error)
+                if matches!(error.classification_source(), DriveError::OutcomeUnknown(_)) =>
             {
-                Ok(DriveRequestStatusResponse {
-                    state: DriveRequestState::Committed,
-                    response: Some(response),
-                    ..
-                }) => {
-                    diagnostic.record(Stage::Reconcile, Reason::Reconciled, None);
-                    Ok(response) // status validates both IDs and entry metadata
+                match self
+                    .status_with_diagnostic(id, &diagnostic.at_stage(Stage::Reconcile))
+                    .await
+                {
+                    Ok(DriveRequestStatusResponse {
+                        state: DriveRequestState::Committed,
+                        response: Some(response),
+                        ..
+                    }) => {
+                        diagnostic.record(Stage::Reconcile, Reason::Reconciled, None);
+                        Ok(response) // status validates both IDs and entry metadata
+                    }
+                    Ok(status) => {
+                        diagnostic.record(
+                            Stage::Reconcile,
+                            match status.state {
+                                DriveRequestState::Uncommitted => Reason::NotCommittedSnapshot,
+                                DriveRequestState::Committed => Reason::IncompleteReceipt,
+                            },
+                            None,
+                        );
+                        Err(error)
+                    }
+                    Err(_) => Err(error),
                 }
-                Ok(status) => {
-                    diagnostic.record(
-                        Stage::Reconcile,
-                        match status.state {
-                            DriveRequestState::Uncommitted => Reason::NotCommittedSnapshot,
-                            DriveRequestState::Committed => Reason::IncompleteReceipt,
-                        },
-                        None,
-                    );
-                    Err(DriveError::OutcomeUnknown(id.into()))
-                }
-                Err(_) => Err(DriveError::OutcomeUnknown(id.into())),
-            },
+            }
             other => other,
         }
     }
@@ -578,6 +607,7 @@ impl DriveBackend {
             }
             Ok(Ok(Ok(response))) => Err(classify(
                 response.status,
+                response.content_type.as_deref(),
                 &response.body,
                 true,
                 &query.request_id,
@@ -686,27 +716,41 @@ fn query_string<T: Serialize>(value: &T) -> Result<String, DriveError> {
 }
 fn classify(
     status: u16,
+    content_type: Option<&str>,
     body: &[u8],
     mutation: bool,
     id: &str,
     diagnostic: &Diagnostic,
 ) -> DriveError {
-    if let Ok(error) = serde_json::from_slice::<DriveApiError>(body) {
-        if error.classification == DriveFailureClassification::Unknown
+    if let Ok(received) =
+        DriveHttpApiError::decode_received(status, content_type.unwrap_or(""), body)
+    {
+        let error = received.legacy();
+        let result = if error.classification == DriveFailureClassification::Unknown
             || error.code == DriveApiErrorCode::OutcomeUnknown
         {
             diagnostic.record(Stage::Response, Reason::BackendUnknown, Some(status));
-            return DriveError::OutcomeUnknown(id.into());
-        }
-        diagnostic.record(Stage::Response, Reason::BackendRejected, Some(status));
-        return match error.code {
-            DriveApiErrorCode::Denied => DriveError::Denied,
-            DriveApiErrorCode::NotFound => DriveError::NotFound,
-            DriveApiErrorCode::Conflict => DriveError::Conflict,
-            DriveApiErrorCode::Invalid => DriveError::Invalid("Backend rejected arguments".into()),
-            DriveApiErrorCode::Limit => DriveError::Limit,
-            DriveApiErrorCode::StorageUnavailable => DriveError::Unavailable,
-            DriveApiErrorCode::OutcomeUnknown => DriveError::OutcomeUnknown(id.into()),
+            DriveError::OutcomeUnknown(id.into())
+        } else {
+            diagnostic.record(Stage::Response, Reason::BackendRejected, Some(status));
+            match error.code {
+                DriveApiErrorCode::Denied => DriveError::Denied,
+                DriveApiErrorCode::NotFound => DriveError::NotFound,
+                DriveApiErrorCode::Conflict => DriveError::Conflict,
+                DriveApiErrorCode::Invalid => {
+                    DriveError::Invalid("Backend rejected arguments".into())
+                }
+                DriveApiErrorCode::Limit => DriveError::Limit,
+                DriveApiErrorCode::StorageUnavailable => DriveError::Unavailable,
+                DriveApiErrorCode::OutcomeUnknown => DriveError::OutcomeUnknown(id.into()),
+            }
+        };
+        return match received.details() {
+            Some(details) => DriveError::Remote {
+                result: Box::new(result),
+                details: *details,
+            },
+            None => result,
         };
     }
     diagnostic.record(Stage::Response, Reason::UnrecognizedResponse, Some(status));

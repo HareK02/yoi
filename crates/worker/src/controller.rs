@@ -4357,8 +4357,7 @@ mod tests {
                     });
                 }
                 assert_eq!(request.path, "/api/w/workspace-1/drive/root");
-                Ok(crate::worker::WorkspaceResponse { content_type: None,
-status: 200, body: serde_json::json!({
+                Ok(crate::worker::WorkspaceResponse { content_type: None, status: 200, body: serde_json::json!({
                     "entry": {"workspace_id": "workspace-1", "node_id": "1"},
                     "parent": null, "name": "", "kind": "folder", "last_mutation_id": "",
                     "size": null, "content_type": null, "updated_by": "test",

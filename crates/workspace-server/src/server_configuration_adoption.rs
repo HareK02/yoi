@@ -18,6 +18,13 @@
 //! Callbacks must not reenter the Feature store or its canonical source provider.
 
 use super::*;
+#[path = "server_configuration_publication.rs"]
+mod publication;
+use crate::configuration_failure::{
+    ConfigurationFailure, ConfigurationFailureOperation as FailureOperation,
+    ConfigurationFailureReason as FailureReason,
+};
+use publication::{dispatch_publication, publication_to_api};
 
 use crate::config_adoption::{
     ConfigurationAdoptionRequest as AdoptionRequest, ConfigurationAdoptionResult as AdoptionResult,
@@ -32,8 +39,8 @@ use crate::subjektiv::{
 use feature_permissions::PermissionHost;
 use server_api::{
     ConfigurationAdoptionApi, ConfigurationAdoptionReceipt, ConfigurationAdoptionRequest,
-    ConfigurationMigrationDiagnostic, ConfigurationPreviewResponse, ConfigurationReconciliation,
-    ConfigurationSourceResponse, ConfigurationSubjectPolicy, RepositoryApiError,
+    ConfigurationApiError, ConfigurationMigrationDiagnostic, ConfigurationPreviewResponse,
+    ConfigurationReconciliation, ConfigurationSourceResponse, ConfigurationSubjectPolicy,
     RuntimePolicyApplication, ServerRequestContext,
 };
 
@@ -48,6 +55,9 @@ pub(super) fn routes(service: WorkspaceServerApi) -> Router {
         .merge(server_api::configuration_adoption_api_axum::configuration_adopt(service.clone()))
         .merge(
             server_api::configuration_adoption_api_axum::configuration_reconcile(service.clone()),
+        )
+        .merge(
+            server_api::configuration_adoption_api_axum::configuration_publication(service.clone()),
         )
         .merge(
             server_api::feature_permissions::feature_permissions_api_axum::permission_catalog(
@@ -69,25 +79,80 @@ pub(super) async fn owner_operation<T: Send + 'static>(
     service: &WorkspaceServerApi,
     context: ServerRequestContext,
     workspace: String,
+    failure_operation: FailureOperation,
     operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
-) -> std::result::Result<T, RepositoryApiError> {
+) -> std::result::Result<T, ConfigurationApiError> {
+    with_owner_operation(
+        service,
+        context,
+        workspace,
+        Some(failure_operation),
+        operation,
+        |error, can_view_cause| {
+            if can_view_cause {
+                if let Error::Configuration(cause) = &error.error {
+                    use error_contract::{Browser, FailureFacts, project_failure};
+                    let visibility = crate::configuration_failure::ConfigurationFailureVisibility {
+                        can_view_cause: true,
+                    };
+                    if let Ok(projected) = FailureFacts::new(*cause.details())
+                        .and_then(|facts| project_failure::<Browser, _>(&facts, &visibility))
+                    {
+                        return ConfigurationApiError::projected(projected);
+                    }
+                }
+            }
+            error.into_repository_api_error().into()
+        },
+    )
+    .await
+}
+
+pub(super) async fn owner_repository_operation<T: Send + 'static>(
+    service: &WorkspaceServerApi,
+    context: ServerRequestContext,
+    workspace: String,
+    operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
+) -> std::result::Result<T, server_api::RepositoryApiError> {
+    with_owner_operation(service, context, workspace, None, operation, |error, _| {
+        error.into_repository_api_error()
+    })
+    .await
+}
+
+async fn with_owner_operation<T: Send + 'static, E>(
+    service: &WorkspaceServerApi,
+    context: ServerRequestContext,
+    workspace: String,
+    failure_operation: Option<FailureOperation>,
+    operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
+    project_error: impl Fn(ApiError, bool) -> E,
+) -> std::result::Result<T, E> {
     // These owner-only routes are mounted above Workspace fallback dispatch.
     // A Runtime proof must not be ignored in favor of a shared human credential.
     if context.transport_headers.iter().any(|(name, _)| {
         name.eq_ignore_ascii_case(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
     }) {
-        return Err(ApiError::from(Error::WorkspacePermissionDenied(
-            "Runtime source proofs cannot authorize owner configuration management".into(),
-        ))
-        .into_repository_api_error());
+        return Err(project_error(
+            ApiError::from(Error::WorkspacePermissionDenied(
+                "Runtime source proofs cannot authorize owner configuration management".into(),
+            )),
+            false,
+        ));
     }
     let actor = subject_authorization::administration_actor(&context)
-        .map_err(ApiError::into_repository_api_error)?
+        .map_err(|error| project_error(error, false))?
         .clone();
+    let mut can_view_cause = false;
     let result: ApiResult<T> = async {
         let gate = service.admission_for_workspace(&workspace).await;
         let lease = gate.admit(false).ok_or_else(|| {
-            Error::WorkspaceConfigConflict("Workspace deletion is draining requests".into())
+            failure_operation.map_or_else(
+                || Error::WorkspaceConfigConflict("Workspace deletion is draining requests".into()),
+                |operation| {
+                    ConfigurationFailure::new(operation, FailureReason::WorkspaceDraining).into()
+                },
+            )
         })?;
         crate::db_executor::with_operation_lifetime(Arc::new(lease), async {
             // Authenticate against catalog ownership before resolving an API:
@@ -98,15 +163,31 @@ pub(super) async fn owner_operation<T: Send + 'static>(
                 .await?
                 .ok_or(Error::WorkspaceIdMismatch)?;
             if record.owner_account_id != actor.account_id {
-                return Err(Error::WorkspacePermissionDenied(
-                    "configuration management requires the Workspace owner".into(),
-                )
-                .into());
+                return Err(failure_operation
+                    .map_or_else(
+                        || {
+                            Error::WorkspacePermissionDenied(
+                                "configuration management requires the Workspace owner".into(),
+                            )
+                        },
+                        |operation| {
+                            ConfigurationFailure::new(operation, FailureReason::OwnerRequired)
+                                .into()
+                        },
+                    )
+                    .into());
             }
+            can_view_cause = true;
             if record.state != "active" {
-                return Err(
-                    Error::WorkspaceConfigConflict("Workspace is not active".into()).into(),
-                );
+                return Err(failure_operation
+                    .map_or_else(
+                        || Error::WorkspaceConfigConflict("Workspace is not active".into()),
+                        |operation| {
+                            ConfigurationFailure::new(operation, FailureReason::WorkspaceInactive)
+                                .into()
+                        },
+                    )
+                    .into());
             }
             let api = service
                 .api_for_workspace(&workspace)
@@ -118,14 +199,23 @@ pub(super) async fn owner_operation<T: Send + 'static>(
             service
                 .store
                 .db_executor()
-                .run(move || operation(api, actor.account_id))
+                .run(move || {
+                    operation(api, actor.account_id).map_err(|error| {
+                        match (error, failure_operation) {
+                            (Error::Configuration(cause), Some(operation)) => {
+                                cause.with_operation(operation).into()
+                            }
+                            (other, _) => other,
+                        }
+                    })
+                })
                 .await
                 .map_err(ApiError::from)
         })
         .await
     }
     .await;
-    result.map_err(ApiError::into_repository_api_error)
+    result.map_err(|error| project_error(error, can_view_cause))
 }
 
 fn conflict(message: &str) -> Error {
@@ -338,59 +428,96 @@ fn receipt_to_api(result: AdoptionResult) -> ConfigurationAdoptionReceipt {
 }
 
 impl ConfigurationAdoptionApi for WorkspaceServerApi {
+    async fn configuration_publication(
+        &self,
+        context: ServerRequestContext,
+        workspace_id: String,
+        operation_id: String,
+    ) -> std::result::Result<server_api::ConfigurationPublicationLookup, ConfigurationApiError>
+    {
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Publication,
+            move |api, account| {
+                server_api::authorization::validate_authorization_identifier(&operation_id)
+                    .map_err(Error::InvalidInput)?;
+                Ok(server_api::ConfigurationPublicationLookup {
+                    publication: api
+                        .config_store
+                        .configuration_publication(
+                            &api.config.workspace_id,
+                            &account,
+                            &operation_id,
+                        )?
+                        .map(publication_to_api)
+                        .transpose()?,
+                })
+            },
+        )
+        .await
+    }
+
     async fn configuration_source(
         &self,
         context: ServerRequestContext,
         workspace_id: String,
-    ) -> std::result::Result<ConfigurationSourceResponse, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, |api, account| {
-            // A source GET produces a nonauthoritative draft, not an admission
-            // lease. Retain one catalog snapshot without holding registry read
-            // across legacy Feature reads; preview/adopt revalidate its digest.
-            let host = host(&api)?;
-            let current = source_snapshot(&api, &account)?;
-            let catalog_digest = crate::config_adoption::catalog_digest(&host)?;
-            let (state, expected_legacy_export, policies, diagnostics) = if current.canonical {
-                (current.state, None, current.policies, vec![])
-            } else {
-                let legacy = raw_legacy(&api)?;
-                let seed = preview_migration(
-                    &api.config_store,
-                    &legacy,
-                    &api.config.workspace_id,
-                    api.config_schema_registry.compose()?,
-                    &host,
-                )?;
-                let observed = source_snapshot(&api, &account)?;
-                if observed.canonical
-                    || observed.history_head != current.history_head
-                    || observed.state != seed.original
-                {
-                    return Err(conflict(
-                        "configuration changed during migration preview; reload source",
-                    ));
-                }
-                (
-                    seed.state,
-                    Some(seed.snapshot.export_digest),
-                    seed.policies,
-                    seed.diagnostics,
-                )
-            };
-            Ok(ConfigurationSourceResponse {
-                state: workspace_config_state_to_api(state),
-                history_head: current.history_head,
-                source_stored: current.canonical,
-                catalog: host.catalog(),
-                catalog_digest,
-                expected_legacy_export,
-                policies: policies
-                    .into_values()
-                    .map(|policy| policy_to_api(policy, &host))
-                    .collect(),
-                migration_diagnostics: diagnostics.into_iter().map(diagnostic_to_api).collect(),
-            })
-        })
+    ) -> std::result::Result<ConfigurationSourceResponse, ConfigurationApiError> {
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Source,
+            |api, account| {
+                // A source GET produces a nonauthoritative draft, not an admission
+                // lease. Retain one catalog snapshot without holding registry read
+                // across legacy Feature reads; preview/adopt revalidate its digest.
+                let host = host(&api)?;
+                let current = source_snapshot(&api, &account)?;
+                let catalog_digest = crate::config_adoption::catalog_digest(&host)?;
+                let (state, expected_legacy_export, policies, diagnostics) = if current.canonical {
+                    (current.state, None, current.policies, vec![])
+                } else {
+                    let legacy = raw_legacy(&api)?;
+                    let seed = preview_migration(
+                        &api.config_store,
+                        &legacy,
+                        &api.config.workspace_id,
+                        api.config_schema_registry.compose()?,
+                        &host,
+                    )?;
+                    let observed = source_snapshot(&api, &account)?;
+                    if observed.canonical
+                        || observed.history_head != current.history_head
+                        || observed.state != seed.original
+                    {
+                        return Err(conflict(
+                            "configuration changed during migration preview; reload source",
+                        ));
+                    }
+                    (
+                        seed.state,
+                        Some(seed.snapshot.export_digest),
+                        seed.policies,
+                        seed.diagnostics,
+                    )
+                };
+                Ok(ConfigurationSourceResponse {
+                    state: workspace_config_state_to_api(state),
+                    history_head: current.history_head,
+                    source_stored: current.canonical,
+                    catalog: host.catalog(),
+                    catalog_digest,
+                    expected_legacy_export,
+                    policies: policies
+                        .into_values()
+                        .map(|policy| policy_to_api(policy, &host))
+                        .collect(),
+                    migration_diagnostics: diagnostics.into_iter().map(diagnostic_to_api).collect(),
+                })
+            },
+        )
         .await
     }
 
@@ -399,48 +526,56 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
-    ) -> std::result::Result<ConfigurationPreviewResponse, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, move |api, account| {
-            let request = request_from_api(request)?;
-            // Detect operation-ID reuse even though preview itself never persists.
-            saved_result(&api, &account, &request)?;
-            let Preparation {
-                schema,
-                legacy,
-                identity,
-                seed,
-            } = prepare(&api, &account, &request)?;
-            let baseline = seed.as_ref().map(baseline);
-            // Preview never seals. The native read-only IMMEDIATE transaction
-            // fences metadata updates through core validation, then rolls back.
-            let preview = legacy
-                .with_permission_authority_guard(&identity, |authority| {
-                    Ok((|| -> Result<_> {
-                        // Feature DB -> registry -> Host, matching native Memory.
-                        // Keep current declarations pinned through core validation.
-                        let registry = api.permission_registry.read().map_err(|_| {
-                            Error::Config("current Feature declarations unavailable".into())
-                        })?;
-                        let host = registry.host();
-                        api.config_store.preview_configuration_adoption(
-                            &api.config.workspace_id,
-                            &account,
-                            &request,
-                            schema,
-                            &host,
-                            baseline.as_ref(),
-                            |subject| authority.require_subject(subject).map_err(transfer_error),
-                        )
-                    })())
+    ) -> std::result::Result<ConfigurationPreviewResponse, ConfigurationApiError> {
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Preview,
+            move |api, account| {
+                let request = request_from_api(request)?;
+                // Detect operation-ID reuse even though preview itself never persists.
+                saved_result(&api, &account, &request)?;
+                let Preparation {
+                    schema,
+                    legacy,
+                    identity,
+                    seed,
+                } = prepare(&api, &account, &request)?;
+                let baseline = seed.as_ref().map(baseline);
+                // Preview never seals. The native read-only IMMEDIATE transaction
+                // fences metadata updates through core validation, then rolls back.
+                let preview = legacy
+                    .with_permission_authority_guard(&identity, |authority| {
+                        Ok((|| -> Result<_> {
+                            // Feature DB -> registry -> Host, matching native Memory.
+                            // Keep current declarations pinned through core validation.
+                            let registry = api.permission_registry.read().map_err(|_| {
+                                Error::Config("current Feature declarations unavailable".into())
+                            })?;
+                            let host = registry.host();
+                            api.config_store.preview_configuration_adoption(
+                                &api.config.workspace_id,
+                                &account,
+                                &request,
+                                schema,
+                                &host,
+                                baseline.as_ref(),
+                                |subject| {
+                                    authority.require_subject(subject).map_err(transfer_error)
+                                },
+                            )
+                        })())
+                    })
+                    .map_err(transfer_error)??;
+                Ok(ConfigurationPreviewResponse {
+                    expected_head: preview.expected_head,
+                    state: workspace_config_state_to_api(preview.state),
+                    changed_paths: preview.changed_paths,
+                    changed_subjects: preview.changed_subjects,
                 })
-                .map_err(transfer_error)??;
-            Ok(ConfigurationPreviewResponse {
-                expected_head: preview.expected_head,
-                state: workspace_config_state_to_api(preview.state),
-                changed_paths: preview.changed_paths,
-                changed_subjects: preview.changed_subjects,
-            })
-        })
+            },
+        )
         .await
     }
 
@@ -449,33 +584,38 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
-    ) -> std::result::Result<ConfigurationAdoptionReceipt, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, move |api, account| {
-            let request = request_from_api(request)?;
-            if let Some(result) = saved_result(&api, &account, &request)? {
-                return Ok(receipt_to_api(result));
-            }
-            let Preparation {
-                schema,
-                legacy,
-                identity,
-                seed,
-            } = prepare(&api, &account, &request)?;
-            let baseline = seed.as_ref().map(baseline);
-            // Feature connection + IMMEDIATE transaction always precede Server.
-            // Never call store-level Feature APIs from inside this closure.
-            let result = legacy
-                .with_permission_authority_guard(&identity, |authority| {
-                    // Keep Server failures as the inner Result. Only native gate
-                    // acquisition/finalization failures belong to the outer lane.
-                    Ok((|| -> Result<_> {
-                        // Acquire declarations only after native Feature admission,
-                        // retaining them through seal and the Server commit.
-                        let registry = api.permission_registry.read().map_err(|_| {
-                            Error::Config("current Feature declarations unavailable".into())
-                        })?;
-                        let host = registry.host();
-                        api.config_store.adopt_configuration(
+    ) -> std::result::Result<ConfigurationAdoptionReceipt, ConfigurationApiError> {
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Adopt,
+            move |api, account| {
+                let request = request_from_api(request)?;
+                if let Some(result) = saved_result(&api, &account, &request)? {
+                    return Ok(receipt_to_api(result));
+                }
+                let Preparation {
+                    schema,
+                    legacy,
+                    identity,
+                    seed,
+                } = prepare(&api, &account, &request)?;
+                let baseline = seed.as_ref().map(baseline);
+                // Feature connection + IMMEDIATE transaction always precede Server.
+                // Never call store-level Feature APIs from inside this closure.
+                let result = legacy
+                    .with_permission_authority_guard(&identity, |authority| {
+                        // Keep Server failures as the inner Result. Only native gate
+                        // acquisition/finalization failures belong to the outer lane.
+                        Ok((|| -> Result<_> {
+                            // Acquire declarations only after native Feature admission,
+                            // retaining them through seal and the Server commit.
+                            let registry = api.permission_registry.read().map_err(|_| {
+                                Error::Config("current Feature declarations unavailable".into())
+                            })?;
+                            let host = registry.host();
+                            api.config_store.adopt_configuration(
                         &api.config.workspace_id,
                         &account,
                         &request,
@@ -510,30 +650,25 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                             })
                         },
                         )
-                    })())
-                })
-                .map_err(transfer_error)??;
-            api.refresh_plugin_permission_registry()?;
-            // Core and Feature guards are released before best-effort Runtime
-            // publication. Dispatch transfers the admitted lifetime without
-            // keeping the SQL lane occupied by an external Runtime response.
-            // Exact historical receipt replay above must not publish old state.
-            let publication_api = api.clone();
-            let state = result.state.clone();
-            let _ = api.host_executors.host().and_then(|executor| {
-                executor.dispatch(move || {
-                    if let Ok(projection) = publication_api
-                        .prompt_projection_cache
-                        .resolve(&publication_api.config.workspace_id, &state)
-                    {
-                        let _ = publication_api
-                            .runtime
-                            .observe_workspace_prompt_projection((*projection).clone());
-                    }
-                })
-            });
-            Ok(receipt_to_api(result))
-        })
+                        })())
+                    })
+                    .map_err(transfer_error)??;
+                // Core and Feature guards are released before best-effort Runtime
+                // publication. Dispatch transfers the admitted lifetime without
+                // keeping the SQL lane occupied by an external Runtime response.
+                // Exact historical receipt replay above must not publish old state.
+                let publication_identity = crate::config_publication::PublicationIdentity {
+                    request_fingerprint: request_fingerprint(
+                        &api.config.workspace_id,
+                        &account,
+                        &request,
+                    )?,
+                    receipt: result.clone(),
+                };
+                dispatch_publication(&api, account, publication_identity);
+                Ok(receipt_to_api(result))
+            },
+        )
         .await
     }
 
@@ -542,42 +677,49 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
         request: ConfigurationAdoptionRequest,
-    ) -> std::result::Result<ConfigurationReconciliation, RepositoryApiError> {
-        owner_operation(self, context, workspace_id, move |api, account| {
-            let request = request_from_api(request)?;
-            if let Some(result) = saved_result(&api, &account, &request)? {
-                return Ok(ConfigurationReconciliation::Adopted {
-                    receipt: receipt_to_api(result),
-                });
-            }
-            // Canonical operations do not use the old transfer. A missing normal
-            // save receipt is not evidence about the unrelated initial cutover.
-            if source_snapshot(&api, &account)?.canonical {
-                return Ok(match saved_result(&api, &account, &request)? {
-                    Some(result) => ConfigurationReconciliation::Adopted {
+    ) -> std::result::Result<ConfigurationReconciliation, ConfigurationApiError> {
+        owner_operation(
+            self,
+            context,
+            workspace_id,
+            FailureOperation::Reconcile,
+            move |api, account| {
+                let request = request_from_api(request)?;
+                if let Some(result) = saved_result(&api, &account, &request)? {
+                    return Ok(ConfigurationReconciliation::Adopted {
                         receipt: receipt_to_api(result),
+                    });
+                }
+                // Canonical operations do not use the old transfer. A missing normal
+                // save receipt is not evidence about the unrelated initial cutover.
+                if source_snapshot(&api, &account)?.canonical {
+                    return Ok(match saved_result(&api, &account, &request)? {
+                        Some(result) => ConfigurationReconciliation::Adopted {
+                            receipt: receipt_to_api(result),
+                        },
+                        None => ConfigurationReconciliation::NotObserved,
+                    });
+                }
+                // No draft generation, validation against today's head/catalog, seal,
+                // or adoption here: this is observation of the exact original input.
+                let legacy = raw_legacy(&api)?;
+                let pending =
+                    pending_transfer(&legacy, &api.config.workspace_id, &account, &request)?;
+                // Adoption may have committed between the first lookup and Feature read.
+                if let Some(result) = saved_result(&api, &account, &request)? {
+                    return Ok(ConfigurationReconciliation::Adopted {
+                        receipt: receipt_to_api(result),
+                    });
+                }
+                Ok(match pending {
+                    Some(receipt) => ConfigurationReconciliation::PendingTransfer {
+                        transfer_identity: receipt.transfer_id,
+                        export_digest: receipt.snapshot.export_digest,
                     },
                     None => ConfigurationReconciliation::NotObserved,
-                });
-            }
-            // No draft generation, validation against today's head/catalog, seal,
-            // or adoption here: this is observation of the exact original input.
-            let legacy = raw_legacy(&api)?;
-            let pending = pending_transfer(&legacy, &api.config.workspace_id, &account, &request)?;
-            // Adoption may have committed between the first lookup and Feature read.
-            if let Some(result) = saved_result(&api, &account, &request)? {
-                return Ok(ConfigurationReconciliation::Adopted {
-                    receipt: receipt_to_api(result),
-                });
-            }
-            Ok(match pending {
-                Some(receipt) => ConfigurationReconciliation::PendingTransfer {
-                    transfer_identity: receipt.transfer_id,
-                    export_digest: receipt.snapshot.export_digest,
-                },
-                None => ConfigurationReconciliation::NotObserved,
-            })
-        })
+                })
+            },
+        )
         .await
     }
 }

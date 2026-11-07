@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+pub mod audit;
 pub mod checkout;
 pub use checkout::{
     CheckoutObservation, CheckoutOperation, CheckoutOutput, CheckoutRequest, CheckoutResult,
@@ -8,8 +9,10 @@ pub use checkout::{
 mod environment;
 pub use environment::WorkdirSessionEnvironment;
 pub mod external;
+pub mod failure;
 pub mod http;
 mod local;
+pub mod management_failure;
 mod operation;
 mod router;
 mod scope;
@@ -435,6 +438,7 @@ pub enum WorkdirFailureReason {
     HttpResponseInvalid,
     HttpResponseTooLarge,
     OperationResultMismatch,
+    ReadLimitExceeded,
     SessionIdentityMismatch,
     SessionOpenTaskFailed,
     SessionOpenFailed,
@@ -452,6 +456,8 @@ pub enum WorkdirFailureReason {
     WorkingDirectoryNotActive,
     WorkingDirectoryRecordInvalid,
     WorkingDirectoryAccessUnavailable,
+    SessionRegistryUnavailable,
+    AttachmentProjectionUnavailable,
 }
 
 impl WorkdirFailureReason {
@@ -472,6 +478,7 @@ impl WorkdirFailureReason {
             Self::HttpResponseInvalid => "http_response_invalid",
             Self::HttpResponseTooLarge => "http_response_too_large",
             Self::OperationResultMismatch => "operation_result_mismatch",
+            Self::ReadLimitExceeded => "read_limit_exceeded",
             Self::SessionIdentityMismatch => "session_identity_mismatch",
             Self::SessionOpenTaskFailed => "session_open_task_failed",
             Self::SessionOpenFailed => "session_open_failed",
@@ -489,6 +496,8 @@ impl WorkdirFailureReason {
             Self::WorkingDirectoryNotActive => "working_directory_not_active",
             Self::WorkingDirectoryRecordInvalid => "working_directory_record_invalid",
             Self::WorkingDirectoryAccessUnavailable => "working_directory_access_unavailable",
+            Self::SessionRegistryUnavailable => "session_registry_unavailable",
+            Self::AttachmentProjectionUnavailable => "attachment_projection_unavailable",
         }
     }
 
@@ -503,10 +512,14 @@ impl WorkdirFailureReason {
             Self::ProviderResponseLost | Self::ProviderOperationTimeout => Stage::ProviderResponse,
             Self::AuditStoreUnavailable => Stage::Audit,
             Self::CommandTerminalMissing => Stage::Command,
+            Self::SessionRegistryUnavailable | Self::AttachmentProjectionUnavailable => {
+                Stage::Cleanup
+            }
             Self::HttpTimeout | Self::HttpConnect | Self::HttpTransfer => Stage::Http,
             Self::HttpResponseInvalid
             | Self::HttpResponseTooLarge
-            | Self::OperationResultMismatch => Stage::ResponseValidation,
+            | Self::OperationResultMismatch
+            | Self::ReadLimitExceeded => Stage::ResponseValidation,
             Self::SessionIdentityMismatch
             | Self::SessionOpenTaskFailed
             | Self::SessionOpenFailed
@@ -538,6 +551,7 @@ pub enum WorkdirFailureStage {
     ProviderResponse,
     Audit,
     Command,
+    Cleanup,
     Http,
     ResponseValidation,
     SessionOpen,
@@ -555,6 +569,7 @@ impl WorkdirFailureStage {
             Self::ProviderResponse => "provider_response",
             Self::Audit => "audit",
             Self::Command => "command",
+            Self::Cleanup => "cleanup",
             Self::Http => "http",
             Self::ResponseValidation => "response_validation",
             Self::SessionOpen => "session_open",

@@ -33,7 +33,10 @@ impl Cleanup {
         {
             Ok(Ok(())) => CleanupCancel::Acknowledged,
             Ok(Err(error)) => CleanupCancel::Failed {
-                reason: CleanupProviderFailure::from(&error),
+                reason: CleanupProviderFailure::new(
+                    workdir::failure::WorkdirFailureOperation::CommandCancel,
+                    error,
+                ),
             },
             Err(_) => CleanupCancel::DeadlineExceeded,
         };
@@ -86,7 +89,10 @@ impl Cleanup {
             )
             .await
             .map_err(|error| CleanupFailure::Provider {
-                reason: CleanupProviderFailure::from(&error),
+                reason: CleanupProviderFailure::new(
+                    workdir::failure::WorkdirFailureOperation::CommandOutput,
+                    error,
+                ),
             })?;
             let mut next = self.cursor;
             for chunk in &page.chunks {

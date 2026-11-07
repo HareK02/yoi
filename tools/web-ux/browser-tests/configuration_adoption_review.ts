@@ -4,6 +4,7 @@ import { assert, assertEquals } from "@std/assert";
 import { dirname, fromFileUrl, join, resolve } from "@std/path";
 import { createHash } from "node:crypto";
 import { chromium, type Page } from "playwright";
+import catalogChanged from "../../../web/workspace/test/config-source/fixtures/catalog-changed.json" with { type: "json" };
 import { sha256File } from "../src/artifacts.ts";
 import { startOwnedProcesses, stopOwnedProcesses } from "../src/processes.ts";
 import { assertNoPageWideOverflow, freePort } from "./memory_document_harness.ts";
@@ -23,8 +24,9 @@ const root = resolve(dirname(fromFileUrl(import.meta.url)), "../../..");
 const buildRoot = resolve(Deno.args[0] ?? join(root, "web/workspace/build"));
 const runId = Deno.args[1];
 const before = Deno.args[2] === "before";
+const catalogConflict = Deno.args[3] === "catalog-conflict";
 if (!runId || !/^[a-zA-Z0-9._-]+$/.test(runId)) throw new Error("supply unique safe run id");
-const output = join(root, "target/web-ux/t838", runId);
+const output = join(root, catalogConflict ? "target/web-ux/t815" : "target/web-ux/t838", runId);
 await Deno.mkdir(dirname(output), { recursive: true });
 await Deno.mkdir(output);
 await init({
@@ -90,6 +92,7 @@ const source = await new Deno.Command("git", { args: ["rev-parse", "HEAD"], cwd:
 const manifest = {
   evidence: "actual-Web-and-WASM-with-synthetic-HTTP-NOT-real-Backend",
   before,
+  catalogConflict,
   source: new TextDecoder().decode(source.stdout).trim(),
   buildRoot,
   buildIndexSha256: await sha256File(join(buildRoot, "index.html")),
@@ -121,6 +124,7 @@ async function capture(page: Page, id: string, errors: unknown[], expectedErrors
     imageSha256: await sha256File(image),
     accessibilitySnapshot,
     visibleAlerts: await page.getByRole("alert").allTextContents(),
+    visibleStatuses: await page.locator(".config-source-status").allTextContents(),
     errors: [...errors],
     expectedErrors,
   });
@@ -188,6 +192,7 @@ try {
               message: `${r.method()} ${new URL(r.url()).pathname}: ${r.failure()?.errorText}`,
             }),
         );
+        let commitCount = 0;
         let state = structuredClone(initial);
         let request: unknown = null;
         let savedReceipt: unknown = null;
@@ -229,7 +234,9 @@ try {
             });
           }
           if (path.endsWith("/commit")) {
+            commitCount++;
             request = input;
+            if (catalogConflict) return await route.fulfill({ status: 409, contentType: "application/problem+json", json: catalogChanged });
             set_snapshot(state.snapshot);
             state = {
               ...state,
@@ -256,9 +263,22 @@ try {
         await page.goto(`${base}/w/home-owner/settings/configuration`);
         await page.locator(".cm-content[contenteditable=true]").waitFor();
         await page.locator(".config-source-shell").scrollIntoViewIfNeeded();
-        await capture(page, `${prefix}-ready`, errors);
+        if (!catalogConflict) await capture(page, `${prefix}-ready`, errors);
         assertEquals(errors, []);
-        if (!before) {
+        if (catalogConflict) {
+          await page.getByRole("button", { name: "Create local source" }).click();
+          await page.getByRole("button", { name: "Commit", exact: true }).click();
+          await page.getByRole("button", { name: "Discard local candidate and reload" }).waitFor();
+          const status = page.locator(".config-source-status");
+          assert((await status.innerText()).includes(before ? "yoi_failure" : catalogChanged.detail));
+          await status.scrollIntoViewIfNeeded();
+          assertEquals(commitCount, 1, "failure display must not resend adoption");
+          assertEquals(errors.filter((error) => !(
+            (error.kind === "http" && error.message === "409 /api/w/home-owner/config/adoption/commit") ||
+            (error.kind === "console" && error.message === "Failed to load resource: the server responded with a status of 409 (Conflict)")
+          )), []);
+          await capture(page, `${prefix}-catalog-conflict`, errors, ["HTTP409 intentional catalog conflict"]);
+        } else if (!before) {
           await page.getByRole("button", { name: "Create local source" }).click();
           const commit = page.getByRole("button", { name: "Commit", exact: true });
           await commit.click();

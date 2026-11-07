@@ -14,8 +14,8 @@
 use serde::{Deserialize, Serialize};
 use server_api::{
     ConfigCommitRequest, ConfigContentType, ConfigTreeChange, ConfigurationAdoptionApiClient,
-    ConfigurationAdoptionReceipt, ConfigurationAdoptionRequest, ConfigurationReconciliation,
-    ConfigurationSourceResponse, RepositoryApiError,
+    ConfigurationAdoptionReceipt, ConfigurationAdoptionRequest, ConfigurationApiError,
+    ConfigurationReconciliation, ConfigurationSourceResponse,
     client_support::{ClientError, RequestAuthorizer},
 };
 use std::{
@@ -158,8 +158,22 @@ fn json_error(_: serde_json::Error) -> Error {
     local("invalid checkout JSON; preserve metadata and source before repairing")
 }
 
-fn remote(error: ClientError<RepositoryApiError>, adopting: bool) -> Error {
-    let (exit_code, message) = match error {
+fn remote(error: ClientError<ConfigurationApiError>, adopting: bool) -> Error {
+    let explanation = match &error {
+        ClientError::Public { error, .. } => error.details().and_then(|details| {
+            let facts = error_contract::FailureFacts::new(*details).ok()?;
+            error_contract::project_failure::<error_contract::Tool, _>(
+                &facts,
+                &server_api::configuration_failure::ConfigurationFailureVisibility {
+                    can_view_cause: true,
+                },
+            )
+            .ok()
+            .map(|projected| projected.explanation().to_owned())
+        }),
+        _ => None,
+    };
+    let (exit_code, mut message) = match error {
         ClientError::Public { status, .. } if matches!(status.as_u16(), 401 | 403) => {
             (5, "authorization refused by Server".to_owned())
         }
@@ -182,10 +196,14 @@ fn remote(error: ClientError<RepositoryApiError>, adopting: bool) -> Error {
             format!("Server read/preview transport failed ({error}); no commit was sent"),
         ),
     };
+    if let Some(explanation) = explanation {
+        message.push_str("; ");
+        message.push_str(&explanation);
+    }
     Error { exit_code, message }
 }
 
-fn unresolved(error: ClientError<RepositoryApiError>) -> Error {
+fn unresolved(error: ClientError<ConfigurationApiError>) -> Error {
     let mut error = remote(error, true);
     error
         .message

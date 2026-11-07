@@ -52,14 +52,21 @@ pub struct CommitObservation {
     pub parents: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RepositoryLookupError {
+    #[error("repository was not found in the registry")]
     UnknownRepository { id: RepositoryId },
+    #[error("repository provider is unsupported for this operation")]
     UnsupportedProvider { id: RepositoryId, provider: String },
+    #[error("repository has no default selector")]
     MissingDefaultSelector { id: RepositoryId },
+    #[error("repository selector is invalid")]
     InvalidSelector { id: RepositoryId, selector: String },
+    #[error("repository commit was not found")]
     CommitNotFound { id: RepositoryId, commit: String },
+    #[error("repository commit relationship is invalid")]
     InvalidCommitRelation { id: RepositoryId, detail: String },
+    #[error("repository provider operation failed")]
     ProviderFailure { id: RepositoryId, operation: String },
 }
 
@@ -781,10 +788,39 @@ mod tests {
                 .commit,
             base
         );
+        let error = reader.ensure_ancestor("main", &source, &base).unwrap_err();
         assert!(matches!(
-            reader.ensure_ancestor("main", &source, &base),
-            Err(RepositoryLookupError::InvalidCommitRelation { .. })
+            error,
+            RepositoryLookupError::InvalidCommitRelation { .. }
         ));
+        use crate::repository_failure::{
+            RepositoryFailure, RepositoryFailureOperation, RepositoryFailureVisibility,
+        };
+        use error_contract::{
+            Browser, Budget, FailureFacts, Tool, encode_projected_failure, project_failure,
+        };
+        let facts = FailureFacts::new(RepositoryFailure::new(
+            RepositoryFailureOperation::EnsureAncestor,
+            error,
+        ))
+        .unwrap();
+        let visible = RepositoryFailureVisibility {
+            can_view_cause: true,
+        };
+        let browser = project_failure::<Browser, _>(&facts, &visible).unwrap();
+        let tool = project_failure::<Tool, _>(&facts, &visible).unwrap();
+        let budget = Budget::new(4096, 4096);
+        let bytes = encode_projected_failure(&browser, budget).unwrap();
+        assert_eq!(
+            bytes.as_bytes(),
+            encode_projected_failure(&tool, budget).unwrap().as_bytes()
+        );
+        let text = std::str::from_utf8(bytes.as_bytes()).unwrap();
+        assert!(text.contains("invalid_commit_relation"));
+        assert!(browser.explanation().contains("commit ancestry check"));
+        assert!(!text.contains(path.to_str().unwrap()));
+        assert!(!text.contains(&source));
+        assert!(!text.contains(&base));
     }
 
     #[test]

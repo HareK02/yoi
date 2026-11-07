@@ -3,6 +3,17 @@
  * ConfigProjectionValidatorはstatic template catalogの検査方針であり、鮮度tokenではない。
  * Browserの解析成功はServerのcommit受理を代替しない。
  */
+import type { DomainFailureDetails } from "#lib/generated/domain-failures.ts";
+import { decodeDomainFailureDetails } from "#lib/workspace/failure/domains.ts";
+import { failureNotice } from "#lib/workspace/failure/model.ts";
+import {
+  type FailureReceipt,
+  receiveProblem,
+} from "#lib/workspace/failure/receive.ts";
+import {
+  readBoundedText,
+  ResponseByteLimitError,
+} from "#lib/workspace/api/http.ts";
 import type {
   ConfigContentType,
   ConfigEntry,
@@ -44,6 +55,7 @@ export class ConfigSourceApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly receipt?: FailureReceipt<DomainFailureDetails>,
   ) {
     super(message);
     this.name = "ConfigSourceApiError";
@@ -62,29 +74,40 @@ async function readJson<T>(
   response: Response,
   parser: Parser<T>,
 ): Promise<T> {
-  const limit = response.ok ? MAX_RESPONSE_BYTES : MAX_ERROR_BYTES;
-  const declared = response.headers.get("content-length");
-  if (declared !== null) {
-    const bytes = Number(declared);
-    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > limit) {
-      throw new ConfigSourceApiError(
-        response.ok
-          ? "Workspace configuration response is too large."
-          : "Workspace configuration request failed.",
-        response.ok ? 502 : response.status,
-      );
-    }
-  }
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > limit) {
+  if (
+    !response.ok &&
+    response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ===
+      "application/problem+json"
+  ) {
+    let receipt = await receiveProblem(response, decodeDomainFailureDetails);
+    if (
+      receipt.kind === "problem" &&
+      receipt.problem.yoi_failure.domain !== "configuration"
+    ) receipt = { kind: "unsupported" };
     throw new ConfigSourceApiError(
-      response.ok
+      failureNotice(receipt).explanation,
+      response.status,
+      receipt,
+    );
+  }
+  let text: string;
+  try {
+    text = await readBoundedText(
+      response,
+      response.ok ? MAX_RESPONSE_BYTES : MAX_ERROR_BYTES,
+    );
+  } catch (error) {
+    throw new ConfigSourceApiError(
+      response.ok && error instanceof ResponseByteLimitError
         ? "Workspace configuration response is too large."
+        : response.ok
+        ? "Workspace configuration returned an invalid response."
         : "Workspace configuration request failed.",
       response.ok ? 502 : response.status,
     );
   }
-  const text = new TextDecoder().decode(bytes);
+  // Existing bounded authoring diagnostics remain legacy; they are not decoded
+  // into a typed cause or used to decide adoption state/retry safety.
   if (!response.ok) {
     throw new ConfigSourceApiError(
       text || `${response.status} ${response.statusText}`,

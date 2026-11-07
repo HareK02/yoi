@@ -8,6 +8,7 @@ use super::*;
 use futures::StreamExt;
 use server_api::*;
 use sha2::{Digest, Sha256};
+use workspace_drive::failure::{DriveFailure, DriveFailureOperation};
 use workspace_drive::{Drive, Mutation, NodeId};
 
 fn mutation_actor(context: &ServerRequestContext) -> DriveResult<String> {
@@ -25,10 +26,10 @@ fn mutation_actor(context: &ServerRequestContext) -> DriveResult<String> {
     }
 }
 
-type DriveResult<T> = std::result::Result<T, DriveApiError>;
+type DriveResult<T> = std::result::Result<T, DriveHttpApiError>;
 const TRANSFER_CHUNK: usize = 64 * 1024;
 
-pub(super) fn failure(status: u16) -> DriveApiError {
+pub(super) fn failure(status: u16) -> DriveHttpApiError {
     let code = match status {
         401 | 403 => DriveApiErrorCode::Denied,
         404 => DriveApiErrorCode::NotFound,
@@ -37,21 +38,57 @@ pub(super) fn failure(status: u16) -> DriveApiError {
         500..=599 => DriveApiErrorCode::StorageUnavailable,
         _ => DriveApiErrorCode::Invalid,
     };
-    DriveApiError::new(code)
+    DriveHttpApiError::new(code)
 }
-fn domain_error(error: workspace_drive::Error, mutation: bool) -> DriveApiError {
-    use workspace_drive::Error;
-    match error {
-        Error::Denied => failure(403),
-        Error::NotFound => failure(404),
-        Error::Conflict | Error::Fenced => failure(409),
-        Error::Invalid(_) => failure(400),
-        Error::Blob(_) => failure(503),
-        _ if mutation => DriveApiError::new(DriveApiErrorCode::OutcomeUnknown),
+fn domain_error(
+    error: workspace_drive::Error,
+    operation: DriveFailureOperation,
+    mutation: bool,
+) -> DriveHttpApiError {
+    // Keep the real source before selecting the existing HTTP/result contract.
+    let source = DriveFailure::new(operation, error);
+    let result = match source.source_error() {
+        workspace_drive::Error::Denied => failure(403),
+        workspace_drive::Error::NotFound => failure(404),
+        workspace_drive::Error::Conflict | workspace_drive::Error::Fenced => failure(409),
+        workspace_drive::Error::Invalid(_) => failure(400),
+        workspace_drive::Error::Blob(_) => failure(503),
+        _ if mutation => DriveHttpApiError::new(DriveApiErrorCode::OutcomeUnknown),
         _ => failure(503),
+    };
+    result.with_source(source)
+}
+/// Result facts are already public in the legacy contract. Storage causes require
+/// successful admission and the operation's own current authorizer; denial and
+/// hidden/not-found results never gain an internal cause through this adapter.
+pub(super) fn http_error(
+    error: DriveHttpApiError,
+    operation: DriveHttpOperation,
+) -> DriveHttpApiError {
+    let mut details = DriveHttpFailureDetails::result(operation, error.legacy());
+    let visible = !matches!(
+        error.code,
+        DriveApiErrorCode::Denied | DriveApiErrorCode::NotFound
+    );
+    if visible {
+        details.storage = error.source_failure().map(|source| *source.details());
+    }
+    let projected = error_contract::FailureFacts::new(details).and_then(|facts| {
+        error_contract::project_failure::<error_contract::Browser, _>(
+            &facts,
+            &DriveHttpFailureVisibility {
+                can_view_result: true,
+                can_view_storage_cause: visible,
+            },
+        )
+    });
+    match projected {
+        Ok(projected) => error.with_projection(projected),
+        Err(_) => error,
     }
 }
 async fn blocking<T: Send + 'static>(
+    operation: DriveFailureOperation,
     mutation: bool,
     action: impl FnOnce() -> workspace_drive::Result<T> + Send + 'static,
 ) -> DriveResult<T> {
@@ -60,10 +97,10 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(|error| match error {
             Error::DbCapacityExceeded | Error::DbExecutorUnavailable => failure(503),
-            _ if mutation => DriveApiError::new(DriveApiErrorCode::OutcomeUnknown),
+            _ if mutation => DriveHttpApiError::new(DriveApiErrorCode::OutcomeUnknown),
             _ => failure(503),
         })?
-        .map_err(|error| domain_error(error, mutation))
+        .map_err(|error| domain_error(error, operation, mutation))
 }
 fn node_id(value: &str) -> DriveResult<NodeId> {
     value.to_owned().try_into().map_err(|_| failure(400))
@@ -115,16 +152,10 @@ fn disposition(name: &str) -> String {
         .collect();
     format!("attachment; filename=\"download\"; filename*=UTF-8''{encoded}")
 }
-fn error_response(error: DriveApiError) -> Response {
-    let status = match error.code {
-        DriveApiErrorCode::Denied => 403,
-        DriveApiErrorCode::NotFound => 404,
-        DriveApiErrorCode::Conflict => 409,
-        DriveApiErrorCode::Limit => 413,
-        DriveApiErrorCode::Invalid => 400,
-        DriveApiErrorCode::StorageUnavailable | DriveApiErrorCode::OutcomeUnknown => 503,
-    };
-    (StatusCode::from_u16(status).unwrap(), Json(error)).into_response()
+fn error_response(error: DriveHttpApiError) -> Response {
+    let status = StatusCode::from_u16(api_macros::HttpError::status_code(&error))
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    api_macros::axum::http_error_response(status, error)
 }
 // No raw storage diagnostic is ever placed in a public error or stream failure.
 fn stream_error() -> std::io::Error {
@@ -236,7 +267,9 @@ pub(super) async fn root(
     workspace: &str,
 ) -> DriveResult<DriveEntry> {
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
-    blocking(false, move || drive.root()).await.map(public_node)
+    blocking(DriveFailureOperation::Root, false, move || drive.root())
+        .await
+        .map(public_node)
 }
 /// Query only the authenticated caller's current ceiling using the operation authorizer.
 /// This is admission/publication evidence, never authority retained for a later mutation.
@@ -246,14 +279,18 @@ pub(super) async fn capabilities(
     workspace: &str,
 ) -> DriveResult<DriveCapabilities> {
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
-    let write = blocking(false, move || match drive.check_authorized(true) {
-        Ok(()) => Ok(true),
-        Err(workspace_drive::Error::Denied) => {
-            drive.check_authorized(false)?;
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    })
+    let write = blocking(
+        DriveFailureOperation::CheckAuthorized,
+        false,
+        move || match drive.check_authorized(true) {
+            Ok(()) => Ok(true),
+            Err(workspace_drive::Error::Denied) => {
+                drive.check_authorized(false)?;
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        },
+    )
     .await?;
     Ok(DriveCapabilities { write })
 }
@@ -265,9 +302,11 @@ pub(super) async fn metadata(
 ) -> DriveResult<DriveEntry> {
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
     let id = scoped_id(workspace, &query.entry_workspace_id, &query.id)?;
-    blocking(false, move || drive.metadata(id))
-        .await
-        .map(public_node)
+    blocking(DriveFailureOperation::Metadata, false, move || {
+        drive.metadata(id)
+    })
+    .await
+    .map(public_node)
 }
 pub(super) async fn list(
     api: &WorkspaceApi,
@@ -279,7 +318,10 @@ pub(super) async fn list(
     let id = scoped_id(workspace, &query.entry_workspace_id, &query.id)?;
     let after = after(workspace, query.after)?;
     let limit = limit(query.limit, workspace_drive::MAX_PAGE)?;
-    let page = blocking(false, move || drive.list(id, after, limit)).await?;
+    let page = blocking(DriveFailureOperation::List, false, move || {
+        drive.list(id, after, limit)
+    })
+    .await?;
     Ok(DriveListResponse {
         entries: page.nodes.into_iter().map(public_node).collect(),
         next_after: cursor(workspace, page.next_after),
@@ -294,7 +336,7 @@ pub(super) async fn search(
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
     let after = after(workspace, query.after)?;
     let limit = limit(query.limit, workspace_drive::MAX_SEARCH_NODES)?;
-    let page = blocking(false, move || {
+    let page = blocking(DriveFailureOperation::Search, false, move || {
         drive.search(&query.query, query.include_text, after, limit)
     })
     .await?;
@@ -315,7 +357,7 @@ pub(super) async fn read_text(
     if max == 0 || max > DRIVE_TEXT_MAX_BYTES {
         return Err(failure(413));
     }
-    let (node, chunk) = blocking(false, move || {
+    let (node, chunk) = blocking(DriveFailureOperation::ReadText, false, move || {
         let node = drive.metadata(id)?;
         let chunk = drive.read(id, &node.last_mutation_id, 0, max)?;
         Ok((node, chunk))
@@ -346,7 +388,7 @@ pub(super) async fn read_chunk(
     if query.length == 0 || query.length > DRIVE_CHUNK_MAX_BYTES {
         return Err(failure(413));
     }
-    let chunk = blocking(false, move || {
+    let chunk = blocking(DriveFailureOperation::Read, false, move || {
         drive.read(
             id,
             &last_mutation_id,
@@ -427,7 +469,8 @@ pub(super) async fn mutate(
     let actor = mutation_actor(context)?;
     let operation = mutation(workspace, request.mutation)?;
     let request_id = request.request_id.clone();
-    let mutated = blocking(true, move || {
+    let storage_operation = DriveFailureOperation::from(&operation);
+    let mutated = blocking(storage_operation, true, move || {
         drive.mutate(&request.request_id, &actor, operation)
     })
     .await?;
@@ -495,7 +538,8 @@ async fn publish_upload(
 ) -> DriveResult<DriveMutationResponse> {
     let mutation = upload_mutation(workspace, &query, bytes)?;
     let request_id = query.request_id.clone();
-    let mutated = blocking(true, move || {
+    let storage_operation = DriveFailureOperation::from(&mutation);
+    let mutated = blocking(storage_operation, true, move || {
         drive.mutate(&query.request_id, &actor, mutation)
     })
     .await?;
@@ -509,7 +553,10 @@ pub(super) async fn request_status(
 ) -> DriveResult<DriveRequestStatusResponse> {
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
     let id = request_id.clone();
-    let status = blocking(false, move || drive.request_status(&id)).await?;
+    let status = blocking(DriveFailureOperation::RequestStatus, false, move || {
+        drive.request_status(&id)
+    })
+    .await?;
     Ok(match status {
         workspace_drive::RequestStatus::Uncommitted => DriveRequestStatusResponse {
             request_id,
@@ -535,7 +582,10 @@ async fn select_download(
     let drive = drive_grants::authorized_drive(api, context, workspace, false).await?;
     let id = scoped_id(workspace, &query.entry_workspace_id, &query.id)?;
     let for_node = drive.clone();
-    let node = blocking(false, move || for_node.metadata(id)).await?;
+    let node = blocking(DriveFailureOperation::Metadata, false, move || {
+        for_node.metadata(id)
+    })
+    .await?;
     if node.kind != workspace_drive::Kind::File {
         return Err(failure(400));
     }
@@ -561,7 +611,7 @@ pub(super) async fn download(
     loop {
         let copy = drive.clone();
         let node = node.clone();
-        let chunk = blocking(false, move || {
+        let chunk = blocking(DriveFailureOperation::Read, false, move || {
             copy.read(node.id, &node.last_mutation_id, offset, TRANSFER_CHUNK)
         })
         .await?;
@@ -627,17 +677,29 @@ pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
         .layer(DefaultBodyLimit::max(512 * 1024))
         .layer(middleware::from_fn(normalize_rejections))
 }
-async fn normalize_rejections(request: Request, next: Next) -> Response {
+pub(super) async fn normalize_rejections(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
-    if matches!(response.status().as_u16(), 415 | 422) {
-        error_response(failure(400))
-    } else if matches!(response.status().as_u16(), 400 | 413)
-        && response
+    // Never replace a typed response from the generated adapter or a service/middleware.
+    let typed = response
+        .extensions()
+        .get::<Arc<DriveHttpApiError>>()
+        .is_some()
+        || response
             .headers()
             .get(CONTENT_TYPE)
-            .is_none_or(|value| value != "application/json")
-    {
-        error_response(failure(response.status().as_u16()))
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                let media = value.split(';').next().unwrap_or("").trim();
+                media.eq_ignore_ascii_case("application/json")
+                    || media.eq_ignore_ascii_case("application/problem+json")
+            });
+    if !typed && matches!(response.status().as_u16(), 400 | 413 | 415 | 422) {
+        let status = response.status().as_u16();
+        let error = <DriveHttpApiError as api_macros::HttpRequestError>::from_request_rejection(
+            status,
+            String::new(),
+        );
+        error_response(error)
     } else {
         response
     }
@@ -691,7 +753,7 @@ async fn streaming_upload(
     .await;
     match result {
         Ok(result) => Json(result).into_response(),
-        Err(error) => error_response(error),
+        Err(error) => error_response(http_error(error, DriveHttpOperation::Upload)),
     }
 }
 async fn streaming_download(
@@ -707,7 +769,7 @@ async fn streaming_download(
         // Validate the referenced blob before HTTP success, including a zero-byte file.
         let first_drive = drive.clone();
         let selected = node.clone();
-        let first = blocking(false, move || {
+        let first = blocking(DriveFailureOperation::Read, false, move || {
             first_drive.read(selected.id, &selected.last_mutation_id, 0, TRANSFER_CHUNK)
         })
         .await?;
@@ -725,7 +787,7 @@ async fn streaming_download(
                     None => {
                         let copy = drive.clone();
                         let expected = last_mutation_id.clone();
-                        blocking(false, move || {
+                        blocking(DriveFailureOperation::Read, false, move || {
                             copy.read(id, &expected, offset, TRANSFER_CHUNK)
                         })
                         .await
@@ -770,12 +832,12 @@ async fn streaming_download(
             "content-security-policy",
             HeaderValue::from_static("sandbox; default-src 'none'"),
         );
-        Ok::<_, DriveApiError>(response)
+        Ok::<_, DriveHttpApiError>(response)
     }
     .await;
     match result {
         Ok(response) => response,
-        Err(error) => error_response(error),
+        Err(error) => error_response(http_error(error, DriveHttpOperation::Download)),
     }
 }
 

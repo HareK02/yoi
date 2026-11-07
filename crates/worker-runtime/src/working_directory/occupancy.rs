@@ -1,7 +1,7 @@
 //! Transient, clone-shared admission for local filesystem effects. Bindings are
 //! passive; only effects and activated session resources own leases. The mutex
 //! protects admission bookkeeping only, never filesystem work.
-use super::WorkingDirectoryDiagnostic;
+use super::{WorkdirManagementReason, WorkingDirectoryDiagnostic};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -42,7 +42,7 @@ fn busy(id: &str, action: &str, blocking: &Entry) -> WorkingDirectoryDiagnostic 
         active_use_count,
         "Workdir operation blocked by busy resource");
     WorkingDirectoryDiagnostic::new(
-        "working_directory_cleanup_resource_busy",
+        WorkdirManagementReason::CleanupResourceBusy,
         "A filesystem resource is busy or changed during removal. Release the resource and retry.",
     )
 }
@@ -103,7 +103,7 @@ impl Occupancy {
             .is_some_and(|current| Arc::ptr_eq(current, &generation.0));
         if !valid {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_not_found",
+                WorkdirManagementReason::NotFound,
                 "Workdir binding is stale; acquire a fresh binding before opening a session",
             ));
         }

@@ -13,7 +13,7 @@ impl FeaturePermissionsApi for WorkspaceServerApi {
         context: ServerRequestContext,
         workspace_id: String,
     ) -> std::result::Result<PermissionCatalogResponse, RepositoryApiError> {
-        configuration_adoption::owner_operation(
+        configuration_adoption::owner_repository_operation(
             self,
             context,
             workspace_id,
@@ -34,7 +34,7 @@ impl FeaturePermissionsApi for WorkspaceServerApi {
         workspace_id: String,
         request: PermissionValidationRequest,
     ) -> std::result::Result<PermissionResolutionResponse, RepositoryApiError> {
-        configuration_adoption::owner_operation(
+        configuration_adoption::owner_repository_operation(
             self,
             context,
             workspace_id,

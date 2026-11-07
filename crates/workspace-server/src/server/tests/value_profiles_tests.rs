@@ -158,8 +158,9 @@ async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_ba
             StatusCode::BAD_REQUEST,
         )
         .await;
+        assert_eq!(error["yoi_failure"]["details"]["reason"], "builtin_read_only");
         assert!(
-            error["message"]
+            error["detail"]
                 .as_str()
                 .unwrap()
                 .contains("builtin namespace is read-only"),

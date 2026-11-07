@@ -109,7 +109,7 @@ async fn open_session(
     Path(id): Path<String>,
     uri: Uri,
     headers: HeaderMap,
-    AxumJson(_request): AxumJson<OpenWorkdirSessionRequest>,
+    AxumJson(request): AxumJson<OpenWorkdirSessionRequest>,
 ) -> AxumResponse {
     if let Err(response) = state.authorize(&headers, "POST", &uri) {
         return response;
@@ -117,8 +117,9 @@ async fn open_session(
     if id != state.session.workdir().id().as_str() {
         return provider_error(WorkdirError::NotFound("unknown workdir".into()));
     }
+    assert_eq!(request.session_id.as_str(), SESSION);
     AxumJson(OpenWorkdirSessionResponse {
-        session_id: WorkdirSessionId::new(SESSION).unwrap(),
+        session_id: request.session_id,
         workdir_id: state.session.workdir().id().clone(),
         capabilities: state.session.capabilities(),
         environment: state.session.environment(),
@@ -321,7 +322,10 @@ impl HttpFixture {
             self.base_url.clone(),
             token.to_owned(),
             self.state.session.workdir().id().clone(),
-            OpenWorkdirSessionRequest::default(),
+            OpenWorkdirSessionRequest {
+                session_id: WorkdirSessionId::new(SESSION).unwrap(),
+                owner_worker_id: None,
+            },
         )
         .await
     }
@@ -338,7 +342,7 @@ impl HttpFixture {
         );
     }
 
-    fn assert_endpoints(&self) {
+    fn assert_endpoints(&self, expected_close_attempts: usize) {
         let open = format!(
             "/provider/v1/working-directories/{}/sessions",
             self.state.session.workdir().id()
@@ -353,7 +357,7 @@ impl HttpFixture {
                 .iter()
                 .filter(|(method, path)| method == "DELETE" && path == &close)
                 .count(),
-            1
+            expected_close_attempts
         );
         assert!(requests.iter().all(|(method, path)| (method == "POST"
             && (path == &open || path == &operations))
@@ -383,7 +387,7 @@ async fn remote_open_keeps_provider_environment_and_nonroot_operation_coordinate
     assert_eq!(result.bytes, b"first\nneedle needle\nlast\n");
     fixture.public_output(&serde_json::to_string(&remote.environment()).unwrap());
     remote.close().await.unwrap();
-    fixture.assert_endpoints();
+    fixture.assert_endpoints(1);
 }
 
 fn native_runtime(remote: Arc<RemoteWorkdirSession>) -> (WipRuntime, Arc<WorkdirSessionRouter>) {
@@ -582,7 +586,7 @@ async fn checkout_http_native_search_links_read_edit_write_create_and_close() {
             .detach(&WorkdirAttachmentAlias::new("main").unwrap())
             .await
             .unwrap();
-        fixture.assert_endpoints();
+        fixture.assert_endpoints(1);
     })
     .await;
 }
@@ -680,7 +684,9 @@ async fn checkout_http_wrong_bearer_and_readonly_caps_fail_closed() {
             .detach(&WorkdirAttachmentAlias::new("main").unwrap())
             .await
             .unwrap();
-        fixture.assert_endpoints();
+        // The refused open's best-effort close uses the same rejected bearer;
+        // the later authorized session remains usable until its explicit detach.
+        fixture.assert_endpoints(2);
     })
     .await;
 }
@@ -704,8 +710,19 @@ async fn committed_write_unknown(fault: WriteResponseFault) {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("outcome unknown"));
-    assert!(error.to_string().contains("do not retry automatically"));
+    let ToolError::ExecutionFailure(output) = &error else {
+        panic!("missing retained Workdir cause")
+    };
+    assert!(output.summary.contains("result unknown"));
+    assert!(output.summary.contains("do not automatically resend"));
+    let report: serde_json::Value =
+        serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    assert_eq!(report["failure"]["domain"], "workdir");
+    assert_eq!(
+        report["failure"]["details"]["classification"],
+        "outcome_unknown"
+    );
+    assert_eq!(report["result"]["mutation"], "outcome_unknown");
     fixture.public_output(&error.to_string());
     assert_eq!(
         runtime.audit().last().unwrap().outcome,
@@ -745,7 +762,7 @@ async fn committed_write_unknown(fault: WriteResponseFault) {
         .detach(&WorkdirAttachmentAlias::new("main").unwrap())
         .await
         .unwrap();
-    fixture.assert_endpoints();
+    fixture.assert_endpoints(1);
 }
 
 #[tokio::test]
@@ -918,7 +935,7 @@ async fn remote_native_bash_retains_streams_quota_and_replays_lost_terminal_thro
         assert_eq!(f.state.operations.lock().unwrap().iter().filter(|op| matches!(op, WorkdirSessionOperation::CommandStart(_))).count(), 2);
         assert!(f.state.command_fault.lock().unwrap().is_none());
         router.close_all().await.unwrap();
-        f.assert_endpoints();
+        f.assert_endpoints(1);
     }).await;
 }
 

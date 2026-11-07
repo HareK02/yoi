@@ -1,10 +1,11 @@
 <script lang="ts">
   import { loadJson, workspaceApiPath } from '#lib/workspace/api/http.ts';
   import { parseRuntimeCleanupPlan } from '#lib/workspace/api/runtime-workers.ts';
-  import { parseWorkingDirectoryListResponse } from '#lib/workspace/api/workdirs.ts';
+  import { loadWorkdirJson, parseWorkingDirectoryListResponse } from '#lib/workspace/api/workdirs.ts';
   import { canRemoveWorkdir, removalCause, removalGuard, WorkdirRemovalRequests, WorkdirRemovalError } from '#lib/workspace/settings/workdir-removal.ts';
   import { formatCurrentWorkdirCheckout } from '#lib/workspace/settings/workdir-checkout.ts';
   import type { CleanupWorkdirCandidate, RuntimeCleanupPlanResponse, WorkingDirectorySummary } from '#lib/workspace/sidebar/types.ts';
+  import type { WorkingDirectoryManagementDiagnostic } from '#lib/generated/workdir-api.ts';
   import type { PageData as RouteData } from './$types';
   import type { ResolvedPageData } from '#lib/workspace/navigation/deferred.ts';
   type PageProps = { data: ResolvedPageData<RouteData> };
@@ -16,6 +17,7 @@
   let refreshError = $state<string | null>(null);
   let cleanupPlan = $state<RuntimeCleanupPlanResponse | null>(null);
   let workdirs = $state<WorkingDirectorySummary[]>([]);
+  let inventoryDiagnostics = $state<WorkingDirectoryManagementDiagnostic[]>([]);
   let inventoryLoaded = $state(false);
   let feedback = $state<{ id: string; message: string; retryable: boolean; removed: boolean } | null>(null);
   let runtimeLabel = $derived(data.runtimes?.items.find((runtime) => runtime.runtime_id === data.runtimeId)?.label ?? data.runtimeId);
@@ -26,7 +28,8 @@
     cleanupPlan = data.cleanupPlan ?? null;
     workdirs = data.workdirs?.items ?? [];
     inventoryLoaded = Boolean(data.workdirs);
-    refreshError = data.workdirsError || data.cleanupPlanError ? 'Inventory or removal eligibility is unavailable. Refresh before deletion.' : null;
+    inventoryDiagnostics = data.workdirs?.diagnostics ?? [];
+    refreshError = [data.workdirsError, data.cleanupPlanError].filter(Boolean).join(' ') || null;
     feedback = null;
   });
 
@@ -53,14 +56,18 @@
     try {
       const base = `/runtimes/${encodeURIComponent(runtimeId)}`;
       const [inventory, plan] = await Promise.all([
-        loadJson(fetch, workspaceApiPath(workspaceId, `${base}/working-directories`), undefined, parseWorkingDirectoryListResponse),
+        loadWorkdirJson(fetch, workspaceApiPath(workspaceId, `${base}/working-directories`), parseWorkingDirectoryListResponse),
         loadJson(fetch, workspaceApiPath(workspaceId, `${base}/cleanup-plan`), undefined, parseRuntimeCleanupPlan),
       ]);
       if (workspaceId !== data.workspaceId || runtimeId !== data.runtimeId) return;
       // Keep the last observed list on failure, but never authorize another deletion with stale eligibility.
-      if (inventory.data) { workdirs = inventory.data.items; inventoryLoaded = true; }
+      if (inventory.data) {
+        workdirs = inventory.data.items;
+        inventoryDiagnostics = inventory.data.diagnostics;
+        inventoryLoaded = true;
+      }
       cleanupPlan = plan.data;
-      refreshError = inventory.error || plan.error ? 'Inventory or removal eligibility could not be refreshed. Refresh before another deletion.' : null;
+      refreshError = [inventory.error, plan.error].filter(Boolean).join(' ') || null;
     } finally {
       refreshing = false;
     }
@@ -120,7 +127,22 @@
       {#if feedback.retryable}<p>After resolving this cause, retry Delete. Current safety conditions will be rechecked.</p>{/if}
     </div>
   {/if}
-  {#if refreshError}<p class="section-state error" role="alert">{refreshError}</p>{/if}
+  {#if refreshError}
+    <div class="section-state error" role="alert">
+      <p>Inventory or removal eligibility is unavailable. Refresh before deletion.</p>
+      <p>{refreshError}</p>
+    </div>
+  {/if}
+  {#if inventoryDiagnostics.length > 0}
+    <div class="inventory-diagnostics" role="status">
+      <p><strong>{refreshError ? 'Last observed inventory diagnostics' : 'Inventory diagnostics'}</strong></p>
+      <ul>
+        {#each inventoryDiagnostics as diagnostic}
+          <li>{diagnostic.message}</li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
 
   {#if !inventoryLoaded}
     <p class="section-state">{data.workdirsError ? 'Workdir inventory is unavailable.' : 'Loading workdirs…'}</p>
@@ -196,7 +218,9 @@
     min-width: 0;
   }
 
-  .removal-feedback {
+  .removal-feedback,
+  .inventory-diagnostics,
+  .section-state {
     overflow-wrap: anywhere;
   }
 

@@ -5,9 +5,13 @@
 //! endpoints, credentials, materializer handles, and operation sessions stay
 //! behind [`WorkspaceClient`].
 
+mod lifecycle_error;
 pub(crate) mod permission_declaration;
 
 pub mod wip;
+use lifecycle_error::LifecycleError;
+use server_api::workdir_management_error::WorkdirManagementCause;
+use workdir::management_failure::WorkdirManagementOperation;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -302,6 +306,7 @@ impl WorkspaceAttachedWorkdirSession {
         let workspace_id = self.client.workspace_id().ok_or_else(|| {
             WorkdirError::Unavailable("Workspace identity is unavailable".to_string())
         })?;
+        let expected_operation = workdir::failure::WorkdirFailureOperation::from(&operation);
         let request = WorkspaceRequest::json(
             WorkspaceRequestMethod::Post,
             format!(
@@ -323,21 +328,51 @@ impl WorkspaceAttachedWorkdirSession {
             .execute(request)
             .map_err(workspace_workdir_error)?;
         if !response.is_success() {
-            if let Ok(error) =
-                serde_json::from_str::<server_api::WorkdirOperationApiError>(&response.body)
-            {
-                notify_workdir_audit_failures(&error.audit_failures);
+            let error = server_api::WorkdirHttpApiError::decode_received(
+                response.status,
+                response.content_type.as_deref().unwrap_or(""),
+                response.body.as_bytes(),
+            )
+            .map_err(|_| {
+                WorkdirError::Transport(format!(
+                    "Workspace Workdir failure response could not be verified (HTTP {})",
+                    response.status,
+                ))
+                .with_failure_reason(workdir::WorkdirFailureReason::HttpResponseInvalid)
+            })?;
+            if error.details().is_some_and(|details| {
+                details.operation != expected_operation
+                    && details.operation != workdir::failure::WorkdirFailureOperation::SessionOpen
+            }) {
+                return Err(WorkdirError::Transport(
+                    "Workspace Workdir failure operation did not match".into(),
+                )
+                .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch));
             }
-            return Err(
-                serde_json::from_str::<workdir::http::WorkdirTransportError>(&response.body)
-                    .map(workdir::http::WorkdirTransportError::into_workdir_error)
-                    .unwrap_or_else(|_| {
-                        WorkdirError::Transport(format!(
-                            "Workspace Workdir operation failed with HTTP {}",
-                            response.status
-                        ))
-                    }),
-            );
+            let legacy = error.legacy();
+            notify_workdir_audit_failures(&legacy.audit_failures);
+            if let Some(details) = error.details() {
+                return Err(workdir::http::WorkdirTransportError {
+                    code: details.classification,
+                    message: "Workspace Workdir operation failed".into(),
+                    denial_reason: details.denial_reason,
+                    failure_reason: details.failure_reason,
+                }
+                .into_workdir_error());
+            }
+            return Err(match legacy.code {
+                Some(code) => workdir::http::WorkdirTransportError {
+                    code,
+                    message: "Workspace Workdir operation failed".into(),
+                    denial_reason: legacy.denial_reason,
+                    failure_reason: legacy.failure_reason,
+                }
+                .into_workdir_error(),
+                None => WorkdirError::Transport(format!(
+                    "Workspace Workdir operation failed with HTTP {}",
+                    response.status,
+                )),
+            });
         }
         let response: workdir::http::WorkdirSessionOperationResponse =
             serde_json::from_str(&response.body).map_err(|_| {
@@ -361,6 +396,7 @@ impl WorkspaceAttachedWorkdirSession {
 fn notify_workdir_audit_failures(failures: &[workdir::http::WorkdirAuditFailure]) {
     use sha2::Digest;
     for failure in failures {
+        workdir::audit::notify(failure.clone());
         // Response strings are untrusted. Never copy them into the receiving process log.
         let operation_id_hash = sha2::Sha256::digest(failure.operation_id.as_bytes())
             .iter()
@@ -663,7 +699,7 @@ impl WorkspaceHttpWorkdirBackend {
             .authorize_operation(operation, resource)
             .map_err(|error| {
                 let message = error.to_string();
-                if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
+                if error.is_authorization_denial() {
                     ToolError::StructuredConflict {
                         code: "workspace_http_403".into(),
                         message: format!("Host denied {operation} for {resource:?}"),
@@ -705,12 +741,15 @@ impl WorkspaceHttpWorkdirBackend {
             .authorize_workdir_attachment_operation("workdir.detach", alias, expected_connection_id)
             .map_err(|error| {
                 let message = error.to_string();
-                if message.contains("HTTP status 401") || message.contains("HTTP status 403") {
+                if error.is_authorization_denial() {
                     ToolError::StructuredConflict {
                         code: "workspace_http_403".into(),
                         message: format!("Host denied workdir.detach for attachment {alias}"),
                     }
-                } else if message.contains("HTTP status 409") {
+                } else if matches!(
+                    error,
+                    crate::worker::WorkspaceClientError::AuthorizationRejected { status: 409 }
+                ) {
                     ToolError::StructuredConflict {
                         code: "workspace_http_409".into(),
                         message: "attachment lifetime changed before local cleanup".into(),
@@ -723,21 +762,27 @@ impl WorkspaceHttpWorkdirBackend {
             })
     }
 
-    fn list(&self) -> Result<ToolOutput, ToolError> {
+    fn list(&self) -> Result<ToolOutput, LifecycleError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
         self.authorize_workspace("workdir.list")?;
-        let response = self.execute_json::<WorkdirListResponse>(WorkspaceRequest::get(format!(
-            "/api/w/{workspace_id}/working-directories"
-        )))?;
+        let mut response = self.execute_json::<WorkdirListResponse>(
+            WorkspaceRequest::get(format!("/api/w/{workspace_id}/working-directories")),
+            Some(WorkdirManagementOperation::List),
+        )?;
+        project_management_diagnostics(&mut response.diagnostics, WorkdirManagementOperation::List);
         let count = response.items.len();
-        workdir_output(format!("Listed {count} Workdir(s)"), &response)
+        workdir_output(
+            management_summary(format!("Listed {count} Workdir(s)"), &response.diagnostics),
+            &response,
+        )
+        .map_err(Into::into)
     }
 
     fn create(
         &self,
         input: WorkdirCreateInput,
         operation_id: String,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ToolOutput, LifecycleError> {
         let runtime_id = input
             .runtime_id
             .as_deref()
@@ -762,21 +807,32 @@ impl WorkspaceHttpWorkdirBackend {
                 repository_key: repository_key.into(),
             },
         )?;
-        let response = self.execute_json::<WorkdirCreateResponse>(WorkspaceRequest::json(
-            WorkspaceRequestMethod::Post,
-            format!("/api/w/{workspace_id}/working-directories"),
-            serde_json::to_string(&request).map_err(decode_error)?,
-        ))?;
+        let mut response = self.execute_json::<WorkdirCreateResponse>(
+            WorkspaceRequest::json(
+                WorkspaceRequestMethod::Post,
+                format!("/api/w/{workspace_id}/working-directories"),
+                serde_json::to_string(&request).map_err(decode_error)?,
+            ),
+            Some(WorkdirManagementOperation::Create),
+        )?;
+        project_management_diagnostics(
+            &mut response.diagnostics,
+            WorkdirManagementOperation::Create,
+        );
         workdir_output(
-            format!(
-                "Created Workdir {} on Runtime {}",
-                response.item.working_directory_id, response.runtime_id
+            management_summary(
+                format!(
+                    "Created Workdir {} on Runtime {}",
+                    response.item.working_directory_id, response.runtime_id
+                ),
+                &response.diagnostics,
             ),
             &response,
         )
+        .map_err(Into::into)
     }
 
-    fn attach(&self, input: WorkdirAttachInput) -> Result<ToolOutput, ToolError> {
+    fn attach(&self, input: WorkdirAttachInput) -> Result<ToolOutput, LifecycleError> {
         let alias = validate_identity(&input.alias, ATTACH_TOOL, "alias")?;
         workdir::WorkdirAttachmentAlias::new(alias)
             .map_err(|error| ToolError::InvalidArgument(error.to_string()))?;
@@ -791,7 +847,8 @@ impl WorkspaceHttpWorkdirBackend {
         {
             return Err(ToolError::ExecutionFailed(
                 "Workdir attachment response does not match the target".into(),
-            ));
+            )
+            .into());
         }
         // Backend ownership decides the name. A requested alias cannot rename
         // an existing attachment or create a second route to the same Workdir.
@@ -800,7 +857,7 @@ impl WorkspaceHttpWorkdirBackend {
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         if let Some(session) = self.session_router.session(&alias_key) {
             if session.workdir().id().as_str() != working_directory_id {
-                return Err(ToolError::ExecutionFailed("Local Workdir attachment differs from Backend; refresh attachments before retrying".into()));
+                return Err(ToolError::ExecutionFailed("Local Workdir attachment differs from Backend; refresh attachments before retrying".into()).into());
             }
         } else if let Err(error) = self.session_router.attach(
             alias_key,
@@ -813,19 +870,15 @@ impl WorkspaceHttpWorkdirBackend {
             ),
         ) {
             if response.attachment.already_attached {
-                return Err(ToolError::ExecutionFailed(format!(
-                    "attach Workdir session route: {error}; existing Backend attachment preserved"
-                )));
+                return Err(LifecycleError::route(error, "existing_preserved", None));
             }
             let rollback = self.detach(attached_alias);
-            return Err(ToolError::ExecutionFailed(match rollback {
-                Ok(_) => {
-                    format!("attach Workdir session route: {error}; Backend attachment rolled back")
+            return Err(match rollback {
+                Ok(_) => LifecycleError::route(error, "rolled_back", None),
+                Err(rollback_error) => {
+                    LifecycleError::route(error, "rollback_unconfirmed", Some(rollback_error))
                 }
-                Err(rollback_error) => format!(
-                    "attach Workdir session route: {error}; Backend attachment rollback failed: {rollback_error}; inspect the current attachment before retrying"
-                ),
-            }));
+            });
         }
         workdir_output(
             if response.attachment.already_attached {
@@ -835,13 +888,14 @@ impl WorkspaceHttpWorkdirBackend {
             },
             &response,
         )
+        .map_err(Into::into)
     }
 
     fn attach_response(
         &self,
         alias: &str,
         working_directory_id: &str,
-    ) -> Result<WorkdirSessionAttachmentResponse, ToolError> {
+    ) -> Result<WorkdirSessionAttachmentResponse, LifecycleError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
         self.authorize_workdir("workdir.attach", working_directory_id)?;
         let response = self
@@ -855,8 +909,8 @@ impl WorkspaceHttpWorkdirBackend {
                 })
                 .map_err(decode_error)?,
             ))
-            .map_err(|error| {
-                ToolError::ExecutionFailed(format!("Workspace Workdir request failed: {error}"))
+            .map_err(|_| {
+                ToolError::ExecutionFailed("Workspace Workdir transport failed; outcome unknown; inspect current state and do not resend automatically".into())
             })?;
         if response.status == 409
             && let Ok(error) =
@@ -866,12 +920,13 @@ impl WorkspaceHttpWorkdirBackend {
             return Err(ToolError::StructuredConflict {
                 code: "workdir_occupied".into(),
                 message: "Workdir is occupied by another Worker".into(),
-            });
+            }
+            .into());
         }
-        decode_response(response)
+        decode_response(response, Some(WorkdirManagementOperation::Attach))
     }
 
-    fn detach(&self, alias: &str) -> Result<ToolOutput, ToolError> {
+    fn detach(&self, alias: &str) -> Result<ToolOutput, LifecycleError> {
         self.detach_expected(alias, None)
     }
 
@@ -879,7 +934,7 @@ impl WorkspaceHttpWorkdirBackend {
         &self,
         alias: &str,
         expected_connection_id: Option<&str>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ToolOutput, LifecycleError> {
         let workspace_id = encode_path_segment(self.workspace_id()?);
         let alias_path = encode_path_segment(alias);
         let connection_id = self.authorize_detach(alias, expected_connection_id)?;
@@ -887,13 +942,16 @@ impl WorkspaceHttpWorkdirBackend {
             "?expected_connection_id={}",
             encode_path_segment(&connection_id)
         );
-        let response = self.execute_json::<WorkdirAttachmentResponse>(WorkspaceRequest {
-            method: WorkspaceRequestMethod::Delete,
-            path: format!(
-                "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias_path}{suffix}"
-            ),
-            body: None,
-        })?;
+        let response = self.execute_json::<WorkdirAttachmentResponse>(
+            WorkspaceRequest {
+                method: WorkspaceRequestMethod::Delete,
+                path: format!(
+                    "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias_path}{suffix}"
+                ),
+                body: None,
+            },
+            Some(WorkdirManagementOperation::Detach),
+        )?;
         workdir_output(
             format!(
                 "Detached Workdir {} ({})",
@@ -901,13 +959,14 @@ impl WorkspaceHttpWorkdirBackend {
             ),
             &response,
         )
+        .map_err(Into::into)
     }
 
     fn delete(
         &self,
         input: WorkdirDeleteInput,
         operation_id: String,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ToolOutput, LifecycleError> {
         let workdir_id = validate_identity(
             &input.working_directory_id,
             DELETE_TOOL,
@@ -917,15 +976,18 @@ impl WorkspaceHttpWorkdirBackend {
         let workdir_path = encode_path_segment(workdir_id);
         let reason = validate_delete_reason(&input.reason)?;
         self.authorize_workdir("workdir.delete", workdir_id)?;
-        let response = self.execute_json::<WorkdirRemovalResponse>(WorkspaceRequest::json(
-            WorkspaceRequestMethod::Delete,
-            format!("/api/w/{workspace_id}/working-directories/{workdir_path}"),
-            serde_json::to_string(&WorkdirRemovalRequest {
-                operation_id,
-                reason: reason.to_string(),
-            })
-            .map_err(decode_error)?,
-        ))?;
+        let response = self.execute_json::<WorkdirRemovalResponse>(
+            WorkspaceRequest::json(
+                WorkspaceRequestMethod::Delete,
+                format!("/api/w/{workspace_id}/working-directories/{workdir_path}"),
+                serde_json::to_string(&WorkdirRemovalRequest {
+                    operation_id,
+                    reason: reason.to_string(),
+                })
+                .map_err(decode_error)?,
+            ),
+            Some(WorkdirManagementOperation::Cleanup),
+        )?;
         workdir_output(
             format!(
                 "Workdir {workdir_id} removal disposition: {:?}. {}{}",
@@ -938,14 +1000,14 @@ impl WorkspaceHttpWorkdirBackend {
                 }
             ),
             &response,
-        )
+        ).map_err(Into::into)
     }
 
     async fn detach_managed(
         &self,
         alias: &str,
         expected_connection_id: Option<&str>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<ToolOutput, LifecycleError> {
         let _mutation_guard = self.attachment_mutation_lock.lock().await;
         let alias = validate_identity(alias, DETACH_TOOL, "alias")?;
         // Denial must precede local route exclusion and child cleanup as well as DELETE.
@@ -962,10 +1024,13 @@ impl WorkspaceHttpWorkdirBackend {
                     connection_id: expected.into(),
                 },
             )?;
-            let page: serde_json::Value = self.execute_json(WorkspaceRequest::get(format!(
-                "/api/w/{workspace}/workers/self/workdir-attachments?limit=1&connection_id={}",
-                encode_path_segment(expected)
-            )))?;
+            let page: serde_json::Value = self.execute_json(
+                WorkspaceRequest::get(format!(
+                    "/api/w/{workspace}/workers/self/workdir-attachments?limit=1&connection_id={}",
+                    encode_path_segment(expected)
+                )),
+                None,
+            )?;
             let current = page
                 .get("items")
                 .and_then(serde_json::Value::as_array)
@@ -981,7 +1046,8 @@ impl WorkspaceHttpWorkdirBackend {
                 return Err(ToolError::StructuredConflict {
                     code: "workspace_http_409".into(),
                     message: "attachment lifetime changed before local cleanup".into(),
-                });
+                }
+                .into());
             }
         }
         let alias_key = workdir::WorkdirAttachmentAlias::new(alias)
@@ -989,14 +1055,27 @@ impl WorkspaceHttpWorkdirBackend {
         self.session_router
             .begin_detach(&alias_key)
             .await
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+            .map_err(|error| LifecycleError::route(error, "unchanged", None))?;
         if let Some(before_release) = &self.before_workdir_release
             && let Err(error) = before_release().await
         {
             self.session_router.cancel_detach(&alias_key);
-            return Err(ToolError::ExecutionFailed(format!(
-                "stop Internal SubWorkers before Workdir detach: {error}"
-            )));
+            let mut failure = LifecycleError::route(
+                WorkdirError::Io {
+                    path: Default::default(),
+                    source: error,
+                },
+                "unchanged",
+                None,
+            );
+            let prefix = "Could not stop Internal SubWorkers before Workdir detach. ";
+            if let Some(report) = &mut failure.report {
+                report.summary.insert_str(0, prefix);
+            }
+            if let ToolError::ExecutionFailed(message) = &mut failure.source {
+                message.insert_str(0, prefix);
+            }
+            return Err(failure);
         }
         let result = match self.detach_expected(alias, Some(&authorized_connection_id)) {
             Ok(result) => result,
@@ -1005,25 +1084,21 @@ impl WorkspaceHttpWorkdirBackend {
                 return Err(error);
             }
         };
-        self.session_router
-            .finish_detach(&alias_key)
-            .await
-            .map_err(|error| {
-                ToolError::ExecutionFailed(format!(
-                    "detach Workdir session route after Backend release: {error}"
-                ))
-            })?;
-        Ok(result)
+        match self.session_router.finish_detach(&alias_key).await {
+            Ok(_) => Ok(result),
+            Err(error) => Ok(LifecycleError::route_cleanup(result, error)),
+        }
     }
 
     fn execute_json<T: for<'de> Deserialize<'de>>(
         &self,
         request: WorkspaceRequest,
-    ) -> Result<T, ToolError> {
-        let response = self.client.execute(request).map_err(|error| {
-            ToolError::ExecutionFailed(format!("Workspace Workdir request failed: {error}"))
+        expected: Option<WorkdirManagementOperation>,
+    ) -> Result<T, LifecycleError> {
+        let response = self.client.execute(request).map_err(|_| {
+            ToolError::ExecutionFailed("Workspace Workdir transport failed; outcome unknown; inspect current state and do not resend automatically".into())
         })?;
-        decode_response(response)
+        decode_response(response, expected)
     }
 }
 
@@ -1069,6 +1144,17 @@ impl Tool for WorkspaceHttpWorkdirTool {
         input_json: &str,
         ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
+        self.execute_lifecycle(input_json, ctx)
+            .await
+            .map_err(Into::into)
+    }
+}
+impl WorkspaceHttpWorkdirTool {
+    async fn execute_lifecycle(
+        &self,
+        input_json: &str,
+        ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, LifecycleError> {
         match self.operation {
             WorkdirOperation::List => {
                 let _input = parse_input::<WorkdirListInput>(input_json)?;
@@ -1109,21 +1195,120 @@ fn parse_input<T: for<'de> Deserialize<'de>>(input: &str) -> Result<T, ToolError
 
 fn decode_response<T: for<'de> Deserialize<'de>>(
     response: WorkspaceResponse,
-) -> Result<T, ToolError> {
-    if matches!(response.status, 401 | 403 | 404 | 409) {
-        return Err(ToolError::StructuredConflict {
-            code: format!("workspace_http_{}", response.status),
-            message: "Workspace lifecycle authority rejected the request before execution".into(),
-        });
-    }
+    expected: Option<WorkdirManagementOperation>,
+) -> Result<T, LifecycleError> {
     if !response.is_success() {
-        return Err(ToolError::ExecutionFailed(format!(
-            "Workspace Workdir API returned HTTP {}: {}",
+        let source = ToolError::ExecutionFailed(format!(
+            "Workspace Workdir API returned HTTP {}; execution outcome is not established; inspect current state before retrying",
             response.status,
-            bounded_error_body(&response.body)
-        )));
+        ));
+        if let Some(expected) = expected
+            && let Some(media) = &response.content_type
+            && let Ok(received) = server_api::WorkdirManagementApiError::decode_received(
+                response.status,
+                media,
+                response.body.as_bytes(),
+            )
+            && let Some(cause) = received.cause()
+            && match cause {
+                WorkdirManagementCause::Management(cause) => cause.operation == expected,
+                WorkdirManagementCause::Session(_) | WorkdirManagementCause::Runtime(_) => {
+                    matches!(
+                        expected,
+                        WorkdirManagementOperation::Attach | WorkdirManagementOperation::Detach
+                    )
+                }
+            }
+        {
+            let reason = received.details().map(|cause| cause.reason);
+            let source = lifecycle_http_source(response.status, reason);
+            return Err(LifecycleError::received(
+                source,
+                response.status,
+                *cause,
+                received.related_failures(),
+                received.related_failures_unavailable(),
+            ));
+        }
+        let is_problem = response.content_type.as_deref().is_some_and(|media| {
+            media
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case(error_contract::problem::PROBLEM_CONTENT_TYPE)
+        });
+        if !is_problem {
+            if matches!(response.status, 401 | 403 | 404 | 409) {
+                return Err(lifecycle_http_source(response.status, None).into());
+            }
+        }
+        return Err(source.into());
     }
-    serde_json::from_str(&response.body).map_err(decode_error)
+    serde_json::from_str(&response.body).map_err(|error| decode_error(error).into())
+}
+
+fn lifecycle_http_source(
+    status: u16,
+    reason: Option<workdir::management_failure::WorkdirManagementReason>,
+) -> ToolError {
+    if matches!(status, 401 | 403 | 404 | 409) {
+        let code = if reason == Some(workdir::management_failure::WorkdirManagementReason::Occupied)
+        {
+            "workdir_occupied".into()
+        } else {
+            format!("workspace_http_{status}")
+        };
+        ToolError::StructuredConflict { code, message: "Workspace lifecycle authority rejected the request; inspect current state before deciding recovery".into() }
+    } else {
+        ToolError::ExecutionFailed(format!(
+            "Workspace Workdir API returned HTTP {status}; execution outcome is not established; inspect current state before retrying"
+        ))
+    }
+}
+
+fn project_management_diagnostics(
+    diagnostics: &mut [server_api::WorkingDirectoryManagementDiagnostic],
+    operation: WorkdirManagementOperation,
+) {
+    use error_contract::Tool;
+    use workdir::management_failure::{WorkdirManagementFailure, WorkdirManagementVisibility};
+    for diagnostic in diagnostics {
+        let projected = diagnostic
+            .failure
+            .take()
+            .and_then(|attachment| {
+                attachment
+                    .project_for::<Tool, WorkdirManagementFailure>(&WorkdirManagementVisibility {
+                        can_view_cause: true,
+                    })
+                    .ok()
+            })
+            .filter(|projected| projected.details().operation == operation);
+        if let Some(projected) = projected {
+            diagnostic.code = projected.details().reason.as_str().into();
+            diagnostic.message = projected.explanation().into();
+            diagnostic.failure =
+                protocol::startup_failure::StartupFailureAttachment::from_projected(&projected)
+                    .ok();
+        } else {
+            diagnostic.code = "workdir_diagnostic_unavailable".into();
+            diagnostic.message = "Workdir management diagnostic cause is unavailable; this observation does not change the operation result".into();
+        }
+    }
+}
+fn management_summary(
+    mut summary: String,
+    diagnostics: &[server_api::WorkingDirectoryManagementDiagnostic],
+) -> String {
+    for diagnostic in diagnostics.iter().take(16) {
+        summary.push_str("\n");
+        summary.push_str(&diagnostic.message);
+    }
+    if diagnostics.len() > 16 {
+        summary.push_str("\nAdditional diagnostics are retained in the result content.");
+    }
+    summary
 }
 
 fn decode_error(error: serde_json::Error) -> ToolError {
@@ -1257,17 +1442,6 @@ fn encode_path_segment(value: &str) -> String {
     encoded
 }
 
-fn bounded_error_body(body: &str) -> String {
-    const MAX_CHARS: usize = 4096;
-    let mut chars = body.chars();
-    let bounded: String = chars.by_ref().take(MAX_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{bounded}…")
-    } else {
-        bounded
-    }
-}
-
 fn list_schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -1387,6 +1561,9 @@ struct WorkdirDeleteInput {
 
 #[cfg(test)]
 mod tests {
+    mod audit_tool_tests;
+    mod http_failure_tests;
+
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1453,7 +1630,7 @@ mod tests {
                 self.bound_authorizations.lock().unwrap().push(auth);
                 return Ok(WorkspaceResponse {
                     content_type: None,
-status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 200 },
+                    status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 200 },
                     body: json!({"scope":{"kind":"workdir_attachment", "workspace_id":"workspace/test", "connection_id":connection_id}}).to_string(),
                 });
             }
@@ -1493,7 +1670,7 @@ status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 
         message: &str,
     ) -> WorkspaceResponse {
         WorkspaceResponse {
-            content_type: None,
+            content_type: Some("application/json".into()),
             status,
             body: serde_json::to_string(&workdir::http::WorkdirTransportError {
                 failure_reason: None,
@@ -1716,7 +1893,7 @@ status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 
 
         let backend = WorkspaceHttpWorkdirBackend::new(Arc::new(MissingWorkspaceClient));
         let error = backend.list().unwrap_err();
-        assert!(matches!(error, ToolError::ExecutionFailed(_)));
+        assert!(matches!(error.source, ToolError::ExecutionFailed(_)));
         assert!(error.to_string().contains("Workspace identity"));
     }
 
@@ -1901,7 +2078,7 @@ status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 
             })
             .unwrap_err();
         assert!(
-            matches!(error, ToolError::StructuredConflict { code, message } if code == "workdir_occupied" && message == "Workdir is occupied by another Worker")
+            matches!(error.source, ToolError::StructuredConflict { code, message } if code == "workdir_occupied" && message == "Workdir is occupied by another Worker")
         );
         assert_eq!(client.requests().len(), 1);
     }
@@ -2070,24 +2247,27 @@ status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) { 403 } else { 
         ] {
             let mut failure = failure.clone();
             failure["operation_outcome"] = outcome;
-            responses.push(WorkspaceResponse { content_type: None,
-status, body: json!({
+            responses.push(WorkspaceResponse { content_type: Some("application/json".into()), status, body: json!({
                 "code":code, "message":"safe provider classification", "audit_failures":[failure]
             }).to_string() });
         }
         let client = Arc::new(RecordingWorkspaceClient::new(responses));
         let session = WorkspaceAttachedWorkdirSession::handle(client.clone(), "checkout");
-        let handle = session
-            .start_command(CommandRequest {
-                command: "true".into(),
-                timeout_secs: 1,
-                transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
-                cwd: workdir::WorkdirPath::root(),
-                tool_call_id: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(handle.0, "retained-command");
+        let (handle, notices) = workdir::audit::capture(session.start_command(CommandRequest {
+            command: "true".into(),
+            timeout_secs: 1,
+            transport_byte_budget: workdir::MAX_COMMAND_TRANSPORT_BYTES,
+            cwd: workdir::WorkdirPath::root(),
+            tool_call_id: None,
+        }))
+        .await;
+        assert_eq!(handle.unwrap().0, "retained-command");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].operation_id, "op-safe-id");
+        assert_eq!(
+            notices[0].operation_outcome,
+            workdir::http::WorkdirAuditOperationOutcome::Succeeded
+        );
         let request = workdir::CheckoutRequest {
             target: workdir::WorkdirPath::new("file.txt").unwrap(),
             validator: vec![1],
@@ -2096,18 +2276,30 @@ status, body: json!({
                 expected_hash: [0; 32],
             },
         };
-        assert!(matches!(
-            session.checkout_execute(request.clone()).await,
-            Err(WorkdirError::Denied(_))
-        ));
-        assert!(matches!(
-            session.checkout_execute(request.clone()).await,
-            Err(WorkdirError::OutcomeUnknown(_))
-        ));
-        assert!(matches!(
-            session.checkout_execute(request).await,
-            Err(WorkdirError::NotDispatched)
-        ));
+        for expected_outcome in [
+            workdir::http::WorkdirAuditOperationOutcome::Failed {
+                code: workdir::http::WorkdirTransportErrorCode::Denied,
+            },
+            workdir::http::WorkdirAuditOperationOutcome::Unknown,
+            workdir::http::WorkdirAuditOperationOutcome::NotDispatched,
+        ] {
+            let (result, notices) =
+                workdir::audit::capture(session.checkout_execute(request.clone())).await;
+            match expected_outcome {
+                workdir::http::WorkdirAuditOperationOutcome::Failed { .. } => {
+                    assert!(matches!(result, Err(WorkdirError::Denied(_))))
+                }
+                workdir::http::WorkdirAuditOperationOutcome::Unknown => {
+                    assert!(matches!(result, Err(WorkdirError::OutcomeUnknown(_))))
+                }
+                workdir::http::WorkdirAuditOperationOutcome::NotDispatched => {
+                    assert!(matches!(result, Err(WorkdirError::NotDispatched)))
+                }
+                workdir::http::WorkdirAuditOperationOutcome::Succeeded => unreachable!(),
+            }
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].operation_outcome, expected_outcome);
+        }
         assert_eq!(
             client.requests().len(),
             4,
@@ -2190,7 +2382,14 @@ status, body: json!({
             .await
             .unwrap_err();
         let message = error.to_string();
-        assert!(matches!(error, WorkdirError::Transport(_)));
+        assert!(matches!(
+            error.classification_source(),
+            WorkdirError::Transport(_)
+        ));
+        assert_eq!(
+            error.failure_reason(),
+            Some(workdir::WorkdirFailureReason::HttpResponseInvalid)
+        );
         assert!(!message.contains("secret token"));
         assert!(!message.contains("/host/private/path"));
         assert!(message.contains("HTTP 502"));
@@ -2292,7 +2491,7 @@ status, body: json!({
                 "call-invalid".to_string(),
             )
             .unwrap_err();
-        assert!(matches!(error, ToolError::InvalidArgument(_)));
+        assert!(matches!(error.source, ToolError::InvalidArgument(_)));
         assert!(client.requests().is_empty());
         assert!(parse_input::<WorkdirListInput>(r#"{"path":"/tmp"}"#).is_err());
     }

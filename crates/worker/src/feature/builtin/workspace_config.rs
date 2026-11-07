@@ -29,6 +29,7 @@ mod content;
 mod contract;
 #[cfg(test)]
 mod contract_tests;
+pub mod failure;
 pub mod wip;
 
 use std::sync::Arc;
@@ -90,32 +91,43 @@ pub struct ConfigAttachment {
 
 /// Safe diagnostics only. Raw Backend/transport errors may contain host paths or
 /// secrets and must be classified by the adapter, never copied into these results.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ConfigAttachError {
     InvalidRequest,
     Denied,
     Unavailable,
     OutcomeUnknown,
+    Backend(Box<failure::ConfigFailure>),
 }
 
 impl ConfigAttachError {
-    fn message(self) -> &'static str {
+    fn message(&self) -> String {
         match self {
-            Self::InvalidRequest => "Invalid Workspace config attachment request",
-            Self::Denied => "Workspace config access denied; explicit access is not downgraded",
-            Self::Unavailable => "Workspace config attachment unavailable before effects",
-            Self::OutcomeUnknown => {
-                "Workspace config attachment outcome unknown; inspect current attachments before retrying"
-            }
+            Self::InvalidRequest => "Invalid Workspace config attachment request".into(),
+            Self::Denied => "Workspace config access denied; explicit access is not downgraded".into(),
+            Self::Unavailable => "Workspace config attachment unavailable before effects".into(),
+            Self::OutcomeUnknown => "Workspace config attachment outcome unknown; inspect current attachments before retrying".into(),
+            Self::Backend(source) => source.details().explanation(),
         }
     }
 
+    fn outcome_unknown(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown)
+            || matches!(self, Self::Backend(source) if matches!(source.source_error(),
+                crate::wip::WipOperationError::OutcomeUnknown(_) |
+                crate::wip::WipOperationError::OutcomeUnknownWithFailure { .. }))
+    }
+
     fn invocation_error(self) -> FeatureInvocationHandlerError {
-        if self == Self::OutcomeUnknown {
+        let mut error = if self.outcome_unknown() {
             FeatureInvocationHandlerError::outcome_unknown(self.message())
         } else {
             FeatureInvocationHandlerError::failed(self.message())
+        };
+        if let Self::Backend(source) = self {
+            error.failure = source.invocation_attachment();
         }
+        error
     }
 }
 
@@ -324,6 +336,24 @@ impl FeatureInvocationHandler for WorkspaceConfigFeature {
             .map_err(ConfigAttachError::invocation_error)
     }
 
+    fn project_failure(
+        &self,
+        failure: &protocol::startup_failure::StartupFailureAttachment,
+    ) -> Option<(String, protocol::startup_failure::StartupFailureAttachment)> {
+        // The registry already validated this invocation against current access.
+        let projected = failure
+            .project_for::<error_contract::Tool, failure::ConfigFailureDetails>(
+                &failure::ConfigFailureVisibility {
+                    can_view_cause: true,
+                },
+            )
+            .ok()?;
+        let message = projected.explanation().to_owned();
+        let attachment =
+            protocol::startup_failure::StartupFailureAttachment::from_projected(&projected).ok()?;
+        Some((message, attachment))
+    }
+
     async fn invoke(
         &self,
         context: FeatureInvocationContext,
@@ -350,6 +380,7 @@ impl FeatureInvocationHandler for WorkspaceConfigFeature {
                 "{action}: {ATTACHMENT_ALIAS} (Workspace configuration; {}).",
                 result.access.as_str()
             ),
+            failure: None,
             context: Some(format!(
                 "Workspace configuration is available as logical attachment `{ATTACHMENT_ALIAS}` at WIP `{CONTENT_ROOT}` with {} access. Use a shallow Tree only when paths are unknown. Inspect a needed Object to learn its Interface references, then inspect only unknown Interface contracts via their returned paths. Reuse known exact references/contracts and Invoke directly; do not repeat Inspect before each operation. Invoke handles observation freshness. Use published read/list Operations for configuration content, not Inspect. This attachment grants no OS paths or command execution. Backend validation, concurrency checks and activation rules apply; saving does not imply running Workers adopted new configuration.",
                 result.access.as_str()

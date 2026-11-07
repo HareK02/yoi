@@ -7,14 +7,18 @@ mod backend_job_host_effects;
 pub mod companion;
 pub mod config;
 pub mod config_adoption;
+mod config_publication;
 pub mod config_source;
+pub mod configuration_failure;
 mod configuration_migration;
 #[cfg(test)]
 mod configuration_transfer_tests;
 #[cfg(test)]
 mod content_history_tests;
 pub mod db_executor;
+pub mod external_workdir_connection_observations;
 pub mod feature_storage;
+pub mod grant_cleanup_operation;
 pub mod hosts;
 pub mod memory_backend;
 pub mod memory_staging;
@@ -35,6 +39,8 @@ pub mod prompt_settings;
 pub mod records;
 pub mod repositories;
 pub mod repository_access;
+pub mod repository_access_failure;
+pub mod repository_failure;
 pub mod repository_source;
 pub mod resource_broker;
 #[cfg(test)]
@@ -52,7 +58,9 @@ pub mod subjektiv;
 #[cfg(test)]
 mod ticket_browse_performance_tests;
 mod ticket_item_checker;
+pub mod workdir_cleanup_failure;
 pub mod workdir_create_operations;
+mod workdir_inventory_failure;
 mod workdir_removal;
 mod worker_create_failure_store;
 mod worker_projection;
@@ -111,8 +119,12 @@ pub enum Error {
     InvalidInput(String),
     #[error("invalid project record id `{0}`")]
     InvalidRecordId(String),
+    #[error("{0}")]
+    Configuration(#[from] configuration_failure::ConfigurationFailure),
     #[error("workspace backend config error: {0}")]
     Config(String),
+    #[error("Workspace prompt projection is unavailable")]
+    PromptProjection(#[source] std::sync::Arc<Error>),
     #[error("record `{0}` is missing frontmatter")]
     MissingFrontmatter(String),
     #[error("unknown local host `{0}`")]
@@ -145,6 +157,44 @@ pub enum Error {
         code: String,
         message: String,
     },
+    #[error("Runtime Workdir attachment synchronization could not be confirmed")]
+    WorkdirAttachmentSyncFailed {
+        runtime_id: String,
+        observation: Box<hosts::RuntimeOperationResponse>,
+    },
+    #[error("External Workdir connection stage source")]
+    ExternalWorkdirConnectionSource(#[source] std::sync::Arc<Error>),
+    #[error("External Workdir provider frame encoding failed")]
+    ExternalWorkdirFrameEncoding(#[source] serde_json::Error),
+    #[error("External Workdir provider frame decoding failed")]
+    ExternalWorkdirFrameDecoding(#[source] serde_json::Error),
+    #[error("External Workdir provider transport failed")]
+    ExternalWorkdirTransport(#[source] axum::Error),
+    #[error("External Workdir provider transport timed out")]
+    ExternalWorkdirTransportTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("External Workdir connection ended ({reason})")]
+    ExternalWorkdirConnectionClosed {
+        reason: workdir::management_failure::WorkdirManagementReason,
+    },
+    #[error("External Workdir observation failed")]
+    ExternalWorkdirObservationFailed {
+        operation: workdir::management_failure::WorkdirManagementOperation,
+        reason: workdir::management_failure::WorkdirManagementReason,
+        #[source]
+        source: Box<Error>,
+    },
+    #[error("External Workdir cleanup has additional failures; the primary result is unchanged")]
+    ExternalWorkdirCleanupFailed {
+        #[source]
+        primary: Box<Error>,
+        supplementary: Vec<Error>,
+    },
+    #[error("Workdir session closing could not be confirmed")]
+    WorkdirSessionCloseFailed {
+        runtime_id: String,
+        #[source]
+        failure: workdir_cleanup_failure::WorkdirCleanupFailure,
+    },
     #[error("runtime `{runtime_id}` operation failed (workdir_session_open_failed): {}", transport.message)]
     WorkdirSessionOpenFailed {
         runtime_id: String,
@@ -155,6 +205,10 @@ pub enum Error {
         runtime_id: String,
         capability: String,
     },
+    #[error("{0}")]
+    RepositoryLookup(#[from] repository_failure::RepositoryFailure),
+    #[error("{0}")]
+    RepositoryAccess(#[from] repository_access_failure::RepositoryAccessFailure),
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
     #[error("subjektiv subject `{0}` was not found in this Workspace")]
@@ -198,6 +252,8 @@ pub enum Error {
     SubjectBodySuperseded,
     #[error("Worker lifecycle observation is stale; this request was not accepted")]
     WorkerLifecycleObservationStale,
+    #[error("Repository key {repository_key} already exists with different registration intent")]
+    RepositoryRegistrationConflict { repository_key: String },
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

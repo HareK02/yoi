@@ -453,7 +453,10 @@ impl Provider {
                 crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
                     self.backend.client.clone(),
                 )
-                .current()?
+                .current()
+                .map_err(
+                    crate::feature::builtin::workspace_config::failure::ConfigFailure::into_source,
+                )?
                 && Some(current.connection_id.as_str()) == id
                 && Some(current.working_directory_id.as_str()) == workdir
                 && Some(current.alias.as_str()) == alias
@@ -759,11 +762,11 @@ impl WipOperationHandler for CollectionHandler {
                     operation: WorkdirOperation::Create,
                 };
                 let output = tool
-                    .execute(&input.to_string(), context.execution)
+                    .execute_lifecycle(&input.to_string(), context.execution)
                     .await
-                    .map_err(map_tool_error)?;
+                    .map_err(map_lifecycle_error)?;
                 let raw = output_json(output)?;
-                json!({"item": self.provider.projected(Domain::Workdir, &raw["item"])?, "runtime_id":raw["runtime_id"]})
+                json!({"item": self.provider.projected(Domain::Workdir, &raw["item"])?, "runtime_id":raw["runtime_id"], "diagnostics":raw["diagnostics"]})
             }
             _ => {
                 return Err(failure(
@@ -906,9 +909,9 @@ impl WipOperationHandler for ItemHandler {
                     backend: self.provider.backend.clone(),
                     operation: op,
                 }
-                .execute(&input.to_string(), context.execution)
+                .execute_lifecycle(&input.to_string(), context.execution)
                 .await
-                .map_err(map_tool_error)?;
+                .map_err(map_lifecycle_error)?;
                 let raw = output_json(output)?;
                 if operation == "attach" {
                     let mut result = raw;
@@ -941,7 +944,7 @@ impl WipOperationHandler for ItemHandler {
                         .backend
                         .detach_managed(alias, Some(&self.id))
                         .await
-                        .map_err(map_tool_error)?,
+                        .map_err(map_lifecycle_error)?,
                 )?
             }
             _ => {
@@ -983,6 +986,18 @@ fn failure(code: ProtocolErrorCode, message: impl Into<String>) -> WipOperationE
         code,
         message: message.into(),
     })
+}
+fn map_lifecycle_error(error: super::LifecycleError) -> WipOperationError {
+    let original = map_tool_error(error.source);
+    match (original, error.report) {
+        (WipOperationError::Protocol(error), Some(report)) => {
+            WipOperationError::protocol_with_failure(error, report)
+        }
+        (WipOperationError::OutcomeUnknown(message), Some(report)) => {
+            WipOperationError::outcome_unknown_with_failure(message, report)
+        }
+        (original, _) => original,
+    }
 }
 fn map_tool_error(error: ToolError) -> WipOperationError {
     match error {
@@ -1219,6 +1234,7 @@ pub(crate) mod tests {
         pub(crate) authorization_denied: bool,
         pub(crate) denied: bool,
         pub(crate) config_current: Option<Json>,
+        create_failure: Option<WorkspaceResponse>,
         generation: usize,
     }
     impl Default for CatalogClient {
@@ -1236,6 +1252,7 @@ pub(crate) mod tests {
                     authorization_denied: false,
                     denied: false,
                     config_current: None,
+                    create_failure: None,
                     generation: 0,
                 }),
             }
@@ -1282,7 +1299,7 @@ pub(crate) mod tests {
                 state.bound_authorizations.push(auth);
                 return Ok(WorkspaceResponse {
                     content_type: None,
-status: if state.authorization_denied { 403 } else if connection.is_none() { 409 } else { 200 },
+                    status: if state.authorization_denied { 403 } else if connection.is_none() { 409 } else { 200 },
                     body: json!({"scope":{"kind":"workdir_attachment", "workspace_id":"test-workspace", "connection_id":connection.unwrap_or_default()}}).to_string(),
                 });
             }
@@ -1297,6 +1314,12 @@ status: if state.authorization_denied { 403 } else if connection.is_none() { 409
                 });
             }
             state.requests.push(request.clone());
+            if request.method == WorkspaceRequestMethod::Post
+                && request.path.ends_with("/working-directories")
+                && let Some(response) = state.create_failure.take()
+            {
+                return Ok(response);
+            }
             if state.denied {
                 return Ok(WorkspaceResponse {
                     content_type: None,
@@ -1676,6 +1699,97 @@ status: if state.authorization_denied { 403 } else if connection.is_none() { 409
     }
 
     #[tokio::test]
+    async fn catalog_create_keeps_unknown_and_typed_cause_without_retry_or_provider_prose() {
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
+            WorkdirManagementVisibility,
+        };
+        let cause = WorkdirManagementFailure {
+            operation: WorkdirManagementOperation::Create,
+            reason: WorkdirManagementReason::NotFound,
+        };
+        let projected = error_contract::project_failure::<error_contract::Browser, _>(
+            &error_contract::FailureFacts::new(cause).unwrap(),
+            &WorkdirManagementVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+        let mut body =
+            serde_json::to_value(server_api::WorkdirManagementApiError::projected(projected))
+                .unwrap();
+        body["detail"] = json!("SECRET /private/path safe to retry");
+        body["yoi_failure"]["explanation"] = body["detail"].clone();
+        let client = Arc::new(CatalogClient::default());
+        client.state.lock().unwrap().create_failure = Some(WorkspaceResponse {
+            status: 400,
+            content_type: Some(error_contract::problem::PROBLEM_CONTENT_TYPE.into()),
+            body: body.to_string(),
+        });
+        let handler = CollectionHandler {
+            provider: provider(client.clone(), true, true, None),
+            domain: Domain::Workdir,
+        };
+        let result = handler
+            .call(
+                "create",
+                &arguments(json!({"repository_key":"registered-key"})),
+                context(),
+            )
+            .await;
+        let Err(WipOperationError::OutcomeUnknownWithFailure { message, failure }) = result else {
+            panic!(
+                "typed cause must not turn native Unknown into a protocol rejection or typed return"
+            )
+        };
+        assert!(message.contains("do not automatically retry"));
+        assert!(failure.summary.contains("not found"));
+        assert!(failure.summary.contains("do not resend automatically"));
+        let content = failure.content.unwrap();
+        let report: Json = serde_json::from_str(&content).unwrap();
+        assert_eq!(report["failure"]["reason"], "working_directory_not_found");
+        assert_eq!(report["result"]["http_status"], 400);
+        assert_eq!(report["result"]["mutation"], "not_reported");
+        assert!(!content.contains("SECRET"));
+        assert!(!content.contains("/private/path"));
+        assert_eq!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.method == WorkspaceRequestMethod::Post
+                    && request.path.ends_with("/working-directories"))
+                .count(),
+            1
+        );
+        client.state.lock().unwrap().authorization_denied = true;
+        assert!(
+            handler
+                .call(
+                    "create",
+                    &arguments(json!({"repository_key":"registered-key"})),
+                    context()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.method == WorkspaceRequestMethod::Post
+                    && request.path.ends_with("/working-directories"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn catalog_fresh_workspace_find_key_create_attach_read_detach_preserves_workdir() {
         let client = Arc::new(CatalogClient::default());
         let p = provider(client.clone(), true, true, None);
@@ -2052,7 +2166,7 @@ mod lifetime_tests {
             .detach_managed("checkout", Some("old-lifetime"))
             .await
             .unwrap_err();
-        assert!(matches!(error, ToolError::StructuredConflict { .. }));
+        assert!(matches!(error.source, ToolError::StructuredConflict { .. }));
         assert_eq!(hooks.load(Ordering::SeqCst), 0);
         assert!(backend.session_router.session(&alias).is_some());
         assert_eq!(

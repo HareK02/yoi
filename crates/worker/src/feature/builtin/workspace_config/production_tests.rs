@@ -21,6 +21,12 @@ use std::sync::{Arc, Mutex};
 use tracing::instrument::WithSubscriber;
 use wip_protocol::ProtocolErrorCode;
 
+#[derive(Clone, Copy, Debug)]
+enum AttachFault {
+    ReplyLost,
+    AliasMismatch,
+}
+
 #[derive(Debug)]
 struct State {
     operation_denied: bool,
@@ -43,6 +49,7 @@ struct State {
     fail_commit: bool,
     fail_current: bool,
     lose_commit_reply: bool,
+    attach_fault: Option<AttachFault>,
     race_commit: bool,
     mismatched_commit_reply: Option<&'static str>,
 }
@@ -85,6 +92,7 @@ impl Router {
                 fail_commit: false,
                 fail_current: false,
                 lose_commit_reply: false,
+                attach_fault: None,
                 race_commit: false,
                 mismatched_commit_reply: None,
             })),
@@ -270,6 +278,19 @@ impl WorkspaceClient for Router {
                 already_attached,
             };
             state.active = Some(attachment.clone());
+            match state.attach_fault.take() {
+                Some(AttachFault::ReplyLost) => {
+                    return Err(WorkspaceClientError::Request(
+                        "secret-token /private/host/config reply lost after attach".into(),
+                    ));
+                }
+                Some(AttachFault::AliasMismatch) => {
+                    let mut invalid = attachment;
+                    invalid.alias = "another-alias".into();
+                    return Ok(response(&invalid));
+                }
+                None => {}
+            }
             return Ok(response(&attachment));
         }
         let input: Json = serde_json::from_str(request.body.as_ref().unwrap()).unwrap();
@@ -1200,7 +1221,7 @@ async fn workspace_config_backend_validators_reject_path_and_connection_transpla
         )
         .await;
     assert!(
-        matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
+        matches!(result.map_err(failure::ConfigFailure::into_source), Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
     );
     let result: WorkspaceConfigReadResponse = backend
         .post(
@@ -1224,7 +1245,7 @@ async fn workspace_config_backend_validators_reject_path_and_connection_transpla
             )
             .await;
         assert!(
-            matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
+            matches!(result.map_err(failure::ConfigFailure::into_source), Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::ValidatorMismatch)
         );
     }
     // Fresh path/connection observation restores native common mutation access,
@@ -1317,8 +1338,34 @@ async fn production_postcommit_transport_loss_retains_cause_and_unknown_without_
     )
     .with_subscriber(capture.dispatch())
     .await
-    .unwrap_err()
-    .to_string();
+    .unwrap_err();
+    let agen::tool::ToolError::ExecutionFailure(output) = &error else {
+        panic!("postcommit observation cause lost")
+    };
+    let report: Json = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+    let error_contract::DecodeFailure::Known(cause) =
+        error_contract::decode_failure::<failure::ConfigFailureDetails>(
+            &serde_json::to_vec(&report["failure"]).unwrap(),
+            error_contract::Budget::new(65536, 65536),
+        )
+    else {
+        panic!("postcommit observation cause is not decodable")
+    };
+    assert_eq!(
+        cause.facts().cause().operation,
+        failure::ConfigFailureOperation::Observe
+    );
+    assert_eq!(
+        cause.facts().cause().stage,
+        failure::ConfigFailureStage::Reconcile
+    );
+    assert_eq!(
+        cause.facts().cause().reason,
+        failure::ConfigFailureReason::Communication
+    );
+    assert_eq!(report["result"]["kind"], "outcome_unknown");
+    assert!(output.summary.contains("do not resend"));
+    let error = error.to_string();
     assert!(error.contains("unknown"));
     let text = capture.text();
     assert!(
@@ -1353,6 +1400,170 @@ async fn production_postcommit_transport_loss_retains_cause_and_unknown_without_
     );
 }
 
+#[tokio::test]
+async fn native_config_commit_failure_retains_cause_and_settlement_in_reopened_model_history() {
+    use failure::{ConfigFailureDetails, ConfigFailureOperation, ConfigFailureReason};
+    for unknown in [false, true] {
+        let client = Router::new();
+        let (feature, runtime) = runtime(client.clone());
+        feature.attach("native-failure", None).await.unwrap();
+        let path = "/workspace-config/main.dcdl";
+        observe_interface(&runtime, path, true).await;
+        {
+            let mut state = client.state.lock().unwrap();
+            state.lose_commit_reply = unknown;
+            state.fail_commit = !unknown;
+        }
+        let error = call(&runtime, path, "write", json!({"content":"native-saved"}))
+            .await
+            .unwrap_err();
+        let result = agen::tool::ToolResult::from_error("config-native-failure", error);
+        assert!(result.is_error);
+        let history = crate::test_support::reopen_result(result);
+        let agen::Item::ToolResult {
+            summary,
+            content: Some(content),
+            disposition,
+            is_error,
+            ..
+        } = &history
+        else {
+            panic!("config Invoke lost its structured cause on Session replay")
+        };
+        assert!(*is_error);
+        assert_eq!(*disposition, agen::ToolResultDisposition::Error);
+        assert!(!content.contains("secret-token") && !content.contains("/private/host"));
+        let report: Json = serde_json::from_str(content).unwrap();
+        let error_contract::DecodeFailure::Known(cause) =
+            error_contract::decode_failure::<ConfigFailureDetails>(
+                &serde_json::to_vec(&report["failure"]).unwrap(),
+                error_contract::Budget::new(65536, 65536),
+            )
+        else {
+            panic!("config cause missing")
+        };
+        assert_eq!(
+            cause.facts().cause().operation,
+            ConfigFailureOperation::Commit
+        );
+        assert_eq!(
+            cause.facts().cause().reason,
+            if unknown {
+                ConfigFailureReason::Communication
+            } else {
+                ConfigFailureReason::BackendRejected
+            }
+        );
+        assert_eq!(
+            report["result"]["kind"],
+            if unknown {
+                "outcome_unknown"
+            } else {
+                "protocol_failure"
+            }
+        );
+        assert_eq!(
+            runtime.audit().last().unwrap().outcome,
+            if unknown {
+                crate::wip::WipAuditOutcome::OutcomeUnknown
+            } else {
+                crate::wip::WipAuditOutcome::Rejected
+            }
+        );
+        if unknown {
+            assert!(summary.contains("outcome unknown") && summary.contains("do not resend"));
+            let mut request_history = vec![history];
+            assert_eq!(agen::prune::project(&mut request_history, &[0]), 1);
+            assert!(
+                matches!(&request_history[0], agen::Item::ToolResult { summary, content: None, .. }
+                if summary.contains("outcome unknown") && summary.contains("do not resend"))
+            );
+            observe_interface(&runtime, path, true).await;
+            let read = call(&runtime, path, "read", json!({})).await.unwrap();
+            assert!(read.content.unwrap().contains("native-saved"));
+        }
+        let state = client.state.lock().unwrap();
+        assert_eq!(state.commits.len(), 1, "no automatic resend");
+        assert_eq!(state.applied_commits, usize::from(unknown));
+        assert_eq!(
+            state.entries["main.dcdl"].1,
+            if unknown {
+                "native-saved"
+            } else {
+                "model = old"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn typed_lost_commit_reply_keeps_unknown_and_reads_applied_state_without_resending() {
+    use failure::{
+        ConfigFailureOperation as Op, ConfigFailureReason as Cause, ConfigFailureStage as Stage,
+    };
+    let client = Router::new();
+    let (feature, _) = runtime(client.clone());
+    let attachment = feature.attach("typed-loss", None).await.unwrap();
+    let backend = backend::WorkspaceConfigBackend::new(client.clone());
+    let request = {
+        let mut state = client.state.lock().unwrap();
+        state.lose_commit_reply = true;
+        json!({
+            "connection_id": attachment.connection_id,
+            "validator": state.validator(""),
+            "request": {
+                "base_digest": state.tree_digest(), "entrypoints": state.entrypoints,
+                "changes": [{"kind":"update", "path":"main.dcdl", "expected_digest":digest(&state.entries["main.dcdl"].1), "content":"saved-after-reply-loss"}]
+            }
+        })
+    };
+    let error = backend
+        .post::<WorkspaceConfigCommitResponse, _>("/commit", &request, true)
+        .await
+        .unwrap_err();
+    assert_eq!(error.details().operation, Op::Commit);
+    assert_eq!(error.details().stage, Stage::Request);
+    assert_eq!(error.details().reason, Cause::Communication);
+    failure::tests::assert_projection(*error.details());
+    assert!(matches!(
+        error.source_error(),
+        WipOperationError::OutcomeUnknown(_)
+    ));
+    assert!(matches!(
+        error.into_source(),
+        WipOperationError::OutcomeUnknown(_)
+    ));
+    let read_request = {
+        let state = client.state.lock().unwrap();
+        assert_eq!(state.commits.len(), 1);
+        assert_eq!(state.applied_commits, 1);
+        json!({"connection_id":attachment.connection_id, "path":"main.dcdl", "validator":state.validator("main.dcdl")})
+    };
+    let read: WorkspaceConfigReadResponse =
+        backend.post("/read", &read_request, false).await.unwrap();
+    assert_eq!(read.content, "saved-after-reply-loss");
+    {
+        let state = client.state.lock().unwrap();
+        assert_eq!(state.applied_commits, 1);
+        assert_eq!(state.commits.len(), 1);
+    }
+    // The old successful read/attachment does not grant the next read.
+    client.state.lock().unwrap().operation_denied = true;
+    let before = client.state.lock().unwrap().requests.len();
+    let error = backend
+        .post::<WorkspaceConfigReadResponse, _>("/read", &read_request, false)
+        .await
+        .unwrap_err();
+    assert_eq!(error.details().reason, Cause::AuthorizationDenied);
+    failure::tests::assert_projection(*error.details());
+    assert!(
+        matches!(error.into_source(), WipOperationError::Protocol(error) if error.code == ProtocolErrorCode::PermissionDenied)
+    );
+    let state = client.state.lock().unwrap();
+    assert_eq!(state.requests.len(), before);
+    assert_eq!(state.applied_commits, 1);
+}
+
 #[path = "authorization_tests.rs"]
 mod authorization_tests;
 
@@ -1372,7 +1583,7 @@ async fn denied_config_operations_have_no_provider_access_or_attachment_effects(
         };
         assert!(
             matches!(
-                result,
+                result.map_err(failure::ConfigFailure::into_source),
                 Err(WipOperationError::Protocol(wip_protocol::ProtocolError {
                     code: ProtocolErrorCode::PermissionDenied,
                     ..
@@ -1433,12 +1644,19 @@ async fn config_wip_read_and_attach_replay_recheck_current_operation_authority()
             .await
             .is_err()
     );
+    let error = feature
+        .attach("initial", Some(ConfigAccess::ReadOnly))
+        .await
+        .unwrap_err();
+    let ConfigAttachError::Backend(source) = error else {
+        panic!("denial lost typed cause")
+    };
     assert_eq!(
-        feature
-            .attach("initial", Some(ConfigAccess::ReadOnly))
-            .await
-            .unwrap_err(),
-        ConfigAttachError::Denied
+        source.details().reason,
+        failure::ConfigFailureReason::AuthorizationDenied
+    );
+    assert!(
+        matches!(source.source_error(), WipOperationError::Protocol(error) if error.code == ProtocolErrorCode::PermissionDenied)
     );
     let state = client.state.lock().unwrap();
     assert_eq!(state.requests.len(), requests);
@@ -1452,7 +1670,7 @@ async fn config_rename_checks_both_paths_before_commit() {
     let backend = backend::WorkspaceConfigBackend::new(client.clone());
     let result = backend.post::<Json, _>("/commit", &json!({"connection_id":"c", "validator":"v", "request":{"base_digest":"d", "entrypoints":["main.dcdl"], "changes":[{"kind":"rename", "from":"main.dcdl", "to":"destination.dcdl", "expected_digest":"d"}]}}), true).await;
     assert!(matches!(
-        result,
+        result.map_err(failure::ConfigFailure::into_source),
         Err(WipOperationError::Protocol(wip_protocol::ProtocolError {
             code: ProtocolErrorCode::PermissionDenied,
             ..
@@ -1474,3 +1692,6 @@ async fn config_rename_checks_both_paths_before_commit() {
         ["", "main.dcdl", "destination.dcdl"]
     );
 }
+
+#[path = "attach_failure_tests.rs"]
+mod attach_failure_tests;

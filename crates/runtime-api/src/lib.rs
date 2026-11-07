@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod control_failure;
+pub mod management_failure;
 pub mod startup;
 
 use std::collections::BTreeMap;
@@ -104,6 +105,8 @@ pub enum WorkerRestoreState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiError {
     #[serde(skip)]
+    management: Option<workdir::management_failure::WorkdirManagementFailure>,
+    #[serde(skip)]
     control: Option<control_failure::RuntimeControlCause>,
     pub error: RuntimeApiErrorDetail,
     #[serde(skip)]
@@ -124,6 +127,18 @@ pub struct RuntimeApiErrorDetail {
 }
 
 impl RuntimeApiError {
+    pub fn with_management(
+        mut self,
+        cause: workdir::management_failure::WorkdirManagementFailure,
+    ) -> Self {
+        self.management = Some(cause);
+        self
+    }
+    pub fn management_cause(
+        &self,
+    ) -> Option<workdir::management_failure::WorkdirManagementFailure> {
+        self.management
+    }
     pub fn with_control(mut self, cause: control_failure::RuntimeControlCause) -> Self {
         self.control = Some(cause);
         self
@@ -140,6 +155,7 @@ impl RuntimeApiError {
             },
             status,
             control: None,
+            management: None,
             create_failure: None,
         }
     }
@@ -166,17 +182,22 @@ impl RuntimeApiError {
 impl api_macros::HttpError for RuntimeApiError {
     fn custom_response(&self) -> Option<api_macros::HttpErrorResponse> {
         startup::http::runtime_error_response(self).or_else(|| {
-            self.control.map(|cause| {
-                control_failure::control_problem(cause).unwrap_or_else(|_| {
-                    api_macros::HttpErrorResponse {
-                        status: 500,
-                        content_type: "application/problem+json",
-                        body: error_contract::problem::STATIC_PROBLEM_FALLBACK
-                            .to_vec()
-                            .into(),
-                    }
-                })
-            })
+            let encoded = if let Some(cause) = self.management {
+                management_failure::management_problem(cause)
+            } else if let Some(cause) = self.control {
+                control_failure::control_problem(cause)
+            } else {
+                return None;
+            };
+            Some(encoded.unwrap_or_else(|_| {
+                api_macros::HttpErrorResponse {
+                    status: 500,
+                    content_type: "application/problem+json",
+                    body: error_contract::problem::STATIC_PROBLEM_FALLBACK
+                        .to_vec()
+                        .into(),
+                }
+            }))
         })
     }
     fn status_code(&self) -> u16 {
@@ -401,6 +422,7 @@ pub struct WorkingDirectoryRequest {
 /// Logical aliases and session capabilities are stored as Workspace attachments; Runtime resolves
 /// host paths and provider sessions. Workdir write scope alone does not grant command execution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogicalWorkdirAttachment {
     /// Stable Worker-local routing key. This is not a Workdir id or display name.
     pub alias: workdir::WorkdirAttachmentAlias,
@@ -428,10 +450,77 @@ pub struct WorkingDirectoryAttachmentClaim {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerWorkdirAttachmentsRequest {
     /// Exact current logical attachment set. Runtime-local bindings are not
     /// inferred from these identities.
     pub logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
+}
+
+/// Exact-request observation, not an acknowledgement or permission to resend.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerWorkdirAttachmentsMatch {
+    Matching,
+    Different,
+    Unconfirmed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsObservation {
+    pub worker_ref: WorkerRef,
+    pub request: WorkerWorkdirAttachmentsRequest,
+    pub result: WorkerWorkdirAttachmentsMatch,
+    /// Present only when the current live and durable attachment state agree.
+    /// This is independent of whether the queried set matches that state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<String>,
+}
+
+/// Exact replay identity and generation fence for an attachment-set operation.
+/// Retry or query with the same full request and Worker identity after uncertainty.
+/// This is distinct from the legacy, unfenced attachment-set replacement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsOperationRequest {
+    pub request_id: String,
+    pub expected_generation: String,
+    pub logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
+}
+
+/// Immutable historical receipt, not a claim about the current attachment set.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsOperationReceipt {
+    pub worker_ref: WorkerRef,
+    pub request: WorkerWorkdirAttachmentsOperationRequest,
+    pub resulting_generation: String,
+}
+
+/// Read-only exact-operation lookup. Absence does not authorize a new operation;
+/// conflict does not acknowledge the queried request; unconfirmed is not absence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerWorkdirAttachmentsOperationOutcome {
+    Absent,
+    Conflict,
+    Receipt {
+        receipt: WorkerWorkdirAttachmentsOperationReceipt,
+    },
+    Unconfirmed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsOperationObservation {
+    pub worker_ref: WorkerRef,
+    pub request: WorkerWorkdirAttachmentsOperationRequest,
+    pub result: WorkerWorkdirAttachmentsOperationOutcome,
+    /// Present only when the current live and durable attachment state agree.
+    /// Independent of the historical lookup outcome and resulting_generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1614,13 +1703,55 @@ pub trait RuntimeApi {
     #[post(
         "/v1/workers/{worker_id}/workdir-attachments",
         status = 200,
-        error_status = 400
+        error_status = 400,
+        client_error_hook = true
     )]
     async fn replace_worker_workdir_attachments(
         &self,
         #[path] worker_id: String,
         #[body] request: WorkerWorkdirAttachmentsRequest,
     ) -> Result<WorkerResponse, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/workdir-attachments/observe",
+        status = 200,
+        error_status = 400,
+        client_error_hook = true
+    )]
+    async fn observe_worker_workdir_attachments(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkdirAttachmentsRequest,
+    ) -> Result<WorkerWorkdirAttachmentsObservation, RuntimeApiError>;
+
+    /// Apply a generation-fenced operation, or replay its immutable receipt.
+    /// This must not be dispatched through the legacy unfenced replacement.
+    #[post(
+        "/v1/workers/{worker_id}/workdir-attachments/operations",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [409],
+        client_error_hook = true
+    )]
+    async fn apply_worker_workdir_attachments_operation(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<WorkerWorkdirAttachmentsOperationReceipt, RuntimeApiError>;
+
+    /// Observe the same full operation and Worker identity without admitting work.
+    #[post(
+        "/v1/workers/{worker_id}/workdir-attachments/operations/observe",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [409],
+        client_error_hook = true
+    )]
+    async fn observe_worker_workdir_attachments_operation(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<WorkerWorkdirAttachmentsOperationObservation, RuntimeApiError>;
 
     #[post(
         "/v1/workers/{worker_id}/completions",
@@ -2045,6 +2176,15 @@ mod tests {
         }
 
         async fn get_worker(&self, worker_id: String) -> Result<WorkerResponse, RuntimeApiError> {
+            if worker_id == "management" {
+                use workdir::management_failure::{
+                    WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
+                };
+                return Err(test_error(500).with_management(WorkdirManagementFailure {
+                    operation: WorkdirManagementOperation::Cleanup,
+                    reason: WorkdirManagementReason::CleanupResourceBusy,
+                }));
+            }
             if worker_id == "startup" {
                 use startup::*;
                 let failure = WorkerCreateFailure::from_cause(
@@ -2267,6 +2407,50 @@ mod tests {
         ) -> Result<WorkerResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn observe_worker_workdir_attachments(
+            &self,
+            worker_id: String,
+            request: WorkerWorkdirAttachmentsRequest,
+        ) -> Result<WorkerWorkdirAttachmentsObservation, RuntimeApiError> {
+            Ok(WorkerWorkdirAttachmentsObservation {
+                worker_ref: WorkerRef {
+                    worker_id: worker_id.parse().unwrap(),
+                },
+                request,
+                result: WorkerWorkdirAttachmentsMatch::Different,
+                current_generation: Some("fixture-generation-current".into()),
+            })
+        }
+        async fn apply_worker_workdir_attachments_operation(
+            &self,
+            worker_id: String,
+            request: WorkerWorkdirAttachmentsOperationRequest,
+        ) -> Result<WorkerWorkdirAttachmentsOperationReceipt, RuntimeApiError> {
+            Ok(WorkerWorkdirAttachmentsOperationReceipt {
+                worker_ref: WorkerRef {
+                    worker_id: worker_id.parse().unwrap(),
+                },
+                request,
+                resulting_generation: "fixture-generation-after".into(),
+            })
+        }
+        async fn observe_worker_workdir_attachments_operation(
+            &self,
+            worker_id: String,
+            request: WorkerWorkdirAttachmentsOperationRequest,
+        ) -> Result<WorkerWorkdirAttachmentsOperationObservation, RuntimeApiError> {
+            let receipt = self
+                .apply_worker_workdir_attachments_operation(worker_id.clone(), request.clone())
+                .await?;
+            Ok(WorkerWorkdirAttachmentsOperationObservation {
+                worker_ref: WorkerRef {
+                    worker_id: worker_id.parse().unwrap(),
+                },
+                request,
+                result: WorkerWorkdirAttachmentsOperationOutcome::Receipt { receipt },
+                current_generation: Some("fixture-generation-current".into()),
+            })
+        }
         async fn complete_worker_arguments(
             &self,
             _worker_id: String,
@@ -2420,6 +2604,26 @@ mod tests {
         assert!(
             matches!(error, client_support::ClientError::Public { status, error } if status.as_u16() == 404 && error.control_cause() == Some(control_failure::RuntimeControlCause::WorkerMissing))
         );
+        let error = client
+            .get_worker("management".to_string())
+            .await
+            .unwrap_err();
+        let client_support::ClientError::Public { status, error } = error else {
+            panic!("expected a normalized public Workdir management failure");
+        };
+        assert_eq!(status.as_u16(), 409);
+        assert_eq!(error.status(), 409);
+        assert_eq!(
+            error.management_cause(),
+            Some(workdir::management_failure::WorkdirManagementFailure {
+                operation: workdir::management_failure::WorkdirManagementOperation::Cleanup,
+                reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy,
+            })
+        );
+        assert!(error.control_cause().is_none());
+        assert!(error.create_failure().is_none());
+        assert!(error.error.startup.is_none());
+        assert_ne!(error.error.message, "test error");
         let error = client.get_worker("startup".to_string()).await.unwrap_err();
         let client_support::ClientError::Public { status, error } = error else {
             panic!("expected a normalized public startup failure");
@@ -2448,7 +2652,96 @@ mod tests {
                 .unwrap()
                 .contains("session.record")
         );
+        let operation = WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "attachment-attempt-1".into(),
+            expected_generation: "fixture-generation-before".into(),
+            logical_workdir_attachments: vec![LogicalWorkdirAttachment {
+                alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                working_directory_id: "remote-workdir".into(),
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            }],
+        };
+        let worker_id = WorkerId::now_v7().to_string();
+        let set_observation = client
+            .observe_worker_workdir_attachments(
+                worker_id.clone(),
+                WorkerWorkdirAttachmentsRequest {
+                    logical_workdir_attachments: operation.logical_workdir_attachments.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            set_observation.current_generation.as_deref(),
+            Some("fixture-generation-current")
+        );
+        assert_eq!(
+            set_observation.result,
+            WorkerWorkdirAttachmentsMatch::Different
+        );
+        let applied = client
+            .apply_worker_workdir_attachments_operation(worker_id.clone(), operation.clone())
+            .await
+            .unwrap();
+        assert_eq!(applied.request, operation);
+        assert_eq!(applied.worker_ref.worker_id.to_string(), worker_id);
+        let observed = client
+            .observe_worker_workdir_attachments_operation(worker_id, operation.clone())
+            .await
+            .unwrap();
+        assert_eq!(observed.request, operation);
+        assert_eq!(
+            observed.result,
+            WorkerWorkdirAttachmentsOperationOutcome::Receipt { receipt: applied }
+        );
+        assert_eq!(
+            observed.current_generation.as_deref(),
+            Some("fixture-generation-current")
+        );
         server.abort();
+    }
+
+    #[test]
+    fn attachment_operation_wire_rejects_unknown_duplicate_and_unfenced_input() {
+        let request = serde_json::json!({
+            "request_id": "attempt-a", "expected_generation": "opaque-generation",
+            "logical_workdir_attachments": [{"alias": "checkout", "working_directory_id": "remote-workdir"}]
+        });
+        let decoded: WorkerWorkdirAttachmentsOperationRequest =
+            serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(
+            decoded.logical_workdir_attachments[0].capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        for missing in [
+            "request_id",
+            "expected_generation",
+            "logical_workdir_attachments",
+        ] {
+            let mut invalid = request.clone();
+            invalid.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<WorkerWorkdirAttachmentsOperationRequest>(invalid)
+                    .is_err()
+            );
+        }
+        let mut invalid = request.clone();
+        invalid["receipt"] = serde_json::json!({});
+        assert!(
+            serde_json::from_value::<WorkerWorkdirAttachmentsOperationRequest>(invalid).is_err()
+        );
+        let mut invalid = request;
+        invalid["logical_workdir_attachments"][0]["host_path"] = "/private/host/path".into();
+        assert!(
+            serde_json::from_value::<WorkerWorkdirAttachmentsOperationRequest>(invalid).is_err()
+        );
+        assert!(serde_json::from_str::<WorkerWorkdirAttachmentsOperationRequest>(r#"{"request_id":"a","request_id":"b","expected_generation":"g","logical_workdir_attachments":[]}"#).is_err());
+        assert!(
+            serde_json::from_value::<WorkerWorkdirAttachmentsOperationOutcome>(
+                serde_json::json!({"state":"matching"})
+            )
+            .is_err()
+        );
     }
 
     #[test]

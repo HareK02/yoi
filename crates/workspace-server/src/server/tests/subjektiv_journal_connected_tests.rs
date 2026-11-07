@@ -1595,6 +1595,10 @@ async fn seed_unstarted_pending_head(
     std::fs::create_dir_all(&aggregate).unwrap();
     let record = json!({
         "schema_version": snapshot["schema_version"],
+        "workdir_attachments_guard": {
+            "generation": uuid::Uuid::now_v7().to_string(),
+            "owners": {},
+        },
         "worker_ref": worker_ref,
         "worker_id": request.worker_id,
         "profile": request.profile,

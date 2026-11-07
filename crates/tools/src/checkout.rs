@@ -38,7 +38,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use workdir::{WorkdirPath, WorkdirSessionCapability, WorkdirSessionRouter};
 
-use crate::{ToolsError, Tracker, file_target::FileTarget};
+use crate::{ToolsError, Tracker, WorkdirToolError, file_target::FileTarget};
 
 pub struct CheckoutToolOutput {
     pub output: ToolOutput,
@@ -64,7 +64,7 @@ pub async fn execute_checkout_tool(
     tool_name: &str,
     arguments: Value,
     ctx: ToolExecutionContext,
-) -> Result<CheckoutToolOutput, ToolError> {
+) -> Result<CheckoutToolOutput, WorkdirToolError> {
     // Native file arguments come from the same definitions used by ordinary
     // Tools and both WIP projections. Route fields are intentionally not in them.
     let file_schema = fs_operation::text::TextOperation::from_name(&tool_name.to_lowercase(), true)
@@ -101,7 +101,8 @@ pub async fn execute_checkout_tool(
         _ => {
             return Err(ToolError::InvalidArgument(format!(
                 "unknown checkout Operation: {tool_name}"
-            )));
+            ))
+            .into());
         }
     };
     let mut arguments = arguments
@@ -114,7 +115,8 @@ pub async fn execute_checkout_tool(
     {
         return Err(ToolError::InvalidArgument(format!(
             "unknown or route override checkout argument: {key}"
-        )));
+        ))
+        .into());
     }
     // Do not rebuild a singleton router: this is the original router identity and
     // tracker namespace shared with normal Tool calls and its detach/reuse fence.
@@ -122,7 +124,8 @@ pub async fn execute_checkout_tool(
     if selected.generation != generation {
         return Err(stale_checkout(
             "checkout attachment generation changed; resolve the checkout again",
-        ));
+        )
+        .into());
     }
     // Checkout paths are always logical and cannot use Tool-mode absolute scope.
     let path = WorkdirPath::new(path.as_str()).map_err(ToolsError::from)?;
@@ -167,9 +170,14 @@ pub async fn execute_checkout_tool(
                 .session
                 .checkout_observe(path.clone())
                 .await
-                .map_err(crate::file_target::checked_error)?;
+                .map_err(|error| {
+                    crate::file_target::checked_error_for(
+                        workdir::failure::WorkdirFailureOperation::CheckoutObserve,
+                        error,
+                    )
+                })?;
             if before.validator != validator {
-                return Err(stale_search());
+                return Err(stale_search().into());
             }
             let mut result = if tool_name == "List" {
                 let params: ListParams = decode(Value::Object(arguments), tool_name)?;
@@ -213,9 +221,14 @@ pub async fn execute_checkout_tool(
                 .session
                 .checkout_observe(path)
                 .await
-                .map_err(crate::file_target::checked_error)?;
+                .map_err(|error| {
+                    crate::file_target::checked_error_for(
+                        workdir::failure::WorkdirFailureOperation::CheckoutObserve,
+                        error,
+                    )
+                })?;
             if after.validator != before.validator {
-                return Err(stale_search());
+                return Err(stale_search().into());
             }
             result.validator = Some(after.validator);
             Ok(result)
@@ -243,17 +256,18 @@ async fn execute_list(
     session: workdir::WorkdirSessionHandle,
     path: WorkdirPath,
     params: ListParams,
-) -> Result<CheckoutToolOutput, ToolError> {
+) -> Result<CheckoutToolOutput, WorkdirToolError> {
     if !(1..=1000).contains(&params.limit) {
-        return Err(ToolError::InvalidArgument(
-            "List limit must be between 1 and 1000".into(),
-        ));
+        return Err(
+            ToolError::InvalidArgument("List limit must be between 1 and 1000".into()).into(),
+        );
     }
     if let Some(after) = &params.after {
         if !is_direct_child(&path, &after.path) {
             return Err(ToolError::InvalidArgument(
                 "List after must name a direct child of the bound directory".into(),
-            ));
+            )
+            .into());
         }
     }
     let result = session
@@ -265,7 +279,12 @@ async fn execute_list(
             }),
         ))
         .await
-        .map_err(crate::file_target::checked_error)?;
+        .map_err(|error| {
+            crate::file_target::checked_error_for(
+                workdir::failure::WorkdirFailureOperation::List,
+                error,
+            )
+        })?;
     let listing = match result {
         workdir::CheckoutSearchResult::List(listing) => listing,
         _ => return Err(crate::file_target::readonly_result_error("List")),
@@ -417,11 +436,11 @@ pub async fn read_checkout_text(
     offset: usize,
     limit: usize,
     max_bytes: usize,
-) -> Result<(workdir::ReadResult, Option<Vec<u8>>, impl FnOnce()), ToolError> {
+) -> Result<(workdir::ReadResult, Option<Vec<u8>>, impl FnOnce()), WorkdirToolError> {
     let selected =
         crate::routing::resolve_session(&router, Some(alias), WorkdirSessionCapability::Read)?;
     if selected.generation != generation {
-        return Err(stale_checkout("checkout connection changed"));
+        return Err(stale_checkout("checkout connection changed").into());
     }
     let tracker = tracker.scoped_attachment(&selected.alias, selected.generation);
     let target = FileTarget {
@@ -447,11 +466,11 @@ pub async fn read_checkout_bytes(
     validator: Vec<u8>,
     offset: u64,
     max_bytes: usize,
-) -> Result<(workdir::ReadBytesResult, Vec<u8>), ToolError> {
+) -> Result<(workdir::ReadBytesResult, Vec<u8>), WorkdirToolError> {
     let selected =
         crate::routing::resolve_session(&router, Some(alias), WorkdirSessionCapability::Read)?;
     if selected.generation != generation {
-        return Err(stale_checkout("checkout connection changed"));
+        return Err(stale_checkout("checkout connection changed").into());
     }
     let result = selected
         .session
@@ -461,7 +480,12 @@ pub async fn read_checkout_bytes(
             operation: workdir::CheckoutOperation::ReadBytes { offset, max_bytes },
         })
         .await
-        .map_err(crate::file_target::checked_error)?;
+        .map_err(|error| {
+            crate::file_target::checked_error_for(
+                workdir::failure::WorkdirFailureOperation::ReadBytes,
+                error,
+            )
+        })?;
     match result.output {
         workdir::CheckoutOutput::ReadBytes(read)
             if read.path == path && read.offset == offset && read.bytes.len() <= max_bytes =>

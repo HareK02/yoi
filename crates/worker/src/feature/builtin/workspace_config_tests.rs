@@ -277,10 +277,10 @@ async fn workspace_config_non_wip_and_missing_workspace_have_no_fallback() {
         let mut mounts = WipMountRegistry::new();
         wip::mount_workspace_config_attach_wip(&mut mounts, &feature).unwrap();
         assert_eq!(mounts.routes().count(), 0);
-        assert_eq!(
+        assert!(matches!(
             feature.attach("not-enabled", None).await,
             Err(ConfigAttachError::Denied)
-        );
+        ));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     }
 }

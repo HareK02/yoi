@@ -283,7 +283,7 @@ test("terminal subscription rejection is shown only through WorkspaceAlerts", as
   expect(alerts()[0]?.textContent).toContain("Worker subscription denied");
 });
 
-test("Workdir fetch failure preserves Worker updates and uses a separate stable alert", async () => {
+test("Unsupported Workdir failure preserves Worker updates and a separate stable alert without raw text", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) =>
@@ -308,7 +308,10 @@ test("Workdir fetch failure preserves Worker updates and uses a separate stable 
 
   expect(await screen.findByText("Worker visible")).toBeTruthy();
   await waitFor(() => expect(alerts()).toHaveLength(1));
-  expect(alerts()[0]?.textContent).toContain("Workdir lookup failed");
+  expect(alerts()[0]?.textContent).toContain("Worker Workdirs unavailable");
+  expect(alerts()[0]?.textContent).toContain("supported failure response");
+  expect(alerts()[0]?.textContent).toContain("operation result has not been confirmed");
+  expect(alerts()[0]?.textContent).not.toContain("Workdir lookup failed");
   expect(document.querySelector(".sidebar-nav-section")?.textContent).not
     .toContain(
       "Workdir lookup failed",

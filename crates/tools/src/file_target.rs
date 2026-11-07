@@ -6,13 +6,13 @@
 //! or `checkout_unavailable`. Ambiguous IO/transport failures and explicit OutcomeUnknown do not
 //! imply nonexecution. Invalid read-only responses mean retrieval failure; invalid mutation
 //! responses mean unknown outcomes.
-use agen::tool::ToolError;
+use workdir::failure::WorkdirFailureOperation as Operation;
 use workdir::{
     CheckoutOperation, CheckoutOutput, CheckoutRequest, ContentHash, EditRequest, EditResult,
     ReadRequest, ReadResult, WorkdirPath, WorkdirSessionHandle, WriteRequest, WriteResult,
 };
 
-use crate::ToolsError;
+use crate::{WorkdirToolError, workdir_error::CheckoutCode};
 
 pub(crate) struct FileTarget {
     pub session: WorkdirSessionHandle,
@@ -24,7 +24,13 @@ impl FileTarget {
     async fn checked(
         &self,
         operation: CheckoutOperation,
-    ) -> Result<(CheckoutOutput, Option<Vec<u8>>), ToolError> {
+    ) -> Result<(CheckoutOutput, Option<Vec<u8>>), WorkdirToolError> {
+        let failure_operation = match &operation {
+            CheckoutOperation::Read { .. } => Operation::Read,
+            CheckoutOperation::ReadBytes { .. } => Operation::ReadBytes,
+            CheckoutOperation::Edit { .. } => Operation::Edit,
+            CheckoutOperation::Write { .. } | CheckoutOperation::Create { .. } => Operation::Write,
+        };
         let result = self
             .session
             .checkout_execute(CheckoutRequest {
@@ -36,7 +42,7 @@ impl FileTarget {
                 operation,
             })
             .await
-            .map_err(checked_error)?;
+            .map_err(|error| checked_error_for(failure_operation, error))?;
         Ok((result.output, Some(result.observation.validator)))
     }
 
@@ -45,7 +51,7 @@ impl FileTarget {
         offset: usize,
         limit: usize,
         max_bytes: usize,
-    ) -> Result<(ReadResult, Option<Vec<u8>>), ToolError> {
+    ) -> Result<(ReadResult, Option<Vec<u8>>), WorkdirToolError> {
         if self.validator.is_some() {
             let (output, validator) = self
                 .checked(CheckoutOperation::Read {
@@ -68,7 +74,7 @@ impl FileTarget {
                     max_bytes,
                 })
                 .await
-                .map_err(ToolsError::from)?;
+                .map_err(|error| WorkdirToolError::operation(Operation::Read, error))?;
             Ok((result, None))
         }
     }
@@ -79,7 +85,7 @@ impl FileTarget {
         new_string: String,
         replace_all: bool,
         expected_hash: ContentHash,
-    ) -> Result<(EditResult, Option<Vec<u8>>), ToolError> {
+    ) -> Result<(EditResult, Option<Vec<u8>>), WorkdirToolError> {
         if self.validator.is_some() {
             let (output, validator) = self
                 .checked(CheckoutOperation::Edit {
@@ -104,7 +110,7 @@ impl FileTarget {
                     expected_hash,
                 })
                 .await
-                .map_err(ToolsError::from)?;
+                .map_err(|error| WorkdirToolError::operation(Operation::Edit, error))?;
             Ok((result, None))
         }
     }
@@ -114,7 +120,7 @@ impl FileTarget {
         content: Vec<u8>,
         expected_hash: Option<ContentHash>,
         create_path: Option<WorkdirPath>,
-    ) -> Result<(WriteResult, Option<Vec<u8>>), ToolError> {
+    ) -> Result<(WriteResult, Option<Vec<u8>>), WorkdirToolError> {
         if self.validator.is_some() {
             let operation = match create_path {
                 Some(path) => CheckoutOperation::Create { path, content },
@@ -138,26 +144,33 @@ impl FileTarget {
                     expected_hash,
                 })
                 .await
-                .map_err(ToolsError::from)?;
+                .map_err(|error| WorkdirToolError::operation(Operation::Write, error))?;
             Ok((result, None))
         }
     }
 }
 
-pub(crate) fn checked_error(error: workdir::WorkdirError) -> ToolError {
+pub(crate) fn checked_error(error: workdir::WorkdirError) -> WorkdirToolError {
+    checked_error_for(Operation::CheckoutExecute, error)
+}
+
+pub(crate) fn checked_error_for(
+    operation: Operation,
+    error: workdir::WorkdirError,
+) -> WorkdirToolError {
     use workdir::WorkdirError;
     let code = match error.classification_source() {
         WorkdirError::DenialContext { .. } | WorkdirError::FailureContext { .. } => {
             unreachable!("diagnostic context unwrapped")
         }
-        WorkdirError::Conflict(_) | WorkdirError::NotFound(_) => "checkout_stale",
+        WorkdirError::Conflict(_) | WorkdirError::NotFound(_) => CheckoutCode::CheckoutStale,
         WorkdirError::Denied { .. }
         | WorkdirError::OutOfScope { .. }
         | WorkdirError::ReadOnly { .. }
         | WorkdirError::Unsupported { .. }
         | WorkdirError::UnsupportedOperation { .. }
         | WorkdirError::SymlinkOutOfScope { .. }
-        | WorkdirError::SymlinkDirectoryNotTraversed { .. } => "checkout_denied",
+        | WorkdirError::SymlinkDirectoryNotTraversed { .. } => CheckoutCode::CheckoutDenied,
         WorkdirError::InvalidArgument { .. }
         | WorkdirError::InvalidPath { .. }
         | WorkdirError::UnknownCommand { .. }
@@ -166,32 +179,34 @@ pub(crate) fn checked_error(error: workdir::WorkdirError) -> ToolError {
         | WorkdirError::SymlinkTargetIsDirectory { .. }
         | WorkdirError::IsDirectory { .. }
         | WorkdirError::InvalidGlob { .. }
-        | WorkdirError::InvalidRegex { .. } => "checkout_invalid",
-        WorkdirError::NotDispatched => "checkout_not_dispatched",
-        WorkdirError::Unavailable { .. } | WorkdirError::SessionClosed => "checkout_unavailable",
+        | WorkdirError::InvalidRegex { .. } => CheckoutCode::CheckoutInvalid,
+        WorkdirError::NotDispatched => CheckoutCode::CheckoutNotDispatched,
+        WorkdirError::Unavailable { .. } | WorkdirError::SessionClosed => {
+            CheckoutCode::CheckoutUnavailable
+        }
         // IO/transport failures may arrive after effects have begun. Do not infer
         // no-effects from their text or strip explicit OutcomeUnknown evidence.
         WorkdirError::Io { .. }
         | WorkdirError::Transport { .. }
         | WorkdirError::OutcomeUnknown { .. }
         | WorkdirError::OperationFailed => {
-            return ToolsError::from(error).into();
+            return WorkdirToolError::operation(operation, error);
         }
     };
-    ToolError::StructuredConflict {
-        code: code.into(),
-        message: error.to_string(),
-    }
+    WorkdirToolError::checked(operation, error, Some(code))
 }
 
-pub(crate) fn readonly_result_error(operation: &str) -> ToolError {
+pub(crate) fn readonly_result_error(operation: &str) -> WorkdirToolError {
     checked_error(workdir::WorkdirError::Unavailable(format!(
         "provider returned an invalid readonly checkout {operation} result"
     )))
 }
 
-fn unknown_result(operation: &str) -> ToolError {
-    ToolError::ExecutionFailed(format!(
-        "Outcome unknown: provider returned wrong checkout {operation} result after mutation; do not automatically retry"
-    ))
+fn unknown_result(operation: &str) -> WorkdirToolError {
+    checked_error(
+        workdir::WorkdirError::OutcomeUnknown(format!(
+            "provider returned wrong checkout {operation} result after mutation"
+        ))
+        .with_failure_reason(workdir::WorkdirFailureReason::OperationResultMismatch),
+    )
 }

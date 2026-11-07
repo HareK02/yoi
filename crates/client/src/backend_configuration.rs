@@ -84,7 +84,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(ClientError::Public { status: reqwest::StatusCode::FORBIDDEN, error })
-                if error.message == "owner required"
+                if error.legacy().message == "owner required"
         ));
     }
 

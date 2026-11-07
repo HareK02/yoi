@@ -6,6 +6,10 @@ fn subject_delete_schema14_migration_adds_exclusion_store_without_changing_worke
         let mut legacy =
             serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
         legacy["schema_version"] = serde_json::json!(RESTORE_REPAIR_SCHEMA_VERSION);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard");
         fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         let id = WorkerId::now_v7();
         let request = serde_json::json!({"workspace_id": "workspace-a", "worker_id": id,
@@ -37,6 +41,14 @@ fn subject_delete_schema14_migration_adds_exclusion_store_without_changing_worke
         assert_eq!(fs::read(&path).unwrap(), before);
         let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
         legacy["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+        legacy["workdir_attachments_guard"] = serde_json::to_value(
+            &opened
+                .store
+                .read_worker_record(&worker.worker_ref)
+                .unwrap()
+                .workdir_attachments_guard,
+        )
+        .unwrap();
         assert_eq!(
             read_json::<serde_json::Value>(&path, "read migrated Worker").unwrap(),
             legacy

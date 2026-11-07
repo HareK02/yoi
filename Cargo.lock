@@ -4787,6 +4787,7 @@ dependencies = [
  "url",
  "webauthn-rs-proto",
  "workdir",
+ "workspace-drive",
 ]
 
 [[package]]
@@ -7300,6 +7301,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "error-contract",
  "fs-operation",
  "libc",
  "manifest",
@@ -7429,10 +7431,12 @@ name = "workspace-drive"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "error-contract",
  "feature-storage",
  "futures",
  "object_store",
  "rusqlite",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -7498,6 +7502,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "client",
+ "error-contract",
  "feature-permissions",
  "fs4",
  "futures",
@@ -7614,6 +7619,7 @@ dependencies = [
  "ring",
  "runtime-api",
  "rusqlite",
+ "schemars",
  "secrets",
  "serde",
  "serde_json",
