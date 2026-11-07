@@ -10,10 +10,9 @@ use server_api::{
     WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
 };
 use ticket::{
-    MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
-    OrchestrationPlanKind, OrchestrationPlanRecord, Ticket, TicketBackend, TicketDependencyCheck,
-    TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketItemEdit,
-    TicketListQuery, TicketListState, TicketMarkReady, TicketRef, TicketRelation,
+    MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, Ticket, TicketBackend,
+    TicketDependencyCheck, TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary,
+    TicketItemEdit, TicketListQuery, TicketListState, TicketMarkReady, TicketRef, TicketRelation,
     TicketRelationKind, TicketRelationView, TicketStateChange, TicketStateSelector, TicketSummary,
 };
 
@@ -920,44 +919,6 @@ impl TicketBackend for BackendWorkspaceProductClient {
         .map_err(ticket_client_error)
     }
 
-    fn add_orchestration_plan_record(
-        &self,
-        id: TicketIdOrSlug,
-        record: NewOrchestrationPlanRecord,
-    ) -> ticket::Result<OrchestrationPlanRecord> {
-        let workspace_id = self.workspace_id.clone();
-        let id = ticket_reference(&id);
-        self.generated(move |client| async move {
-            client
-                .ticket_orchestration_plan_record(
-                    workspace_id,
-                    id,
-                    server_api::CreateTicketOrchestrationPlanRequest(record),
-                )
-                .await
-                .map(|response| response.0)
-        })
-        .map_err(ticket_client_error)
-    }
-
-    fn query_orchestration_plan_records(
-        &self,
-        ticket: Option<TicketIdOrSlug>,
-        kind: Option<OrchestrationPlanKind>,
-    ) -> ticket::Result<Vec<OrchestrationPlanRecord>> {
-        let workspace_id = self.workspace_id.clone();
-        self.generated(move |client| async move {
-            client
-                .ticket_orchestration_plan_query(
-                    workspace_id,
-                    server_api::TicketOrchestrationPlanSearchRequest { ticket, kind },
-                )
-                .await
-                .map(|response| response.0)
-        })
-        .map_err(ticket_client_error)
-    }
-
     fn doctor(&self) -> ticket::Result<TicketDoctorReport> {
         self.ticket_doctor().map_err(ticket_client_error)
     }
@@ -1679,28 +1640,6 @@ mod tests {
         let request = request.recv().unwrap();
         assert!(request.starts_with("POST /api/w/workspace-a/tickets/relations/search "));
         assert!(request.contains("\"ticket\":{\"Query\":\"T-1\"}"));
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn orchestration_plan_query_uses_workspace_scoped_backend_route() {
-        let (base_url, request, handle) = one_response_server("200 OK", "[]");
-        let client = BackendWorkspaceProductClient::new_with_access_token(
-            base_url,
-            "workspace-a",
-            "test-backend-token",
-        )
-        .unwrap();
-
-        let records = TicketBackend::query_orchestration_plan_records(&client, None, None).unwrap();
-
-        assert!(records.is_empty());
-        assert!(
-            request
-                .recv()
-                .unwrap()
-                .starts_with("POST /api/w/workspace-a/tickets/orchestration-plans/search ")
-        );
         handle.join().unwrap();
     }
 

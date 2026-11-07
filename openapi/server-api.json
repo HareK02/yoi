@@ -1,36 +1,6 @@
 {
   "components": {
     "schemas": {
-      "AcceptedOrchestrationPlan": {
-        "additionalProperties": false,
-        "properties": {
-          "branch": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "role_plan": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "summary": {
-            "type": "string"
-          },
-          "worktree": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "summary"
-        ],
-        "type": "object"
-      },
       "ActivationCodeResponse": {
         "additionalProperties": false,
         "description": "The only response allowed to disclose an activation code. Clients must keep it\nout of URLs, persistent browser storage and diagnostics. A lost response is\nrecovered by reissuing, which invalidates the previous code and its ceremonies.",
@@ -92,12 +62,6 @@
       "Array_of_MergeRequestThreadEvent": {
         "items": {
           "$ref": "#/components/schemas/MergeRequestThreadEvent"
-        },
-        "type": "array"
-      },
-      "Array_of_OrchestrationPlanRecord": {
-        "items": {
-          "$ref": "#/components/schemas/OrchestrationPlanRecord"
         },
         "type": "array"
       },
@@ -6558,45 +6522,6 @@
         },
         "type": "object"
       },
-      "NewOrchestrationPlanRecord": {
-        "properties": {
-          "accepted_plan": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AcceptedOrchestrationPlan"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "author": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "kind": {
-            "$ref": "#/components/schemas/OrchestrationPlanKind"
-          },
-          "note": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "related_ticket": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "kind"
-        ],
-        "type": "object"
-      },
       "NewTicket": {
         "properties": {
           "assignee": {
@@ -7635,69 +7560,6 @@
             "type": "integer"
           }
         },
-        "type": "object"
-      },
-      "OrchestrationPlanKind": {
-        "enum": [
-          "before",
-          "after",
-          "blocked_by",
-          "blocks",
-          "conflicts_with",
-          "do_not_parallelize",
-          "waiting_capacity_note",
-          "accepted_plan"
-        ],
-        "type": "string"
-      },
-      "OrchestrationPlanRecord": {
-        "additionalProperties": false,
-        "properties": {
-          "accepted_plan": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/AcceptedOrchestrationPlan"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "at": {
-            "type": "string"
-          },
-          "author": {
-            "type": "string"
-          },
-          "id": {
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/OrchestrationPlanKind"
-          },
-          "note": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "related_ticket": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ticket_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "ticket_id",
-          "kind",
-          "author",
-          "at"
-        ],
         "type": "object"
       },
       "PasskeyAdditionOptionsRequest": {
@@ -20895,32 +20757,6 @@
         ],
         "type": "object"
       },
-      "TicketOrchestrationPlanSearchRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "kind": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/OrchestrationPlanKind"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "ticket": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/TicketIdOrSlug"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          }
-        },
-        "type": "object"
-      },
       "TicketParentFilter": {
         "oneOf": [
           {
@@ -25985,7 +25821,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:2f46a7ec6775d285336c61afdce8b91042d54aaa5dff100a8a4238fe23963aae"
+    "x-yoi-source-digest": "sha256:6053d1db168f5c9a6cbd5e9eaade63ed38c0e963a979c804f0c0ecb576e6ae73"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -50535,103 +50371,6 @@
         ]
       }
     },
-    "/api/w/{workspace_id}/tickets/orchestration-plans/search": {
-      "post": {
-        "operationId": "ticket_orchestration_plan_query",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TicketOrchestrationPlanSearchRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Array_of_OrchestrationPlanRecord"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
     "/api/w/{workspace_id}/tickets/query": {
       "post": {
         "operationId": "ticket_query",
@@ -52226,123 +51965,6 @@
             "description": "Error response"
           },
           "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "500": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          },
-          {
-            "browserSession": []
-          }
-        ]
-      }
-    },
-    "/api/w/{workspace_id}/tickets/{id}/orchestration-plans": {
-      "post": {
-        "operationId": "ticket_orchestration_plan_record",
-        "parameters": [
-          {
-            "explode": false,
-            "in": "path",
-            "name": "workspace_id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          },
-          {
-            "explode": false,
-            "in": "path",
-            "name": "id",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/string"
-            },
-            "style": "simple"
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/NewOrchestrationPlanRecord"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OrchestrationPlanRecord"
-                }
-              }
-            },
-            "description": "Successful response"
-          },
-          "400": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "404": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RepositoryApiError"
-                }
-              }
-            },
-            "description": "Error response"
-          },
-          "409": {
             "content": {
               "application/json": {
                 "schema": {

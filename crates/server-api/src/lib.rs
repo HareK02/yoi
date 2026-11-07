@@ -551,7 +551,6 @@ impl_openapi_schema!(
     CancelTicketImplementationRequest,
     ClearTicketRoleAssignmentQuery,
     CompleteMergeRequestRequest,
-    CreateTicketOrchestrationPlanRequest,
     CreateTicketRecordRequest,
     CreateTicketRelationRequest,
     DefaultIntakeReadyBodyRequest,
@@ -603,9 +602,6 @@ impl_openapi_schema!(
     TicketListHttpQuery,
     TicketListResponse,
     TicketMarkReadyRequest,
-    TicketOrchestrationPlanRecord,
-    TicketOrchestrationPlanRecordList,
-    TicketOrchestrationPlanSearchRequest,
     TicketAssignmentsQuery,
     TicketAssignmentsPage,
     TicketAssignmentAnswerRequest,
@@ -3795,13 +3791,6 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: TicketRelationSearchRequest,
     ) -> Result<TicketRelationRecordList, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/orchestration-plans/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_orchestration_plan_query(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[body] request: TicketOrchestrationPlanSearchRequest,
-    ) -> Result<TicketOrchestrationPlanRecordList, RepositoryApiError>;
     #[get("/api/w/{workspace_id}/tickets/{id}/record", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_record_get(
         &self,
@@ -4089,15 +4078,6 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketRelationRemoveRequest,
     ) -> Result<TicketRelationRecord, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/orchestration-plans", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_orchestration_plan_record(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: CreateTicketOrchestrationPlanRequest,
-    ) -> Result<TicketOrchestrationPlanRecord, RepositoryApiError>;
-
     #[get("/api/w/{workspace_id}/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_get(
         &self,
@@ -7514,7 +7494,6 @@ pub struct RepositoryLogResponse {
 }
 
 pub const TICKET_RELATIONS_QUERY_PATH: &str = "/tickets/relations/search";
-pub const TICKET_ORCHESTRATION_PLANS_QUERY_PATH: &str = "/tickets/orchestration-plans/search";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -9115,14 +9094,6 @@ transparent_ticket_dto!(TicketDoctorResponse, ticket::TicketDoctorReport);
 transparent_ticket_dto!(TicketRelationRecord, ticket::TicketRelation);
 transparent_ticket_dto!(TicketRelationRecordList, Vec<ticket::TicketRelation>);
 transparent_ticket_dto!(TicketRelationRecordView, ticket::TicketRelationView);
-transparent_ticket_dto!(
-    TicketOrchestrationPlanRecord,
-    ticket::OrchestrationPlanRecord
-);
-transparent_ticket_dto!(
-    TicketOrchestrationPlanRecordList,
-    Vec<ticket::OrchestrationPlanRecord>
-);
 transparent_ticket_dto!(CreateTicketRecordRequest, ticket::NewTicket);
 transparent_ticket_dto!(EditTicketRecordItemRequest, ticket::TicketItemEdit);
 transparent_ticket_dto!(EditTicketPostRequest, ticket::TicketPostEdit);
@@ -9130,10 +9101,6 @@ transparent_ticket_dto!(TicketPostSnapshots, (ticket::Ticket, ticket::Ticket));
 transparent_ticket_dto!(TicketThreadEventRequest, ticket::NewTicketEvent);
 transparent_ticket_dto!(TicketIntakeSummaryRequest, ticket::TicketIntakeSummary);
 transparent_ticket_dto!(CreateTicketRelationRequest, ticket::NewTicketRelation);
-transparent_ticket_dto!(
-    CreateTicketOrchestrationPlanRequest,
-    ticket::NewOrchestrationPlanRecord
-);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -9157,13 +9124,6 @@ pub struct TicketRelationRemoveRequest {
 pub struct TicketRelationSearchRequest {
     pub ticket: Option<ticket::TicketIdOrSlug>,
     pub kind: Option<ticket::TicketRelationKind>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TicketOrchestrationPlanSearchRequest {
-    pub ticket: Option<ticket::TicketIdOrSlug>,
-    pub kind: Option<ticket::OrchestrationPlanKind>,
 }
 
 /// Selected existing live Workdir attachment, including its current connection
@@ -13305,6 +13265,10 @@ mod tests {
     #[test]
     fn ticket_objective_and_merge_request_operations_are_in_server_api_metadata() {
         let operations = ServerApiMetadata::OPERATIONS;
+        assert!(operations.iter().all(|operation| {
+            !operation.operation_id.contains("orchestration_plan")
+                && !operation.path.contains("orchestration-plans")
+        }));
         assert_eq!(
             operations
                 .iter()
@@ -13329,11 +13293,6 @@ mod tests {
                 "ticket_relation_query",
                 HttpMethod::Post,
                 "/api/w/{workspace_id}/tickets/relations/search",
-            ),
-            (
-                "ticket_orchestration_plan_query",
-                HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/orchestration-plans/search",
             ),
             (
                 "merge_request_complete",

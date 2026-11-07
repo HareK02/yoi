@@ -327,7 +327,7 @@ fn tracking_reopens_database_without_restarting_or_reassigning_workers() {
 
 fn legacy(original: &str, fenced: bool, later_case: bool, reassigned: bool) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(include_str!("latest_schema.sql"))
+    conn.execute_batch(include_str!("frozen_schema_v10.sql"))
         .unwrap();
     conn.execute_batch("CREATE TABLE ticket_schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL); INSERT INTO ticket_schema_migrations VALUES(10,'ticket schema baseline','original-time');").unwrap();
     install_assignment_core(&conn).unwrap();
@@ -417,7 +417,7 @@ fn migration_preserves_original_records_and_only_reconciles_current_fenced_deleg
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-            16
+            17
         );
         let value = sqlite_ticket_assignment_tracking(&conn, "w", "t", "a")
             .unwrap()

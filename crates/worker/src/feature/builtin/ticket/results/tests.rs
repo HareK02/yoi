@@ -182,18 +182,6 @@ fn lookup_and_record_results_publish_only_their_explicit_domain_reference_fields
             vec![],
         ),
         (
-            "query_orchestration_plans",
-            json!({"records":[{"ticket_id":"T-42","related_ticket":"T-7","accepted_plan":{"branch":"T-999","worktree":"/cases/T-999"}}],"truncated":true,"count":2,"returned":1}),
-            vec!["T-42", "T-7"],
-            vec![],
-        ),
-        (
-            "record_orchestration_plan",
-            json!({"ticket_id":"T-42","related_ticket":"T-7","note":"T-999"}),
-            vec!["T-42", "T-7"],
-            vec![],
-        ),
-        (
             "dependency_check",
             json!({"ticket":{"id":"internal42","resource_key":"T-42"},"blockers":[{"blocking_ticket":"T-7"}],"queue_tickets":["T-8"],"recommended_action":"wait_for_orchestrator"}),
             vec!["T-42", "T-7", "T-8"],

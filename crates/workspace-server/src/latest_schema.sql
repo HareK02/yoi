@@ -5,7 +5,6 @@ DROP TABLE typed_ticket_event_attributes;
 DROP TABLE typed_ticket_event_references;
 DROP TABLE typed_ticket_artifacts;
 DROP TABLE typed_ticket_labels;
-DROP TABLE typed_ticket_orchestration_plans;
 DROP TABLE typed_ticket_raw_frontmatter;
 DROP TABLE typed_ticket_relations;
 DROP TABLE typed_ticket_risk_flags;
@@ -457,22 +456,6 @@ CREATE TABLE typed_ticket_events (
 CREATE TABLE typed_ticket_labels (
     workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, ordinal INTEGER NOT NULL, label TEXT NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id, ordinal),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
-CREATE TABLE typed_ticket_orchestration_plans (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    related_ticket TEXT,
-    note TEXT,
-    accepted_summary TEXT,
-    accepted_branch TEXT,
-    accepted_worktree TEXT,
-    accepted_role_plan TEXT,
-    author TEXT NOT NULL,
-    at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, record_id),
     FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
 );
 CREATE TABLE typed_ticket_raw_frontmatter (

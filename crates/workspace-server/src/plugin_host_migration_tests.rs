@@ -28,7 +28,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
         assert_eq!(upgraded.iter().find(|(version, _)| *version == 109).unwrap().1, "Durable Plugin Host invocations and HTTPS effect receipts");
         assert_eq!(upgraded.iter().find(|(version, _)| *version == 110).unwrap().1, "Worker Plugin launch selection associations");
         assert_eq!(upgraded.iter().find(|(version, _)| *version == 127).unwrap().1, journal_removal_store::MIGRATION_NAME);
-        assert_eq!(upgraded.last().unwrap(), &(128, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()));
+        assert_eq!(upgraded.last().unwrap(), &(129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()));
         assert_eq!(conn.query_row("SELECT count(*) FROM workspaces WHERE workspace_id='space'", [], |row| row.get::<_, i64>(0))?, 1);
         assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0))?, 0);
         Ok(())

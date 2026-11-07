@@ -5,9 +5,9 @@
 //! receipts). Published 114..121 databases retain their version, receipt names,
 //! policy, Job states, root records and erasure fences. They need no domain DDL
 //! merely to acquire the common storage identity/lifetime owned by the caller.
-//! Ordered 122..128 receipts add configuration, Job execution, startup results,
-//! bounded Job causes, Service outcomes, Journal removal and publication/connection
-//! observations; each intermediate/fresh baseline stays exact.
+//! Ordered 122..129 receipts add configuration, Job execution, startup results,
+//! bounded Job causes, Service outcomes, Journal removal, Plan retirement and independent
+//! publication/connection observations; each intermediate/fresh baseline stays exact.
 //! This does not attest policy transfer, execution termination or Journal release.
 //!
 //! Frozen SQL below is a physical reference: it runs ONLY on empty, private
@@ -78,6 +78,9 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
         return Err(invalid(format!(
             "unknown baseline or current version: {rows:?}"
         )));
+    }
+    if current >= 128 {
+        ticket::verify_sqlite_ticket_schema(conn).map_err(invalid)?;
     }
     verify_publication_shape(conn, current)?;
     verify_connection_observation_shape(conn, current)?;
@@ -359,7 +362,8 @@ impl FailureTail {
                 (127, super::journal_removal_store::RETAINED_BRIDGE_NAME),
             ],
         });
-        tail.push((128, super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME));
+        tail.push((128, super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME));
+        tail.push((129, super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -581,7 +585,7 @@ fn verify_connection_observation_shape(conn: &Connection, current: i64) -> Resul
         .into_iter()
         .filter(|(_, object)| tables.contains(&object.1))
         .collect();
-    if (current >= 128 && actual != expected) || (current < 128 && !actual.is_empty()) {
+    if (current >= 129 && actual != expected) || (current < 129 && !actual.is_empty()) {
         return Err(invalid(
             "External Workdir connection observation receipt/shape mismatch",
         ));
@@ -598,7 +602,7 @@ fn verify_publication_shape(conn: &Connection, current: i64) -> Result<()> {
         .into_iter()
         .filter(|(_, object)| tables.contains(&object.1))
         .collect();
-    if (current >= 128 && actual != expected) || (current < 128 && !actual.is_empty()) {
+    if (current >= 129 && actual != expected) || (current < 129 && !actual.is_empty()) {
         return Err(invalid("configuration publication receipt/shape mismatch"));
     }
     Ok(())
@@ -653,7 +657,14 @@ fn snapshot(conn: &Connection) -> Result<Shape> {
 fn reference_base() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     super::configure_sqlite(&conn)?;
-    ticket::migrate_sqlite_ticket_schema(&conn).map_err(invalid)?;
+    // Frozen physical reference for published host schemas through 127.
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+    )
+    .map_err(invalid)?;
+    tx.commit()?;
     merge_request::migrate(&conn).map_err(invalid)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
     let tx = conn.unchecked_transaction()?;
@@ -1380,7 +1391,7 @@ mod failure_format_tests {
             Stage::Converged(121),
         ] {
             let conn = fixture_123(stage);
-            for current in 123..=128 {
+            for current in 123..=store::LATEST_SCHEMA_VERSION {
                 if current > 123 {
                     apply(&conn, current).unwrap();
                 }
@@ -1407,7 +1418,7 @@ mod failure_format_tests {
         }
         // Fresh composition has the Base shape, not fabricated published-family
         // receipts. Each supported additive intermediate is a real baseline.
-        for current in 123..=128 {
+        for current in 123..=store::LATEST_SCHEMA_VERSION {
             let conn = fixture_123(Stage::Base);
             for version in 124..=current {
                 apply(&conn, version).unwrap();
@@ -1450,11 +1461,12 @@ mod failure_format_tests {
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![127, 128]
+            vec![127, 128, 129]
         );
         apply(&conn, 127).unwrap();
         apply(&conn, 128).unwrap();
-        verify_history(&conn, 128).unwrap();
+        apply(&conn, 129).unwrap();
+        verify_history(&conn, 129).unwrap();
         let history = store::workspace_schema_migration_history(&conn).unwrap();
         assert_eq!(&history[..retained.len()], retained.as_slice());
         assert_eq!(
@@ -1479,22 +1491,29 @@ mod failure_format_tests {
     fn failure_tail_mismatches_are_rejected_without_repair() {
         for (current, sql) in [
             (127, crate::external_workdir_connection_observations::SCHEMA),
+            (128, crate::external_workdir_connection_observations::SCHEMA),
             (
-                128,
+                129,
                 "DROP TRIGGER external_workdir_connection_observations_no_update",
             ),
             (
-                128,
-                "UPDATE __yoi_schema_migrations SET name='counterfeit connection receipt' WHERE version=128",
+                129,
+                "UPDATE __yoi_schema_migrations SET name='counterfeit connection receipt' WHERE version=129",
             ),
             (127, crate::config_publication::SCHEMA),
+            (128, crate::config_publication::SCHEMA),
             (
                 128,
+                "UPDATE __yoi_schema_migrations SET name='Independent configuration publication and Workdir connection observations' WHERE version=128",
+            ),
+            (128, "DELETE FROM ticket_schema_migrations WHERE version=17"),
+            (
+                129,
                 "DROP TRIGGER workspace_configuration_publication_no_update",
             ),
             (
-                128,
-                "UPDATE __yoi_schema_migrations SET name='counterfeit publication receipt' WHERE version=128",
+                129,
+                "UPDATE __yoi_schema_migrations SET name='counterfeit publication receipt' WHERE version=129",
             ),
             (123, store::backend_job_recovery_store::CAUSE_SCHEMA),
             (124, crate::plugin_service::FAILURE_MIGRATION_SQL),
@@ -1585,8 +1604,26 @@ mod failure_format_tests {
         );
         let mut old_columns = columns(&conn);
         old_columns.remove("__yoi_schema_migrations");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM typed_ticket_orchestration_plans",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        old_columns.remove("typed_ticket_orchestration_plans");
+        old_columns.remove("ticket_schema_migrations");
+        let component_receipts = values(
+            &conn,
+            &BTreeMap::from([(
+                "ticket_schema_migrations".into(),
+                store::table_columns(&conn, "ticket_schema_migrations").unwrap(),
+            )]),
+        );
         let retained = values(&conn, &old_columns);
-        for version in 124..=128 {
+        for version in 124..=store::LATEST_SCHEMA_VERSION {
             conn.execute_batch(&format!("CREATE TRIGGER inject_failure_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version={version} BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")).unwrap();
             let before = snapshot(&conn).unwrap();
             let rollback_columns = columns(&conn);
@@ -1601,6 +1638,20 @@ mod failure_format_tests {
             apply(&conn, version).unwrap();
             verify_history(&conn, version).unwrap();
             assert_eq!(values(&conn, &old_columns), retained);
+            let component = values(
+                &conn,
+                &BTreeMap::from([(
+                    "ticket_schema_migrations".into(),
+                    store::table_columns(&conn, "ticket_schema_migrations").unwrap(),
+                )]),
+            );
+            for row in &component_receipts["ticket_schema_migrations"] {
+                assert!(component["ticket_schema_migrations"].contains(row));
+            }
+            assert_eq!(
+                component["ticket_schema_migrations"].len(),
+                component_receipts["ticket_schema_migrations"].len() + usize::from(version >= 128)
+            );
             assert!(
                 apply(&conn, version).is_err(),
                 "migration must not run twice"
@@ -1670,10 +1721,10 @@ mod failure_format_tests {
             plan.migrations
                 .iter()
                 .rev()
-                .take(4)
+                .take(5)
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![128, 127, 126, 125]
+            vec![129, 128, 127, 126, 125]
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(snapshot(&conn).unwrap(), shape, "dry-run changed DDL");
@@ -1696,12 +1747,13 @@ mod failure_format_tests {
             Some(&(50, store::SCHEMA_BASELINE_NAME.to_owned()))
         );
         assert_eq!(
-            &history[history.len() - 4..],
+            &history[history.len() - 5..],
             &[
                 (125, tail_migration_name(125).unwrap().to_owned()),
                 (126, tail_migration_name(126).unwrap().to_owned()),
                 (127, tail_migration_name(127).unwrap().to_owned()),
                 (128, tail_migration_name(128).unwrap().to_owned()),
+                (129, tail_migration_name(129).unwrap().to_owned()),
             ]
         );
         let upgraded_shape = snapshot(&conn).unwrap();

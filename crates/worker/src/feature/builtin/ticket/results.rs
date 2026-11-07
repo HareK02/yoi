@@ -206,16 +206,6 @@ impl References {
                 add(&mut refs.tickets, data, "ticket_id");
                 add(&mut refs.tickets, data, "target");
             }
-            "record_orchestration_plan" => {
-                add(&mut refs.tickets, data, "ticket_id");
-                add(&mut refs.tickets, data, "related_ticket");
-            }
-            "query_orchestration_plans" => {
-                for plan in array(data, "records") {
-                    add(&mut refs.tickets, plan, "ticket_id");
-                    add(&mut refs.tickets, plan, "related_ticket");
-                }
-            }
             "dependency_check" => {
                 if let Some(ticket) = data.get("ticket") {
                     if let Some(id) = leaf(ticket, "resource_key").or_else(|| leaf(ticket, "id")) {

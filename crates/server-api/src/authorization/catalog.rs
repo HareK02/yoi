@@ -201,11 +201,6 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
                 "Query Workspace Ticket relation metadata.",
             ),
             (
-                "ticket.orchestration_plan.query",
-                "Read orchestration plans",
-                "Query retained orchestration plan metadata; does not start work.",
-            ),
-            (
                 "objective.query",
                 "Search Objectives",
                 "Query the Workspace Objective collection.",
@@ -324,11 +319,6 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
                 "ticket.relation.remove",
                 "Remove Ticket relation",
                 "Remove an exact relation or observed parent link on the authorized endpoints.",
-            ),
-            (
-                "ticket.orchestration_plan.record",
-                "Record orchestration plan",
-                "Record plan metadata for this Ticket; does not grant execution authority.",
             ),
             (
                 "ticket.mark_ready",

@@ -534,7 +534,8 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
                     (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
                     (126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
                     (127, journal_removal_store::MIGRATION_NAME.into()),
-                    (128, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into())
+                    (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into()),
+                    (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into())
                 ]
             );
             for (table, rows) in retained.iter().zip(original.iter()) {

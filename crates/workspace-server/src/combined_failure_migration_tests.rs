@@ -94,7 +94,13 @@ fn fixture(path: &Path, tail: Tail, current: i64, origin: Origin) {
         Origin::Fresh | Origin::Fresh124Prefix => {
             let conn = Connection::open(path).unwrap();
             configure_sqlite(&conn).unwrap();
-            ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+                &tx,
+                ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+            )
+            .unwrap();
+            tx.commit().unwrap();
             merge_request::migrate(&conn).unwrap();
             // Same rebuild window as the fresh owner: execution-123 rebuilds
             // parent tables before installing their final guards.
@@ -348,6 +354,11 @@ fn assert_plan(plan: &WorkspaceSchemaMigrationPlan, tail: Tail, current: i64) {
             .into_iter()
             .chain(std::iter::once((
                 128,
+                TICKET_PLAN_RETIREMENT_MIGRATION_NAME,
+                ""
+            )))
+            .chain(std::iter::once((
+                129,
                 DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME,
                 ""
             )))
@@ -390,6 +401,12 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
                     "dry run changed source data/receipts"
                 );
                 old_columns.remove("__yoi_schema_migrations");
+                // This suite owns failure-tail preservation. Ticket17 intentionally
+                // appends its receipt and retires this empty historical table;
+                // populated-row coverage belongs to ticket_plan_retirement.
+                assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
+                old_columns.remove("typed_ticket_orchestration_plans");
+                old_columns.remove("ticket_schema_migrations");
                 let retained = values(&conn, &old_columns);
                 drop(conn);
 
@@ -501,7 +518,7 @@ fn combined_failure_receipt_126_abort_rolls_back_ddl_and_data_then_retries_once(
             assert!(column_exists(&conn, missing.0, missing.1).unwrap());
             assert_old_receipts(&conn, &saved_receipts);
             let after = receipts(&conn);
-            assert_eq!(after.len(), saved_receipts.len() + 3);
+            assert_eq!(after.len(), saved_receipts.len() + 4);
             assert_eq!(
                 after[saved_receipts.len()][1],
                 Value::Text(tail.steps()[2].1.into())
@@ -700,7 +717,8 @@ fn assert_journal_bridge_plan(plan: &WorkspaceSchemaMigrationPlan) {
             .collect::<Vec<_>>(),
         [
             (127, journal_removal_store::RETAINED_BRIDGE_NAME),
-            (128, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME)
+            (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME),
+            (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME)
         ]
     );
 }
@@ -730,6 +748,12 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
             "dry run must retain every old value and applied_at"
         );
         old_columns.remove("__yoi_schema_migrations");
+        // This suite owns failure-tail preservation. Ticket17 intentionally
+        // appends its receipt and retires this empty historical table;
+        // populated-row coverage belongs to ticket_plan_retirement.
+        assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
+        old_columns.remove("typed_ticket_orchestration_plans");
+        old_columns.remove("ticket_schema_migrations");
         let retained = values(&conn, &old_columns);
         drop(conn);
         let applied = SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -739,7 +763,7 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
             store.with_conn(|conn| {
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                 assert_old_receipts(conn, &old_receipts);
-                assert_eq!(receipts(conn).len(), old_receipts.len()+2, "no empty intermediate receipts");
+                assert_eq!(receipts(conn).len(), old_receipts.len()+3, "no empty intermediate receipts");
                 assert_eq!(values(conn, &old_columns), retained, "all old columns and values must remain exact");
                 assert_eq!(failure_signature(conn), expected, "all changed tables, keys and programs match fresh composition");
                 storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
@@ -851,14 +875,15 @@ fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_
             let conn = Connection::open(&path).unwrap();
             configure_sqlite(&conn).unwrap();
             journal_removal_store::migrate_to_v127(&conn).unwrap();
-            conn.execute_batch("CREATE TRIGGER interrupt_publication_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=128 BEGIN SELECT RAISE(ABORT,'injected publication receipt interruption'); END;").unwrap();
+            migrate_ticket_plan_retirement_v127_to_v128(&conn).unwrap();
+            conn.execute_batch("CREATE TRIGGER interrupt_publication_receipt BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=129 BEGIN SELECT RAISE(ABORT,'injected publication receipt interruption'); END;").unwrap();
             let before_schema = schema(&conn);
             let columns = all_columns(&conn);
             let before = values(&conn, &columns);
             let retained_receipts = receipts(&conn);
             assert!(SqliteWorkspaceStore::migration_plan(&path).is_err());
             assert!(apply_migrations(&conn).is_err());
-            assert_eq!(current_schema_version(&conn).unwrap(), 127);
+            assert_eq!(current_schema_version(&conn).unwrap(), 128);
             assert_eq!(schema(&conn), before_schema);
             assert_eq!(values(&conn, &columns), before);
             conn.execute_batch("DROP TRIGGER interrupt_publication_receipt")

@@ -863,7 +863,8 @@ mod tests {
         assert!(!server.contains("T-21"));
         assert!(server.contains("were omitted from this notice: 1"));
         assert!(server.contains("Re-query current Ticket authority"));
-        assert!(server.contains("Reread the current Ticket state before acting"));
+        assert!(server.contains("Reread the current Ticket body, discussion and typed relations"));
+        assert!(server.contains("current assignment/event identity and new input"));
         for secret in [
             "workspace_id",
             "Workspace:",
