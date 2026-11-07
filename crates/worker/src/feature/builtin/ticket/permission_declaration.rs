@@ -57,11 +57,6 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
             sets: &["implementer", "companion"],
         },
         BuiltinPermissionOperation {
-            key: "ticket.orchestration_plan.query",
-            description: "Query retained orchestration plan metadata; does not start work.",
-            sets: &["implementer", "companion"],
-        },
-        BuiltinPermissionOperation {
             key: "ticket.read",
             description: "Read the selected Ticket and its thread.",
             sets: &["implementer", "companion", "subject-default"],
@@ -119,11 +114,6 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         BuiltinPermissionOperation {
             key: "ticket.relation.remove",
             description: "Remove an exact relation or observed parent link on the authorized endpoints.",
-            sets: &["implementer", "companion"],
-        },
-        BuiltinPermissionOperation {
-            key: "ticket.orchestration_plan.record",
-            description: "Record plan metadata for this Ticket; does not grant execution authority.",
             sets: &["implementer", "companion"],
         },
         BuiltinPermissionOperation {

@@ -20,7 +20,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 16;
+const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 17;
 const BASELINE_MIGRATION_NAME: &str = "ticket schema baseline";
 
 #[derive(Clone, Copy)]
@@ -54,7 +54,6 @@ const OWNED_TABLES: &[&str] = &[
     "typed_ticket_relations",
     "typed_ticket_parent_links",
     "typed_ticket_parent_operations",
-    "typed_ticket_orchestration_plans",
     "typed_ticket_artifacts",
     "typed_ticket_case_metadata",
     "typed_ticket_case_history",
@@ -227,6 +226,7 @@ const RELATION_COLUMNS: &[ExpectedColumn] = &[
     column("at", "TEXT", true, 0),
 ];
 
+// Only retained component 7..=16 preimages contain this retired table.
 const ORCHESTRATION_PLAN_COLUMNS: &[ExpectedColumn] = &[
     column("workspace_id", "TEXT", true, 1),
     column("ticket_id", "TEXT", true, 2),
@@ -340,6 +340,8 @@ pub enum HistoricalTicketSchemaTarget {
     Subjects14,
     /// Service outbox, before work-decomposition parent links.
     Outbox15,
+    /// Work decomposition, before retiring historical orchestration records.
+    ParentLinks16,
 }
 impl HistoricalTicketSchemaTarget {
     fn shape(self) -> TicketSchemaShape {
@@ -350,6 +352,7 @@ impl HistoricalTicketSchemaTarget {
             Self::Content13 => TicketSchemaShape::ContentChanges13,
             Self::Subjects14 => TicketSchemaShape::Subjects14,
             Self::Outbox15 => TicketSchemaShape::Outbox15,
+            Self::ParentLinks16 => TicketSchemaShape::ParentLinks16,
         }
     }
 }
@@ -375,7 +378,7 @@ pub fn migrate_historical_sqlite_ticket_schema_in_transaction(
 /// A savepoint rolls back this component on failure without committing host work.
 /// Already-current schemas are verified, never repaired or backfilled.
 pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> Result<()> {
-    migrate_ticket_schema_to_in_transaction(connection, TicketSchemaShape::ParentLinks16)
+    migrate_ticket_schema_to_in_transaction(connection, TicketSchemaShape::PlanRetired17)
 }
 
 fn migrate_ticket_schema_to_in_transaction(
@@ -402,7 +405,7 @@ fn migrate_ticket_schema_to_in_transaction(
         let applied = load_applied_migrations(connection)?;
         if applied.is_empty() {
             connection
-                .execute_batch(include_str!("latest_schema.sql"))
+                .execute_batch(include_str!("frozen_schema_v10.sql"))
                 .map_err(sqlite_err)?;
             for version in 11..=target.version() {
                 apply_component_migration(connection, version)?;
@@ -444,7 +447,8 @@ fn migrate_ticket_schema_to_in_transaction(
                 | TicketSchemaShape::ContentChanges13
                 | TicketSchemaShape::Subjects14
                 | TicketSchemaShape::Outbox15
-                | TicketSchemaShape::ParentLinks16 => {}
+                | TicketSchemaShape::ParentLinks16
+                | TicketSchemaShape::PlanRetired17 => {}
             }
             if version < 10 {
                 append_component_receipt(connection, 10)?;
@@ -482,6 +486,7 @@ enum TicketSchemaShape {
     Subjects14,
     Outbox15,
     ParentLinks16,
+    PlanRetired17,
 }
 impl TicketSchemaShape {
     fn from_version(version: i64) -> Self {
@@ -496,6 +501,7 @@ impl TicketSchemaShape {
             14 => Self::Subjects14,
             15 => Self::Outbox15,
             16 => Self::ParentLinks16,
+            17 => Self::PlanRetired17,
             _ => unreachable!(),
         }
     }
@@ -511,6 +517,7 @@ impl TicketSchemaShape {
             Self::Subjects14 => 14,
             Self::Outbox15 => 15,
             Self::ParentLinks16 => 16,
+            Self::PlanRetired17 => 17,
         }
     }
     fn tags(self) -> bool {
@@ -524,6 +531,7 @@ impl TicketSchemaShape {
                 | Self::Subjects14
                 | Self::Outbox15
                 | Self::ParentLinks16
+                | Self::PlanRetired17
         )
     }
     fn cases(self) -> bool {
@@ -537,6 +545,7 @@ impl TicketSchemaShape {
                 | Self::Subjects14
                 | Self::Outbox15
                 | Self::ParentLinks16
+                | Self::PlanRetired17
         )
     }
 }
@@ -559,7 +568,7 @@ pub fn verify_historical_sqlite_ticket_schema(
 
 /// Verifies the current Ticket-owned SQLite schema without executing DDL.
 pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
-    verify_ticket_schema_shape(connection, TicketSchemaShape::ParentLinks16)
+    verify_ticket_schema_shape(connection, TicketSchemaShape::PlanRetired17)
 }
 
 /// Retained Workspace schema-66 migration produces the pre-classification v7
@@ -664,6 +673,18 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             CHILD_FOREIGN_KEYS,
         ),
     ] {
+        // Retained preimages still require the retired table; current stores reject it.
+        if table == "typed_ticket_orchestration_plans"
+            && matches!(shape, TicketSchemaShape::PlanRetired17)
+        {
+            if table_exists(connection, table)? {
+                push_diagnostic(
+                    &mut diagnostics,
+                    "retired Ticket orchestration storage remains".into(),
+                );
+            }
+            continue;
+        }
         if !shape.tags()
             && matches!(
                 table,
@@ -680,6 +701,7 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
                 | TicketSchemaShape::Subjects14
                 | TicketSchemaShape::Outbox15
                 | TicketSchemaShape::ParentLinks16
+                | TicketSchemaShape::PlanRetired17
         ) {
             if table == "typed_tickets" {
                 columns.retain(|c| c.name != "body");
@@ -897,13 +919,21 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             ),
         );
     }
+    if !matches!(shape, TicketSchemaShape::PlanRetired17) {
+        collect_foreign_key_check_diagnostics(
+            connection,
+            "typed_ticket_orchestration_plans",
+            &mut diagnostics,
+        );
+    }
     for table in OWNED_TABLES {
-        if !matches!(shape, TicketSchemaShape::ParentLinks16)
-            && matches!(
-                *table,
-                "typed_ticket_parent_links" | "typed_ticket_parent_operations"
-            )
-        {
+        if !matches!(
+            shape,
+            TicketSchemaShape::ParentLinks16 | TicketSchemaShape::PlanRetired17
+        ) && matches!(
+            *table,
+            "typed_ticket_parent_links" | "typed_ticket_parent_operations"
+        ) {
             continue;
         }
         if !shape.tags()
@@ -935,6 +965,7 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             | TicketSchemaShape::Subjects14
             | TicketSchemaShape::Outbox15
             | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
     ) {
         if let Err(error) = crate::assignment_tracking::verify_assignment_tracking_schema(
             connection,
@@ -943,6 +974,7 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
                 TicketSchemaShape::Subjects14
                     | TicketSchemaShape::Outbox15
                     | TicketSchemaShape::ParentLinks16
+                    | TicketSchemaShape::PlanRetired17
             ),
         ) {
             push_diagnostic(&mut diagnostics, error.to_string());
@@ -955,6 +987,7 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             | TicketSchemaShape::Subjects14
             | TicketSchemaShape::Outbox15
             | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
     ) {
         collect_index_diagnostics(
             connection,
@@ -971,16 +1004,22 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             | TicketSchemaShape::Subjects14
             | TicketSchemaShape::Outbox15
             | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
     ) {
         collect_content_change_diagnostics(connection, &mut diagnostics)?;
     }
     if matches!(
         shape,
-        TicketSchemaShape::Outbox15 | TicketSchemaShape::ParentLinks16
+        TicketSchemaShape::Outbox15
+            | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
     ) {
         collect_service_outbox_diagnostics(connection, &mut diagnostics)?;
     }
-    if matches!(shape, TicketSchemaShape::ParentLinks16) {
+    if matches!(
+        shape,
+        TicketSchemaShape::ParentLinks16 | TicketSchemaShape::PlanRetired17
+    ) {
         collect_parent_link_diagnostics(connection, &mut diagnostics)?;
     }
     if diagnostics.is_empty() {
@@ -1012,6 +1051,7 @@ fn apply_component_migration(connection: &Connection, version: i64) -> Result<()
         16 => connection
             .execute_batch(crate::parent_links::SCHEMA_SQL)
             .map_err(sqlite_err),
+        17 => crate::retire_orchestration_plans::migrate(connection),
         _ => unreachable!("bounded component migration"),
     }
 }
@@ -1026,6 +1066,7 @@ fn component_migration_name(version: i64) -> &'static str {
         14 => "Subject Ticket responsibility",
         15 => "Ticket Service transactional outbox",
         16 => "Ticket work-decomposition parent links",
+        17 => "Retire Ticket orchestration plans into historical comments",
         _ => unreachable!("bounded component receipt"),
     }
 }
@@ -1277,7 +1318,7 @@ fn migrate_legacy_cases(connection: &Connection) -> Result<()> {
 }
 fn add_tag_schema(connection: &Connection) -> Result<()> {
     // Use the exact canonical DDL rather than duplicating migration definitions.
-    let (_, tag_schema) = include_str!("latest_schema.sql")
+    let (_, tag_schema) = include_str!("frozen_schema_v10.sql")
         .split_once("-- Workspace tag foundation (v8): shared by fresh schema and v7 upgrade.")
         .expect("canonical tag schema marker");
     connection.execute_batch(tag_schema).map_err(sqlite_err)
@@ -1453,7 +1494,7 @@ fn recognized_schema_version(applied: &BTreeMap<i64, String>) -> Result<i64> {
             }
             // Versions 8 and 9 were independent baseline generations, not
             // ordered upgrades. Both compose at10; v6 additionally needs v7.
-            for version in [7, 10, 11, 12, 13, 14, 15, 16] {
+            for version in [7, 10, 11, 12, 13, 14, 15, 16, 17] {
                 if version <= baseline || (version == 7 && baseline != 6) {
                     continue;
                 }
@@ -1970,7 +2011,8 @@ mod tests {
                 (13, "Ticket content change facts".to_owned()),
                 (14, "Subject Ticket responsibility".to_owned()),
                 (15, "Ticket Service transactional outbox".to_owned()),
-                (16, "Ticket work-decomposition parent links".to_owned())
+                (16, "Ticket work-decomposition parent links".to_owned()),
+                (17, component_migration_name(17).to_owned())
             ])
         );
     }
@@ -2113,7 +2155,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain a canonical baseline and ordered migrations through 16"
+            "migration history must contain a canonical baseline and ordered migrations through 17"
         ));
         assert_eq!(load_applied_migrations(&connection).unwrap().len(), 2);
     }
@@ -2135,7 +2177,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain a canonical baseline and ordered migrations through 16"
+            "migration history must contain a canonical baseline and ordered migrations through 17"
         ));
         assert!(!table_exists(&connection, "typed_tickets").unwrap());
     }

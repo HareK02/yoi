@@ -97,6 +97,8 @@ use memory::backend::{
 use protocol::Segment;
 use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use server_api::TICKET_RELATIONS_QUERY_PATH;
 use server_api::{
     ActorAuthMethod, AuthBootstrapUserRequest, AuthPublicConfig, AuthUserResponse,
     AuthenticatedUser, BrowserCreateWorkerResponse, BrowserWorkspaceOrchestratorResponse,
@@ -150,8 +152,6 @@ use server_api::{
     RuntimeWorkersQuery, RuntimeWorkersStatusFilter, WorkerFileDeleteResponse,
     WorkerFileUploadQuery, WorkerFileUploadResponse,
 };
-#[cfg(test)]
-use server_api::{TICKET_ORCHESTRATION_PLANS_QUERY_PATH, TICKET_RELATIONS_QUERY_PATH};
 use sha2::{Digest, Sha256};
 use ticket::{
     MarkdownText, NewTicketEvent, TicketBackend, TicketBodyReplacement, TicketEventKind,
@@ -8305,7 +8305,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_relation_query(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::ticket_orchestration_plan_query(service.clone()))
         .merge(server_api::server_api_axum::ticket_record_get(
             service.clone(),
         ))
@@ -8413,7 +8412,6 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::ticket_relation_remove(
             service.clone(),
         ))
-        .merge(server_api::server_api_axum::ticket_orchestration_plan_record(service.clone()))
         .merge(server_api::server_api_axum::ticket_get(service.clone()))
         .merge(server_api::server_api_axum::ticket_edit(service.clone()))
         .merge(server_api::server_api_axum::ticket_post_get(
@@ -12795,26 +12793,6 @@ impl server_api::ServerApi for ServerApiContractService {
         Ok(server_api::TicketRelationRecordList(response))
     }
 
-    async fn ticket_orchestration_plan_query(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        request: server_api::TicketOrchestrationPlanSearchRequest,
-    ) -> std::result::Result<
-        server_api::TicketOrchestrationPlanRecordList,
-        server_api::RepositoryApiError,
-    > {
-        let Json(response) = scoped_query_ticket_orchestration_plans(
-            State(self.workspace_api()?.clone()),
-            AxumPath(ScopedWorkspacePath { workspace_id }),
-            contract_request_headers(&context)?,
-            Json(request),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(server_api::TicketOrchestrationPlanRecordList(response))
-    }
-
     async fn ticket_record_get(
         &self,
         context: server_api::ServerRequestContext,
@@ -13474,27 +13452,6 @@ impl server_api::ServerApi for ServerApiContractService {
         .await
         .map_err(ApiError::into_repository_api_error)?;
         Ok(server_api::TicketRelationRecord(response))
-    }
-
-    async fn ticket_orchestration_plan_record(
-        &self,
-        context: server_api::ServerRequestContext,
-        workspace_id: String,
-        id: String,
-        request: server_api::CreateTicketOrchestrationPlanRequest,
-    ) -> std::result::Result<
-        server_api::TicketOrchestrationPlanRecord,
-        server_api::RepositoryApiError,
-    > {
-        let Json(response) = scoped_record_ticket_orchestration_plan(
-            State(self.workspace_api()?.clone()),
-            AxumPath((workspace_id, id)),
-            contract_request_headers(&context)?,
-            Json(request.0),
-        )
-        .await
-        .map_err(ApiError::into_repository_api_error)?;
-        Ok(server_api::TicketOrchestrationPlanRecord(response))
     }
 
     async fn ticket_get(
@@ -21667,50 +21624,6 @@ async fn scoped_ticket_relation_view(
     })
 }
 
-async fn scoped_record_ticket_orchestration_plan(
-    State(api): State<WorkspaceApi>,
-    AxumPath((workspace_id, id)): AxumPath<(String, String)>,
-    headers: HeaderMap,
-    Json(record): Json<ticket::NewOrchestrationPlanRecord>,
-) -> ApiResult<Json<ticket::OrchestrationPlanRecord>> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &workspace_id,
-        headers,
-        TicketBackendOperation::AddOrchestrationPlanRecord {
-            id: TicketIdOrSlug::Query(id),
-            record,
-        },
-    )
-    .await?;
-    ticket_rest_result(result, |result| match result {
-        TicketBackendOperationResult::OrchestrationPlanRecord(record) => Some(record),
-        _ => None,
-    })
-}
-
-async fn scoped_query_ticket_orchestration_plans(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    headers: HeaderMap,
-    Json(query): Json<server_api::TicketOrchestrationPlanSearchRequest>,
-) -> ApiResult<Json<Vec<ticket::OrchestrationPlanRecord>>> {
-    let result = execute_ticket_rest_operation(
-        &api,
-        &path.workspace_id,
-        headers,
-        TicketBackendOperation::QueryOrchestrationPlanRecords {
-            ticket: query.ticket,
-            kind: query.kind,
-        },
-    )
-    .await?;
-    ticket_rest_result(result, |result| match result {
-        TicketBackendOperationResult::OrchestrationPlanRecords(records) => Some(records),
-        _ => None,
-    })
-}
-
 async fn scoped_ticket_doctor(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -21867,8 +21780,7 @@ fn ticket_mutation_target(operation: &TicketBackendOperation) -> Option<&TicketI
         | TicketBackendOperation::SetTicketTags { id, .. }
         | TicketBackendOperation::SetParentLink { id, .. }
         | TicketBackendOperation::AddTicketRelation { id, .. }
-        | TicketBackendOperation::RemoveTicketRelation { id, .. }
-        | TicketBackendOperation::AddOrchestrationPlanRecord { id, .. } => Some(id),
+        | TicketBackendOperation::RemoveTicketRelation { id, .. } => Some(id),
         _ => None,
     }
 }
@@ -21913,9 +21825,6 @@ fn bind_worker_ticket_operation_source(
         TicketBackendOperation::AddTicketRelation { relation, .. } => {
             relation.author = Some(author)
         }
-        TicketBackendOperation::AddOrchestrationPlanRecord { record, .. } => {
-            record.author = Some(author)
-        }
         _ => {}
     }
 }
@@ -21936,7 +21845,6 @@ fn ticket_mutation_operation_kind(operation: &TicketBackendOperation) -> &'stati
         TicketBackendOperation::SetParentLink { .. } => "set_parent",
         TicketBackendOperation::AddTicketRelation { .. } => "add_relation",
         TicketBackendOperation::RemoveTicketRelation { .. } => "remove_relation",
-        TicketBackendOperation::AddOrchestrationPlanRecord { .. } => "add_plan_record",
         _ => "read",
     }
 }
@@ -69475,10 +69383,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        for path in [
-            TICKET_RELATIONS_QUERY_PATH,
-            TICKET_ORCHESTRATION_PLANS_QUERY_PATH,
-        ] {
+        for path in [TICKET_RELATIONS_QUERY_PATH] {
             let response = app
                 .clone()
                 .oneshot(

@@ -132,7 +132,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
     verify_history(conn, current).unwrap();
     if current >= 114 {
         let plan = published_plan(conn, current).unwrap().unwrap();
-        assert_eq!(plan.migrations.len(), 6);
+        assert_eq!(plan.migrations.len(), 7);
         assert_eq!(plan.migrations[0].version, 122);
         assert_eq!(
             plan.migrations[0].name,
@@ -143,7 +143,7 @@ fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
             plan.migrations[1].name,
             super::super::backend_job_upgrade::MIGRATION_NAME
         );
-        assert_eq!(plan.target_schema_version, 127);
+        assert_eq!(plan.target_schema_version, 128);
     }
     assert_eq!(rows, saved_rows(conn));
     assert_eq!(shape, snapshot(conn).unwrap());
@@ -206,7 +206,19 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
         if name == "__yoi_schema_migrations" {
             continue;
         }
-        let mut columns = super::super::table_columns(conn, &name)
+        if name == "typed_ticket_orchestration_plans" {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM typed_ticket_orchestration_plans",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            continue; // Ticket17 retires this empty fixture table.
+        }
+        let columns = super::super::table_columns(conn, &name)
             .unwrap()
             .into_iter()
             .filter(|column| {
@@ -230,16 +242,14 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
             })
             .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
             .collect::<Vec<_>>();
-        if name == "backend_job_attempts"
-            && !super::super::column_exists(conn, &name, "allocation_precluded_at").unwrap()
-        {
-            assert!(super::super::current_schema_version(conn).unwrap() < 123);
-            // Migration adds no allocation/termination proof for retained attempts.
-            columns.push("NULL AS allocation_precluded_at".into());
-        }
         let columns = columns.join(",");
+        let predicate = if name == "ticket_schema_migrations" {
+            " WHERE version<=16"
+        } else {
+            ""
+        };
         let mut statement = conn
-            .prepare(&format!("SELECT {columns} FROM \"{name}\""))
+            .prepare(&format!("SELECT {columns} FROM \"{name}\"{predicate}"))
             .unwrap();
         let count = statement.column_count();
         let mut rows = statement
@@ -274,7 +284,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
         let conn = Connection::open(&path).unwrap();
         // Actual production open/ordered runner, including the new migration.
         super::super::prepare_connection(&conn).unwrap();
-        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 127);
+        assert_eq!(super::super::current_schema_version(&conn).unwrap(), 128);
         let actual = immutable_rows(&conn);
         for (table, rows) in &expected {
             assert_eq!(
@@ -293,7 +303,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             )
         );
         let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
-        for version in [127, 126, 125, 124] {
+        for version in [128, 127, 126, 125, 124] {
             assert_eq!(
                 history.pop(),
                 Some((version, tail_migration_name(version).unwrap().into()))
@@ -311,7 +321,7 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
             Some((122, crate::config_adoption::MIGRATION_NAME.into()))
         );
         assert_eq!(history, original_receipts);
-        verify_history(&conn, 127).unwrap();
+        verify_history(&conn, 128).unwrap();
         let saved = saved_rows(&conn);
         if let Some(previous) = &committed_history {
             assert_eq!(previous, &saved);

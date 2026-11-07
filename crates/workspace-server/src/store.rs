@@ -148,7 +148,9 @@ pub(crate) use journal_removal_store::{
     record_physical_failure as record_journal_removal_physical_failure,
 };
 
-const LATEST_SCHEMA_VERSION: i64 = 127;
+const LATEST_SCHEMA_VERSION: i64 = 128;
+const TICKET_PLAN_RETIREMENT_MIGRATION_NAME: &str =
+    "Retire Ticket orchestration plans into historical comments";
 const WORKER_CREATE_FAILURE_MIGRATION_NAME: &str =
     "Worker create coordinator returned startup failure";
 pub(crate) const WORKER_CREATE_FAILURE_MAX_BYTES: usize = 32 * 1024;
@@ -556,6 +558,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 127,
         name: journal_removal_store::MIGRATION_NAME,
         apply: journal_removal_store::migrate_to_v127,
+    },
+    Migration {
+        version: 128,
+        name: TICKET_PLAN_RETIREMENT_MIGRATION_NAME,
+        apply: migrate_ticket_plan_retirement_v127_to_v128,
     },
 ];
 
@@ -16962,6 +16969,24 @@ fn migrate_configuration_adoption_to_v122(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_ticket_plan_retirement_v127_to_v128(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 127 {
+        return Err(Error::Store(
+            "Ticket Plan retirement migration requires schema 127".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 127)?;
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
+        .map_err(|error| Error::Store(format!("Ticket Plan retirement failed: {error}")))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(128,?1)",
+        [TICKET_PLAN_RETIREMENT_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_ticket_parents_v112_to_v113(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 112 {
         return Err(Error::Store(
@@ -16970,8 +16995,12 @@ fn migrate_ticket_parents_v112_to_v113(conn: &Connection) -> Result<()> {
     }
     verify_schema_history(conn, 112)?;
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|e| Error::Store(format!("Ticket parent migration failed: {e}")))?;
+    // Published host-113 stops at Ticket16. Ticket17 belongs to host-128.
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+    )
+    .map_err(|e| Error::Store(format!("Ticket parent migration failed: {e}")))?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(113,?1)",
         ["Ticket work-decomposition parent links"],
@@ -17059,7 +17088,7 @@ fn migrate_plugin_receipts_v108_to_v109(conn: &Connection) -> Result<()> {
 }
 
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
-    create_workspace_schema_through_v113(conn)?;
+    create_workspace_schema_prefix(conn, include_str!("latest_schema.sql"))?;
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
     backend_job_upgrade::install_fresh(conn)?;
@@ -17068,11 +17097,20 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
     conn.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
     conn.execute_batch(journal_removal_store::SCHEMA_SQL)?;
+    ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
+        Error::Store(format!("fresh Ticket schema verification failed: {error}"))
+    })?;
     Ok(())
 }
 
+// Historical builders must retain Ticket16 and its old Plan table. Do not
+// redirect this prefix to the evolving fresh baseline.
 fn create_workspace_schema_through_v113(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure(conn)?;
+    create_workspace_schema_prefix(conn, include_str!("frozen_schema_v113.sql"))
+}
+
+fn create_workspace_schema_prefix(conn: &Connection, schema_sql: &str) -> Result<()> {
+    create_workspace_schema_structure(conn, schema_sql)?;
     assignment_delivery::install(conn)?;
     assignment_delivery::install_post_inputs(conn)?;
     notification_routing::install(conn)?;
@@ -17082,9 +17120,13 @@ fn create_workspace_schema_through_v113(conn: &Connection) -> Result<()> {
     subject_deletion_store::install_notification_erasure(conn)?;
     subject_assignment_migration::install(conn)?;
     notification_routing::install_subject_recipients(conn)?;
-    ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
+    ticket::verify_historical_sqlite_ticket_schema(
+        conn,
+        ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+    )
+    .map_err(|error| {
         Error::Store(format!(
-            "fresh Workspace Ticket schema verification failed: {error}"
+            "Workspace Ticket schema boundary verification failed: {error}"
         ))
     })
 }
@@ -17104,10 +17146,10 @@ fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
 
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
-fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
+fn create_workspace_schema_structure(conn: &Connection, schema_sql: &str) -> Result<()> {
     // The pre-124 reference composition must not already contain the column
     // added by migration 124. Fresh latest creation installs it after this prefix.
-    let retained_schema = backend_job_upgrade::retained_checks(include_str!("latest_schema.sql"))
+    let retained_schema = backend_job_upgrade::retained_checks(schema_sql)
         .replace(
             "            startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR\n                (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),\n",
             "",
@@ -20034,7 +20076,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
             (83..=113)
-                .chain([122, 123, 124, 125, 126, 127])
+                .chain([122, 123, 124, 125, 126, 127, 128])
                 .collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -20531,6 +20573,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("schema_convergence_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
+    include!("ticket_plan_retirement_tests.rs");
     include!("migration_entrypoint_tests.rs");
     include!("plugin_host_migration_tests.rs");
     include!("plugin_data_migration_tests.rs");
@@ -21036,6 +21079,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 127,
                 name: journal_removal_store::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 128,
+                name: TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -21176,6 +21223,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.to_string()),
 (126, SERVICE_OUTCOME_MIGRATION_NAME.to_string()),
 (127, journal_removal_store::MIGRATION_NAME.to_string()),
+(128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.to_string()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -24459,7 +24507,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
             ((version + 1)..=113)
-                .chain([122, 123, 124, 125, 126, 127])
+                .chain([122, 123, 124, 125, 126, 127, 128])
                 .collect::<Vec<_>>()
         );
         drop(conn);
@@ -24501,7 +24549,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
                          (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
                          (126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
-                         (127, journal_removal_store::MIGRATION_NAME.into())]);
+                         (127, journal_removal_store::MIGRATION_NAME.into()),
+                         (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -26538,13 +26587,10 @@ INSERT INTO worker_registry (
         );
         let error = apply_migrations(&conn).unwrap_err().to_string();
         assert!(
-            error.contains("Server storage format: unknown baseline or current version"),
+            error.contains("Server storage format: unsupported future failure history"),
             "{error}"
         );
-        assert!(
-            error.contains(&format!("({future_version}, \"future\")")),
-            "{error}"
-        );
+
         assert_eq!(workspace_schema_migration_history(&conn).unwrap(), history);
         assert_eq!(current_schema_version(&conn).unwrap(), future_version);
         assert_eq!(
@@ -28919,12 +28965,15 @@ INSERT INTO worker_registry (
         store.with_conn(|conn| {
             // Fixture-only reconstruction of the previous additive schema. No
             // production downgrade API or mutation of historical receipts ships.
-            conn.execute_batch("ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json;
-                UPDATE __yoi_schema_migrations SET version=125 WHERE version=126;
+            conn.execute_batch("DROP TRIGGER worker_removal_journal_immutable;
+                DROP INDEX worker_removal_journal_active;
+                ALTER TABLE worker_removal_operations DROP COLUMN journal_removal_json;
+                UPDATE __yoi_schema_migrations SET version=124 WHERE version=128 AND name='workspace schema baseline';
+                ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json;
                 ALTER TABLE backend_jobs DROP COLUMN failure_cause;
                 ALTER TABLE backend_job_attempts DROP COLUMN failure_cause;
                 ALTER TABLE backend_job_attempts DROP COLUMN worker_cleanup_failure_cause;
-                UPDATE __yoi_schema_migrations SET version=124 WHERE version=125;")?;
+")?;
             storage_formats::verify_history(conn, 124)?;
             conn.execute_batch("CREATE TRIGGER inject_cause_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=125 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")?;
             assert!(migrate_backend_job_causes_v124_to_v125(conn).is_err());

@@ -12,7 +12,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
     assert!(!table_exists(&conn, "plugin_invocations").unwrap());
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 108);
-    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110, 111, 112, 113, 122, 123, 124, 125, 126, 127]);
+    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110, 111, 112, 113, 122, 123, 124, 125, 126, 127, 128]);
     let expected_history: Vec<_> = history.iter().cloned()
         .chain(plan.migrations.iter().map(|step| (step.version, step.name.clone())))
         .collect();
@@ -27,7 +27,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
         assert_eq!(upgraded, expected_history);
         assert_eq!(upgraded.iter().find(|(version, _)| *version == 109).unwrap().1, "Durable Plugin Host invocations and HTTPS effect receipts");
         assert_eq!(upgraded.iter().find(|(version, _)| *version == 110).unwrap().1, "Worker Plugin launch selection associations");
-        assert_eq!(upgraded.last().unwrap(), &(127, journal_removal_store::MIGRATION_NAME.into()));
+        assert_eq!(upgraded.last().unwrap(), &(128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into()));
         assert_eq!(conn.query_row("SELECT count(*) FROM workspaces WHERE workspace_id='space'", [], |row| row.get::<_, i64>(0))?, 1);
         assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0))?, 0);
         Ok(())

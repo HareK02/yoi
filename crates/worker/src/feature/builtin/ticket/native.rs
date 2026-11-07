@@ -631,33 +631,6 @@ pub(super) fn contract(op: &str) -> Contract {
                 page("cursor", "limit"),
             ],
         ),
-        "record_orchestration_plan" => (
-            "record_orchestration_plan",
-            "Record project-level ordering/conflict/capacity/accepted-plan context without moving case state or starting work. Domain validates kind-specific requirements.",
-            vec![
-                p("kind", true, plan_kind()),
-                p("related_ticket", false, ticket_ref()),
-                p("note", false, Shape::String),
-                p(
-                    "accepted_plan",
-                    false,
-                    record(vec![
-                        p("summary", true, Shape::String),
-                        p("branch", false, Shape::String),
-                        p("worktree", false, Shape::String),
-                        p("role_plan", false, Shape::String),
-                    ]),
-                ),
-            ],
-        ),
-        "query_orchestration_plans" => (
-            "query_orchestration_plans",
-            "Read bounded project-level plan records; planning history is not execution authority.",
-            vec![
-                rename("kind", "relation_kind", false, plan_kind()),
-                p("limit", false, Shape::Integer),
-            ],
-        ),
         _ => unreachable!("every enabled native Ticket action has a contract: {op}"),
     };
     Contract {
@@ -666,19 +639,6 @@ pub(super) fn contract(op: &str) -> Contract {
         parameters,
     }
 }
-fn plan_kind() -> Shape {
-    enumeration(&[
-        "before",
-        "after",
-        "blocked_by",
-        "blocks",
-        "conflicts_with",
-        "do_not_parallelize",
-        "waiting_capacity_note",
-        "accepted_plan",
-    ])
-}
-
 pub(super) fn input(
     op: &str,
     arguments: &BTreeMap<String, WipValue>,

@@ -64,8 +64,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use ticket::{
-    NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
-    OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult, Ticket, TicketBackend,
+    NewTicket, NewTicketEvent, NewTicketRelation, Result as TicketResult, Ticket, TicketBackend,
     TicketBackendOperation, TicketBackendOperationResult, TicketDoctorReport, TicketError,
     TicketIdOrSlug, TicketIntakeSummary, TicketListQuery, TicketRef, TicketRelation,
     TicketRelationKind, TicketRelationView, TicketState, TicketStateChange, TicketSummary,
@@ -799,8 +798,6 @@ const WORKFLOW_TOOL_NAMES: &[&str] = &[
     "TicketDependencyCheck",
     "TicketRelationRecord",
     "TicketRelationRemove",
-    "TicketOrchestrationPlanRecord",
-    "TicketOrchestrationPlanQuery",
     "WorkspaceTagList",
     "WorkspaceTagCreate",
     "WorkspaceTagRename",
@@ -826,8 +823,6 @@ const WORKFLOW_ADDITIONAL_TOOL_NAMES: &[&str] = &[
     "TicketDependencyCheck",
     "TicketRelationRecord",
     "TicketRelationRemove",
-    "TicketOrchestrationPlanRecord",
-    "TicketOrchestrationPlanQuery",
 ];
 
 #[derive(Clone, Debug)]
@@ -1497,44 +1492,6 @@ impl WorkspaceHttpTicketBackend {
                 )?;
                 Ok(TicketBackendOperationResult::RelationView(view))
             }
-            TicketBackendOperation::AddOrchestrationPlanRecord { id, record } => {
-                authorize_ticket_item(client.as_ref(), "ticket.orchestration_plan.record", &id)?;
-                let record = Self::request(
-                    client,
-                    WorkspaceRequestMethod::Post,
-                    format!("{base}/{}/orchestration-plans", Self::ticket_path(&id)),
-                    Some(serde_json::to_value(record).map_err(|error| {
-                        TicketError::Conflict(format!(
-                            "serialize Ticket orchestration plan: {error}"
-                        ))
-                    })?),
-                )?;
-                Ok(TicketBackendOperationResult::OrchestrationPlanRecord(
-                    record,
-                ))
-            }
-            TicketBackendOperation::QueryOrchestrationPlanRecords { ticket, kind } => {
-                match &ticket {
-                    Some(id) => authorize_ticket_item(
-                        client.as_ref(),
-                        "ticket.orchestration_plan.query",
-                        id,
-                    ),
-                    None => authorize_ticket_operation(
-                        client.as_ref(),
-                        "ticket.orchestration_plan.query",
-                    ),
-                }?;
-                let records = Self::request(
-                    client,
-                    WorkspaceRequestMethod::Post,
-                    format!("{base}/orchestration-plans/search"),
-                    Some(serde_json::json!({ "ticket": ticket, "kind": kind })),
-                )?;
-                Ok(TicketBackendOperationResult::OrchestrationPlanRecords(
-                    records,
-                ))
-            }
             TicketBackendOperation::Doctor => {
                 authorize_ticket_operation(client.as_ref(), "ticket.doctor")?;
                 let report = Self::request(
@@ -1786,28 +1743,6 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         )
     }
 
-    fn add_orchestration_plan_record(
-        &self,
-        id: TicketIdOrSlug,
-        record: NewOrchestrationPlanRecord,
-    ) -> TicketResult<OrchestrationPlanRecord> {
-        expect_ticket_result!(
-            self.invoke(TicketBackendOperation::AddOrchestrationPlanRecord { id, record }),
-            TicketBackendOperationResult::OrchestrationPlanRecord
-        )
-    }
-
-    fn query_orchestration_plan_records(
-        &self,
-        ticket: Option<TicketIdOrSlug>,
-        kind: Option<OrchestrationPlanKind>,
-    ) -> TicketResult<Vec<OrchestrationPlanRecord>> {
-        expect_ticket_result!(
-            self.invoke(TicketBackendOperation::QueryOrchestrationPlanRecords { ticket, kind }),
-            TicketBackendOperationResult::OrchestrationPlanRecords
-        )
-    }
-
     fn doctor(&self) -> TicketResult<TicketDoctorReport> {
         expect_ticket_result!(
             self.invoke(TicketBackendOperation::Doctor),
@@ -2002,18 +1937,6 @@ fn native_ticket_operation(tool_name: &str) -> Option<NativeTicketOperation> {
             surface: NativeTicketSurface::Item,
             identity_field: Some("ticket"),
             mutating: true,
-        },
-        "TicketOrchestrationPlanRecord" => NativeTicketOperation {
-            operation: "record_orchestration_plan",
-            surface: NativeTicketSurface::Item,
-            identity_field: Some("ticket"),
-            mutating: true,
-        },
-        "TicketOrchestrationPlanQuery" => NativeTicketOperation {
-            operation: "query_orchestration_plans",
-            surface: NativeTicketSurface::Item,
-            identity_field: Some("ticket"),
-            mutating: false,
         },
         _ => return None,
     };
@@ -4110,7 +4033,10 @@ status,
         assert!(orchestration_tools.contains(&"TicketCaseUpdate"));
         assert!(orchestration_tools.contains(&"TicketDependencyCheck"));
         assert!(orchestration_tools.contains(&"TicketRelationRecord"));
-        assert!(orchestration_tools.contains(&"TicketOrchestrationPlanRecord"));
+        assert!(orchestration_tools.contains(&"TicketAssignmentTrackingQuery"));
+        assert!(orchestration_tools.contains(&"TicketAssignmentAnswer"));
+        assert!(!orchestration_tools.contains(&"TicketOrchestrationPlanRecord"));
+        assert!(!orchestration_tools.contains(&"TicketOrchestrationPlanQuery"));
         assert!(!orchestration_tools.contains(&"TicketEditItem"));
         assert!(!orchestration_tools.contains(&"TicketEditPost"));
         assert!(!orchestration_tools.contains(&"TicketQueue"));
@@ -5317,26 +5243,6 @@ status,
                 "ticket.relation.read",
                 TicketBackendOperation::RelationView { id: id.clone() },
             ),
-            (
-                "ticket.orchestration_plan.record",
-                TicketBackendOperation::AddOrchestrationPlanRecord {
-                    id,
-                    record: NewOrchestrationPlanRecord {
-                        kind: OrchestrationPlanKind::Before,
-                        related_ticket: Some("T-740".into()),
-                        note: None,
-                        accepted_plan: None,
-                        author: None,
-                    },
-                },
-            ),
-            (
-                "ticket.orchestration_plan.query",
-                TicketBackendOperation::QueryOrchestrationPlanRecords {
-                    ticket: None,
-                    kind: None,
-                },
-            ),
             ("ticket.doctor", TicketBackendOperation::Doctor),
         ];
         for (name, action) in [
@@ -5391,7 +5297,6 @@ status,
                     | "ticket.list"
                     | "ticket.create"
                     | "ticket.relation.query"
-                    | "ticket.orchestration_plan.query"
                     | "ticket.doctor"
                     | "ticket.tag.create"
                     | "ticket.tag.rename"

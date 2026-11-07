@@ -25,8 +25,9 @@ fn service_migration_preserves_history_has_no_backfill_and_matches_fresh() {
     let objects = |c: &Connection| -> Result<Vec<(String, String)>> {
         Ok(c.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND (name LIKE 'plugin_service_%' OR name LIKE 'typed_ticket_service_outbox%') ORDER BY name")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
     };
-    assert_eq!(objects(&conn).unwrap(), fresh.with_conn(objects).unwrap());
     assert!(migrate_plugin_services_v111_to_v112(&conn).is_err());
+    apply_migrations(&conn).unwrap();
+    assert_eq!(objects(&conn).unwrap(), fresh.with_conn(objects).unwrap());
 }
 
 #[test]

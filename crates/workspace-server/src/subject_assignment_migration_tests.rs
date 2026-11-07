@@ -1000,6 +1000,13 @@ mod subject_assignment_migration_tests {
             tables
                 .into_iter()
                 .filter(|table| !preserved || !table.contains("schema_migrations"))
+                .filter(|table| {
+                    if preserved && table == "typed_ticket_orchestration_plans" {
+                        assert_eq!(conn.query_row("SELECT count(*) FROM typed_ticket_orchestration_plans", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+                        return false; // Ticket17 retires this empty fixture table.
+                    }
+                    true
+                })
                 .map(|table| {
                     let columns = conn
                         .prepare(&format!("PRAGMA table_info(\"{table}\")"))
@@ -1085,7 +1092,7 @@ mod subject_assignment_migration_tests {
             assert_eq!(history.len(), host.len() + expected.len());
             let history = component_history(conn);
             assert_eq!(&history[..component.len()], component, "owner receipt prefix is preserved");
-            assert_eq!(history.len(), component.len() + 3);
+            assert_eq!(history.len(), component.len() + 4);
             let tail: Vec<(i64, String, String)> = conn.prepare("SELECT version,name,applied_at FROM ticket_schema_migrations WHERE version>=14 ORDER BY version").unwrap()
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
             assert_eq!(
@@ -1096,6 +1103,7 @@ mod subject_assignment_migration_tests {
                     (14, "Subject Ticket responsibility"),
                     (15, "Ticket Service transactional outbox"),
                     (16, "Ticket work-decomposition parent links"),
+                    (17, "Retire Ticket orchestration plans into historical comments"),
                 ]
             );
             assert!(tail.iter().all(|(_,_,at)| !at.is_empty()));

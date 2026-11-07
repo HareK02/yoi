@@ -84,7 +84,13 @@ fn fixture(path: &Path, tail: Tail, current: i64, origin: Origin) {
         Origin::Fresh | Origin::Fresh124Prefix => {
             let conn = Connection::open(path).unwrap();
             configure_sqlite(&conn).unwrap();
-            ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+                &tx,
+                ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+            )
+            .unwrap();
+            tx.commit().unwrap();
             merge_request::migrate(&conn).unwrap();
             // Same rebuild window as the fresh owner: execution-123 rebuilds
             // parent tables before installing their final guards.
@@ -339,6 +345,11 @@ fn assert_plan(plan: &WorkspaceSchemaMigrationPlan, tail: Tail, current: i64) {
                 journal_removal_store::MIGRATION_NAME,
                 journal_removal_store::SCHEMA_SQL
             )))
+            .chain(std::iter::once((
+                128,
+                TICKET_PLAN_RETIREMENT_MIGRATION_NAME,
+                ""
+            )))
             .filter(|(version, _, _)| *version > current)
             .map(|(version, name, _)| (version, name))
             .collect::<Vec<_>>()
@@ -378,6 +389,12 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
                     "dry run changed source data/receipts"
                 );
                 old_columns.remove("__yoi_schema_migrations");
+                // This suite owns failure-tail preservation. Ticket17 intentionally
+                // appends its receipt and retires this empty historical table;
+                // populated-row coverage belongs to ticket_plan_retirement.
+                assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
+                old_columns.remove("typed_ticket_orchestration_plans");
+                old_columns.remove("ticket_schema_migrations");
                 let retained = values(&conn, &old_columns);
                 drop(conn);
 
@@ -482,9 +499,9 @@ fn combined_failure_receipt_126_abort_rolls_back_ddl_and_data_then_retries_once(
             assert!(column_exists(&conn, missing.0, missing.1).unwrap());
             assert_old_receipts(&conn, &saved_receipts);
             let after = receipts(&conn);
-            assert_eq!(after.len(), saved_receipts.len() + 2);
+            assert_eq!(after.len(), saved_receipts.len() + 3);
             assert_eq!(
-                after[after.len() - 2][1],
+                after[after.len() - 3][1],
                 Value::Text(tail.steps()[2].1.into())
             );
             apply_migrations(&conn).unwrap();
@@ -673,13 +690,16 @@ fn published_journal(path: &Path, sql: &str) -> Connection {
 
 fn assert_journal_bridge_plan(plan: &WorkspaceSchemaMigrationPlan) {
     assert_eq!(plan.current_schema_version, 124);
-    assert_eq!(plan.target_schema_version, 127);
+    assert_eq!(plan.target_schema_version, 128);
     assert_eq!(
         plan.migrations
             .iter()
             .map(|step| (step.version, step.name.as_str()))
             .collect::<Vec<_>>(),
-        [(127, journal_removal_store::RETAINED_BRIDGE_NAME)]
+        [
+            (127, journal_removal_store::RETAINED_BRIDGE_NAME),
+            (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME)
+        ]
     );
 }
 
@@ -708,6 +728,12 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
             "dry run must retain every old value and applied_at"
         );
         old_columns.remove("__yoi_schema_migrations");
+        // This suite owns failure-tail preservation. Ticket17 intentionally
+        // appends its receipt and retires this empty historical table;
+        // populated-row coverage belongs to ticket_plan_retirement.
+        assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
+        old_columns.remove("typed_ticket_orchestration_plans");
+        old_columns.remove("ticket_schema_migrations");
         let retained = values(&conn, &old_columns);
         drop(conn);
         let applied = SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -715,12 +741,12 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
         for _ in 0..2 {
             let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
             store.with_conn(|conn| {
-                assert_eq!(current_schema_version(conn)?, 127);
+                assert_eq!(current_schema_version(conn)?, 128);
                 assert_old_receipts(conn, &old_receipts);
-                assert_eq!(receipts(conn).len(), old_receipts.len()+1, "no empty intermediate receipts");
+                assert_eq!(receipts(conn).len(), old_receipts.len()+2, "no empty intermediate receipts");
                 assert_eq!(values(conn, &old_columns), retained, "all old columns and values must remain exact");
                 assert_eq!(failure_signature(conn), expected, "all changed tables, keys and programs match fresh composition");
-                storage_formats::verify_history(conn, 127)?;
+                storage_formats::verify_history(conn, 128)?;
                 assert_eq!(rows(conn, "SELECT j.state,a.state,j.failure_cause FROM backend_jobs j JOIN backend_job_attempts a USING(workspace_id,job_id) WHERE j.job_id='after-retirement'"),
                     vec![vec![Value::Text("pending".into()),Value::Text("reserved".into()),Value::Null]], "Job-123 must not sweep a post-retirement Job again");
                 assert!(rows(conn, "PRAGMA foreign_key_check").is_empty());
@@ -772,8 +798,8 @@ fn journal_bridge_failure_rolls_back_all_extensions_and_receipt_and_retries_same
             .unwrap();
         let plan = SqliteWorkspaceStore::migrate_database(&path).unwrap();
         assert_journal_bridge_plan(&plan);
-        storage_formats::verify_history(&conn, 127).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 127);
+        storage_formats::verify_history(&conn, 128).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 128);
     }
 }
 

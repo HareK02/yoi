@@ -16,9 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AcceptedOrchestrationPlan, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
-    NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
-    Ticket, TicketBackend, TicketBodyReplacement, TicketDoctorDiagnostic, TicketDoctorReport,
+    MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, Result as TicketResult, Ticket,
+    TicketBackend, TicketBodyReplacement, TicketDoctorDiagnostic, TicketDoctorReport,
     TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary,
     TicketListState, TicketMarkReady, TicketRef, TicketRelation, TicketRelationKind,
     TicketRelationView, TicketState, TicketStateChange, TicketSummary, default_author,
@@ -61,18 +60,15 @@ pub const TICKET_BASE_READ_ONLY_TOOL_NAMES: [&str; 4] = [
     "TicketDoctor",
 ];
 
-pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 5] = [
+pub const TICKET_ORCHESTRATION_TOOL_NAMES: [&str; 3] = [
     "TicketRelationRecord",
     "TicketRelationRemove",
     "TicketRelationQuery",
-    "TicketOrchestrationPlanRecord",
-    "TicketOrchestrationPlanQuery",
 ];
 
-pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 2] =
-    ["TicketRelationQuery", "TicketOrchestrationPlanQuery"];
+pub const TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES: [&str; 1] = ["TicketRelationQuery"];
 
-pub const TICKET_TOOL_NAMES: [&str; 20] = [
+pub const TICKET_TOOL_NAMES: [&str; 18] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketEditPost",
@@ -91,20 +87,17 @@ pub const TICKET_TOOL_NAMES: [&str; 20] = [
     "TicketRelationRecord",
     "TicketRelationRemove",
     "TicketRelationQuery",
-    "TicketOrchestrationPlanRecord",
-    "TicketOrchestrationPlanQuery",
 ];
 
-pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 6] = [
+pub const TICKET_READ_ONLY_TOOL_NAMES: [&str; 5] = [
     "QueryTicket",
     "ShowTicket",
     "TicketDependencyCheck",
     "TicketDoctor",
     "TicketRelationQuery",
-    "TicketOrchestrationPlanQuery",
 ];
 
-pub const TICKET_MUTATING_TOOL_NAMES: [&str; 14] = [
+pub const TICKET_MUTATING_TOOL_NAMES: [&str; 13] = [
     "TicketCreate",
     "TicketEditItem",
     "TicketEditPost",
@@ -118,7 +111,6 @@ pub const TICKET_MUTATING_TOOL_NAMES: [&str; 14] = [
     "TicketCaseUpdate",
     "TicketRelationRecord",
     "TicketRelationRemove",
-    "TicketOrchestrationPlanRecord",
 ];
 
 const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed Ticket backend. \
@@ -157,12 +149,6 @@ source Ticket, relation kind, and target Ticket. Use this to correct obsolete or
 relation metadata; derived inverse views update automatically.";
 const RELATION_QUERY_DESCRIPTION: &str = "Query durable typed Ticket relation metadata. When a Ticket \
 is provided, both outgoing records owned by it and incoming forward records that target it are returned.";
-const ORCHESTRATION_PLAN_RECORD_DESCRIPTION: &str = "Append a typed Ticket orchestration plan record \
-for ordering, dependency, conflict, waiting/capacity, or accepted-plan decisions. Records are durable \
-Ticket artifacts and do not move state, reorder queues, or start work.";
-const ORCHESTRATION_PLAN_QUERY_DESCRIPTION: &str = "Query durable Ticket orchestration plan records by \
-Ticket id and/or relation kind. This is read-only planning context; Orchestrator must still make \
-explicit state decisions.";
 const DOCTOR_DESCRIPTION: &str = "Run typed Ticket backend consistency checks and return bounded \
 diagnostics through the typed backend without shelling out to external commands.";
 const DEPENDENCY_CHECK_DESCRIPTION: &str = "Return a structured Ticket dependency / queue readiness \
@@ -186,8 +172,6 @@ fn base_tool_description(name: &str) -> &'static str {
         "TicketRelationRecord" => RELATION_RECORD_DESCRIPTION,
         "TicketRelationRemove" => RELATION_REMOVE_DESCRIPTION,
         "TicketRelationQuery" => RELATION_QUERY_DESCRIPTION,
-        "TicketOrchestrationPlanRecord" => ORCHESTRATION_PLAN_RECORD_DESCRIPTION,
-        "TicketOrchestrationPlanQuery" => ORCHESTRATION_PLAN_QUERY_DESCRIPTION,
         "TicketDependencyCheck" => DEPENDENCY_CHECK_DESCRIPTION,
         "TicketDoctor" => DOCTOR_DESCRIPTION,
         _ => "Ticket backend tool.",
@@ -205,7 +189,7 @@ pub fn ticket_tool_description(name: &str, record_language: Option<&str>) -> Str
     if let Some(language) = record_language.filter(|language| !language.trim().is_empty()) {
         description.push_str("\n\nTicket record language: ");
         description.push_str(language.trim());
-        description.push_str(". Use this language for durable Ticket record and Ticket tool body text, including Ticket item bodies, thread comments/plans/decisions/implementation reports, reviews, resolutions, intake summaries, and orchestration plan notes. This policy is distinct from worker.language for normal prose and memory.language for Memory. Preserve protocol literals, file paths, commands, logs, identifiers, and quoted external text when translation would reduce fidelity.");
+        description.push_str(". Use this language for durable Ticket record and Ticket tool body text, including Ticket item bodies, thread comments/plans/decisions/implementation reports, reviews, resolutions, and intake summaries. This policy is distinct from worker.language for normal prose and memory.language for Memory. Preserve protocol literals, file paths, commands, logs, identifiers, and quoted external text when translation would reduce fidelity.");
     }
     description
 }
@@ -395,22 +379,6 @@ impl TicketBackend for TicketToolBackend {
 
     fn relation_view(&self, id: TicketIdOrSlug) -> TicketResult<TicketRelationView> {
         self.backend.relation_view(id)
-    }
-
-    fn add_orchestration_plan_record(
-        &self,
-        id: TicketIdOrSlug,
-        record: NewOrchestrationPlanRecord,
-    ) -> TicketResult<OrchestrationPlanRecord> {
-        self.backend.add_orchestration_plan_record(id, record)
-    }
-
-    fn query_orchestration_plan_records(
-        &self,
-        ticket: Option<TicketIdOrSlug>,
-        kind: Option<OrchestrationPlanKind>,
-    ) -> TicketResult<Vec<OrchestrationPlanRecord>> {
-        self.backend.query_orchestration_plan_records(ticket, kind)
     }
 
     fn doctor(&self) -> TicketResult<TicketDoctorReport> {
@@ -709,87 +677,6 @@ struct TicketRelationQueryOutput {
     relations: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum OrchestrationPlanKindParam {
-    Before,
-    After,
-    BlockedBy,
-    Blocks,
-    ConflictsWith,
-    DoNotParallelize,
-    WaitingCapacityNote,
-    AcceptedPlan,
-}
-
-impl OrchestrationPlanKindParam {
-    fn into_kind(self) -> OrchestrationPlanKind {
-        match self {
-            Self::Before => OrchestrationPlanKind::Before,
-            Self::After => OrchestrationPlanKind::After,
-            Self::BlockedBy => OrchestrationPlanKind::BlockedBy,
-            Self::Blocks => OrchestrationPlanKind::Blocks,
-            Self::ConflictsWith => OrchestrationPlanKind::ConflictsWith,
-            Self::DoNotParallelize => OrchestrationPlanKind::DoNotParallelize,
-            Self::WaitingCapacityNote => OrchestrationPlanKind::WaitingCapacityNote,
-            Self::AcceptedPlan => OrchestrationPlanKind::AcceptedPlan,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct AcceptedOrchestrationPlanParams {
-    /// Bounded project-relevant accepted plan summary.
-    summary: String,
-    /// Optional branch name for the accepted plan. Do not include runtime/session/socket details.
-    #[serde(default)]
-    branch: Option<String>,
-    /// Optional worktree path for the accepted plan. Do not include runtime/session/socket details.
-    #[serde(default)]
-    worktree: Option<String>,
-    /// Optional bounded role/work allocation plan. Do not include raw model output or private runtime details.
-    #[serde(default)]
-    role_plan: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TicketOrchestrationPlanRecordParams {
-    /// Ticket id that owns this orchestration plan record.
-    ticket: String,
-    /// Record kind: before/after, blocked_by/blocks, conflicts_with/do_not_parallelize, waiting_capacity_note, or accepted_plan.
-    kind: OrchestrationPlanKindParam,
-    /// Related Ticket id for ordering, dependency, and conflict records.
-    #[serde(default)]
-    related_ticket: Option<String>,
-    /// Optional bounded rationale/note. Required for waiting_capacity_note.
-    #[serde(default)]
-    note: Option<String>,
-    /// Accepted plan fields. Required for accepted_plan and invalid for other kinds.
-    #[serde(default)]
-    accepted_plan: Option<AcceptedOrchestrationPlanParams>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TicketOrchestrationPlanQueryParams {
-    /// Optional Ticket id to query. Omit to query across the backend root.
-    #[serde(default)]
-    ticket: Option<String>,
-    /// Optional relation kind filter.
-    #[serde(default)]
-    relation_kind: Option<OrchestrationPlanKindParam>,
-    /// Maximum records to return. Defaults to 100, max 200.
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct TicketOrchestrationPlanQueryOutput {
-    count: usize,
-    returned: usize,
-    truncated: bool,
-    records: Vec<Value>,
-}
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketDoctorParams {
     /// Maximum diagnostics to return. Defaults to 100, max 500.
@@ -910,16 +797,6 @@ struct TicketRelationRemoveTool {
 
 #[derive(Clone)]
 struct TicketRelationQueryTool {
-    backend: TicketToolBackend,
-}
-
-#[derive(Clone)]
-struct TicketOrchestrationPlanRecordTool {
-    backend: TicketToolBackend,
-}
-
-#[derive(Clone)]
-struct TicketOrchestrationPlanQueryTool {
     backend: TicketToolBackend,
 }
 
@@ -1543,99 +1420,6 @@ fn execute_ticket_relation_query(
 }
 
 #[async_trait]
-impl Tool for TicketOrchestrationPlanRecordTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _ctx: agen::tool::ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let params: TicketOrchestrationPlanRecordParams =
-            parse_input("TicketOrchestrationPlanRecord", input_json)?;
-        execute_ticket_orchestration_plan_record(&self.backend, params, _ctx)
-            .map(TicketCommandResult::into_tool_output)
-    }
-}
-
-fn execute_ticket_orchestration_plan_record(
-    backend: &TicketToolBackend,
-    params: TicketOrchestrationPlanRecordParams,
-    _context: agen::tool::ToolExecutionContext,
-) -> Result<TicketCommandResult, ToolError> {
-    let accepted_plan = params.accepted_plan.map(|plan| AcceptedOrchestrationPlan {
-        summary: plan.summary,
-        branch: plan.branch,
-        worktree: plan.worktree,
-        role_plan: plan.role_plan,
-    });
-    let record = NewOrchestrationPlanRecord {
-        kind: params.kind.into_kind(),
-        related_ticket: params.related_ticket,
-        note: params.note,
-        accepted_plan,
-        author: None,
-    };
-    let output = backend
-        .add_orchestration_plan_record(TicketIdOrSlug::Query(params.ticket.clone()), record)
-        .map_err(|error| backend_error("TicketOrchestrationPlanRecord", error))?;
-    Ok(command_result(
-        format!(
-            "Recorded orchestration plan {} for ticket {}",
-            output.kind, params.ticket
-        ),
-        output,
-    ))
-}
-
-#[async_trait]
-impl Tool for TicketOrchestrationPlanQueryTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _ctx: agen::tool::ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let params: TicketOrchestrationPlanQueryParams =
-            parse_input("TicketOrchestrationPlanQuery", input_json)?;
-        execute_ticket_orchestration_plan_query(&self.backend, params, _ctx)
-            .map(TicketCommandResult::into_tool_output)
-    }
-}
-
-fn execute_ticket_orchestration_plan_query(
-    backend: &TicketToolBackend,
-    params: TicketOrchestrationPlanQueryParams,
-    _context: agen::tool::ToolExecutionContext,
-) -> Result<TicketCommandResult, ToolError> {
-    let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
-    let ticket = params.ticket.clone().map(TicketIdOrSlug::Query);
-    let kind = params
-        .relation_kind
-        .map(OrchestrationPlanKindParam::into_kind);
-    let records = backend
-        .query_orchestration_plan_records(ticket, kind)
-        .map_err(|error| backend_error("TicketOrchestrationPlanQuery", error))?;
-    let count = records.len();
-    let truncated = count > limit;
-    let returned_records = records
-        .into_iter()
-        .take(limit)
-        .map(|record| serde_json::to_value(record).unwrap_or_else(|_| json!({})))
-        .collect::<Vec<_>>();
-    Ok(command_result(
-        format!(
-            "Found {} orchestration plan record(s){}",
-            count,
-            if truncated { " (truncated)" } else { "" }
-        ),
-        TicketOrchestrationPlanQueryOutput {
-            count,
-            returned: returned_records.len(),
-            truncated,
-            records: returned_records,
-        },
-    ))
-}
-
-#[async_trait]
 impl Tool for TicketDoctorTool {
     async fn execute(
         &self,
@@ -1790,16 +1574,6 @@ fn execute_ticket_command_result(
         "TicketRelationQuery" => execute_ticket_relation_query(
             &backend,
             convert::<TicketRelationQueryParams>(command)?,
-            context,
-        ),
-        "TicketOrchestrationPlanRecord" => execute_ticket_orchestration_plan_record(
-            &backend,
-            convert::<TicketOrchestrationPlanRecordParams>(command)?,
-            context,
-        ),
-        "TicketOrchestrationPlanQuery" => execute_ticket_orchestration_plan_query(
-            &backend,
-            convert::<TicketOrchestrationPlanQueryParams>(command)?,
             context,
         ),
         "TicketDoctor" => {
@@ -2131,8 +1905,6 @@ enum TicketCommandValue {
     Json(Value),
     Query(QueryTicketOutput),
     RelationQuery(TicketRelationQueryOutput),
-    PlanRecord(OrchestrationPlanRecord),
-    PlanQuery(TicketOrchestrationPlanQueryOutput),
     Doctor(TicketDoctorOutput),
     Dependency(crate::TicketDependencyCheck),
 }
@@ -2152,18 +1924,6 @@ impl From<QueryTicketOutput> for TicketCommandValue {
 impl From<TicketRelationQueryOutput> for TicketCommandValue {
     fn from(value: TicketRelationQueryOutput) -> Self {
         Self::RelationQuery(value)
-    }
-}
-
-impl From<OrchestrationPlanRecord> for TicketCommandValue {
-    fn from(value: OrchestrationPlanRecord) -> Self {
-        Self::PlanRecord(value)
-    }
-}
-
-impl From<TicketOrchestrationPlanQueryOutput> for TicketCommandValue {
-    fn from(value: TicketOrchestrationPlanQueryOutput) -> Self {
-        Self::PlanQuery(value)
     }
 }
 
@@ -2248,12 +2008,6 @@ fn input_schema(name: &str) -> Value {
         "TicketRelationQuery" => {
             serde_json::to_value(schemars::schema_for!(TicketRelationQueryParams))
         }
-        "TicketOrchestrationPlanRecord" => {
-            serde_json::to_value(schemars::schema_for!(TicketOrchestrationPlanRecordParams))
-        }
-        "TicketOrchestrationPlanQuery" => {
-            serde_json::to_value(schemars::schema_for!(TicketOrchestrationPlanQueryParams))
-        }
         "TicketDoctor" => serde_json::to_value(schemars::schema_for!(TicketDoctorParams)),
         _ => Ok(json!({})),
     }
@@ -2286,8 +2040,6 @@ impl_from_backend!(TicketCaseUpdateTool);
 impl_from_backend!(TicketRelationRecordTool);
 impl_from_backend!(TicketRelationRemoveTool);
 impl_from_backend!(TicketRelationQueryTool);
-impl_from_backend!(TicketOrchestrationPlanRecordTool);
-impl_from_backend!(TicketOrchestrationPlanQueryTool);
 impl_from_backend!(TicketDoctorTool);
 impl_from_backend!(TicketDependencyCheckTool);
 
@@ -2316,14 +2068,6 @@ pub fn ticket_tools(backend: impl Into<TicketToolBackend>) -> Vec<ToolDefinition
         tool_definition::<TicketRelationRecordTool>("TicketRelationRecord", backend.clone()),
         tool_definition::<TicketRelationRemoveTool>("TicketRelationRemove", backend.clone()),
         tool_definition::<TicketRelationQueryTool>("TicketRelationQuery", backend.clone()),
-        tool_definition::<TicketOrchestrationPlanRecordTool>(
-            "TicketOrchestrationPlanRecord",
-            backend.clone(),
-        ),
-        tool_definition::<TicketOrchestrationPlanQueryTool>(
-            "TicketOrchestrationPlanQuery",
-            backend.clone(),
-        ),
     ]
 }
 
@@ -2557,7 +2301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_relation_and_plan_commands_share_tools_business_validation_and_queries() {
+    async fn internal_relation_commands_share_tools_business_validation_and_queries() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
         let source = backend.create(NewTicket::new("Source")).unwrap().id;
@@ -2590,36 +2334,16 @@ mod tests {
         let empty =
             assert_value_read_matches_tools(&backend, "TicketRelationQuery", query.clone()).await;
         assert_eq!(empty["count"], 0);
-        let plan = json!({"ticket":source, "kind":"accepted_plan", "accepted_plan":{"summary":"Shared execution plan", "branch":"work"}});
-        let planned = execute_ticket_command_value(
-            backend.clone().into(),
-            "TicketOrchestrationPlanRecord",
-            plan,
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        let queried = assert_value_read_matches_tools(
-            &backend,
-            "TicketOrchestrationPlanQuery",
-            query.clone(),
-        )
-        .await;
-        assert_eq!(
-            queried["count"], 1,
-            "one durable plan, without duplicate execution"
-        );
-        assert_eq!(queried["records"][0], planned);
-        let invalid = json!({"ticket":source, "kind":"accepted_plan"});
+        let invalid = json!({"ticket":source, "kind":"depends_on", "target":"missing-target"});
         let native = execute_ticket_command_value(
             backend.clone().into(),
-            "TicketOrchestrationPlanRecord",
+            "TicketRelationRecord",
             invalid.clone(),
             Default::default(),
         )
         .await
         .unwrap_err();
-        let ordinary = tool_by_name(backend.clone(), "TicketOrchestrationPlanRecord")
+        let ordinary = tool_by_name(backend.clone(), "TicketRelationRecord")
             .execute(&invalid.to_string(), Default::default())
             .await
             .unwrap_err();
@@ -2634,13 +2358,24 @@ mod tests {
             .await,
             Err(ToolError::InvalidArgument(_))
         ));
-        assert!(
-            execute_ticket_command_value(backend.into(), "Unknown", json!({}), Default::default())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("unknown Ticket command")
-        );
+        for removed in [
+            "TicketOrchestrationPlanRecord",
+            "TicketOrchestrationPlanQuery",
+            "Unknown",
+        ] {
+            let error = execute_ticket_command_value(
+                backend.clone().into(),
+                removed,
+                json!({"ticket": source}),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unknown Ticket command"),
+                "{removed}: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2789,8 +2524,7 @@ mod tests {
                 "ShowTicket",
                 "TicketDependencyCheck",
                 "TicketDoctor",
-                "TicketRelationQuery",
-                "TicketOrchestrationPlanQuery"
+                "TicketRelationQuery"
             ]
         );
         assert_eq!(
@@ -2808,8 +2542,7 @@ mod tests {
                 "TicketQueue",
                 "TicketCaseUpdate",
                 "TicketRelationRecord",
-                "TicketRelationRemove",
-                "TicketOrchestrationPlanRecord"
+                "TicketRelationRemove"
             ]
         );
         for name in TICKET_READ_ONLY_TOOL_NAMES {
@@ -3162,10 +2895,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_relation_tools_record_query_remove_and_show_derived_view() {
+    async fn ticket_tools_preserve_body_discussion_and_relations_without_plan_records() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
-        let source = backend.create(NewTicket::new("Relation Source")).unwrap();
+        let created = tool_by_name(backend.clone(), "TicketCreate")
+            .execute(
+                &json!({"title":"Relation Source", "body":"Deliver the API after its dependency."})
+                    .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let created: Value = serde_json::from_str(&created.content.unwrap()).unwrap();
+        let source = backend
+            .show(created["id"].as_str().unwrap().into())
+            .unwrap()
+            .meta;
+        tool_by_name(backend.clone(), "TicketComment")
+            .execute(
+                &json!({"ticket":source.id, "body":"Keep the existing caller compatible."})
+                    .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
         let target = backend.create(NewTicket::new("Relation Target")).unwrap();
         let record = tool_by_name(backend.clone(), "TicketRelationRecord");
         let remove = tool_by_name(backend.clone(), "TicketRelationRemove");
@@ -3214,6 +2967,27 @@ mod tests {
             shown_json["relations"]["incoming"][0]["inverse_kind"],
             "dependency_of"
         );
+
+        // Reopen real storage before reading the ordinary coordination context.
+        let reopened = sqlite_backend(&temp);
+        let context =
+            assert_value_read_matches_tools(&reopened, "ShowTicket", json!({"id":source.id})).await;
+        assert_eq!(context["body"], "Deliver the API after its dependency.");
+        assert_eq!(context["initial_post"]["body"], context["body"]);
+        assert_eq!(context["events"]["count"], 2);
+        assert!(
+            context["events"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event["kind"] == "comment"
+                        && event["body"] == "Keep the existing caller compatible."
+                })
+        );
+        assert_eq!(context["relations"]["outgoing"][0]["kind"], "depends_on");
+        assert_eq!(context["relations"]["outgoing"][0]["target"], target.id);
+        assert_eq!(context["meta"]["state"], "open");
 
         let removed = remove
             .execute(
@@ -3318,55 +3092,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_orchestration_plan_tools_record_and_query_without_state_changes() {
-        let temp = TempDir::new().unwrap();
-        let backend = backend(&temp);
-        let first = backend.create(NewTicket::new("Plan Tool First")).unwrap();
-        let second = backend.create(NewTicket::new("Plan Tool Second")).unwrap();
-        let record = tool_by_name(backend.clone(), "TicketOrchestrationPlanRecord");
-        let query = tool_by_name(backend.clone(), "TicketOrchestrationPlanQuery");
-
-        let recorded = record
-            .execute(
-                &json!({
-                    "ticket": first.id.clone(),
-                    "kind": "blocked_by",
-                    "related_ticket": second.id.clone(),
-                    "note": "Wait for the second Ticket's API boundary decision.",
-                    "author": "orchestrator"
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            recorded
-                .summary
-                .contains("Recorded orchestration plan blocked_by")
-        );
-
-        let found = query
-            .execute(
-                &json!({
-                    "ticket": first.id,
-                    "relation_kind": "blocked_by"
-                })
-                .to_string(),
-                Default::default(),
-            )
-            .await
-            .unwrap();
-        let found_json: Value = serde_json::from_str(&found.content.unwrap()).unwrap();
-        assert_eq!(found_json["count"], 1);
-        assert_eq!(found_json["records"][0]["kind"], "blocked_by");
-        assert_eq!(found_json["records"][0]["related_ticket"], second.id);
-
-        let current = backend.show(TicketIdOrSlug::Id(first.id)).unwrap();
-        assert_eq!(current.meta.workflow_state, TicketState::Open);
-    }
-
-    #[tokio::test]
     async fn ticket_show_requires_exactly_one_identifier() {
         let temp = TempDir::new().unwrap();
         let show = tool_by_name(backend(&temp), "ShowTicket");
@@ -3429,23 +3154,32 @@ mod tests {
         assert!(!create_properties.contains_key("ref_selector"));
         assert!(create_schema.contains("read_only"));
         assert!(create_schema.contains("read_write"));
-        let plan_record_schema = tools
-            .iter()
-            .map(|definition| definition().0)
-            .find(|meta| meta.name == "TicketOrchestrationPlanRecord")
-            .unwrap()
-            .input_schema
-            .to_string();
-        assert!(plan_record_schema.contains("accepted_plan"));
-        assert!(plan_record_schema.contains("related_ticket"));
-        let plan_query_schema = tools
-            .iter()
-            .map(|definition| definition().0)
-            .find(|meta| meta.name == "TicketOrchestrationPlanQuery")
-            .unwrap()
-            .input_schema
-            .to_string();
-        assert!(plan_query_schema.contains("relation_kind"));
+        for removed in [
+            "TicketOrchestrationPlanRecord",
+            "TicketOrchestrationPlanQuery",
+        ] {
+            assert!(
+                !tools
+                    .iter()
+                    .any(|definition| definition().0.name == removed)
+            );
+            assert!(!TICKET_ORCHESTRATION_TOOL_NAMES.contains(&removed));
+            assert!(!TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES.contains(&removed));
+        }
+        let relation_schema = input_schema("TicketRelationRecord");
+        assert!(
+            relation_schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("target")
+        );
+        let query_schema = input_schema("TicketRelationQuery");
+        assert!(
+            query_schema["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("kind")
+        );
         let edit_schema = tools
             .iter()
             .map(|definition| definition().0)
@@ -3474,7 +3208,6 @@ mod tests {
             "TicketMarkReady",
             "TicketQueue",
             "TicketRelationRecord",
-            "TicketOrchestrationPlanRecord",
         ] {
             let schema = tools
                 .iter()

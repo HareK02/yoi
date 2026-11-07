@@ -351,6 +351,7 @@ impl FailureTail {
                 (127, super::journal_removal_store::RETAINED_BRIDGE_NAME),
             ],
         });
+        tail.push((128, super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -612,7 +613,14 @@ fn snapshot(conn: &Connection) -> Result<Shape> {
 fn reference_base() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     super::configure_sqlite(&conn)?;
-    ticket::migrate_sqlite_ticket_schema(&conn).map_err(invalid)?;
+    // Frozen physical reference for published host schemas through 127.
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+    )
+    .map_err(invalid)?;
+    tx.commit()?;
     merge_request::migrate(&conn).map_err(invalid)?;
     conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")?;
     let tx = conn.unchecked_transaction()?;
@@ -1562,10 +1570,10 @@ mod failure_format_tests {
             plan.migrations
                 .iter()
                 .rev()
-                .take(4)
+                .take(5)
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![127, 126, 125, 124]
+            vec![128, 127, 126, 125, 124]
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(snapshot(&conn).unwrap(), shape, "dry-run changed DDL");
@@ -1588,12 +1596,13 @@ mod failure_format_tests {
             Some(&(50, store::SCHEMA_BASELINE_NAME.to_owned()))
         );
         assert_eq!(
-            &history[history.len() - 4..],
+            &history[history.len() - 5..],
             &[
                 (124, tail_migration_name(124).unwrap().to_owned()),
                 (125, tail_migration_name(125).unwrap().to_owned()),
                 (126, tail_migration_name(126).unwrap().to_owned()),
                 (127, tail_migration_name(127).unwrap().to_owned()),
+                (128, tail_migration_name(128).unwrap().to_owned()),
             ]
         );
         let upgraded_shape = snapshot(&conn).unwrap();
