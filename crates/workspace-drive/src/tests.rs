@@ -485,3 +485,6 @@ fn revoke_serializes_with_publication_and_cached_handle_denies_after_revoke_comm
     ));
     assert_eq!(raw.blobs.list(None, 10).unwrap().len(), 1);
 }
+
+#[path = "failure/tests.rs"]
+mod drive_failure_contract;

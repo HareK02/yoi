@@ -414,14 +414,24 @@ fn activation_plaintext_never_persists_and_pending_survives_reopen() {
         })
         .unwrap();
     drop(store);
-    for entry in std::fs::read_dir(dir.path()).unwrap() {
-        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
-        assert!(
-            !bytes
-                .windows(issue.code.len())
-                .any(|window| window == issue.code.as_bytes())
-        );
+    fn assert_no_plaintext(path: &std::path::Path, plaintext: &[u8]) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                assert_no_plaintext(&entry.path(), plaintext);
+            } else {
+                assert!(kind.is_file(), "unexpected fixture entry: {:?}", entry.path());
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(
+                    !bytes.windows(plaintext.len()).any(|window| window == plaintext),
+                    "activation plaintext persisted in {:?}",
+                    entry.path()
+                );
+            }
+        }
     }
+    assert_no_plaintext(dir.path(), issue.code.as_bytes());
     let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     assert!(
         reopened

@@ -239,6 +239,8 @@ impl GeminiScheme {
         let mut contents = Vec::new();
         let mut pending_model_parts: Vec<GeminiPart> = Vec::new();
         let mut pending_user_parts: Vec<GeminiPart> = Vec::new();
+        let mut call_names: std::collections::HashMap<&str, std::collections::VecDeque<&str>> =
+            std::collections::HashMap::new();
 
         for item in items {
             match item {
@@ -270,8 +272,12 @@ impl GeminiScheme {
                 }
 
                 Item::ToolCall {
-                    name, arguments, ..
+                    call_id,
+                    name,
+                    arguments,
+                    ..
                 } => {
+                    call_names.entry(call_id).or_default().push_back(name);
                     // Flush pending user parts first
                     if !pending_user_parts.is_empty() {
                         contents.push(GeminiContent {
@@ -309,11 +315,17 @@ impl GeminiScheme {
                         Some(c) => format!("{summary}\n{c}"),
                         None => summary.clone(),
                     };
+                    // Gemini responses identify the function by its declaration
+                    // name, never by the adapter's response-local correlation ID.
+                    let name = call_names
+                        .get_mut(call_id.as_str())
+                        .and_then(std::collections::VecDeque::pop_front)
+                        .unwrap_or(call_id.as_str());
                     pending_user_parts.push(GeminiPart::FunctionResponse {
                         function_response: GeminiFunctionResponse {
-                            name: call_id.clone(),
+                            name: name.to_string(),
                             response: GeminiFunctionResponseContent {
-                                name: call_id.clone(),
+                                name: name.to_string(),
                                 content: Value::String(text),
                             },
                         },
@@ -468,6 +480,36 @@ mod tests {
         assert_eq!(gemini_req.contents[0].role, "user");
         assert_eq!(gemini_req.contents[1].role, "model");
         assert_eq!(gemini_req.contents[2].role, "user");
+        let body = serde_json::to_value(gemini_req).unwrap();
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "get_weather"
+        );
+    }
+
+    #[test]
+    fn parallel_results_resolve_function_names_not_synthetic_call_ids() {
+        let scheme = GeminiScheme::new();
+        let request = Request::new()
+            .item(Item::tool_call("call_0", "echo", r#"{"text":"first"}"#))
+            .item(Item::tool_call("call_1", "echo", r#"{"text":"second"}"#))
+            .item(Item::tool_result("call_1", "second"))
+            .item(Item::tool_result("call_0", "first"))
+            .item(Item::tool_call("call_0", "other", "{}"))
+            .item(Item::tool_result("call_0", "later"));
+        let body = serde_json::to_value(scheme.build_request(&request, &cap())).unwrap();
+        let responses: Vec<_> = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .filter_map(|part| part.get("functionResponse"))
+            .collect();
+        assert_eq!(responses.len(), 3);
+        for (response, name) in responses.iter().zip(["echo", "echo", "other"]) {
+            assert_eq!(response["name"], name);
+            assert_eq!(response["response"]["name"], name);
+        }
     }
 
     #[test]

@@ -132,7 +132,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-test("actual loader posts browse only; rows render while orchestrator is unresolved and repositories stay lazy", async () => {
+test("actual loader posts browse only; no singleton status request or startup UI and repositories stay lazy", async () => {
   const rows = deferred<Response>();
   const orchestrator = deferred<Response>();
   const repos = deferred<Response>();
@@ -151,19 +151,9 @@ test("actual loader posts browse only; rows render while orchestrator is unresol
   rows.resolve(Response.json(browse()));
   const view = render(TicketsPage, { data: await pending });
   expect(await screen.findByText("First ticket")).toBeTruthy();
-  expect(screen.getByText("Checking…")).toBeTruthy();
-  expect(
-    view.container.querySelector(".orchestrator-status")?.getAttribute(
-      "aria-busy",
-    ),
-  ).toBe("true");
-  expect(screen.queryByText("Offline")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Start Orchestrator" }))
-    .toBeNull();
-  expect(request.mock.calls.map(([path]) => path)).toEqual([
-    "/api/w/workspace-a/tickets/browse",
-    "/api/w/workspace-a/orchestrator",
-  ]);
+  expect(view.container.querySelector(".orchestrator-status")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Start Orchestrator" })).toBeNull();
+  expect(request.mock.calls.map(([path]) => path)).toEqual(["/api/w/workspace-a/tickets/browse"]);
   await fireEvent.click(screen.getByRole("button", { name: "Add Ticket" }));
   expect(
     request.mock.calls.filter(([path]) =>
@@ -174,7 +164,7 @@ test("actual loader posts browse only; rows render while orchestrator is unresol
   expect(screen.getByText("First ticket")).toBeTruthy();
   repos.resolve(Response.json(repositories()));
   orchestrator.resolve(Response.json(status()));
-  expect(await screen.findByText("Online")).toBeTruthy();
+  expect(screen.queryByText("Online")).toBeNull();
 });
 
 test("lazy repository HTTP failure is visible and retry enables targetless creation without reloading tickets", async () => {
@@ -224,19 +214,13 @@ test("lazy repository HTTP failure is visible and retry enables targetless creat
     .toBe(false);
 });
 
-test("failed status is Unavailable, not Offline, and does not hide rows", async () => {
-  const orchestrator = deferred<Response>();
-  requests({ "/api/w/workspace-a/orchestrator": () => orchestrator.promise });
+test("no singleton status is read even if the compatibility endpoint would fail", async () => {
+  const request = requests({ "/api/w/workspace-a/orchestrator": async () => { throw new Error("No singleton"); } });
   render(TicketsPage, { data: data() });
-  expect(screen.getByText("Checking…")).toBeTruthy();
-  orchestrator.reject(new Error("Controlled status failure"));
-  expect(await screen.findByText("Unavailable")).toBeTruthy();
-  expect(screen.getByText("Orchestrator status: Controlled status failure"))
-    .toBeTruthy();
-  expect(screen.queryByText("Offline")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Start Orchestrator" }))
-    .toBeNull();
+  await flushResponses();
+  expect(request).not.toHaveBeenCalled();
   expect(screen.getByText("First ticket")).toBeTruthy();
+  expect(screen.queryByText("Checking…")).toBeNull();
 });
 
 test("late prior-Workspace status and repository responses cannot replace current state or finish its pending load", async () => {
@@ -267,7 +251,7 @@ test("late prior-Workspace status and repository responses cannot replace curren
   oldStatus.resolve(Response.json(status("workspace-a", false)));
   oldRepos.resolve(Response.json(repositories("workspace-a")));
   await flushResponses();
-  expect(screen.getByText("Checking…")).toBeTruthy();
+  expect(screen.queryByText("Checking…")).toBeNull();
   expect(screen.queryByText("Offline")).toBeNull();
   expect(screen.getByText("Loading repositories…")).toBeTruthy();
   expect(
@@ -277,7 +261,7 @@ test("late prior-Workspace status and repository responses cannot replace curren
   expect(screen.getByText("Current Workspace ticket")).toBeTruthy();
   newStatus.resolve(Response.json(status("workspace-b")));
   newRepos.resolve(Response.json(repositories("workspace-b")));
-  expect(await screen.findByText("Online")).toBeTruthy();
+  expect(screen.queryByText("Online")).toBeNull();
   await waitFor(() =>
     expect(
       (screen.getByRole("button", {

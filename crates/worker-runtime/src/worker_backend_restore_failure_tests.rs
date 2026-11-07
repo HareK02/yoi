@@ -87,18 +87,14 @@ struct PendingProfileSeedBackend {
     inner: Arc<WorkerRuntimeExecutionBackend>,
 }
 
-impl WorkerExecutionBackend for PendingProfileSeedBackend {
-    fn backend_id(&self) -> &str {
-        self.inner.backend_id()
-    }
-
-    fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+impl PendingProfileSeedBackend {
+    fn seed_pending_head(&self, worker_ref: &WorkerRef) {
         let aggregate = self
             .inner
             .factory
-            .worker_aggregate_dir(&request.worker_ref)
+            .worker_aggregate_dir(&worker_ref)
             .unwrap();
-        let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&request.worker_ref);
+        let name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
         self.inner
             .run_on_adapter_runtime(async move {
                 assert!(
@@ -153,84 +149,6 @@ max_tokens = 100
                 Ok(())
             })
             .unwrap();
-        WorkerExecutionSpawnResult::Connected {
-            worker_state: protocol::WorkerStateSnapshot::initial(),
-            workdir_attachments: Vec::new(),
-        }
-    }
-
-    fn fetch_workspace_config(
-        &self,
-        request: WorkspaceConfigFetchRequest,
-    ) -> Result<WorkspaceConfigFetchResult, String> {
-        self.inner.fetch_workspace_config(request)
-    }
-
-    fn observe_workspace_prompt_projection(
-        &self,
-        projection: worker::WorkspacePromptProjection,
-    ) -> Result<(), String> {
-        self.inner.observe_workspace_prompt_projection(projection)
-    }
-
-    fn preflight_restore(
-        &self,
-        request: &WorkerExecutionRestoreRequest,
-    ) -> Result<(), WorkerExecutionResult> {
-        self.inner.preflight_restore(request)
-    }
-
-    fn completed_restore_failure(
-        &self,
-        operation_id: crate::execution::WorkerLifecycleOperationId,
-        worker_ref: &WorkerRef,
-    ) -> Option<WorkerExecutionSpawnResult> {
-        self.inner
-            .completed_restore_failure(operation_id, worker_ref)
-    }
-
-    fn restore_worker(&self, request: WorkerExecutionRestoreRequest) -> WorkerExecutionSpawnResult {
-        self.inner.restore_worker(request)
-    }
-
-    fn restore_recovery_disposition(
-        &self,
-        operation_id: crate::execution::WorkerLifecycleOperationId,
-        worker_ref: &WorkerRef,
-    ) -> Option<crate::execution::RestoreRecoveryDisposition> {
-        self.inner.restore_recovery_disposition(operation_id, worker_ref)
-    }
-
-    fn reclaim_uncommitted_restore(&self, request: WorkerExecutionRestoreRequest) -> WorkerExecutionSpawnResult {
-        self.inner.reclaim_uncommitted_restore(request)
-    }
-
-    fn reconcile_restore(
-        &self,
-        request: WorkerExecutionRestoreRequest,
-    ) -> WorkerExecutionSpawnResult {
-        self.inner.reconcile_restore(request)
-    }
-
-    fn activate_restored_worker(
-        &self,
-        operation_id: crate::execution::WorkerLifecycleOperationId,
-        worker_ref: &WorkerRef,
-    ) -> Result<(), String> {
-        self.inner
-            .activate_restored_worker(operation_id, worker_ref)
-    }
-
-    fn dispatch_input(&self, worker_ref: &WorkerRef, input: WorkerInput) -> WorkerExecutionResult {
-        self.inner.dispatch_input(worker_ref, input)
-    }
-
-    fn dispatch_method(&self, worker_ref: &WorkerRef, method: Method) -> WorkerExecutionResult {
-        self.inner.dispatch_method(worker_ref, method)
-    }
-
-    fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
-        self.inner.stop_worker_operation(request)
     }
 }
 
@@ -283,20 +201,13 @@ impl ProfileFailureFixture {
                     opens: provider_opens.clone(),
                 }),
         );
-        let execution: Arc<dyn WorkerExecutionBackend> = if pending_head {
-            Arc::new(PendingProfileSeedBackend {
-                inner: backend.clone(),
-            })
-        } else {
-            backend.clone()
-        };
-        let runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+        let mut runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
-                root: store,
+                root: store.clone(),
                 runtime_id: "r".into(),
                 display_name: None,
             },
-            execution,
+            backend.clone(),
         )
         .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
@@ -308,7 +219,60 @@ impl ProfileFailureFixture {
                 working_directory: working_directory_request(&repo),
             }];
         }
-        let worker = runtime.create_worker(request).unwrap();
+        let worker = if pending_head {
+            use crate::fs_store::{
+                PersistedWorkerExecution, PersistedWorkerExecutionState, PersistedWorkerRecord,
+            };
+            let worker_ref = WorkerRef::new(request.worker_id);
+            PendingProfileSeedBackend {
+                inner: backend.clone(),
+            }
+            .seed_pending_head(&worker_ref);
+            // This catalog has never launched a Controller. Stopped is a restore
+            // input fixture, not evidence of actual scope termination.
+            runtime
+                .test_runtime_store()
+                .write_worker_record(&PersistedWorkerRecord {
+                    workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard::default(),
+                    restore_guard: crate::runtime::RestoreGuard::default(),
+                    worker_ref: worker_ref.clone(),
+                    worker_id: request.worker_id,
+                    profile: request.profile.clone(),
+                    display_name: None,
+                    profile_source: request.profile_source.reference(),
+                    config_bundle: request.config_bundle.clone(),
+                    created_at_ms: None,
+                    status: crate::catalog::WorkerStatus::Stopped,
+                    last_finished_submission_request_id: None,
+                    execution_state: PersistedWorkerExecutionState::Available(
+                        PersistedWorkerExecution {
+                            request,
+                            binding: None,
+                            restore_intent: crate::catalog::WorkerRestoreIntent::Explicit,
+                        },
+                    ),
+                    workspace_id: None,
+                    workdir_attachments: Vec::new(),
+                    logical_workdir_attachments: Vec::new(),
+                })
+                .unwrap();
+            drop(runtime);
+            runtime = EmbeddedRuntime::with_fs_store_and_execution_backend(
+                crate::fs_store::FsRuntimeStoreOptions::new(store).with_runtime_id("r"),
+                backend.clone(),
+            )
+            .unwrap();
+            assert!(
+                runtime
+                    .execution_termination(&worker_ref)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(backend.workers.lock().unwrap().is_empty());
+            runtime.worker_detail(&worker_ref).unwrap()
+        } else {
+            runtime.create_worker(request).unwrap()
+        };
         let seed_handle = queue_inputs.then(|| {
             backend.workers.lock().unwrap()[&worker.worker_ref]
                 .handle
@@ -337,7 +301,9 @@ impl ProfileFailureFixture {
                 Ok(())
             }).unwrap();
         }
-        runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        if !pending_head {
+            runtime.stop_worker(&worker.worker_ref, None).unwrap();
+        }
         // Count restore provider access, not the initial create/stop setup.
         provider_opens.store(0, Ordering::SeqCst);
         Self {
@@ -697,10 +663,13 @@ impl ProfileFailureFixture {
 #[test]
 #[serial_test::serial(worker_allocation)]
 fn profile_restore_prior_effects_survive_read_only_reprepare_failure() {
-    for read_stage in [RuntimeRestoreStage::Metadata, RuntimeRestoreStage::Reconstruction] {
+    for read_stage in [
+        RuntimeRestoreStage::Metadata,
+        RuntimeRestoreStage::Reconstruction,
+    ] {
         let activation_stage = RuntimeRestoreStage::ActivationEffects;
         let fixture = ProfileFailureFixture::new(Duration::from_secs(5));
-    let _pause = fixture.runtime.test_pause_restore_continuation();
+        let _pause = fixture.runtime.test_pause_restore_continuation();
         let (artifacts, pinned) = fixture.pin_unclaimed_restore_upload();
         fixture.fail(activation_stage);
         let request = fixture
@@ -754,6 +723,7 @@ fn profile_restore_prior_effects_survive_read_only_reprepare_failure() {
 #[serial_test::serial(worker_allocation)]
 fn profile_restore_prior_effects_from_pending_head_repair_survive_read_only_reprepare_failure() {
     let fixture = ProfileFailureFixture::with_pending_head(Duration::from_secs(5));
+    let _pause = fixture.runtime.test_pause_restore_continuation();
     let aggregate = fixture
         .backend
         .factory
@@ -853,16 +823,21 @@ fn profile_restore_prior_effects_from_pending_head_repair_survive_read_only_repr
     let repaired_session = persisted_files(&aggregate.join("session"));
 
     for _ in 0..2 {
-        fixture.fail(RuntimeRestoreStage::Reconstruction);
-        let replay = fixture
-            .runtime
-            .restore_worker_operation(&fixture.worker.worker_ref, request.clone())
+        fixture
+            .backend
+            .wait_pending_restore(&pending, Duration::from_secs(5))
             .unwrap();
-        assert_eq!(
-            replay.state,
-            server_api::WorkerRestoreState::ReconciliationRequired,
-            "repair effect cannot become a rollback on the next read failure: {replay:?}"
-        );
+        fixture.fail(RuntimeRestoreStage::Reconstruction);
+        // Drive one operation-owned reprepare before the public continuation
+        // can autonomously retry a transient failure again in the same call.
+        fixture
+            .backend
+            .retry_pending_restore_cleanup(&pending, true)
+            .unwrap();
+        fixture
+            .backend
+            .wait_pending_restore(&pending, Duration::from_secs(5))
+            .unwrap();
         fixture.assert_retained_restore_effects(
             &request,
             &pending,
@@ -915,7 +890,11 @@ fn profile_restore_prior_effects_survive_rebuilt_candidate_pre_effect_activation
         .pending_restore(&fixture.worker.worker_ref)
         .unwrap()
         .unwrap();
-    fixture.assert_retained_restore_effects(&request, &pending, RuntimeRestoreStage::ActivationEffects);
+    fixture.assert_retained_restore_effects(
+        &request,
+        &pending,
+        RuntimeRestoreStage::ActivationEffects,
+    );
     let effected = persisted_files(&artifacts);
     assert_ne!(effected, pinned);
 
@@ -994,6 +973,79 @@ fn profile_restore_prior_effects_survive_rebuilt_candidate_pre_effect_activation
     assert_eq!(metadata.read_by_name(&name).unwrap().unwrap(), changed);
     assert_eq!(persisted_files(&artifacts), effected);
     fixture.resume_same_operation(request, pending.request.operation_id);
+}
+
+#[test]
+#[serial_test::serial(worker_allocation)]
+fn registered_attachment_replace_fault_keeps_canonical_outcome_without_resend() {
+    use crate::fs_store::AtomicWriteFault;
+    use protocol::control_failure::RuntimeControlCause as C;
+    for fault in [
+        AtomicWriteFault::BeforeRename,
+        AtomicWriteFault::AfterRename,
+    ] {
+        let fixture = ProfileFailureFixture::new(Duration::from_secs(2));
+        let worker_ref = &fixture.worker.worker_ref;
+        let store = fixture.runtime.test_runtime_store();
+        let before = store.read_worker_record(worker_ref).unwrap();
+        assert!(!before.logical_workdir_attachments.is_empty());
+        assert!(!before.workdir_attachments.is_empty());
+        let aggregate = fixture
+            .backend
+            .factory
+            .worker_aggregate_dir(worker_ref)
+            .unwrap();
+        let session_before = persisted_files(&aggregate.join("session"));
+        store.fail_next_worker_write(fault);
+        let error = fixture
+            .runtime
+            .replace_worker_workdir_attachments(worker_ref, Vec::new())
+            .unwrap_err();
+        let renamed = matches!(fault, AtomicWriteFault::AfterRename);
+        assert_eq!(
+            error.control_cause(),
+            if renamed {
+                C::PersistenceOutcomeUnknown
+            } else {
+                C::PersistenceFailed
+            }
+        );
+        // Memory restoration is not canonical rollback. An implicit retry would
+        // consume the one-shot fault and erase this error and divergence.
+        assert_eq!(
+            fixture
+                .runtime
+                .worker_detail(worker_ref)
+                .unwrap()
+                .workdir_attachments,
+            before.workdir_attachments
+        );
+        let canonical = store.read_worker_record(worker_ref).unwrap();
+        if renamed {
+            assert!(canonical.logical_workdir_attachments.is_empty());
+            assert!(canonical.workdir_attachments.is_empty());
+        } else {
+            assert_eq!(
+                canonical.logical_workdir_attachments,
+                before.logical_workdir_attachments
+            );
+            assert_eq!(canonical.workdir_attachments, before.workdir_attachments);
+        }
+        assert_eq!(canonical.status, before.status);
+        let canonical_path = fixture
+            .root
+            .path()
+            .join("s/workers")
+            .join(worker_ref.worker_id.to_string())
+            .join("worker.json");
+        let canonical_bytes = fs::read(&canonical_path).unwrap();
+        fixture.runtime.worker_detail(worker_ref).unwrap();
+        store.read_worker_record(worker_ref).unwrap();
+        assert_eq!(fs::read(canonical_path).unwrap(), canonical_bytes);
+        assert_eq!(persisted_files(&aggregate.join("session")), session_before);
+        assert_eq!(fixture.provider_opens.load(Ordering::SeqCst), 0);
+        assert!(fixture.backend.workers.lock().unwrap().is_empty());
+    }
 }
 
 #[test]
@@ -1594,10 +1646,7 @@ fn profile_restore_publication_failure_retains_committed_candidate_until_cleanup
         "{result:?}"
     );
     let diagnostic = serde_json::to_string(&result).unwrap();
-    assert!(
-        diagnostic.contains("publication failed"),
-        "{diagnostic}"
-    );
+    assert!(diagnostic.contains("publication failed"), "{diagnostic}");
     assert!(diagnostic.contains("io=Some(Other)"), "{diagnostic}");
     // Fail at the in-process publication boundary after activation effects.
     let pending = fixture
@@ -1615,12 +1664,43 @@ fn profile_restore_publication_failure_retains_committed_candidate_until_cleanup
     assert!(!run_dir.join("worker.sock").exists());
     assert!(fixture.backend.workers.lock().unwrap().is_empty());
     assert!(pending.owns_prepared_candidate());
-    assert!(pending.result.lock().unwrap().as_ref().unwrap().as_ref().unwrap().can_retry_publication());
-    assert!(fixture.backend.factory.failed_restore_resources.lock().unwrap()[&fixture.worker.worker_ref].allocation.is_some());
-    let durable: serde_json::Value = serde_json::from_slice(&fs::read(
-        fixture.root.path().join("s/workers").join(fixture.worker.worker_ref.worker_id.to_string()).join("worker.json")
-    ).unwrap()).unwrap();
-    assert_eq!(durable["execution_state"]["execution"]["intent"]["commit"], "committed");
+    assert!(
+        pending
+            .result
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .can_retry_publication()
+    );
+    assert!(
+        fixture
+            .backend
+            .factory
+            .failed_restore_resources
+            .lock()
+            .unwrap()[&fixture.worker.worker_ref]
+            .allocation
+            .is_some()
+    );
+    let durable: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .root
+                .path()
+                .join("s/workers")
+                .join(fixture.worker.worker_ref.worker_id.to_string())
+                .join("worker.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        durable["execution_state"]["execution"]["intent"]["commit"],
+        "committed"
+    );
     assert!(durable["restore_guard"]["owners"][&request.request_id]["receipt"].is_null());
     assert!(
         fixture
@@ -1632,10 +1712,21 @@ fn profile_restore_publication_failure_retains_committed_candidate_until_cleanup
     );
     // Explicit cleanup settles the retained owner without reconstructing it.
     drop(pending);
-    fixture.runtime.stop_worker(&fixture.worker.worker_ref, None).unwrap();
+    fixture
+        .runtime
+        .stop_worker(&fixture.worker.worker_ref, None)
+        .unwrap();
     fixture.assert_released();
     assert!(!run_dir.exists());
-    assert_eq!(fixture.backend.factory.restore_faults.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .backend
+            .factory
+            .restore_faults
+            .executions
+            .load(Ordering::SeqCst),
+        1
+    );
 }
 
 #[test]

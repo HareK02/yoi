@@ -1,3 +1,5 @@
+mod workdir_open;
+
 use super::*;
 use std::io::Write;
 use tracing::instrument::WithSubscriber;
@@ -40,13 +42,28 @@ async fn request_with_logs(app: Router, request: Request<Body>) -> (StatusCode, 
     let status = response.status();
     let content_type = response.headers()[CONTENT_TYPE].clone();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(
-        content_type,
-        "application/json",
-        "status={status}, body={}",
-        String::from_utf8_lossy(&body)
-    );
     let body: Value = serde_json::from_slice(&body).unwrap();
+    if body.get("yoi_failure").is_some() {
+        assert_eq!(content_type, error_contract::problem::PROBLEM_CONTENT_TYPE);
+        assert!(matches!(
+            api_macros::http::decode_problem_response::<workdir::failure::WorkdirFailureDetails>(
+                body.to_string().as_bytes(),
+                status.as_u16(),
+                content_type.to_str().unwrap(),
+                &server_api::WorkdirHttpBoundary,
+                error_contract::Budget::new(
+                    error_contract::MAX_FAILURE_BYTES,
+                    error_contract::MAX_FAILURE_BYTES
+                ),
+            ),
+            error_contract::DecodeFailure::Known(_)
+        ));
+    } else {
+        assert_eq!(
+            content_type, "application/json",
+            "status={status}, body={body}"
+        );
+    }
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     for secret in [
         "query-secret",
@@ -114,6 +131,7 @@ async fn cleanup_retention_failures_preserve_cause_on_execution_and_recovery() {
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: Some("retention diagnostic fixture".into()),
                 ticket_assignment: None,
             },
@@ -573,7 +591,30 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
         let ((actual_status, body, events), ()) =
             tokio::join!(request_with_logs(app.clone(), request()), provider,);
         assert_eq!(actual_status.as_u16(), status);
-        assert_eq!(body, json!({ "code": code.as_str(), "message": message }));
+        assert_eq!(body["status"], status);
+        assert_eq!(body["yoi_failure"]["domain"], "workdir");
+        assert_eq!(
+            body["yoi_failure"]["details"]["classification"],
+            code.as_str()
+        );
+        assert_eq!(
+            body["yoi_failure"]["details"]["operation"],
+            "command_status"
+        );
+        assert_eq!(
+            body["yoi_failure"]["details"]["denial_reason"],
+            serde_json::to_value(reason).unwrap()
+        );
+        let decoded = server_api::WorkdirHttpApiError::decode_received(
+            status,
+            error_contract::problem::PROBLEM_CONTENT_TYPE,
+            body.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(decoded.legacy().code, Some(code));
+        assert_eq!(decoded.legacy().denial_reason, reason);
+        assert!(!body.to_string().contains("body-secret"));
+        assert!(!body.to_string().contains("/private/provider/path"));
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(
             events[0]["kind"],
@@ -651,10 +692,21 @@ async fn generated_workdir_provider_errors_preserve_response_and_log_details() {
         let ((status, body, events), ()) =
             tokio::join!(request_with_logs(app.clone(), request), provider);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], 503);
         assert_eq!(
-            body,
-            json!({"code":"unavailable", "message":"Workdir session is unavailable"})
+            body["yoi_failure"]["details"]["classification"],
+            "unavailable"
         );
+        assert_eq!(
+            body["yoi_failure"]["details"]["operation"],
+            "command_output"
+        );
+        assert_eq!(
+            body["yoi_failure"]["details"]["failure_reason"],
+            reason.as_str()
+        );
+        assert!(!body.to_string().contains("body-secret"));
+        assert!(!body.to_string().contains("/private/provider/path"));
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["failure_reason"], reason.as_str());
         assert_eq!(events[0]["failure_stage"], reason.stage().as_str());
@@ -824,11 +876,16 @@ async fn self_workdir_provider_refusals_log_operation_identity_without_request_t
         );
         let (status, body, events) = request_with_logs(app.clone(), request).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(body["code"], code, "{body}");
-        assert!(
-            body.get("denial_reason").is_none(),
-            "internal diagnostics leaked: {body}"
+        assert_eq!(
+            body["yoi_failure"]["details"]["classification"], code,
+            "{body}"
         );
+        assert_eq!(
+            body["yoi_failure"]["details"]["denial_reason"],
+            serde_json::to_value(reason).unwrap()
+        );
+        assert_eq!(body["yoi_failure"]["details"]["operation"], label);
+        assert!(!body.to_string().contains(&secret));
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["operation"], label);
         assert_eq!(events[0]["workdir_stage"], "provider_dispatch");
@@ -957,10 +1014,13 @@ async fn self_workdir_session_open_refusals_keep_reason_before_registry_conversi
             request_with_logs(build_router(fixture.api.clone()), request).await;
         // Opening retained its existing Registry HTTP meaning, not an operation's 403.
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["yoi_failure"]["details"]["operation"], "session_open");
+        assert_eq!(body["yoi_failure"]["details"]["classification"], "denied");
         assert_eq!(
-            body["message"],
-            "workdir_session_open_failed: Workdir operation was denied"
+            body["yoi_failure"]["details"]["denial_reason"],
+            serde_json::to_value(reason).unwrap()
         );
+        assert!(body["detail"].as_str().unwrap().contains("session opening"));
         assert!(body.get("denial_reason").is_none(), "{body}");
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["workdir_stage"], "session_open");
@@ -1291,10 +1351,17 @@ async fn session_open_failure_causes_survive_registry_api_conversion_without_raw
         let (status, body, events) =
             request_with_logs(build_router(fixture.api.clone()), request).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["yoi_failure"]["details"]["operation"], "session_open");
         assert_eq!(
-            body["message"],
-            "workdir_session_open_failed: Workdir session is unavailable"
+            body["yoi_failure"]["details"]["classification"],
+            "unavailable"
         );
+        assert_eq!(
+            body["yoi_failure"]["details"]["failure_reason"],
+            reason.as_str()
+        );
+        assert_eq!(body["yoi_failure"]["reason"], reason.as_str());
+        assert!(body["detail"].as_str().unwrap().contains("session opening"));
         assert!(body.get("failure_reason").is_none(), "{body}");
         assert!(!body.to_string().contains("secret"));
         assert_eq!(events.len(), 1, "{events:?}");

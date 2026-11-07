@@ -10,7 +10,7 @@ use crate::llm_client::{
 use super::GeminiScheme;
 
 impl Scheme for GeminiScheme {
-    type State = ();
+    type State = super::events::GeminiStreamState;
 
     fn default_base_url(&self) -> &'static str {
         "https://generativelanguage.googleapis.com"
@@ -38,9 +38,9 @@ impl Scheme for GeminiScheme {
         &self,
         _event_type: &str,
         data: &str,
-        _state: &mut Self::State,
+        state: &mut Self::State,
     ) -> Result<Vec<Event>, ClientError> {
-        Ok(self.parse_event(data)?.unwrap_or_default())
+        Ok(self.parse_event(data, state)?.unwrap_or_default())
     }
 
     fn default_capability(&self) -> ModelCapability {

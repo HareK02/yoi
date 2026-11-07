@@ -65,6 +65,77 @@ fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let s = MergeRequestStore::open(&p, Arc::new(a), Arc::new(Repositories)).unwrap();
     (d, s)
 }
+#[test]
+fn concurrent_open_serializes_the_conflict_snapshot_instead_of_upgrading_read_locks() {
+    struct SynchronizedAssignments(Arc<std::sync::Barrier>);
+    impl AssignmentSource for SynchronizedAssignments {
+        fn current_assignment(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<CurrentAssignment>, String> {
+            self.0.wait();
+            Ok(Some(CurrentAssignment {
+                assignment_id: "A".into(),
+                ticket_id: "T".into(),
+                runtime_id: "runtime".into(),
+                worker_id: "coder".into(),
+            }))
+        }
+    }
+    // Independent connections share a file, like MR and Subject history writers.
+    // Admission synchronizes the callers before either acquires the transaction.
+    for _ in 0..20 {
+        let (dir, _fixture) = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let stores: Vec<_> = (0..2)
+            .map(|_| {
+                MergeRequestStore::open(
+                    dir.path().join("db"),
+                    Arc::new(SynchronizedAssignments(barrier.clone())),
+                    Arc::new(Repositories),
+                )
+                .unwrap()
+            })
+            .collect();
+        let threads: Vec<_> = stores
+            .into_iter()
+            .enumerate()
+            .map(|(index, store)| {
+                std::thread::spawn(move || {
+                    store.open_merge_request(OpenMergeRequest {
+                        merge_request_id: format!("MR-{index}"),
+                        ticket_id: "T".into(),
+                        repository_id: "R".into(),
+                        selector_from: format!("work/{index}"),
+                        selector_to: "main".into(),
+                        summary: String::new(),
+                        auth: auth(),
+                        now: at(0),
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(MergeRequestError::Conflict(_))))
+                .count(),
+            1,
+            "{results:?}"
+        );
+    }
+}
+
 /// Frozen v12 fixture: counters must never be promoted to content attestations.
 fn freeze_v12_review_payloads(connection: &Connection) {
     let rows = {
@@ -436,6 +507,72 @@ fn review_submission_authorization_rejects_invalid_grants_before_side_effects() 
     assert_eq!(authorized.merge_request_id, "MR");
     assert_eq!(authorized.ticket_id, "T");
     assert_eq!(authorized.subject_ref, "published-source");
+}
+
+#[test]
+fn completion_admission_fences_commit_and_receipt_replay_without_duplicate_events() {
+    let (_dir, store) = fixture();
+    open(&store);
+    let review = approve(&store, "source", "admission-review");
+    let completion = CompleteMergeRequest {
+        merge_request_id: "MR".into(),
+        ticket_id: "T".into(),
+        operation_id: "admitted-completion".into(),
+        approval_event_id: review.event_id,
+        current_subject_ref: "source".into(),
+        target_ref_before: "before".into(),
+        target_ref_after: "after".into(),
+        strategy: MergeStrategy::FastForward,
+        resolution: ConflictResolution::None,
+        auth: auth(),
+        now: at(5),
+    };
+    let calls = std::cell::Cell::new(0);
+    let rejected = store.complete_with_admission(completion.clone(), |connection| {
+        calls.set(calls.get() + 1);
+        if !connection.is_autocommit() {
+            return Err(MergeRequestError::Unauthorized(
+                "authority changed before commit".into(),
+            ));
+        }
+        Ok(())
+    });
+    assert!(matches!(rejected, Err(MergeRequestError::Unauthorized(_))));
+    assert_eq!(calls.get(), 2);
+    assert_eq!(store.get("W", "T").unwrap().state, MergeRequestState::Open);
+    assert!(
+        !store
+            .get("W", "T")
+            .unwrap()
+            .thread
+            .iter()
+            .any(|event| matches!(event, MergeRequestThreadEvent::Merge(_)))
+    );
+    let merged = store
+        .complete_with_admission(completion.clone(), |_| Ok(()))
+        .unwrap();
+    assert!(matches!(
+        store.complete_with_admission(completion.clone(), |_| Err(
+            MergeRequestError::Unauthorized("revoked replay".into())
+        )),
+        Err(MergeRequestError::Unauthorized(_))
+    ));
+    assert_eq!(
+        store
+            .complete_with_admission(completion, |_| Ok(()))
+            .unwrap(),
+        merged
+    );
+    assert_eq!(
+        store
+            .get("W", "T")
+            .unwrap()
+            .thread
+            .iter()
+            .filter(|event| matches!(event, MergeRequestThreadEvent::Merge(_)))
+            .count(),
+        1
+    );
 }
 
 #[test]

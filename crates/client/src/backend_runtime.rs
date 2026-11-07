@@ -253,6 +253,7 @@ pub enum BackendRuntimeClientError {
     Api(BackendApiClientError),
     SessionApi(server_api::ServerApiClientError),
     ContractApi(server_api::client_support::ClientError<server_api::RepositoryApiError>),
+    WorkerCreateApi(server_api::client_support::ClientError<server_api::WorkerCreateApiError>),
     Http(reqwest::Error),
     Protocol(String),
 }
@@ -264,6 +265,7 @@ impl fmt::Display for BackendRuntimeClientError {
             Self::Api(error) => write!(f, "{error}"),
             Self::SessionApi(error) => write!(f, "{error}"),
             Self::ContractApi(error) => write!(f, "{error}"),
+            Self::WorkerCreateApi(error) => write!(f, "{error}"),
             Self::Http(error) => write!(f, "{error}"),
             Self::Protocol(message) => f.write_str(message),
         }
@@ -1014,5 +1016,15 @@ mod tests {
         stale["workdir_attachments"][0]["working_directory"]["occupied_by"]["runtime_worker_id"] =
             serde_json::json!(64);
         assert!(serde_json::from_value::<BackendWorkerSummary>(stale).is_err());
+    }
+}
+
+impl From<server_api::client_support::ClientError<server_api::WorkerCreateApiError>>
+    for BackendRuntimeClientError
+{
+    fn from(
+        error: server_api::client_support::ClientError<server_api::WorkerCreateApiError>,
+    ) -> Self {
+        Self::WorkerCreateApi(error)
     }
 }

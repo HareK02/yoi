@@ -1,5 +1,9 @@
 #![doc = include_str!("../README.md")]
 
+pub mod control_failure;
+pub mod management_failure;
+pub mod startup;
+
 use std::collections::BTreeMap;
 
 use api_macros::api;
@@ -9,6 +13,13 @@ pub use api_macros::{ApiContract, HttpMethod};
 use protocol::{CompletionEntry, CompletionKind, Segment, WorkerId, WorkerStateSnapshot};
 use serde::{Deserialize, Serialize};
 use workdir::workspace::{MaterializerKind, RuntimeWorkerRef, RuntimeWorkingDirectorySummary};
+
+pub use protocol::startup_failure::{
+    RuntimeStartupCause, RuntimeStartupReason, StartupCleanup, StartupCleanupFailure,
+    StartupFailureAttachment, StartupFailurePhase, StartupIoKind, StartupPersistenceOutcome,
+    StartupResourceFacts, StartupResources, StartupSecondaryFailure, StartupStage,
+    StoredStartupFailureAttachment,
+};
 
 pub const RUNTIME_API_VERSION: &str = "v1";
 pub const RUNTIME_API_BASE_PATH: &str = "/v1";
@@ -93,34 +104,102 @@ pub enum WorkerRestoreState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiError {
+    #[serde(skip)]
+    management: Option<workdir::management_failure::WorkdirManagementFailure>,
+    #[serde(skip)]
+    control: Option<control_failure::RuntimeControlCause>,
     pub error: RuntimeApiErrorDetail,
     #[serde(skip)]
     status: u16,
+    /// Local owner/normalized observations, never a second wire attachment.
+    #[serde(skip)]
+    create_failure: Option<startup::WorkerCreateFailure>,
 }
+
+pub use protocol::startup_failure::StartupFailureObservations as WorkerStartupFailure;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeApiErrorDetail {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<WorkerStartupFailure>,
 }
 
 impl RuntimeApiError {
+    pub fn with_management(
+        mut self,
+        cause: workdir::management_failure::WorkdirManagementFailure,
+    ) -> Self {
+        self.management = Some(cause);
+        self
+    }
+    pub fn management_cause(
+        &self,
+    ) -> Option<workdir::management_failure::WorkdirManagementFailure> {
+        self.management
+    }
+    pub fn with_control(mut self, cause: control_failure::RuntimeControlCause) -> Self {
+        self.control = Some(cause);
+        self
+    }
+    pub fn control_cause(&self) -> Option<control_failure::RuntimeControlCause> {
+        self.control
+    }
     pub fn new(status: u16, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             error: RuntimeApiErrorDetail {
                 code: code.into(),
                 message: message.into(),
+                startup: None,
             },
             status,
+            control: None,
+            management: None,
+            create_failure: None,
         }
     }
 
     pub fn status(&self) -> u16 {
         self.status
     }
+
+    /// Retain owner-selected facts locally; the HTTP hook projects them afresh.
+    pub fn with_create_failure(mut self, failure: startup::WorkerCreateFailure) -> Self {
+        self.create_failure = Some(failure);
+        self
+    }
+
+    pub fn create_failure(&self) -> Option<&startup::WorkerCreateFailure> {
+        self.create_failure.as_ref()
+    }
+
+    pub fn into_create_failure(self) -> Option<startup::WorkerCreateFailure> {
+        self.create_failure
+    }
 }
 
 impl api_macros::HttpError for RuntimeApiError {
+    fn custom_response(&self) -> Option<api_macros::HttpErrorResponse> {
+        startup::http::runtime_error_response(self).or_else(|| {
+            let encoded = if let Some(cause) = self.management {
+                management_failure::management_problem(cause)
+            } else if let Some(cause) = self.control {
+                control_failure::control_problem(cause)
+            } else {
+                return None;
+            };
+            Some(encoded.unwrap_or_else(|_| {
+                api_macros::HttpErrorResponse {
+                    status: 500,
+                    content_type: "application/problem+json",
+                    body: error_contract::problem::STATIC_PROBLEM_FALLBACK
+                        .to_vec()
+                        .into(),
+                }
+            }))
+        })
+    }
     fn status_code(&self) -> u16 {
         self.status
     }
@@ -343,6 +422,7 @@ pub struct WorkingDirectoryRequest {
 /// Logical aliases and session capabilities are stored as Workspace attachments; Runtime resolves
 /// host paths and provider sessions. Workdir write scope alone does not grant command execution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogicalWorkdirAttachment {
     /// Stable Worker-local routing key. This is not a Workdir id or display name.
     pub alias: workdir::WorkdirAttachmentAlias,
@@ -370,10 +450,77 @@ pub struct WorkingDirectoryAttachmentClaim {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerWorkdirAttachmentsRequest {
     /// Exact current logical attachment set. Runtime-local bindings are not
     /// inferred from these identities.
     pub logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
+}
+
+/// Exact-request observation, not an acknowledgement or permission to resend.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerWorkdirAttachmentsMatch {
+    Matching,
+    Different,
+    Unconfirmed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsObservation {
+    pub worker_ref: WorkerRef,
+    pub request: WorkerWorkdirAttachmentsRequest,
+    pub result: WorkerWorkdirAttachmentsMatch,
+    /// Present only when the current live and durable attachment state agree.
+    /// This is independent of whether the queried set matches that state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<String>,
+}
+
+/// Exact replay identity and generation fence for an attachment-set operation.
+/// Retry or query with the same full request and Worker identity after uncertainty.
+/// This is distinct from the legacy, unfenced attachment-set replacement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsOperationRequest {
+    pub request_id: String,
+    pub expected_generation: String,
+    pub logical_workdir_attachments: Vec<LogicalWorkdirAttachment>,
+}
+
+/// Immutable historical receipt, not a claim about the current attachment set.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsOperationReceipt {
+    pub worker_ref: WorkerRef,
+    pub request: WorkerWorkdirAttachmentsOperationRequest,
+    pub resulting_generation: String,
+}
+
+/// Read-only exact-operation lookup. Absence does not authorize a new operation;
+/// conflict does not acknowledge the queried request; unconfirmed is not absence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerWorkdirAttachmentsOperationOutcome {
+    Absent,
+    Conflict,
+    Receipt {
+        receipt: WorkerWorkdirAttachmentsOperationReceipt,
+    },
+    Unconfirmed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerWorkdirAttachmentsOperationObservation {
+    pub worker_ref: WorkerRef,
+    pub request: WorkerWorkdirAttachmentsOperationRequest,
+    pub result: WorkerWorkdirAttachmentsOperationOutcome,
+    /// Present only when the current live and durable attachment state agree.
+    /// Independent of the historical lookup outcome and resulting_generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_generation: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -408,6 +555,9 @@ pub enum WorkerInputKind {
 pub struct WorkerInput {
     pub kind: WorkerInputKind,
     pub content: String,
+    /// Provenance stamped by the authenticated Backend, never by public/model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<protocol::AuthenticatedInputSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -431,6 +581,17 @@ pub struct BackendJobExecutionBinding {
     pub subjektiv_journal: bool,
 }
 
+/// Server-authored immutable launch input, retained unchanged across restoration.
+/// A snapshot fixes selection and ceilings; each preparation and invocation must
+/// still consult the current owner. No credential or cache location is serialized.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginExecutionSnapshot {
+    pub plan_id: String,
+    pub fingerprint: String,
+    pub plan: plugin_plan::WorkerPluginExecutionPlan,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CreateWorkerRequest {
     pub worker_id: WorkerId,
@@ -447,6 +608,9 @@ pub struct CreateWorkerRequest {
     pub workdir_attachment_requests: Vec<WorkingDirectoryAttachmentRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workdir_attachments: Vec<WorkingDirectoryAttachmentClaim>,
+    /// Enables the optional Runtime-local peer observation provider, not operation
+    /// authority. Scoped Backend observation follows the Worker Feature and live
+    /// operation/control checks, including when this saved flag is false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_observation_enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -455,6 +619,8 @@ pub struct CreateWorkerRequest {
     pub workspace_api: Option<WorkspaceApiRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_settings: Option<manifest::WorkspaceMemorySettingsSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_execution: Option<PluginExecutionSnapshot>,
     /// Backend-attested subject or consolidation attachment. Profile policy alone
     /// never activates subjektiv for an ordinary Workspace Worker.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -571,6 +737,10 @@ pub struct WorkingDirectoryRepositoryAccessRequest {
 /// using the same Restore intent.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerRestoreResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<protocol::control_failure::RuntimeControlCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<WorkerStartupFailure>,
     pub state: WorkerRestoreState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerDetail>,
@@ -604,9 +774,29 @@ pub struct WorkerDeleteResponse {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerLifecycleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_intent: Option<WorkerStopIntent>,
+}
+
+/// Fences a normal Worker stop to the observed lifecycle, not a Subject ledger.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerStopIntent {
+    pub expected_observation_token: String,
+    pub request_id: String,
+}
+
+/// Historical stop evidence. Stopped does not describe the current execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerStopOutcome {
+    NotFound,
+    Pending,
+    Stopped { ack: WorkerLifecycleAck },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -614,6 +804,10 @@ pub struct EmptyObjectRequest {}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerLifecycleAck {
+    /// Historical typed stop receipt, not a fresh stop of the current execution.
+    /// Consumers must not repeat cleanup of current resources when this is true.
+    #[serde(default)]
+    pub replayed: bool,
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -709,6 +903,52 @@ pub struct WorkerRetentionExecutionRequest {
     pub diagnostics_disposition: DiagnosticsDisposition,
 }
 
+/// Metadata-only, operation-bound inventory of all retained recording sources.
+/// This freezes original Worker ingress, not the authority of Journal Jobs reading
+/// these sources. Bodies remain at their producer-owned storage locations.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalFreeze {
+    pub operation_id: String,
+    pub input_fingerprint: String,
+    pub workspace_id: String,
+    pub source_runtime_id: String,
+    pub worker_id: WorkerId,
+    pub members: Vec<WorkerRemovalSessionMember>,
+}
+
+/// One canonical union per retained Session. The active lineage is an unchanged
+/// prefix, followed by deduplicated branch originals in deterministic Segment order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalSessionMember {
+    pub session_id: session_store::SessionId,
+    /// The original active lineage endpoint; its descriptor order is preserved.
+    /// None is reserved for an attested not-yet-materialized Session.
+    pub active_segment_id: Option<session_store::SegmentId>,
+    pub materialized: bool,
+    /// Exclusive end in this member's recording view. Empty views end at zero.
+    pub end: session_store::capture::RecordingPosition,
+    /// Original identities/digests only, without bodies. Shared ancestors occur
+    /// once across members, keyed by Session plus original material identity.
+    /// Orders are contiguous within the selected member view, beginning at zero;
+    /// scoped capture uses exactly these orders, not the unfiltered source view.
+    pub descriptors: Vec<session_store::public_material::PublicMaterialDescriptor>,
+}
+
+/// Bounded capture from one Session union of the exact Worker removal operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalSessionCaptureRequest {
+    pub workspace_id: String,
+    pub operation_id: String,
+    pub session_id: session_store::SessionId,
+    pub active_segment_id: Option<session_store::SegmentId>,
+    pub start: session_store::capture::RecordingPosition,
+    pub max_entries: usize,
+    pub max_serialized_bytes: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerSessionArchiveManifest {
     pub schema_version: u32,
@@ -717,6 +957,8 @@ pub struct WorkerSessionArchiveManifest {
     pub source_runtime_id: String,
     pub source_worker_id: WorkerId,
     pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_sessions: Vec<session_store::worker_sources::RetainedSessionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_active_segment_id: Option<String>,
     pub segment_ids: Vec<String>,
@@ -1169,6 +1411,18 @@ pub struct SubjectReleaseResponse {
     pub operation_id: String,
     pub binding_id: String,
     pub state: SubjectReleaseState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_scope: Option<SubjectReleaseRecordingScope>,
+}
+
+/// Complete producer-owned inventory, fixed under the actual Controller reservation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectReleaseRecordingScope {
+    pub workspace_id: String,
+    pub source_runtime_id: String,
+    pub worker_id: WorkerId,
+    pub members: Vec<WorkerRemovalSessionMember>,
 }
 
 /// Irreversibly fence an unpublished failed Subject create. Exact retries must retain
@@ -1193,8 +1447,66 @@ pub struct SubjectCreateRecoveryResponse {
     pub operation_id: String,
 }
 
-#[api(reqwest, axum)]
+/// Host requests this only after durably fencing the Subject in Backend authority.
+/// Permanently exclude the Worker from creation and restoration, and confirm actual
+/// execution shutdown. This does not delete Worker or Session records.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectDeleteWorkerRequest {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub create_fingerprint: String,
+    pub operation_id: String,
+}
+
+/// Durable admission exclusion plus confirmed execution shutdown/absence. Errors,
+/// timeouts and lost responses are unknown outcomes; retry the same full request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectDeleteWorkerResponse {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub create_fingerprint: String,
+    pub operation_id: String,
+    /// The canonical live Worker/Session/diagnostic aggregate is physically absent
+    /// under the permanent creation fence. False is not a deletion receipt.
+    pub originals_absent: bool,
+}
+
+/// Additional erasure of a Subject Job's newly reconciled removal copies.
+/// Both identities are exact saved requests; this never changes the old receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectJobRemovalPurgeRequest {
+    pub deletion: SubjectDeleteWorkerRequest,
+    pub removal: WorkerRetentionExecutionRequest,
+}
+
+/// Confirms current physical erasure under the permanent deletion fence.
+/// Operation identity belongs to `removal`, not the Subject deletion operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectJobRemovalPurgeResponse {
+    pub workspace_id: String,
+    pub worker_id: WorkerId,
+    pub operation_id: String,
+    pub input_fingerprint: String,
+}
+
+#[api(reqwest, axum, client_error_hook)]
 pub trait RuntimeApi {
+    #[post("/v1/subject-job-removal-purge", status = 200, error_status = 400)]
+    async fn purge_subject_job_removal(
+        &self,
+        #[body] request: SubjectJobRemovalPurgeRequest,
+    ) -> Result<SubjectJobRemovalPurgeResponse, RuntimeApiError>;
+
+    #[post("/v1/subject-delete-worker", status = 200, error_status = 400)]
+    async fn subject_delete_worker(
+        &self,
+        #[body] request: SubjectDeleteWorkerRequest,
+    ) -> Result<SubjectDeleteWorkerResponse, RuntimeApiError>;
+
     #[post("/v1/subject-create-recovery", status = 200, error_status = 400)]
     async fn recover_subject_create(
         &self,
@@ -1333,12 +1645,28 @@ pub trait RuntimeApi {
         #[body] input: WorkerInput,
     ) -> Result<WorkerInputResponse, RuntimeApiError>;
 
-    #[post("/v1/workers/{worker_id}/stop", status = 200, error_status = 400)]
+    #[post("/v1/workers/{worker_id}/stop", status = 200, error_status = 400, additional_error_statuses = [409])]
     async fn stop_worker(
         &self,
         #[path] worker_id: String,
         #[body] request: WorkerLifecycleRequest,
     ) -> Result<WorkerLifecycleResponse, RuntimeApiError>;
+
+    /// Admit the same fenced stop without backend cleanup; requires stop_intent.
+    #[post("/v1/workers/{worker_id}/stop/admit", status = 200, error_status = 400, additional_error_statuses = [409])]
+    async fn coordinate_worker_stop(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerLifecycleRequest,
+    ) -> Result<WorkerStopOutcome, RuntimeApiError>;
+
+    /// Read-only exact-identity lookup; never initiates backend stop cleanup.
+    #[post("/v1/workers/{worker_id}/stop/outcome", status = 200, error_status = 400, additional_error_statuses = [409])]
+    async fn worker_stop_outcome(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerLifecycleRequest,
+    ) -> Result<WorkerStopOutcome, RuntimeApiError>;
 
     #[post("/v1/workers/{worker_id}/cancel", status = 200, error_status = 400)]
     async fn cancel_worker(
@@ -1375,13 +1703,55 @@ pub trait RuntimeApi {
     #[post(
         "/v1/workers/{worker_id}/workdir-attachments",
         status = 200,
-        error_status = 400
+        error_status = 400,
+        client_error_hook = true
     )]
     async fn replace_worker_workdir_attachments(
         &self,
         #[path] worker_id: String,
         #[body] request: WorkerWorkdirAttachmentsRequest,
     ) -> Result<WorkerResponse, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/workdir-attachments/observe",
+        status = 200,
+        error_status = 400,
+        client_error_hook = true
+    )]
+    async fn observe_worker_workdir_attachments(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkdirAttachmentsRequest,
+    ) -> Result<WorkerWorkdirAttachmentsObservation, RuntimeApiError>;
+
+    /// Apply a generation-fenced operation, or replay its immutable receipt.
+    /// This must not be dispatched through the legacy unfenced replacement.
+    #[post(
+        "/v1/workers/{worker_id}/workdir-attachments/operations",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [409],
+        client_error_hook = true
+    )]
+    async fn apply_worker_workdir_attachments_operation(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<WorkerWorkdirAttachmentsOperationReceipt, RuntimeApiError>;
+
+    /// Observe the same full operation and Worker identity without admitting work.
+    #[post(
+        "/v1/workers/{worker_id}/workdir-attachments/operations/observe",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [409],
+        client_error_hook = true
+    )]
+    async fn observe_worker_workdir_attachments_operation(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<WorkerWorkdirAttachmentsOperationObservation, RuntimeApiError>;
 
     #[post(
         "/v1/workers/{worker_id}/completions",
@@ -1414,6 +1784,28 @@ pub trait RuntimeApi {
         #[path] worker_id: String,
         #[body] request: WorkerRetentionExecutionRequest,
     ) -> Result<WorkerRetentionExecutionResult, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/freeze",
+        status = 200,
+        error_status = 400
+    )]
+    async fn freeze_worker_removal(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeApiError>;
+
+    #[post(
+        "/v1/workers/{worker_id}/retention/capture",
+        status = 200,
+        error_status = 400
+    )]
+    async fn capture_worker_removal_session(
+        &self,
+        #[path] worker_id: String,
+        #[body] request: WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1551,6 +1943,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trusted_notify_source_round_trips_and_omitted_source_defaults_to_none() {
+        let mut value = serde_json::json!({
+            "kind": "notify", "content": "message", "submission_request_id": "stable-id"
+        });
+        let legacy: WorkerInput = serde_json::from_value(value.clone()).unwrap();
+        assert!(legacy.source.is_none());
+        assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+        for source in [
+            protocol::AuthenticatedInputSource::Account {
+                account_id: "account-a".into(),
+            },
+            protocol::AuthenticatedInputSource::Worker {
+                runtime_id: "runtime-a".into(),
+                worker_id: "worker-a".into(),
+            },
+        ] {
+            value["source"] = serde_json::to_value(&source).unwrap();
+            let input: WorkerInput = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(input.source, Some(source));
+            assert_eq!(serde_json::to_value(input).unwrap(), value);
+        }
+    }
+
+    #[test]
     fn backend_job_journal_grant_defaults_off_and_does_not_enable_memory_grant() {
         let legacy = serde_json::json!({"job_id":"job", "attempt_id":"attempt", "subjektiv_consolidation":true});
         let binding: BackendJobExecutionBinding = serde_json::from_value(legacy).unwrap();
@@ -1564,6 +1980,47 @@ mod tests {
         let roundtrip: BackendJobExecutionBinding =
             serde_json::from_value(serde_json::to_value(&binding).unwrap()).unwrap();
         assert_eq!(roundtrip, binding);
+    }
+
+    #[test]
+    fn lifecycle_ack_legacy_default_and_replay_marker_round_trip() {
+        let mut value = serde_json::json!({
+            "worker_ref": {"worker_id": WorkerId::now_v7()}, "status": "stopped"
+        });
+        let legacy: WorkerLifecycleAck = serde_json::from_value(value.clone()).unwrap();
+        assert!(!legacy.replayed);
+        value["replayed"] = serde_json::json!(false);
+        assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+        value["replayed"] = serde_json::json!(true);
+        let replay: WorkerLifecycleAck = serde_json::from_value(value.clone()).unwrap();
+        assert!(replay.replayed);
+        assert_eq!(serde_json::to_value(replay).unwrap(), value);
+    }
+
+    #[test]
+    fn lifecycle_stop_intent_defaults_and_strict_external_fields() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"reason": "cancel"}),
+        ] {
+            let request: WorkerLifecycleRequest = serde_json::from_value(value.clone()).unwrap();
+            assert!(request.stop_intent.is_none());
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let value = serde_json::json!({"reason":"stop", "stop_intent": {
+            "expected_observation_token":"observed", "request_id":"same-request"
+        }});
+        let request: WorkerLifecycleRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for invalid in [
+            serde_json::json!({"unknown":true}),
+            serde_json::json!({"stop_intent":{}}),
+            serde_json::json!({"stop_intent":{"request_id":"r"}}),
+            serde_json::json!({"stop_intent":{"expected_observation_token":"t"}}),
+            serde_json::json!({"stop_intent":{"expected_observation_token":"t", "request_id":"r", "unknown":true}}),
+        ] {
+            assert!(serde_json::from_value::<WorkerLifecycleRequest>(invalid).is_err());
+        }
     }
 
     #[test]
@@ -1719,8 +2176,36 @@ mod tests {
         }
 
         async fn get_worker(&self, worker_id: String) -> Result<WorkerResponse, RuntimeApiError> {
+            if worker_id == "management" {
+                use workdir::management_failure::{
+                    WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
+                };
+                return Err(test_error(500).with_management(WorkdirManagementFailure {
+                    operation: WorkdirManagementOperation::Cleanup,
+                    reason: WorkdirManagementReason::CleanupResourceBusy,
+                }));
+            }
+            if worker_id == "startup" {
+                use startup::*;
+                let failure = WorkerCreateFailure::from_cause(
+                    StartupCause::Session(
+                        protocol::session_failure::SessionRegistrationCause::denied(
+                            protocol::session_failure::SessionPrincipal::Subject,
+                        ),
+                    ),
+                    StartupOperationFacts {
+                        acceptance: CreationAcceptance::Unknown,
+                        execution: ExecutionOutcome::Unknown,
+                        finalize: None,
+                        backend_compensation: None,
+                        correlation: None,
+                    },
+                )
+                .unwrap();
+                return Err(test_error(500).with_create_failure(failure));
+            }
             assert_eq!(worker_id, "missing worker");
-            Err(test_error(404))
+            Err(test_error(404).with_control(control_failure::RuntimeControlCause::WorkerMissing))
         }
 
         async fn worker_session(
@@ -1755,6 +2240,31 @@ mod tests {
         ) -> Result<SessionMaterialPinResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn purge_subject_job_removal(
+            &self,
+            request: SubjectJobRemovalPurgeRequest,
+        ) -> Result<SubjectJobRemovalPurgeResponse, RuntimeApiError> {
+            Ok(SubjectJobRemovalPurgeResponse {
+                workspace_id: request.removal.workspace_id,
+                worker_id: request.removal.worker_id,
+                operation_id: request.removal.operation_id,
+                input_fingerprint: request.removal.input_fingerprint,
+            })
+        }
+
+        async fn subject_delete_worker(
+            &self,
+            request: SubjectDeleteWorkerRequest,
+        ) -> Result<SubjectDeleteWorkerResponse, RuntimeApiError> {
+            Ok(SubjectDeleteWorkerResponse {
+                originals_absent: true,
+                workspace_id: request.workspace_id,
+                worker_id: request.worker_id,
+                create_fingerprint: request.create_fingerprint,
+                operation_id: request.operation_id,
+            })
+        }
+
         async fn recover_subject_create(
             &self,
             request: SubjectCreateRecoveryRequest,
@@ -1848,6 +2358,20 @@ mod tests {
         ) -> Result<WorkerLifecycleResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn coordinate_worker_stop(
+            &self,
+            _worker_id: String,
+            _request: WorkerLifecycleRequest,
+        ) -> Result<WorkerStopOutcome, RuntimeApiError> {
+            Err(test_error(501))
+        }
+        async fn worker_stop_outcome(
+            &self,
+            _worker_id: String,
+            _request: WorkerLifecycleRequest,
+        ) -> Result<WorkerStopOutcome, RuntimeApiError> {
+            Err(test_error(501))
+        }
         async fn cancel_worker(
             &self,
             _worker_id: String,
@@ -1883,6 +2407,50 @@ mod tests {
         ) -> Result<WorkerResponse, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn observe_worker_workdir_attachments(
+            &self,
+            worker_id: String,
+            request: WorkerWorkdirAttachmentsRequest,
+        ) -> Result<WorkerWorkdirAttachmentsObservation, RuntimeApiError> {
+            Ok(WorkerWorkdirAttachmentsObservation {
+                worker_ref: WorkerRef {
+                    worker_id: worker_id.parse().unwrap(),
+                },
+                request,
+                result: WorkerWorkdirAttachmentsMatch::Different,
+                current_generation: Some("fixture-generation-current".into()),
+            })
+        }
+        async fn apply_worker_workdir_attachments_operation(
+            &self,
+            worker_id: String,
+            request: WorkerWorkdirAttachmentsOperationRequest,
+        ) -> Result<WorkerWorkdirAttachmentsOperationReceipt, RuntimeApiError> {
+            Ok(WorkerWorkdirAttachmentsOperationReceipt {
+                worker_ref: WorkerRef {
+                    worker_id: worker_id.parse().unwrap(),
+                },
+                request,
+                resulting_generation: "fixture-generation-after".into(),
+            })
+        }
+        async fn observe_worker_workdir_attachments_operation(
+            &self,
+            worker_id: String,
+            request: WorkerWorkdirAttachmentsOperationRequest,
+        ) -> Result<WorkerWorkdirAttachmentsOperationObservation, RuntimeApiError> {
+            let receipt = self
+                .apply_worker_workdir_attachments_operation(worker_id.clone(), request.clone())
+                .await?;
+            Ok(WorkerWorkdirAttachmentsOperationObservation {
+                worker_ref: WorkerRef {
+                    worker_id: worker_id.parse().unwrap(),
+                },
+                request,
+                result: WorkerWorkdirAttachmentsOperationOutcome::Receipt { receipt },
+                current_generation: Some("fixture-generation-current".into()),
+            })
+        }
         async fn complete_worker_arguments(
             &self,
             _worker_id: String,
@@ -1896,6 +2464,25 @@ mod tests {
         ) -> Result<WorkerRetentionInventory, RuntimeApiError> {
             Err(test_error(501))
         }
+        async fn freeze_worker_removal(
+            &self,
+            _worker_id: String,
+            _request: WorkerRetentionExecutionRequest,
+        ) -> Result<WorkerRemovalFreeze, RuntimeApiError> {
+            assert_eq!(_worker_id, _request.worker_id.to_string());
+            Err(test_error(409))
+        }
+        async fn capture_worker_removal_session(
+            &self,
+            _worker_id: String,
+            _request: WorkerRemovalSessionCaptureRequest,
+        ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeApiError> {
+            assert_eq!(_request.operation_id, "capture-operation");
+            assert_eq!(_request.start.canonical_order, 11);
+            assert_eq!(_request.start.byte_offset, 3);
+            Err(test_error(409))
+        }
+
         async fn execute_retention(
             &self,
             _worker_id: String,
@@ -1934,6 +2521,73 @@ mod tests {
         assert_eq!(response.create_fingerprint, recovery.create_fingerprint);
         assert_eq!(response.operation_id, recovery.operation_id);
 
+        let deletion = SubjectDeleteWorkerRequest {
+            workspace_id: "workspace-a".into(),
+            worker_id: WorkerId::now_v7(),
+            create_fingerprint: "deleted-create".into(),
+            operation_id: "delete-1".into(),
+        };
+        let receipt = client
+            .subject_delete_worker(deletion.clone())
+            .await
+            .unwrap();
+        let mut expected = serde_json::to_value(&deletion).unwrap();
+        expected["originals_absent"] = true.into();
+        assert_eq!(serde_json::to_value(receipt).unwrap(), expected);
+        let purge = SubjectJobRemovalPurgeRequest {
+            removal: WorkerRetentionExecutionRequest {
+                operation_id: "old-removal".into(),
+                input_fingerprint: "old-removal-fingerprint".into(),
+                archive_id: Some("old-archive".into()),
+                workspace_id: deletion.workspace_id.clone(),
+                source_runtime_id: "runtime-a".into(),
+                worker_id: deletion.worker_id,
+                source_created_at: "2026-01-01T00:00:00Z".into(),
+                removed_at: "2026-01-02T00:00:00Z".into(),
+                effective_profile: None,
+                retention_class: None,
+                policy_id: "old-policy".into(),
+                session_disposition: SessionDisposition::Archive,
+                diagnostics_disposition: DiagnosticsDisposition::Retain,
+            },
+            deletion,
+        };
+        let receipt = client
+            .purge_subject_job_removal(purge.clone())
+            .await
+            .unwrap();
+        assert_eq!(receipt.workspace_id, purge.removal.workspace_id);
+        assert_eq!(receipt.worker_id, purge.removal.worker_id);
+        assert_eq!(receipt.operation_id, purge.removal.operation_id);
+        assert_eq!(receipt.input_fingerprint, purge.removal.input_fingerprint);
+        let freeze_error = client
+            .freeze_worker_removal(purge.removal.worker_id.to_string(), purge.removal.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(freeze_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
+        );
+        let capture_error = client
+            .capture_worker_removal_session(
+                purge.removal.worker_id.to_string(),
+                WorkerRemovalSessionCaptureRequest {
+                    workspace_id: purge.removal.workspace_id.clone(),
+                    operation_id: "capture-operation".into(),
+                    session_id: session_store::new_session_id(),
+                    active_segment_id: Some(session_store::new_segment_id()),
+                    start: session_store::capture::RecordingPosition {
+                        canonical_order: 11,
+                        byte_offset: 3,
+                    },
+                    max_entries: 3,
+                    max_serialized_bytes: 128 * 1024,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(capture_error, client_support::ClientError::Public { status, .. } if status.as_u16() == 409)
+        );
         let summary = client.runtime_summary().await.unwrap();
         assert_eq!(summary.runtime.display_name.as_deref(), Some("round-trip"));
         let workers = client
@@ -1948,9 +2602,146 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, client_support::ClientError::Public { status, .. } if status.as_u16() == 404)
+            matches!(error, client_support::ClientError::Public { status, error } if status.as_u16() == 404 && error.control_cause() == Some(control_failure::RuntimeControlCause::WorkerMissing))
+        );
+        let error = client
+            .get_worker("management".to_string())
+            .await
+            .unwrap_err();
+        let client_support::ClientError::Public { status, error } = error else {
+            panic!("expected a normalized public Workdir management failure");
+        };
+        assert_eq!(status.as_u16(), 409);
+        assert_eq!(error.status(), 409);
+        assert_eq!(
+            error.management_cause(),
+            Some(workdir::management_failure::WorkdirManagementFailure {
+                operation: workdir::management_failure::WorkdirManagementOperation::Cleanup,
+                reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy,
+            })
+        );
+        assert!(error.control_cause().is_none());
+        assert!(error.create_failure().is_none());
+        assert!(error.error.startup.is_none());
+        assert_ne!(error.error.message, "test error");
+        let error = client.get_worker("startup".to_string()).await.unwrap_err();
+        let client_support::ClientError::Public { status, error } = error else {
+            panic!("expected a normalized public startup failure");
+        };
+        assert_eq!(status.as_u16(), 403);
+        assert_eq!(error.status(), 403);
+        let failure = error
+            .create_failure()
+            .expect("hook retains non-HTTP observations");
+        assert_eq!(
+            failure.operation().acceptance,
+            startup::CreationAcceptance::Unknown
+        );
+        let browser = failure
+            .problem(
+                startup::StartupBoundary::Browser,
+                &startup::SessionFailureVisibility {
+                    can_view_cause: true,
+                },
+                "",
+            )
+            .unwrap();
+        assert_eq!(browser.status, 409);
+        assert!(
+            std::str::from_utf8(browser.body())
+                .unwrap()
+                .contains("session.record")
+        );
+        let operation = WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "attachment-attempt-1".into(),
+            expected_generation: "fixture-generation-before".into(),
+            logical_workdir_attachments: vec![LogicalWorkdirAttachment {
+                alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                working_directory_id: "remote-workdir".into(),
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            }],
+        };
+        let worker_id = WorkerId::now_v7().to_string();
+        let set_observation = client
+            .observe_worker_workdir_attachments(
+                worker_id.clone(),
+                WorkerWorkdirAttachmentsRequest {
+                    logical_workdir_attachments: operation.logical_workdir_attachments.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            set_observation.current_generation.as_deref(),
+            Some("fixture-generation-current")
+        );
+        assert_eq!(
+            set_observation.result,
+            WorkerWorkdirAttachmentsMatch::Different
+        );
+        let applied = client
+            .apply_worker_workdir_attachments_operation(worker_id.clone(), operation.clone())
+            .await
+            .unwrap();
+        assert_eq!(applied.request, operation);
+        assert_eq!(applied.worker_ref.worker_id.to_string(), worker_id);
+        let observed = client
+            .observe_worker_workdir_attachments_operation(worker_id, operation.clone())
+            .await
+            .unwrap();
+        assert_eq!(observed.request, operation);
+        assert_eq!(
+            observed.result,
+            WorkerWorkdirAttachmentsOperationOutcome::Receipt { receipt: applied }
+        );
+        assert_eq!(
+            observed.current_generation.as_deref(),
+            Some("fixture-generation-current")
         );
         server.abort();
+    }
+
+    #[test]
+    fn attachment_operation_wire_rejects_unknown_duplicate_and_unfenced_input() {
+        let request = serde_json::json!({
+            "request_id": "attempt-a", "expected_generation": "opaque-generation",
+            "logical_workdir_attachments": [{"alias": "checkout", "working_directory_id": "remote-workdir"}]
+        });
+        let decoded: WorkerWorkdirAttachmentsOperationRequest =
+            serde_json::from_value(request.clone()).unwrap();
+        assert_eq!(
+            decoded.logical_workdir_attachments[0].capabilities,
+            workdir::WorkdirSessionCapabilities::READ_ONLY
+        );
+        for missing in [
+            "request_id",
+            "expected_generation",
+            "logical_workdir_attachments",
+        ] {
+            let mut invalid = request.clone();
+            invalid.as_object_mut().unwrap().remove(missing);
+            assert!(
+                serde_json::from_value::<WorkerWorkdirAttachmentsOperationRequest>(invalid)
+                    .is_err()
+            );
+        }
+        let mut invalid = request.clone();
+        invalid["receipt"] = serde_json::json!({});
+        assert!(
+            serde_json::from_value::<WorkerWorkdirAttachmentsOperationRequest>(invalid).is_err()
+        );
+        let mut invalid = request;
+        invalid["logical_workdir_attachments"][0]["host_path"] = "/private/host/path".into();
+        assert!(
+            serde_json::from_value::<WorkerWorkdirAttachmentsOperationRequest>(invalid).is_err()
+        );
+        assert!(serde_json::from_str::<WorkerWorkdirAttachmentsOperationRequest>(r#"{"request_id":"a","request_id":"b","expected_generation":"g","logical_workdir_attachments":[]}"#).is_err());
+        assert!(
+            serde_json::from_value::<WorkerWorkdirAttachmentsOperationOutcome>(
+                serde_json::json!({"state":"matching"})
+            )
+            .is_err()
+        );
     }
 
     #[test]

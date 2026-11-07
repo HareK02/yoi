@@ -7,6 +7,121 @@ use memory::extract::{CandidateKind, ExtractedCandidate, StagingRecord};
 use memory::schema::SourceRef;
 
 #[test]
+fn abandoned_attempt_inspection_preserves_original_preparation_and_rejects_stale_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = feature_storage::FeatureStorage::new(temp.path());
+    let scope = manager.scope("abandoned-consolidation").unwrap();
+    let registration = SubjektivStore::register(&scope).unwrap();
+    let store = SubjektivStore::open(&scope, &registration).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("companion").unwrap())
+        .unwrap();
+    assert_eq!(
+        inspect_abandoned_attempt(&store, &subject.id, &[], "job", "attempt").unwrap(),
+        AbandonedAttempt {
+            disposition_ids: vec![],
+            unresolved_candidate_ids: vec![],
+            prepared_generation_id: None,
+        }
+    );
+    let generation = store
+        .prepare_job_surface_generation(&subject.id, Some(("job", "attempt")))
+        .unwrap();
+    let surface = store.resident_surface(&subject.id).unwrap();
+    for _ in 0..2 {
+        let abandoned =
+            inspect_abandoned_attempt(&store, &subject.id, &[], "job", "attempt").unwrap();
+        assert_eq!(
+            abandoned.prepared_generation_id.as_deref(),
+            Some(generation.id.as_str())
+        );
+        // Inspection never fabricates a terminal surface failure or finalizes it.
+        assert!(
+            lookup_result(&store, &subject.id, &[], "job", "attempt")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.resident_surface(&subject.id).unwrap(), surface);
+    }
+    let count: i64 = store
+        .database
+        .try_with_connection(|connection| {
+            Ok::<_, crate::SubjektivError>(connection.query_row(
+                "SELECT COUNT(*) FROM surface_generation_runs",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(count, 1, "no new generation on abandoned reconciliation");
+    let ready = store
+        .publish_surface_generation(&subject.id, &generation.id, vec![])
+        .unwrap();
+    inspect_abandoned_attempt(&store, &subject.id, &[], "job", "attempt").unwrap();
+    assert_eq!(
+        store.resident_surface(&subject.id).unwrap().snapshot,
+        Some(ready)
+    );
+    assert!(
+        inspect_abandoned_attempt(&store, &subject.id, &["missing".into()], "job", "attempt")
+            .is_err()
+    );
+    store
+        .create_memory(
+            &subject.id,
+            crate::MemoryDraft::active(CandidateKind::Lesson, "new", "body", "reason", "change"),
+        )
+        .unwrap();
+    assert!(inspect_abandoned_attempt(&store, &subject.id, &[], "job", "attempt").is_err());
+    store
+        .begin_subject_deletion(&subject.id, "delete-abandoned-subject")
+        .unwrap();
+    assert!(
+        inspect_abandoned_attempt(&store, &subject.id, &[], "fresh-job", "fresh-attempt").is_err()
+    );
+}
+
+#[test]
+fn prepared_dirty_surface_waits_for_terminal_receipt_and_rejects_stale_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = feature_storage::FeatureStorage::new(temp.path());
+    let scope = manager.scope("consolidation-recovery").unwrap();
+    let registration = SubjektivStore::register(&scope).unwrap();
+    let store = SubjektivStore::open(&scope, &registration).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("companion").unwrap())
+        .unwrap();
+    store
+        .prepare_job_surface_generation(&subject.id, Some(("old-job", "old-attempt")))
+        .unwrap();
+    store
+        .create_memory(
+            &subject.id,
+            crate::MemoryDraft::active(CandidateKind::Lesson, "lesson", "body", "reason", "change"),
+        )
+        .unwrap();
+    let prepared = store
+        .prepare_job_surface_generation(&subject.id, Some(("job", "attempt")))
+        .unwrap();
+    // A committed preparation is not a terminal receipt, even with no candidates.
+    assert!(
+        lookup_result(&store, &subject.id, &[], "job", "attempt")
+            .unwrap()
+            .is_none()
+    );
+    assert!(lookup_result(&store, &subject.id, &[], "old-job", "old-attempt").is_err());
+    store
+        .fail_surface_generation(&subject.id, &prepared.id, "model_failure")
+        .unwrap();
+    let completed = lookup_result(&store, &subject.id, &[], "job", "attempt")
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed["surface"]["generation_id"], prepared.id);
+    assert_eq!(completed["surface"]["availability"], "failed");
+    assert_eq!(completed["surface"]["reason_code"], "model_failure");
+}
+
+#[test]
 fn escaped_ids_use_exact_t704_complete_result_budget() {
     const MAX_RESULT_BYTES: u32 = 16 * 1024;
     let ids: Vec<_> = (0..100)
@@ -127,6 +242,11 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
             .contains("unresolved")
     );
     assert!(with_dispositions(&store, &subject.id, &batch, &ready).is_err());
+    assert!(
+        lookup_result(&store, &subject.id, &batch, "job", "attempt")
+            .unwrap()
+            .is_none()
+    );
     store
         .decide_candidate(
             &subject.id,
@@ -143,6 +263,10 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
         .unwrap();
     validate_result(&store, &subject.id, &batch, "job", "attempt", &ready).unwrap();
     let enriched = with_dispositions(&store, &subject.id, &batch, &ready).unwrap();
+    assert_eq!(
+        lookup_result(&store, &subject.id, &batch, "job", "attempt").unwrap(),
+        Some(enriched.clone())
+    );
     assert_eq!(
         enriched["candidate_dispositions"],
         serde_json::json!([{"candidate_id": "candidate", "action": "invalid"}])
@@ -176,6 +300,12 @@ fn result_checks_durable_dispositions_and_exact_job_surface_outcome() {
     let failed = serde_json::json!({"subject_id": subject.id, "candidate_ids": batch,
         "surface": {"availability": "failed", "generation_id": failure.id, "memory_fingerprint": memory_fingerprint, "reason_code": "model_failure"}});
     validate_result(&store, &subject.id, &batch, "job", "attempt", &failed).unwrap();
+    // The same attempt can prepare again after committing Memory. Recovery must
+    // select its compatible stored outcome, not its first/last-arriving generation.
+    assert_eq!(
+        lookup_result(&store, &subject.id, &batch, "job", "attempt").unwrap(),
+        Some(with_dispositions(&store, &subject.id, &batch, &failed).unwrap())
+    );
     assert!(validate_result(&store, &subject.id, &batch, "job", "attempt", &ready).is_err());
     let mut false_reason = failed;
     false_reason["surface"]["reason_code"] = serde_json::json!("invented");

@@ -48,7 +48,93 @@ pub(crate) enum WorkerOperationContext {
 }
 
 impl WorkerOperationContext {
+    fn bind_stop_intent(
+        &self,
+        workspace: &str,
+        request: &mut WorkerLifecycleRequest,
+    ) -> ApiResult<()> {
+        let Some(intent) = request.stop_intent.as_mut() else {
+            return Ok(());
+        };
+        if intent.request_id.trim().is_empty()
+            || intent.request_id.len() > 512
+            || intent.request_id.chars().any(char::is_control)
+        {
+            return Err(Error::InvalidInput(
+                "Stop request_id must be nonempty bounded text".into(),
+            )
+            .into());
+        }
+        let source = match self {
+            Self::Browser { source, .. } => source.clone(),
+            Self::WorkerControl { controller } => protocol::AuthenticatedInputSource::Worker {
+                runtime_id: controller.runtime_id.clone(),
+                worker_id: controller.worker_id.clone(),
+            },
+            #[cfg(test)]
+            Self::Backend => return Ok(()),
+        };
+        let canonical = serde_json::to_vec(&(workspace, source.namespace(), &intent.request_id))
+            .expect("stop identity contains only strings");
+        let digest = Sha256::digest(canonical)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        intent.request_id = format!("runtime-stop:{digest}");
+        Ok(())
+    }
+
+    fn bind_input(&self, request: &mut WorkerInputRequest) {
+        // Public adapters cannot choose provenance or consume another input path's
+        // receipt IDs. Bind these only after the current caller is authorized.
+        request.source = match self {
+            WorkerOperationContext::Browser { source, .. } => Some(source.clone()),
+            WorkerOperationContext::WorkerControl { controller } => {
+                Some(protocol::AuthenticatedInputSource::Worker {
+                    runtime_id: controller.runtime_id.clone(),
+                    worker_id: controller.worker_id.clone(),
+                })
+            }
+            #[cfg(test)]
+            WorkerOperationContext::Backend => request.source.clone(),
+        };
+        if let Some(source) = request.source.as_ref() {
+            if let Some(client_id) = request.submission_request_id.take() {
+                let path = match request.kind {
+                    WorkerInputKind::Notify => "notify",
+                    WorkerInputKind::User => "user",
+                    WorkerInputKind::UserIfIdle => "user-if-idle",
+                    WorkerInputKind::Compact => "compact",
+                    WorkerInputKind::RegisterPeer => "register-peer",
+                };
+                // Fixed-size identity stays below the controller's request-ID ceiling
+                // even for long Runtime/Account IDs. Tuple framing remains unambiguous.
+                let canonical = serde_json::to_vec(&(source.namespace(), client_id))
+                    .expect("input namespace contains only strings");
+                let digest = sha2::Sha256::digest(canonical)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                request.submission_request_id = Some(format!("runtime-input:{path}:{digest}"));
+            }
+        }
+    }
+
     pub(super) async fn authorize_workspace(&self, api: &WorkspaceApi) -> ApiResult<()> {
+        self.authorize_workspace_request(api, true).await
+    }
+
+    /// Read-only snapshots revalidate the caller without requiring the Origin header
+    /// that browsers omit on same-origin GETs. An explicit foreign Origin still fails.
+    pub(super) async fn authorize_workspace_read(&self, api: &WorkspaceApi) -> ApiResult<()> {
+        self.authorize_workspace_request(api, false).await
+    }
+
+    async fn authorize_workspace_request(
+        &self,
+        api: &WorkspaceApi,
+        require_origin: bool,
+    ) -> ApiResult<()> {
         if let Self::Browser { headers, source } = self {
             let actor = resolve_actor(&ServerAuthApi::from(api), headers)
                 .await?
@@ -57,7 +143,9 @@ impl WorkerOperationContext {
                         "Worker connection credentials were revoked".into(),
                     )
                 })?;
-            if matches!(actor.auth_method, ActorAuthMethod::BrowserSession) {
+            if matches!(actor.auth_method, ActorAuthMethod::BrowserSession)
+                && (require_origin || headers.contains_key(ORIGIN))
+            {
                 let AuthConfig::Passkey { origin, .. } = &api.config.auth;
                 if headers.get(ORIGIN).and_then(|value| value.to_str().ok())
                     != Some(origin.as_str())
@@ -407,41 +495,195 @@ impl WorkspaceWorker {
         self.api.restore_workspace_worker(&self.identity, request)
     }
 
+    pub(super) async fn restore_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        request: server_api::WorkerRestoreRequest,
+        subject: String,
+        expected: server_api::SubjectBodyRef,
+    ) -> ApiResult<InternalWorkerRestoreResult> {
+        let guard = self.authorize_operation(context, "restore").await?;
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || {
+                let _control = guard;
+                worker.current_record()?;
+                worker.api.restore_workspace_worker_with_subject(
+                    &worker.identity,
+                    request,
+                    Some((&subject, &expected)),
+                )
+            })
+            .await
+    }
+
+    pub(super) async fn stop_outcome_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        mut request: WorkerLifecycleRequest,
+        subject: String,
+        expected: server_api::SubjectBodyRef,
+    ) -> ApiResult<runtime_api::WorkerStopOutcome> {
+        let control = self.authorize_operation(context, "stop").await?;
+        context.bind_stop_intent(self.api.workspace_id(), &mut request)?;
+        let worker = self.clone();
+        self.api
+            .host_executors
+            .host()?
+            .run(move || {
+                let _control = control;
+                {
+                    let gate = subjektiv_journal::lifecycle_lock(&worker.api, &subject)?;
+                    let _subject = gate
+                        .lock()
+                        .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
+                    subject_body::require_expected(&worker.api, &subject, Some(&expected))?;
+                }
+                // Read-only receipt lookup may wait for an ongoing cleanup callback;
+                // never retain the Subject gate while waiting for the Worker lock.
+                worker
+                    .api
+                    .runtime
+                    .worker_stop_outcome(&worker.identity, request)
+                    .map_err(|error| error.into_error().into())
+            })
+            .await
+    }
+
+    pub(super) async fn stop_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        request: WorkerLifecycleRequest,
+        subject: String,
+        expected: server_api::SubjectBodyRef,
+    ) -> ApiResult<WorkerLifecycleResult> {
+        self.stop_impl(context, request, Some((subject, expected)))
+            .await
+    }
+
     pub(super) async fn stop(
         &self,
         context: &WorkerOperationContext,
         request: WorkerLifecycleRequest,
     ) -> ApiResult<WorkerLifecycleResult> {
+        self.stop_impl(context, request, None).await
+    }
+
+    async fn stop_impl(
+        &self,
+        context: &WorkerOperationContext,
+        mut request: WorkerLifecycleRequest,
+        expected_subject: Option<(String, server_api::SubjectBodyRef)>,
+    ) -> ApiResult<WorkerLifecycleResult> {
         let guard = self.authorize_operation(context, "stop").await?;
+        context.bind_stop_intent(self.api.workspace_id(), &mut request)?;
         let worker = self.clone();
         // Once admitted, Runtime stop, session close and linked Workdir
         // publication have one owner. Never hand an accepted stop's guards
         // back to its cancellable waiter or acquire this Host lane again.
         run_host_workflow(self.api.host_executors.host()?, async move {
             let _control = guard;
-            let result = worker
+            let mut expected_subject = expected_subject;
+            if expected_subject.is_none() {
+                if let Some(lease) = worker
+                    .api
+                    .store
+                    .retained_worker_singleton_lease(worker.api.workspace_id(), &worker.identity)?
+                {
+                    if let Some(subject) = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) {
+                        expected_subject =
+                            Some((subject.to_owned(), subject_body::reference(&lease)));
+                    }
+                }
+            }
+            if expected_subject.is_some() && request.stop_intent.is_none() {
+                return Err(Error::InvalidInput(
+                    "Subject body stop requires request identity and its observed Runtime token"
+                        .into(),
+                )
+                .into());
+            }
+            // Observe concrete resource lifetimes under the existing session
+            // fence, then release it before Runtime/cleanup can call back here.
+            let (observed_sessions, observed_links) = {
+                let _session = current_worker_session_lock(&worker.api, &worker.identity)
+                    .lock_owned()
+                    .await;
+                let links = worker
+                    .api
+                    .store
+                    .list_worker_workdir_links(worker.api.workspace_id(), &worker.identity)?;
+                let sessions = worker
+                    .api
+                    .workdir_sessions
+                    .lock()
+                    .map_err(|_| Error::Store("Workdir session registry was poisoned".into()))?
+                    .observe_worker(&worker.identity);
+                (sessions, links)
+            };
+            if let Some((subject, expected)) = expected_subject.as_ref() {
+                let gate = subjektiv_journal::lifecycle_lock(&worker.api, subject)?;
+                let _subject = gate
+                    .lock()
+                    .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
+                subject_body::require_expected(&worker.api, subject, Some(expected))?;
+                worker
+                    .api
+                    .runtime
+                    .coordinate_worker_stop(&worker.identity, request.clone())
+                    .map_err(RuntimeRegistryError::into_error)?;
+            }
+            // Admission owns the exact pending stop before releasing the Subject
+            // gate. Execution may call back into Session/Journal/Subject services.
+            let mut result = worker
                 .api
                 .runtime
                 .stop_worker(&worker.identity, request)
-                .map_err(|error| error.into_error())?;
-            if result.state != InternalWorkerOperationState::Accepted {
+                .map_err(RuntimeRegistryError::into_error)?;
+            if result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "stop_observation_conflict")
+            {
+                return Err(Error::WorkerLifecycleObservationStale.into());
+            }
+            if let Some(conflict) = result
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "stop_request_conflict")
+            {
+                return Err(Error::RepositoryConflict(conflict.message.clone()).into());
+            }
+            if result.state != InternalWorkerOperationState::Accepted || result.replayed {
                 return Ok(result);
             }
             parse_runtime_worker_id_for_registry(&worker.identity.worker_id)?;
             let _session = current_worker_session_lock(&worker.api, &worker.identity)
                 .lock_owned()
                 .await;
-            close_current_worker_session_locked(&worker.api, &worker.identity).await?;
-            if let Some(record) = worker
-                .api
-                .store
-                .get_worker_registry(worker.api.workspace_id(), &worker.identity)?
+            if let Err(failure) = close_observed_worker_workdir_sessions(
+                &worker.api.workdir_sessions,
+                &observed_sessions,
+            )
+            .await
             {
-                sync_linked_workdir_after_worker_stop(
-                    &worker.api,
-                    &worker.identity.runtime_id,
-                    &record,
-                )?;
+                // Runtime already accepted Stop. Cleanup is independent evidence,
+                // not an outer failure or permission to issue another Stop.
+                result.cleanup_failures.extend(failure.details());
+                return Ok(result);
+            }
+            if let Err(error) = sync_linked_workdir_after_worker_stop(
+                &worker.api,
+                &worker.identity,
+                &observed_links,
+            ) {
+                let failure =
+                    crate::workdir_cleanup_failure::WorkdirCleanupFailure::AttachmentProjection(
+                        Box::new(error.error),
+                    );
+                result.cleanup_failures.extend(failure.details());
             }
             Ok(result)
         })
@@ -453,6 +695,9 @@ impl WorkspaceWorker {
         context: &WorkerOperationContext,
         request: WorkerLifecycleRequest,
     ) -> ApiResult<WorkerLifecycleResult> {
+        if request.stop_intent.is_some() {
+            return Err(Error::InvalidInput("stop_intent is not valid for Cancel".into()).into());
+        }
         let guard = self.authorize_operation(context, "cancel").await?;
         let worker = self.clone();
         self.api
@@ -472,7 +717,26 @@ impl WorkspaceWorker {
     pub(super) async fn input(
         &self,
         context: &WorkerOperationContext,
+        request: WorkerInputRequest,
+    ) -> ApiResult<WorkerInputResult> {
+        self.input_impl(context, request, None).await
+    }
+
+    pub(super) async fn input_current_subject(
+        &self,
+        context: &WorkerOperationContext,
+        request: WorkerInputRequest,
+        expected_subject: &str,
+    ) -> ApiResult<WorkerInputResult> {
+        self.input_impl(context, request, Some(expected_subject.to_owned()))
+            .await
+    }
+
+    async fn input_impl(
+        &self,
+        context: &WorkerOperationContext,
         mut request: WorkerInputRequest,
+        expected_subject: Option<String>,
     ) -> ApiResult<WorkerInputResult> {
         let permission = if request.kind == WorkerInputKind::Notify {
             "notify"
@@ -488,12 +752,41 @@ impl WorkspaceWorker {
         {
             request.kind = WorkerInputKind::UserIfIdle;
         }
+        context.bind_input(&mut request);
         let worker = self.clone();
         self.api
             .host_executors
             .host()?
             .run(move || -> ApiResult<_> {
                 let (_control, _session) = (guard, session_guard);
+                // Re-resolve while excluding Subject replacement through Runtime
+                // admission. The DB read ends before Runtime I/O; a DB transaction
+                // fence here would deadlock reentrant Host operations.
+                let subject_gate = expected_subject
+                    .as_deref()
+                    .map(|subject| subjektiv_journal::lifecycle_lock(&worker.api, subject))
+                    .transpose()?;
+                let _subject_guard = subject_gate
+                    .as_ref()
+                    .map(|gate| {
+                        gate.lock()
+                            .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))
+                    })
+                    .transpose()?;
+                if let Some(subject) = expected_subject.as_deref() {
+                    let key = crate::subjektiv::subject_worker_singleton_key(subject)
+                        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+                    let owner = worker
+                        .api
+                        .store
+                        .current_worker_singleton_owner(worker.api.workspace_id(), &key)?;
+                    if !owner.is_some_and(|lease| lease.worker == worker.identity) {
+                        return Err(Error::WorkspacePermissionDenied(
+                            "chat input target is no longer the current Subject body".into(),
+                        )
+                        .into());
+                    }
+                }
                 Ok(worker
                     .api
                     .runtime
@@ -587,7 +880,7 @@ impl WorkspaceWorker {
         &self,
         context: &WorkerOperationContext,
         candidate: &CleanupWorkerCandidate,
-    ) -> ApiResult<()> {
+    ) -> ApiResult<server_api::WorkerRemoveResponse> {
         let _guard = self.authorize_operation(context, "remove").await?;
         if candidate.runtime_id != self.identity.runtime_id
             || candidate.runtime_worker_id != self.identity.worker_id
@@ -787,5 +1080,144 @@ impl WorkspaceWorkerMethodSender {
                 code: code.into(), message: message.into(),
             }.into()
         })
+    }
+}
+
+#[cfg(test)]
+mod input_binding_tests {
+    use super::*;
+
+    fn notify(client_id: &str) -> WorkerInputRequest {
+        WorkerInputRequest {
+            kind: WorkerInputKind::Notify,
+            content: "message".into(),
+            source: Some(protocol::AuthenticatedInputSource::Backend {
+                operation_id: "forged-source".into(),
+            }),
+            submission_request_id: Some(client_id.into()),
+            segments: None,
+        }
+    }
+
+    #[test]
+    fn stop_identity_is_bound_to_authenticated_account_and_workspace_without_replacing_the_observation()
+     {
+        let context = |account: &str| WorkerOperationContext::Browser {
+            headers: HeaderMap::new(),
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: account.into(),
+            },
+        };
+        let request = || WorkerLifecycleRequest {
+            stop_intent: Some(runtime_api::WorkerStopIntent {
+                request_id: "same-request".into(),
+                expected_observation_token: "observed-lifecycle".into(),
+            }),
+            ..Default::default()
+        };
+        let mut first = request();
+        context("account-a")
+            .bind_stop_intent("workspace-a", &mut first)
+            .unwrap();
+        let mut retry = request();
+        context("account-a")
+            .bind_stop_intent("workspace-a", &mut retry)
+            .unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(
+            first
+                .stop_intent
+                .as_ref()
+                .unwrap()
+                .expected_observation_token,
+            "observed-lifecycle"
+        );
+        for (account, workspace) in [("account-b", "workspace-a"), ("account-a", "workspace-b")] {
+            let mut other = request();
+            context(account)
+                .bind_stop_intent(workspace, &mut other)
+                .unwrap();
+            assert_ne!(
+                first.stop_intent.as_ref().unwrap().request_id,
+                other.stop_intent.as_ref().unwrap().request_id
+            );
+        }
+        let mut empty = request();
+        empty.stop_intent.as_mut().unwrap().request_id.clear();
+        assert!(
+            context("account-a")
+                .bind_stop_intent("workspace-a", &mut empty)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn generic_input_binds_caller_source_and_isolates_client_ids_from_chat_and_other_paths() {
+        let browser = |id: &str| WorkerOperationContext::Browser {
+            headers: HeaderMap::new(),
+            source: protocol::AuthenticatedInputSource::Account {
+                account_id: id.into(),
+            },
+        };
+        let context = browser("account-a");
+        let raw_id = "chat-message:stored-message-uuid";
+        let mut request = notify(raw_id);
+        context.bind_input(&mut request);
+        assert_eq!(
+            request.source,
+            Some(protocol::AuthenticatedInputSource::Account {
+                account_id: "account-a".into(),
+            })
+        );
+        let bounded = request.submission_request_id.as_deref().unwrap();
+        assert!(bounded.starts_with("runtime-input:notify:"));
+        assert!(bounded.len() < 128);
+        assert_ne!(bounded, raw_id);
+        let mut retry = notify(raw_id);
+        context.bind_input(&mut retry);
+        assert_eq!(retry.submission_request_id, request.submission_request_id);
+        let mut other = notify(raw_id);
+        browser("account-b").bind_input(&mut other);
+        assert_ne!(other.submission_request_id, request.submission_request_id);
+        let mut submit = notify(raw_id);
+        submit.kind = WorkerInputKind::User;
+        context.bind_input(&mut submit);
+        assert_ne!(submit.submission_request_id, request.submission_request_id);
+        // JSON tuple framing keeps delimiter/quote characters unambiguous.
+        let mut delimiter = notify("a\",\"b");
+        context.bind_input(&mut delimiter);
+        assert_ne!(
+            delimiter.submission_request_id,
+            request.submission_request_id
+        );
+        let mut no_client_id = notify(raw_id);
+        no_client_id.submission_request_id = None;
+        context.bind_input(&mut no_client_id);
+        assert!(no_client_id.submission_request_id.is_none());
+    }
+
+    #[test]
+    fn worker_control_provenance_is_the_authenticated_controller_not_a_body_or_source_claim() {
+        let context = WorkerOperationContext::WorkerControl {
+            controller: RuntimeWorkerRef::new("controller-runtime", "controller-worker"),
+        };
+        let mut request = notify("same-id");
+        request.content = r#"{"source":{"kind":"account","account_id":"spoofed"}}"#.into();
+        context.bind_input(&mut request);
+        assert_eq!(
+            request.source,
+            Some(protocol::AuthenticatedInputSource::Worker {
+                runtime_id: "controller-runtime".into(),
+                worker_id: "controller-worker".into(),
+            })
+        );
+        assert!(
+            request
+                .submission_request_id
+                .as_deref()
+                .unwrap()
+                .starts_with("runtime-input:notify:")
+        );
+        assert!(request.submission_request_id.as_ref().unwrap().len() < 128);
     }
 }

@@ -39,11 +39,14 @@ impl ContentChange<'_> {
             ),
             Self::CommentEdit { event_ref } => ("comment_edit", false, Some(event_ref), false),
         };
+        let change_id: String = conn
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+            .map_err(sqlite_err)?;
         conn.execute(
             "INSERT INTO typed_ticket_content_changes
              (change_id, workspace_id, ticket_id, kind, actor, at,
               title_changed, body_changed, targets_changed, source_event_ref)
-             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 workspace_id,
                 ticket_id,
@@ -53,10 +56,19 @@ impl ContentChange<'_> {
                 title_changed,
                 source_event_ref.is_some(),
                 targets_changed,
-                source_event_ref
+                source_event_ref,
+                change_id
             ],
         )
         .map_err(sqlite_err)?;
+        crate::service_outbox::insert(
+            conn,
+            workspace_id,
+            ticket_id,
+            crate::service_outbox::EventType::Changed,
+            at,
+            &change_id,
+        )?;
         Ok(())
     }
 }

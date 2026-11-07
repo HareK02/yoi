@@ -9,11 +9,14 @@ default = []
 e2e-test = ["tui/e2e-test"]
 
 [dependencies]
+error-contract = { workspace = true }
 project-record = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 client = { workspace = true }
 futures = { workspace = true }
+fs4 = { workspace = true }
+feature-permissions = { workspace = true }
 manifest = { workspace = true }
 protocol = { workspace = true }
 server-api = { workspace = true }

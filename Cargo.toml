@@ -17,6 +17,8 @@ members = [
     "crates/runtime-api",
     "crates/server-api",
     "crates/plugin-pdk",
+    "crates/plugin-plan",
+    "crates/plugin-runtime",
     "crates/yoi",
     "crates/protocol",
     "crates/session-metrics",
@@ -24,14 +26,19 @@ members = [
     "crates/lint-common",
     "crates/tools",
     "crates/fs-operation",
+    "crates/error-contract",
     "crates/flow",
     "crates/builtin-source",
     "crates/config-source",
     "crates/config-source-wasm",
+    "crates/content-history",
+    "crates/content-history-store",
+    "crates/content-history-adapters",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
     "crates/feature-storage",
+    "crates/feature-permissions",
     "crates/workspace-drive",
     "crates/subjektiv",
     "crates/ticket",
@@ -57,6 +64,8 @@ default-members = [
     "crates/runtime-api",
     "crates/server-api",
     "crates/plugin-pdk",
+    "crates/plugin-plan",
+    "crates/plugin-runtime",
     "crates/yoi",
     "crates/protocol",
     "crates/session-metrics",
@@ -64,14 +73,19 @@ default-members = [
     "crates/lint-common",
     "crates/tools",
     "crates/fs-operation",
+    "crates/error-contract",
     "crates/flow",
     "crates/builtin-source",
     "crates/config-source",
     "crates/config-source-wasm",
+    "crates/content-history",
+    "crates/content-history-store",
+    "crates/content-history-adapters",
     "crates/workdir",
     "crates/tui",
     "crates/memory",
     "crates/feature-storage",
+    "crates/feature-permissions",
     "crates/workspace-drive",
     "crates/subjektiv",
     "crates/ticket",
@@ -112,6 +126,7 @@ mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
 feature-storage = { path = "crates/feature-storage" }
+feature-permissions = { path = "crates/feature-permissions" }
 workspace-drive = { path = "crates/workspace-drive" }
 subjektiv = { path = "crates/subjektiv" }
 merge-request = { path = "crates/merge-request" }
@@ -120,6 +135,7 @@ project-record = { path = "crates/project-record" }
 worker = { path = "crates/worker" }
 worker-runtime = { path = "crates/worker-runtime" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
+plugin-plan = { path = "crates/plugin-plan" }
 yoi = { path = "crates/yoi" }
 protocol = { path = "crates/protocol" }
 session-metrics = { path = "crates/session-metrics" }
@@ -133,6 +149,10 @@ secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 builtin-source = { path = "crates/builtin-source" }
 config-source = { path = "crates/config-source" }
+content-history = { path = "crates/content-history" }
+content-history-store = { path = "crates/content-history-store" }
+content-history-adapters = { path = "crates/content-history-adapters" }
+error-contract = { path = "crates/error-contract" }
 fs-operation = { path = "crates/fs-operation" }
 workdir = { path = "crates/workdir" }
 tui = { path = "crates/tui" }

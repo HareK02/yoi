@@ -1,6 +1,8 @@
 <script lang="ts">
   import { untrack } from 'svelte';
   import Spinner from '#lib/workspace/console/Spinner.svelte';
+  import WorkerRemovalStatus from '#lib/workspace/workers/WorkerRemovalStatus.svelte';
+  import { deletionNotice } from '#lib/workspace/workers/worker-removal.ts';
   import { workerConsoleHref } from '#lib/workspace/resource-links.ts';
   import { pushWorkspaceAlert } from '#lib/workspace/alerts/store.ts';
   import {
@@ -14,6 +16,7 @@
     canDeleteSidebarWorker,
     deleteSidebarWorker,
     stopSidebarWorker,
+    stopCleanupMessage,
   } from './worker-actions';
   import {
     workspaceWorkersStore,
@@ -139,12 +142,21 @@
     closeWorkerMenu();
     busyAction = { workerKey: workerKey(worker), kind: 'stop' };
     try {
-      await stopSidebarWorker(scope.workspaceId, worker);
+      const cleanup = await stopSidebarWorker(scope.workspaceId, worker);
       if (!scope.isCurrent()) return;
-      await refreshWorkspaceWorkers(scope.workspaceId);
-      if (!scope.isCurrent()) return;
-      pushWorkspaceAlert('info', `${worker.display_name || worker.label} stopped`, {
-        title: 'Worker stopped',
+      if (cleanup.length) {
+        pushWorkspaceAlert('warning', stopCleanupMessage(cleanup), {
+          title: 'Stop accepted; cleanup needs attention',
+        });
+      } else {
+        pushWorkspaceAlert('info', `Stop accepted for ${worker.display_name || worker.label}. Check the refreshed Worker state for confirmation.`, {
+          title: 'Stop accepted',
+        });
+      }
+      await refreshWorkspaceWorkers(scope.workspaceId).catch(() => {
+        if (scope.isCurrent()) pushWorkspaceAlert('warning', 'The Worker state could not be refreshed. Stop remains accepted; reload its current state before another action.', {
+          title: 'Worker state unavailable',
+        });
       });
     } catch (cause) {
       if (!scope.isCurrent()) return;
@@ -162,16 +174,15 @@
     closeWorkerMenu();
     busyAction = { workerKey: workerKey(worker), kind: 'delete' };
     try {
-      await deleteSidebarWorker(scope.workspaceId, worker, (input, init) => {
+      const outcome = await deleteSidebarWorker(scope.workspaceId, worker, (input, init) => {
         if (!scope.isCurrent()) throw new Error('Worker action is no longer current');
         return fetch(input, init);
       });
       if (!scope.isCurrent()) return;
       await refreshWorkspaceWorkers(scope.workspaceId);
       if (!scope.isCurrent()) return;
-      pushWorkspaceAlert('info', `${worker.display_name || worker.label} deleted`, {
-        title: 'Worker deleted',
-      });
+      const notice = deletionNotice(outcome);
+      pushWorkspaceAlert(notice.level, notice.message, { title: notice.title });
     } catch (cause) {
       if (!scope.isCurrent()) return;
       pushWorkspaceAlert('error', cause instanceof Error ? cause.message : 'Worker deletion failed', {
@@ -258,6 +269,7 @@
             <small class="worker-nav-meta" title={workdir.details} aria-label={workdir.details}>
               {workdir.text}
             </small>
+            {#if worker.removal}<WorkerRemovalStatus removal={worker.removal} compact />{/if}
           </a>
           <button
             class="worker-actions-trigger"

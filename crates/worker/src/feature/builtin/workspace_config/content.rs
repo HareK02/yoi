@@ -39,6 +39,9 @@ use super::backend::{
     MAX_DEPTH, MAX_NODES, MAX_PATH_BYTES, MAX_TEXT_BYTES, WorkspaceConfigBackend, diagnostic,
     failure, unknown,
 };
+use super::failure::{
+    ConfigFailure, ConfigFailureOperation, ConfigFailureReason, ConfigFailureStage,
+};
 use super::{CONTENT_ROOT, WorkspaceConfigFeature};
 use crate::feature::builtin::backend_diagnostic::{Diagnostic, Reason, Stage};
 use crate::wip::{
@@ -149,6 +152,7 @@ async fn observe(
         diagnostic("observe", false),
     )
     .await
+    .map_err(ConfigFailure::into_source)
 }
 
 async fn observe_diagnosed(
@@ -157,13 +161,26 @@ async fn observe_diagnosed(
     paths: Vec<String>,
     depth: u32,
     diagnostic: Diagnostic,
-) -> Result<WorkspaceConfigObserveResponse, WipOperationError> {
+) -> Result<WorkspaceConfigObserveResponse, ConfigFailure> {
+    let typed = |stage, reason, source| {
+        ConfigFailure::new(ConfigFailureOperation::Observe, stage, reason, source)
+    };
     if paths.len() > MAX_NODES || depth > MAX_DEPTH {
-        return Err(invalid());
+        return Err(typed(
+            ConfigFailureStage::Request,
+            ConfigFailureReason::InvalidRequest,
+            invalid(),
+        ));
     }
     for path in &paths {
         if !path.is_empty() {
-            validate_source(path)?;
+            validate_source(path).map_err(|source| {
+                typed(
+                    ConfigFailureStage::Request,
+                    ConfigFailureReason::InvalidRequest,
+                    source,
+                )
+            })?;
         }
     }
     let result: WorkspaceConfigObserveResponse = backend
@@ -193,28 +210,53 @@ async fn observe_diagnosed(
             },
             None,
         );
-        return Err(failure(
-            ProtocolErrorCode::Internal,
-            "Invalid Workspace config metadata",
+        return Err(typed(
+            ConfigFailureStage::Response,
+            if result.connection_id != connection {
+                ConfigFailureReason::Identity
+            } else {
+                ConfigFailureReason::InvalidMetadata
+            },
+            failure(
+                ProtocolErrorCode::Internal,
+                "Invalid Workspace config metadata",
+            ),
         ));
     }
     if result.entrypoints.is_empty() || result.entrypoints.len() > MAX_NODES {
         diagnostic.record(Stage::Response, Reason::InvalidMetadata, None);
-        return Err(failure(
-            ProtocolErrorCode::Internal,
-            "Invalid Workspace config entrypoints",
+        return Err(typed(
+            ConfigFailureStage::Response,
+            ConfigFailureReason::InvalidMetadata,
+            failure(
+                ProtocolErrorCode::Internal,
+                "Invalid Workspace config entrypoints",
+            ),
         ));
     }
     for path in &result.entrypoints {
         validate_source(path)
-            .inspect_err(|_| diagnostic.record(Stage::Response, Reason::InvalidMetadata, None))?;
+            .inspect_err(|_| diagnostic.record(Stage::Response, Reason::InvalidMetadata, None))
+            .map_err(|source| {
+                typed(
+                    ConfigFailureStage::Response,
+                    ConfigFailureReason::InvalidMetadata,
+                    source,
+                )
+            })?;
     }
     let mut seen = BTreeSet::new();
     for node in &result.nodes {
         if !node.path.is_empty() {
-            validate_source(&node.path).inspect_err(|_| {
-                diagnostic.record(Stage::Response, Reason::InvalidMetadata, None)
-            })?;
+            validate_source(&node.path)
+                .inspect_err(|_| diagnostic.record(Stage::Response, Reason::InvalidMetadata, None))
+                .map_err(|source| {
+                    typed(
+                        ConfigFailureStage::Response,
+                        ConfigFailureReason::InvalidMetadata,
+                        source,
+                    )
+                })?;
         }
         if !seen.insert(&node.path)
             || node.validator.is_empty()
@@ -232,9 +274,13 @@ async fn observe_diagnosed(
             })
         {
             diagnostic.record(Stage::Response, Reason::InvalidMetadata, None);
-            return Err(failure(
-                ProtocolErrorCode::Internal,
-                "Invalid Workspace config metadata scope",
+            return Err(typed(
+                ConfigFailureStage::Response,
+                ConfigFailureReason::InvalidMetadata,
+                failure(
+                    ProtocolErrorCode::Internal,
+                    "Invalid Workspace config metadata scope",
+                ),
             ));
         }
     }
@@ -244,7 +290,13 @@ async fn observe_diagnosed(
 impl ConfigProvider {
     async fn projection_at(&self, path: &str) -> Result<Option<WipProjection>, ProtocolError> {
         let source = source_path(path).map_err(protocol)?;
-        let Some(attachment) = visible_metadata(self.backend.current_async().await)? else {
+        let Some(attachment) = visible_metadata(
+            self.backend
+                .current_async()
+                .await
+                .map_err(ConfigFailure::into_source),
+        )?
+        else {
             return Ok(None);
         };
         let Some(attachment) = attachment else {
@@ -337,7 +389,13 @@ impl WipSubtreeProvider for ConfigProvider {
 
     async fn children(&self, path: &str) -> Result<Vec<String>, ProtocolError> {
         let source = source_path(path).map_err(protocol)?;
-        let Some(Some(attachment)) = visible_metadata(self.backend.current_async().await)? else {
+        let Some(Some(attachment)) = visible_metadata(
+            self.backend
+                .current_async()
+                .await
+                .map_err(ConfigFailure::into_source),
+        )?
+        else {
             return Ok(Vec::new());
         };
         let Some(snapshot) = visible_metadata(
@@ -419,18 +477,21 @@ fn descriptor(names: &[String]) -> InterfaceDescriptor {
             summary: "Logical Workspace configuration file operations".into(),
             details: Some("Backend grants, semantic validation, atomic whole-tree CAS and activation apply. Validators and change digests are managed automatically. apply_changes atomically accepts create/update/delete/rename changes without validators or expected_digest fields. Saving updates configuration for future operation boundaries, not already-running Worker manifests. No OS or command access.".into()),
         }),
-        operations: names.iter().filter(|name| !matches!(name.as_str(), "read_lines" | "search_text" | "edit" | "write")).map(|name| OperationDeclaration {
+        operations: names.iter().filter(|name| !matches!(name.as_str(), "read_lines" | "search_text" | "edit" | "write")).map(|name| {
+            if name == "apply_changes" {
+                return super::contract::declaration();
+            }
+            OperationDeclaration {
             name: name.clone(), documentation: None,
             parameters: match name.as_str() {
                 "attach" => vec![parameter("access", false, TypeExpr::String)],
                 "read" => crate::file_operation::parameters(name, false).unwrap(),
                 "delete" => vec![],
                 "create" => vec![parameter("path", false, TypeExpr::String), parameter("content", true, TypeExpr::String), parameter("content_type", false, TypeExpr::String)],
-                "apply_changes" => vec![parameter("changes", true, TypeExpr::Json)],
                 _ => vec![],
             },
             returns: ReturnDeclaration { documentation: None, r#type: TypeExpr::Json },
-        }).collect(),
+        }}).collect(),
     }
 }
 
@@ -537,7 +598,8 @@ impl ConfigHandler {
                 false,
                 diagnostic.clone(),
             )
-            .await?;
+            .await
+            .map_err(ConfigFailure::into_invocation_error)?;
         if response.path != self.node.path
             || response.validator != self.node.validator
             || Some(&response.digest) != self.node.digest.as_ref()
@@ -594,13 +656,15 @@ impl ConfigHandler {
             ));
         }
         // Resolve canonical per-file preconditions at the SAME captured tree content.
-        let metadata = observe(
+        let metadata = observe_diagnosed(
             &self.backend,
             &self.attachment.connection_id,
             paths.into_iter().collect(),
             0,
+            diagnostic("observe", false),
         )
-        .await?;
+        .await
+        .map_err(ConfigFailure::into_invocation_error)?;
         same_snapshot(&self.snapshot, &metadata)?;
         changes
             .into_iter()
@@ -830,13 +894,9 @@ impl ConfigHandler {
                 }]
             }
             "apply_changes" => {
-                let Some(value) = arguments.get("changes") else {
-                    return Err(invalid());
-                };
-                serde_json::from_value::<Vec<Change>>(
-                    crate::wip::wip_to_json(value).map_err(|_| invalid())?,
-                )
-                .map_err(|_| invalid())?
+                let mut command = super::contract::convert(arguments)?;
+                serde_json::from_value::<Vec<Change>>(command["changes"].take())
+                    .map_err(|_| invalid())?
             }
             _ => return Err(invalid()),
         };
@@ -859,7 +919,8 @@ impl ConfigHandler {
                 true,
                 diagnostic.clone(),
             )
-            .await?;
+            .await
+            .map_err(ConfigFailure::into_invocation_error)?;
         // Commit response supplies ROOT state. Obtain the exact post-commit PATH
         // validator, never substitute the root validator for a file validator.
         let updated = observe_diagnosed(
@@ -870,7 +931,7 @@ impl ConfigHandler {
             diagnostic.at_stage(Stage::Reconcile),
         )
         .await
-        .map_err(|_| unknown())?;
+        .map_err(ConfigFailure::into_post_commit_observation_error)?;
         if updated.digest != result.digest || updated.validator != result.validator {
             diagnostic.record(Stage::Reconcile, Reason::Identity, None);
             return Err(unknown());
@@ -884,10 +945,11 @@ impl ConfigHandler {
                 unknown()
             })?;
         let value = json_to_wip(&json!({"digest": result.digest,
-            "activation": "Saved to canonical Workspace configuration; existing Worker manifests are not rewritten"})).map_err(|_| {
-                diagnostic.record(Stage::Completion, Reason::Decode, None);
-                unknown()
-            })?;
+            "activation": super::contract::ACTIVATION}))
+        .map_err(|_| {
+            diagnostic.record(Stage::Completion, Reason::Decode, None);
+            unknown()
+        })?;
         Ok(WipOperationOutput::native_with_validator(
             value,
             object_validator(

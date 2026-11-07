@@ -1,0 +1,61 @@
+package yoi:host@2.0.0;
+
+interface errors {
+  enum code {
+    invalid-input, denied, not-found, conflict, unsupported,
+    quota-exceeded, deadline-exceeded, cancelled, unavailable,
+    indeterminate, receipt-expired,
+  }
+  enum effect-observation { not-dispatched, response-observed, indeterminate }
+  record host-error {
+    code: code,
+    message: string,
+    diagnostic-id: string,
+    effect: effect-observation,
+  }
+}
+
+interface connections {
+  use errors.{host-error};
+  /// Call-local resource. No serialization, persistence or cross-Worker transfer.
+  resource connection;
+  open: func(slot: string) -> result<connection, host-error>;
+}
+
+interface http {
+  use connections.{connection};
+  use errors.{host-error};
+  enum method { get, head, post, put, patch, delete, options }
+  record pair { name: string, value: string }
+  record request {
+    method: method,
+    path: string,
+    query: list<pair>,
+    headers: list<pair>,
+    body: list<u8>,
+    timeout-ms: u32,
+    effect-key: string,
+  }
+  record response {
+    status: u16,
+    headers: list<pair>,
+    body: list<u8>,
+  }
+  /// Host authorizes each operation and does not automatically retry or follow redirects.
+  send: func(target: borrow<connection>, input: request) -> result<response, host-error>;
+}
+
+interface logging {
+  use errors.{host-error};
+  enum level { trace, debug, info, warn, error }
+  variant scalar { text(string), boolean(bool), signed(s64), unsigned(u64), number(f64) }
+  record field { name: string, value: scalar }
+  record entry {
+    level: level,
+    event-code: string,
+    message: string,
+    fields: list<field>,
+  }
+  /// Bounded diagnostic data, not model context. Never include secrets or raw payloads.
+  log: func(input: entry) -> result<_, host-error>;
+}

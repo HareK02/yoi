@@ -69,7 +69,7 @@ pub(crate) async fn execute_read(
     target: crate::file_target::FileTarget,
     tracker: Tracker,
     params: ReadParams,
-) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+) -> Result<crate::checkout::CheckoutToolOutput, crate::WorkdirToolError> {
     let (offset, limit) = params.read.range(DEFAULT_LIMIT);
     let path = &target.path;
     tracing::debug!(path = %path, offset, limit, "Read");
@@ -147,7 +147,7 @@ pub(crate) fn routed_read_tool(
             router: router.clone(),
             tracker: tracker.clone(),
         });
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }
 
@@ -257,7 +257,7 @@ mod tests {
             .execute(&input.to_string(), Default::default())
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::ExecutionFailed(_)));
+        crate::workdir_error::assert_report(err, "execution_failed", "not_found");
     }
 
     #[tokio::test]

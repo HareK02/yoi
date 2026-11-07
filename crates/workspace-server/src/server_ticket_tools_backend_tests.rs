@@ -80,7 +80,11 @@ impl WorkspaceClient for TicketRouterClient {
                     "response lost after commit; outcome unknown".into(),
                 ));
             }
-            Ok(WorkspaceResponse { status, body })
+            Ok(WorkspaceResponse {
+                content_type: None,
+                status,
+                body,
+            })
         })
     }
 }
@@ -207,7 +211,18 @@ impl TicketSurface {
         )
         .await?;
         if name == "ShowTicket" {
-            return execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":input}), context).await;
+            let mut page = serde_json::Map::new();
+            for (tool_field, native_field) in [("event_cursor", "cursor"), ("event_limit", "limit")]
+            {
+                if let Some(value) = input.as_object_mut().unwrap().remove(tool_field) {
+                    page.insert(native_field.into(), value);
+                }
+            }
+            assert!(input.as_object().unwrap().is_empty());
+            input = serde_json::json!({"page": page});
+            let output = execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":input}), context).await?;
+            let canonical_path = format!("/tickets/{}", output["data"]["ticket"].as_str().unwrap());
+            return Ok(Self::native_data(output, &canonical_path));
         }
         execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":"read","arguments":{}}), ToolExecutionContext::direct()).await?;
         let inspected = execute_tool(
@@ -216,6 +231,16 @@ impl TicketSurface {
             ToolExecutionContext::direct(),
         )
         .await?;
+        // The fixture accepts Tool commands for shared scenarios, but invokes the real v2
+        // native coordinates. Do not weaken the production descriptor to accept flat v1 input.
+        if name == "TicketAssignmentAnswer" {
+            let fields = input.as_object_mut().unwrap();
+            let observed = serde_json::json!({
+                "assignment_id": fields.remove("assignment_id").unwrap(),
+                "expected_last_event_id": fields.remove("expected_last_event_id").unwrap(),
+            });
+            fields.insert("observed".into(), observed);
+        }
         let operation = match name {
             "TicketAssignmentTrackingQuery" => "assignment_tracking_query",
             "TicketAssignmentAnswer" => "assignment_answer",
@@ -223,7 +248,19 @@ impl TicketSurface {
             "TicketImplementationResultQuery" => "implementation_result_query",
             _ => unreachable!(),
         };
-        execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":operation,"arguments":input}), context).await
+        let output = execute_tool(self.tools["Invoke"].clone(), serde_json::json!({"path":path,"interface":inspected["interfaces"][0]["reference"],"operation":operation,"arguments":input}), context).await?;
+        Ok(Self::native_data(output, &path))
+    }
+
+    // Native results keep navigation typed while ordinary Tools retain their domain JSON.
+    // Assert the signed route's native envelope before sharing the persistence assertions.
+    fn native_data(mut output: serde_json::Value, expected_entry: &str) -> serde_json::Value {
+        assert_eq!(output["entry"], expected_entry);
+        for domain in ["tickets", "objectives", "merge_requests"] {
+            assert!(output["links"][domain].is_array());
+        }
+        assert!(output.get("data").is_some());
+        output["data"].take()
     }
 }
 fn ticket_client(
@@ -419,12 +456,29 @@ async fn reviewer_reads_saved_related_tickets_by_key_and_id_and_pages_their_thre
         let related_before = backend.show(related.id.clone().into()).unwrap();
         let bound_key = bound.meta.resource_key.as_deref().unwrap();
         let related_key = related.resource_key.as_deref().unwrap();
+        // A relation and Reviewer profile do not grant access to its target.
+        // Exercise the signed denial first, then grant only the related read.
         let transport = ticket_client(&api, identity, &source);
         // One client must retain its review binding while following related Tickets.
         let client = reviewer_client(transport.clone(), &bound_id);
         let surface =
             TicketSurface::with_access(dir.path(), client, wip, TicketFeatureAccess::review())
                 .await;
+        let denied = surface
+            .call(
+                "ShowTicket",
+                serde_json::json!({"id": related_key}),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("403"), "{denied}");
+        grant_test_ticket_operations(
+            &api,
+            &ensure_test_assignment_subject(&api),
+            &related.id,
+            &["ticket.read", "ticket.relation.read"],
+        );
         for (reference, expected_key, expected_title, expected_body) in [
             (
                 bound_key,
@@ -652,12 +706,25 @@ async fn implementation_result_tool_and_wip_keep_host_owned_retry_identity_witho
         );
         assert_eq!(receipt["request"]["body"], input["body"]);
         assert_eq!(report_counts(&api), (1, 1));
-        let queried = surface
+        let query = serde_json::json!({"ticket":ticket,"result_id":receipt["result_id"]});
+        let denied = surface
             .call(
                 "TicketImplementationResultQuery",
-                serde_json::json!({"ticket":ticket,"result_id":receipt["result_id"]}),
-                context("query"),
+                query.clone(),
+                context("query-denied"),
             )
+            .await
+            .unwrap_err();
+        assert!(denied.to_string().contains("403"), "{denied}");
+        // Writing a result does not implicitly authorize reading it.
+        grant_test_ticket_operations(
+            &api,
+            &ensure_test_assignment_subject(&api),
+            &ticket,
+            &["ticket.implementation_result.read"],
+        );
+        let queried = surface
+            .call("TicketImplementationResultQuery", query, context("query"))
             .await
             .unwrap();
         assert_eq!(queried, receipt);

@@ -20,6 +20,7 @@ use crate::store::{ControlPlaneStore, WorkspaceRuntimeAuthenticationMode};
 use crate::workspace_signing_identity::WorkspaceSigningIdentityService;
 use chrono::Utc;
 use protocol::Segment;
+use protocol::control_failure::RuntimeControlCause;
 use reqwest::blocking::{Client as BlockingHttpClient, RequestBuilder};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client as AsyncHttpClient, StatusCode, Url};
@@ -32,7 +33,7 @@ use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 use workdir::{
@@ -75,7 +76,8 @@ use worker_runtime::interaction::{
 use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, RuntimeStatus};
 use worker_runtime::profile_archive::ProfileSourceArchive;
 use worker_runtime::retention::{
-    WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult, WorkerRetentionInventory,
+    WorkerRemovalFreeze, WorkerRetentionExecutionRequest, WorkerRetentionExecutionResult,
+    WorkerRetentionInventory,
 };
 use worker_runtime::ssh_host_key_probe::{
     SSH_HOST_KEY_PROBE_OPERATION, SSH_HOST_KEY_PROBE_PATH, SshHostKeyProbeRequest,
@@ -89,6 +91,35 @@ const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_RUNTIME_PING_RESPONSE_BYTES: usize = 8 * 1024;
 const MAX_REMOTE_RUNTIME_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+fn session_recording_capture_transport_budget() -> Result<usize, RuntimeDiagnostic> {
+    // Capture budgets include slice metadata/escaping, but exclude the normal
+    // endpoint's availability enum. Measure that wrapper from the actual wire
+    // DTO rather than reserving an arbitrary number of bytes. The generated
+    // Axum/reqwest contract serializes this DTO directly, with no other envelope.
+    let slice = session_store::capture::RecordingCaptureSlice {
+        capture: session_store::capture::CaptureDto {
+            version: 1,
+            session_id: String::new(),
+            segment_id: String::new(),
+            view_entry_count: 0,
+            entries: Vec::new(),
+        },
+        next: None,
+    };
+    let encode_error = |_| {
+        diagnostic(
+            "recording_capture_transport_budget_failed",
+            HostDiagnosticSeverity::Error,
+            "could not measure recording capture response envelope",
+        )
+    };
+    let slice_bytes = serde_json::to_vec(&slice).map_err(encode_error)?.len();
+    let response = runtime_api::SessionRecordingCaptureAvailability::Captured { slice };
+    let response_bytes = serde_json::to_vec(&response).map_err(encode_error)?.len();
+    Ok(MAX_REMOTE_RUNTIME_RESPONSE_BYTES - (response_bytes - slice_bytes))
+}
+
 // Runtime creation can spend up to 60s bootstrapping; durable Submit
 // acceptance is acknowledged before the potentially long run preparation.
 const REMOTE_WORKER_CREATE_TIMEOUT: Duration = Duration::from_secs(80);
@@ -115,8 +146,64 @@ where
     }
 }
 
+fn close_abandoned_remote_sessions(
+    sessions: workdir::http::RemoteWorkdirSessionRegistry,
+    workdir_id: String,
+    timeout: Duration,
+) -> Result<(), WorkdirError> {
+    run_blocking_http(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| WorkdirError::Unavailable(error.to_string()))?
+            .block_on(async move {
+                tokio::time::timeout(timeout, sessions.close_abandoned(&workdir_id))
+                    .await
+                    .map_err(|_| {
+                        WorkdirError::Unavailable(
+                            "Workdir session cleanup is still unconfirmed".into(),
+                        )
+                    })?
+            })
+    })
+}
+
+fn unconfirmed_workdir_session_cleanup(error: WorkdirError) -> RuntimeWorkingDirectoryResult {
+    let cause = crate::workdir_cleanup_failure::WorkdirCleanupFailure::SessionCloses(vec![error])
+        .details()[0];
+    let mut diagnostic = diagnostic(
+        "working_directory_session_close_unconfirmed",
+        HostDiagnosticSeverity::Error,
+        "Workdir session closing remains unconfirmed; removal was not dispatched",
+    );
+    diagnostic.session = Some(cause);
+    RuntimeWorkingDirectoryResult {
+        state: InternalWorkerOperationState::Rejected,
+        working_directory: None,
+        diagnostics: vec![diagnostic],
+    }
+}
+
+/// One Runtime's immediate observation of a Workspace Prompt projection notification.
+/// This is not stored delivery state, retry authority, or current Workspace authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePromptProjectionObservation {
+    pub runtime_id: String,
+    pub result: Result<(), RuntimeControlCause>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
+    /// Closed Runtime observations, not historical authorization or retry permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<workdir::management_failure::WorkdirManagementFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<workdir::failure::WorkdirFailureDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<RuntimeControlCause>,
+    /// Internal startup observations; public consumers must separately authorize projection.
+    #[serde(skip)]
+    pub startup: Option<runtime_api::WorkerStartupFailure>,
     pub code: String,
     pub severity: HostDiagnosticSeverity,
     pub message: String,
@@ -369,6 +456,7 @@ pub(crate) fn workspace_worker_summary(
     workdir_attachments: Vec<server_api::WorkerWorkdirAttachmentSummary>,
 ) -> server_api::WorkerSummary {
     server_api::WorkerSummary {
+        removal: None,
         restore_observation_token: summary.restore_observation_token,
         runtime_id: summary.worker.runtime_id,
         worker_id: summary.worker.worker_id,
@@ -402,6 +490,10 @@ pub(crate) fn workspace_worker_summary(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InternalWorkerRestoreResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<RuntimeControlCause>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<runtime_api::WorkerStartupFailure>,
     pub state: server_api::WorkerRestoreState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<InternalWorkerSummary>,
@@ -416,6 +508,162 @@ pub struct WorkerWorkspaceApiResult {
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
+/// Authoritative exact-request observation; absence is not a negative result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAttachmentObservation {
+    pub result: Option<runtime_api::WorkerWorkdirAttachmentsMatch>,
+    pub current_generation: Option<String>,
+    pub cause: Option<RuntimeControlCause>,
+}
+
+/// Operation receipts and current authority are separate observations. Neither
+/// absence nor transport failure permits dispatching a new attachment attempt.
+#[derive(Clone)]
+pub struct RuntimeAttachmentOperationObservation {
+    pub observation: Option<runtime_api::WorkerWorkdirAttachmentsOperationObservation>,
+    pub cause: Option<RuntimeControlCause>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeAttachmentOperationResponse {
+    pub response: RuntimeOperationResponse,
+    pub receipt: Option<runtime_api::WorkerWorkdirAttachmentsOperationReceipt>,
+}
+
+/// Attachment replacement has an explicit unknown outcome, unlike legacy
+/// Worker operation acknowledgements. Status is not authority to resend or undo.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeOperationStatus {
+    Accepted,
+    Unsupported,
+    Rejected,
+    Unknown,
+}
+
+/// Immediate attachment-sync observation. A missing typed cause remains missing;
+/// diagnostic prose and HTTP status are never parsed to reconstruct one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeOperationResponse {
+    pub status: RuntimeOperationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<RuntimeControlCause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<InternalWorkerSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+impl RuntimeAttachmentOperationResponse {
+    fn failure(cause: Option<RuntimeControlCause>) -> Self {
+        let explanation = cause
+            .map(|cause| cause.explanation())
+            .unwrap_or("Runtime attachment operation result is unavailable");
+        Self {
+            response: RuntimeOperationResponse::attachment_failure(
+                cause,
+                diagnostic(
+                    "attachment_operation_observation",
+                    HostDiagnosticSeverity::Error,
+                    explanation,
+                ),
+            ),
+            receipt: None,
+        }
+    }
+
+    fn received(
+        worker_id: &str,
+        request: &runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+        receipt: runtime_api::WorkerWorkdirAttachmentsOperationReceipt,
+    ) -> Self {
+        if receipt.worker_ref.worker_id.to_string() != worker_id
+            || &receipt.request != request
+            || receipt.resulting_generation.is_empty()
+            || receipt.resulting_generation == request.expected_generation
+        {
+            return Self::failure(Some(RuntimeControlCause::InvalidResponse));
+        }
+        Self {
+            response: RuntimeOperationResponse {
+                status: RuntimeOperationStatus::Accepted,
+                cause: None,
+                worker: None,
+                diagnostics: Vec::new(),
+            },
+            receipt: Some(receipt),
+        }
+    }
+}
+
+impl RuntimeAttachmentOperationObservation {
+    fn received(
+        worker_id: &str,
+        request: &runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+        observation: runtime_api::WorkerWorkdirAttachmentsOperationObservation,
+    ) -> Self {
+        let receipt_valid = match &observation.result {
+            runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Receipt { receipt } => {
+                receipt.worker_ref.worker_id.to_string() == worker_id
+                    && &receipt.request == request
+                    && !receipt.resulting_generation.is_empty()
+                    && receipt.resulting_generation != request.expected_generation
+            }
+            _ => true,
+        };
+        if observation.worker_ref.worker_id.to_string() != worker_id
+            || &observation.request != request
+            || !receipt_valid
+        {
+            Self {
+                observation: None,
+                cause: Some(RuntimeControlCause::InvalidResponse),
+            }
+        } else {
+            Self {
+                observation: Some(observation),
+                cause: None,
+            }
+        }
+    }
+}
+
+impl RuntimeOperationResponse {
+    fn attachment_failure(
+        cause: Option<RuntimeControlCause>,
+        diagnostic: RuntimeDiagnostic,
+    ) -> Self {
+        use RuntimeControlCause as C;
+        // Only explicit admission/pre-publication failures settle this replace
+        // as rejected. This allowlist is attachment-specific, not a category or
+        // retry-hint classifier. In particular, failed response observation and
+        // post-rename uncertainty never prove that replacement did not execute.
+        let status = match cause {
+            Some(
+                C::WorkerMissing
+                | C::InvalidWorkerIdentifier
+                | C::InvalidRequest
+                | C::RuntimeStopped
+                | C::WorkspaceBindingMismatch
+                | C::AuthorizationFailed
+                | C::UnsupportedOperation
+                | C::PersistenceFailed
+                | C::RequestEncodingFailed
+                | C::ClientSetupFailed
+                | C::ConfigurationUnavailable,
+            ) => RuntimeOperationStatus::Rejected,
+            _ => RuntimeOperationStatus::Unknown,
+        };
+        Self {
+            status,
+            cause,
+            worker: None,
+            diagnostics: vec![diagnostic],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeList<T> {
     pub items: Vec<T>,
@@ -428,11 +676,74 @@ impl<T> RuntimeList<T> {
     }
 }
 
+/// Source-owned observation. Diagnostics never select or override this outcome.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerLookupOutcome {
+    Found { worker: InternalWorkerSummary },
+    Missing,
+    Failed { cause: RuntimeControlCause },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLookupResult {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<InternalWorkerSummary>,
+    pub outcome: WorkerLookupOutcome,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+impl WorkerLookupResult {
+    pub fn found(worker: InternalWorkerSummary) -> Self {
+        Self {
+            outcome: WorkerLookupOutcome::Found { worker },
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn missing() -> Self {
+        Self {
+            outcome: WorkerLookupOutcome::Missing,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn failed(cause: RuntimeControlCause, diagnostics: Vec<RuntimeDiagnostic>) -> Self {
+        Self {
+            outcome: WorkerLookupOutcome::Failed { cause },
+            diagnostics,
+        }
+    }
+
+    fn from_cause(cause: RuntimeControlCause, diagnostics: Vec<RuntimeDiagnostic>) -> Self {
+        if cause == RuntimeControlCause::WorkerMissing {
+            Self {
+                outcome: WorkerLookupOutcome::Missing,
+                diagnostics,
+            }
+        } else {
+            Self::failed(cause, diagnostics)
+        }
+    }
+
+    /// Lookup failure is not absence, operation rejection, or permission for fresh retry.
+    pub fn into_worker(
+        self,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<InternalWorkerSummary, RuntimeRegistryError> {
+        match self.outcome {
+            WorkerLookupOutcome::Found { worker } => Ok(worker),
+            WorkerLookupOutcome::Missing => Err(RuntimeRegistryError::UnknownWorker {
+                worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+            }),
+            WorkerLookupOutcome::Failed { cause } => {
+                Err(RuntimeRegistryError::RuntimeControlFailed {
+                    runtime_id: runtime_id.to_string(),
+                    cause,
+                    diagnostics: self.diagnostics,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -517,6 +828,7 @@ pub struct WorkerControlOperation {
 pub struct WorkerCreateBinding {
     pub worker_id: EmbeddedWorkerId,
     pub create_fingerprint: String,
+    pub plugin_execution: Option<runtime_api::PluginExecutionSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -616,6 +928,7 @@ fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
     Some(EmbeddedWorkerInput {
         kind: EmbeddedWorkerInputKind::User,
         content: Segment::flatten_to_text(segments),
+        source: None,
         submission_request_id: None,
         segments: Some(segments.to_vec()),
     })
@@ -623,6 +936,10 @@ fn initial_worker_input(segments: &[Segment]) -> Option<EmbeddedWorkerInput> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSpawnResult {
+    /// Typed failure for internal consumers, independent of diagnostic prose.
+    /// HTTP publication requires a fresh audience projection, not serialization here.
+    #[serde(skip)]
+    pub failure: Option<runtime_api::startup::WorkerCreateFailure>,
     pub state: InternalWorkerOperationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<InternalWorkerSummary>,
@@ -667,6 +984,8 @@ fn required_worker_workspace_api(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InternalWorkerOperationState {
+    /// The boundary did not observe a conclusive operation result.
+    Unknown,
     Accepted,
     Unsupported,
     Rejected,
@@ -675,6 +994,7 @@ pub enum InternalWorkerOperationState {
 impl From<InternalWorkerOperationState> for server_api::WorkerOperationState {
     fn from(state: InternalWorkerOperationState) -> Self {
         match state {
+            InternalWorkerOperationState::Unknown => Self::Unknown,
             InternalWorkerOperationState::Accepted => Self::Accepted,
             InternalWorkerOperationState::Unsupported => Self::Unsupported,
             InternalWorkerOperationState::Rejected => Self::Rejected,
@@ -710,6 +1030,8 @@ pub struct WorkerStopResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLifecycleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_intent: Option<runtime_api::WorkerStopIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
@@ -717,6 +1039,11 @@ pub struct WorkerLifecycleRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLifecycleResult {
+    /// Local post-operation cleanup facts, never inferred from Runtime diagnostics.
+    #[serde(skip)]
+    pub cleanup_failures: Vec<workdir::failure::WorkdirFailureDetails>,
+    #[serde(default)]
+    pub replayed: bool,
     pub state: InternalWorkerOperationState,
     #[serde(flatten)]
     pub worker: RuntimeWorkerRef,
@@ -748,6 +1075,9 @@ pub struct WorkerInputRequest {
     #[serde(default = "default_worker_input_kind")]
     pub kind: WorkerInputKind,
     pub content: String,
+    /// Provenance stamped by the authenticated Backend, never by public/model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<protocol::AuthenticatedInputSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -779,13 +1109,7 @@ pub struct WorkerCompletionsResult {
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerInputDisposition {
-    Accepted,
-    Rejected,
-    Unknown,
-}
+pub use server_api::WorkerInputDisposition;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerInputResult {
@@ -826,6 +1150,12 @@ pub enum RuntimeRegistryError {
     UnknownWorker {
         worker: RuntimeWorkerRef,
     },
+    /// Typed cause retained to the registry boundary; diagnostics are supplementary only.
+    RuntimeControlFailed {
+        runtime_id: String,
+        cause: RuntimeControlCause,
+        diagnostics: Vec<RuntimeDiagnostic>,
+    },
     RuntimeOperationFailed {
         runtime_id: String,
         code: String,
@@ -845,6 +1175,7 @@ impl RuntimeRegistryError {
                 "unknown worker `{}` in runtime `{}`",
                 worker.worker_id, worker.runtime_id
             ),
+            Self::RuntimeControlFailed { cause, .. } => cause.explanation().to_string(),
             Self::RuntimeOperationFailed { message, .. } => message.clone(),
             Self::WorkdirSessionOpenFailed { transport, .. } => transport.message.clone(),
         }
@@ -866,13 +1197,26 @@ impl RuntimeRegistryError {
             Self::UnknownRuntime(runtime_id) => Error::UnknownRuntime(runtime_id),
             Self::UnknownHost(host_id) => Error::UnknownHost(host_id),
             Self::UnknownWorker { worker } => Error::UnknownWorker { worker },
+            Self::RuntimeControlFailed {
+                runtime_id, cause, ..
+            } => Error::RuntimeControlFailed { runtime_id, cause },
             Self::RuntimeOperationFailed {
                 runtime_id,
                 code,
                 message,
             } => {
-                if code == "restore_observation_conflict" {
+                if matches!(
+                    code.as_str(),
+                    "restore_observation_stale" | "stop_observation_conflict"
+                ) {
+                    Error::WorkerLifecycleObservationStale
+                } else if code == "restore_observation_conflict" {
                     Error::RestoreObservationConflict
+                } else if matches!(
+                    code.as_str(),
+                    "stop_request_conflict" | "stop_admission_busy" | "restore_admission_busy"
+                ) {
+                    Error::RepositoryConflict(message)
                 } else {
                     Error::RuntimeOperationFailed {
                         runtime_id,
@@ -922,6 +1266,10 @@ impl RuntimePingFailure {
 
 pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn runtime_id(&self) -> &str;
+
+    fn workdir_session_recovery(&self) -> Option<workdir::http::RemoteWorkdirSessionRegistry> {
+        None
+    }
 
     fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary;
 
@@ -978,6 +1326,8 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: runtime_api::WorkerRestoreRequest,
     ) -> InternalWorkerRestoreResult {
         InternalWorkerRestoreResult {
+            control: None,
+            startup: None,
             state: server_api::WorkerRestoreState::Rejected,
             worker: None,
             diagnostics: vec![diagnostic(
@@ -1010,9 +1360,10 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         &self,
         worker_id: &str,
         _attachments: Vec<LogicalWorkdirAttachment>,
-    ) -> WorkerWorkspaceApiResult {
-        WorkerWorkspaceApiResult {
-            state: InternalWorkerOperationState::Unsupported,
+    ) -> RuntimeOperationResponse {
+        RuntimeOperationResponse {
+            status: RuntimeOperationStatus::Unsupported,
+            cause: Some(RuntimeControlCause::UnsupportedOperation),
             worker: None,
             diagnostics: vec![diagnostic(
                 "worker_workdir_attachments_replace_unsupported",
@@ -1021,6 +1372,37 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                     "runtime does not support replacing Workdir attachments for worker `{worker_id}`"
                 ),
             )],
+        }
+    }
+
+    fn observe_worker_workdir_attachments(
+        &self,
+        _worker_id: &str,
+        _attachments: Vec<LogicalWorkdirAttachment>,
+    ) -> RuntimeAttachmentObservation {
+        RuntimeAttachmentObservation {
+            result: None,
+            current_generation: None,
+            cause: Some(RuntimeControlCause::UnsupportedOperation),
+        }
+    }
+
+    fn apply_worker_workdir_attachments_operation(
+        &self,
+        _worker_id: &str,
+        _request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> RuntimeAttachmentOperationResponse {
+        RuntimeAttachmentOperationResponse::failure(Some(RuntimeControlCause::UnsupportedOperation))
+    }
+
+    fn observe_worker_workdir_attachments_operation(
+        &self,
+        _worker_id: &str,
+        _request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> RuntimeAttachmentOperationObservation {
+        RuntimeAttachmentOperationObservation {
+            observation: None,
+            cause: Some(RuntimeControlCause::UnsupportedOperation),
         }
     }
 
@@ -1092,6 +1474,15 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn open_owned_workdir_session<'a>(
+        &'a self,
+        workdir_id: &'a str,
+        owner_worker_id: Option<&'a str>,
+        _owner: workdir::http::RemoteWorkdirSessionOwner,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkdirSessionHandle, WorkdirError>> + Send + 'a>> {
+        self.open_workdir_session(workdir_id, owner_worker_id)
+    }
+
     fn cleanup_working_directory(
         &self,
         working_directory_id: &str,
@@ -1115,6 +1506,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         request: WorkerSpawnRequest,
     ) -> WorkerSpawnResult {
         WorkerSpawnResult {
+            failure: None,
             state: InternalWorkerOperationState::Unsupported,
             worker: None,
             acceptance_evidence: Vec::new(),
@@ -1132,8 +1524,8 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn observe_workspace_prompt_projection(
         &self,
         _projection: worker::WorkspacePromptProjection,
-    ) -> Result<(), String> {
-        Ok(())
+    ) -> Result<(), RuntimeControlCause> {
+        Err(RuntimeControlCause::UnsupportedOperation)
     }
 
     fn sync_config_bundle(&self, _bundle: ConfigBundle) -> ConfigBundleSyncResult {
@@ -1183,12 +1575,38 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         })
     }
 
+    fn coordinate_worker_stop(
+        &self,
+        _worker_id: &str,
+        _request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_stop_admission_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support fenced stop admission",
+        ))
+    }
+
+    fn worker_stop_outcome(
+        &self,
+        _worker_id: &str,
+        _request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_stop_outcome_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support stop outcome queries",
+        ))
+    }
+
     fn stop_worker(
         &self,
         worker_id: &str,
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            cleanup_failures: Vec::new(),
+            replayed: false,
             state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
@@ -1207,6 +1625,8 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _request: WorkerLifecycleRequest,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            cleanup_failures: Vec::new(),
+            replayed: false,
             state: InternalWorkerOperationState::Unsupported,
             worker: RuntimeWorkerRef::new(self.runtime_id().to_string(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
@@ -1251,6 +1671,29 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         ))
     }
 
+    fn freeze_worker_removal(
+        &self,
+        _request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_removal_freeze_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support operation-bound Worker removal freeze",
+        ))
+    }
+
+    fn capture_worker_removal_session(
+        &self,
+        _worker_id: &str,
+        _request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        Err(diagnostic(
+            "worker_removal_capture_unsupported",
+            HostDiagnosticSeverity::Error,
+            "Runtime does not support frozen Worker removal recording capture",
+        ))
+    }
+
     fn worker_session(
         &self,
         _workspace_id: &str,
@@ -1290,6 +1733,20 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 worker_ref.worker_id
             ),
         })
+    }
+
+    fn purge_subject_job_removal(
+        &self,
+        _request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, String> {
+        Err("Subject Job removal source erasure is unavailable on this Runtime".into())
+    }
+
+    fn subject_delete_worker(
+        &self,
+        _request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, String> {
+        Err("Subject deletion fencing is unavailable on this Runtime".into())
     }
 
     fn recover_subject_create(
@@ -1373,6 +1830,45 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
         _worker_id: &str,
     ) -> Result<Option<crate::observation::RuntimeObservationSource>, RuntimeDiagnostic> {
         Ok(None)
+    }
+
+    /// Original allocation identity only, not execution or input acceptance.
+    fn lookup_job_worker_creation(
+        &self,
+        _worker_id: &str,
+        _create_fingerprint: &str,
+        _binding: &worker_runtime::catalog::BackendJobExecutionBinding,
+    ) -> Result<Option<InternalWorkerSummary>, RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_owned(),
+            code: "worker_creation_receipt_unsupported".into(),
+            message: "Runtime does not support original Job Worker identity lookup".into(),
+        })
+    }
+
+    fn backend_job_termination(
+        &self,
+        _worker_id: &str,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>, RuntimeRegistryError>
+    {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_owned(),
+            code: "worker_termination_receipt_unsupported".into(),
+            message: "Runtime does not support actual scope-termination receipt lookup".into(),
+        })
+    }
+
+    /// Read-only exact receipt lookup. Unsupported lookup is not proof of rejection.
+    fn reconcile_worker_input(
+        &self,
+        _worker_id: &str,
+        _request: WorkerInputRequest,
+    ) -> Result<WorkerInputResult, RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_owned(),
+            code: "worker_input_receipt_unsupported".into(),
+            message: "Runtime does not support read-only submission receipt lookup".into(),
+        })
     }
 
     fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
@@ -1472,6 +1968,8 @@ type RuntimeBindingGate = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct RuntimeRegistry {
     runtimes: Arc<RwLock<Vec<Arc<dyn WorkspaceWorkerRuntime>>>>,
     runtime_binding_gate: Arc<RwLock<Option<RuntimeBindingGate>>>,
+    retired_workdir_session_owners:
+        Arc<Mutex<Vec<(String, workdir::http::RemoteWorkdirSessionRegistry)>>>,
 }
 
 impl RuntimeRegistry {
@@ -1479,6 +1977,7 @@ impl RuntimeRegistry {
         Self {
             runtimes: Arc::new(RwLock::new(runtimes)),
             runtime_binding_gate: Arc::new(RwLock::new(None)),
+            retired_workdir_session_owners: Default::default(),
         }
     }
 
@@ -1527,6 +2026,21 @@ impl RuntimeRegistry {
             .runtimes
             .write()
             .expect("runtime registry lock poisoned");
+        let mut retired = self
+            .retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned");
+        for existing in runtimes
+            .iter()
+            .filter(|existing| existing.runtime_id() == runtime_id)
+        {
+            if let Some(sessions) = existing.workdir_session_recovery() {
+                if !sessions.is_empty() {
+                    retired.push((runtime_id.clone(), sessions));
+                }
+            }
+        }
+        retired.retain(|(_, sessions)| !sessions.is_empty());
         runtimes.retain(|existing| existing.runtime_id() != runtime_id);
         runtimes.push(runtime);
     }
@@ -1558,6 +2072,21 @@ impl RuntimeRegistry {
             .write()
             .expect("runtime registry lock poisoned");
         let before = runtimes.len();
+        let mut retired = self
+            .retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned");
+        for existing in runtimes
+            .iter()
+            .filter(|existing| existing.runtime_id() == runtime_id)
+        {
+            if let Some(sessions) = existing.workdir_session_recovery() {
+                if !sessions.is_empty() {
+                    retired.push((runtime_id.to_owned(), sessions));
+                }
+            }
+        }
+        retired.retain(|(_, sessions)| !sessions.is_empty());
         runtimes.retain(|runtime| runtime.runtime_id() != runtime_id);
         if runtimes.len() == before {
             Ok(RuntimeRegistryUnregisterResult::NotFound)
@@ -1689,11 +2218,7 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        let worker = lookup.worker.ok_or_else(|| {
-            operation_failed_or_unknown_worker(runtime_id, worker_id, lookup.diagnostics)
-        })?;
-        Ok(worker)
+        runtime.worker(worker_id).into_worker(runtime_id, worker_id)
     }
 
     pub fn coordinate_worker_restore(
@@ -1748,7 +2273,7 @@ impl RuntimeRegistry {
         &self,
         worker: &RuntimeWorkerRef,
         attachments: Vec<LogicalWorkdirAttachment>,
-    ) -> Result<WorkerWorkspaceApiResult, RuntimeRegistryError> {
+    ) -> Result<RuntimeOperationResponse, RuntimeRegistryError> {
         let runtime_id = worker.runtime_id.as_str();
         let worker_id = worker.worker_id.as_str();
         validate_backend_identifier("runtime_id", runtime_id)?;
@@ -1757,28 +2282,54 @@ impl RuntimeRegistry {
         Ok(runtime.replace_worker_workdir_attachments(worker_id, attachments))
     }
 
+    pub fn observe_worker_workdir_attachments(
+        &self,
+        worker: &RuntimeWorkerRef,
+        attachments: Vec<LogicalWorkdirAttachment>,
+    ) -> Result<RuntimeAttachmentObservation, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        Ok(self
+            .runtime(&worker.runtime_id)?
+            .observe_worker_workdir_attachments(&worker.worker_id, attachments))
+    }
+
+    pub fn apply_worker_workdir_attachments_operation(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<RuntimeAttachmentOperationResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        Ok(self
+            .runtime(&worker.runtime_id)?
+            .apply_worker_workdir_attachments_operation(&worker.worker_id, request))
+    }
+
+    pub fn observe_worker_workdir_attachments_operation(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<RuntimeAttachmentOperationObservation, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        Ok(self
+            .runtime(&worker.runtime_id)?
+            .observe_worker_workdir_attachments_operation(&worker.worker_id, request))
+    }
+
     pub fn observe_workspace_prompt_projection(
         &self,
         projection: worker::WorkspacePromptProjection,
-    ) -> Vec<RuntimeDiagnostic> {
+    ) -> Vec<RuntimePromptProjectionObservation> {
+        // Canonical observations include successes and unsupported producers, not
+        // just warning diagnostics. Never apply the display diagnostic limit here.
         self.runtimes_snapshot()
             .into_iter()
-            .filter_map(|runtime| {
-                runtime
-                    .observe_workspace_prompt_projection(projection.clone())
-                    .err()
-                    .map(|message| {
-                        diagnostic(
-                            "workspace_prompt_projection_notification_failed",
-                            HostDiagnosticSeverity::Warning,
-                            format!(
-                                "runtime '{}' rejected Workspace Prompt projection digest {}: {message}",
-                                runtime.runtime_id(), projection.projection_digest
-                            ),
-                        )
-                    })
+            .map(|runtime| RuntimePromptProjectionObservation {
+                runtime_id: runtime.runtime_id().to_string(),
+                result: runtime.observe_workspace_prompt_projection(projection.clone()),
             })
-            .take(MAX_DIAGNOSTICS)
             .collect()
     }
 
@@ -1952,6 +2503,50 @@ impl RuntimeRegistry {
             })
     }
 
+    pub async fn open_owned_workdir_session(
+        &self,
+        runtime_id: &str,
+        workdir_id: &str,
+        owner_worker_id: Option<&str>,
+        owner: workdir::http::RemoteWorkdirSessionOwner,
+    ) -> Result<WorkdirSessionHandle, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("working_directory_id", workdir_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        runtime
+            .open_owned_workdir_session(workdir_id, owner_worker_id, owner)
+            .await
+            .map_err(|error| RuntimeRegistryError::WorkdirSessionOpenFailed {
+                runtime_id: runtime_id.into(),
+                transport: workdir::http::WorkdirTransportError::from_workdir_error(&error),
+            })
+    }
+
+    pub async fn close_owned_workdir_sessions(
+        &self,
+        worker: &RuntimeWorkerRef,
+        connection_id: Option<&str>,
+    ) -> Result<(), WorkdirError> {
+        let mut sessions = self
+            .runtimes_snapshot()
+            .into_iter()
+            .filter_map(|runtime| runtime.workdir_session_recovery())
+            .collect::<Vec<_>>();
+        sessions.extend(
+            self.retired_workdir_session_owners
+                .lock()
+                .expect("retired Workdir session owners poisoned")
+                .iter()
+                .map(|(_, sessions)| sessions.clone()),
+        );
+        for sessions in sessions {
+            sessions
+                .close_owned(&worker.runtime_id, &worker.worker_id, connection_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub fn cleanup_working_directory(
         &self,
         runtime_id: &str,
@@ -1960,6 +2555,27 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("working_directory_id", working_directory_id)?;
         let runtime = self.runtime(runtime_id)?;
+        let retired = self
+            .retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned")
+            .iter()
+            .filter(|(owner, _)| owner == runtime_id)
+            .map(|(_, sessions)| sessions.clone())
+            .collect::<Vec<_>>();
+        for sessions in retired {
+            if let Err(error) = close_abandoned_remote_sessions(
+                sessions,
+                working_directory_id.to_owned(),
+                Duration::from_secs(30),
+            ) {
+                return Ok(unconfirmed_workdir_session_cleanup(error));
+            }
+        }
+        self.retired_workdir_session_owners
+            .lock()
+            .expect("retired Workdir session owners poisoned")
+            .retain(|(_, sessions)| !sessions.is_empty());
         Ok(runtime.cleanup_working_directory(working_directory_id))
     }
 
@@ -2002,15 +2618,44 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         runtime.send_protocol_method(worker_id, method)
+    }
+
+    pub fn lookup_job_worker_creation(
+        &self,
+        worker: &RuntimeWorkerRef,
+        create_fingerprint: &str,
+        binding: &worker_runtime::catalog::BackendJobExecutionBinding,
+    ) -> Result<Option<InternalWorkerSummary>, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", worker.runtime_id.as_str())?;
+        validate_backend_identifier("worker_id", worker.worker_id.as_str())?;
+        self.runtime(worker.runtime_id.as_str())?
+            .lookup_job_worker_creation(worker.worker_id.as_str(), create_fingerprint, binding)
+    }
+
+    pub fn backend_job_termination(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>, RuntimeRegistryError>
+    {
+        validate_backend_identifier("runtime_id", worker.runtime_id.as_str())?;
+        validate_backend_identifier("worker_id", worker.worker_id.as_str())?;
+        self.runtime(worker.runtime_id.as_str())?
+            .backend_job_termination(worker.worker_id.as_str())
+    }
+
+    pub fn reconcile_worker_input(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerInputRequest,
+    ) -> Result<WorkerInputResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", worker.runtime_id.as_str())?;
+        validate_backend_identifier("worker_id", worker.worker_id.as_str())?;
+        self.runtime(worker.runtime_id.as_str())?
+            .reconcile_worker_input(worker.worker_id.as_str(), request)
     }
 
     pub fn send_input(
@@ -2023,14 +2668,9 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         Ok(runtime.send_input(worker_id, request))
     }
 
@@ -2047,14 +2687,9 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         runtime.upload_worker_file(worker_id, file_name, media_type, content, context)
     }
 
@@ -2068,14 +2703,9 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         runtime.delete_worker_uploaded_file(worker_id, artifact_id)
     }
 
@@ -2089,15 +2719,44 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         Ok(runtime.worker_completions(worker_id, request))
+    }
+
+    pub fn coordinate_worker_stop(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        let runtime = self.runtime(&worker.runtime_id)?;
+        runtime
+            .coordinate_worker_stop(&worker.worker_id, request)
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+    }
+
+    pub fn worker_stop_outcome(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        let runtime = self.runtime(&worker.runtime_id)?;
+        runtime
+            .worker_stop_outcome(&worker.worker_id, request)
+            .map_err(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
     }
 
     pub fn stop_worker(
@@ -2110,14 +2769,9 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         Ok(runtime.stop_worker(worker_id, request))
     }
 
@@ -2131,14 +2785,9 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         Ok(runtime.cancel_worker(worker_id, request))
     }
 
@@ -2151,14 +2800,9 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
+        runtime
+            .worker(worker_id)
+            .into_worker(runtime_id, worker_id)?;
         Ok(runtime.delete_worker(worker_id))
     }
 
@@ -2197,6 +2841,62 @@ impl RuntimeRegistry {
                 runtime_id: worker.runtime_id.clone(),
                 code: "worker_retention_execution_failed".to_string(),
                 message,
+            })
+    }
+
+    pub fn freeze_worker_removal(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        if request.worker_id.to_string() != worker.worker_id
+            || request.source_runtime_id != worker.runtime_id
+        {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_removal_target_mismatch".into(),
+                message: "removal request Runtime/Worker identity does not match target".into(),
+            });
+        }
+        let expected = request.clone();
+        let freeze = self
+            .runtime(&worker.runtime_id)?
+            .freeze_worker_removal(request)
+            .map_err(|cause| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: cause.code,
+                message: cause.message,
+            })?;
+        if freeze.operation_id != expected.operation_id
+            || freeze.input_fingerprint != expected.input_fingerprint
+            || freeze.workspace_id != expected.workspace_id
+            || freeze.source_runtime_id != expected.source_runtime_id
+            || freeze.worker_id != expected.worker_id
+        {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: "worker_removal_freeze_identity_mismatch".into(),
+                message: "Runtime removal freeze does not match the exact retention request".into(),
+            });
+        }
+        Ok(freeze)
+    }
+
+    pub fn capture_worker_removal_session(
+        &self,
+        worker: &RuntimeWorkerRef,
+        request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", &worker.runtime_id)?;
+        validate_backend_identifier("worker_id", &worker.worker_id)?;
+        self.runtime(&worker.runtime_id)?
+            .capture_worker_removal_session(&worker.worker_id, request)
+            .map_err(|cause| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: worker.runtime_id.clone(),
+                code: cause.code,
+                message: cause.message,
             })
     }
 
@@ -2267,6 +2967,47 @@ impl RuntimeRegistry {
                 },
             )?);
         runtime.worker_session_attachment(workspace_id, &worker_ref, session_id, attachment_id)
+    }
+
+    pub fn purge_subject_job_removal(
+        &self,
+        runtime_id: &str,
+        deletion: runtime_api::SubjectDeleteWorkerRequest,
+        removal: WorkerRetentionExecutionRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let removal = runtime_contract_convert(removal).map_err(|diagnostic| {
+            RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "subject_job_removal_request_invalid".into(),
+                message: diagnostic.message,
+            }
+        })?;
+        self.runtime(runtime_id)?
+            .purge_subject_job_removal(runtime_api::SubjectJobRemovalPurgeRequest {
+                deletion,
+                removal,
+            })
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "subject_job_removal_purge_unconfirmed".into(),
+                message,
+            })
+    }
+
+    pub fn subject_delete_worker(
+        &self,
+        runtime_id: &str,
+        request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        self.runtime(runtime_id)?
+            .subject_delete_worker(request)
+            .map_err(|message| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: runtime_id.into(),
+                code: "subject_delete_worker_unproven".into(),
+                message,
+            })
     }
 
     pub fn recover_subject_create(
@@ -2756,28 +3497,21 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
 
     fn worker(&self, worker_id: &str) -> WorkerLookupResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
-            return WorkerLookupResult {
-                worker: None,
-                diagnostics: vec![diagnostic(
+            return WorkerLookupResult::failed(
+                RuntimeControlCause::InvalidWorkerIdentifier,
+                vec![diagnostic(
                     "embedded_worker_id_invalid",
                     HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot be resolved".to_string(),
                 )],
-            };
+            );
         };
         match self.runtime.worker_detail(&worker_ref) {
-            Ok(detail) => WorkerLookupResult {
-                worker: Some(self.map_worker_detail(detail)),
-                diagnostics: Vec::new(),
-            },
-            Err(EmbeddedRuntimeError::WorkerNotFound { .. }) => WorkerLookupResult {
-                worker: None,
-                diagnostics: Vec::new(),
-            },
-            Err(err) => WorkerLookupResult {
-                worker: None,
-                diagnostics: vec![embedded_runtime_diagnostic(&err)],
-            },
+            Ok(detail) => WorkerLookupResult::found(self.map_worker_detail(detail)),
+            Err(error) => WorkerLookupResult::from_cause(
+                embedded_control_cause(&error),
+                vec![embedded_runtime_diagnostic(&error)],
+            ),
         }
     }
 
@@ -2805,6 +3539,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .map_err(|error| embedded_runtime_diagnostic(&error))?;
         Ok((
             result.map(|result| InternalWorkerRestoreResult {
+                control: result.control,
+                startup: result.startup.and_then(internal_startup_transfer),
                 state: result.state,
                 worker: result.worker.map(|detail| self.map_worker_detail(detail)),
                 diagnostics: match (result.reason_code, result.message) {
@@ -2825,6 +3561,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     ) -> InternalWorkerRestoreResult {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
             return InternalWorkerRestoreResult {
+                control: None,
+                startup: None,
                 state: server_api::WorkerRestoreState::Rejected,
                 worker: None,
                 diagnostics: vec![diagnostic(
@@ -2843,6 +3581,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     _ => Vec::new(),
                 };
                 InternalWorkerRestoreResult {
+                    control: result.control,
+                    startup: result.startup.and_then(internal_startup_transfer),
                     state: result.state,
                     worker: result.worker.map(|detail| self.map_worker_detail(detail)),
                     diagnostics,
@@ -2850,6 +3590,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             }
             Err(worker_runtime::error::RuntimeError::RestoreObservationConflict { .. }) => {
                 InternalWorkerRestoreResult {
+                    control: Some(RuntimeControlCause::RestoreObservationConflict),
+                    startup: None,
                     state: server_api::WorkerRestoreState::Rejected,
                     worker: None,
                     diagnostics: vec![diagnostic(
@@ -2860,6 +3602,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 }
             }
             Err(err) => InternalWorkerRestoreResult {
+                control: Some(err.control_cause()),
+                startup: embedded_runtime_diagnostic(&err).startup,
                 state: server_api::WorkerRestoreState::ReconciliationRequired,
                 worker: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
@@ -2904,31 +3648,114 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         &self,
         worker_id: &str,
         attachments: Vec<LogicalWorkdirAttachment>,
-    ) -> WorkerWorkspaceApiResult {
+    ) -> RuntimeOperationResponse {
         let Some(worker_ref) = self.worker_ref(worker_id) else {
-            return WorkerWorkspaceApiResult {
-                state: InternalWorkerOperationState::Rejected,
-                worker: None,
-                diagnostics: vec![diagnostic(
+            return RuntimeOperationResponse::attachment_failure(
+                Some(RuntimeControlCause::InvalidWorkerIdentifier),
+                diagnostic(
                     "embedded_worker_id_invalid",
                     HostDiagnosticSeverity::Warning,
                     "Worker id was empty and cannot change Workdir attachments".to_string(),
-                )],
-            };
+                ),
+            );
         };
         match self
             .runtime
             .replace_worker_workdir_attachments(&worker_ref, attachments)
         {
-            Ok(detail) => WorkerWorkspaceApiResult {
-                state: InternalWorkerOperationState::Accepted,
+            Ok(detail) => RuntimeOperationResponse {
+                status: RuntimeOperationStatus::Accepted,
+                cause: None,
                 worker: Some(self.map_worker_detail(detail)),
                 diagnostics: Vec::new(),
             },
-            Err(err) => WorkerWorkspaceApiResult {
-                state: InternalWorkerOperationState::Rejected,
-                worker: None,
-                diagnostics: vec![embedded_runtime_diagnostic(&err)],
+            Err(err) => RuntimeOperationResponse::attachment_failure(
+                Some(err.control_cause()),
+                embedded_runtime_diagnostic(&err),
+            ),
+        }
+    }
+
+    fn observe_worker_workdir_attachments(
+        &self,
+        worker_id: &str,
+        attachments: Vec<LogicalWorkdirAttachment>,
+    ) -> RuntimeAttachmentObservation {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return RuntimeAttachmentObservation {
+                result: None,
+                current_generation: None,
+                cause: Some(RuntimeControlCause::InvalidWorkerIdentifier),
+            };
+        };
+        match self
+            .runtime
+            .observe_worker_workdir_attachments_state_scoped(
+                &RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend"),
+                &worker_ref,
+                attachments,
+            ) {
+            Ok(result) => RuntimeAttachmentObservation {
+                result: Some(result.result),
+                current_generation: result.current_generation,
+                cause: None,
+            },
+            Err(error) => RuntimeAttachmentObservation {
+                result: None,
+                current_generation: None,
+                cause: Some(error.control_cause()),
+            },
+        }
+    }
+
+    fn apply_worker_workdir_attachments_operation(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> RuntimeAttachmentOperationResponse {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return RuntimeAttachmentOperationResponse::failure(Some(
+                RuntimeControlCause::InvalidWorkerIdentifier,
+            ));
+        };
+        match self
+            .runtime
+            .apply_worker_workdir_attachments_operation_scoped(
+                &RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend"),
+                &worker_ref,
+                request.clone(),
+            ) {
+            Ok(receipt) => {
+                RuntimeAttachmentOperationResponse::received(worker_id, &request, receipt)
+            }
+            Err(error) => RuntimeAttachmentOperationResponse::failure(Some(error.control_cause())),
+        }
+    }
+
+    fn observe_worker_workdir_attachments_operation(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> RuntimeAttachmentOperationObservation {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return RuntimeAttachmentOperationObservation {
+                observation: None,
+                cause: Some(RuntimeControlCause::InvalidWorkerIdentifier),
+            };
+        };
+        match self
+            .runtime
+            .observe_worker_workdir_attachments_operation_scoped(
+                &RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend"),
+                &worker_ref,
+                request.clone(),
+            ) {
+            Ok(observation) => {
+                RuntimeAttachmentOperationObservation::received(worker_id, &request, observation)
+            }
+            Err(error) => RuntimeAttachmentOperationObservation {
+                observation: None,
+                cause: Some(error.control_cause()),
             },
         }
     }
@@ -2940,7 +3767,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         RuntimeWorkingDirectoryResult {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
-            diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
+            diagnostics: vec![embedded_workdir_unsupported_diagnostic(Some(
+                workdir::management_failure::WorkdirManagementOperation::Create,
+            ))],
         }
     }
 
@@ -2974,7 +3803,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         RuntimeWorkingDirectoryResult {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
-            diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
+            diagnostics: vec![embedded_workdir_unsupported_diagnostic(Some(
+                workdir::management_failure::WorkdirManagementOperation::Detail,
+            ))],
         }
     }
 
@@ -2985,7 +3816,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         RuntimeWorkingDirectoryResult {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
-            diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
+            diagnostics: vec![embedded_workdir_unsupported_diagnostic(Some(
+                workdir::management_failure::WorkdirManagementOperation::Cleanup,
+            ))],
         }
     }
 
@@ -2998,8 +3831,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         if !request.resolved_workdir_attachment_requests.is_empty()
             || !request.resolved_workdir_attachments.is_empty()
         {
-            diagnostics.push(embedded_workdir_unsupported_diagnostic());
+            diagnostics.push(embedded_workdir_unsupported_diagnostic(None));
             return WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
@@ -3016,18 +3850,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 "Embedded backend Runtime is transportless; use run_accepted/create acceptance for backend-internal Workers".to_string(),
             ));
             return WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
                 diagnostics,
             };
-        }
-        if request.requested_worker_name.is_some() {
-            diagnostics.push(diagnostic(
-                "embedded_worker_name_display_only",
-                HostDiagnosticSeverity::Info,
-                "requested_worker_name is used only as display_name; Worker identity is allocated by Workspace authority".to_string(),
-            ));
         }
         if matches!(request.acceptance, WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments } if expected_segments > 0)
         {
@@ -3048,6 +3876,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     error,
                 ));
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -3060,6 +3889,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -3082,6 +3912,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .create_worker_scoped(&workspace_scope, create_request)
         {
             Ok(detail) => WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Accepted,
                 worker: Some(self.map_worker_detail(detail)),
                 acceptance_evidence: vec![
@@ -3100,9 +3931,15 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics,
             },
             Err(err) => {
+                let failure = err.create_failure();
                 diagnostics.push(embedded_runtime_diagnostic(&err));
+                let state = failure.as_ref().map_or(
+                    InternalWorkerOperationState::Rejected,
+                    startup_failure_operation_state,
+                );
                 WorkerSpawnResult {
-                    state: InternalWorkerOperationState::Rejected,
+                    failure,
+                    state,
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics,
@@ -3114,10 +3951,10 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
     fn observe_workspace_prompt_projection(
         &self,
         projection: worker::WorkspacePromptProjection,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeControlCause> {
         self.runtime
             .observe_workspace_prompt_projection(projection)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.control_cause())
     }
 
     fn sync_config_bundle(&self, bundle: ConfigBundle) -> ConfigBundleSyncResult {
@@ -3163,6 +4000,56 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
     }
 
+    fn coordinate_worker_stop(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_ref = self.worker_ref(worker_id).ok_or_else(|| {
+            diagnostic(
+                "embedded_worker_id_invalid",
+                HostDiagnosticSeverity::Error,
+                "Worker ID could not be resolved",
+            )
+        })?;
+        let outcome = self
+            .runtime
+            .coordinate_worker_stop(
+                &worker_ref,
+                runtime_api::WorkerLifecycleRequest {
+                    reason: request.reason,
+                    stop_intent: request.stop_intent,
+                },
+            )
+            .map_err(|error| embedded_runtime_diagnostic(&error))?;
+        runtime_contract_convert(outcome)
+    }
+
+    fn worker_stop_outcome(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_ref = self.worker_ref(worker_id).ok_or_else(|| {
+            diagnostic(
+                "embedded_worker_id_invalid",
+                HostDiagnosticSeverity::Error,
+                "Worker ID could not be resolved",
+            )
+        })?;
+        let outcome = self
+            .runtime
+            .worker_stop_outcome(
+                &worker_ref,
+                runtime_api::WorkerLifecycleRequest {
+                    reason: request.reason,
+                    stop_intent: request.stop_intent,
+                },
+            )
+            .map_err(|error| embedded_runtime_diagnostic(&error))?;
+        runtime_contract_convert(outcome)
+    }
+
     fn stop_worker(
         &self,
         worker_id: &str,
@@ -3190,8 +4077,16 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 ),
             );
         };
-        match self.runtime.stop_worker(&worker_ref, request.reason) {
-            Ok(_) => WorkerLifecycleResult {
+        match self.runtime.stop_worker_request(
+            &worker_ref,
+            runtime_api::WorkerLifecycleRequest {
+                reason: request.reason,
+                stop_intent: request.stop_intent,
+            },
+        ) {
+            Ok(response) => WorkerLifecycleResult {
+                cleanup_failures: Vec::new(),
+                replayed: response.replayed,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
@@ -3235,6 +4130,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         };
         match self.runtime.cancel_worker(&worker_ref, request.reason) {
             Ok(_) => WorkerLifecycleResult {
+                cleanup_failures: Vec::new(),
+                replayed: false,
                 state: InternalWorkerOperationState::Accepted,
                 worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
                 diagnostics: Vec::new(),
@@ -3303,6 +4200,58 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .map_err(|error| error.to_string())
     }
 
+    fn freeze_worker_removal(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id || request.source_runtime_id != self.runtime_id
+        {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal request does not match embedded Runtime/Workspace",
+            ));
+        }
+        let scope = RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend");
+        self.runtime
+            .freeze_worker_removal_scoped(&scope, &request)
+            .map_err(|error| embedded_runtime_diagnostic(&error))
+    }
+
+    fn capture_worker_removal_session(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal capture Workspace does not match embedded Runtime",
+            ));
+        }
+        let worker_id = EmbeddedWorkerId::parse(worker_id).ok_or_else(|| {
+            diagnostic(
+                "embedded_worker_id_invalid",
+                HostDiagnosticSeverity::Error,
+                "invalid Worker identity for removal capture",
+            )
+        })?;
+        let scope = RuntimeWorkspaceScope::new(&self.workspace_id, "embedded-backend");
+        self.runtime
+            .capture_worker_removal_session_scoped(
+                &scope,
+                &request.operation_id,
+                worker_id,
+                request.session_id,
+                request.active_segment_id,
+                request.start,
+                request.max_entries,
+                request.max_serialized_bytes,
+            )
+            .map_err(|error| embedded_runtime_diagnostic(&error))
+    }
+
     fn worker_session(
         &self,
         workspace_id: &str,
@@ -3365,6 +4314,32 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 .to_string(),
                 message: error.to_string(),
             })
+    }
+
+    fn subject_delete_worker(
+        &self,
+        request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, String> {
+        if request.workspace_id != self.workspace_id {
+            return Err("Subject deletion Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.workspace_id, "embedded-backend");
+        self.runtime
+            .subject_delete_worker_scoped(&scope, request)
+            .map_err(|e| e.to_string())
+    }
+
+    fn purge_subject_job_removal(
+        &self,
+        request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, String> {
+        if request.deletion.workspace_id != self.workspace_id {
+            return Err("Subject Job removal erasure Workspace mismatch".into());
+        }
+        let scope = RuntimeWorkspaceScope::new(&request.deletion.workspace_id, "embedded-backend");
+        self.runtime
+            .purge_subject_job_removal_scoped(&scope, request)
+            .map_err(|e| e.to_string())
     }
 
     fn recover_subject_create(
@@ -3578,6 +4553,111 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             })
     }
 
+    fn lookup_job_worker_creation(
+        &self,
+        worker_id: &str,
+        create_fingerprint: &str,
+        binding: &worker_runtime::catalog::BackendJobExecutionBinding,
+    ) -> Result<Option<InternalWorkerSummary>, RuntimeRegistryError> {
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        self.runtime
+            .lookup_job_worker_creation(
+                &self.workspace_id,
+                &worker_ref,
+                create_fingerprint,
+                binding,
+            )
+            .map(|worker| worker.map(|worker| self.map_worker_detail(worker)))
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_job_creation_lookup_failed".into(),
+                message: error.to_string(),
+            })
+    }
+
+    fn backend_job_termination(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>, RuntimeRegistryError>
+    {
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        self.runtime
+            .execution_termination(&worker_ref)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_termination_lookup_failed".into(),
+                message: error.to_string(),
+            })
+    }
+
+    fn reconcile_worker_input(
+        &self,
+        worker_id: &str,
+        request: WorkerInputRequest,
+    ) -> Result<WorkerInputResult, RuntimeRegistryError> {
+        if !self.execution_enabled {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_execution_unavailable".into(),
+                message: "Runtime has no execution backend for receipt lookup".into(),
+            });
+        }
+        let worker_ref =
+            self.worker_ref(worker_id)
+                .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                    worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                })?;
+        let input = EmbeddedWorkerInput {
+            kind: match request.kind {
+                WorkerInputKind::User => EmbeddedWorkerInputKind::User,
+                WorkerInputKind::UserIfIdle => EmbeddedWorkerInputKind::UserIfIdle,
+                WorkerInputKind::Notify => EmbeddedWorkerInputKind::Notify,
+                WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
+                WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
+            },
+            content: request.content,
+            source: request.source,
+            submission_request_id: request.submission_request_id,
+            segments: request.segments,
+        };
+        let receipt = self
+            .runtime
+            .reconcile_input(&worker_ref, input)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_receipt_lookup_failed".into(),
+                message: error.to_string(),
+            })?;
+        if receipt.is_accepted() {
+            Ok(WorkerInputResult {
+                state: InternalWorkerOperationState::Accepted,
+                disposition: WorkerInputDisposition::Accepted,
+                worker: RuntimeWorkerRef::new(&self.runtime_id, worker_id),
+                runtime_run_id: receipt.submission.map(|ack| ack.submission_request_id),
+                diagnostics: Vec::new(),
+            })
+        } else {
+            Ok(embedded_input_rejected(
+                &self.runtime_id,
+                worker_id,
+                WorkerInputDisposition::Unknown,
+                diagnostic(
+                    "embedded_worker_receipt_not_confirmed",
+                    HostDiagnosticSeverity::Warning,
+                    receipt.message_or_default(),
+                ),
+            ))
+        }
+    }
+
     fn send_input(&self, worker_id: &str, request: WorkerInputRequest) -> WorkerInputResult {
         if !self.execution_enabled {
             return embedded_input_rejected(
@@ -3614,6 +4694,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
+            source: request.source,
             submission_request_id: request.submission_request_id,
             segments: request.segments,
         };
@@ -4197,6 +5278,7 @@ pub struct RemoteWorkerRuntime {
     workdir_cleanup_http: BlockingHttpClient,
     async_http: AsyncHttpClient,
     request_timeout: Duration,
+    workdir_sessions: workdir::http::RemoteWorkdirSessionRegistry,
 }
 
 fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static str {
@@ -4240,6 +5322,8 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
         return "workers:input";
     }
     if path.ends_with("/stop")
+        || path.ends_with("/stop/admit")
+        || path.ends_with("/stop/outcome")
         || path.ends_with("/cancel")
         || (path == "/v1/subject-release" && method == "POST")
     {
@@ -4256,7 +5340,10 @@ fn workspace_runtime_operation(method: &str, path_and_query: &str) -> &'static s
     }
     if path.contains("/retention/")
         || (path.starts_with("/v1/workers/") && method == "DELETE")
-        || (path == "/v1/subject-create-recovery" && method == "POST")
+        || (matches!(
+            path,
+            "/v1/subject-create-recovery" | "/v1/subject-delete-worker"
+        ) && method == "POST")
     {
         return "workers:delete";
     }
@@ -4322,6 +5409,11 @@ impl runtime_api::client_support::RequestAuthorizer for RemoteRuntimeApiAuthoriz
         );
         Ok(headers)
     }
+}
+
+enum RemoteRuntimeApiError {
+    ClientSetup(RuntimeDiagnostic),
+    Client(runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>),
 }
 
 impl RemoteWorkerRuntime {
@@ -4402,6 +5494,7 @@ impl RemoteWorkerRuntime {
             workdir_cleanup_http,
             async_http,
             request_timeout: timeout,
+            workdir_sessions: Default::default(),
         })
     }
 
@@ -4415,6 +5508,16 @@ impl RemoteWorkerRuntime {
         working_directory_id: &str,
         owner_worker_id: Option<&str>,
     ) -> Result<RemoteWorkdirSession, WorkdirError> {
+        self.open_owned_session(working_directory_id, owner_worker_id, None)
+            .await
+    }
+
+    async fn open_owned_session(
+        &self,
+        working_directory_id: &str,
+        owner_worker_id: Option<&str>,
+        owner: Option<workdir::http::RemoteWorkdirSessionOwner>,
+    ) -> Result<RemoteWorkdirSession, WorkdirError> {
         let base_url = Url::parse(&self.base_url)
             .map_err(|error| WorkdirError::InvalidArgument(error.to_string()))?;
         let workdir_id = Workdir::new(working_directory_id).id().clone();
@@ -4423,16 +5526,20 @@ impl RemoteWorkerRuntime {
                 workspace_authorization: self.workspace_authorization.clone(),
                 fallback_bearer_token: self.bearer_token.clone(),
             });
-        RemoteWorkdirSession::open_with_authorization(
-            self.async_http.clone(),
-            base_url,
-            authorization,
-            workdir_id,
-            OpenWorkdirSessionRequest {
-                owner_worker_id: owner_worker_id.map(str::to_string),
-            },
-        )
-        .await
+        self.workdir_sessions
+            .open_with_authorization(
+                self.async_http.clone(),
+                base_url,
+                authorization,
+                workdir_id,
+                OpenWorkdirSessionRequest {
+                    owner_worker_id: owner_worker_id.map(str::to_string),
+                    ..Default::default()
+                },
+                self.request_timeout,
+                owner,
+            )
+            .await
     }
 
     fn runtime_api_client(
@@ -4485,8 +5592,69 @@ impl RemoteWorkerRuntime {
             > + Send
             + 'static,
     {
-        let client = self.runtime_api_client(timeout, response_body_limit)?;
-        let runtime_id = self.runtime_id.clone();
+        self.run_runtime_api_typed(timeout, response_body_limit, operation)
+            .map_err(|error| match error {
+                RemoteRuntimeApiError::ClientSetup(diagnostic) => diagnostic,
+                RemoteRuntimeApiError::Client(error) => {
+                    runtime_api_diagnostic(&self.runtime_id, error)
+                }
+            })
+    }
+
+    fn run_runtime_api_with_diagnostic<T, F, Fut>(
+        &self,
+        timeout: Duration,
+        response_body_limit: usize,
+        operation: F,
+        map_error: fn(
+            &str,
+            runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+        ) -> RuntimeDiagnostic,
+    ) -> Result<T, RuntimeDiagnostic>
+    where
+        T: Send + 'static,
+        F: FnOnce(runtime_api::RuntimeApiClient<RemoteRuntimeApiAuthorizer>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    T,
+                    runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+                >,
+            > + Send
+            + 'static,
+    {
+        self.run_runtime_api_typed(timeout, response_body_limit, operation)
+            .map_err(|error| match error {
+                RemoteRuntimeApiError::ClientSetup(diagnostic) => diagnostic,
+                RemoteRuntimeApiError::Client(error) => map_error(&self.runtime_id, error),
+            })
+    }
+
+    // Execute through the existing generated client and bounds, retaining its typed error
+    // until the control adapter has classified it. Other operations keep the legacy helper.
+    fn run_runtime_api_typed<T, F, Fut>(
+        &self,
+        timeout: Duration,
+        response_body_limit: usize,
+        operation: F,
+    ) -> Result<T, RemoteRuntimeApiError>
+    where
+        T: Send + 'static,
+        F: FnOnce(runtime_api::RuntimeApiClient<RemoteRuntimeApiAuthorizer>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    T,
+                    runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+                >,
+            > + Send
+            + 'static,
+    {
+        let client = self
+            .runtime_api_client(timeout, response_body_limit)
+            .map_err(RemoteRuntimeApiError::ClientSetup)?;
         run_blocking_http(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -4498,7 +5666,39 @@ impl RemoteWorkerRuntime {
                 })?
                 .block_on(operation(client))
         })
-        .map_err(|error| runtime_api_diagnostic(&runtime_id, error))
+        .map_err(RemoteRuntimeApiError::Client)
+    }
+
+    // Keep the original client error until an attachment operation owner records
+    // settlement. Outer Err is local client setup (no request issued); inner Err
+    // is an owner failure or failure to observe the result. No automatic retry.
+    fn run_runtime_api_observed<T, F, Fut>(
+        &self,
+        timeout: Duration,
+        response_body_limit: usize,
+        operation: F,
+    ) -> Result<
+        Result<T, runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>>,
+        RuntimeDiagnostic,
+    >
+    where
+        T: Send + 'static,
+        F: FnOnce(runtime_api::RuntimeApiClient<RemoteRuntimeApiAuthorizer>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<
+                Output = Result<
+                    T,
+                    runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+                >,
+            > + Send
+            + 'static,
+    {
+        match self.run_runtime_api_typed(timeout, response_body_limit, operation) {
+            Ok(value) => Ok(Ok(value)),
+            Err(RemoteRuntimeApiError::ClientSetup(diagnostic)) => Err(diagnostic),
+            Err(RemoteRuntimeApiError::Client(error)) => Ok(Err(error)),
+        }
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -4585,6 +5785,63 @@ impl RemoteWorkerRuntime {
                 ));
             }
             Ok(RuntimeSessionAttachment { media_type, data })
+        })
+    }
+
+    /// Projection has no Worker-absence or startup-error compatibility contract.
+    /// Keep its typed receive path separate from domain-specific manual consumers.
+    fn post_workspace_prompt_projection(
+        &self,
+        projection: worker::WorkspacePromptProjection,
+    ) -> Result<(), RuntimeControlCause> {
+        use RuntimeControlCause as C;
+        let path = "/v1/workspace-prompt-projections";
+        let expected = RuntimeHttpWorkspacePromptProjectionResponse {
+            workspace_id: projection.workspace_id.clone(),
+            source_digest: projection.source_digest.clone(),
+            projection_digest: projection.projection_digest.clone(),
+        };
+        let body = serde_json::to_vec(&RuntimeHttpWorkspacePromptProjectionRequest { projection })
+            .map_err(|_| C::RequestEncodingFailed)?;
+        let capability_token = match &self.workspace_authorization {
+            Some(authorization) => Some(
+                authorization
+                    .issue(
+                        "POST",
+                        path,
+                        workspace_runtime_operation("POST", path),
+                        None,
+                        &body,
+                    )
+                    // Failure to obtain current request-bound authorization is not
+                    // a remote execution outcome; never inspect its diagnostic text.
+                    .map_err(|_| C::AuthorizationFailed)?,
+            ),
+            None => None,
+        };
+        let token = capability_token.as_deref().or(self.bearer_token.as_deref());
+        let mut request = self
+            .http
+            .post(self.endpoint(path))
+            .header(CONTENT_TYPE, "application/json")
+            .header(RUNTIME_WORKSPACE_SCOPE_HEADER, &self.workspace_id)
+            .body(body);
+        if let Some(token) = token {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        run_blocking_http(move || {
+            let response = request.send().map_err(|error| {
+                if error.is_timeout() {
+                    C::TimedOut
+                } else if error.is_connect() {
+                    C::ConnectionFailed
+                } else if error.is_builder() {
+                    C::RequestEncodingFailed
+                } else {
+                    C::TransportFailed
+                }
+            })?;
+            receive_workspace_prompt_projection(response, &expected)
         })
     }
 
@@ -4816,6 +6073,8 @@ impl RemoteWorkerRuntime {
         response: worker_runtime::catalog::WorkerLifecycleAck,
     ) -> WorkerLifecycleResult {
         WorkerLifecycleResult {
+            cleanup_failures: Vec::new(),
+            replayed: response.replayed,
             state: InternalWorkerOperationState::Accepted,
             worker: RuntimeWorkerRef::new(self.runtime_id.clone(), worker_id.to_string()),
             diagnostics: vec![diagnostic(
@@ -4831,6 +6090,9 @@ impl RemoteWorkerRuntime {
 }
 
 impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
+    fn workdir_session_recovery(&self) -> Option<workdir::http::RemoteWorkdirSessionRegistry> {
+        Some(self.workdir_sessions.clone())
+    }
     fn runtime_id(&self) -> &str {
         &self.runtime_id
     }
@@ -5018,27 +6280,33 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
 
     fn worker(&self, worker_id: &str) -> WorkerLookupResult {
         let worker_id_owned = worker_id.to_string();
-        match self
-            .run_runtime_api(
-                self.request_timeout,
-                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
-                move |client| async move { client.get_worker(worker_id_owned).await },
-            )
-            .and_then(|value| {
-                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
-            }) {
-            Ok(response) => WorkerLookupResult {
-                worker: Some(self.map_worker_detail(response)),
-                diagnostics: Vec::new(),
-            },
-            Err(diagnostic) if diagnostic.code == "worker_not_found" => WorkerLookupResult {
-                worker: None,
-                diagnostics: Vec::new(),
-            },
-            Err(diagnostic) => WorkerLookupResult {
-                worker: None,
-                diagnostics: vec![diagnostic],
-            },
+        match self.run_runtime_api_typed(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.get_worker(worker_id_owned).await },
+        ) {
+            Ok(value) => {
+                match runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(
+                    value.worker,
+                ) {
+                    Ok(detail) => WorkerLookupResult::found(self.map_worker_detail(detail)),
+                    Err(diagnostic) => WorkerLookupResult::failed(
+                        RuntimeControlCause::InvalidResponse,
+                        vec![diagnostic],
+                    ),
+                }
+            }
+            Err(RemoteRuntimeApiError::ClientSetup(diagnostic)) => {
+                WorkerLookupResult::failed(RuntimeControlCause::ClientSetupFailed, vec![diagnostic])
+            }
+            Err(RemoteRuntimeApiError::Client(error)) => {
+                // Classify the original typed error BEFORE producing any presentation.
+                let cause = remote_lookup_cause(&error);
+                WorkerLookupResult::from_cause(
+                    cause,
+                    vec![runtime_api_diagnostic(&self.runtime_id, error)],
+                )
+            }
         }
     }
 
@@ -5069,6 +6337,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 let state =
                     runtime_contract_convert::<_, server_api::WorkerRestoreState>(result.state)?;
                 Ok(InternalWorkerRestoreResult {
+                    control: result.control,
+                    startup: result.startup.and_then(internal_startup_transfer),
                     state,
                     worker: worker.map(|detail| self.map_worker_detail(detail)),
                     diagnostics: match (result.reason_code, result.message) {
@@ -5100,9 +6370,16 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     .worker
                     .map(runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>)
                     .transpose()?;
-                Ok((value.state, worker, value.reason_code, value.message))
+                Ok((
+                    value.state,
+                    worker,
+                    value.reason_code,
+                    value.message,
+                    value.control,
+                    value.startup,
+                ))
             }) {
-            Ok((state, worker, reason_code, message)) => {
+            Ok((state, worker, reason_code, message, control, startup)) => {
                 let diagnostics = match (reason_code, message) {
                     (Some(code), Some(message)) => {
                         vec![diagnostic(code, HostDiagnosticSeverity::Warning, message)]
@@ -5110,6 +6387,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     _ => Vec::new(),
                 };
                 InternalWorkerRestoreResult {
+                    control,
+                    startup: startup.and_then(internal_startup_transfer),
                     state: match state {
                         runtime_api::WorkerRestoreState::Accepted => {
                             server_api::WorkerRestoreState::Accepted
@@ -5132,6 +6411,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 }
             }
             Err(diagnostic) => InternalWorkerRestoreResult {
+                control: diagnostic.control,
+                startup: diagnostic.startup.clone(),
                 // A transport/protocol failure cannot prove that the Runtime
                 // rejected before side effects. Preserve uncertainty.
                 state: server_api::WorkerRestoreState::ReconciliationRequired,
@@ -5187,43 +6468,200 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         &self,
         worker_id: &str,
         attachments: Vec<LogicalWorkdirAttachment>,
-    ) -> WorkerWorkspaceApiResult {
+    ) -> RuntimeOperationResponse {
         let workdir_attachments = match runtime_contract_convert(attachments) {
             Ok(attachments) => attachments,
             Err(diagnostic) => {
-                return WorkerWorkspaceApiResult {
-                    state: InternalWorkerOperationState::Rejected,
-                    worker: None,
-                    diagnostics: vec![diagnostic],
-                };
+                return RuntimeOperationResponse::attachment_failure(
+                    Some(RuntimeControlCause::RequestEncodingFailed),
+                    diagnostic,
+                );
             }
         };
         let request = runtime_api::WorkerWorkdirAttachmentsRequest {
             logical_workdir_attachments: workdir_attachments,
         };
         let worker_id = worker_id.to_string();
-        match self
-            .run_runtime_api(
-                self.request_timeout,
-                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
-                move |client| async move {
-                    client
-                        .replace_worker_workdir_attachments(worker_id, request)
-                        .await
-                },
-            )
-            .and_then(|value| {
-                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
-            }) {
-            Ok(response) => WorkerWorkspaceApiResult {
-                state: InternalWorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response)),
-                diagnostics: Vec::new(),
+        let observed = self.run_runtime_api_observed(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .replace_worker_workdir_attachments(worker_id, request)
+                    .await
             },
-            Err(diagnostic) => WorkerWorkspaceApiResult {
-                state: InternalWorkerOperationState::Rejected,
-                worker: None,
-                diagnostics: vec![diagnostic],
+        );
+        match observed {
+            Ok(Ok(value)) => {
+                match runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(
+                    value.worker,
+                ) {
+                    Ok(response) => RuntimeOperationResponse {
+                        status: RuntimeOperationStatus::Accepted,
+                        cause: None,
+                        worker: Some(self.map_worker_detail(response)),
+                        diagnostics: Vec::new(),
+                    },
+                    // The mutation returned success but its result is unreadable.
+                    // Do not turn conversion failure into rejection or compensate.
+                    Err(diagnostic) => RuntimeOperationResponse::attachment_failure(
+                        Some(RuntimeControlCause::InvalidResponse),
+                        diagnostic,
+                    ),
+                }
+            }
+            Ok(Err(error)) => {
+                let cause = match &error {
+                    runtime_api::client_support::ClientError::Public { error, .. } => {
+                        error.control_cause()
+                    }
+                    // Keep absence of owner cause; do not reconstruct it from
+                    // legacy codes, HTTP status, diagnostic text or categories.
+                    _ => None,
+                };
+                let diagnostic = match cause {
+                    Some(cause) => diagnostic(
+                        cause.reason(),
+                        HostDiagnosticSeverity::Error,
+                        cause.explanation(),
+                    ),
+                    None => runtime_api_diagnostic(&self.runtime_id, error),
+                };
+                RuntimeOperationResponse::attachment_failure(cause, diagnostic)
+            }
+            Err(diagnostic) => RuntimeOperationResponse::attachment_failure(
+                Some(RuntimeControlCause::ClientSetupFailed),
+                diagnostic,
+            ),
+        }
+    }
+
+    fn observe_worker_workdir_attachments(
+        &self,
+        worker_id: &str,
+        attachments: Vec<LogicalWorkdirAttachment>,
+    ) -> RuntimeAttachmentObservation {
+        let attachments = match runtime_contract_convert(attachments) {
+            Ok(attachments) => attachments,
+            Err(_) => {
+                return RuntimeAttachmentObservation {
+                    result: None,
+                    current_generation: None,
+                    cause: Some(RuntimeControlCause::RequestEncodingFailed),
+                };
+            }
+        };
+        let request = runtime_api::WorkerWorkdirAttachmentsRequest {
+            logical_workdir_attachments: attachments,
+        };
+        let expected_request = request.clone();
+        let expected_worker_id = worker_id.to_string();
+        let worker_id = expected_worker_id.clone();
+        let observed = self.run_runtime_api_observed(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .observe_worker_workdir_attachments(worker_id, request)
+                    .await
+            },
+        );
+        match observed {
+            Ok(Ok(value))
+                if value.worker_ref.worker_id.to_string() == expected_worker_id
+                    && value.request == expected_request =>
+            {
+                RuntimeAttachmentObservation {
+                    result: Some(value.result),
+                    current_generation: value.current_generation,
+                    cause: None,
+                }
+            }
+            Ok(Ok(_)) => RuntimeAttachmentObservation {
+                result: None,
+                current_generation: None,
+                cause: Some(RuntimeControlCause::InvalidResponse),
+            },
+            Ok(Err(error)) => RuntimeAttachmentObservation {
+                result: None,
+                current_generation: None,
+                cause: match error {
+                    runtime_api::client_support::ClientError::Public { error, .. } => {
+                        error.control_cause()
+                    }
+                    _ => None,
+                },
+            },
+            Err(_) => RuntimeAttachmentObservation {
+                result: None,
+                current_generation: None,
+                cause: Some(RuntimeControlCause::ClientSetupFailed),
+            },
+        }
+    }
+
+    fn apply_worker_workdir_attachments_operation(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> RuntimeAttachmentOperationResponse {
+        let expected = request.clone();
+        let id = worker_id.to_string();
+        match self.run_runtime_api_observed(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .apply_worker_workdir_attachments_operation(id, request)
+                    .await
+            },
+        ) {
+            Ok(Ok(receipt)) => {
+                RuntimeAttachmentOperationResponse::received(worker_id, &expected, receipt)
+            }
+            Ok(Err(error)) => RuntimeAttachmentOperationResponse::failure(match error {
+                runtime_api::client_support::ClientError::Public { error, .. } => {
+                    error.control_cause()
+                }
+                _ => None,
+            }),
+            Err(_) => RuntimeAttachmentOperationResponse::failure(Some(
+                RuntimeControlCause::ClientSetupFailed,
+            )),
+        }
+    }
+
+    fn observe_worker_workdir_attachments_operation(
+        &self,
+        worker_id: &str,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> RuntimeAttachmentOperationObservation {
+        let expected = request.clone();
+        let id = worker_id.to_string();
+        match self.run_runtime_api_observed(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .observe_worker_workdir_attachments_operation(id, request)
+                    .await
+            },
+        ) {
+            Ok(Ok(observation)) => {
+                RuntimeAttachmentOperationObservation::received(worker_id, &expected, observation)
+            }
+            Ok(Err(error)) => RuntimeAttachmentOperationObservation {
+                observation: None,
+                cause: match error {
+                    runtime_api::client_support::ClientError::Public { error, .. } => {
+                        error.control_cause()
+                    }
+                    _ => None,
+                },
+            },
+            Err(_) => RuntimeAttachmentOperationObservation {
+                observation: None,
+                cause: Some(RuntimeControlCause::ClientSetupFailed),
             },
         }
     }
@@ -5245,7 +6683,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Err(diagnostic) => RuntimeWorkingDirectoryResult {
                 state: InternalWorkerOperationState::Rejected,
                 working_directory: None,
-                diagnostics: vec![diagnostic],
+                diagnostics: vec![bind_workdir_diagnostic(
+                    workdir::management_failure::WorkdirManagementOperation::Create,
+                    diagnostic,
+                )],
             },
         }
     }
@@ -5289,7 +6730,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
         match self.get_json::<RuntimeHttpWorkingDirectoriesResponse>("/v1/working-directories") {
             Ok(response) => RuntimeList::new(response.working_directories, Vec::new()),
-            Err(diagnostic) => RuntimeList::new(Vec::new(), vec![diagnostic]),
+            Err(diagnostic) => RuntimeList::new(
+                Vec::new(),
+                vec![bind_workdir_diagnostic(
+                    workdir::management_failure::WorkdirManagementOperation::List,
+                    diagnostic,
+                )],
+            ),
         }
     }
 
@@ -5305,7 +6752,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Err(diagnostic) => RuntimeWorkingDirectoryResult {
                 state: InternalWorkerOperationState::Rejected,
                 working_directory: None,
-                diagnostics: vec![diagnostic],
+                diagnostics: vec![bind_workdir_diagnostic(
+                    workdir::management_failure::WorkdirManagementOperation::Detail,
+                    diagnostic,
+                )],
             },
         }
     }
@@ -5328,10 +6778,31 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         })
     }
 
+    fn open_owned_workdir_session<'a>(
+        &'a self,
+        workdir_id: &'a str,
+        owner_worker_id: Option<&'a str>,
+        owner: workdir::http::RemoteWorkdirSessionOwner,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkdirSessionHandle, WorkdirError>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(Arc::new(
+                self.open_owned_session(workdir_id, owner_worker_id, Some(owner))
+                    .await?,
+            ) as WorkdirSessionHandle)
+        })
+    }
+
     fn cleanup_working_directory(
         &self,
         working_directory_id: &str,
     ) -> RuntimeWorkingDirectoryResult {
+        if let Err(error) = close_abandoned_remote_sessions(
+            self.workdir_sessions.clone(),
+            working_directory_id.to_owned(),
+            self.request_timeout,
+        ) {
+            return unconfirmed_workdir_session_cleanup(error);
+        }
         let path = format!("/v1/working-directories/{working_directory_id}");
         match self.send_json::<RuntimeHttpWorkingDirectoryResponse>(
             &path,
@@ -5347,7 +6818,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Err(diagnostic) => RuntimeWorkingDirectoryResult {
                 state: InternalWorkerOperationState::Rejected,
                 working_directory: None,
-                diagnostics: vec![diagnostic],
+                diagnostics: vec![bind_workdir_diagnostic(
+                    workdir::management_failure::WorkdirManagementOperation::Cleanup,
+                    diagnostic,
+                )],
             },
         }
     }
@@ -5362,6 +6836,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             WorkerSpawnAcceptanceRequirement::SocketReady
         ) {
             return WorkerSpawnResult {
+                failure: None,
                 state: InternalWorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
@@ -5377,6 +6852,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(archive) => archive,
             Err(error) => {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -5395,6 +6871,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(workspace_api) => workspace_api,
             Err(diagnostic) => {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -5414,6 +6891,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             Ok(create) => create,
             Err(diagnostic) => {
                 return WorkerSpawnResult {
+                    failure: None,
                     state: InternalWorkerOperationState::Rejected,
                     worker: None,
                     acceptance_evidence: Vec::new(),
@@ -5421,43 +6899,78 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 };
             }
         };
-        match self
-            .run_runtime_api(
-                REMOTE_WORKER_CREATE_TIMEOUT,
-                MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
-                move |client| async move { client.create_worker(create).await },
-            )
-            .and_then(|value| {
-                runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(value.worker)
-            }) {
-            Ok(response) => WorkerSpawnResult {
-                state: InternalWorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(response)),
-                acceptance_evidence: vec![WorkerSpawnAcceptanceEvidence {
-                    kind: "remote_runtime_worker_created".to_string(),
-                    detail: "worker-runtime REST create endpoint accepted the Worker".to_string(),
-                }],
-                diagnostics: Vec::new(),
-            },
-            Err(diagnostic) => WorkerSpawnResult {
-                state: InternalWorkerOperationState::Rejected,
-                worker: None,
-                acceptance_evidence: Vec::new(),
-                diagnostics: vec![diagnostic],
-            },
+        let client = match self.runtime_api_client(
+            REMOTE_WORKER_CREATE_TIMEOUT,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+        ) {
+            Ok(client) => client,
+            Err(diagnostic) => {
+                return WorkerSpawnResult {
+                    failure: None,
+                    state: InternalWorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics: vec![diagnostic],
+                };
+            }
+        };
+        let received = run_blocking_http(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| {
+                    runtime_api::client_support::ClientError::failure(
+                        runtime_api::client_support::ClientFailure::Transport,
+                    )
+                })?
+                .block_on(client.create_worker(create))
+        });
+        match received {
+            Ok(response) => {
+                match runtime_contract_convert::<_, worker_runtime::catalog::WorkerDetail>(
+                    response.worker,
+                ) {
+                    Ok(worker) => WorkerSpawnResult {
+                        failure: None,
+                        state: InternalWorkerOperationState::Accepted,
+                        worker: Some(self.map_worker_detail(worker)),
+                        acceptance_evidence: vec![WorkerSpawnAcceptanceEvidence {
+                            kind: "remote_runtime_worker_created".into(),
+                            detail: "Runtime create returned a Worker summary".into(),
+                        }],
+                        diagnostics: Vec::new(),
+                    },
+                    Err(diagnostic) => WorkerSpawnResult {
+                        failure: Some(startup_observation_failure(
+                            runtime_api::startup::StartupBoundaryReason::Decode,
+                        )),
+                        state: InternalWorkerOperationState::Unknown,
+                        worker: None,
+                        acceptance_evidence: Vec::new(),
+                        diagnostics: vec![diagnostic],
+                    },
+                }
+            }
+            Err(error) => {
+                let failure = runtime_create_client_failure(&error);
+                let state = startup_failure_operation_state(&failure);
+                let diagnostic = runtime_api_diagnostic(&self.runtime_id, error);
+                WorkerSpawnResult {
+                    failure: Some(failure),
+                    state,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics: vec![diagnostic],
+                }
+            }
         }
     }
 
     fn observe_workspace_prompt_projection(
         &self,
         projection: worker::WorkspacePromptProjection,
-    ) -> Result<(), String> {
-        self.post_json::<_, RuntimeHttpWorkspacePromptProjectionResponse>(
-            "/v1/workspace-prompt-projections",
-            &RuntimeHttpWorkspacePromptProjectionRequest { projection },
-        )
-        .map(|_| ())
-        .map_err(|error| error.message)
+    ) -> Result<(), RuntimeControlCause> {
+        self.post_workspace_prompt_projection(projection)
     }
 
     fn sync_config_bundle(&self, bundle: ConfigBundle) -> ConfigBundleSyncResult {
@@ -5495,6 +7008,40 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         }
     }
 
+    fn coordinate_worker_stop(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_id = worker_id.to_string();
+        let request = runtime_api::WorkerLifecycleRequest {
+            reason: request.reason,
+            stop_intent: request.stop_intent,
+        };
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.coordinate_worker_stop(worker_id, request).await },
+        )
+    }
+
+    fn worker_stop_outcome(
+        &self,
+        worker_id: &str,
+        request: WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, RuntimeDiagnostic> {
+        let worker_id = worker_id.to_string();
+        let request = runtime_api::WorkerLifecycleRequest {
+            reason: request.reason,
+            stop_intent: request.stop_intent,
+        };
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.worker_stop_outcome(worker_id, request).await },
+        )
+    }
+
     fn stop_worker(
         &self,
         worker_id: &str,
@@ -5502,6 +7049,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     ) -> WorkerLifecycleResult {
         let body = runtime_api::WorkerLifecycleRequest {
             reason: request.reason,
+            stop_intent: request.stop_intent,
         };
         let worker_id_owned = worker_id.to_string();
         match self
@@ -5527,6 +7075,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     ) -> WorkerLifecycleResult {
         let body = runtime_api::WorkerLifecycleRequest {
             reason: request.reason,
+            stop_intent: request.stop_intent,
         };
         let worker_id_owned = worker_id.to_string();
         match self
@@ -5606,6 +7155,60 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         .map_err(|diagnostic| diagnostic.message)
     }
 
+    fn freeze_worker_removal(
+        &self,
+        request: WorkerRetentionExecutionRequest,
+    ) -> Result<WorkerRemovalFreeze, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id || request.source_runtime_id != self.runtime_id
+        {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal request does not match remote Runtime/Workspace",
+            ));
+        }
+        let worker_id = request.worker_id.to_string();
+        let request = runtime_contract_convert(request)?;
+        self.run_runtime_api_with_diagnostic(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.freeze_worker_removal(worker_id, request).await },
+            runtime_removal_api_diagnostic,
+        )
+    }
+
+    fn capture_worker_removal_session(
+        &self,
+        worker_id: &str,
+        mut request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, RuntimeDiagnostic> {
+        if request.workspace_id != self.workspace_id {
+            return Err(diagnostic(
+                "worker_removal_target_mismatch",
+                HostDiagnosticSeverity::Error,
+                "removal capture Workspace does not match remote Runtime",
+            ));
+        }
+        // The generated endpoint returns RecordingCaptureSlice directly as JSON,
+        // without an availability wrapper. Its budget already includes all slice
+        // metadata and JSON escaping, so the entire response-body limit is usable.
+        // The caller separately constrains its durable Job input envelope.
+        request.max_serialized_bytes = request
+            .max_serialized_bytes
+            .min(MAX_REMOTE_RUNTIME_RESPONSE_BYTES);
+        let worker_id = worker_id.to_string();
+        self.run_runtime_api_with_diagnostic(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move {
+                client
+                    .capture_worker_removal_session(worker_id, request)
+                    .await
+            },
+            runtime_removal_api_diagnostic,
+        )
+    }
+
     fn worker_session(
         &self,
         workspace_id: &str,
@@ -5665,6 +7268,30 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 message: diagnostic.message,
             }
         })
+    }
+
+    fn purge_subject_job_removal(
+        &self,
+        request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.purge_subject_job_removal(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
+    }
+
+    fn subject_delete_worker(
+        &self,
+        request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, String> {
+        self.run_runtime_api(
+            self.request_timeout,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
+            move |client| async move { client.subject_delete_worker(request).await },
+        )
+        .map_err(|diagnostic| diagnostic.message)
     }
 
     fn recover_subject_create(
@@ -5728,8 +7355,11 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
 
     fn session_recording_capture(
         &self,
-        request: runtime_api::SessionRecordingCaptureRequest,
+        mut request: runtime_api::SessionRecordingCaptureRequest,
     ) -> Result<runtime_api::SessionRecordingCaptureAvailability, String> {
+        request.max_serialized_bytes = request
+            .max_serialized_bytes
+            .min(session_recording_capture_transport_budget().map_err(|cause| cause.message)?);
         self.run_runtime_api(
             self.request_timeout,
             MAX_REMOTE_RUNTIME_RESPONSE_BYTES,
@@ -5817,6 +7447,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
+            source: request.source,
             submission_request_id: request.submission_request_id,
             segments: request.segments,
         };
@@ -6033,6 +7664,7 @@ fn runtime_create_worker_request(
         worker_observation_grants: request.resolved_worker_observation_grants.clone(),
         workspace_api: Some(workspace_api),
         memory_settings: request.resolved_memory_settings.clone(),
+        plugin_execution: binding.plugin_execution,
         subjektiv_attached: request.resolved_subjektiv_attached,
         backend_job: match &request.intent {
             WorkerSpawnIntent::BackendJob {
@@ -6294,6 +7926,8 @@ fn embedded_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
+        cleanup_failures: Vec::new(),
+        replayed: false,
         state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
@@ -6306,18 +7940,26 @@ fn remote_lifecycle_rejected(
     diagnostic: RuntimeDiagnostic,
 ) -> WorkerLifecycleResult {
     WorkerLifecycleResult {
+        cleanup_failures: Vec::new(),
+        replayed: false,
         state: InternalWorkerOperationState::Rejected,
         worker: RuntimeWorkerRef::new(runtime_id.to_string(), worker_id.to_string()),
         diagnostics: vec![diagnostic],
     }
 }
 
-fn embedded_workdir_unsupported_diagnostic() -> RuntimeDiagnostic {
-    diagnostic(
-        "embedded_worker_workdir_unsupported",
+fn embedded_workdir_unsupported_diagnostic(
+    operation: Option<workdir::management_failure::WorkdirManagementOperation>,
+) -> RuntimeDiagnostic {
+    use workdir::management_failure::{WorkdirManagementFailure, WorkdirManagementReason};
+    let reason = WorkdirManagementReason::EmbeddedWorkdirUnsupported;
+    let mut diagnostic = diagnostic(
+        reason.as_str(),
         HostDiagnosticSeverity::Error,
-        "Embedded Runtime is no-workdir only; choose a non-embedded Runtime for workspace-file Workers".to_string(),
-    )
+        reason.explanation(),
+    );
+    diagnostic.workdir = operation.map(|operation| WorkdirManagementFailure { operation, reason });
+    diagnostic
 }
 
 fn sanitize_embedded_execution_message(
@@ -6378,11 +8020,51 @@ fn sanitize_embedded_execution_detail(summary: &str, message: &str) -> String {
 }
 
 fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnostic {
-    match error {
+    let mut projection = match error {
+        EmbeddedRuntimeError::WorkdirAttachmentsRequestConflict { .. } => diagnostic(
+            "attachment_request_conflict",
+            HostDiagnosticSeverity::Warning,
+            "Attachment operation identity conflicts with retained input; inspect the original request without resending",
+        ),
+        EmbeddedRuntimeError::WorkdirAttachmentsGenerationStale { .. } => diagnostic(
+            "attachment_generation_stale",
+            HostDiagnosticSeverity::Warning,
+            "Attachment authority changed; the frozen operation cannot be attributed to the current attachment set",
+        ),
+        EmbeddedRuntimeError::RestoreAdmissionBusy { .. } => diagnostic(
+            "restore_admission_busy",
+            HostDiagnosticSeverity::Warning,
+            "Worker lifecycle admission is busy; retry the same Restore intent",
+        ),
+        EmbeddedRuntimeError::StopAdmissionBusy { .. } => diagnostic(
+            "stop_admission_busy",
+            HostDiagnosticSeverity::Warning,
+            "Worker lifecycle admission is busy; retry the same stop intent",
+        ),
+        EmbeddedRuntimeError::StopObservationConflict { .. } => diagnostic(
+            "stop_observation_conflict",
+            HostDiagnosticSeverity::Warning,
+            "Stop observation changed; reload before a new intent",
+        ),
+        EmbeddedRuntimeError::StopRequestConflict { .. } => diagnostic(
+            "stop_request_conflict",
+            HostDiagnosticSeverity::Warning,
+            "Stop request ID was already used with different input",
+        ),
+        EmbeddedRuntimeError::RestoreObservationStale { .. } => diagnostic(
+            "restore_observation_stale",
+            HostDiagnosticSeverity::Warning,
+            "Restore observation changed; this request was not accepted",
+        ),
         EmbeddedRuntimeError::RestoreObservationConflict { .. } => diagnostic(
             "restore_observation_conflict",
             HostDiagnosticSeverity::Warning,
             "Restore observation changed; refresh before a new intent".to_string(),
+        ),
+        EmbeddedRuntimeError::WorkerCreateConflict { .. } => diagnostic(
+            "worker_create_conflict",
+            HostDiagnosticSeverity::Error,
+            "Worker create identity conflicts with existing input".to_string(),
         ),
         EmbeddedRuntimeError::RuntimeStopped => diagnostic(
             "embedded_runtime_stopped",
@@ -6406,6 +8088,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
                 "Embedded Runtime execution backend is unavailable",
                 message,
             ),
+        ),
+        EmbeddedRuntimeError::WorkerCreateFailed { failure, .. } => diagnostic(
+            "embedded_worker_create_failed",
+            HostDiagnosticSeverity::Warning,
+            worker::startup_failure::internal_startup_failure_summary(&failure.startup().primary),
         ),
         EmbeddedRuntimeError::WorkerExecutionRejected {
             operation,
@@ -6431,6 +8118,24 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             workdir_diagnostic.code.clone(),
             HostDiagnosticSeverity::Warning,
             workdir_diagnostic.message.clone(),
+        ),
+        EmbeddedRuntimeError::RecordingSourceUnavailable { .. } => diagnostic(
+            "source_unavailable",
+            HostDiagnosticSeverity::Warning,
+            "Complete recording sources are unavailable; original input remains retained"
+                .to_string(),
+        ),
+        EmbeddedRuntimeError::RecordingOwnershipUnknown { .. } => diagnostic(
+            "ownership_unknown",
+            HostDiagnosticSeverity::Warning,
+            "Complete recording source ownership is unconfirmed; original input remains retained"
+                .to_string(),
+        ),
+        EmbeddedRuntimeError::RecordingExecutionUnconfirmed { .. } => diagnostic(
+            "execution_unconfirmed",
+            HostDiagnosticSeverity::Warning,
+            "Original execution quiescence is unconfirmed; original input remains retained"
+                .to_string(),
         ),
         EmbeddedRuntimeError::InvalidRequest(_)
         | EmbeddedRuntimeError::WorkspaceOwnerMismatch { .. }
@@ -6471,7 +8176,29 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             HostDiagnosticSeverity::Error,
             "Embedded Runtime state is unavailable".to_string(),
         ),
+    };
+    if let EmbeddedRuntimeError::WorkerExecutionRejected { result, .. } = error {
+        if let Some(primary) = &result.startup_failure {
+            projection.message = format!(
+                "Embedded Runtime: {}",
+                worker::startup_failure::internal_startup_failure_summary(primary)
+            );
+        }
+        projection.startup = result.startup_failure.as_ref().and_then(|primary| {
+            internal_startup_transfer(runtime_api::WorkerStartupFailure {
+                primary: primary.clone(),
+                secondary: result.secondary_failures.clone(),
+                resources: result.startup_resources,
+                persistence: result.startup_failure_persistence,
+                io_kind: result.startup_io_kind,
+            })
+        });
     }
+    projection.control = Some(error.control_cause());
+    if let EmbeddedRuntimeError::WorkerCreateFailed { failure, .. } = error {
+        projection.startup = internal_startup_transfer(failure.startup().clone());
+    }
+    projection
 }
 
 fn host_id_for_embedded_workspace(workspace_id: &str) -> String {
@@ -6504,6 +8231,71 @@ fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
         }
     }
     encoded
+}
+
+/// Bounded, projection-specific receiver. Actual status and Content-Type participate
+/// in the core codec's coherence checks. Legacy bodies never supply a control cause.
+fn receive_workspace_prompt_projection(
+    response: reqwest::blocking::Response,
+    expected: &RuntimeHttpWorkspacePromptProjectionResponse,
+) -> Result<(), RuntimeControlCause> {
+    use RuntimeControlCause as C;
+    use error_contract::{Budget, ContractError, DecodeFailure};
+    const LIMIT: usize = 16384;
+    let status = response.status();
+    let content_type = {
+        let values = response.headers().get_all(CONTENT_TYPE);
+        let mut values = values.iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => value.to_str().unwrap_or("").to_string(),
+            _ => String::new(),
+        }
+    };
+    let mut body = Vec::new();
+    response
+        .take((LIMIT + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| C::ResultUnavailable)?;
+    if body.len() > LIMIT {
+        return Err(C::ResponseTooLarge);
+    }
+    if status.is_success() {
+        if status != StatusCode::OK
+            || !content_type
+                .split(";")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        {
+            return Err(C::InvalidResponse);
+        }
+        let received: RuntimeHttpWorkspacePromptProjectionResponse =
+            serde_json::from_slice(&body).map_err(|_| C::InvalidResponse)?;
+        return if &received == expected {
+            Ok(())
+        } else {
+            Err(C::InvalidResponse)
+        };
+    }
+    let cause = match api_macros::http::decode_problem_response::<RuntimeControlCause>(
+        &body,
+        status.as_u16(),
+        &content_type,
+        &runtime_api::control_failure::ControlBoundary,
+        Budget::new(LIMIT, LIMIT),
+    ) {
+        DecodeFailure::Known(failure) => *failure.facts().cause(),
+        // Authentication denial is a transport boundary fact, not a Worker or
+        // execution classification. A valid owner cause above takes precedence.
+        _ if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+            C::AuthorizationFailed
+        }
+        DecodeFailure::Unsupported(_) => C::ResultUnavailable,
+        DecodeFailure::Corrupt(ContractError::TooLarge) => C::ResponseTooLarge,
+        DecodeFailure::Corrupt(_) => C::InvalidResponse,
+    };
+    Err(cause)
 }
 
 fn remote_reqwest_diagnostic(runtime_id: &str, err: reqwest::Error) -> RuntimeDiagnostic {
@@ -6544,12 +8336,75 @@ where
         })
 }
 
+fn runtime_removal_api_diagnostic(
+    runtime_id: &str,
+    error: runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> RuntimeDiagnostic {
+    // Removal holds must retain the domain cause even when its HTTP status is
+    // authorization-related. Reuse sanitization/transport classification, not
+    // the older display-oriented collapse of all 401/403 domain codes.
+    let domain_code = match &error {
+        runtime_api::client_support::ClientError::Public { error, .. } => {
+            use protocol::control_failure::RuntimeControlCause as C;
+            Some(match error.control_cause() {
+                Some(C::RecordingSourceUnavailable) => "source_unavailable".to_owned(),
+                Some(C::RecordingOwnershipUnknown) => "ownership_unknown".to_owned(),
+                Some(C::RecordingExecutionUnconfirmed) => "execution_unconfirmed".to_owned(),
+                // Keep the bounded legacy domain code only when no typed owner
+                // cause was received. Never classify from prose or HTTP status.
+                Some(cause) => cause.reason().to_owned(),
+                None => error.error.code.clone(),
+            })
+        }
+        _ => None,
+    };
+    let mut cause = runtime_api_diagnostic(runtime_id, error);
+    if let Some(code) = domain_code {
+        cause.code = code;
+    }
+    cause
+}
+
 fn runtime_api_diagnostic(
     runtime_id: &str,
     error: runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
 ) -> RuntimeDiagnostic {
-    match error {
+    let cause = remote_control_cause(&error);
+    let mut result = match error {
         runtime_api::client_support::ClientError::Public { status, error } => {
+            if let Some(cause) = error.management_cause() {
+                let facts = error_contract::FailureFacts::new(cause);
+                let projected = facts.as_ref().ok().and_then(|facts| {
+                    error_contract::project_failure::<error_contract::InternalTransfer, _>(
+                        facts,
+                        &workdir::management_failure::WorkdirManagementVisibility {
+                            can_view_cause: true,
+                        },
+                    )
+                    .ok()
+                });
+                return if let Some(projected) = projected {
+                    let mut result = diagnostic(
+                        cause.reason.as_str(),
+                        HostDiagnosticSeverity::Error,
+                        projected.explanation(),
+                    );
+                    result.workdir = Some(cause);
+                    result
+                } else {
+                    diagnostic(
+                        "remote_runtime_invalid_workdir_failure",
+                        HostDiagnosticSeverity::Error,
+                        "Remote Runtime returned unavailable or invalid Workdir failure evidence",
+                    )
+                };
+            }
+            if let Some(startup) = error.error.startup {
+                let mut diagnostic = remote_startup_diagnostic(runtime_id, status, startup);
+                diagnostic.control = Some(cause);
+                return diagnostic;
+            }
+            let startup = None;
             let remote_code = error.error.code;
             let message = sanitize_remote_runtime_message(&remote_code, &error.error.message);
             let (code, severity) = match status {
@@ -6566,13 +8421,15 @@ fn runtime_api_diagnostic(
                     },
                 ),
             };
-            diagnostic(
+            let mut projection = diagnostic(
                 code,
                 severity,
                 format!(
                     "Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {message}"
                 ),
-            )
+            );
+            projection.startup = startup;
+            projection
         }
         runtime_api::client_support::ClientError::Failure(failure) => {
             let code = match failure {
@@ -6603,7 +8460,9 @@ fn runtime_api_diagnostic(
                 format!("Remote Runtime client error for '{runtime_id}': {failure}"),
             )
         }
-    }
+    };
+    result.control = Some(cause);
+    result
 }
 
 fn sanitize_remote_runtime_message(code: &str, message: &str) -> String {
@@ -6614,18 +8473,83 @@ fn sanitize_remote_runtime_message(code: &str, message: &str) -> String {
     }
 }
 
+fn bind_workdir_diagnostic(
+    operation: workdir::management_failure::WorkdirManagementOperation,
+    mut diagnostic: RuntimeDiagnostic,
+) -> RuntimeDiagnostic {
+    if diagnostic
+        .workdir
+        .is_some_and(|failure| failure.operation != operation)
+    {
+        diagnostic.workdir = None;
+        diagnostic.code = "remote_runtime_workdir_operation_mismatch".into();
+        diagnostic.message =
+            "Remote Runtime returned Workdir failure evidence for another operation".into();
+    }
+    diagnostic
+}
+
 fn remote_http_status_diagnostic(
     runtime_id: &str,
     status: StatusCode,
     response: reqwest::blocking::Response,
 ) -> RuntimeDiagnostic {
+    let content_type = {
+        let mut values = response.headers().get_all(CONTENT_TYPE).iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => value.to_str().ok().map(str::to_owned),
+            _ => None,
+        }
+    };
     let mut body = Vec::new();
-    let error = response
+    let read = response
         .take((MAX_RUNTIME_PING_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .ok()
-        .filter(|_| body.len() <= MAX_RUNTIME_PING_RESPONSE_BYTES)
-        .and_then(|_| serde_json::from_slice::<RuntimeHttpErrorResponse>(&body).ok());
+        .read_to_end(&mut body);
+    if body.len() > MAX_RUNTIME_PING_RESPONSE_BYTES {
+        return runtime_api_diagnostic(
+            runtime_id,
+            runtime_api::client_support::ClientError::Failure(
+                runtime_api::client_support::ClientFailure::ResponseTooLarge {
+                    limit: MAX_RUNTIME_PING_RESPONSE_BYTES,
+                },
+            ),
+        );
+    }
+    if read.is_err() {
+        return runtime_api_diagnostic(
+            runtime_id,
+            runtime_api::client_support::ClientError::Failure(
+                runtime_api::client_support::ClientFailure::Transport,
+            ),
+        );
+    }
+    if content_type.as_deref().is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/problem+json")
+    }) {
+        // Use the Runtime-owned representation dispatch, exactly as the generated
+        // client does. Startup/control Problems must not become Workdir failures.
+        let decoded = runtime_api::RuntimeApiError::decode_http_error(
+            status.as_u16(),
+            content_type.as_deref(),
+            &body,
+        );
+        return runtime_api_diagnostic(
+            runtime_id,
+            match decoded {
+                Ok(error) => runtime_api::client_support::ClientError::Public { status, error },
+                Err(error) => runtime_api::client_support::ClientError::Failure(error),
+            },
+        );
+    }
+    let error = serde_json::from_slice::<RuntimeHttpErrorResponse>(&body).ok();
+    if let Some(startup) = error.as_ref().and_then(|error| error.error.startup.clone()) {
+        return remote_startup_diagnostic(runtime_id, status, startup);
+    }
     let remote_code = error
         .as_ref()
         .map(|error| error.error.code.as_str())
@@ -6649,11 +8573,48 @@ fn remote_http_status_diagnostic(
         }
         _ => (remote_code, HostDiagnosticSeverity::Warning),
     };
-    diagnostic(
+    let mut projection = diagnostic(
         code,
         severity,
         format!("Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {remote_message}"),
-    )
+    );
+    projection.startup = error
+        .and_then(|error| error.error.startup)
+        .and_then(internal_startup_transfer);
+    projection
+}
+
+fn remote_startup_diagnostic(
+    runtime_id: &str,
+    status: StatusCode,
+    startup: runtime_api::WorkerStartupFailure,
+) -> RuntimeDiagnostic {
+    let startup = internal_startup_transfer(startup);
+    let message = startup.as_ref().map_or("Worker startup failed", |startup| {
+        worker::startup_failure::internal_startup_failure_summary(&startup.primary)
+    });
+    let code = if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        "remote_runtime_auth_failed"
+    } else {
+        "remote_runtime_startup_failed"
+    };
+    let mut projection = diagnostic(
+        code,
+        HostDiagnosticSeverity::Error,
+        format!("Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {message}"),
+    );
+    projection.startup = startup;
+    projection
+}
+
+/// Treat transferred details as untrusted observations and reproject through the
+/// same domain allowlist; HTTP status and text never supply a missing cause.
+fn internal_startup_transfer(
+    mut startup: runtime_api::WorkerStartupFailure,
+) -> Option<runtime_api::WorkerStartupFailure> {
+    startup.primary =
+        worker::startup_failure::reproject_internal_startup_failure(&startup.primary).ok()?;
+    Some(startup)
 }
 
 fn diagnostic(
@@ -6662,28 +8623,96 @@ fn diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        session: None,
+        workdir: None,
+        control: None,
+        startup: None,
         code: code.into(),
         severity,
         message: message.into(),
     }
 }
 
-fn operation_failed_or_unknown_worker(
-    runtime_id: &str,
-    worker_id: &str,
-    diagnostics: Vec<RuntimeDiagnostic>,
-) -> RuntimeRegistryError {
-    diagnostics
-        .into_iter()
-        .find(|diagnostic| matches!(diagnostic.severity, HostDiagnosticSeverity::Error))
-        .map(|diagnostic| RuntimeRegistryError::RuntimeOperationFailed {
-            runtime_id: runtime_id.to_string(),
-            code: diagnostic.code,
-            message: diagnostic.message,
-        })
-        .unwrap_or_else(|| RuntimeRegistryError::UnknownWorker {
-            worker: RuntimeWorkerRef::new(runtime_id, worker_id),
-        })
+fn embedded_control_cause(error: &EmbeddedRuntimeError) -> RuntimeControlCause {
+    error.control_cause()
+}
+
+/// GET-worker's endpoint contract assigns a decoded public 404 to absence. A raw
+/// status/invalid error body is NOT evidence of absence. Never inspect error text,
+/// diagnostic codes, severity, or ordering here. Rich remote control reasons need the
+/// shared Runtime API contract (T812); do not invent them from legacy code strings.
+fn remote_lookup_cause(
+    error: &runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> RuntimeControlCause {
+    if matches!(error, runtime_api::client_support::ClientError::Public { status, error } if *status == StatusCode::NOT_FOUND && error.control_cause().is_none() && error.create_failure().is_none())
+    {
+        return RuntimeControlCause::WorkerMissing;
+    }
+    remote_control_cause(error)
+}
+
+fn remote_control_cause(
+    error: &runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> RuntimeControlCause {
+    use RuntimeControlCause as C;
+    use runtime_api::client_support::{ClientError, ClientFailure};
+    match error {
+        ClientError::Public { status, error } => {
+            if let Some(cause) = error.control_cause() {
+                cause
+            } else if matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                C::AuthorizationFailed
+            } else if let Some(failure) = error.create_failure() {
+                use runtime_api::startup::{StartupBoundaryReason as R, StartupCause};
+                match failure.startup().primary.decode::<StartupCause>() {
+                    error_contract::DecodeFailure::Known(received) => {
+                        match received.facts().cause() {
+                            StartupCause::Boundary(boundary) => match boundary.reason {
+                                R::Timeout => C::TimedOut,
+                                R::Transport => C::TransportFailed,
+                                R::Decode | R::InvalidResponse => C::InvalidResponse,
+                                R::TooLarge => C::ResponseTooLarge,
+                                R::UnsupportedVersion
+                                | R::UnsupportedReason
+                                | R::FinalizeFailed => C::ResultUnavailable,
+                            },
+                            _ => C::ExecutionRejected,
+                        }
+                    }
+                    _ => C::ResultUnavailable,
+                }
+            } else if error.error.startup.is_some() {
+                C::ExecutionRejected
+            } else {
+                match *status {
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => C::AuthorizationFailed,
+                    _ => C::RemoteRejected,
+                }
+            }
+        }
+        ClientError::Failure(failure) => match failure {
+            ClientFailure::Authorization => C::AuthorizationFailed,
+            ClientFailure::ErrorResponseDecode { status }
+            | ClientFailure::UnsupportedErrorResponse { status }
+                if matches!(status, 401 | 403) =>
+            {
+                C::AuthorizationFailed
+            }
+            ClientFailure::RequestEncoding => C::RequestEncodingFailed,
+            ClientFailure::Connect => C::ConnectionFailed,
+            ClientFailure::Transport => C::TransportFailed,
+            ClientFailure::Timeout => C::TimedOut,
+            ClientFailure::ResponseTooLarge { .. } => C::ResponseTooLarge,
+            ClientFailure::UnsupportedErrorResponse { .. } => C::ResultUnavailable,
+            ClientFailure::UnexpectedStatus { .. }
+            | ClientFailure::ErrorResponseDecode { .. }
+            | ClientFailure::Decode { .. }
+            | ClientFailure::MissingResponseHeader { .. }
+            | ClientFailure::DuplicateResponseHeader { .. }
+            | ClientFailure::InvalidResponseHeader { .. }
+            | ClientFailure::UnexpectedBody => C::InvalidResponse,
+        },
+    }
 }
 
 fn bounded_backend_identifier(prefix: &str, value: &str) -> String {
@@ -6825,6 +8854,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> InternalWorkerSummary {
 
 pub fn placeholder_spawn_response(host_id: impl Into<String>) -> WorkerSpawnResult {
     WorkerSpawnResult {
+        failure: None,
         state: InternalWorkerOperationState::Unsupported,
         worker: Some(placeholder_worker(host_id)),
         acceptance_evidence: Vec::new(),
@@ -6849,6 +8879,451 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn lookup_outcomes_ignore_diagnostic_order_severity_code_and_wording() {
+        let fixture = FixtureRuntime::with_worker("runtime-a", "host-a", "worker-a", "Worker");
+        let outcomes = [
+            WorkerLookupOutcome::Found {
+                worker: fixture.workers[0].clone(),
+            },
+            WorkerLookupOutcome::Missing,
+            WorkerLookupOutcome::Failed {
+                cause: RuntimeControlCause::RuntimeStopped,
+            },
+            WorkerLookupOutcome::Failed {
+                cause: RuntimeControlCause::TransportFailed,
+            },
+        ];
+        for outcome in outcomes {
+            let mut lookup = WorkerLookupResult {
+                outcome,
+                diagnostics: Vec::new(),
+            };
+            let expected = lookup.clone().into_worker("runtime-a", "worker-a");
+            let variants = [
+                vec![diagnostic(
+                    "worker_not_found",
+                    HostDiagnosticSeverity::Error,
+                    "missing",
+                )],
+                vec![diagnostic(
+                    "operation_failed",
+                    HostDiagnosticSeverity::Info,
+                    "wording changed",
+                )],
+                vec![
+                    diagnostic("unrelated", HostDiagnosticSeverity::Error, "first error"),
+                    diagnostic(
+                        "worker_not_found",
+                        HostDiagnosticSeverity::Warning,
+                        "second observation",
+                    ),
+                ],
+            ];
+            for mut diagnostics in variants {
+                for _ in 0..2 {
+                    diagnostics.reverse();
+                    lookup.diagnostics = diagnostics.clone();
+                    let result = lookup.clone().into_worker("runtime-a", "worker-a");
+                    match (&expected, &result) {
+                        (Ok(expected), Ok(actual)) => assert_eq!(expected, actual),
+                        (
+                            Err(RuntimeRegistryError::UnknownWorker { .. }),
+                            Err(RuntimeRegistryError::UnknownWorker { .. }),
+                        ) => {}
+                        (
+                            Err(RuntimeRegistryError::RuntimeControlFailed {
+                                cause: expected, ..
+                            }),
+                            Err(RuntimeRegistryError::RuntimeControlFailed {
+                                cause: actual,
+                                diagnostics: retained,
+                                ..
+                            }),
+                        ) => {
+                            assert_eq!(expected, actual);
+                            assert_eq!(retained, &diagnostics);
+                            assert_eq!(
+                                result.as_ref().unwrap_err().message(),
+                                actual.explanation()
+                            );
+                        }
+                        _ => panic!("diagnostics changed lookup semantics: {result:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_lookup_source_distinguishes_missing_invalid_and_stopped_error() {
+        let runtime = EmbeddedWorkerRuntime::new_memory("workspace-test");
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        assert_eq!(
+            runtime.worker(&worker_id).outcome,
+            WorkerLookupOutcome::Missing
+        );
+        assert!(matches!(
+            runtime.worker("").outcome,
+            WorkerLookupOutcome::Failed {
+                cause: RuntimeControlCause::InvalidWorkerIdentifier,
+            }
+        ));
+        let missing = EmbeddedRuntimeError::WorkerNotFound {
+            worker_id: EmbeddedWorkerId::now_v7(),
+        };
+        for (error, expected) in [
+            (missing, WorkerLookupOutcome::Missing),
+            (
+                EmbeddedRuntimeError::RuntimeStopped,
+                WorkerLookupOutcome::Failed {
+                    cause: RuntimeControlCause::RuntimeStopped,
+                },
+            ),
+        ] {
+            let result = WorkerLookupResult::from_cause(
+                embedded_control_cause(&error),
+                vec![embedded_runtime_diagnostic(&error)],
+            );
+            assert_eq!(result.outcome, expected);
+        }
+        // Actual Runtime reads remain allowed after stop; do not fabricate a stopped error
+        // from the Runtime status. RuntimeStopped above exercises the typed error adapter.
+        runtime.runtime.stop_runtime().unwrap();
+        assert_eq!(
+            runtime.worker(&worker_id).outcome,
+            WorkerLookupOutcome::Missing
+        );
+    }
+
+    #[test]
+    fn embedded_control_mapping_does_not_read_display_or_private_fields() {
+        let worker_id = EmbeddedWorkerId::now_v7();
+        let first = EmbeddedRuntimeError::WorkerExecutionUnavailable {
+            worker_id,
+            message: "worker_not_found".into(),
+        };
+        let second = EmbeddedRuntimeError::WorkerExecutionUnavailable {
+            worker_id,
+            message: "TEST_ONLY_CREDENTIAL /private/path changed wording".into(),
+        };
+        assert_eq!(
+            embedded_control_cause(&first),
+            RuntimeControlCause::ExecutionUnavailable
+        );
+        assert_eq!(
+            embedded_control_cause(&second),
+            embedded_control_cause(&first)
+        );
+        let unknown = EmbeddedRuntimeError::StoreCommitOutcomeUnknown {
+            operation: "save",
+            path: PathBuf::from("/private/path"),
+            source: std::io::Error::other("TEST_ONLY_CREDENTIAL"),
+        };
+        assert_eq!(
+            embedded_control_cause(&unknown),
+            RuntimeControlCause::PersistenceOutcomeUnknown
+        );
+    }
+
+    #[test]
+    fn remote_lookup_classifies_typed_client_failures_not_absence() {
+        use RuntimeControlCause as C;
+        use runtime_api::client_support::{ClientError, ClientFailure as F, DecodeKind};
+        let failures = [
+            (F::Authorization, C::AuthorizationFailed),
+            (F::RequestEncoding, C::RequestEncodingFailed),
+            (F::Connect, C::ConnectionFailed),
+            (F::Transport, C::TransportFailed),
+            (F::Timeout, C::TimedOut),
+            (F::ResponseTooLarge { limit: 8 }, C::ResponseTooLarge),
+            (
+                F::UnexpectedStatus {
+                    expected: 200,
+                    actual: 404,
+                },
+                C::InvalidResponse,
+            ),
+            (F::ErrorResponseDecode { status: 404 }, C::InvalidResponse),
+            (
+                F::Decode {
+                    kind: DecodeKind::Success,
+                },
+                C::InvalidResponse,
+            ),
+            (
+                F::Decode {
+                    kind: DecodeKind::PublicError,
+                },
+                C::InvalidResponse,
+            ),
+            (
+                F::MissingResponseHeader { name: "x-test" },
+                C::InvalidResponse,
+            ),
+            (
+                F::DuplicateResponseHeader { name: "x-test" },
+                C::InvalidResponse,
+            ),
+            (
+                F::InvalidResponseHeader { name: "x-test" },
+                C::InvalidResponse,
+            ),
+            (F::UnexpectedBody, C::InvalidResponse),
+        ];
+        for (failure, expected) in failures {
+            let error = ClientError::failure(failure);
+            assert_eq!(remote_lookup_cause(&error), expected);
+            assert!(matches!(
+                WorkerLookupResult::from_cause(expected, Vec::new()).outcome,
+                WorkerLookupOutcome::Failed { .. }
+            ));
+        }
+        for (status, expected) in [
+            (StatusCode::NOT_FOUND, C::WorkerMissing),
+            (StatusCode::UNAUTHORIZED, C::AuthorizationFailed),
+            (StatusCode::FORBIDDEN, C::AuthorizationFailed),
+            (StatusCode::INTERNAL_SERVER_ERROR, C::RemoteRejected),
+        ] {
+            for code in ["worker_not_found", "changed-code"] {
+                let error = ClientError::public(
+                    status,
+                    runtime_api::RuntimeApiError::new(
+                        status.as_u16(),
+                        code,
+                        "TEST_ONLY_CREDENTIAL changed wording",
+                    ),
+                );
+                assert_eq!(remote_lookup_cause(&error), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_lookup_real_generated_client_to_registry_distinguishes_absence_and_failure() {
+        use RuntimeControlCause as C;
+        let cases = [
+            (
+                404,
+                json!({ "error": { "code": "changed-code", "message": "wording changed" } })
+                    .to_string(),
+                None,
+            ),
+            (
+                404,
+                "not a typed error body".to_string(),
+                Some(C::InvalidResponse),
+            ),
+            (
+                403,
+                json!({ "error": { "code": "worker_not_found", "message": "missing" } })
+                    .to_string(),
+                Some(C::AuthorizationFailed),
+            ),
+            (
+                500,
+                json!({ "error": { "code": "worker_not_found", "message": "missing" } })
+                    .to_string(),
+                Some(C::RemoteRejected),
+            ),
+            (200, "{}".to_string(), Some(C::InvalidResponse)),
+        ];
+        for (status, body, cause) in cases {
+            let worker_id = EmbeddedWorkerId::now_v7().to_string();
+            let (base_url, server) = serve_mock_http(vec![mock_response(
+                "GET",
+                format!("/v1/workers/{worker_id}"),
+                true,
+                status,
+                body,
+            )]);
+            let registry = RuntimeRegistry::new(Vec::new());
+            registry.register(
+                RemoteWorkerRuntime::new(
+                    RemoteRuntimeConfig::new(
+                        "remote:test",
+                        "Remote Test",
+                        base_url,
+                        Some("secret-token".into()),
+                    ),
+                    "workspace-test".into(),
+                    "http://127.0.0.1:8787".into(),
+                )
+                .unwrap(),
+            );
+            let error = registry
+                .worker(&RuntimeWorkerRef::new("remote:test", &worker_id))
+                .unwrap_err();
+            match cause {
+                None => assert!(matches!(error, RuntimeRegistryError::UnknownWorker { .. })),
+                Some(expected) => match error {
+                    RuntimeRegistryError::RuntimeControlFailed { cause, .. } => {
+                        assert_eq!(cause, expected)
+                    }
+                    other => panic!("remote failure was not retained: {other:?}"),
+                },
+            }
+            server.join().expect("mock remote server finished");
+        }
+    }
+
+    #[test]
+    fn session_registration_embedded_and_remote_host_projection_is_internal_only() {
+        use protocol::session_failure::{
+            SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
+        };
+        use worker_runtime::execution::{
+            WorkerExecutionOperation, WorkerExecutionOutcome, WorkerExecutionResult,
+        };
+        let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn);
+        result.outcome = WorkerExecutionOutcome::Errored;
+        result.startup_failure = Some(
+            session_registration_attachment(SessionRegistrationCause::denied(
+                SessionPrincipal::Subject,
+            ))
+            .unwrap(),
+        );
+        result.startup_failure_persistence =
+            Some(protocol::startup_failure::StartupPersistenceOutcome::OutcomeUnknown);
+        result.secondary_failures.push(
+            protocol::startup_failure::StartupSecondaryFailure::Persistence {
+                phase: protocol::startup_failure::StartupFailurePhase::MetadataSave,
+                outcome: protocol::startup_failure::StartupPersistenceOutcome::OutcomeUnknown,
+            },
+        );
+        let error = EmbeddedRuntimeError::WorkerExecutionRejected {
+            worker_id: EmbeddedWorkerId::now_v7(),
+            operation: result.operation,
+            outcome: result.outcome,
+            message: "TEST_ONLY_CREDENTIAL /private/path raw_http_body".into(),
+            result,
+        };
+        let embedded = embedded_runtime_diagnostic(&error);
+        let mut wire = runtime_api::RuntimeApiError::new(
+            500,
+            "worker_execution_rejected",
+            "TEST_ONLY_CREDENTIAL private-subject-id raw_http_body",
+        );
+        wire.error.startup = embedded.startup.clone();
+        let received = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+        let remote = runtime_api_diagnostic(
+            "remote",
+            runtime_api::client_support::ClientError::Public {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                error: received,
+            },
+        );
+        assert!(embedded.startup.is_some());
+        assert_eq!(embedded.startup, remote.startup);
+        let public = serde_json::to_value(&remote).unwrap();
+        assert!(
+            public.get("startup").is_none(),
+            "no blind public/storage attachment forwarding"
+        );
+        for secret in [
+            "TEST_ONLY_CREDENTIAL",
+            "private-subject-id",
+            "/private/path",
+            "raw_http_body",
+        ] {
+            assert!(!serde_json::to_string(&embedded).unwrap().contains(secret));
+            assert!(!serde_json::to_string(&remote).unwrap().contains(secret));
+        }
+
+        let legacy = runtime_api_diagnostic(
+            "remote",
+            runtime_api::client_support::ClientError::Public {
+                status: reqwest::StatusCode::FORBIDDEN,
+                error: runtime_api::RuntimeApiError::new(403, "forbidden", "session.record denied"),
+            },
+        );
+        assert!(
+            legacy.startup.is_none(),
+            "HTTP status and prose cannot attest a Session cause"
+        );
+        let mut corrupt = embedded.startup.unwrap();
+        corrupt.primary = serde_json::from_value(json!("not an error-contract envelope")).unwrap();
+        assert!(internal_startup_transfer(corrupt).is_none());
+    }
+
+    #[test]
+    fn remote_startup_receivers_discard_untrusted_prose_and_code_even_without_paths() {
+        use protocol::session_failure::{
+            SessionRegistrationCause, session_registration_attachment,
+        };
+        let valid = runtime_api::WorkerStartupFailure {
+            primary: session_registration_attachment(SessionRegistrationCause::binding_mismatch())
+                .unwrap(),
+            secondary: vec![],
+            persistence: None,
+            resources: None,
+            io_kind: None,
+        };
+        for corrupt in [false, true] {
+            for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
+                let mut startup = valid.clone();
+                if corrupt {
+                    startup.primary = serde_json::from_value(json!("corrupt attachment")).unwrap();
+                }
+                let mut wire = runtime_api::RuntimeApiError::new(
+                    status.as_u16(),
+                    "PRIVATE_CODE_SENTINEL",
+                    "TEST_ONLY_CREDENTIAL private-subject-id raw_http_body",
+                );
+                wire.error.startup = Some(startup);
+                let body = serde_json::to_string(&wire).unwrap();
+                let typed = runtime_api_diagnostic(
+                    "remote",
+                    runtime_api::client_support::ClientError::Public {
+                        status,
+                        error: serde_json::from_str(&body).unwrap(),
+                    },
+                );
+                let (url, server) = serve_mock_http(vec![mock_response(
+                    "GET",
+                    "/",
+                    false,
+                    status.as_u16(),
+                    body,
+                )]);
+                let response = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap()
+                    .get(url)
+                    .send()
+                    .unwrap();
+                let http = remote_http_status_diagnostic("remote", status, response);
+                server.join().unwrap();
+                for diagnostic in [typed, http] {
+                    assert_eq!(diagnostic.startup.is_some(), !corrupt);
+                    assert_eq!(diagnostic.message.contains("session.record"), !corrupt);
+                    assert_eq!(
+                        diagnostic.code,
+                        if status == StatusCode::FORBIDDEN {
+                            "remote_runtime_auth_failed"
+                        } else {
+                            "remote_runtime_startup_failed"
+                        }
+                    );
+                    let public = serde_json::to_string(&diagnostic).unwrap();
+                    for secret in [
+                        "PRIVATE_CODE_SENTINEL",
+                        "TEST_ONLY_CREDENTIAL",
+                        "private-subject-id",
+                        "raw_http_body",
+                        "corrupt attachment",
+                    ] {
+                        assert!(
+                            !public.contains(secret),
+                            "received prose/code must never bypass startup projection: {public}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn async_workdir_authorization_uses_store_capacity_without_bearer_fallback() {
@@ -7043,6 +9518,37 @@ mod tests {
     }
 
     #[test]
+    fn worker_removal_embedded_causes_match_http_codes_without_source_details() {
+        let cases = [
+            (
+                EmbeddedRuntimeError::RecordingSourceUnavailable {
+                    message: "/private/source raw-body".into(),
+                },
+                "source_unavailable",
+            ),
+            (
+                EmbeddedRuntimeError::RecordingOwnershipUnknown {
+                    message: "/private/source raw-body".into(),
+                },
+                "ownership_unknown",
+            ),
+            (
+                EmbeddedRuntimeError::RecordingExecutionUnconfirmed {
+                    message: "/private/source raw-body".into(),
+                },
+                "execution_unconfirmed",
+            ),
+        ];
+        for (error, code) in cases {
+            let diagnostic = embedded_runtime_diagnostic(&error);
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.severity, HostDiagnosticSeverity::Warning);
+            assert!(!diagnostic.message.contains("/private/source"));
+            assert!(!diagnostic.message.contains("raw-body"));
+        }
+    }
+
+    #[test]
     fn embedded_delete_persistence_failure_diagnostic_is_bounded_and_path_free() {
         let diagnostic =
             embedded_runtime_diagnostic(&EmbeddedRuntimeError::WorkerDeletePersistenceFailed {
@@ -7151,6 +9657,7 @@ mod tests {
 
     fn test_create_binding() -> WorkerCreateBinding {
         WorkerCreateBinding {
+            plugin_execution: None,
             worker_id: EmbeddedWorkerId::now_v7(),
             create_fingerprint: "sha256:test-create".to_string(),
         }
@@ -7183,6 +9690,8 @@ mod tests {
         assert!(value.get("worker").is_none());
 
         let lifecycle = WorkerLifecycleResult {
+            cleanup_failures: Vec::new(),
+            replayed: false,
             state: InternalWorkerOperationState::Accepted,
             worker: RuntimeWorkerRef::new("arcadia", "30"),
             diagnostics: Vec::new(),
@@ -7339,6 +9848,9 @@ mod tests {
             let input = EmbeddedWorkerInput {
                 kind,
                 content: "contract test".to_string(),
+                source: Some(protocol::AuthenticatedInputSource::Account {
+                    account_id: "contract-account".into(),
+                }),
                 submission_request_id: Some("contract-request".to_string()),
                 segments: Some(vec![protocol::Segment::text("contract test")]),
             };
@@ -7367,6 +9879,7 @@ mod tests {
         let input = EmbeddedWorkerInput {
             kind: EmbeddedWorkerInputKind::User,
             content: protocol::Segment::flatten_to_text(&segments),
+            source: None,
             submission_request_id: Some("submit-request".into()),
             segments: Some(segments),
         };
@@ -7698,10 +10211,10 @@ mod tests {
         fn observe_workspace_prompt_projection(
             &self,
             projection: worker::WorkspacePromptProjection,
-        ) -> Result<(), String> {
+        ) -> Result<(), RuntimeControlCause> {
             self.observed_prompt_digests
                 .lock()
-                .map_err(|_| "prompt projection observations poisoned".to_string())?
+                .map_err(|_| RuntimeControlCause::StateUnavailable)?
                 .push(projection.projection_digest);
             Ok(())
         }
@@ -7747,13 +10260,13 @@ mod tests {
         }
 
         fn worker(&self, worker_id: &str) -> WorkerLookupResult {
-            WorkerLookupResult {
-                worker: self
-                    .workers
-                    .iter()
-                    .find(|worker| worker.worker.worker_id == worker_id)
-                    .cloned(),
-                diagnostics: Vec::new(),
+            match self
+                .workers
+                .iter()
+                .find(|worker| worker.worker.worker_id == worker_id)
+            {
+                Some(worker) => WorkerLookupResult::found(worker.clone()),
+                None => WorkerLookupResult::missing(),
             }
         }
     }
@@ -7839,10 +10352,12 @@ mod tests {
             catalog,
         )
         .unwrap();
-        assert!(
-            registry
-                .observe_workspace_prompt_projection(projection)
-                .is_empty()
+        assert_eq!(
+            registry.observe_workspace_prompt_projection(projection),
+            vec![RuntimePromptProjectionObservation {
+                runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
+                result: Ok(()),
+            }]
         );
         assert!(remote_observed.lock().unwrap().is_empty());
         assert_eq!(*embedded_observed.lock().unwrap(), vec![expected_digest]);
@@ -7872,9 +10387,15 @@ mod tests {
         )
         .unwrap();
 
-        let diagnostics = registry.observe_workspace_prompt_projection(projection);
+        let observations = registry.observe_workspace_prompt_projection(projection);
 
-        assert!(diagnostics.is_empty());
+        assert_eq!(
+            observations,
+            vec![RuntimePromptProjectionObservation {
+                runtime_id: "runtime-a".to_string(),
+                result: Ok(()),
+            }]
+        );
         assert_eq!(*observed.lock().unwrap(), vec![expected_digest]);
     }
 
@@ -8107,20 +10628,31 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_spawn_execution_failure_is_rejected_and_not_input_capable() {
+    fn embedded_runtime_spawn_execution_error_preserves_unknown_acceptance_and_no_input() {
         let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
             "local:test",
             Arc::new(FailingSpawnBackend),
         )
         .expect("test backend should connect");
-        let spawned = runtime.spawn_worker(test_create_binding(), embedded_spawn_request());
-        assert_eq!(spawned.state, InternalWorkerOperationState::Rejected);
+        let mut request = embedded_spawn_request();
+        request.requested_worker_name = Some("friendly-name".into());
+        let spawned = runtime.spawn_worker(test_create_binding(), request);
+        assert_eq!(spawned.state, InternalWorkerOperationState::Unknown);
+        let operation = spawned.failure.as_ref().unwrap().operation();
+        assert_eq!(
+            operation.acceptance,
+            runtime_api::startup::CreationAcceptance::Unknown
+        );
+        assert_eq!(
+            operation.execution,
+            runtime_api::startup::ExecutionOutcome::Errored
+        );
         assert!(spawned.acceptance_evidence.is_empty());
+        assert_eq!(spawned.diagnostics.len(), 1);
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "embedded_worker_execution_rejected"
-                && diagnostic
-                    .message
-                    .contains("provider setup failed at [redacted]")
+            diagnostic.code == "embedded_worker_create_failed"
+                && diagnostic.startup.is_some()
+                && !diagnostic.message.contains("provider setup failed")
                 && !diagnostic.message.contains("/tmp/secret-provider-config")
                 && !diagnostic.message.contains("secret-value")
                 && !diagnostic.message.contains("session-42")
@@ -8175,6 +10707,122 @@ mod tests {
     }
 
     #[test]
+    fn registry_receipt_lookup_uses_embedded_read_boundary_without_input_dispatch() {
+        use worker_runtime::execution::{
+            WorkerExecutionBackend, WorkerExecutionOperation, WorkerExecutionResult,
+        };
+        #[derive(Default)]
+        struct ReceiptBackend {
+            creation: AcceptingExecutionBackend,
+            receipt: Mutex<Option<WorkerExecutionResult>>,
+            queries: Mutex<Vec<EmbeddedWorkerInput>>,
+        }
+        impl WorkerExecutionBackend for ReceiptBackend {
+            fn backend_id(&self) -> &str {
+                "receipt-only-test-backend"
+            }
+            fn spawn_worker(
+                &self,
+                request: worker_runtime::execution::WorkerExecutionSpawnRequest,
+            ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+                self.creation.spawn_worker(request)
+            }
+            fn dispatch_input(
+                &self,
+                _: &EmbeddedWorkerRef,
+                _: EmbeddedWorkerInput,
+            ) -> WorkerExecutionResult {
+                panic!("a receipt query must not dispatch input")
+            }
+            fn reconcile_submission(
+                &self,
+                _: &EmbeddedWorkerRef,
+                input: EmbeddedWorkerInput,
+            ) -> WorkerExecutionResult {
+                self.queries.lock().unwrap().push(input);
+                self.receipt.lock().unwrap().clone().unwrap_or_else(|| {
+                    WorkerExecutionResult::errored(
+                        WorkerExecutionOperation::Input,
+                        "no stored receipt",
+                    )
+                })
+            }
+        }
+        let backend = Arc::new(ReceiptBackend::default());
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "workspace-test",
+            backend.clone(),
+        )
+        .unwrap();
+        let mut spawn = embedded_spawn_request();
+        spawn.intent = WorkerSpawnIntent::BackendJob {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            purpose: "receipt-only test".into(),
+            input_digest: format!("sha256:{}", "a".repeat(64)),
+            subjektiv_consolidation: false,
+            subjektiv_journal: false,
+        };
+        let binding = worker_runtime::catalog::BackendJobExecutionBinding {
+            job_id: "job-1".into(),
+            attempt_id: "attempt-1".into(),
+            input_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            subjektiv_consolidation: false,
+            subjektiv_journal: false,
+        };
+        let created = runtime.spawn_worker(test_create_binding(), spawn);
+        let worker = created.worker.unwrap().worker;
+        let registry = RuntimeRegistry::for_workspace(runtime);
+        let saved = registry
+            .lookup_job_worker_creation(&worker, "sha256:test-create", &binding)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.worker, worker);
+        let mut foreign = binding.clone();
+        foreign.attempt_id = "attempt-foreign".into();
+        assert!(
+            registry
+                .lookup_job_worker_creation(&worker, "sha256:test-create", &foreign)
+                .is_err()
+        );
+        assert!(
+            registry
+                .lookup_job_worker_creation(&worker, "foreign-create", &binding)
+                .is_err()
+        );
+        let request = || WorkerInputRequest {
+            source: None,
+            kind: WorkerInputKind::User,
+            content: "frozen input".into(),
+            submission_request_id: Some("stored-request".into()),
+            segments: None,
+        };
+        let absent = registry.reconcile_worker_input(&worker, request()).unwrap();
+        assert_eq!(absent.disposition, WorkerInputDisposition::Unknown);
+        *backend.receipt.lock().unwrap() = Some(WorkerExecutionResult::accepted_submission(
+            WorkerExecutionOperation::Input,
+            "stored-request",
+            "stored-submission",
+            protocol::SubmissionDisposition::Started,
+        ));
+        let accepted = registry.reconcile_worker_input(&worker, request()).unwrap();
+        assert_eq!(accepted.state, InternalWorkerOperationState::Accepted);
+        assert_eq!(accepted.runtime_run_id.as_deref(), Some("stored-request"));
+        *backend.receipt.lock().unwrap() = Some(WorkerExecutionResult::accepted_submission(
+            WorkerExecutionOperation::Input,
+            "foreign-request",
+            "stored-submission",
+            protocol::SubmissionDisposition::Started,
+        ));
+        let foreign = registry.reconcile_worker_input(&worker, request()).unwrap();
+        assert_eq!(foreign.disposition, WorkerInputDisposition::Unknown);
+        let queries = backend.queries.lock().unwrap();
+        assert_eq!(queries.len(), 3);
+        assert!(queries.iter().all(|input| input.content == "frozen input"
+            && input.submission_request_id.as_deref() == Some("stored-request")));
+    }
+
+    #[test]
     fn embedded_runtime_with_execution_backend_routes_input_and_updates_status() {
         let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
             "local:test",
@@ -8196,6 +10844,7 @@ mod tests {
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: "hello".to_string(),
+                source: None,
                 submission_request_id: Some("tracked-input-1".to_string()),
                 segments: None,
             },
@@ -8208,7 +10857,7 @@ mod tests {
         loop {
             let detail = runtime
                 .worker(&worker.worker.worker_id)
-                .worker
+                .into_worker(runtime.runtime_id(), &worker.worker.worker_id)
                 .expect("worker detail");
             if detail.state == "idle" {
                 break;
@@ -8285,7 +10934,9 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.kind == "embedded_runtime_backend_internal_projection")
         );
+        assert!(spawned.diagnostics.is_empty());
         let worker = spawned.worker.expect("created embedded worker");
+        assert_eq!(worker.display_name, "friendly-name-is-not-authority");
         assert_eq!(worker.worker.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(worker.workspace.visibility, "backend_internal");
         assert_eq!(worker.workspace.identity, "runtime_registry_worker");
@@ -8297,6 +10948,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello embedded runtime".to_string(),
+                    source: None,
                     submission_request_id: None,
                     segments: None,
                 },
@@ -8509,6 +11161,12 @@ mod tests {
             ),
             "workers:read"
         );
+        for suffix in ["stop", "stop/admit", "stop/outcome"] {
+            assert_eq!(
+                workspace_runtime_operation("POST", &format!("/v1/workers/{worker_id}/{suffix}")),
+                "workers:stop"
+            );
+        }
         assert_eq!(
             workspace_runtime_operation("POST", "/v1/session-public/material/retention/erase"),
             "workers:delete"
@@ -8517,6 +11175,57 @@ mod tests {
             workspace_runtime_operation("POST", SSH_HOST_KEY_PROBE_PATH),
             SSH_HOST_KEY_PROBE_OPERATION
         );
+    }
+
+    #[test]
+    fn remote_subject_delete_uses_generated_exact_identity_transport() {
+        assert_eq!(
+            workspace_runtime_operation("POST", "/v1/subject-delete-worker"),
+            "workers:delete"
+        );
+        let request = runtime_api::SubjectDeleteWorkerRequest {
+            workspace_id: "workspace-test".into(),
+            worker_id: EmbeddedWorkerId::now_v7(),
+            create_fingerprint: "sha256:reserved-create".into(),
+            operation_id: "delete-worker-1".into(),
+        };
+        let response = runtime_api::SubjectDeleteWorkerResponse {
+            originals_absent: true,
+            workspace_id: request.workspace_id.clone(),
+            worker_id: request.worker_id,
+            create_fingerprint: request.create_fingerprint.clone(),
+            operation_id: request.operation_id.clone(),
+        };
+        // Only remote transport is substituted; actual Controller shutdown and
+        // signed admission are covered by worker-runtime's independent suites.
+        let (base_url, server) = serve_mock_http(vec![mock_response(
+            "POST",
+            "/v1/subject-delete-worker",
+            true,
+            200,
+            serde_json::to_string(&response).unwrap(),
+        )]);
+        let registry = RuntimeRegistry::new(Vec::new());
+        registry.register(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "remote:delete",
+                    "Deletion transport fixture",
+                    base_url,
+                    Some("secret-token".into()),
+                ),
+                "workspace-test".into(),
+                "http://127.0.0.1:8787".into(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            registry
+                .subject_delete_worker("remote:delete", request)
+                .unwrap(),
+            response
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -8695,6 +11404,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello remote".to_string(),
+                    source: None,
                     submission_request_id: None,
                     segments: None,
                 },
@@ -8993,10 +11703,283 @@ mod tests {
             .expect_err("auth failure is a backend operation error");
         assert!(matches!(
             error,
-            RuntimeRegistryError::RuntimeOperationFailed { runtime_id, code, .. }
-                if runtime_id == "remote:primary" && code == "remote_runtime_auth_failed"
+            RuntimeRegistryError::RuntimeControlFailed { runtime_id, cause, .. }
+                if runtime_id == "remote:primary" && cause == RuntimeControlCause::AuthorizationFailed
         ));
         server.join().expect("mock remote server finished");
+    }
+
+    fn removal_request(runtime_id: &str, worker_id: &str) -> WorkerRetentionExecutionRequest {
+        WorkerRetentionExecutionRequest {
+            operation_id: "remove-op-original".into(),
+            input_fingerprint: "original-fingerprint".into(),
+            archive_id: Some("original-archive".into()),
+            workspace_id: "workspace-test".into(),
+            source_runtime_id: runtime_id.into(),
+            worker_id: EmbeddedWorkerId::parse(worker_id).unwrap(),
+            source_created_at: "2026-01-01T00:00:00Z".into(),
+            removed_at: "2026-01-02T00:00:00Z".into(),
+            effective_profile: Some("builtin:coder".into()),
+            retention_class: Some("recording".into()),
+            policy_id: "original-policy".into(),
+            session_disposition: worker_runtime::retention::SessionDisposition::Archive,
+            diagnostics_disposition: worker_runtime::retention::DiagnosticsDisposition::Retain,
+        }
+    }
+
+    fn removal_capture_request() -> runtime_api::WorkerRemovalSessionCaptureRequest {
+        runtime_api::WorkerRemovalSessionCaptureRequest {
+            workspace_id: "workspace-test".into(),
+            operation_id: "remove-op-original".into(),
+            session_id: session_store::SessionId::new_v4(),
+            active_segment_id: Some(session_store::SegmentId::new_v4()),
+            start: session_store::capture::RecordingPosition {
+                canonical_order: 17,
+                byte_offset: 23,
+            },
+            max_entries: 31,
+            max_serialized_bytes: 128 * 1024,
+        }
+    }
+
+    #[test]
+    fn worker_removal_defaults_fail_closed_and_registry_preserves_cause_codes() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let registry = RuntimeRegistry::new(vec![Arc::new(FixtureRuntime::with_worker(
+            "runtime-a",
+            "host-a",
+            &worker_id,
+            "stopped",
+        ))]);
+        let worker = RuntimeWorkerRef::new("runtime-a", &worker_id);
+        let error = registry
+            .freeze_worker_removal(&worker, removal_request("runtime-a", &worker_id))
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "worker_removal_freeze_unsupported")
+        );
+        let error = registry
+            .capture_worker_removal_session(&worker, removal_capture_request())
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "worker_removal_capture_unsupported")
+        );
+    }
+
+    #[test]
+    fn worker_removal_registry_rejects_request_target_mismatch_before_dispatch() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("runtime-a", &worker_id);
+        let registry = RuntimeRegistry::new(Vec::new());
+        for request in [
+            removal_request("runtime-b", &worker_id),
+            removal_request("runtime-a", &EmbeddedWorkerId::now_v7().to_string()),
+        ] {
+            let error = registry
+                .freeze_worker_removal(&worker, request)
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+                if code == "worker_removal_target_mismatch")
+            );
+        }
+    }
+
+    fn removal_remote_registry(
+        responses: Vec<MockResponse>,
+    ) -> (RuntimeRegistry, thread::JoinHandle<()>) {
+        let (base_url, server) = serve_mock_http(responses);
+        let runtime = RemoteWorkerRuntime::new(
+            RemoteRuntimeConfig::new(
+                "remote:removal",
+                "Removal transport",
+                base_url,
+                Some("secret-token".into()),
+            ),
+            "workspace-test".into(),
+            "http://127.0.0.1:8787".into(),
+        )
+        .unwrap();
+        (RuntimeRegistry::new(vec![Arc::new(runtime)]), server)
+    }
+
+    #[test]
+    fn worker_removal_remote_exact_requests_preserve_domain_and_resource_causes() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+        let request = removal_request("remote:removal", &worker_id);
+        let mut capture = removal_capture_request();
+        capture.max_serialized_bytes = usize::MAX;
+        let mut transmitted = capture.clone();
+        transmitted.max_serialized_bytes = MAX_REMOTE_RUNTIME_RESPONSE_BYTES;
+        let freeze_path = format!("/v1/workers/{worker_id}/retention/freeze");
+        let capture_path = format!("/v1/workers/{worker_id}/retention/capture");
+        for path in [&freeze_path, &capture_path] {
+            assert_eq!(workspace_runtime_operation("POST", path), "workers:delete");
+        }
+        let (registry, server) = removal_remote_registry(vec![
+            MockResponse {
+                request_body: Some(serde_json::to_value(&request).unwrap()),
+                ..mock_response("POST", freeze_path, true, 409,
+                    json!({"error":{"code":"removal_operation_conflict","message":"different saved request"}}).to_string())
+            },
+            MockResponse {
+                request_body: Some(serde_json::to_value(&transmitted).unwrap()),
+                ..mock_response("POST", capture_path, true, 403,
+                    json!({"error":{"code":"removal_source_revoked","message":"source unavailable"}}).to_string())
+            },
+        ]);
+        let error = registry
+            .freeze_worker_removal(&worker, request)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "removal_operation_conflict")
+        );
+        let error = registry
+            .capture_worker_removal_session(&worker, capture)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "removal_source_revoked")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_removal_remote_problem_causes_keep_the_shared_removal_classification() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        for (cause, code) in [
+            (C::RecordingSourceUnavailable, "source_unavailable"),
+            (C::RecordingOwnershipUnknown, "ownership_unknown"),
+            (C::RecordingExecutionUnconfirmed, "execution_unconfirmed"),
+        ] {
+            let worker_id = EmbeddedWorkerId::now_v7().to_string();
+            let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+            let problem = runtime_api::control_failure::control_problem(cause).unwrap();
+            let mut response = mock_response(
+                "POST",
+                format!("/v1/workers/{worker_id}/retention/freeze"),
+                true,
+                problem.status,
+                String::from_utf8(problem.body.to_vec()).unwrap(),
+            );
+            response.content_type = problem.content_type;
+            let (registry, server) = removal_remote_registry(vec![response]);
+            let error = registry
+                .freeze_worker_removal(&worker, removal_request("remote:removal", &worker_id))
+                .unwrap_err();
+            assert!(
+                matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code: actual, .. } if actual == code)
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn worker_removal_remote_oversized_freeze_is_a_resource_error_not_empty_success() {
+        let worker_id = EmbeddedWorkerId::now_v7().to_string();
+        let worker = RuntimeWorkerRef::new("remote:removal", &worker_id);
+        let request = removal_request("remote:removal", &worker_id);
+        let freeze = WorkerRemovalFreeze {
+            operation_id: request.operation_id.clone(),
+            input_fingerprint: request.input_fingerprint.clone(),
+            workspace_id: request.workspace_id.clone(),
+            source_runtime_id: request.source_runtime_id.clone(),
+            worker_id: request.worker_id,
+            members: vec![runtime_api::WorkerRemovalSessionMember {
+                session_id: session_store::SessionId::new_v4(),
+                active_segment_id: Some(session_store::SegmentId::new_v4()),
+                materialized: true,
+                end: Default::default(),
+                descriptors: Vec::new(),
+            }],
+        };
+        // Inflate metadata at the wire boundary only; this test does not attest
+        // a Runtime source enumeration or actual Worker quiescence.
+        let mut value = serde_json::to_value(freeze).unwrap();
+        value["input_fingerprint"] =
+            serde_json::Value::String("x".repeat(MAX_REMOTE_RUNTIME_RESPONSE_BYTES));
+        let (registry, server) = removal_remote_registry(vec![mock_response(
+            "POST",
+            format!("/v1/workers/{worker_id}/retention/freeze"),
+            true,
+            200,
+            value.to_string(),
+        )]);
+        let error = registry
+            .freeze_worker_removal(&worker, request)
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeRegistryError::RuntimeOperationFailed { code, .. }
+            if code == "remote_runtime_response_too_large")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn worker_removal_normal_capture_caps_slice_after_measuring_wire_wrapper() {
+        let worker_id = EmbeddedWorkerId::now_v7();
+        let mut request = runtime_api::SessionRecordingCaptureRequest {
+            workspace_id: "workspace-test".into(),
+            source: runtime_api::SessionPublicSource::Retained { worker_id },
+            expected_session_id: session_store::SessionId::new_v4().to_string(),
+            start: Default::default(),
+            max_entries: 1,
+            max_serialized_bytes: usize::MAX,
+        };
+        let mut capped = request.clone();
+        capped.max_serialized_bytes = session_recording_capture_transport_budget().unwrap();
+        let responses = [capped.clone(), {
+            request.max_serialized_bytes = 128 * 1024;
+            request.clone()
+        }].into_iter().map(|expected| MockResponse {
+            request_body: Some(serde_json::to_value(expected).unwrap()),
+            ..mock_response("POST", "/v1/session-public/recording-capture", true, 200,
+                json!({"availability":"unavailable","reason":"resource_limit","message":"fixture hold"}).to_string())
+        }).collect();
+        let (registry, server) = removal_remote_registry(responses);
+        capped.max_serialized_bytes = usize::MAX;
+        for input in [capped, request] {
+            assert!(matches!(
+                registry
+                    .session_recording_capture("remote:removal", input)
+                    .unwrap(),
+                runtime_api::SessionRecordingCaptureAvailability::Unavailable {
+                    reason: runtime_api::SessionPublicUnavailableReason::ResourceLimit,
+                    ..
+                }
+            ));
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recording_capture_transport_budget_measures_availability_wrapper_not_job_input() {
+        let budget = session_recording_capture_transport_budget().unwrap();
+        let slice = session_store::capture::RecordingCaptureSlice {
+            capture: session_store::capture::CaptureDto {
+                version: 1,
+                session_id: "日本語\\\"\n".repeat(10000),
+                segment_id: "segment".into(),
+                view_entry_count: u64::MAX,
+                entries: Vec::new(),
+            },
+            next: Some(session_store::capture::RecordingPosition {
+                canonical_order: u64::MAX,
+                byte_offset: u64::MAX,
+            }),
+        };
+        let slice_bytes = serde_json::to_vec(&slice).unwrap().len();
+        let response = runtime_api::SessionRecordingCaptureAvailability::Captured { slice };
+        let response_bytes = serde_json::to_vec(&response).unwrap().len();
+        assert_eq!(
+            budget + response_bytes - slice_bytes,
+            MAX_REMOTE_RUNTIME_RESPONSE_BYTES
+        );
+        assert!(budget > 128 * 1024);
     }
 
     #[derive(Clone)]
@@ -9005,7 +11988,9 @@ mod tests {
         path: String,
         require_auth: bool,
         status: u16,
+        content_type: &'static str,
         body: String,
+        request_body: Option<serde_json::Value>,
     }
 
     fn mock_response(
@@ -9020,7 +12005,9 @@ mod tests {
             path: path.into(),
             require_auth,
             status,
+            content_type: "application/json",
             body,
+            request_body: None,
         }
     }
 
@@ -9028,12 +12015,29 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
-            for expected in responses {
+            let mut session_aliases = Vec::<(String, String)>::new();
+            for mut expected in responses {
                 let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut buffer = [0_u8; 8192];
                 let read = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..read]);
-                let first_line = request.lines().next().unwrap_or_default();
+                let mut request = buffer[..read].to_vec();
+                let body_start = loop {
+                    if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break offset + 4;
+                    }
+                    assert!(request.len() < 65536, "oversized mock request headers");
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert_ne!(read, 0, "incomplete mock request headers");
+                    request.extend_from_slice(&buffer[..read]);
+                };
+                let headers = std::str::from_utf8(&request[..body_start]).unwrap();
+                for (alias, actual) in &session_aliases {
+                    expected.path = expected.path.replace(alias, actual);
+                }
+                let first_line = headers.lines().next().unwrap_or_default();
                 let expected_line = format!("{} {} ", expected.method, expected.path);
                 assert!(
                     first_line.starts_with(&expected_line),
@@ -9041,11 +12045,47 @@ mod tests {
                 );
                 if expected.require_auth {
                     assert!(
-                        request
+                        headers
                             .to_ascii_lowercase()
                             .contains("authorization: bearer secret-token"),
-                        "authorization header missing from request: {request}"
+                        "authorization header missing from request: {headers}"
                     );
+                }
+                let opened = serde_json::from_str::<workdir::http::OpenWorkdirSessionResponse>(
+                    &expected.body,
+                )
+                .ok();
+                if expected.request_body.is_some() || opened.is_some() {
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("JSON request content length");
+                    let mut body = request[body_start..].to_vec();
+                    while body.len() < content_length {
+                        let read = stream.read(&mut buffer).unwrap();
+                        assert_ne!(read, 0, "incomplete JSON request body");
+                        body.extend_from_slice(&buffer[..read]);
+                    }
+                    if let Some(expected_body) = expected.request_body {
+                        assert_eq!(
+                            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                            expected_body
+                        );
+                    }
+                    if let Some(mut opened) = opened {
+                        let open: OpenWorkdirSessionRequest =
+                            serde_json::from_slice(&body).unwrap();
+                        session_aliases.push((
+                            opened.session_id.as_str().to_owned(),
+                            open.session_id.as_str().to_owned(),
+                        ));
+                        opened.session_id = open.session_id;
+                        expected.body = serde_json::to_string(&opened).unwrap();
+                    }
                 }
                 let status_text = match expected.status {
                     200 => "OK",
@@ -9054,12 +12094,23 @@ mod tests {
                     _ => "Mock",
                 };
                 let response = format!(
-                    "HTTP/1.1 {} {status_text}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} {status_text}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                     expected.status,
+                    expected.content_type,
                     expected.body.len(),
                     expected.body
                 );
-                stream.write_all(response.as_bytes()).unwrap();
+                if let Err(error) = stream.write_all(response.as_bytes()) {
+                    assert!(
+                        expected.body.len() > MAX_REMOTE_RUNTIME_RESPONSE_BYTES
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            ),
+                        "unexpected mock response write failure: {error}",
+                    );
+                }
             }
         });
         (base_url, handle)
@@ -9090,5 +12141,826 @@ mod tests {
             },
             "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" }
         })
+    }
+
+    fn prompt_projection_fixture() -> worker::WorkspacePromptProjection {
+        let catalog = worker::EffectivePromptCatalog::new(
+            std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "workspace prompt".to_string(),
+            )]),
+            "schema",
+            "toolchain",
+        )
+        .unwrap();
+        worker::WorkspacePromptProjection::new(
+            "workspace-a",
+            "source-content",
+            catalog.catalog_digest.clone(),
+            catalog,
+        )
+        .unwrap()
+    }
+
+    // Deliberately does not override the projection method: default/noop adapters
+    // must be reported as unsupported, not silently recorded as delivered.
+    struct UnsupportedPromptProjectionRuntime(FixtureRuntime);
+
+    impl WorkspaceWorkerRuntime for UnsupportedPromptProjectionRuntime {
+        fn runtime_id(&self) -> &str {
+            self.0.runtime_id()
+        }
+        fn runtime_summary(&self, limit: usize) -> InternalRuntimeSummary {
+            self.0.runtime_summary(limit)
+        }
+        fn list_hosts(&self, limit: usize) -> RuntimeList<InternalHostSummary> {
+            self.0.list_hosts(limit)
+        }
+        fn list_workers(&self, limit: usize) -> RuntimeList<InternalWorkerSummary> {
+            self.0.list_workers(limit)
+        }
+        fn worker(&self, worker_id: &str) -> WorkerLookupResult {
+            self.0.worker(worker_id)
+        }
+    }
+
+    #[test]
+    fn embedded_prompt_projection_retains_backend_unavailable_and_stopped_causes() {
+        let runtime = EmbeddedWorkerRuntime::new_memory("workspace-a");
+        assert_eq!(
+            runtime.observe_workspace_prompt_projection(prompt_projection_fixture()),
+            Err(RuntimeControlCause::ExecutionUnavailable)
+        );
+        runtime.runtime.stop_runtime().unwrap();
+        assert_eq!(
+            runtime.observe_workspace_prompt_projection(prompt_projection_fixture()),
+            Err(RuntimeControlCause::RuntimeStopped)
+        );
+    }
+
+    #[test]
+    fn registry_prompt_projection_preserves_all_success_rejection_and_unsupported_observations() {
+        let registry = RuntimeRegistry::new(Vec::new());
+        let mut successes = Vec::new();
+        for index in 0..(MAX_DIAGNOSTICS + 3) {
+            let runtime_id = format!("projection-runtime-{index}");
+            let runtime = FixtureRuntime::with_worker(&runtime_id, "host", "worker", "Worker");
+            successes.push((runtime_id, runtime.observed_prompt_digests.clone()));
+            registry.register(runtime);
+        }
+        registry.register(EmbeddedWorkerRuntime::new_memory("workspace-a"));
+        let unsupported = FixtureRuntime::with_worker("unsupported", "host", "worker", "Worker");
+        let unobserved = unsupported.observed_prompt_digests.clone();
+        registry.register(UnsupportedPromptProjectionRuntime(unsupported));
+        let projection = prompt_projection_fixture();
+        let digest = projection.projection_digest.clone();
+        let observations = registry.observe_workspace_prompt_projection(projection);
+        assert_eq!(observations.len(), successes.len() + 2);
+        for (runtime_id, observed) in successes {
+            assert_eq!(
+                observations
+                    .iter()
+                    .find(|item| item.runtime_id == runtime_id),
+                Some(&RuntimePromptProjectionObservation {
+                    runtime_id,
+                    result: Ok(()),
+                })
+            );
+            // One call per Runtime; no local retry/queue is hidden in the broadcast.
+            assert_eq!(*observed.lock().unwrap(), vec![digest.clone()]);
+        }
+        assert!(observations.contains(&RuntimePromptProjectionObservation {
+            runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
+            result: Err(RuntimeControlCause::ExecutionUnavailable),
+        }));
+        assert!(observations.contains(&RuntimePromptProjectionObservation {
+            runtime_id: "unsupported".to_string(),
+            result: Err(RuntimeControlCause::UnsupportedOperation),
+        }));
+        assert!(unobserved.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn poisoned_prompt_projection_fixture_returns_state_unavailable() {
+        let runtime = FixtureRuntime::with_worker("fixture", "host", "worker", "Worker");
+        let observed = runtime.observed_prompt_digests.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = observed.lock().unwrap();
+            panic!("poison fixture observation lock");
+        });
+        assert_eq!(
+            runtime.observe_workspace_prompt_projection(prompt_projection_fixture()),
+            Err(RuntimeControlCause::StateUnavailable)
+        );
+    }
+
+    fn remote_prompt_projection_fixture(base_url: String) -> RemoteWorkerRuntime {
+        RemoteWorkerRuntime::new(
+            RemoteRuntimeConfig::new(
+                "remote-projection",
+                "Remote",
+                base_url,
+                Some("secret-token".into()),
+            )
+            .with_timeout(Duration::from_secs(2)),
+            "workspace-a".to_string(),
+            "http://backend.invalid".to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn attachment_sync_owner_persistence_cause_survives_embedded_projection_and_serde() {
+        let error = EmbeddedRuntimeError::StoreCommitOutcomeUnknown {
+            operation: "write Worker aggregate",
+            path: PathBuf::from("/private/runtime/worker.json"),
+            source: std::io::Error::other("TEST_ONLY_CREDENTIAL"),
+        };
+        let response = RuntimeOperationResponse::attachment_failure(
+            Some(error.control_cause()),
+            embedded_runtime_diagnostic(&error),
+        );
+        assert_eq!(response.status, RuntimeOperationStatus::Unknown);
+        assert_eq!(
+            response.cause,
+            Some(RuntimeControlCause::PersistenceOutcomeUnknown)
+        );
+        assert!(response.worker.is_none());
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("/private/runtime"));
+        assert!(!encoded.contains("TEST_ONLY_CREDENTIAL"));
+        assert_eq!(
+            serde_json::from_str::<RuntimeOperationResponse>(&encoded).unwrap(),
+            response
+        );
+
+        let runtime = EmbeddedWorkerRuntime::new_memory("workspace-a");
+        let invalid = runtime.replace_worker_workdir_attachments("", Vec::new());
+        assert_eq!(invalid.status, RuntimeOperationStatus::Rejected);
+        assert_eq!(
+            invalid.cause,
+            Some(RuntimeControlCause::InvalidWorkerIdentifier)
+        );
+    }
+
+    #[test]
+    fn remote_attachment_sync_keeps_owner_cause_and_unknown_without_retry() {
+        for (cause, status) in [
+            (
+                RuntimeControlCause::PersistenceOutcomeUnknown,
+                RuntimeOperationStatus::Unknown,
+            ),
+            (
+                RuntimeControlCause::PersistenceFailed,
+                RuntimeOperationStatus::Rejected,
+            ),
+            (
+                RuntimeControlCause::WorkerMissing,
+                RuntimeOperationStatus::Rejected,
+            ),
+            (
+                RuntimeControlCause::ResultUnavailable,
+                RuntimeOperationStatus::Unknown,
+            ),
+        ] {
+            let problem = runtime_api::control_failure::control_problem(cause).unwrap();
+            let mut response = mock_response(
+                "POST",
+                "/v1/workers/attachment-worker/workdir-attachments",
+                true,
+                problem.status,
+                String::from_utf8(problem.body.to_vec()).unwrap(),
+            );
+            response.content_type = problem.content_type;
+            // One response only. A retry loses the original owner cause and
+            // fails these assertions rather than silently succeeding.
+            let (base_url, server) = serve_mock_http(vec![response]);
+            let runtime = remote_prompt_projection_fixture(base_url);
+            let result =
+                runtime.replace_worker_workdir_attachments("attachment-worker", Vec::new());
+            assert_eq!(result.status, status);
+            assert_eq!(result.cause, Some(cause));
+            assert_eq!(result.diagnostics[0].message, cause.explanation());
+            assert!(result.worker.is_none());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_attachment_observation_requires_the_exact_worker_and_request() {
+        let worker_id = "00000000-0000-7000-8000-000000000001";
+        for (observed_worker, attachments, expected) in [
+            (
+                worker_id,
+                json!([]),
+                Some(runtime_api::WorkerWorkdirAttachmentsMatch::Matching),
+            ),
+            ("00000000-0000-7000-8000-000000000002", json!([]), None),
+            (
+                worker_id,
+                json!([{
+                    "alias": "checkout", "working_directory_id": "another-workdir",
+                    "capabilities": workdir::WorkdirSessionCapabilities::READ_ONLY,
+                }]),
+                None,
+            ),
+        ] {
+            let body = json!({
+                "worker_ref": {"worker_id": observed_worker},
+                "request": {"logical_workdir_attachments": attachments},
+                "result": "matching",
+            })
+            .to_string();
+            let (base_url, server) = serve_mock_http(vec![mock_response(
+                "POST",
+                "/v1/workers/00000000-0000-7000-8000-000000000001/workdir-attachments/observe",
+                true,
+                200,
+                body,
+            )]);
+            let runtime = remote_prompt_projection_fixture(base_url);
+            let observation = runtime.observe_worker_workdir_attachments(worker_id, Vec::new());
+            assert_eq!(observation.result, expected);
+            assert_eq!(
+                observation.cause,
+                if expected.is_some() {
+                    None
+                } else {
+                    Some(RuntimeControlCause::InvalidResponse)
+                }
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_attachment_operation_validates_receipt_and_keeps_current_authority_independent() {
+        let worker_id = "00000000-0000-7000-8000-000000000001";
+        let request = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "frozen-cleanup-operation".into(),
+            expected_generation: "before".into(),
+            logical_workdir_attachments: Vec::new(),
+        };
+        let receipt = json!({
+            "worker_ref": {"worker_id": worker_id}, "request": request,
+            "resulting_generation": "after-original",
+        });
+        for (field, wrong) in [
+            ("valid", json!(null)),
+            (
+                "worker_ref",
+                json!({"worker_id": "00000000-0000-7000-8000-000000000002"}),
+            ),
+            (
+                "request",
+                json!({"request_id":"another-operation", "expected_generation":"before", "logical_workdir_attachments":[]}),
+            ),
+            ("resulting_generation", json!("before")),
+        ] {
+            let mut response = receipt.clone();
+            if field != "valid" {
+                response[field] = wrong;
+            }
+            let (base_url, server) = serve_mock_http(vec![mock_response(
+                "POST",
+                "/v1/workers/00000000-0000-7000-8000-000000000001/workdir-attachments/operations",
+                true,
+                200,
+                response.to_string(),
+            )]);
+            let runtime = remote_prompt_projection_fixture(base_url);
+            let result =
+                runtime.apply_worker_workdir_attachments_operation(worker_id, request.clone());
+            assert_eq!(result.receipt.is_some(), field == "valid");
+            assert_eq!(
+                result.response.status,
+                if field == "valid" {
+                    RuntimeOperationStatus::Accepted
+                } else {
+                    RuntimeOperationStatus::Unknown
+                }
+            );
+            assert_eq!(
+                result.response.cause,
+                if field == "valid" {
+                    None
+                } else {
+                    Some(RuntimeControlCause::InvalidResponse)
+                }
+            );
+            server.join().unwrap();
+        }
+        // A superseded historical receipt remains a receipt, not confirmation of
+        // current cleanup and not permission to resend a matching attachment set.
+        for generation in [Some("after-original"), Some("after-another-same-set"), None] {
+            let response = json!({"worker_ref":{"worker_id":worker_id}, "request":request,
+                "result":{"state":"receipt", "receipt":receipt}, "current_generation":generation});
+            let (base_url, server) = serve_mock_http(vec![mock_response(
+                "POST",
+                "/v1/workers/00000000-0000-7000-8000-000000000001/workdir-attachments/operations/observe",
+                true,
+                200,
+                response.to_string(),
+            )]);
+            let result = remote_prompt_projection_fixture(base_url)
+                .observe_worker_workdir_attachments_operation(worker_id, request.clone());
+            assert_eq!(result.cause, None);
+            let observed = result.observation.unwrap();
+            assert_eq!(observed.current_generation.as_deref(), generation);
+            assert!(matches!(
+                observed.result,
+                runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Receipt { .. }
+            ));
+            server.join().unwrap();
+        }
+        for mismatch in ["outer_worker", "outer_request", "receipt_request"] {
+            let mut response = json!({"worker_ref":{"worker_id":worker_id}, "request":request,
+                "result":{"state":"receipt", "receipt":receipt}, "current_generation":"after-original"});
+            match mismatch {
+                "outer_worker" => {
+                    response["worker_ref"]["worker_id"] =
+                        json!("00000000-0000-7000-8000-000000000002")
+                }
+                "outer_request" => {
+                    response["request"]["expected_generation"] = json!("another-incarnation")
+                }
+                _ => {
+                    response["result"]["receipt"]["request"]["request_id"] =
+                        json!("another-operation")
+                }
+            }
+            let (base_url, server) = serve_mock_http(vec![mock_response(
+                "POST",
+                "/v1/workers/00000000-0000-7000-8000-000000000001/workdir-attachments/operations/observe",
+                true,
+                200,
+                response.to_string(),
+            )]);
+            let result = remote_prompt_projection_fixture(base_url)
+                .observe_worker_workdir_attachments_operation(worker_id, request.clone());
+            assert!(result.observation.is_none());
+            assert_eq!(result.cause, Some(RuntimeControlCause::InvalidResponse));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_attachment_operation_keeps_unknown_and_query_causes_without_redispatch() {
+        let request = runtime_api::WorkerWorkdirAttachmentsOperationRequest {
+            request_id: "frozen-cleanup-operation".into(),
+            expected_generation: "before".into(),
+            logical_workdir_attachments: Vec::new(),
+        };
+        let problem = runtime_api::control_failure::control_problem(
+            RuntimeControlCause::PersistenceOutcomeUnknown,
+        )
+        .unwrap();
+        for query in [false, true] {
+            let path = if query {
+                "/v1/workers/attachment-worker/workdir-attachments/operations/observe"
+            } else {
+                "/v1/workers/attachment-worker/workdir-attachments/operations"
+            };
+            let mut response = mock_response(
+                "POST",
+                path,
+                true,
+                problem.status,
+                String::from_utf8(problem.body.to_vec()).unwrap(),
+            );
+            response.content_type = problem.content_type;
+            let (base_url, server) = serve_mock_http(vec![response]);
+            let runtime = remote_prompt_projection_fixture(base_url);
+            if query {
+                let result = runtime.observe_worker_workdir_attachments_operation(
+                    "attachment-worker",
+                    request.clone(),
+                );
+                assert!(result.observation.is_none());
+                assert_eq!(
+                    result.cause,
+                    Some(RuntimeControlCause::PersistenceOutcomeUnknown)
+                );
+            } else {
+                let result = runtime.apply_worker_workdir_attachments_operation(
+                    "attachment-worker",
+                    request.clone(),
+                );
+                assert!(result.receipt.is_none());
+                assert_eq!(result.response.status, RuntimeOperationStatus::Unknown);
+                assert_eq!(
+                    result.response.cause,
+                    Some(RuntimeControlCause::PersistenceOutcomeUnknown)
+                );
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_attachment_sync_does_not_infer_rejection_from_legacy_text_or_bad_success() {
+        for (status, body) in [
+            (409, json!({"error": {"code": "persistence_failed", "message": "replacement rejected before execution"}}).to_string()),
+            (503, json!({"error": {"code": "persistence_outcome_unknown", "message": "must not resend"}}).to_string()),
+            (200, "{}".to_string()),
+        ] {
+            let (base_url, server) = serve_mock_http(vec![mock_response(
+                "POST", "/v1/workers/attachment-worker/workdir-attachments", true, status, body,
+            )]);
+            let runtime = remote_prompt_projection_fixture(base_url);
+            let result = runtime.replace_worker_workdir_attachments("attachment-worker", Vec::new());
+            assert_eq!(result.status, RuntimeOperationStatus::Unknown);
+            assert_eq!(result.cause, None);
+            assert!(result.worker.is_none());
+            server.join().unwrap();
+        }
+    }
+
+    fn receive_remote_status_problem(
+        status: u16,
+        media: &'static str,
+        body: String,
+    ) -> RuntimeDiagnostic {
+        let mut response = mock_response("GET", "/", true, status, body);
+        response.content_type = media;
+        let (url, server) = serve_mock_http(vec![response]);
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(url)
+            .bearer_auth("secret-token")
+            .send()
+            .unwrap();
+        let actual = response.status();
+        let diagnostic = remote_http_status_diagnostic("remote", actual, response);
+        server.join().unwrap();
+        diagnostic
+    }
+
+    fn startup_status_problem() -> runtime_api::startup::ProblemResponse {
+        use runtime_api::startup::*;
+        WorkerCreateFailure::from_cause(
+            StartupCause::Session(
+                protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
+            ),
+            StartupOperationFacts {
+                acceptance: CreationAcceptance::Unknown,
+                execution: ExecutionOutcome::Unknown,
+                finalize: None,
+                backend_compensation: None,
+                correlation: None,
+            },
+        )
+        .unwrap()
+        .problem(
+            StartupBoundary::Runtime,
+            &SessionFailureVisibility {
+                can_view_cause: true,
+            },
+            "",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_status_http_dispatches_management_control_and_startup_without_cross_domain_relabeling()
+     {
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
+        };
+        let cause = WorkdirManagementFailure {
+            operation: WorkdirManagementOperation::Create,
+            reason: WorkdirManagementReason::NotFound,
+        };
+        let management = runtime_api::management_failure::management_problem(cause).unwrap();
+        let control =
+            runtime_api::control_failure::control_problem(RuntimeControlCause::RuntimeStopped)
+                .unwrap();
+        let startup = startup_status_problem();
+        for (index, status, media, body) in [
+            (
+                0,
+                management.status,
+                management.content_type,
+                management.body.to_vec(),
+            ),
+            (
+                1,
+                control.status,
+                control.content_type,
+                control.body.to_vec(),
+            ),
+            (2, startup.status, startup.content_type, startup.into_body()),
+        ] {
+            let mut body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            body["detail"] = json!("PRIVATE_SENTINEL raw_http_body /private/path");
+            body["yoi_failure"]["explanation"] =
+                json!("PRIVATE_SENTINEL raw_http_body /private/path");
+            let diagnostic = receive_remote_status_problem(status, media, body.to_string());
+            assert_eq!(diagnostic.workdir, (index == 0).then_some(cause));
+            assert_eq!(diagnostic.startup.is_some(), index == 2);
+            assert_eq!(
+                diagnostic.control,
+                match index {
+                    0 => None,
+                    1 => Some(RuntimeControlCause::RuntimeStopped),
+                    _ => Some(RuntimeControlCause::ExecutionRejected),
+                }
+            );
+            let public = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!public.contains("PRIVATE_SENTINEL"));
+            assert!(!public.contains("raw_http_body"));
+            assert!(!public.contains("/private/path"));
+        }
+    }
+
+    #[test]
+    fn remote_status_http_keeps_unsupported_startup_and_corrupt_transport_as_receiver_observations()
+    {
+        let problem = startup_status_problem();
+        let mut unsupported: serde_json::Value = serde_json::from_slice(problem.body()).unwrap();
+        unsupported["yoi_failure"]["details_version"] = json!(65535);
+        let control =
+            runtime_api::control_failure::control_problem(RuntimeControlCause::RuntimeStopped)
+                .unwrap();
+        for (status, media, body, expected) in [
+            (
+                problem.status,
+                problem.content_type,
+                unsupported.to_string(),
+                Some(RuntimeControlCause::ResultUnavailable),
+            ),
+            (
+                409,
+                control.content_type,
+                String::from_utf8(control.body.to_vec()).unwrap(),
+                Some(RuntimeControlCause::InvalidResponse),
+            ),
+            (
+                503,
+                "application/problem+json",
+                "invalid JSON".into(),
+                Some(RuntimeControlCause::InvalidResponse),
+            ),
+            (
+                503,
+                "application/json",
+                String::from_utf8(control.body.to_vec()).unwrap(),
+                None,
+            ),
+            (
+                503,
+                "application/problem+json",
+                "x".repeat(MAX_RUNTIME_PING_RESPONSE_BYTES + 1),
+                Some(RuntimeControlCause::ResponseTooLarge),
+            ),
+        ] {
+            let diagnostic = receive_remote_status_problem(status, media, body);
+            assert!(diagnostic.workdir.is_none());
+            assert_eq!(diagnostic.control, expected, "{diagnostic:?}");
+        }
+    }
+
+    #[test]
+    fn remote_prompt_projection_roundtrips_owner_problem_causes_over_http() {
+        for cause in RuntimeControlCause::ALL {
+            let problem = runtime_api::control_failure::control_problem(*cause).unwrap();
+            let mut response = mock_response(
+                "POST",
+                "/v1/workspace-prompt-projections",
+                true,
+                problem.status,
+                String::from_utf8(problem.body.to_vec()).unwrap(),
+            );
+            response.content_type = problem.content_type;
+            let (base_url, server) = serve_mock_http(vec![response]);
+            let runtime = remote_prompt_projection_fixture(base_url);
+            assert_eq!(
+                runtime.observe_workspace_prompt_projection(prompt_projection_fixture()),
+                Err(*cause)
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_prompt_projection_does_not_infer_outcomes_from_legacy_or_invalid_problems() {
+        use RuntimeControlCause as C;
+        let problem = runtime_api::control_failure::control_problem(C::RuntimeStopped).unwrap();
+        let problem_body = String::from_utf8(problem.body.to_vec()).unwrap();
+        let mut unsupported: serde_json::Value = serde_json::from_str(&problem_body).unwrap();
+        unsupported["yoi_failure"]["details_version"] = json!(65535);
+        let projection = prompt_projection_fixture();
+        let success = serde_json::to_string(&RuntimeHttpWorkspacePromptProjectionResponse {
+            workspace_id: projection.workspace_id.clone(),
+            source_digest: projection.source_digest.clone(),
+            projection_digest: projection.projection_digest.clone(),
+        })
+        .unwrap();
+        for (status, media, body, expected) in [
+            (200, "application/json", success, Ok(())),
+            (
+                200,
+                "application/json",
+                "{}".into(),
+                Err(C::InvalidResponse),
+            ),
+            (
+                404,
+                "application/json",
+                json!({"error": {
+                    "code": "worker_not_found",
+                    "message": "TEST_ONLY_CREDENTIAL /private/path"
+                }})
+                .to_string(),
+                Err(C::InvalidResponse),
+            ),
+            (
+                409,
+                "application/json",
+                json!({"error": {"code": "execution_rejected", "message": "rejected"}}).to_string(),
+                Err(C::InvalidResponse),
+            ),
+            (
+                503,
+                "application/problem+json",
+                "not JSON".into(),
+                Err(C::InvalidResponse),
+            ),
+            (
+                503,
+                "application/problem+json",
+                unsupported.to_string(),
+                Err(C::ResultUnavailable),
+            ),
+            (
+                503,
+                "application/problem+json",
+                "x".repeat(16385),
+                Err(C::ResponseTooLarge),
+            ),
+            (
+                403,
+                "application/json",
+                "denied".into(),
+                Err(C::AuthorizationFailed),
+            ),
+            (
+                401,
+                "application/json",
+                "denied".into(),
+                Err(C::AuthorizationFailed),
+            ),
+            // A valid envelope with inconsistent actual transport metadata is invalid.
+            (
+                409,
+                "application/problem+json",
+                problem_body.clone(),
+                Err(C::InvalidResponse),
+            ),
+            (
+                503,
+                "application/json",
+                problem_body,
+                Err(C::InvalidResponse),
+            ),
+        ] {
+            let mut response = mock_response(
+                "POST",
+                "/v1/workspace-prompt-projections",
+                true,
+                status,
+                body,
+            );
+            response.content_type = media;
+            let (base_url, server) = serve_mock_http(vec![response]);
+            let runtime = remote_prompt_projection_fixture(base_url);
+            let result = runtime.observe_workspace_prompt_projection(projection.clone());
+            assert_eq!(result, expected);
+            let rendered = format!("{result:?}");
+            assert!(!rendered.contains("TEST_ONLY_CREDENTIAL"));
+            assert!(!rendered.contains("/private/path"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_prompt_projection_connection_and_body_read_failures_remain_receiver_observations() {
+        // Reserve then release an isolated endpoint; no ambient service is required.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let runtime = remote_prompt_projection_fixture(base_url);
+        assert_eq!(
+            runtime.observe_workspace_prompt_projection(prompt_projection_fixture()),
+            Err(RuntimeControlCause::ConnectionFailed)
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            // Drain the request before closing so an unread request body cannot
+            // turn the intended truncated-response observation into a TCP reset.
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 8192];
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() <= 8192);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\nconnection: close\r\n\r\n{")
+                .unwrap();
+        });
+        let runtime = remote_prompt_projection_fixture(base_url);
+        assert_eq!(
+            runtime.observe_workspace_prompt_projection(prompt_projection_fixture()),
+            Err(RuntimeControlCause::ResultUnavailable)
+        );
+        server.join().unwrap();
+    }
+}
+
+/// A local observation failure is not a received execution failure. Its operation
+/// facts remain unknown even if HTTP or compatibility diagnostics say "rejected".
+fn startup_failure_operation_state(
+    failure: &runtime_api::startup::WorkerCreateFailure,
+) -> InternalWorkerOperationState {
+    use runtime_api::startup::{CreationAcceptance, ExecutionOutcome};
+    if failure.operation().acceptance == CreationAcceptance::Unknown
+        || failure.operation().execution == ExecutionOutcome::Unknown
+    {
+        InternalWorkerOperationState::Unknown
+    } else if failure.operation().execution == ExecutionOutcome::Unsupported {
+        InternalWorkerOperationState::Unsupported
+    } else {
+        InternalWorkerOperationState::Rejected
+    }
+}
+
+fn startup_observation_failure(
+    reason: runtime_api::startup::StartupBoundaryReason,
+) -> runtime_api::startup::WorkerCreateFailure {
+    use runtime_api::startup::*;
+    WorkerCreateFailure::from_cause(
+        StartupCause::Boundary(StartupBoundaryCause { reason }),
+        StartupOperationFacts {
+            acceptance: CreationAcceptance::Unknown,
+            execution: ExecutionOutcome::Unknown,
+            finalize: None,
+            correlation: None,
+            backend_compensation: None,
+        },
+    )
+    .expect("fixed enum-only observation fits the startup boundary")
+}
+
+fn runtime_create_client_failure(
+    error: &runtime_api::client_support::ClientError<runtime_api::RuntimeApiError>,
+) -> runtime_api::startup::WorkerCreateFailure {
+    use runtime_api::client_support::{ClientError, ClientFailure};
+    use runtime_api::startup::StartupBoundaryReason;
+    match error {
+        ClientError::Public { error, .. } => error
+            .create_failure()
+            .cloned()
+            .unwrap_or_else(|| startup_observation_failure(StartupBoundaryReason::InvalidResponse)),
+        ClientError::Failure(failure) => startup_observation_failure(match failure {
+            ClientFailure::Timeout => StartupBoundaryReason::Timeout,
+            ClientFailure::ResponseTooLarge { .. } => StartupBoundaryReason::TooLarge,
+            ClientFailure::Decode { .. } | ClientFailure::ErrorResponseDecode { .. } => {
+                StartupBoundaryReason::Decode
+            }
+            ClientFailure::UnsupportedErrorResponse { .. } => {
+                StartupBoundaryReason::UnsupportedVersion
+            }
+            ClientFailure::UnexpectedStatus { .. }
+            | ClientFailure::MissingResponseHeader { .. }
+            | ClientFailure::DuplicateResponseHeader { .. }
+            | ClientFailure::InvalidResponseHeader { .. }
+            | ClientFailure::UnexpectedBody => StartupBoundaryReason::InvalidResponse,
+            ClientFailure::Authorization
+            | ClientFailure::RequestEncoding
+            | ClientFailure::Connect
+            | ClientFailure::Transport => StartupBoundaryReason::Transport,
+        }),
     }
 }

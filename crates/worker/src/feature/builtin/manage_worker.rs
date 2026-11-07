@@ -1,5 +1,11 @@
 //! Workspace-authority-backed Worker session management tools.
 
+pub(crate) mod permission_declaration;
+
+#[cfg(test)]
+#[path = "manage_worker_startup_tests.rs"]
+mod startup_tests;
+
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
@@ -8,11 +14,18 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use protocol::Segment;
+use server_api::authorization::PermissionResource;
 use server_api::{
     BrowserWorkerWorkingDirectorySelection, CreateWorkspaceWorkerRequest,
     CreateWorkspaceWorkerTicketAssignmentRequest,
 };
 
+use crate::feature::contracts::{
+    WORKER_CONTROL_SERVICE_ID, WORKER_CONTROL_SERVICE_VERSION, WORKER_LIFECYCLE_SERVICE_ID,
+    WORKER_LIFECYCLE_SERVICE_VERSION, WorkerControlInputKind, WorkerControlService,
+    WorkerControlStopKind, WorkerControlSubject, WorkerLifecycleService,
+    WorkerLifecycleSpawnRequest, WorkerLifecycleWorkdirAttachment, WorkerObservationSubjectRef,
+};
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule,
     ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
@@ -24,77 +37,7 @@ const FEATURE_ID: &str = "worker";
 const FEATURE_NAME: &str = "Worker";
 const FEATURE_DESCRIPTION: &str =
     "Workspace-authority tools for managing Workdir-bound Backend/Runtime Worker sessions.";
-pub const WORKER_LIFECYCLE_SERVICE_ID: &str = "worker.lifecycle";
-pub const WORKER_CONTROL_SERVICE_ID: &str = "worker.control";
-const WORKER_LIFECYCLE_SERVICE_VERSION: &str = "1";
 const INITIAL_WORKDIR_ALIAS: &str = "workdir";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkerControlSubject {
-    RuntimeWorker {
-        runtime_id: String,
-        worker_id: String,
-    },
-    SubWorker {
-        name: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerControlInputKind {
-    User,
-    Notify,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkerControlStopKind {
-    Cancel,
-    Stop,
-}
-
-#[async_trait]
-pub trait WorkerControlService: Send + Sync {
-    fn workspace_id(&self) -> &str;
-    async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn send_input(
-        &self,
-        subject: WorkerControlSubject,
-        content: String,
-        kind: WorkerControlInputKind,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn stop_worker(
-        &self,
-        subject: WorkerControlSubject,
-        kind: WorkerControlStopKind,
-        reason: Option<String>,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn spawn_worker(
-        &self,
-        request: WorkerLifecycleSpawnRequest,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn restore_worker(
-        &self,
-        runtime_id: String,
-        worker_id: String,
-        request: server_api::WorkerRestoreRequest,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-        let _ = (runtime_id, worker_id, request);
-        Err(WorkspaceClientError::Unavailable(
-            "Runtime Worker restore is unavailable".to_string(),
-        ))
-    }
-    fn remove_runtime_worker(
-        &self,
-        runtime_id: &str,
-        worker_id: &str,
-        reason: &str,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-    async fn ensure_permission(
-        &self,
-        subject: &super::worker_observation::WorkerObservationSubjectRef,
-        permission: &str,
-    ) -> Result<(), WorkspaceClientError>;
-}
 
 struct WorkspaceWorkerControlService {
     client: Arc<dyn WorkspaceClient>,
@@ -104,28 +47,55 @@ struct WorkspaceWorkerControlService {
 }
 
 impl WorkspaceWorkerControlService {
-    fn known_subworkers(&self) -> Vec<serde_json::Value> {
-        self.registry
-            .as_ref()
-            .map(|registry| {
-                registry
-                    .list_internal()
-                    .into_iter()
-                    .map(|internal| {
-                        serde_json::json!({
-                            "subject": { "kind": "sub_worker", "name": internal.worker_name },
-                            "relation": "direct_child",
-                            "origin": "sub_worker_spawn",
-                            "permissions": ["send_input", "stop", "observe"],
-                            "summary": {
-                                "display_name": internal.worker_name,
-                                "status": format!("{:?}", internal.session.status()).to_lowercase(),
-                            }
-                        })
-                    })
-                    .collect()
+    fn authorize_runtime_operation(&self, operation: &str) -> Result<(), WorkspaceClientError> {
+        if !self.runtime_worker_control {
+            return Err(WorkspaceClientError::Unavailable(
+                "Runtime Worker control is not enabled for this Worker".into(),
+            ));
+        }
+        // Common authorization permits using the operation. The Backend separately
+        // checks the authenticated caller's control grant for the actual target.
+        self.client.authorize_operation(
+            operation,
+            &PermissionResource::WorkerOperation {
+                workspace_id: self.workspace_id.clone(),
+            },
+        )
+    }
+
+    fn authorize_subworker(&self, operation: &str, name: &str) -> Result<(), WorkspaceClientError> {
+        // Explicit standalone sessions retain parent-owned local child control.
+        // A failed or incomplete Workspace binding must never take this path.
+        if !self.client.is_available()
+            && self.client.workspace_id().is_none()
+            && self.client.kind() == "unavailable"
+        {
+            return Ok(());
+        }
+        self.client.authorize_subworker_operation(operation, name)
+    }
+
+    fn known_subworkers(&self) -> Result<Vec<serde_json::Value>, WorkspaceClientError> {
+        let Some(registry) = &self.registry else {
+            return Ok(Vec::new());
+        };
+        registry
+            .list_internal()
+            .into_iter()
+            .map(|internal| {
+                self.authorize_subworker("subworker.observe", &internal.worker_name)?;
+                Ok(serde_json::json!({
+                    "subject": { "kind": "sub_worker", "name": internal.worker_name },
+                    "relation": "direct_child",
+                    "origin": "sub_worker_spawn",
+                    "permissions": ["send_input", "stop", "observe"],
+                    "summary": {
+                        "display_name": internal.worker_name,
+                        "status": format!("{:?}", internal.session.status()).to_lowercase(),
+                    }
+                }))
             })
-            .unwrap_or_default()
+            .collect()
     }
 }
 
@@ -147,11 +117,18 @@ impl WorkerControlService for WorkspaceWorkerControlService {
 
     async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let response = if self.runtime_worker_control {
+            self.client.authorize_operation(
+                "worker.list",
+                &PermissionResource::Workspace {
+                    workspace_id: self.workspace_id.clone(),
+                },
+            )?;
             self.client.execute_server_operation(
                 crate::worker::WorkspaceServerOperation::WorkerControlList,
             )?
         } else {
             WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "items": [] }).to_string(),
             }
@@ -200,7 +177,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 .map(serde_json::Value::to_string)
                 .is_none_or(|subject| seen.insert(subject))
         });
-        for worker in self.known_subworkers() {
+        for worker in self.known_subworkers()? {
             let is_new = worker
                 .get("subject")
                 .map(serde_json::Value::to_string)
@@ -210,6 +187,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
             }
         }
         Ok(WorkspaceResponse {
+            content_type: response.content_type,
             status: response.status,
             body: serde_json::to_string(&payload)
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -227,6 +205,10 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 runtime_id,
                 worker_id,
             } => {
+                self.authorize_runtime_operation(match kind {
+                    WorkerControlInputKind::User => "worker.send_input",
+                    WorkerControlInputKind::Notify => "worker.messaging",
+                })?;
                 let kind = match kind {
                     WorkerControlInputKind::User => "user",
                     WorkerControlInputKind::Notify => "notify",
@@ -236,6 +218,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         runtime_id,
                         worker_id,
                         request: server_api::RuntimeWorkerInputRequest {
+                            submission_request_id: None,
                             kind: Some(kind.to_string()),
                             content,
                             segments: None,
@@ -250,9 +233,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ));
                 }
                 self.ensure_permission(
-                    &super::worker_observation::WorkerObservationSubjectRef::SubWorker {
-                        name: name.clone(),
-                    },
+                    &WorkerObservationSubjectRef::SubWorker { name: name.clone() },
                     "send_input",
                 )
                 .await?;
@@ -271,6 +252,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ))
                 })?;
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::json!({
                         "subject": { "kind": "sub_worker", "name": name }
@@ -292,12 +274,17 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 runtime_id,
                 worker_id,
             } => {
+                self.authorize_runtime_operation(match kind {
+                    WorkerControlStopKind::Cancel => "worker.cancel",
+                    WorkerControlStopKind::Stop => "worker.stop",
+                })?;
                 let operation = match kind {
                     WorkerControlStopKind::Cancel => {
                         crate::worker::WorkspaceServerOperation::WorkerControlCancel {
                             runtime_id,
                             worker_id,
                             request: server_api::RuntimeWorkerLifecycleRequest {
+                                stop_intent: None,
                                 reason,
                                 ticket_assignment: None,
                             },
@@ -308,6 +295,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                             runtime_id,
                             worker_id,
                             request: server_api::RuntimeWorkerLifecycleRequest {
+                                stop_intent: None,
                                 reason,
                                 ticket_assignment: None,
                             },
@@ -323,9 +311,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     ));
                 }
                 self.ensure_permission(
-                    &super::worker_observation::WorkerObservationSubjectRef::SubWorker {
-                        name: name.clone(),
-                    },
+                    &WorkerObservationSubjectRef::SubWorker { name: name.clone() },
                     "stop",
                 )
                 .await?;
@@ -344,6 +330,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         )
                     })?;
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 200,
                     body: serde_json::to_string(&summary)
                         .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -374,6 +361,7 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 "Runtime Worker control is not enabled for this Worker".to_string(),
             ));
         }
+        self.authorize_runtime_operation("worker.restore")?;
         self.client.execute_server_operation(
             crate::worker::WorkspaceServerOperation::WorkerControlRestore {
                 runtime_id,
@@ -394,31 +382,32 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                 "Runtime Worker control is not enabled for this Worker".to_string(),
             ));
         }
+        self.authorize_runtime_operation("worker.remove")?;
         self.client
             .execute_worker_remove(runtime_id, worker_id, reason)
     }
 
     async fn ensure_permission(
         &self,
-        subject: &super::worker_observation::WorkerObservationSubjectRef,
+        subject: &WorkerObservationSubjectRef,
         permission: &str,
     ) -> Result<(), WorkspaceClientError> {
         match subject {
-            super::worker_observation::WorkerObservationSubjectRef::SubWorker { name } => {
+            WorkerObservationSubjectRef::SubWorker { name } => {
                 let known = self
                     .registry
                     .as_ref()
                     .and_then(|registry| registry.get_internal(name))
                     .is_some();
                 if known && matches!(permission, "send_input" | "stop" | "observe") {
-                    Ok(())
+                    self.authorize_subworker(&format!("subworker.{permission}"), name)
                 } else {
                     Err(WorkspaceClientError::Request(
                         "unknown Worker or permission not granted".to_string(),
                     ))
                 }
             }
-            super::worker_observation::WorkerObservationSubjectRef::RuntimeWorker {
+            WorkerObservationSubjectRef::RuntimeWorker {
                 runtime_id,
                 worker_id,
             } => {
@@ -427,86 +416,30 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                         "Runtime Worker control is not enabled for this Worker".to_string(),
                     ));
                 }
+                let operation = if permission == "notify" {
+                    "worker.messaging".to_owned()
+                } else {
+                    format!("worker.{permission}")
+                };
+                self.authorize_runtime_operation(&operation)?;
                 let response = self.client.execute_server_operation(
-                    crate::worker::WorkspaceServerOperation::WorkerControlList,
+                    crate::worker::WorkspaceServerOperation::WorkerControlAuthorize {
+                        runtime_id: runtime_id.clone(),
+                        worker_id: worker_id.clone(),
+                        permission: permission.into(),
+                    },
                 )?;
-                if !response.is_success() {
-                    return Err(WorkspaceClientError::Request(format!(
-                        "Workspace control request returned {}: {}",
-                        response.status, response.body
-                    )));
-                }
-                let body: serde_json::Value =
-                    serde_json::from_str(&response.body).map_err(|error| {
-                        WorkspaceClientError::Request(format!(
-                            "invalid Workspace control response: {error}"
-                        ))
-                    })?;
-                let granted = body
-                    .get("items")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .any(|item| {
-                        item.get("subject")
-                            .and_then(|value| value.get("runtime_id"))
-                            == Some(&serde_json::Value::String(runtime_id.clone()))
-                            && item.get("subject").and_then(|value| value.get("worker_id"))
-                                == Some(&serde_json::Value::String(worker_id.clone()))
-                            && item
-                                .get("permissions")
-                                .and_then(serde_json::Value::as_array)
-                                .is_some_and(|permissions| {
-                                    permissions.iter().any(|candidate| candidate == permission)
-                                })
-                    });
-                if granted {
+                if response.is_success() {
                     Ok(())
                 } else {
-                    Err(WorkspaceClientError::Request(
-                        "unknown Worker or permission not granted".to_string(),
-                    ))
+                    Err(WorkspaceClientError::Request(format!(
+                        "Worker target permission check returned {}: {}",
+                        response.status, response.body
+                    )))
                 }
             }
         }
     }
-}
-
-#[async_trait]
-pub trait WorkerLifecycleService: Send + Sync {
-    async fn spawn(
-        &self,
-        request: WorkerLifecycleSpawnRequest,
-    ) -> Result<WorkspaceResponse, WorkspaceClientError>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerLifecycleWorkdirAttachment {
-    /// Stable Worker-local routing alias preserved into the canonical create request.
-    pub alias: String,
-    /// Workspace-authoritative Workdir id preserved into the canonical create request.
-    pub working_directory_id: String,
-    /// Optional normalized initial cwd relative to this Workdir.
-    pub relative_cwd: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkerLifecycleSpawnRequest {
-    /// Observed delegation required for Orchestrator Ticket starts.
-    pub orchestrator_assignment_id: Option<String>,
-
-    pub runtime_id: String,
-    /// Ordered alias-keyed selections forwarded as canonical Workdir attachments.
-    pub workdir_attachments: Vec<WorkerLifecycleWorkdirAttachment>,
-    pub profile: String,
-    pub singleton_key: Option<String>,
-    pub ticket_id: Option<String>,
-    /// Required for ordinary and Ticket spawn; exact retries reuse this ID and full input.
-    pub operation_id: Option<String>,
-    /// Explicit requested authority. Profile selection alone grants nothing.
-    pub execution_grant: Option<server_api::authorization::WorkerDelegationRequest>,
-    pub display_name: String,
-    pub initial_submit: Vec<Segment>,
 }
 
 struct WorkspaceWorkerLifecycleService {
@@ -566,6 +499,15 @@ impl WorkerLifecycleService for WorkspaceWorkerLifecycleService {
         request: WorkerLifecycleSpawnRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
         let body = workspace_worker_create_request(request)?;
+        let workspace_id = self.client.workspace_id().ok_or_else(|| {
+            WorkspaceClientError::Unavailable("Worker creation requires Workspace identity".into())
+        })?;
+        self.client.authorize_operation(
+            "worker.create",
+            &PermissionResource::Workspace {
+                workspace_id: workspace_id.into(),
+            },
+        )?;
         self.client.execute_server_operation(
             crate::worker::WorkspaceServerOperation::WorkerControlSpawn(body),
         )
@@ -625,6 +567,13 @@ impl SubWorkerControlFeature {
 }
 
 impl FeatureModule for SubWorkerControlFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::SUBWORKER.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin("sub-worker-control", "SubWorker Control")
             .with_description(
@@ -632,7 +581,7 @@ impl FeatureModule for SubWorkerControlFeature {
             )
             .with_provided_service(ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Parent-owned SubWorker discovery and control operations",
             ));
         for operation in SUB_WORKER_CONTROL_OPERATIONS {
@@ -651,7 +600,7 @@ impl FeatureModule for SubWorkerControlFeature {
         context.services().provide(
             ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Parent-owned SubWorker discovery and control operations",
             ),
             control.clone(),
@@ -675,6 +624,13 @@ pub fn sub_worker_control_feature(
 }
 
 impl FeatureModule for ManageWorkerFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
             .with_description(FEATURE_DESCRIPTION)
@@ -685,7 +641,7 @@ impl FeatureModule for ManageWorkerFeature {
             ))
             .with_provided_service(ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Known-Worker discovery and permission-fenced control operations",
             ));
         for operation in WorkerOperation::ALL {
@@ -720,7 +676,7 @@ impl FeatureModule for ManageWorkerFeature {
         context.services().provide(
             ServiceDeclaration::new(
                 ServiceId::builtin(WORKER_CONTROL_SERVICE_ID),
-                WORKER_LIFECYCLE_SERVICE_VERSION,
+                WORKER_CONTROL_SERVICE_VERSION,
                 "Known-Worker discovery and permission-fenced control operations",
             ),
             self.control.clone(),
@@ -915,7 +871,7 @@ impl WorkerOperation {
                 "Restore a stopped Backend/Runtime Worker session in the current Workspace. Supply expected_observation_token from WorkerList; a conflict requires refreshing and deliberate new intent. New requests default to the durable Tool call ID. For explicit recovery of an unknown/pending outcome, supply the reported request_id and the original token unchanged; never create a new intent or automatically retry."
             }
             Self::Remove => {
-                "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Conclusion, stopping, retention/removal, attachment release, and Workdir deletion are separate decisions. Removal releases attachments but preserves Workdir materialization. Supply a bounded reason; Backend validation and retention are authoritative."
+                "Remove an eligible stopped, non-internal Worker with no unfinished Ticket work. Terminal Ticket responsibility is retained and does not require unassignment. Conclusion, stopping, retention/removal, attachment release, and Workdir deletion are separate decisions. Removal releases attachments but preserves Workdir materialization. Supply a bounded reason; Backend validation and retention are authoritative. HTTP 202 / removed:false is a saved removal intent, not deletion: waiting or held retains the Worker, history and writer. Inspect operation_id, phase and typed cause in the result and current Worker observation; do not force discard, infer completion, or create a new removal intent to retry."
             }
         }
     }
@@ -1006,10 +962,20 @@ impl Tool for WorkspaceWorkerTool {
                 } else {
                     WorkerControlInputKind::User
                 };
-                self.control
+                let direct_subworker = matches!(&subject, WorkerControlSubject::SubWorker { .. });
+                let response = self
+                    .control
                     .send_input(subject, content, kind)
                     .await
-                    .map_err(control_tool_error)?
+                    .map_err(control_tool_error)?;
+                if direct_subworker && response.is_success() {
+                    return Ok(ToolOutput {
+                        summary: "SubWorker input accepted; model processing and completion are unconfirmed".into(),
+                        content: Some(response.body),
+                        attachments: Vec::new(),
+                    });
+                }
+                response
             }
             WorkerOperation::Cancel | WorkerOperation::Stop => {
                 let input = if self.runtime_worker_control {
@@ -1048,10 +1014,17 @@ impl Tool for WorkspaceWorkerTool {
                         "request_id must contain at most 512 bytes".into(),
                     ));
                 }
-                let recoverable_error = |error| {
-                    ToolError::ExecutionFailed(format!(
-                        "WorkerRestore request_id={request_id}; reuse this ID with the original observation token only for explicit unknown/pending outcome recovery, not after a stale-intent conflict: {error}"
-                    ))
+                let recoverable_error = |error: ToolError| {
+                    let guidance = format!(
+                        "WorkerRestore request_id={request_id}; reuse this ID with the original observation token only for explicit unknown/pending outcome recovery, not after a stale-intent conflict"
+                    );
+                    match error {
+                        ToolError::ExecutionFailure(mut output) => {
+                            output.summary = format!("{guidance}: {}", output.summary);
+                            ToolError::ExecutionFailure(output)
+                        }
+                        error => ToolError::ExecutionFailed(format!("{guidance}: {error}")),
+                    }
                 };
                 let response = self
                     .control
@@ -1127,29 +1100,232 @@ fn unsupported_subject(operation: WorkerOperation, kind: &str) -> ToolError {
 }
 
 fn control_tool_error(error: WorkspaceClientError) -> ToolError {
-    ToolError::ExecutionFailed(error.to_string())
+    use protocol::control_failure::RuntimeControlCause as C;
+    let cause = match error {
+        WorkspaceClientError::Unavailable(_) => C::ExecutionUnavailable,
+        WorkspaceClientError::InvalidPath(_) => C::InvalidRequest,
+        // Legacy clients have not attested a typed domain verdict. Their text is
+        // neither a cause classifier nor safe material to copy into model history.
+        WorkspaceClientError::Request(_) => C::ResultUnavailable,
+        WorkspaceClientError::AuthorizationRejected { status: 401 | 403 } => C::AuthorizationFailed,
+        WorkspaceClientError::AuthorizationRejected { .. } => C::ResultUnavailable,
+    };
+    worker_tool_failure(cause, tools::failure::ToolFailureBoundary::Observation, &())
+}
+
+fn worker_tool_failure<R: serde::Serialize>(
+    cause: protocol::control_failure::RuntimeControlCause,
+    boundary: tools::failure::ToolFailureBoundary,
+    result: &R,
+) -> ToolError {
+    let failure = error_contract::FailureFacts::new(cause)
+        .and_then(|facts| error_contract::project_failure::<error_contract::Tool, _>(&facts, &()));
+    match failure {
+        Ok(failure) => tools::failure::execution_failure(&failure, boundary, result, 64 * 1024),
+        Err(_) => ToolError::ExecutionFailure(ToolOutput {
+            summary: format!("{} Failure details unavailable.", cause.explanation()),
+            content: None,
+            attachments: Vec::new(),
+        }),
+    }
+}
+
+fn api_macros_control_decode(
+    response: &WorkspaceResponse,
+) -> Option<protocol::control_failure::RuntimeControlCause> {
+    // Never infer a representation from body contents or trust received explanation text.
+    match error_contract::problem::decode_problem_details::<
+        protocol::control_failure::RuntimeControlCause,
+    >(
+        response.body.as_bytes(),
+        response.status,
+        response.content_type.as_deref().unwrap_or(""),
+        &server_api::control_failure::ControlBoundary,
+        error_contract::Budget::new(16384, 16384),
+    ) {
+        error_contract::DecodeFailure::Known(value) => Some(*value.facts().cause()),
+        _ => None,
+    }
 }
 
 fn tool_output(
     operation: WorkerOperation,
     response: WorkspaceResponse,
 ) -> Result<ToolOutput, ToolError> {
+    use protocol::control_failure::RuntimeControlCause as C;
+    use tools::failure::ToolFailureBoundary as B;
     if !response.is_success() {
-        return Err(ToolError::ExecutionFailed(format!(
-            "Workspace Worker operation returned HTTP {}: {}",
-            response.status, response.body
-        )));
+        if operation == WorkerOperation::Spawn {
+            use runtime_api::startup::{
+                CreationAcceptance, DecodeStartupProblem, ExecutionOutcome, StartupBoundary,
+                StartupCause, StartupProblemFacts, decode_startup_problem,
+            };
+            if let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+                response.body.as_bytes(),
+                response.status,
+                response.content_type.as_deref().unwrap_or(""),
+                StartupBoundary::Browser,
+            ) {
+                // The Worker control service authorized this current caller. A
+                // received explanation is not authority for model disclosure.
+                let projected = failure
+                    .startup()
+                    .primary
+                    .project_for::<error_contract::Tool, StartupCause>(
+                        &protocol::session_failure::SessionFailureVisibility {
+                            can_view_cause: true,
+                        },
+                    );
+                let boundary = if failure.operation().acceptance == CreationAcceptance::Unknown
+                    || matches!(
+                        failure.operation().execution,
+                        ExecutionOutcome::Unknown | ExecutionOutcome::Unsupported
+                    ) {
+                    B::Observation
+                } else {
+                    B::Execution
+                };
+                #[derive(serde::Serialize)]
+                struct StartupObservation {
+                    status: u16,
+                    startup: StartupProblemFacts,
+                }
+                return Err(match projected {
+                    Ok(projected) => tools::failure::execution_failure(
+                        &projected,
+                        boundary,
+                        &StartupObservation {
+                            status: response.status,
+                            startup: failure.public_facts(),
+                        },
+                        64 * 1024,
+                    ),
+                    Err(_) => worker_tool_failure(C::ResultUnavailable, B::Observation, &()),
+                });
+            }
+        }
+        #[derive(serde::Serialize)]
+        struct HttpObservation {
+            status: u16,
+        }
+        let cause = match api_macros_control_decode(&response) {
+            Some(cause) => cause,
+            None => C::ResultUnavailable,
+        };
+        return Err(worker_tool_failure(
+            cause,
+            B::Observation,
+            &HttpObservation {
+                status: response.status,
+            },
+        ));
+    }
+    if operation == WorkerOperation::Remove {
+        let removed: server_api::WorkerRemoveResponse = serde_json::from_str(&response.body)
+            .map_err(|error| {
+                ToolError::ExecutionFailed(format!("invalid WorkerRemove response: {error}"))
+            })?;
+        let summary = if removed.removed && response.status != 202 {
+            "WorkerRemove completed; Worker removed"
+        } else {
+            match removed.state {
+                Some(server_api::WorkerRemovalState::Waiting) => {
+                    "WorkerRemove accepted; removal waiting, Worker not removed. Inspect operation_id, phase and cause; acceptance is not completion"
+                }
+                Some(server_api::WorkerRemovalState::Held) => {
+                    "WorkerRemove accepted; removal held, Worker not removed. Inspect operation_id, phase and cause; no forced discard or automatic retry"
+                }
+                None => {
+                    "WorkerRemove accepted; deletion unconfirmed. Inspect the current saved operation; acceptance is not completion"
+                }
+            }
+        };
+        return Ok(ToolOutput {
+            summary: summary.into(),
+            content: Some(response.body),
+            attachments: Vec::new(),
+        });
+    }
+    if matches!(
+        operation,
+        WorkerOperation::Notify | WorkerOperation::SendInput
+    ) {
+        let input: server_api::RuntimeWorkerInputResult = serde_json::from_str(&response.body)
+            .map_err(|_| worker_tool_failure(C::InvalidResponse, B::Observation, &()))?;
+        // This is the source-owned acceptance result, independent of diagnostic
+        // severity/code/order and independent of later model processing.
+        if input.disposition != server_api::WorkerInputDisposition::Accepted
+            || input.state != server_api::WorkerOperationState::Accepted
+        {
+            let (cause, boundary) = match input.disposition {
+                server_api::WorkerInputDisposition::Unknown => {
+                    (C::ResultUnavailable, B::Observation)
+                }
+                _ => (C::ExecutionRejected, B::Execution),
+            };
+            return Err(worker_tool_failure(
+                input.control.unwrap_or(cause),
+                boundary,
+                &input,
+            ));
+        }
+        return Ok(ToolOutput {
+            summary: format!(
+                "{} accepted; model processing and work completion are unconfirmed",
+                operation.tool_name()
+            ),
+            content: Some(response.body),
+            attachments: Vec::new(),
+        });
     }
     if operation == WorkerOperation::Restore {
         let restored: server_api::WorkerRestoreResponse = serde_json::from_str(&response.body)
-            .map_err(|error| {
-                ToolError::ExecutionFailed(format!("invalid WorkerRestore response: {error}"))
-            })?;
+            .map_err(|_| worker_tool_failure(C::InvalidResponse, B::Observation, &()))?;
         if restored.result.state != server_api::WorkerRestoreState::Accepted {
-            return Err(ToolError::ExecutionFailed(format!(
-                "WorkerRestore returned {:?}: {}",
-                restored.result.state, response.body
-            )));
+            let cause = match restored.result.state {
+                server_api::WorkerRestoreState::Rejected => C::ExecutionRejected,
+                server_api::WorkerRestoreState::RolledBack => C::ExecutionFailed,
+                server_api::WorkerRestoreState::Superseded
+                | server_api::WorkerRestoreState::ReconciliationRequired => C::ResultUnavailable,
+                server_api::WorkerRestoreState::Accepted => unreachable!(),
+            };
+            let boundary = if matches!(
+                restored.result.state,
+                server_api::WorkerRestoreState::Superseded
+                    | server_api::WorkerRestoreState::ReconciliationRequired
+            ) {
+                B::Observation
+            } else {
+                B::Execution
+            };
+            if let Some(startup) = &restored.result.startup {
+                use crate::startup_failure::PublicStartupFailure;
+                let projected =
+                    crate::startup_failure::project_public_startup_failure::<error_contract::Tool>(
+                        &startup.primary,
+                        protocol::session_failure::SessionFailureVisibility {
+                            can_view_cause: true,
+                        },
+                    );
+                return Err(match projected {
+                    Ok(PublicStartupFailure::Session(failure)) => {
+                        tools::failure::execution_failure(&failure, boundary, &restored, 64 * 1024)
+                    }
+                    Ok(PublicStartupFailure::Runtime(failure)) => {
+                        tools::failure::execution_failure(&failure, boundary, &restored, 64 * 1024)
+                    }
+                    Err(_) => worker_tool_failure(
+                        C::ResultUnavailable,
+                        B::Observation,
+                        &restored.result.state,
+                    ),
+                });
+            }
+            return Err(worker_tool_failure(
+                restored.result.control.unwrap_or(cause),
+                boundary,
+                &restored,
+            ));
         }
     }
     if operation == WorkerOperation::Stop
@@ -1157,6 +1333,30 @@ fn tool_output(
     {
         return Ok(ToolOutput {
             summary: render_subworker_stop_summary(&summary),
+            content: Some(response.body),
+            attachments: Vec::new(),
+        });
+    }
+    if matches!(operation, WorkerOperation::Stop | WorkerOperation::Cancel) {
+        let lifecycle: server_api::RuntimeWorkerLifecycleResult =
+            serde_json::from_str(&response.body)
+                .map_err(|_| worker_tool_failure(C::InvalidResponse, B::Observation, &()))?;
+        if lifecycle.state != server_api::WorkerOperationState::Accepted {
+            let cause = match lifecycle.state {
+                server_api::WorkerOperationState::Unsupported => C::UnsupportedOperation,
+                _ => C::ExecutionRejected,
+            };
+            return Err(worker_tool_failure(
+                lifecycle.control.unwrap_or(cause),
+                B::Execution,
+                &lifecycle,
+            ));
+        }
+        return Ok(ToolOutput {
+            summary: format!(
+                "{} request accepted; this receipt alone does not prove execution termination",
+                operation.tool_name()
+            ),
             content: Some(response.body),
             attachments: Vec::new(),
         });
@@ -1321,6 +1521,10 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingWorkspaceClient {
         requests: Mutex<Vec<WorkspaceRequest>>,
+        authorizations: Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
+        bound_authorizations:
+            Mutex<Vec<server_api::authorization::BoundOperationAuthorizationRequest>>,
+        denied: std::sync::atomic::AtomicBool,
         removals: Mutex<Vec<(String, String, String)>>,
     }
 
@@ -1341,9 +1545,35 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.authorizations.lock().unwrap().push(auth);
+                return Ok(WorkspaceResponse {
+                    content_type: None,
+                    status: if self.denied.load(std::sync::atomic::Ordering::SeqCst) {
+                        403
+                    } else {
+                        200
+                    },
+                    body: r#"{"scope":null}"#.into(),
+                });
+            }
+            if request.path.ends_with("/authorization/bound-check") {
+                let auth = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.bound_authorizations.lock().unwrap().push(auth);
+                return Ok(WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: r#"{"scope":null}"#.into(),
+                });
+            }
             let is_worker_list = request.path.ends_with("/worker-control/workers");
+            let is_worker_input = request.path.ends_with("/input");
+            let is_worker_lifecycle =
+                request.path.ends_with("/cancel") || request.path.ends_with("/stop");
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: if is_worker_list {
                     serde_json::json!({
@@ -1353,6 +1583,7 @@ mod tests {
                                     "runtime_id": "runtime-a",
                                     "worker_id": "worker-a"
                                 },
+                                "permissions": ["observe"],
                                 "summary": { "status": "idle" }
                             },
                             {
@@ -1360,11 +1591,35 @@ mod tests {
                                     "runtime_id": "runtime-a",
                                     "worker_id": "worker-a"
                                 },
+                                "permissions": ["observe"],
                                 "summary": { "status": "idle" }
                             }
                         ]
                     })
                     .to_string()
+                } else if is_worker_input {
+                    serde_json::to_string(&server_api::RuntimeWorkerInputResult {
+                        control_explanation: None,
+                        control: None,
+                        state: server_api::WorkerOperationState::Accepted,
+                        disposition: server_api::WorkerInputDisposition::Accepted,
+                        runtime_id: "runtime-a".into(),
+                        worker_id: "worker-a".into(),
+                        diagnostics: vec![],
+                    })
+                    .unwrap()
+                } else if is_worker_lifecycle {
+                    serde_json::to_string(&server_api::RuntimeWorkerLifecycleResult {
+                        cleanup_failures: vec![],
+                        control_explanation: None,
+                        control: None,
+                        replayed: false,
+                        state: server_api::WorkerOperationState::Accepted,
+                        runtime_id: "runtime-a".into(),
+                        worker_id: "worker-a".into(),
+                        diagnostics: vec![],
+                    })
+                    .unwrap()
                 } else {
                     "{}".to_string()
                 },
@@ -1383,8 +1638,14 @@ mod tests {
                 reason.to_string(),
             ));
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
-                body: r#"{"removed":true}"#.to_string(),
+                body: serde_json::json!({
+                    "removed": true,
+                    "runtime_id": target_runtime_id,
+                    "worker_id": target_worker_id,
+                })
+                .to_string(),
             })
         }
     }
@@ -1415,6 +1676,7 @@ mod tests {
 
         async fn list_workers(&self) -> Result<WorkspaceResponse, WorkspaceClientError> {
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::json!({ "items": [] }).to_string(),
             })
@@ -1436,10 +1698,14 @@ mod tests {
                     "expected user input".to_string(),
                 ));
             }
-            self.sent.lock().unwrap().push((name, content));
+            self.sent.lock().unwrap().push((name.clone(), content));
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
-                body: serde_json::json!({ "status": "accepted" }).to_string(),
+                body: serde_json::json!({
+                    "subject": { "kind": "sub_worker", "name": name }
+                })
+                .to_string(),
             })
         }
 
@@ -1457,10 +1723,19 @@ mod tests {
             if kind != WorkerControlStopKind::Stop {
                 return Err(WorkspaceClientError::Request("expected stop".to_string()));
             }
-            self.stopped.lock().unwrap().push(name);
+            self.stopped.lock().unwrap().push(name.clone());
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
-                body: serde_json::json!({ "status": "stopped" }).to_string(),
+                body: serde_json::to_string(&SubWorkerStopSummary {
+                    session_id: "review-session".into(),
+                    display_name: name,
+                    outcome: crate::spawn::registry::SubWorkerFinalOutcome::Done,
+                    elapsed_ms: 0,
+                    tool_counts: vec![],
+                    change_stat: None,
+                })
+                .unwrap(),
             })
         }
 
@@ -1486,7 +1761,7 @@ mod tests {
 
         async fn ensure_permission(
             &self,
-            _subject: &crate::feature::builtin::WorkerObservationSubjectRef,
+            _subject: &crate::feature::contracts::WorkerObservationSubjectRef,
             _permission: &str,
         ) -> Result<(), WorkspaceClientError> {
             Ok(())
@@ -1496,10 +1771,212 @@ mod tests {
     fn test_control(client: Arc<RecordingWorkspaceClient>) -> Arc<dyn WorkerControlService> {
         Arc::new(WorkspaceWorkerControlService {
             client,
-            workspace_id: "workspace%2Ftest".to_string(),
+            workspace_id: "workspace/test".to_string(),
             registry: None,
             runtime_worker_control: true,
         })
+    }
+
+    #[test]
+    fn shared_control_problem_reaches_model_failure_without_disclosing_received_prose() {
+        for cause in protocol::control_failure::RuntimeControlCause::ALL {
+            let response = server_api::control_failure::control_problem(*cause).unwrap();
+            let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            body["detail"] = "private-body-canary".into();
+            body["yoi_failure"]["explanation"] = "private-body-canary".into();
+            let result = tool_output(
+                WorkerOperation::Stop,
+                WorkspaceResponse {
+                    content_type: Some(response.content_type.to_owned()),
+                    status: response.status,
+                    body: body.to_string(),
+                },
+            )
+            .unwrap_err();
+            assert!(!format!("{result:?}").contains("private-body-canary"));
+            assert_control_failure(
+                result,
+                tools::failure::ToolFailureBoundary::Observation,
+                *cause,
+            );
+        }
+    }
+
+    #[test]
+    fn control_tool_does_not_infer_problem_from_body_when_media_or_status_is_wrong() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        let problem = server_api::control_failure::control_problem(C::AuthorizationFailed).unwrap();
+        for (status, content_type) in [
+            (problem.status, None),
+            (problem.status, Some("text/plain".to_owned())),
+            (409, Some(problem.content_type.to_owned())),
+        ] {
+            let error = tool_output(
+                WorkerOperation::Stop,
+                WorkspaceResponse {
+                    status,
+                    content_type,
+                    body: String::from_utf8(problem.body.to_vec()).unwrap(),
+                },
+            )
+            .unwrap_err();
+            assert_control_failure(
+                error,
+                tools::failure::ToolFailureBoundary::Observation,
+                C::ResultUnavailable,
+            );
+        }
+    }
+
+    fn assert_control_failure(
+        error: ToolError,
+        boundary: tools::failure::ToolFailureBoundary,
+        cause: protocol::control_failure::RuntimeControlCause,
+    ) -> serde_json::Value {
+        #[derive(Deserialize)]
+        struct Report {
+            boundary: tools::failure::ToolFailureBoundary,
+            failure: serde_json::Value,
+            result: serde_json::Value,
+        }
+        let ToolError::ExecutionFailure(output) = error else {
+            panic!("expected a structured execution failure, got {error:?}");
+        };
+        let report: Report = serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+        assert_eq!(report.boundary, boundary);
+        let encoded = serde_json::to_vec(&report.failure).unwrap();
+        let error_contract::DecodeFailure::Known(failure) =
+            error_contract::decode_failure::<protocol::control_failure::RuntimeControlCause>(
+                &encoded,
+                error_contract::Budget::new(65536, 65536),
+            )
+        else {
+            panic!("expected a known Runtime control cause");
+        };
+        assert_eq!(*failure.facts().cause(), cause);
+        // Restore may prefix its recovery identity; the projected explanation stays intact.
+        assert!(output.summary.ends_with(cause.explanation()));
+        report.result
+    }
+
+    #[test]
+    fn notify_transport_success_requires_runtime_acceptance_and_preserves_unknown_diagnostics() {
+        use protocol::control_failure::RuntimeControlCause as C;
+        use server_api::{WorkerInputDisposition as D, WorkerOperationState as S};
+        use tools::failure::ToolFailureBoundary as B;
+
+        // Diagnostic severity, code and prose must not override the source-owned verdict.
+        let diagnostics = serde_json::json!([
+            {"code":"worker_input_outcome_unknown","severity":"warning","message":"inspect current session before retrying"},
+            {"code":"arbitrary_code","severity":"error","message":"accepted rejected unknown: not a verdict"}
+        ]);
+        for (state, disposition, boundary, cause) in [
+            (S::Rejected, D::Rejected, B::Execution, C::ExecutionRejected),
+            (S::Rejected, D::Accepted, B::Execution, C::ExecutionRejected),
+            (
+                S::Unsupported,
+                D::Rejected,
+                B::Execution,
+                C::ExecutionRejected,
+            ),
+            (
+                S::Rejected,
+                D::Unknown,
+                B::Observation,
+                C::ResultUnavailable,
+            ),
+            (
+                S::Accepted,
+                D::Unknown,
+                B::Observation,
+                C::ResultUnavailable,
+            ),
+        ] {
+            let input = server_api::RuntimeWorkerInputResult {
+                control_explanation: None,
+                control: None,
+                state,
+                disposition,
+                runtime_id: "r".into(),
+                worker_id: "w".into(),
+                diagnostics: serde_json::from_value(diagnostics.clone()).unwrap(),
+            };
+            let result = assert_control_failure(
+                tool_output(
+                    WorkerOperation::Notify,
+                    WorkspaceResponse {
+                        content_type: None,
+                        status: 200,
+                        body: serde_json::to_string(&input).unwrap(),
+                    },
+                )
+                .unwrap_err(),
+                boundary,
+                cause,
+            );
+            let retained: server_api::RuntimeWorkerInputResult =
+                serde_json::from_value(result).unwrap();
+            assert_eq!(retained, input);
+        }
+
+        // Missing legacy disposition is unknown, even with an accepted state.
+        let result = assert_control_failure(
+            tool_output(
+                WorkerOperation::Notify,
+                WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: serde_json::json!({"state":"accepted","runtime_id":"r","worker_id":"w"})
+                        .to_string(),
+                },
+            )
+            .unwrap_err(),
+            B::Observation,
+            C::ResultUnavailable,
+        );
+        let legacy: server_api::RuntimeWorkerInputResult = serde_json::from_value(result).unwrap();
+        assert_eq!(legacy.state, S::Accepted);
+        assert_eq!(legacy.disposition, D::Unknown);
+        assert_control_failure(
+            tool_output(
+                WorkerOperation::Notify,
+                WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: "{}".into(),
+                },
+            )
+            .unwrap_err(),
+            B::Observation,
+            C::InvalidResponse,
+        );
+
+        let input = server_api::RuntimeWorkerInputResult {
+            control_explanation: None,
+            control: None,
+            state: S::Accepted,
+            disposition: D::Accepted,
+            runtime_id: "r".into(),
+            worker_id: "w".into(),
+            diagnostics: serde_json::from_value(diagnostics).unwrap(),
+        };
+        let accepted = tool_output(
+            WorkerOperation::Notify,
+            WorkspaceResponse {
+                content_type: None,
+                status: 200,
+                body: serde_json::to_string(&input).unwrap(),
+            },
+        )
+        .unwrap();
+        let retained: server_api::RuntimeWorkerInputResult =
+            serde_json::from_str(accepted.content.as_deref().unwrap()).unwrap();
+        assert_eq!(retained, input);
+        assert!(
+            accepted
+                .summary
+                .contains("model processing and work completion are unconfirmed")
+        );
     }
 
     #[tokio::test]
@@ -1699,7 +2176,7 @@ mod tests {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let control = WorkspaceWorkerControlService {
             client: client.clone(),
-            workspace_id: "workspace%2Ftest".to_string(),
+            workspace_id: "workspace/test".to_string(),
             registry: None,
             runtime_worker_control: true,
         };
@@ -1721,13 +2198,63 @@ mod tests {
 
     #[test]
     fn send_input_rejection_is_a_tool_error_with_notify_guidance() {
-        let error = tool_output(WorkerOperation::SendInput, WorkspaceResponse {
-            status: 400,
-            body: "WorkerSendInput requires an Idle Worker. Use WorkerNotify for work already in progress.".to_string(),
-        }).unwrap_err();
-        assert!(matches!(error, ToolError::ExecutionFailed(_)));
-        assert!(error.to_string().contains("WorkerNotify"));
-        assert!(!error.to_string().contains("completed"));
+        use protocol::control_failure::RuntimeControlCause as C;
+        use tools::failure::ToolFailureBoundary as B;
+
+        let rejected = server_api::RuntimeWorkerInputResult {
+            control_explanation: None,
+            control: None,
+            state: server_api::WorkerOperationState::Rejected,
+            disposition: server_api::WorkerInputDisposition::Rejected,
+            runtime_id: "r".into(),
+            worker_id: "w".into(),
+            diagnostics: vec![],
+        };
+        let result = assert_control_failure(
+            tool_output(
+                WorkerOperation::SendInput,
+                WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: serde_json::to_string(&rejected).unwrap(),
+                },
+            )
+            .unwrap_err(),
+            B::Execution,
+            C::ExecutionRejected,
+        );
+        assert_eq!(
+            serde_json::from_value::<server_api::RuntimeWorkerInputResult>(result).unwrap(),
+            rejected
+        );
+
+        // A non-success HTTP response without a typed verdict is an observation
+        // failure, not proof of rejection. Arbitrary transport prose is not public.
+        for body in [
+            "WorkerSendInput requires an Idle Worker. Use WorkerNotify for work already in progress.",
+            "accepted: private provider text /secret/path?token=do-not-expose",
+        ] {
+            let error = tool_output(
+                WorkerOperation::SendInput,
+                WorkspaceResponse {
+                    content_type: None,
+                    status: 400,
+                    body: body.into(),
+                },
+            )
+            .unwrap_err();
+            let ToolError::ExecutionFailure(output) = &error else {
+                panic!("expected a structured failure");
+            };
+            assert!(!output.summary.contains(body));
+            assert!(!output.content.as_deref().unwrap().contains(body));
+            let result = assert_control_failure(error, B::Observation, C::ResultUnavailable);
+            assert_eq!(result, serde_json::json!({"status":400}));
+        }
+        // Advisory guidance belongs to the Tool contract, not untrusted HTTP prose.
+        let description = WorkerOperation::SendInput.description();
+        assert!(description.contains("Non-Idle Workers reject WorkerSendInput without queueing"));
+        assert!(description.contains("Use WorkerNotify"));
     }
 
     #[tokio::test]
@@ -1735,7 +2262,7 @@ mod tests {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let control = WorkspaceWorkerControlService {
             client: client.clone(),
-            workspace_id: "workspace%2Ftest".to_string(),
+            workspace_id: "workspace/test".to_string(),
             registry: None,
             runtime_worker_control: true,
         };
@@ -1784,7 +2311,7 @@ mod tests {
         let registry = SpawnedWorkerRegistry::new(runtime_dir);
         let control: Arc<dyn WorkerControlService> = Arc::new(WorkspaceWorkerControlService {
             client: client.clone(),
-            workspace_id: "workspace%2Ftest".to_string(),
+            workspace_id: "workspace/test".to_string(),
             registry: Some(registry),
             runtime_worker_control: false,
         });
@@ -1822,20 +2349,42 @@ mod tests {
             runtime_worker_control: false,
         };
 
-        send_tool
+        let sent = send_tool
             .execute(
                 r#"{"subject":{"kind":"sub_worker","name":"reviewer"},"content":"continue"}"#,
                 ToolExecutionContext::new("call-send", "batch-control", 0),
             )
             .await
             .unwrap();
-        stop_tool
+        assert!(
+            sent.summary
+                .contains("model processing and completion are unconfirmed")
+        );
+        let input_receipt: serde_json::Value =
+            serde_json::from_str(sent.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            input_receipt["subject"],
+            serde_json::json!({"kind":"sub_worker","name":"reviewer"})
+        );
+        let stopped = stop_tool
             .execute(
                 r#"{"subject":{"kind":"sub_worker","name":"reviewer"},"reason":"review completed"}"#,
                 ToolExecutionContext::new("call-stop", "batch-control", 1),
             )
             .await
             .unwrap();
+        let stop_receipt: SubWorkerStopSummary =
+            serde_json::from_str(stopped.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stop_receipt.session_id, "review-session");
+        assert_eq!(stop_receipt.display_name, "reviewer");
+        assert_eq!(
+            stop_receipt.outcome,
+            crate::spawn::registry::SubWorkerFinalOutcome::Done
+        );
+        assert_eq!(
+            stopped.summary,
+            render_subworker_stop_summary(&stop_receipt)
+        );
 
         assert_eq!(
             *control.sent.lock().unwrap(),
@@ -1852,13 +2401,13 @@ mod tests {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let control: Arc<dyn WorkerControlService> = Arc::new(WorkspaceWorkerControlService {
             client: client.clone(),
-            workspace_id: "workspace%2Ftest".to_string(),
+            workspace_id: "workspace/test".to_string(),
             registry: None,
             runtime_worker_control: false,
         });
         let permission_error = control
             .ensure_permission(
-                &crate::feature::builtin::WorkerObservationSubjectRef::RuntimeWorker {
+                &crate::feature::contracts::WorkerObservationSubjectRef::RuntimeWorker {
                     runtime_id: "runtime-1".to_string(),
                     worker_id: "worker-1".to_string(),
                 },
@@ -1887,6 +2436,54 @@ mod tests {
 
         assert!(matches!(error, ToolError::InvalidArgument(_)));
         assert!(client.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_remove_accepted_receipts_preserve_progress_without_claiming_completion() {
+        for (state, cause) in [("waiting", "job_pending"), ("held", "job_failed")] {
+            let body = serde_json::json!({
+                "removed": false, "runtime_id": "r", "worker_id": "w",
+                "operation_id": "saved-removal", "state": state,
+                "phase": "recording", "cause": cause,
+            })
+            .to_string();
+            let output = tool_output(
+                WorkerOperation::Remove,
+                WorkspaceResponse {
+                    status: 202,
+                    content_type: None,
+                    body: body.clone(),
+                },
+            )
+            .unwrap();
+            assert!(output.summary.contains(state));
+            assert!(output.summary.contains("not removed"));
+            assert!(!output.summary.contains("completed"));
+            assert_eq!(output.content.as_deref(), Some(body.as_str()));
+        }
+        let output = tool_output(
+            WorkerOperation::Remove,
+            WorkspaceResponse {
+                status: 200,
+                content_type: None,
+                body: r#"{"removed":true,"runtime_id":"r","worker_id":"w"}"#.into(),
+            },
+        )
+        .unwrap();
+        assert!(output.summary.contains("completed"));
+        assert!(
+            tool_output(
+                WorkerOperation::Remove,
+                WorkspaceResponse {
+                    status: 202,
+                    content_type: None,
+                    body:
+                        r#"{"removed":false,"runtime_id":"r","worker_id":"w","phase":"invented"}"#
+                            .into(),
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2147,7 +2744,7 @@ mod tests {
                 None,
             ),
         ] {
-            WorkspaceWorkerTool {
+            let output = WorkspaceWorkerTool {
                 operation,
                 control: test_control(client.clone()),
                 runtime_worker_control: true,
@@ -2158,6 +2755,51 @@ mod tests {
             )
             .await
             .unwrap();
+            if expected_kind.is_some() {
+                let receipt: server_api::RuntimeWorkerInputResult =
+                    serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+                assert_eq!(receipt.state, server_api::WorkerOperationState::Accepted);
+                assert_eq!(
+                    receipt.disposition,
+                    server_api::WorkerInputDisposition::Accepted
+                );
+                assert!(
+                    output
+                        .summary
+                        .contains("model processing and work completion are unconfirmed")
+                );
+            } else {
+                let receipt: server_api::RuntimeWorkerLifecycleResult =
+                    serde_json::from_str(output.content.as_deref().unwrap()).unwrap();
+                assert_eq!(receipt.state, server_api::WorkerOperationState::Accepted);
+                assert!(
+                    output
+                        .summary
+                        .contains("does not prove execution termination")
+                );
+            }
+            let check = client
+                .authorizations
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                check.operation,
+                match operation {
+                    WorkerOperation::SendInput => "worker.send_input",
+                    WorkerOperation::Notify => "worker.messaging",
+                    WorkerOperation::Cancel => "worker.cancel",
+                    _ => unreachable!(),
+                }
+            );
+            assert_eq!(
+                check.resource,
+                PermissionResource::WorkerOperation {
+                    workspace_id: "workspace/test".into(),
+                }
+            );
             let request = client.requests.lock().unwrap().last().cloned().unwrap();
             assert!(request.path.ends_with(expected_suffix));
             assert!(request.path.contains("/worker-control/workers/"));
@@ -2307,6 +2949,7 @@ mod tests {
             }),
         };
         let response = WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&summary).unwrap(),
         };
@@ -2331,5 +2974,298 @@ mod tests {
         assert!(validate_relative_cwd("../repo").is_err());
         assert!(validate_relative_cwd("/repo").is_err());
         assert_eq!(validate_relative_cwd("repo/src").unwrap(), "repo/src");
+    }
+    // Connection: production control/lifecycle services and WorkspaceClient authorization
+    // transport; only the Host verdict and downstream Backend are fixture boundaries.
+    #[tokio::test]
+    async fn every_runtime_control_effect_rechecks_host_before_backend_dispatch() {
+        async fn call(
+            control: &dyn WorkerControlService,
+            op: &str,
+        ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+            let subject = WorkerControlSubject::RuntimeWorker {
+                runtime_id: "target-runtime".into(),
+                worker_id: "target-worker".into(),
+            };
+            match op {
+                "worker.list" => control.list_workers().await,
+                "worker.send_input" | "worker.messaging" => {
+                    control
+                        .send_input(
+                            subject,
+                            "input".into(),
+                            if op == "worker.messaging" {
+                                WorkerControlInputKind::Notify
+                            } else {
+                                WorkerControlInputKind::User
+                            },
+                        )
+                        .await
+                }
+                "worker.cancel" | "worker.stop" => {
+                    control
+                        .stop_worker(
+                            subject,
+                            if op == "worker.cancel" {
+                                WorkerControlStopKind::Cancel
+                            } else {
+                                WorkerControlStopKind::Stop
+                            },
+                            None,
+                        )
+                        .await
+                }
+                "worker.restore" => {
+                    control
+                        .restore_worker(
+                            "target-runtime".into(),
+                            "target-worker".into(),
+                            server_api::WorkerRestoreRequest {
+                                request_id: "restore-intent".into(),
+                                expected_observation_token: "observed".into(),
+                            },
+                        )
+                        .await
+                }
+                "worker.remove" => control.remove_runtime_worker(
+                    "target-runtime",
+                    "target-worker",
+                    "requested removal",
+                ),
+                "worker.observe" => {
+                    control
+                        .ensure_permission(
+                            &WorkerObservationSubjectRef::RuntimeWorker {
+                                runtime_id: "runtime-a".into(),
+                                worker_id: "worker-a".into(),
+                            },
+                            "observe",
+                        )
+                        .await?;
+                    Ok(WorkspaceResponse {
+                        content_type: None,
+                        status: 200,
+                        body: "{}".into(),
+                    })
+                }
+                "worker.create" => {
+                    control
+                        .spawn_worker(WorkerLifecycleSpawnRequest {
+                            orchestrator_assignment_id: None,
+                            runtime_id: "target-runtime".into(),
+                            workdir_attachments: vec![],
+                            profile: "builtin:coder".into(),
+                            singleton_key: None,
+                            ticket_id: None,
+                            operation_id: Some("spawn-intent".into()),
+                            execution_grant: None,
+                            display_name: "child".into(),
+                            initial_submit: vec![Segment::text("work")],
+                        })
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        }
+        for op in [
+            "worker.list",
+            "worker.send_input",
+            "worker.messaging",
+            "worker.cancel",
+            "worker.stop",
+            "worker.restore",
+            "worker.remove",
+            "worker.observe",
+            "worker.create",
+        ] {
+            let client = Arc::new(RecordingWorkspaceClient::default());
+            let control = test_control(client.clone());
+            client
+                .denied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(call(control.as_ref(), op).await.is_err(), "{op}");
+            assert!(client.requests.lock().unwrap().is_empty(), "{op}");
+            assert!(client.removals.lock().unwrap().is_empty(), "{op}");
+            client
+                .denied
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                call(control.as_ref(), op).await.unwrap().is_success(),
+                "{op}"
+            );
+            let effects =
+                client.requests.lock().unwrap().len() + client.removals.lock().unwrap().len();
+            assert_eq!(effects, 1, "{op}");
+            client
+                .denied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(call(control.as_ref(), op).await.is_err(), "{op}");
+            assert_eq!(
+                client.requests.lock().unwrap().len() + client.removals.lock().unwrap().len(),
+                effects,
+                "{op}"
+            );
+            let checks = client.authorizations.lock().unwrap();
+            assert_eq!(checks.len(), 3, "{op}");
+            for check in checks.iter() {
+                assert_eq!(check.operation, op);
+                assert_eq!(
+                    check.resource,
+                    if matches!(op, "worker.list" | "worker.create") {
+                        PermissionResource::Workspace {
+                            workspace_id: "workspace/test".into(),
+                        }
+                    } else {
+                        PermissionResource::WorkerOperation {
+                            workspace_id: "workspace/test".into(),
+                        }
+                    }
+                );
+            }
+        }
+    }
+    // Connection: published Tool registration and dispatch, production typed control
+    // service and authorization transport; the Host and Backend are fixture boundaries.
+    #[tokio::test]
+    async fn published_runtime_tools_reject_missing_operation_grant_without_backend_effects() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let mut pending_tools = Vec::new();
+        let mut hooks = crate::HookRegistryBuilder::default();
+        let report = crate::feature::FeatureRegistryBuilder::new()
+            .with_module(manage_worker_feature(client.clone(), None, true))
+            .install_into_pending(&mut pending_tools, &mut hooks);
+        assert!(report.reports[0].installed);
+        let tools: Vec<_> = pending_tools
+            .into_iter()
+            .map(|definition| definition())
+            .collect();
+        client
+            .denied
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for (tool_name, operation, fields) in [
+            (
+                "WorkerSendInput",
+                "worker.send_input",
+                serde_json::json!({"content":"continue"}),
+            ),
+            (
+                "WorkerNotify",
+                "worker.messaging",
+                serde_json::json!({"content":"result ready"}),
+            ),
+            (
+                "WorkerCancel",
+                "worker.cancel",
+                serde_json::json!({"reason":"cancel"}),
+            ),
+            (
+                "WorkerStop",
+                "worker.stop",
+                serde_json::json!({"reason":"stop"}),
+            ),
+            (
+                "WorkerRestore",
+                "worker.restore",
+                serde_json::json!({"expected_observation_token":"observed"}),
+            ),
+            (
+                "WorkerRemove",
+                "worker.remove",
+                serde_json::json!({"reason":"retire"}),
+            ),
+        ] {
+            let (_, tool) = tools
+                .iter()
+                .find(|(meta, _)| meta.name == tool_name)
+                .unwrap();
+            for worker_id in ["worker-a", "worker-b"] {
+                let mut input = fields.clone();
+                input["subject"] = serde_json::json!({
+                    "kind":"runtime_worker", "runtime_id":"runtime-a", "worker_id":worker_id,
+                });
+                let error = tool
+                    .execute(&input.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .unwrap_err();
+                // The Host response owns the typed denial; its prose is not a classifier.
+                let result = assert_control_failure(
+                    error,
+                    tools::failure::ToolFailureBoundary::Observation,
+                    protocol::control_failure::RuntimeControlCause::AuthorizationFailed,
+                );
+                assert!(result.is_null());
+                let checks = client.authorizations.lock().unwrap();
+                let check = checks.last().unwrap();
+                assert_eq!(check.operation, operation);
+                assert_eq!(
+                    check.resource,
+                    PermissionResource::WorkerOperation {
+                        workspace_id: "workspace/test".into(),
+                    }
+                );
+                assert!(client.requests.lock().unwrap().is_empty(), "{tool_name}");
+                assert!(client.removals.lock().unwrap().is_empty(), "{tool_name}");
+            }
+        }
+        assert_eq!(client.authorizations.lock().unwrap().len(), 12);
+    }
+
+    #[test]
+    fn runtime_operation_denial_does_not_replace_host_bound_subworker_authorization() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        client
+            .denied
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let control = WorkspaceWorkerControlService {
+            client: client.clone(),
+            workspace_id: "workspace/test".into(),
+            registry: None,
+            runtime_worker_control: true,
+        };
+        for operation in [
+            "subworker.send_input",
+            "subworker.stop",
+            "subworker.observe",
+        ] {
+            control.authorize_subworker(operation, "child").unwrap();
+            let checks = client.bound_authorizations.lock().unwrap();
+            let check = checks.last().unwrap();
+            assert_eq!(check.operation, operation);
+            assert_eq!(
+                check.target,
+                server_api::authorization::BoundAuthorizationTarget::SubWorker {
+                    name: "child".into(),
+                }
+            );
+        }
+        assert_eq!(client.bound_authorizations.lock().unwrap().len(), 3);
+        assert!(client.authorizations.lock().unwrap().is_empty());
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(client.removals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_explicit_standalone_retains_local_subworker_authority_without_host() {
+        for workspace_id in [None, Some("bound-workspace".to_string())] {
+            let identity = workspace_id
+                .as_ref()
+                .map(|id| crate::worker::WorkspaceId::new(id.clone()).unwrap());
+            let client = crate::worker::unavailable_workspace_client(
+                identity.as_ref(),
+                "unavailable fixture",
+            );
+            let control = WorkspaceWorkerControlService {
+                client,
+                workspace_id: workspace_id.clone().unwrap_or_default(),
+                registry: None,
+                runtime_worker_control: false,
+            };
+            assert_eq!(
+                control
+                    .authorize_subworker("subworker.stop", "child")
+                    .is_ok(),
+                workspace_id.is_none()
+            );
+        }
     }
 }

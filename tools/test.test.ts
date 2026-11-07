@@ -106,9 +106,9 @@ function assertThrows(fn: () => unknown) {
   assert(failed, "expected failure");
 }
 
-Deno.test("CPU-derived jobs accommodates concurrent suites within the CLI bound", () => {
-  assert(defaultJobs(24) === 32);
-  assert(defaultJobs(128) === 32);
+Deno.test("default jobs bound suite pressure independently of explicit CLI concurrency", () => {
+  assert(defaultJobs(24) === 8);
+  assert(defaultJobs(128) === 8);
   assert(defaultJobs(6) === 8);
   assert(defaultJobs(1) === 2);
   assert(parseJobs([]) === defaultJobs());
@@ -153,7 +153,7 @@ function listedNames(count: number) {
   return Array.from({ length: count }, (_, i) => `unit::case_${i}`);
 }
 
-Deno.test("round-robin shards retain every listed name exactly once at thresholds and the 32-shard cap", () => {
+Deno.test("round-robin shards retain every listed name without exceeding the case budget", () => {
   const task = {
     name: "pkg/binary",
     command: "/test-binary",
@@ -178,9 +178,10 @@ Deno.test("round-robin shards retain every listed name exactly once at threshold
         "small binaries must be unchanged",
       );
     } else {
-      const expected = Math.min(32, Math.ceil(count / 36));
+      const expected = Math.ceil(count / 36);
       assert(shards.length === expected);
       const lengths = shards.map((shard) => shard.selectedNames.length);
+      assert(Math.max(...lengths) <= 36);
       assert(Math.max(...lengths) - Math.min(...lengths) <= 1);
       shards.forEach((shard, index) => {
         assert(
@@ -212,7 +213,7 @@ Deno.test("global runtime-path packages serialize every normal target without lo
         args: [],
         cwd: "/pkg",
       };
-      for (const count of [0, 1, 59, 72, 73, 1135]) {
+      for (const count of [0, 1, 36, 37, 59, 72, 73, 1135, 1716, 2000]) {
         const names = listedNames(count);
         const shards = shardRustCommand(task, names);
         assert(
@@ -222,7 +223,8 @@ Deno.test("global runtime-path packages serialize every normal target without lo
         for (const shard of shards) {
           const args = shard.task.args;
           assert(args[args.indexOf("--test-threads") + 1] === "1");
-          if (count > 72) {
+          assert(shard.selectedNames.length <= 36);
+          if (count > 36) {
             assert(args[0] === "--exact");
             assert(args.slice(3).join() === shard.selectedNames.join());
           } else {

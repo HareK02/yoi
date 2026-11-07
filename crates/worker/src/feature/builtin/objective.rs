@@ -17,6 +17,13 @@
 //! logic. Query/detail uses canonical references and bounded bodies/events, omitting internal
 //! storage IDs from output.
 
+pub(crate) mod permission_declaration;
+
+pub(crate) mod composition;
+#[cfg(test)]
+mod result_tests;
+mod results;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[cfg(test)]
@@ -40,6 +47,7 @@ use crate::wip::{
     WipOperationOutput, WipProjection, WipProjectionKind, json_to_wip, wip_to_json,
 };
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
+use server_api::authorization::PermissionResource;
 
 use super::resource_projection::{project_objective_detail, project_objective_query};
 
@@ -53,10 +61,54 @@ impl WorkspaceHttpObjectiveBackend {
         Self { client }
     }
 
+    fn authorize(
+        &self,
+        operation: &str,
+        resource: PermissionResource,
+    ) -> Result<(), WorkspaceObjectiveBackendError> {
+        self.client
+            .authorize_operation(operation, &resource)
+            .map_err(|error| {
+                let denied = error.is_authorization_denial();
+                WorkspaceObjectiveBackendError::Authorization {
+                    operation: operation.into(),
+                    resource,
+                    denied,
+                }
+            })?;
+        Ok(())
+    }
+    fn workspace_id(&self) -> Result<String, WorkspaceObjectiveBackendError> {
+        self.client
+            .workspace_id()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                crate::worker::WorkspaceClientError::Unavailable(
+                    "Objective operation requires Workspace identity".into(),
+                )
+                .into()
+            })
+    }
+    fn objective_resource(
+        &self,
+        id: &str,
+    ) -> Result<PermissionResource, WorkspaceObjectiveBackendError> {
+        Ok(PermissionResource::Objective {
+            workspace_id: self.workspace_id()?,
+            objective_id: id.into(),
+        })
+    }
     async fn query_value(
         &self,
         input: &QueryObjectiveInput,
     ) -> Result<serde_json::Value, WorkspaceObjectiveBackendError> {
+        self.authorize(
+            "objective.query",
+            PermissionResource::Workspace {
+                workspace_id: self.workspace_id()?,
+            },
+        )?;
         let url = format!(
             "/api/w/{}/objectives/query",
             self.client.workspace_id().unwrap_or_default()
@@ -89,6 +141,7 @@ impl WorkspaceHttpObjectiveBackend {
         event_cursor: Option<String>,
     ) -> Result<serde_json::Value, WorkspaceObjectiveBackendError> {
         let id = validate_backend_id(id)?;
+        self.authorize("objective.read", self.objective_resource(id)?)?;
         let url = format!("{}/show", self.objective_url(id));
         let response = send_json::<ObjectiveShowRequest, serde_json::Value>(
             self.client.as_ref(),
@@ -126,6 +179,12 @@ impl WorkspaceHttpObjectiveBackend {
         &self,
         input: &ObjectiveCreateInput,
     ) -> Result<serde_json::Value, WorkspaceObjectiveBackendError> {
+        self.authorize(
+            "objective.create",
+            PermissionResource::Workspace {
+                workspace_id: self.workspace_id()?,
+            },
+        )?;
         if input.title.trim().is_empty() {
             return Err(WorkspaceObjectiveBackendError::InvalidArgument(
                 "ObjectiveCreate requires non-empty title".to_string(),
@@ -157,6 +216,7 @@ impl WorkspaceHttpObjectiveBackend {
         input: &ObjectiveEditRequest,
     ) -> Result<serde_json::Value, WorkspaceObjectiveBackendError> {
         let id = validate_backend_id(id)?;
+        self.authorize("objective.edit", self.objective_resource(id)?)?;
         if input.title.is_none() && input.old_string.is_none() && input.new_string.is_none() {
             return Err(WorkspaceObjectiveBackendError::InvalidArgument(
                 "ObjectiveEdit requires title or old_string/new_string".to_string(),
@@ -191,6 +251,7 @@ impl WorkspaceHttpObjectiveBackend {
         state: &str,
     ) -> Result<serde_json::Value, WorkspaceObjectiveBackendError> {
         let id = validate_backend_id(id)?;
+        self.authorize("objective.set_state", self.objective_resource(id)?)?;
         if state.trim().is_empty() {
             return Err(WorkspaceObjectiveBackendError::InvalidArgument(
                 "ObjectiveSetState requires non-empty state".to_string(),
@@ -229,6 +290,7 @@ impl WorkspaceHttpObjectiveBackend {
         let id = validate_backend_id(id)?;
         let ticket_id = validate_backend_id(ticket_id)?;
         let ticket_resource_key = self.ticket_resource_key_raw(ticket_id).await?;
+        self.authorize("objective.link_ticket", self.objective_resource(id)?)?;
         let response = send_json::<ObjectiveLinkTicketRequest, serde_json::Value>(
             self.client.as_ref(),
             reqwest::Method::POST,
@@ -263,6 +325,7 @@ impl WorkspaceHttpObjectiveBackend {
         let id = validate_backend_id(id)?;
         let ticket_id = validate_backend_id(ticket_id)?;
         let ticket_resource_key = self.ticket_resource_key_raw(ticket_id).await?;
+        self.authorize("objective.unlink_ticket", self.objective_resource(id)?)?;
         let response = delete_json::<serde_json::Value>(
             self.client.as_ref(),
             &format!(
@@ -296,7 +359,14 @@ impl WorkspaceHttpObjectiveBackend {
         &self,
         ticket_reference: &str,
     ) -> Result<String, WorkspaceObjectiveBackendError> {
-        let workspace_id = self.client.workspace_id().unwrap_or_default();
+        let workspace_id = self.workspace_id()?;
+        self.authorize(
+            "ticket.read",
+            PermissionResource::Ticket {
+                workspace_id: workspace_id.clone(),
+                ticket_id: ticket_reference.into(),
+            },
+        )?;
         let response: serde_json::Value =
             decode_response(self.client.execute(WorkspaceRequest::get(format!(
                 "/api/w/{workspace_id}/tickets/{}",
@@ -330,6 +400,14 @@ impl WorkspaceHttpObjectiveBackend {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceObjectiveBackendError {
+    #[error(
+        "Objective operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"
+    )]
+    Authorization {
+        operation: String,
+        resource: PermissionResource,
+        denied: bool,
+    },
     #[error("invalid Objective operation: {0}")]
     InvalidArgument(String),
     #[error("workspace objective backend request failed: {0}")]
@@ -561,13 +639,16 @@ pub fn mount_workspace_http_objective_wip(
 ) -> Result<(), WipMountError> {
     let collection_route = namespace_route.root().to_string();
     let backend = WorkspaceHttpObjectiveBackend::new(client);
+    let result_routes = results::Routes {
+        objective: collection_route.clone(),
+    };
 
     let collection_descriptor = objective_collection_descriptor();
     let collection_validator = descriptor_validator(&collection_descriptor);
     let collection_handler = Arc::new(ObjectiveCollectionWipHandler {
         backend: backend.clone(),
         permissions: permissions.clone(),
-        collection_route: collection_route.clone(),
+        result_routes: result_routes.clone(),
     });
     registry.mount(WipProjection {
         route: collection_route.clone(),
@@ -605,16 +686,18 @@ pub fn mount_workspace_http_objective_wip(
             backend,
             permissions,
             collection_route: collection_route.clone(),
+            result_routes,
         }),
     })?;
     registry.replace_compatibility_tools(&collection_route, OBJECTIVE_TOOL_NAMES)?;
+    registry.publish_result_namespace(namespace_route)?;
     Ok(())
 }
 
 struct ObjectiveCollectionWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
-    collection_route: String,
+    result_routes: results::Routes,
 }
 
 #[async_trait]
@@ -623,7 +706,7 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
         &self,
         operation: &str,
         arguments: &BTreeMap<String, Value>,
-        _context: WipCallContext,
+        context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let value = match operation {
             "query" => {
@@ -653,34 +736,13 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
                 };
                 let permission_input = native_permission_input(arguments, None)?;
                 authorize_native(&self.permissions, "QueryObjective", &permission_input)?;
-                let mut response = self
+                let response = self
                     .backend
                     .query_value(&input)
                     .await
                     .map_err(map_backend_error)?;
-                if let Some(objectives) =
-                    response.get_mut("objectives").and_then(Json::as_array_mut)
-                {
-                    for objective in objectives {
-                        if let Some(reference) = objective
-                            .get("objective")
-                            .and_then(Json::as_str)
-                            .map(ToOwned::to_owned)
-                        {
-                            objective
-                                .as_object_mut()
-                                .expect("projected Objective is an object")
-                                .insert(
-                                    "path".into(),
-                                    Json::String(format!(
-                                        "{}/{}",
-                                        self.collection_route, reference
-                                    )),
-                                );
-                        }
-                    }
-                }
-                response
+                self.result_routes
+                    .query(&response, context.result_namespaces.root("ticket"))?
             }
             "create" => {
                 let input = ObjectiveCreateInput {
@@ -693,32 +755,17 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
                 };
                 let permission_input = native_permission_input(arguments, None)?;
                 authorize_native(&self.permissions, "ObjectiveCreate", &permission_input)?;
-                let mut response = self
+                let response = self
                     .backend
                     .create_value(&input)
                     .await
                     .map_err(map_backend_error)?;
-
-                if let Some(reference) = response
-                    .get("objective")
-                    .and_then(Json::as_str)
-                    .map(ToOwned::to_owned)
-                {
-                    response
-                        .as_object_mut()
-                        .expect("projected Objective is an object")
-                        .insert(
-                            "path".into(),
-                            Json::String(format!("{}/{}", self.collection_route, reference)),
-                        );
-                }
-                response
+                self.result_routes
+                    .detail(&response, context.result_namespaces.root("ticket"))?
             }
             _ => return Err(operation_not_found()),
         };
-        Ok(WipOperationOutput::native(
-            json_to_wip(&value).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        Ok(WipOperationOutput::native(value))
     }
 }
 
@@ -726,6 +773,7 @@ struct ObjectiveItemResolver {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
     collection_route: String,
+    result_routes: results::Routes,
 }
 
 impl WipDynamicItemResolver for ObjectiveItemResolver {
@@ -748,6 +796,7 @@ impl WipDynamicItemResolver for ObjectiveItemResolver {
                 backend: self.backend.clone(),
                 permissions: self.permissions.clone(),
                 objective_reference: item_reference.to_string(),
+                result_routes: self.result_routes.clone(),
             }),
         })
     }
@@ -757,6 +806,7 @@ struct ObjectiveItemWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
     permissions: Option<ToolPermissionConfig>,
     objective_reference: String,
+    result_routes: results::Routes,
 }
 
 #[async_trait]
@@ -765,7 +815,7 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
         &self,
         operation: &str,
         arguments: &BTreeMap<String, Value>,
-        _context: WipCallContext,
+        context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let permission_input = native_permission_input(arguments, Some(&self.objective_reference))?;
         let response = match operation {
@@ -827,9 +877,10 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
             _ => return Err(operation_not_found()),
         };
 
-        Ok(WipOperationOutput::native(
-            json_to_wip(&response).map_err(WipOperationError::OutcomeUnknown)?,
-        ))
+        Ok(WipOperationOutput::native(self.result_routes.detail(
+            &response,
+            context.result_namespaces.root("ticket"),
+        )?))
     }
 }
 
@@ -880,6 +931,20 @@ fn authorize_native(
 
 fn map_backend_error(error: WorkspaceObjectiveBackendError) -> WipOperationError {
     match error {
+        WorkspaceObjectiveBackendError::Authorization {
+            operation,
+            resource: _,
+            denied,
+        } => protocol_failure(
+            if denied {
+                ProtocolErrorCode::PermissionDenied
+            } else {
+                ProtocolErrorCode::Internal
+            },
+            format!(
+                "Objective operation authorization failed before dispatch: {operation}; denied={denied}"
+            ),
+        ),
         WorkspaceObjectiveBackendError::InvalidArgument(message) => {
             protocol_failure(ProtocolErrorCode::InvalidArguments, message)
         }
@@ -1043,7 +1108,7 @@ fn objective_collection_descriptor() -> InterfaceDescriptor {
         documentation: Some(Documentation {
             summary: "Search and create authoritative Workspace Objectives".into(),
             details: Some(
-                "Query results are bounded and include canonical item paths. Ticket references are data only and confer no Ticket authority."
+                "Query returns bounded items with data: Json, entry: Entry, links.tickets, and separate next_cursor/has_more. Inspect a selected entry and its Interface before read; create returns the same item envelope. Linked Ticket Entries are emitted only for committed published result namespaces; allocation alone omits the optional Entry. Publication does not attest existence or authority: selected reads may be missing or denied. No related resources are fetched eagerly."
                     .into(),
             ),
         }),
@@ -1065,7 +1130,7 @@ fn objective_collection_descriptor() -> InterfaceDescriptor {
                     parameter("limit", false, TypeExpr::Integer),
                     parameter("cursor", false, TypeExpr::String),
                 ],
-                returns: json_return("Bounded Objective query with cursor metadata and item paths"),
+                returns: results::declaration(true),
             },
             OperationDeclaration {
                 name: "create".into(),
@@ -1079,7 +1144,7 @@ fn objective_collection_descriptor() -> InterfaceDescriptor {
                     parameter("state", false, TypeExpr::String),
                     parameter("linked_tickets", false, list_of(TypeExpr::String)),
                 ],
-                returns: json_return("Created Objective with bounded context"),
+                returns: results::declaration(false),
             },
         ],
     }
@@ -1091,7 +1156,7 @@ fn objective_item_descriptor() -> InterfaceDescriptor {
         documentation: Some(Documentation {
             summary: "Read and mutate the Objective bound to this object route".into(),
             details: Some(
-                "The Objective identity is taken exclusively from the target path; operations do not accept a second Objective id."
+                "The Objective identity is taken exclusively from the target path; operations do not accept a second Objective id. Results separate bounded data from the subject Entry and linked Ticket coordinates. Inspect the chosen Entry and its Interface before read; unavailable or denied references do not invalidate a successful mutation and must not cause replay."
                     .into(),
             ),
         }),
@@ -1146,7 +1211,7 @@ fn operation(
             details: None,
         }),
         parameters,
-        returns: json_return("Authoritative Objective detail with bounded context"),
+        returns: results::declaration(false),
     }
 }
 
@@ -1162,16 +1227,6 @@ fn parameter(name: &str, required: bool, r#type: TypeExpr) -> ParameterDeclarati
 fn list_of(items: TypeExpr) -> TypeExpr {
     TypeExpr::List {
         items: Box::new(items),
-    }
-}
-
-fn json_return(summary: &str) -> ReturnDeclaration {
-    ReturnDeclaration {
-        documentation: Some(Documentation {
-            summary: summary.into(),
-            details: None,
-        }),
-        r#type: TypeExpr::Json,
     }
 }
 
@@ -1458,21 +1513,67 @@ mod tests {
         thread,
     };
 
+    fn accept_effect(listener: &TcpListener) -> (std::net::TcpStream, String) {
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let request = loop {
+                let mut buffer = [0; 8192];
+                let len = stream.read(&mut buffer).unwrap();
+                assert!(len > 0 && bytes.len() + len <= 32 * 1024);
+                bytes.extend_from_slice(&buffer[..len]);
+                let text = String::from_utf8_lossy(&bytes);
+                if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|n| n.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break text.into_owned();
+                    }
+                }
+            };
+            if request.starts_with("POST /api/w/workspace/authorization/check ") {
+                let input: server_api::authorization::OperationAuthorizationRequest =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let body = json!({"scope":input.resource}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            } else {
+                return (stream, request);
+            }
+        }
+        panic!("expected protected provider operation after authorization");
+    }
+
     #[derive(Debug)]
-    struct MockWorkspaceClient {
+    pub(super) struct MockWorkspaceClient {
+        pub(super) auth_denied: std::sync::atomic::AtomicBool,
+        pub(super) authorizations:
+            Mutex<Vec<server_api::authorization::OperationAuthorizationRequest>>,
         responses: Mutex<VecDeque<crate::worker::WorkspaceResponse>>,
         requests: Mutex<Vec<WorkspaceRequest>>,
     }
 
     impl MockWorkspaceClient {
-        fn new(responses: impl IntoIterator<Item = crate::worker::WorkspaceResponse>) -> Self {
+        pub(super) fn new(
+            responses: impl IntoIterator<Item = crate::worker::WorkspaceResponse>,
+        ) -> Self {
             Self {
+                auth_denied: std::sync::atomic::AtomicBool::new(false),
+                authorizations: Mutex::new(Vec::new()),
                 responses: Mutex::new(responses.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
             }
         }
 
-        fn requests(&self) -> Vec<WorkspaceRequest> {
+        pub(super) fn requests(&self) -> Vec<WorkspaceRequest> {
             self.requests
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1497,6 +1598,23 @@ mod tests {
             &self,
             request: WorkspaceRequest,
         ) -> Result<crate::worker::WorkspaceResponse, crate::worker::WorkspaceClientError> {
+            if request.path.ends_with("/authorization/check") {
+                let input: server_api::authorization::OperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                self.authorizations.lock().unwrap().push(input.clone());
+                if self.auth_denied.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(crate::worker::WorkspaceResponse {
+                        content_type: None,
+                        status: 403,
+                        body: "{}".into(),
+                    });
+                }
+                return Ok(crate::worker::WorkspaceResponse {
+                    content_type: None,
+                    status: 200,
+                    body: serde_json::json!({"scope": input.resource}).to_string(),
+                });
+            }
             self.requests
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1513,8 +1631,9 @@ mod tests {
         }
     }
 
-    fn objective_response(title: &str) -> crate::worker::WorkspaceResponse {
+    pub(super) fn objective_response(title: &str) -> crate::worker::WorkspaceResponse {
         crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({
                 "id": "00001OBJECTIVE",
@@ -1584,10 +1703,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 8192];
-            let len = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..len]);
+            let (mut stream, request) = accept_effect(&listener);
             assert!(
                 request.starts_with("POST /api/w/workspace/objectives/00001INTERNAL/show HTTP/1.1")
             );
@@ -1639,10 +1755,7 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             for mutation in ["POST", "DELETE"] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0_u8; 8192];
-                let len = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..len]);
+                let (mut stream, request) = accept_effect(&listener);
                 assert!(request.starts_with("GET /api/w/workspace/tickets/00001INTERNAL HTTP/1.1"));
                 let response_body = serde_json::json!({"resource_key": "T-7"}).to_string();
                 write!(
@@ -1653,10 +1766,7 @@ mod tests {
                 )
                 .unwrap();
 
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut buffer = [0_u8; 8192];
-                let len = stream.read(&mut buffer).unwrap();
-                let request = String::from_utf8_lossy(&buffer[..len]);
+                let (mut stream, request) = accept_effect(&listener);
                 assert!(request.starts_with(&format!(
                     "{mutation} /api/w/workspace/objectives/O-3/ticket-links"
                 )));
@@ -1767,6 +1877,9 @@ mod tests {
             )),
             permissions: None,
             collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let initial = resolver.resolve("O-3").unwrap();
         assert_eq!(initial.object.name, "O-3");
@@ -1896,6 +2009,9 @@ mod tests {
                 rules: Vec::new(),
             }),
             objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let result = denied
             .call(
@@ -1904,6 +2020,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await;
@@ -1918,7 +2035,9 @@ mod tests {
         let collection = ObjectiveCollectionWipHandler {
             backend,
             permissions: None,
-            collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let result = collection
             .call(
@@ -1927,6 +2046,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await;
@@ -1942,6 +2062,7 @@ mod tests {
     #[tokio::test]
     async fn native_create_read_state_and_ticket_links_use_existing_backend_routes() {
         let ticket_response = || crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: json!({"resource_key": "T-7"}).to_string(),
         };
@@ -1959,11 +2080,14 @@ mod tests {
         let collection = ObjectiveCollectionWipHandler {
             backend: backend.clone(),
             permissions: None,
-            collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let context = || WipCallContext {
             execution: ToolExecutionContext::direct(),
             security_context: "test".into(),
+            result_namespaces: Default::default(),
         };
         assert!(
             collection
@@ -1980,6 +2104,9 @@ mod tests {
             backend,
             permissions: None,
             objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         assert!(item.call("read", &BTreeMap::new(), context()).await.is_ok());
         assert!(
@@ -2036,6 +2163,7 @@ mod tests {
     #[tokio::test]
     async fn native_missing_objective_and_ticket_refs_are_deterministic_not_found() {
         let missing = || crate::worker::WorkspaceResponse {
+            content_type: None,
             status: 404,
             body: "missing".into(),
         };
@@ -2044,6 +2172,9 @@ mod tests {
             backend: WorkspaceHttpObjectiveBackend::new(client),
             permissions: None,
             objective_reference: "O-404".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         for (operation, arguments) in [
             ("read", BTreeMap::new()),
@@ -2059,6 +2190,7 @@ mod tests {
                     WipCallContext {
                         execution: ToolExecutionContext::direct(),
                         security_context: "test".into(),
+                        result_namespaces: Default::default(),
                     },
                 )
                 .await;
@@ -2077,10 +2209,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 8192];
-            let len = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..len]);
+            let (mut stream, request) = accept_effect(&listener);
             assert!(request.starts_with("POST /api/w/workspace/objectives/query HTTP/1.1"));
             let response_body = serde_json::json!({
                 "items": [{
@@ -2113,7 +2242,9 @@ mod tests {
                 crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
             )),
             permissions: None,
-            collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let output = match handler
             .call(
@@ -2122,6 +2253,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await
@@ -2133,8 +2265,12 @@ mod tests {
         let output = crate::wip::wip_to_json(&output.value).unwrap();
         assert_eq!(output["next_cursor"], "next-page");
         assert_eq!(output["has_more"], true);
-        assert_eq!(output["objectives"][0]["path"], "/objectives/O-3");
-        assert_eq!(output["objectives"][0]["linked_tickets"][0], "T-7");
+        assert_eq!(output["items"][0]["entry"], "/objectives/O-3");
+        assert_eq!(output["items"][0]["data"]["linked_tickets"][0], "T-7");
+        assert_eq!(
+            output["items"][0]["links"]["tickets"],
+            json!([{"id":"T-7"}])
+        );
         assert!(!output.to_string().contains("00001OBJECTIVE"));
         assert!(!output.to_string().contains("00001TICKET"));
     }
@@ -2144,10 +2280,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 8192];
-            let len = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..len]);
+            let (mut stream, request) = accept_effect(&listener);
             assert!(request.starts_with("PATCH /api/w/workspace/objectives/O-3 HTTP/1.1"));
             let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
             assert!(body.contains("Changed"));
@@ -2183,12 +2316,18 @@ mod tests {
             backend: backend.clone(),
             permissions: None,
             collection_route: "/objectives".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let before = resolver.resolve("O-3").unwrap().object.validator;
         let handler = ObjectiveItemWipHandler {
             backend,
             permissions: None,
             objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
         };
         let output = match handler
             .call(
@@ -2197,6 +2336,7 @@ mod tests {
                 WipCallContext {
                     execution: ToolExecutionContext::direct(),
                     security_context: "test".into(),
+                    result_namespaces: Default::default(),
                 },
             )
             .await
@@ -2206,8 +2346,8 @@ mod tests {
         };
         server.join().unwrap();
         let output = crate::wip::wip_to_json(&output.value).unwrap();
-        assert_eq!(output["objective"], "O-3");
-        assert_eq!(output["title"], "Changed");
+        assert_eq!(output["data"]["objective"], "O-3");
+        assert_eq!(output["data"]["title"], "Changed");
         let after = resolver.resolve("O-3").unwrap().object.validator;
         assert_eq!(before, after);
     }
@@ -2220,5 +2360,89 @@ mod tests {
             "state": "active"
         });
         assert!(objective_output("created".to_string(), &response).is_err());
+    }
+    #[tokio::test]
+    async fn denied_objective_tools_and_wip_do_not_reach_provider() {
+        for (operation, input) in [
+            (ObjectiveOperation::List, json!({})),
+            (ObjectiveOperation::Show, json!({"id":"O-3"})),
+            (ObjectiveOperation::Create, json!({"title":"new"})),
+            (ObjectiveOperation::Edit, json!({"id":"O-3", "title":"new"})),
+            (
+                ObjectiveOperation::SetState,
+                json!({"id":"O-3", "state":"active"}),
+            ),
+            (
+                ObjectiveOperation::LinkTicket,
+                json!({"id":"O-3", "ticket_id":"T-7"}),
+            ),
+            (
+                ObjectiveOperation::UnlinkTicket,
+                json!({"id":"O-3", "ticket_id":"T-7"}),
+            ),
+        ] {
+            let client = Arc::new(MockWorkspaceClient::new([]));
+            client
+                .auth_denied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let tool = WorkspaceHttpObjectiveTool {
+                backend: WorkspaceHttpObjectiveBackend::new(client.clone()),
+                operation,
+            };
+            let error = tool
+                .execute(&input.to_string(), ToolExecutionContext::direct())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("denied=true"));
+            assert!(client.requests().is_empty());
+            let auth = client.authorizations.lock().unwrap();
+            assert_eq!(auth.len(), 1);
+            assert!(
+                matches!(&auth[0].resource, PermissionResource::Workspace { workspace_id } | PermissionResource::Objective { workspace_id, .. } | PermissionResource::Ticket { workspace_id, .. } if workspace_id == "workspace")
+            );
+        }
+        let client = Arc::new(MockWorkspaceClient::new([objective_response("one")]));
+        let backend = WorkspaceHttpObjectiveBackend::new(client.clone());
+        backend.read_value("O-3", None, None).await.unwrap();
+        client
+            .auth_denied
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let item = ObjectiveItemWipHandler {
+            backend,
+            permissions: None,
+            objective_reference: "O-3".into(),
+            result_routes: results::Routes {
+                objective: "/objectives".into(),
+            },
+        };
+        let result = item
+            .call(
+                "read",
+                &BTreeMap::new(),
+                WipCallContext {
+                    execution: ToolExecutionContext::direct(),
+                    security_context: "test".into(),
+                    result_namespaces: Default::default(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(WipOperationError::Protocol(ProtocolError {
+                code: ProtocolErrorCode::PermissionDenied,
+                ..
+            }))
+        ));
+        assert_eq!(client.requests().len(), 1);
+        let auth = client.authorizations.lock().unwrap();
+        assert_eq!(auth.len(), 2);
+        assert_eq!(auth[1].operation, "objective.read");
+        assert_eq!(
+            auth[1].resource,
+            PermissionResource::Objective {
+                workspace_id: "workspace".into(),
+                objective_id: "O-3".into()
+            }
+        );
     }
 }

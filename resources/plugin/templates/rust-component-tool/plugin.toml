@@ -1,20 +1,21 @@
-schema_version = 1
+schema_version = 2
 id = "example.rust_component_tool"
 name = "Rust Component Tool Template"
 version = "0.1.0"
 surfaces = ["tool"]
-permissions = [
-  { kind = "surface", surface = "tool" },
-  { kind = "tool", name = "example_echo" },
-]
+config_schema = "{}"
+requested_grants = []
 
 [runtime]
 kind = "wasm-component"
 component = "plugin.component.wasm"
-world = "yoi:plugin/tool@1.0.0"
+world = "yoi:plugin/tool-plugin@2.0.0"
+required_imports = []
 
 [[tools]]
 name = "example_echo"
 description = "Echo input text using the Rust PDK."
 input_schema = { type = "object", properties = { text = { type = "string" } }, required = ["text"], additionalProperties = false }
+output_schema = { type = "object", properties = { tool = { type = "string" }, text = { type = "string" } }, required = ["tool", "text"], additionalProperties = false }
+error_codes = ["invalid_input", "invalid_output", "serialization", "unsupported_tool", "failed"]
 external_write = false

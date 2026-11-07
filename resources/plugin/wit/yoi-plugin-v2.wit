@@ -1,0 +1,49 @@
+package yoi:plugin@2.0.0;
+
+/// Only plugin-specific payloads use schema-validated JSON. Context is not authority.
+interface tool {
+  record invocation {
+    invocation-id: string,
+    tool-name: string,
+    input-json: string,
+    config-json: string,
+    remaining-ms: u32,
+  }
+  record output {
+    summary: string,
+    content: option<string>,
+    structured-json: option<string>,
+  }
+  record tool-error {
+    code: string,
+    message: string,
+  }
+  invoke: func(input: invocation) -> result<output, tool-error>;
+}
+
+/// Pure computation: no ambient WASI or unused Host capabilities.
+world tool-plugin {
+  export tool;
+}
+
+world https-tool-plugin {
+  import yoi:host/errors@2.0.0;
+  import yoi:host/connections@2.0.0;
+  import yoi:host/http@2.0.0;
+  export tool;
+}
+
+/// Logging is an explicit capability, never an ambient console.
+world logged-tool-plugin {
+  import yoi:host/errors@2.0.0;
+  import yoi:host/logging@2.0.0;
+  export tool;
+}
+
+world https-logged-tool-plugin {
+  import yoi:host/errors@2.0.0;
+  import yoi:host/connections@2.0.0;
+  import yoi:host/http@2.0.0;
+  import yoi:host/logging@2.0.0;
+  export tool;
+}

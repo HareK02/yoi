@@ -37,6 +37,7 @@ impl SqliteWorkspaceAuthority {
                 "Ticket browse supports only updated_desc".into(),
             ));
         }
+        self.normalize_parent_filter(&mut query.parent)?;
         query.sort = Some("updated_desc".into());
         query.states.sort_by_key(|state| state.as_str());
         query.states.dedup();
@@ -187,6 +188,15 @@ fn page_sql(
         values.push(Value::Text(value));
         format!("?{}", values.len())
     };
+    if let Some(parent) = &query.parent {
+        match parent {
+            ticket::TicketParentFilter::None {} => predicates.push("NOT EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id IS NOT NULL)".into()),
+            ticket::TicketParentFilter::Parent { ticket } => {
+                let parent = bind(ticket.clone());
+                predicates.push(format!("EXISTS (SELECT 1 FROM typed_ticket_parent_links p WHERE p.workspace_id=t.workspace_id AND p.ticket_id=t.ticket_id AND p.parent_ticket_id={parent})"));
+            }
+        }
+    }
     if !query.states.is_empty() {
         let states = query
             .states
@@ -211,6 +221,10 @@ fn page_sql(
         if let Some(principal) = &query.assigned_principal {
             use ticket::TicketAssignmentPrincipalSnapshot::*;
             terms.push(match principal {
+                Subject { subject_id } => format!(
+                    "a.principal_kind='subject' AND a.principal_id={}",
+                    bind(subject_id.clone())
+                ),
                 WorkspaceAgent { agent_key } => format!(
                     "a.principal_kind='workspace_agent' AND a.principal_id={}",
                     bind(agent_key.clone())
@@ -342,6 +356,7 @@ fn enrich_page(
     let mut statement = conn.prepare(&format!("SELECT a.ticket_id,json_object(
         'workspace_id',a.workspace_id,'ticket_id',a.ticket_id,'assignment_id',a.assignment_id,'role',a.role,
         'principal',json(CASE a.principal_kind
+          WHEN 'subject' THEN json_object('kind','subject','subject_id',a.principal_id)
           WHEN 'workspace_agent' THEN json_object('kind','workspace_agent','agent_key',a.principal_id)
           WHEN 'user' THEN json_object('kind','user','account_id',a.principal_id)
           WHEN 'worker' THEN json_object('kind','worker','runtime_id',a.runtime_id,'worker_id',a.worker_id) END),

@@ -95,6 +95,7 @@ fn migrate_content_state_v85_to_v86(conn: &Connection) -> Result<()> {
         // Converge on the canonical schema for both legacy creation paths.
         tx.execute_batch("CREATE INDEX IF NOT EXISTS worker_create_reservations_worker ON worker_create_reservations(workspace_id, worker_id);")?;
         if column_exists(&tx, "backend_jobs", "input_revision")? {
+            backend_job_upgrade::capture_before_content_cutover(&tx)?;
             let jobs = {
                 let mut stmt =
                     tx.prepare("SELECT workspace_id,job_id,request_json FROM backend_jobs")?;

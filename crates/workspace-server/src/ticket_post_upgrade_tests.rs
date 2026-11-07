@@ -53,16 +53,26 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     let old_attributes = stored_fixture_rows(&conn, "typed_ticket_event_attributes");
     let old_references = stored_fixture_rows(&conn, "typed_ticket_event_references");
     let old_markers = stored_fixture_rows(&conn, "ticket_schema_migrations");
+    let old_history = workspace_schema_migration_history(&conn).unwrap();
+    assert_eq!(old_history, vec![(93, SCHEMA_BASELINE_NAME.into())]);
     drop(conn);
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 93);
+    assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
     assert_eq!(
-        plan.migrations
+        plan.migrations,
+        MIGRATIONS
             .iter()
-            .map(|step| step.version)
-            .collect::<Vec<_>>(),
-        (94..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            .filter(|migration| migration.version > 93)
+            .map(|migration| WorkspaceSchemaMigrationStep {
+                version: migration.version,
+                name: migration.name.into(),
+            })
+            .collect::<Vec<_>>()
     );
+    let expected_history: Vec<_> = old_history.into_iter()
+        .chain(plan.migrations.iter().map(|step| (step.version, step.name.clone())))
+        .collect();
     let conn = Connection::open(&path).unwrap();
     assert!(
         column_exists(&conn, "typed_tickets", "body").unwrap(),
@@ -77,13 +87,24 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store.with_conn(|conn| {
         assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
+        assert_eq!(workspace_schema_migration_history(conn)?, expected_history);
         assert!(!column_exists(conn,"typed_tickets","body")?);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_events"),old_events);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_event_attributes"),old_attributes);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_event_references"),old_references);
         let markers = stored_fixture_rows(conn,"ticket_schema_migrations");
         assert_eq!(&markers[..old_markers.len()],old_markers.as_slice());
-        assert_eq!(markers.len(),old_markers.len()+2);
+        assert_eq!(markers.len(),old_markers.len()+6);
+        let new_markers: Vec<(i64,String)> = conn.prepare("SELECT version,name FROM ticket_schema_migrations WHERE version>11 ORDER BY version")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        assert_eq!(new_markers,vec![
+            (12,"Canonical Ticket posts".into()),
+            (13,"Ticket content change facts".into()),
+            (14,"Subject Ticket responsibility".into()),
+            (15,"Ticket Service transactional outbox".into()),
+            (16,"Ticket work-decomposition parent links".into()),
+            (17,"Retire Ticket orchestration plans into historical comments".into()),
+        ]);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM typed_ticket_service_outbox",[],|r|r.get::<_,i64>(0))?,0,"migration does not invent Service delivery facts");
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM typed_ticket_content_changes",[],|r|r.get::<_,i64>(0))?,0,"migration does not invent content change facts");
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM ticket_assignment_content_inputs",[],|r|r.get::<_,i64>(0))?,0,"migration does not turn historical edits into new inputs");
         let initial: (String,Option<String>,Option<String>,String,String) = conn.query_row("SELECT e.body,t.created_by,e.author,e.kind,e.event_ref FROM typed_tickets t JOIN typed_ticket_events e USING(workspace_id,ticket_id) WHERE t.ticket_id='authored' AND e.event_index=-1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
@@ -124,6 +145,7 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     reopened
         .with_conn(|conn| {
+            assert_eq!(workspace_schema_migration_history(conn)?, expected_history);
             assert_eq!(
                 conn.query_row(
                     "SELECT COUNT(*) FROM typed_ticket_events WHERE event_index=-1",
@@ -139,6 +161,19 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
                     |r| r.get::<_, i64>(0)
                 )?,
                 1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT name FROM ticket_schema_migrations WHERE version=15",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?,
+                "Ticket Service transactional outbox"
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM typed_ticket_service_outbox", [], |r| r
+                    .get::<_, i64>(0))?,
+                0
             );
             Ok(())
         })

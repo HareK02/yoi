@@ -66,7 +66,10 @@ impl RuntimeWorkerFactory for CapturingFactory {
     async fn spawn_controller(
         &self,
         mut request: worker_runtime::execution::WorkerExecutionSpawnRequest,
-    ) -> std::result::Result<RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         let archive = worker_runtime::profile_archive::ProfileSourceArchive::build(
             worker_runtime::profile_archive::ProfileSourceArchiveInput {
                 id: "profile-source-archive:restored-parent".into(),
@@ -93,7 +96,7 @@ impl RuntimeWorkerFactory for CapturingFactory {
     async fn preflight_restore(
         &self,
         request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreFailure> {
         self.inner.preflight_restore(request).await
     }
     async fn recover_restore_source(
@@ -410,6 +413,7 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             .send_input(
                 &parent,
                 WorkerInputRequest {
+                    source: None,
                     kind: WorkerInputKind::UserIfIdle,
                     content: "parent bootstrap".into(),
                     submission_request_id: None,
@@ -441,6 +445,7 @@ async fn restored_runtime_parent_lists_and_inputs_existing_child() {
             .stop_worker(
                 &parent,
                 WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("restart parent".into()),
                     ticket_assignment: None,
                 },

@@ -6,6 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+error-contract.workspace = true
+schemars.workspace = true
 feature-storage.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -21,4 +23,5 @@ futures.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile.workspace = true

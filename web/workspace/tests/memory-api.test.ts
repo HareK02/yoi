@@ -271,24 +271,25 @@ Deno.test("Subject list parser preserves the exact bounded response", () => {
 
 Deno.test("Subject create request mirrors Backend role validation without rewriting input", () => {
   assertEquals(
-    validateSubjektivSubjectCreateRequest({ role: "  Release coordinator  " }),
-    { role: "  Release coordinator  ", behavior_md: "" },
+    validateSubjektivSubjectCreateRequest({ operation_id: "create-attempt", role: "  Release coordinator  " }),
+    { operation_id: "create-attempt", role: "  Release coordinator  ", behavior_md: "" },
   );
   assertThrows(
-    () => validateSubjektivSubjectCreateRequest({ role: "   " }),
+    () => validateSubjektivSubjectCreateRequest({ operation_id: "create-attempt", role: "   " }),
     "must not be empty",
   );
   assertThrows(
-    () => validateSubjektivSubjectCreateRequest({ role: "line\nbreak" }),
+    () => validateSubjektivSubjectCreateRequest({ operation_id: "create-attempt", role: "line\nbreak" }),
     "control characters",
   );
   assertThrows(
-    () => validateSubjektivSubjectCreateRequest({ role: "界".repeat(86) }),
+    () => validateSubjektivSubjectCreateRequest({ operation_id: "create-attempt", role: "界".repeat(86) }),
     "at most 256 bytes",
   );
   assertThrows(
     () =>
       validateSubjektivSubjectCreateRequest({
+        operation_id: "create-attempt",
         role: "Reviewer",
         behavior_md: " ".repeat(3),
       }),
@@ -297,11 +298,41 @@ Deno.test("Subject create request mirrors Backend role validation without rewrit
   assertThrows(
     () =>
       validateSubjektivSubjectCreateRequest({
+        operation_id: "create-attempt",
         role: "Reviewer",
         behavior_md: "x".repeat(16 * 1024 + 1),
       }),
     "at most 16384 bytes",
   );
+});
+
+Deno.test("Subject create rejects invalid operation IDs before sending without rewriting them", async () => {
+  let calls = 0;
+  const fetchFn = (async () => {
+    calls += 1;
+    return Response.json(subject());
+  }) as typeof fetch;
+  for (const operationId of [
+    undefined, null, 12, "", " ", " leading", "trailing ", "create*",
+    "line\nbreak", "control\u007F", "x".repeat(257), "界".repeat(86),
+  ]) {
+    const request = JSON.parse(JSON.stringify({
+      operation_id: operationId,
+      role: "Reviewer",
+    }));
+    await assertSubjectCreateRejects(
+      () => createSubjektivSubject(fetchFn, "workspace", request),
+      "validation",
+      "Subject operation_id",
+    );
+  }
+  assertEquals(calls, 0);
+  for (const operationId of [crypto.randomUUID(), "x".repeat(256), "界".repeat(85)]) {
+    assertEquals(
+      validateSubjektivSubjectCreateRequest({ operation_id: operationId, role: "Reviewer" }),
+      { operation_id: operationId, role: "Reviewer", behavior_md: "" },
+    );
+  }
 });
 
 Deno.test("Subject behavior update uses CAS and preserves exact text", async () => {
@@ -363,6 +394,7 @@ Deno.test("Subject create client sends the exact typed body once and parses the 
   }) as typeof fetch;
 
   const created = await createSubjektivSubject(fetchFn, "workspace one", {
+    operation_id: "create-attempt",
     role: "  Release coordinator  ",
     behavior_md: "Stay concise.",
   });
@@ -376,7 +408,7 @@ Deno.test("Subject create client sends the exact typed body once and parses the 
   assertEquals(requests[0].init?.method, "POST");
   assertEquals(
     requests[0].init?.body,
-    '{"role":"  Release coordinator  ","behavior_md":"Stay concise."}',
+    '{"operation_id":"create-attempt","role":"  Release coordinator  ","behavior_md":"Stay concise."}',
   );
 });
 
@@ -396,6 +428,7 @@ Deno.test("Subject create client distinguishes rejected and unknown outcomes wit
   await assertSubjectCreateRejects(
     () =>
       createSubjektivSubject(rejectedFetch, "workspace-1", {
+        operation_id: "create-attempt",
         role: "Reviewer",
       }),
     "rejected",
@@ -412,6 +445,7 @@ Deno.test("Subject create client distinguishes rejected and unknown outcomes wit
   await assertSubjectCreateRejects(
     () =>
       createSubjektivSubject(serverErrorFetch, "workspace-1", {
+        operation_id: "create-attempt",
         role: "Reviewer",
       }),
     "unknown_outcome",
@@ -428,6 +462,7 @@ Deno.test("Subject create client distinguishes rejected and unknown outcomes wit
   await assertSubjectCreateRejects(
     () =>
       createSubjektivSubject(mismatchFetch, "workspace-1", {
+        operation_id: "create-attempt",
         role: "Reviewer",
       }),
     "unknown_outcome",
@@ -441,11 +476,63 @@ Deno.test("Subject create client distinguishes rejected and unknown outcomes wit
     throw new TypeError("connection reset");
   }) as typeof fetch;
   await assertSubjectCreateRejects(
-    () => createSubjektivSubject(unknownFetch, "workspace-1", { role: "Reviewer" }),
+    () => createSubjektivSubject(unknownFetch, "workspace-1", { operation_id: "create-attempt", role: "Reviewer" }),
     "unknown_outcome",
     "may have been created",
   );
   assertEquals(unknownCalls, 1);
+});
+
+Deno.test("Subject create exact retry retains serialized operation ID and full input after unknown outcomes", async () => {
+  for (const failure of ["transport", "server", "malformed", "mismatched"] as const) {
+    const request = Object.freeze({
+      operation_id: crypto.randomUUID(),
+      role: "  Release coordinator  ",
+      behavior_md: "Stay concise.\nPreserve exact text.\n",
+    });
+    const bodies: unknown[] = [];
+    const created = { ...subject(), role: request.role, behavior_md: request.behavior_md };
+    const fetchFn = (async (_path: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body);
+      if (bodies.length === 1) {
+        if (failure === "transport") throw new TypeError("connection reset");
+        if (failure === "server") return Response.json({ error: "Internal Server Error" }, { status: 500 });
+        if (failure === "malformed") return new Response("not JSON", { status: 201 });
+        return Response.json({ ...created, behavior_md: "Different input" }, { status: 201 });
+      }
+      return Response.json(created, { status: 201 });
+    }) as typeof fetch;
+    await assertSubjectCreateRejects(
+      () => createSubjektivSubject(fetchFn, "workspace", request),
+      "unknown_outcome",
+      "Retry only the same operation_id and full request",
+      failure === "server" ? 500 : null,
+    );
+    assertEquals(bodies, [JSON.stringify(request)]);
+    assertEquals(await createSubjektivSubject(fetchFn, "workspace", request), created);
+    assertEquals(bodies, [JSON.stringify(request), JSON.stringify(request)]);
+  }
+});
+
+Deno.test("Subject create conflict and deleted-Subject rejection never trigger a fresh operation", async () => {
+  for (const [status, message] of [
+    [409, "operation_id already used with different input"],
+    [404, "Subject was deleted"],
+  ] as const) {
+    const request = { operation_id: crypto.randomUUID(), role: "Reviewer", behavior_md: "Changed input" };
+    const bodies: unknown[] = [];
+    const fetchFn = (async (_path: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body);
+      return Response.json({ message }, { status });
+    }) as typeof fetch;
+    await assertSubjectCreateRejects(
+      () => createSubjektivSubject(fetchFn, "workspace", request),
+      "rejected",
+      message,
+      status,
+    );
+    assertEquals(bodies, [JSON.stringify(request)]);
+  }
 });
 
 Deno.test("Resident surface parser accepts ready-empty and enforces snapshot invariants", () => {

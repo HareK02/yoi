@@ -116,6 +116,7 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },
@@ -166,7 +167,7 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
             "external" => assert!(matches!(
                 error,
                 Error::RuntimeOperationFailed { code, .. }
-                    if code == "external_workdir_provider_offline"
+                    if code == "external_workdir_provider_connection_missing"
             )),
             "repository" => assert!(matches!(
                 error,
@@ -186,6 +187,7 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
         .stop_worker(
             &worker,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },

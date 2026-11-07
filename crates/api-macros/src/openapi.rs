@@ -39,6 +39,19 @@ pub trait OpenApiSchema: JsonSchema {
     fn openapi_schema_name() -> Cow<'static, str> {
         Self::schema_name()
     }
+
+    /// Select the exact wire schema for an explicitly declared response media type.
+    /// Custom error adapters may have distinct JSON and Problem Details bodies;
+    /// this avoids claiming an ambiguous untagged body union for either medium.
+    fn response_schema(
+        builder: &mut OpenApiBuilder,
+        _content_type: &str,
+    ) -> Result<Value, OpenApiError>
+    where
+        Self: Sized,
+    {
+        builder.schema_ref::<Self>()
+    }
 }
 
 macro_rules! impl_openapi_schema {
@@ -256,7 +269,8 @@ impl OpenApiBuilder {
         Ok(OpenApiDocument(document))
     }
 
-    fn schema_ref<T: OpenApiSchema>(&mut self) -> Result<Value, OpenApiError> {
+    /// Register an explicitly asserted wire schema, retaining collision and bounds checks.
+    pub fn schema_ref<T: OpenApiSchema>(&mut self) -> Result<Value, OpenApiError> {
         let name = T::openapi_schema_name().into_owned();
         validate_component_name(&name)?;
 
@@ -411,13 +425,39 @@ impl OpenApiOperation<'_> {
         content_type: &'static str,
         description: &'static str,
     ) -> Result<(), OpenApiError> {
-        let schema = self.parent.schema_ref::<T>()?;
+        self.response_content_types::<T>(status, &[content_type], description)
+    }
+
+    /// Declare one response schema under several explicit representations, atomically.
+    /// This does not change conflict detection for repeated status declarations.
+    pub fn response_content_types<T: OpenApiSchema>(
+        &mut self,
+        status: u16,
+        content_types: &[&str],
+        description: &'static str,
+    ) -> Result<(), OpenApiError> {
+        let mut content = Map::new();
+        for content_type in content_types {
+            let schema = T::response_schema(self.parent, content_type)?;
+            if content
+                .insert((*content_type).to_owned(), json!({ "schema": schema }))
+                .is_some()
+            {
+                return Err(OpenApiError::InvalidContract(format!(
+                    "duplicate response content type for `{}`",
+                    self.operation_id
+                )));
+            }
+        }
+        if content.is_empty() {
+            return Err(OpenApiError::InvalidContract(format!(
+                "response content types are empty for `{}`",
+                self.operation_id
+            )));
+        }
         self.insert_response(
             status,
-            json!({
-                "description": description,
-                "content": { content_type: { "schema": schema } },
-            }),
+            json!({ "description": description, "content": content }),
         )
     }
 

@@ -52,6 +52,28 @@ impl Hook<PreToolCall> for PermissionHook {
     }
 }
 
+// Only prune schemas when every possible argument is denied. Conditional
+// rules remain visible and are checked by the normal execution boundary.
+// This is surface composition, not another permission source.
+pub(crate) fn tool_is_unconditionally_denied(
+    config: &ToolPermissionConfig,
+    tool_name: &str,
+) -> bool {
+    for rule in config
+        .rules
+        .iter()
+        .filter(|rule| rule.tool.eq_ignore_ascii_case(tool_name))
+    {
+        if rule.action != ToolPermissionAction::Deny {
+            return false;
+        }
+        if !rule.pattern.is_empty() && rule.pattern.bytes().all(|byte| byte == b'*') {
+            return true;
+        }
+    }
+    config.default_action == ToolPermissionAction::Deny
+}
+
 pub(crate) fn permission_action_for(
     config: &ToolPermissionConfig,
     tool_name: &str,
@@ -136,6 +158,32 @@ mod tests {
             tool_name: tool_name.into(),
             arguments,
         }
+    }
+
+    #[test]
+    fn static_tool_pruning_respects_rule_order_and_never_hides_conditional_allow() {
+        let mut policy = ToolPermissionConfig {
+            default_action: ToolPermissionAction::Deny,
+            rules: Vec::new(),
+        };
+        assert!(tool_is_unconditionally_denied(&policy, "Bash"));
+        policy.rules.push(ToolPermissionRule {
+            tool: "bash".into(),
+            pattern: "git *".into(),
+            action: ToolPermissionAction::Allow,
+        });
+        assert!(!tool_is_unconditionally_denied(&policy, "Bash"));
+        policy.rules.push(ToolPermissionRule {
+            tool: "Bash".into(),
+            pattern: "*".into(),
+            action: ToolPermissionAction::Deny,
+        });
+        assert!(!tool_is_unconditionally_denied(&policy, "Bash"));
+        policy.rules.swap(0, 1);
+        assert!(tool_is_unconditionally_denied(&policy, "Bash"));
+        policy.default_action = ToolPermissionAction::Allow;
+        assert!(tool_is_unconditionally_denied(&policy, "Bash"));
+        assert!(!tool_is_unconditionally_denied(&policy, "Read"));
     }
 
     #[test]

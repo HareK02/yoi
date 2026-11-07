@@ -61,6 +61,39 @@ const tags: readonly WorkspaceTag[] = Object.freeze([
   }),
 ]);
 
+Deno.test("parent filters compose with standard filters without leaking into free text", () => {
+  const request = compileTicketSearch(
+    "parent:T-804 state:closed reason:duplicate tag:Ready assignee:orchestrator retain words",
+    tags,
+  );
+  assertEquals(request.parent, { kind: "parent", ticket: "T-804" });
+  assertEquals(request.states, ["closed"]);
+  assertEquals(request.closure_reason, "duplicate");
+  assertEquals(request.tag_ids, ["tag-1"]);
+  assertEquals(request.assigned_principal, {
+    kind: "workspace_agent",
+    agent_key: "workspace-orchestrator",
+  });
+  assertEquals(request.query, "retain words");
+  assertEquals(compileTicketSearch("parent:none parent:none", tags).parent, {
+    kind: "none",
+  });
+  assertEquals(
+    compileTicketSearch('"parent:none" other:field', tags).query,
+    "parent:none other:field",
+  );
+  assertEquals(compileTicketSearch("ordinary text", tags).parent, undefined);
+});
+
+Deno.test("parent filters reject empty invalid and conflicting choices", () => {
+  assertSearchError("parent:", "Empty parent:");
+  for (const value of ["all", "T-0", "O-804", "T-804-title", "none-other"]) {
+    assertSearchError(`parent:${value}`, "Invalid parent:");
+  }
+  assertSearchError("parent:none parent:T-804", "Conflicting parent:");
+  assertSearchError("parent:T-804 parent:T-805", "Conflicting parent:");
+});
+
 Deno.test("only actual tag qualifiers require the tag catalog", () => {
   for (
     const input of [
@@ -325,5 +358,21 @@ Deno.test("mixed search compiles every supported filter and only remaining words
       cursor: null,
       closure_reason: { other: "Superseded plan" },
     },
+  );
+});
+
+Deno.test("Subject search preserves exact identity, rejects blanks and conflicts", () => {
+  for (const subject of ["subject-a", "subject-b"]) {
+    assertEquals(
+      compileTicketSearch("assignee:subject:" + subject, tags)
+        .assigned_principal,
+      { kind: "subject", subject_id: subject },
+    );
+  }
+  assertSearchError("assignee:subject:", "Subject identity");
+  assertSearchError('assignee:"subject:   "', "Subject identity");
+  assertSearchError(
+    "assignee:subject:a assignee:subject:b",
+    "Conflicting assignee:",
   );
 });

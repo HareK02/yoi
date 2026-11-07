@@ -7,6 +7,90 @@ use memory::extract::{CandidateKind, ExtractedCandidate, StagingEvidence, Stagin
 use memory::schema::SourceRef;
 use memory::schema::{EvidenceKind, EvidenceOrigin, EvidenceOriginKind};
 
+const MEMORY_JOB_OPERATIONS: &[&str] = &[
+    "memory.consolidation.request",
+    "memory.consolidation.supply",
+    "memory.staging.list",
+    "memory.staging.read",
+    "memory.candidate.decide",
+    "memory.query",
+    "memory.read",
+    "memory.changes.list",
+    "memory.surface.prepare",
+    "memory.surface.supply",
+    "memory.surface.publish",
+    "memory.surface.fail",
+];
+
+pub(super) fn grant_memory_operations(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
+    use server_api::authorization::{
+        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+    };
+    let store = open_subjektiv_store(api).unwrap();
+    let previous = store
+        .subject_policy_source(subject)
+        .unwrap()
+        .map(|policy| match policy {
+            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
+            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
+        });
+    store
+        .set_subject_permissions(
+            subject,
+            &SubjectPermissionsUpdate {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_change_id: previous,
+                execution: operations
+                    .iter()
+                    .map(|operation| ScopedPermission {
+                        operation: (*operation).into(),
+                        resource: PermissionResource::Subject {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            subject_id: subject.into(),
+                        },
+                    })
+                    .collect(),
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+}
+
+async fn memory_job_source(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRef {
+    grant_memory_operations(api, subject, MEMORY_JOB_OPERATIONS);
+    attach_memory_job_source(api, subject).await
+}
+
+pub(super) async fn attach_memory_job_source(
+    api: &WorkspaceApi,
+    subject: &str,
+) -> RuntimeWorkerRef {
+    seed_test_delivery_binding(api);
+    let Json(created) = create_workspace_worker(
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+            display_name: "Memory Job authority source".into(),
+            singleton_key: None,
+            profile: Some("builtin:companion".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                    subject_id: subject.into(),
+                }),
+            },
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+}
+
 fn stage(store: &crate::subjektiv::SubjektivStore, subject: &str, id: &str) {
     let origin = EvidenceOrigin {
         kind: EvidenceOriginKind::HumanInput,
@@ -46,14 +130,19 @@ fn stage(store: &crate::subjektiv::SubjektivStore, subject: &str, id: &str) {
         .stage_candidate(SubjectStagingRecord::attach(subject, record))
         .unwrap();
 }
-fn context(worker: &RuntimeWorkerRef) -> server_api::ServerRequestContext {
+fn context(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> server_api::ServerRequestContext {
+    let binding = api
+        .config_store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &worker.runtime_id)
+        .unwrap()
+        .unwrap();
     server_api::ServerRequestContext {
         actor: None,
         worker_source: None,
         runtime_source: Some(server_api::ServerRuntimeSource {
             runtime_id: worker.runtime_id.clone(),
             worker_id: Some(worker.worker_id.clone()),
-            authentication_binding_id: "fixture-binding".into(),
+            authentication_binding_id: binding.binding_id,
         }),
         origin: None,
         transport_headers: vec![],
@@ -69,7 +158,7 @@ async fn op(
         AxumPath(ScopedWorkspacePath {
             workspace_id: TEST_WORKSPACE_ID.into(),
         }),
-        context(worker),
+        context(&api, worker),
         Json(server_api::SubjektivMemoryBackendRequest { operation }),
     )
     .await
@@ -105,10 +194,12 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     let subject = store
         .create_subject(SubjectRole::new("test-subject").unwrap())
         .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
     stage(&store, &subject.id, "candidate-first");
     let started = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -129,14 +220,14 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
             .is_none()
     );
     assert_eq!(
-        subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(worker))
+        subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, worker))
             .unwrap()
             .0,
         subject.id
     );
-    assert!(subjektiv_subject_scope(&api, "foreign", &context(worker)).is_err());
+    assert!(subjektiv_subject_scope(&api, "foreign", &context(&api, worker)).is_err());
     let ordinary = spawn_ticket_check_source(&api, "not-a-consolidator");
-    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&ordinary)).is_err());
+    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, &ordinary)).is_err());
     // A premature result cannot generate a surface or complete unresolved work.
     assert!(
         op(
@@ -153,6 +244,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     let again = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -242,7 +334,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
             .unwrap()
             .is_some()
     );
-    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(worker)).is_err());
+    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, worker)).is_err());
     wait_for_backend_job_worker_cleanup(
         &api,
         &job.request.job_id,
@@ -261,6 +353,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
     let next = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -278,6 +371,99 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
 }
 
 #[tokio::test]
+async fn dirty_consolidation_survives_owner_tick_and_recovers_same_attempt_terminal_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("dirty-recovery").unwrap())
+        .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
+    store
+        .create_memory(
+            &subject.id,
+            MemoryDraft::active(CandidateKind::Lesson, "lesson", "body", "reason", "change"),
+        )
+        .unwrap();
+    let started = start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.status, "started");
+    let job = resource(&api, &subject.id);
+    let attempt = current_attempt(&api, &job);
+    let gate = api.backend_job_recovery.dispatch_gate(&attempt.attempt_id);
+    let observed = api
+        .backend_job_recovery
+        .nonjournal_lookup_pending
+        .notified();
+    tokio::pin!(observed);
+    let generation = {
+        let _guard = gate.lock().unwrap();
+        let generation = store
+            .prepare_job_surface_generation(
+                &subject.id,
+                Some((&job.request.job_id, &attempt.attempt_id)),
+            )
+            .unwrap();
+        // Register while dispatch/recovery is excluded, then permit a real owner
+        // tick before publishing any domain receipt. No timing sleep is needed.
+        observed.as_mut().enable();
+        generation
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), observed)
+        .await
+        .expect("owner must observe the prepared, still-unpublished generation");
+    assert_eq!(
+        current_attempt(&api, &job).state,
+        BackendJobAttemptState::Dispatched
+    );
+    assert_eq!(resource(&api, &subject.id).state, BackendJobState::Pending);
+    store
+        .fail_surface_generation(&subject.id, &generation.id, "model_failure")
+        .unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let saved = api
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+                .unwrap()
+                .unwrap();
+            if saved.state != BackendJobState::Pending {
+                break saved;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("same accepted Job must autonomously save its domain receipt");
+    assert_eq!(completed.state, BackendJobState::Completed);
+    let saved = current_attempt(&api, &completed);
+    assert_eq!(saved.attempt_id, attempt.attempt_id);
+    assert_eq!(saved.worker, attempt.worker);
+    assert_eq!(saved.runtime_run_id, attempt.runtime_run_id);
+    assert_eq!(saved.input_digest, attempt.input_digest);
+    assert_eq!(
+        saved.result.as_ref().unwrap()["surface"]["generation_id"],
+        generation.id
+    );
+    assert_eq!(
+        saved.result.as_ref().unwrap()["surface"]["availability"],
+        "failed"
+    );
+    assert_eq!(
+        execution.take_inputs().len(),
+        1,
+        "no second model submission"
+    );
+    api.stop_backend_job_recovery().await;
+}
+
+#[tokio::test]
 async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let (api, _) = test_api_with_recording_backend(dir.path()).await;
@@ -285,11 +471,13 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
     let subject = store
         .create_subject(SubjectRole::new("surface-only").unwrap())
         .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
     let old = store.prepare_surface_generation(&subject.id).unwrap();
     assert_eq!(
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: false }
         )
         .await
@@ -299,6 +487,14 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
     );
     let job = resource(&api, &subject.id);
     let attempt = current_attempt(&api, &job);
+    // This test exercises live-grant operations before result reconciliation.
+    // The owner may otherwise complete the ready domain surface during an await.
+    let recovery_gate = api.backend_job_recovery.dispatch_gate(&attempt.attempt_id);
+    let recovery_guard = recovery_gate.lock().unwrap();
+    assert_eq!(
+        current_attempt(&api, &job).state,
+        BackendJobAttemptState::Dispatched
+    );
     let worker = attempt.worker.as_ref().unwrap();
     assert!(
         store
@@ -364,6 +560,7 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
         result: serde_json::json!({"subject_id":subject.id,"candidate_ids":[],"surface":{"availability":"ready","generation_id":generation.id,"memory_fingerprint":generation.memory_fingerprint,"snapshot_id":snapshot.id}}),
     };
     api.accept_backend_job_result(worker, &submission).unwrap();
+    drop(recovery_guard);
     wait_for_backend_job_worker_cleanup(
         &api,
         &job.request.job_id,
@@ -375,6 +572,7 @@ async fn subjektiv_job_surface_only_requires_attempt_owned_generation_and_real_o
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: true }
         )
         .await
@@ -502,7 +700,8 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
     let subject = store
         .create_subject(SubjectRole::new("legacy-cutover").unwrap())
         .unwrap();
-    let subject_body = spawn_ticket_check_source(&api, "subject-body-protected");
+    let source = memory_job_source(&api, &subject.id).await;
+    let subject_body = source.clone();
     let key = format!("subjektiv-consolidation:{}", subject.id);
     let legacy = api
         .spawn_workspace_worker(
@@ -557,6 +756,7 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: true }
         )
         .await
@@ -590,6 +790,7 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
         start_subjektiv_staging_consolidation(
             api.clone(),
             &subject.id,
+            Some(source.clone()),
             MemoryConsolidateStagingOperation { force: true }
         )
         .await
@@ -616,6 +817,7 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
     let subject = store
         .create_subject(SubjectRole::new("result-budget").unwrap())
         .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
     for i in 0..100 {
         stage(
             &store,
@@ -626,6 +828,7 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
     start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -706,6 +909,7 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
     start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
+        Some(source.clone()),
         MemoryConsolidateStagingOperation { force: true },
     )
     .await
@@ -729,4 +933,324 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
             .len()
             > 16 * 1024
     );
+}
+
+#[tokio::test]
+async fn subjektiv_job_rechecks_current_policy_and_preserves_provider_batch_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    // Observe current-policy intersection on a live attempt, independently of
+    // recovery retiring it after input-supply revocation. Recovery has its own tests.
+    let _recovery = api.backend_job_recovery.pause_steps_for_test().await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("live-job-policy").unwrap())
+        .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
+    let mut operations = MEMORY_JOB_OPERATIONS.to_vec();
+    operations.extend(["journal.state.read", "session.record"]);
+    grant_memory_operations(&api, &subject.id, &operations);
+    stage(&store, &subject.id, "frozen-candidate");
+    start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source.clone()),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap();
+    let job = resource(&api, &subject.id);
+    assert_eq!(job.request.source_worker.as_ref(), Some(&source));
+    let attempt = current_attempt(&api, &job);
+    let worker = attempt.worker.as_ref().unwrap();
+    assert_eq!(execution.take_inputs().len(), 1);
+    for operation in ["journal.state.read", "session.record"] {
+        let request = server_api::authorization::OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::Subject {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                subject_id: subject.id.clone(),
+            },
+        };
+        assert!(subject_authorization::authorize_scope(&api, &source, &request).is_ok());
+        assert!(
+            subject_authorization::authorize_scope(&api, worker, &request).is_err(),
+            "current body policy cannot widen a consolidation Job's domain: {operation}"
+        );
+    }
+    let prepare = || {
+        server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+            server_api::SubjektivSurfacePrepareRequest {},
+        )
+    };
+    // Late arrivals never enter this attempt's frozen batch, and the pending
+    // granted candidate still prevents premature surface preparation.
+    stage(&store, &subject.id, "late-candidate");
+    assert!(
+        subjektiv_job::require_candidate_grant(&api, TEST_WORKSPACE_ID, worker, "frozen-candidate")
+            .is_ok()
+    );
+    assert!(
+        subjektiv_job::require_candidate_grant(&api, TEST_WORKSPACE_ID, worker, "late-candidate")
+            .is_err()
+    );
+    let read_candidate = |id: &str| {
+        server_api::SubjektivMemoryBackendOperation::ReadCandidate(
+            server_api::SubjektivMemoryCandidateReadRequest {
+                candidate_id: id.into(),
+            },
+        )
+    };
+    assert!(
+        op(&api, worker, read_candidate("frozen-candidate"))
+            .await
+            .is_ok()
+    );
+    assert!(
+        op(&api, worker, read_candidate("late-candidate"))
+            .await
+            .is_err()
+    );
+    grant_memory_operations(&api, &subject.id, &["memory.surface.prepare"]);
+    let error = op(&api, worker, read_candidate("frozen-candidate"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.error.to_string().contains("memory.staging.read"),
+        "{error:?}"
+    );
+    let permissions = subject_authorization::worker_permissions(&api, worker)
+        .unwrap()
+        .unwrap();
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions[0].operation, "memory.surface.prepare");
+    // Provider batch checks remain active even when operation policy allows it.
+    assert!(op(&api, worker, prepare()).await.is_err());
+    grant_memory_operations(&api, &subject.id, &[]);
+    let error = op(&api, worker, prepare()).await.unwrap_err();
+    assert!(
+        error.error.to_string().contains("memory.surface.prepare"),
+        "{error:?}"
+    );
+    assert!(
+        subject_authorization::worker_permissions(&api, worker)
+            .unwrap()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(resource(&api, &subject.id).request, job.request);
+    assert!(execution.take_inputs().is_empty());
+}
+
+#[tokio::test]
+async fn saved_job_without_frozen_source_cannot_use_non_subject_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, _) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("legacy-job-origin").unwrap())
+        .unwrap();
+    let _source = memory_job_source(&api, &subject.id).await;
+    // Reconstruct a retained pre-migration dispatched attempt through the ledger,
+    // not today's dispatcher: new dispatch itself must reject a missing origin.
+    let request = BackendJobRequest {
+        job_id: "legacy-no-operation-origin".into(),
+        purpose: "subjektiv_consolidation".into(),
+        input_ref: format!("subjektiv://{}/consolidation", subject.id),
+        input: serde_json::json!({"subject_id":subject.id,"candidate_ids":[]}),
+        instruction: "retained legacy input".into(),
+        profile: "builtin:subjektiv-memory-consolidation".into(),
+        grants: crate::backend_job::BackendJobGrants {
+            subjektiv_consolidation: Some(crate::backend_job::SubjektivConsolidationGrant {
+                subject_id: subject.id.clone(),
+                candidate_ids: vec![],
+            }),
+            ..Default::default()
+        },
+        serialization_key: None,
+        source_worker: None,
+        notification_target: None,
+        limits: Default::default(),
+    };
+    let error = subject_authorization::authorize_job_input(&api, &request).unwrap_err();
+    assert!(error.error.to_string().contains("frozen"), "{error:?}");
+    let now = Utc::now().to_rfc3339();
+    let reserved = api
+        .store
+        .reserve_backend_job(TEST_WORKSPACE_ID, &request, &now)
+        .unwrap();
+    let (_, claimed) = api
+        .store
+        .claim_backend_job_attempt_dispatch(
+            TEST_WORKSPACE_ID,
+            &request.job_id,
+            &reserved.attempt.attempt_id,
+            &now,
+        )
+        .unwrap();
+    assert!(claimed);
+    let retained_worker = spawn_ticket_check_source(&api, "retained-legacy-job");
+    api.store
+        .bind_backend_job_attempt_worker(
+            TEST_WORKSPACE_ID,
+            &request.job_id,
+            &reserved.attempt.attempt_id,
+            &retained_worker,
+            None,
+            &now,
+        )
+        .unwrap();
+    let job = resource(&api, &subject.id);
+    let attempt = current_attempt(&api, &job);
+    let worker = attempt.worker.as_ref().unwrap();
+    assert!(subjektiv_job::active_grant(&api, TEST_WORKSPACE_ID, worker).is_ok());
+    let error = op(
+        &api,
+        worker,
+        server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+            server_api::SubjektivSurfacePrepareRequest {},
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.error.to_string().contains("frozen"), "{error:?}");
+    assert!(subject_authorization::worker_permissions(&api, worker).is_err());
+    assert_eq!(resource(&api, &subject.id).request, job.request);
+}
+
+#[tokio::test]
+async fn unset_subject_consolidation_denies_before_job_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("unset-job-policy").unwrap())
+        .unwrap();
+    let source = attach_memory_job_source(&api, &subject.id).await;
+    // A legacy unset policy has no source pointer; retain the initial history fixture.
+    api.feature_storage
+        .open(&api.subjektiv_registration)
+        .unwrap()
+        .with_connection(|c| {
+            c.execute(
+                "DELETE FROM subject_permissions WHERE subject_id=?1",
+                [&subject.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(store.subject_permissions(&subject.id).unwrap().is_none());
+    stage(&store, &subject.id, "untouched");
+    let error = start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error.error, Error::WorkspacePermissionDenied(ref message) if message.contains("permissions are unset")),
+        "{error:?}"
+    );
+    assert!(execution.take_inputs().is_empty());
+    assert!(
+        api.store
+            .find_active_backend_job_for_resource(
+                TEST_WORKSPACE_ID,
+                &crate::backend_job::subjektiv_serialization_key(&subject.id)
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
+}
+
+#[tokio::test]
+async fn subject_consolidation_request_without_supply_denies_before_model_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(SubjectRole::new("job-supply-denied").unwrap())
+        .unwrap();
+    let source = memory_job_source(&api, &subject.id).await;
+    stage(&store, &subject.id, "not-supplied");
+    grant_memory_operations(&api, &subject.id, &["memory.consolidation.request"]);
+    // Observe the synchronous supply refusal before the independent recovery
+    // owner retires its still-unallocated reservation, then verify recovery too.
+    let recovery = api.backend_job_recovery.pause_steps_for_test().await;
+    let error = start_subjektiv_staging_consolidation(
+        api.clone(),
+        &subject.id,
+        Some(source),
+        MemoryConsolidateStagingOperation { force: true },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("memory.consolidation.supply"),
+        "{error:?}"
+    );
+    assert!(
+        execution.take_inputs().is_empty(),
+        "denied frozen input must not reach the model/runtime"
+    );
+    let saved = resource(&api, &subject.id);
+    let attempt = current_attempt(&api, &saved);
+    assert_eq!(attempt.state, BackendJobAttemptState::Reserved);
+    assert!(
+        attempt.worker.is_none(),
+        "supply refusal must precede claim/allocation"
+    );
+    assert_eq!(
+        saved.request.input["candidate_ids"],
+        serde_json::json!(["not-supplied"])
+    );
+    assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
+    drop(recovery);
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let current = api
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &saved.request.job_id)
+                .unwrap()
+                .unwrap();
+            if current.state == BackendJobState::Failed {
+                break current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("supply refusal must also settle through independent recovery");
+    assert_eq!(
+        failed.request, saved.request,
+        "recovery must not replace frozen input"
+    );
+    let attempts = api
+        .store
+        .list_backend_job_attempts(TEST_WORKSPACE_ID, &saved.request.job_id)
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].state, BackendJobAttemptState::Failed);
+    assert!(
+        attempts[0].worker.is_none(),
+        "recovery cannot allocate without input supply"
+    );
+    assert!(execution.take_inputs().is_empty());
+    assert!(
+        api.store
+            .find_active_backend_job_for_resource(
+                TEST_WORKSPACE_ID,
+                &crate::backend_job::subjektiv_serialization_key(&subject.id),
+            )
+            .unwrap()
+            .is_none(),
+        "the retired reservation is no longer active"
+    );
+    assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
 }

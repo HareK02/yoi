@@ -5,7 +5,7 @@
 //! Retained migration SQL establishes origins only for reconciled assignment-specific legacy
 //! Queue fences; migration does not reinterpret historical comments as new requests.
 //!
-//! Reserve and prepare recheck delegation, singleton and live binding under
+//! Reserve and prepare recheck delegation, Subject body and live binding under
 //! IMMEDIATE ownership. ACK instead verifies the target authorized before I/O;
 //! a later responsibility change must not erase Runtime acceptance evidence.
 //! Persist the entire rendered request before Runtime I/O, then reuse
@@ -141,16 +141,23 @@ pub(super) fn list_in_tx(
     conn: &Connection,
     workspace_id: &str,
     limit: usize,
+    subject_id: Option<&str>,
 ) -> Result<Vec<TicketAssignmentDelivery>> {
     if !(1..=100).contains(&limit) {
         return Err(Error::InvalidInput("Delivery limit must be 1..100".into()));
     }
-    notification_routing::pending_sources(conn, workspace_id, "orchestrator", limit)?
-        .into_iter()
-        .map(|(ticket, assignment, input, id)| {
-            delivery(conn, workspace_id, ticket, assignment, input, id)
-        })
-        .collect()
+    notification_routing::pending_sources_for_subject(
+        conn,
+        workspace_id,
+        "orchestrator",
+        limit,
+        subject_id,
+    )?
+    .into_iter()
+    .map(|(ticket, assignment, input, id)| {
+        delivery(conn, workspace_id, ticket, assignment, input, id)
+    })
+    .collect()
 }
 fn delivery(
     conn: &Connection,
@@ -199,7 +206,7 @@ fn source_guard(
         workspace_id,
         &source.runtime_id,
         &source.worker_id,
-        &source.agent_key,
+        &source.subject_id,
         &source.authentication_binding_id,
     )
 }
@@ -226,7 +233,31 @@ pub(super) fn require_current(
     Ok(())
 }
 
-// Call only after source_guard and require_current in the reservation/preparation
+// Runtime source authentication alone is insufficient: two live Subject bodies can
+// coexist in one Workspace. Fence the recipient's Subject before any receipt replay
+// or target authorization, in the same write transaction as the delivery/start.
+fn require_assignment_target(
+    conn: &Connection,
+    workspace_id: &str,
+    ticket_id: &str,
+    assignment_id: &str,
+    subject_id: &str,
+) -> Result<()> {
+    require_current(conn, workspace_id, ticket_id, assignment_id)?;
+    let matches: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ticket_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND assignment_id=?3 AND role='orchestrator' AND principal_kind='subject' AND principal_id=?4)",
+        params![workspace_id, ticket_id, assignment_id, subject_id],
+        |row| row.get(0),
+    )?;
+    if !matches {
+        return Err(Error::WorkspacePermissionDenied(
+            "Delivery/start target Subject differs from the current assignment".into(),
+        ));
+    }
+    Ok(())
+}
+
+// Call only after source_guard and require_assignment_target in the reservation/preparation
 // transaction. A replacement target gets its own evidence for the same delivery,
 // not a new request or authority to revive a completed/released assignment.
 fn save_authorized_target(
@@ -242,10 +273,27 @@ fn save_authorized_target(
             delivery,
             source.runtime_id,
             source.worker_id,
-            source.agent_key,
+            source.subject_id,
             source.authentication_binding_id
         ],
     )?;
+    Ok(())
+}
+
+fn is_acknowledged(conn: &Connection, workspace: &str, delivery: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ticket_assignment_delivery_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2)",
+        params![workspace, delivery], |row| row.get(0),
+    )?)
+}
+
+fn require_unacknowledged(conn: &Connection, workspace: &str, delivery: &str) -> Result<()> {
+    if is_acknowledged(conn, workspace, delivery)? {
+        return Err(Error::TicketAssignmentConflict(
+            "Assignment delivery already has Runtime acceptance; new send admission is closed"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -260,9 +308,9 @@ pub(super) fn reserve(
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         source_guard(&tx,workspace_id,source)?;
         let ticket_id:String=tx.query_row("SELECT ticket_id FROM ticket_worker_assignments WHERE workspace_id=?1 AND assignment_id=?2",params![workspace_id,assignment_id],|r|r.get(0))?;
-        require_current(&tx,workspace_id,&ticket_id,assignment_id)?;
+        require_assignment_target(&tx,workspace_id,&ticket_id,assignment_id,&source.subject_id)?;
         let saved:Option<String>=tx.query_row("SELECT payload_json FROM ticket_assignment_deliveries WHERE workspace_id=?1 AND assignment_id=?2 AND input_event_id=?3",params![workspace_id,assignment_id,input_event_id],|r|r.get(0)).optional()?;
-        if let Some(saved)=saved {let result=decode_payload(&saved)?;save_authorized_target(&tx,workspace_id,&result.delivery_id,source)?;tx.commit()?;return Ok(result);}
+        if let Some(saved)=saved {let result=decode_payload(&saved)?;require_unacknowledged(&tx,workspace_id,&result.delivery_id)?;save_authorized_target(&tx,workspace_id,&result.delivery_id,source)?;tx.commit()?;return Ok(result);}
         // A caller cannot fabricate an input. Restrict the same common query by
         // exact assignment/input identity rather than trusting a scan snapshot.
         let candidates=inputs_in_tx(&tx,workspace_id,1,Some(assignment_id),Some(input_event_id))?;
@@ -295,7 +343,8 @@ pub(super) fn prepare_content(
         source_guard(&tx,workspace_id,source)?;
         let payload:String=tx.query_row("SELECT payload_json FROM ticket_assignment_deliveries WHERE workspace_id=?1 AND delivery_id=?2",params![workspace_id,delivery_id],|r|r.get(0))?;
         let delivery=decode_payload(&payload)?;
-        require_current(&tx,workspace_id,&delivery.ticket_id,&delivery.assignment_id)?;
+        require_assignment_target(&tx,workspace_id,&delivery.ticket_id,&delivery.assignment_id,&source.subject_id)?;
+        require_unacknowledged(&tx,workspace_id,delivery_id)?;
         save_authorized_target(&tx,workspace_id,delivery_id,source)?;
         let saved:Option<String>=tx.query_row("SELECT content FROM ticket_assignment_delivery_requests WHERE workspace_id=?1 AND delivery_id=?2",params![workspace_id,delivery_id],|r|r.get(0)).optional()?;
         let result=if let Some(saved)=saved {saved} else {
@@ -304,6 +353,46 @@ pub(super) fn prepare_content(
         };
         tx.commit()?;
         Ok(result)
+    })
+}
+
+/// Final send admission is distinct from reading a receipt or replaying an ACK.
+/// Recheck the current Subject/assignment and prepared target, then return only
+/// the pinned bytes. A known ACK closes admission; an unknown outcome keeps the
+/// same request eligible. The caller still authorizes live policy immediately
+/// before Runtime I/O; the transaction does not serialize external acceptance.
+pub(super) fn admit_send(
+    store: &SqliteWorkspaceStore,
+    workspace_id: &str,
+    delivery_id: &str,
+    source: &TicketAssignmentTrackingSourceContext,
+) -> Result<Option<String>> {
+    store.with_conn_mut(|conn| {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        source_guard(&tx, workspace_id, source)?;
+        let payload: String = tx.query_row(
+            "SELECT payload_json FROM ticket_assignment_deliveries WHERE workspace_id=?1 AND delivery_id=?2",
+            params![workspace_id, delivery_id], |row| row.get(0),
+        )?;
+        let delivery = decode_payload(&payload)?;
+        require_assignment_target(&tx, workspace_id, &delivery.ticket_id, &delivery.assignment_id, &source.subject_id)?;
+        let authorized: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM notification_assignment_targets WHERE workspace_id=?1 AND delivery_id=?2 AND runtime_id=?3 AND worker_id=?4 AND agent_key=?5 AND authentication_binding_id=?6)",
+            params![workspace_id, delivery_id, source.runtime_id, source.worker_id, source.subject_id, source.authentication_binding_id], |row| row.get(0),
+        )?;
+        if !authorized {
+            return Err(Error::WorkspacePermissionDenied("Assignment send target was not prepared or reserved for this delivery".into()));
+        }
+        let content = if is_acknowledged(&tx, workspace_id, delivery_id)? {
+            None
+        } else {
+            Some(tx.query_row(
+                "SELECT content FROM ticket_assignment_delivery_requests WHERE workspace_id=?1 AND delivery_id=?2",
+                params![workspace_id, delivery_id], |row| row.get(0),
+            ).optional()?.ok_or_else(|| Error::TicketAssignmentConflict("Assignment send requires a persisted request".into()))?)
+        };
+        tx.commit()?;
+        Ok(content)
     })
 }
 
@@ -319,7 +408,7 @@ pub(super) fn ack(
         // authenticated target identity fields against evidence saved while current.
         // Actor is audit attribution; it is not target authority. Existing ACK bytes
         // still have to match on replay and are never replaced.
-        let authorized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM notification_assignment_targets WHERE workspace_id=?1 AND delivery_id=?2 AND runtime_id=?3 AND worker_id=?4 AND agent_key=?5 AND authentication_binding_id=?6)",params![workspace_id,delivery_id,source.runtime_id,source.worker_id,source.agent_key,source.authentication_binding_id],|r|r.get(0))?;
+        let authorized:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM notification_assignment_targets WHERE workspace_id=?1 AND delivery_id=?2 AND runtime_id=?3 AND worker_id=?4 AND agent_key=?5 AND authentication_binding_id=?6)",params![workspace_id,delivery_id,source.runtime_id,source.worker_id,source.subject_id,source.authentication_binding_id],|r|r.get(0))?;
         if !authorized {return Err(Error::WorkspacePermissionDenied("Acknowledgement target was not authorized for this delivery".into()));}
         let source_json=serde_json::to_string(source).map_err(|e|Error::Store(e.to_string()))?;
         let saved:Option<String>=tx.query_row("SELECT source_json FROM ticket_assignment_delivery_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2",params![workspace_id,delivery_id],|r|r.get(0)).optional()?;
@@ -339,16 +428,16 @@ pub(super) fn operation_guard(
     operation_id: &str,
 ) -> Result<()> {
     let fence=conn.query_row("SELECT o.ticket_id,f.orchestrator_assignment_id,f.runtime_id,f.worker_id,f.agent_key,f.authentication_binding_id FROM ticket_assignment_operation_fences f JOIN ticket_assignment_operations o ON o.workspace_id=f.workspace_id AND o.operation_id=f.operation_id WHERE f.workspace_id=?1 AND f.operation_id=?2",params![workspace_id,operation_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?))).optional()?;
-    if let Some((ticket_id, assignment_id, runtime_id, worker_id, agent_key, binding_id)) = fence {
+    if let Some((ticket_id, assignment_id, runtime_id, worker_id, subject_id, binding_id)) = fence {
         assignment_tracking::require_runtime_source(
             conn,
             workspace_id,
             &runtime_id,
             &worker_id,
-            &agent_key,
+            &subject_id,
             &binding_id,
         )?;
-        require_current(conn, workspace_id, &ticket_id, &assignment_id)?;
+        require_assignment_target(conn, workspace_id, &ticket_id, &assignment_id, &subject_id)?;
     }
     Ok(())
 }
@@ -363,7 +452,13 @@ pub(super) fn save_operation_fence(
     existing: bool,
 ) -> Result<()> {
     source_guard(conn, workspace_id, source)?;
-    require_current(conn, workspace_id, ticket_id, assignment_id)?;
+    require_assignment_target(
+        conn,
+        workspace_id,
+        ticket_id,
+        assignment_id,
+        &source.subject_id,
+    )?;
     let source_json = serde_json::to_string(source).map_err(|e| Error::Store(e.to_string()))?;
     let saved:Option<(String,String)>=conn.query_row("SELECT orchestrator_assignment_id,source_json FROM ticket_assignment_operation_fences WHERE workspace_id=?1 AND operation_id=?2",params![workspace_id,operation_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     if let Some(saved) = saved {
@@ -386,7 +481,7 @@ pub(super) fn save_operation_fence(
                 assignment_id,
                 source.runtime_id,
                 source.worker_id,
-                source.agent_key,
+                source.subject_id,
                 source.authentication_binding_id,
                 source_json
             ],

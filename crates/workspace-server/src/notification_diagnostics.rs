@@ -6,6 +6,65 @@ use server_api::{
     NotificationDiagnosticsQuery,
 };
 
+pub(super) fn source_resource(
+    store: &SqliteWorkspaceStore,
+    workspace: &str,
+    source_event_id: &str,
+) -> Result<Option<server_api::authorization::PermissionResource>> {
+    use server_api::authorization::PermissionResource;
+    if source_event_id.is_empty()
+        || source_event_id.len() > 512
+        || source_event_id.chars().any(char::is_control)
+    {
+        return Ok(None);
+    }
+    store.with_conn(|conn| {
+        // Read selectors only, not facts_json, requests, rendered content or Job
+        // results. Legacy arbitrary delivery IDs are retained as input_event_id;
+        // neither their spelling nor a caller's Job filter establishes ownership.
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT
+                CASE WHEN COALESCE(json_extract(facts_json,'$.job_id'),json_extract(facts_json,'$.backend_job.job_id')) IS NOT NULL THEN 'job'
+                     WHEN json_extract(facts_json,'$.merge_request_id') IS NOT NULL THEN 'mr'
+                     ELSE 'ticket' END,
+                COALESCE(json_extract(facts_json,'$.job_id'),json_extract(facts_json,'$.backend_job.job_id'),json_extract(facts_json,'$.merge_request_id'),ticket_id)
+             FROM notification_sources WHERE workspace_id=?1 AND input_event_id=?2 LIMIT 2",
+        )?;
+        let targets = statement
+            .query_map(params![workspace, source_event_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if targets.is_empty() {
+            // Uncaptured MR origins still have a concrete resource selector, so
+            // diagnostics can distinguish awaiting capture from absent origin.
+            // Persisted ownership always wins: legacy Job IDs may look like MR IDs.
+            let mr = source_event_id.strip_prefix("mr-event:")
+                .or_else(|| source_event_id.strip_prefix("mr-source:"))
+                .and_then(|value| value.split_once(':'))
+                .map(|(mr, _)| mr);
+            if let Some(mr) = mr {
+                let resource = PermissionResource::MergeRequest {
+                    workspace_id: workspace.into(), merge_request_id: mr.into(),
+                };
+                return Ok(resource.validate().is_ok().then_some(resource));
+            }
+        }
+        let [(kind, Some(id))] = targets.as_slice() else {
+            return Ok(None);
+        };
+        let resource = match kind.as_str() {
+            "job" => PermissionResource::Job { workspace_id: workspace.into(), job_id: id.clone() },
+            "mr" => PermissionResource::MergeRequest { workspace_id: workspace.into(), merge_request_id: id.clone() },
+            _ => PermissionResource::Ticket { workspace_id: workspace.into(), ticket_id: id.clone() },
+        };
+        if resource.validate().is_err() {
+            return Ok(None);
+        }
+        Ok(Some(resource))
+    })
+}
+
 fn source_checks(
     conn: &Connection,
     workspace: &str,

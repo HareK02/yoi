@@ -312,12 +312,14 @@ fn execute_remote_worker_remove_http_blocking(
     ));
     match result {
         Ok(response) => Ok(WorkspaceResponse {
+            content_type: None,
             status: 200,
             body: serde_json::to_string(&response)
                 .map_err(|error| RuntimeWorkerMutationForwardError::Transport(error.to_string()))?,
         }),
         Err(server_api::client_support::ClientError::Public { status, error }) => {
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: status.as_u16(),
                 body: serde_json::to_string(&error).map_err(|error| {
                     RuntimeWorkerMutationForwardError::Transport(error.to_string())
@@ -462,6 +464,7 @@ impl RuntimeOwnedWorkspaceClient {
                 WorkspaceClientError::Request(message.to_string())
             })?;
         Ok(WorkspaceBinaryResponse {
+            content_type: response_content_type(&response.headers),
             status: response.status.as_u16(),
             body: response.body,
         })
@@ -503,13 +506,26 @@ impl RuntimeOwnedWorkspaceClient {
             .map_err(|error| {
                 WorkspaceClientError::Request(format!("{request_label} failed: {error}"))
             })?;
+        let content_type = response_content_type(&response.headers);
         let body = String::from_utf8(response.body)
             .map_err(|error| WorkspaceClientError::Request(error.to_string()))?;
         Ok(WorkspaceResponse {
+            content_type,
             status: response.status.as_u16(),
             body,
         })
     }
+}
+
+#[cfg(feature = "http-server")]
+fn response_content_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(reqwest::header::CONTENT_TYPE).iter();
+    let media = values.next()?.to_str().ok()?;
+    // Multiple media declarations cannot be trusted as an HTTP representation.
+    if values.next().is_some() {
+        return None;
+    }
+    Some(media.to_owned())
 }
 
 #[cfg(feature = "http-server")]
@@ -529,17 +545,38 @@ impl std::fmt::Debug for RuntimeOwnedWorkspaceClient {
 }
 
 #[cfg(feature = "http-server")]
-fn generated_workspace_response<T: serde::Serialize>(
-    response: Result<T, server_api::client_support::ClientError<server_api::RepositoryApiError>>,
+fn generated_workspace_response<
+    T: serde::Serialize,
+    E: serde::Serialize + api_macros::HttpError,
+>(
+    response: Result<T, server_api::client_support::ClientError<E>>,
 ) -> Result<WorkspaceResponse, WorkspaceClientError> {
     match response {
         Ok(response) => Ok(WorkspaceResponse {
+            content_type: Some("application/json".to_owned()),
             status: 200,
             body: serde_json::to_string(&response)
                 .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
         }),
         Err(server_api::client_support::ClientError::Public { status, error }) => {
+            // Resolve each typed boundary projection, including Startup and Control.
+            // Never forward a legacy body under a fabricated Problem media type.
+            if let Some(problem) = error.custom_response() {
+                if problem.status != status.as_u16() {
+                    return Err(WorkspaceClientError::Request(
+                        "error projection status mismatch".into(),
+                    ));
+                }
+                return Ok(WorkspaceResponse {
+                    status: status.as_u16(),
+                    content_type: Some(problem.content_type.to_owned()),
+                    body: String::from_utf8(problem.body.to_vec()).map_err(|_| {
+                        WorkspaceClientError::Request("failure encoding unavailable".into())
+                    })?,
+                });
+            }
             Ok(WorkspaceResponse {
+                content_type: Some("application/json".to_owned()),
                 status: status.as_u16(),
                 body: serde_json::to_string(&error)
                     .map_err(|error| WorkspaceClientError::Request(error.to_string()))?,
@@ -705,9 +742,35 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                                 client.worker_control_list(workspace_id).await,
                             )
                         }
+                        WorkspaceServerOperation::WorkerControlAuthorize {
+                            runtime_id,
+                            worker_id,
+                            permission,
+                        } => generated_workspace_response(
+                            client
+                                .worker_control_authorize(
+                                    workspace_id,
+                                    runtime_id,
+                                    worker_id,
+                                    permission,
+                                )
+                                .await,
+                        ),
                         WorkspaceServerOperation::WorkerControlSpawn(request) => {
                             generated_workspace_response(
-                                client.worker_control_spawn(workspace_id, request).await,
+                                client.worker_control_spawn(workspace_id, request).await.map_err(|error| match error {
+                                    server_api::client_support::ClientError::Public { status, error } => {
+                                        let error = match error.failure().cloned() {
+                                            // This already authenticated Worker control caller may
+                                            // receive the enum-only public startup cause. The domain
+                                            // allowlist reprojects it, never forwards upstream text.
+                                            Some(failure) => server_api::WorkerCreateApiError::startup(failure, &protocol::session_failure::SessionFailureVisibility { can_view_cause: true }),
+                                            None => error,
+                                        };
+                                        server_api::client_support::ClientError::Public { status, error }
+                                    }
+                                    other => other,
+                                }),
                             )
                         }
                         WorkspaceServerOperation::WorkerControlInput {
@@ -773,6 +836,11 @@ impl WorkspaceClient for RuntimeOwnedWorkspaceClient {
                         WorkspaceServerOperation::SubjektivRecordSession(request) => {
                             generated_workspace_response(
                                 client.subjektiv_record_session(workspace_id, request).await,
+                            )
+                        }
+                        WorkspaceServerOperation::ChatWorker(request) => {
+                            generated_workspace_response(
+                                client.chat_worker_operation(workspace_id, request).await,
                             )
                         }
                         WorkspaceServerOperation::SubjektivMemory(request) => {
@@ -999,6 +1067,98 @@ mod tests {
 
     #[cfg(feature = "http-server")]
     #[test]
+    fn workspace_http_response_retains_actual_media_without_body_inference() {
+        for (header, expected) in [
+            (
+                "Content-Type: application/problem+json\r\n",
+                Some("application/problem+json"),
+            ),
+            ("Content-Type: text/plain\r\n", Some("text/plain")),
+            ("", None),
+            (
+                "Content-Type: application/problem+json\r\nContent-Type: text/plain\r\n",
+                None,
+            ),
+        ] {
+            let body = r#"{"type":"urn:yoi:problem:runtime-control"}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (base_url, server) = binary_loopback(response.into_bytes());
+            let client =
+                RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                    .with_request_timeout(Some(Duration::from_secs(5)));
+            let received = client
+                .execute(WorkspaceRequest::get("/api/w/workspace-a/test"))
+                .unwrap();
+            server.join().unwrap();
+            assert_eq!(received.status, 403);
+            assert_eq!(received.content_type.as_deref(), expected);
+            assert_eq!(received.body, body);
+        }
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
+    fn generated_worker_control_keeps_validated_cause_and_rejects_mislabeled_problem() {
+        use error_contract::{Budget, DecodeFailure};
+        use protocol::control_failure::RuntimeControlCause as C;
+        let problem = server_api::control_failure::control_problem(C::AuthorizationFailed).unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&problem.body).unwrap();
+        body["detail"] = "PRIVATE_RECEIVED_TEXT".into();
+        body["yoi_failure"]["explanation"] = "PRIVATE_RECEIVED_TEXT".into();
+        let body = body.to_string();
+        for (status, media, known) in [
+            (403, "application/problem+json", true),
+            (403, "text/plain", false),
+            (409, "application/problem+json", false),
+        ] {
+            let response = format!(
+                "HTTP/1.1 {status} Failure\r\nContent-Type: {media}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let (base_url, server) = binary_loopback(response.into_bytes());
+            let client =
+                RuntimeOwnedWorkspaceClient::new("workspace-a", base_url, "runtime-a", "worker-a")
+                    .with_request_timeout(Some(Duration::from_secs(5)));
+            let received =
+                client.execute_server_operation(WorkspaceServerOperation::WorkerControlStop {
+                    runtime_id: "runtime-a".into(),
+                    worker_id: "worker-a".into(),
+                    request: server_api::RuntimeWorkerLifecycleRequest {
+                        stop_intent: None,
+                        reason: None,
+                        ticket_assignment: None,
+                    },
+                });
+            server.join().unwrap();
+            if known {
+                let received = received.unwrap();
+                assert_eq!(received.status, status);
+                assert_eq!(received.content_type.as_deref(), Some(media));
+                assert!(!received.body.contains("PRIVATE_RECEIVED_TEXT"));
+                let DecodeFailure::Known(failure) =
+                    error_contract::problem::decode_problem_details::<C>(
+                        received.body.as_bytes(),
+                        received.status,
+                        received.content_type.as_deref().unwrap(),
+                        &server_api::control_failure::ControlBoundary,
+                        Budget::new(16384, 16384),
+                    )
+                else {
+                    panic!("validated cause lost at the generated-to-Worker boundary")
+                };
+                assert_eq!(failure.facts().cause(), &C::AuthorizationFailed);
+            } else {
+                let error = received.unwrap_err();
+                assert!(!error.to_string().contains("PRIVATE_RECEIVED_TEXT"));
+            }
+        }
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
     fn generated_ticket_assignment_transport_signs_exact_authoring_and_bounded_read_subjects() {
         use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
         let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
@@ -1132,6 +1292,72 @@ mod tests {
 
     #[cfg(feature = "http-server")]
     #[test]
+    fn generated_chat_worker_transport_preserves_request_and_signed_worker_source() {
+        use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
+        let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
+        let request = server_api::ChatWorkerRequest {
+            operation: server_api::ChatWorkerOperation::Send {
+                request: server_api::ChatSendMessageRequest {
+                    conversation_id: "conversation-a".into(),
+                    operation_id: "send-a".into(),
+                    text: "explicit reply\ncontinued".into(),
+                    reply_to: Some("message-a".into()),
+                    work_ref: Some("work-a".into()),
+                    expected_last_user_message_id: Some("user-message-1".into()),
+                },
+            },
+        };
+        let reply = serde_json::json!({"kind":"sent","message":{
+            "id":"message-b","conversation_id":"conversation-a","sequence":2,
+            "sender":{"kind":"subject","subject_id":"subject-a"},
+            "text":"explicit reply\ncontinued","reply_to":"message-a","work_ref":"work-a",
+            "operation_id":"send-a","last_user_message_id":"user-message-1"
+        }})
+        .to_string();
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", reply.len(), reply).into_bytes();
+        let (url, server) = binary_loopback(response);
+        let client = RuntimeOwnedWorkspaceClient::new("workspace-a", url, "runtime-a", "worker-a")
+            .with_runtime_request_source(&identity, "server-a");
+        let result = client
+            .execute_server_operation(WorkspaceServerOperation::ChatWorker(request.clone()))
+            .unwrap();
+        assert_eq!(result.status, 200);
+        let (head, body) = server.join().unwrap();
+        let path = "/api/w/workspace-a/subjektiv/chat/worker";
+        assert!(head.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+        let proof = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
+                    .then(|| value.trim())
+            })
+            .unwrap();
+        let digest = request_body_digest(&body);
+        verify_runtime_request_source(
+            proof,
+            &identity.public_key,
+            &RuntimeRequestSourceExpectation {
+                identity_id: "runtime-a",
+                audience: "server-a",
+                workspace_id: "workspace-a",
+                worker_id: Some("worker-a"),
+                permission: WORKSPACE_REQUEST_PERMISSION,
+                method: "POST",
+                path,
+                body_digest: &digest,
+                now_unix: unix_now_seconds() as i64,
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
     fn binary_roundtrip_signs_exact_query_method_worker_and_raw_body() {
         use crate::auth::{RuntimeRequestSourceExpectation, verify_runtime_request_source};
         let identity = RuntimeIdentityMaterial::generate("runtime-a").unwrap();
@@ -1218,6 +1444,58 @@ mod tests {
                 ..expected
             };
             assert!(verify_runtime_request_source(token, &identity.public_key, &altered).is_err());
+        }
+    }
+
+    #[cfg(feature = "http-server")]
+    #[test]
+    fn workspace_error_transports_preserve_only_single_valid_content_type_headers() {
+        for (headers, expected) in [
+            (
+                &b"Content-Type: application/problem+json; charset=utf-8\r\n"[..],
+                Some("application/problem+json; charset=utf-8"),
+            ),
+            (&b""[..], None),
+            (
+                &b"Content-Type: application/problem+json\r\nContent-Type: application/json\r\n"[..],
+                None,
+            ),
+            (&b"Content-Type: application/\xff\r\n"[..], None),
+        ] {
+            for binary in [false, true] {
+                let mut wire = b"HTTP/1.1 413 Payload Too Large\r\n".to_vec();
+                wire.extend_from_slice(headers);
+                wire.extend_from_slice(b"Content-Length: 2\r\nConnection: close\r\n\r\n{}");
+                let (base_url, server) = binary_loopback(wire);
+                let client = RuntimeOwnedWorkspaceClient::new(
+                    "workspace-a",
+                    base_url,
+                    "runtime-a",
+                    "worker-a",
+                );
+                let (status, media, body) = if binary {
+                    let response = client
+                        .execute_binary(WorkspaceBinaryRequest {
+                            method: WorkspaceRequestMethod::Get,
+                            path: "/api/test".into(),
+                            body: None,
+                            max_response_bytes: 64,
+                        })
+                        .unwrap();
+                    (response.status, response.content_type, response.body)
+                } else {
+                    let response = client.execute(WorkspaceRequest::get("/api/test")).unwrap();
+                    (
+                        response.status,
+                        response.content_type,
+                        response.body.into_bytes(),
+                    )
+                };
+                server.join().unwrap();
+                assert_eq!(status, 413);
+                assert_eq!(media.as_deref(), expected);
+                assert_eq!(body, b"{}");
+            }
         }
     }
 
@@ -1823,6 +2101,7 @@ mod tests {
                     reason.to_string(),
                 ));
                 Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 202,
                     body: "accepted".to_string(),
                 })

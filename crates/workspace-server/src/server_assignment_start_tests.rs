@@ -7,64 +7,56 @@ use super::*;
 struct StartSource {
     identity: RuntimeIdentityMaterial,
     worker: RuntimeWorkerRef,
+    delegation: Vec<server_api::authorization::ScopedPermission>,
 }
 
-async fn start_source(api: &mut WorkspaceApi, runtime: &WorkdirlessFixtureRuntime) -> StartSource {
-    let runtime_id = WorkdirlessFixtureRuntime::RUNTIME_ID;
+async fn start_source(api: &mut WorkspaceApi, _runtime: &WorkdirlessFixtureRuntime) -> StartSource {
+    start_body_source(api, WorkdirlessFixtureRuntime::RUNTIME_ID).await
+}
+
+async fn start_body_source(api: &mut WorkspaceApi, runtime_id: &str) -> StartSource {
     let identity = RuntimeIdentityMaterial::generate(runtime_id).unwrap();
     configure_runtime_request_auth(api, &identity, runtime_id);
-    let memory = api
-        .config_store
-        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
-        .unwrap();
-    let reservation = api
-        .config_store
-        .reserve_worker_create(
-            TEST_WORKSPACE_ID,
-            runtime_id,
-            "start-orchestrator",
-            "sha256:start-orchestrator",
-            Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY),
-            &memory,
+    let subject_id = ensure_test_assignment_subject(api);
+    let worker = create_test_assignment_body(api, runtime_id, &subject_id).await;
+    for ticket in api.authority.list_tickets(100).unwrap().items {
+        grant_test_assignment_ticket(api, &subject_id, &ticket.id);
+    }
+    use server_api::authorization::{
+        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+    };
+    let delegation: Vec<_> = api
+        .store
+        .list_workdir_registry(TEST_WORKSPACE_ID, 100)
+        .unwrap()
+        .into_iter()
+        .map(|workdir| ScopedPermission {
+            operation: "filesystem.read".into(),
+            resource: PermissionResource::Workdir {
+                working_directory_id: workdir.workdir_id,
+                path: ".".into(),
+                recursive: true,
+            },
+        })
+        .collect();
+    let store = open_subjektiv_store(api).unwrap();
+    let previous = store.subject_permissions(&subject_id).unwrap();
+    store
+        .set_subject_permissions(
+            &subject_id,
+            &SubjectPermissionsUpdate {
+                operation_id: "start-source-delegation".into(),
+                expected_change_id: previous.as_ref().map(|policy| policy.change_id.clone()),
+                execution: previous.map(|policy| policy.execution).unwrap_or_default(),
+                delegation: delegation.clone(),
+            },
         )
         .unwrap();
-    let mut summary = WorkdirlessFixtureRuntime::worker_summary(
-        WorkerCreateBinding {
-            worker_id: reservation.worker_id,
-            create_fingerprint: reservation.create_fingerprint,
-        },
-        &WorkerSpawnRequest {
-            requested_worker_name: Some("Start Orchestrator".into()),
-            singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.into()),
-            intent: WorkerSpawnIntent::WorkspaceCompanion,
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 0,
-            },
-            profile: ProfileSelector::Builtin("builtin:orchestrator".into()),
-            ticket_assignment: None,
-            initial_submit: Vec::new(),
-            workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachment_requests: Vec::new(),
-            resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle: None,
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: Vec::new(),
-            resolved_workspace_api: None,
-            resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
-            resolved_control_operation: None,
-            resolved_execution_grant: None,
-        },
-    );
-    summary.tags = vec!["orchestrator".into(), "singleton".into()];
-    let worker = summary.worker.clone();
-    runtime.workers.lock().unwrap().push(summary);
-    seed_worker_source_member(api, runtime_id, &worker.worker_id);
-    api.config_store
-        .complete_worker_create_reservation(TEST_WORKSPACE_ID, worker.worker_id.parse().unwrap())
-        .unwrap();
-    assert_eq!(find_workspace_orchestrator(api).unwrap().worker, worker);
-    StartSource { identity, worker }
+    StartSource {
+        identity,
+        worker,
+        delegation,
+    }
 }
 
 fn add_unfinished_start_dependency(api: &WorkspaceApi, ticket_id: &str) -> String {
@@ -91,8 +83,37 @@ fn start_http_request(
     token: &str,
     method: &str,
     path: &str,
-    body: Value,
+    mut body: Value,
 ) -> Request<Body> {
+    if let Some(source) =
+        source.filter(|_| method == "POST" && path.ends_with("/worker-control/workers"))
+    {
+        // Supply the normal explicit least-authority child request. Only the
+        // selected reference Workdirs receive read; no write/command is issued.
+        let attachments = body["workdir_attachments"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let permissions: Vec<_> = source
+            .delegation
+            .iter()
+            .filter(|permission| {
+                let server_api::authorization::PermissionResource::Workdir {
+                    working_directory_id,
+                    ..
+                } = &permission.resource
+                else {
+                    return false;
+                };
+                attachments.iter().any(|attachment| {
+                    attachment["working_directory_id"].as_str()
+                        == Some(working_directory_id.as_str())
+                })
+            })
+            .cloned()
+            .collect();
+        body["execution_grant"] = serde_json::json!({"permissions":permissions, "redelegation":[]});
+    }
     let body = serde_json::to_vec(&body).unwrap();
     match source {
         Some(source) => runtime_source_request(
@@ -180,6 +201,54 @@ fn assert_start_dependency_diagnostic_only(api: &WorkspaceApi, ticket: &str, dep
     assert_eq!(prerequisite.state.as_str(), "open");
     assert!(prerequisite.assignments.is_empty());
     assert!(prerequisite.assignment_tracking.is_empty());
+}
+
+#[tokio::test]
+async fn ticket_start_rechecks_changed_target_after_allocation_before_runtime_dispatch() {
+    for change in ["access='read_only'", "ref_selector='different-branch'"] {
+        let fixture = guarded_spawn_fixture().await;
+        let conn = rusqlite::Connection::open(&fixture.api.config.database_path).unwrap();
+        // Deterministic interleaving at a real persistence boundary: the initial
+        // target check has finished, but no Runtime spawn has been dispatched.
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER narrow_target_after_allocation AFTER INSERT ON worker_create_reservations
+             WHEN NEW.runtime_id='workdirless-runtime'
+             BEGIN UPDATE typed_ticket_targets SET {change}
+               WHERE ticket_id='{}' AND repository_key='test-repository'; END;",
+            fixture.ticket_id,
+        )).unwrap();
+        let body = guarded_spawn_payload(&fixture, "target-changed-before-dispatch");
+        let response = post_guarded_spawn(&fixture, body).await;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            matches!(status, StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST),
+            "{change}: {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            fixture.runtime.spawn_requests().is_empty(),
+            "{change}: no Runtime effect"
+        );
+        assert!(
+            fixture
+                .api
+                .store
+                .get_active_ticket_worker_assignment(TEST_WORKSPACE_ID, &fixture.ticket_id,)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM worker_workdir_attachment_reservations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "failed admission must release newly reserved attachments"
+        );
+    }
 }
 
 #[tokio::test]
@@ -590,7 +659,7 @@ async fn orchestrator_start_and_assign_reject_missing_stale_cleared_or_reissued_
                         ticket.id
                     );
                     start_http_response(&api, start_http_request(None, &token, "PUT", &path,
-                        serde_json::json!({"operation_id":"reissue-observed", "principal":{"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}})), StatusCode::OK).await;
+                        serde_json::json!({"operation_id":"reissue-observed", "principal":test_assignment_principal(&api)})), StatusCode::OK).await;
                     assert_ne!(
                         observed_start_delegation(&api, &ticket.id, Some(&source)).unwrap(),
                         observed
@@ -664,11 +733,12 @@ async fn orchestrator_start_and_assign_reject_missing_stale_cleared_or_reissued_
 async fn replaced_orchestrator_cannot_start_or_assign_under_retained_current_delegation() {
     for existing in [false, true] {
         let directory = tempfile::tempdir().unwrap();
-        let mut api = test_api(directory.path()).await;
+        let (mut api, _) = assignment_test_api_with_recording_backend(directory.path()).await;
         register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
         let runtime = WorkdirlessFixtureRuntime::default();
         api.runtime.register_or_replace(runtime.clone());
-        let source = start_source(&mut api, &runtime).await;
+        let source = start_body_source(&mut api, EMBEDDED_WORKER_RUNTIME_ID).await;
+        bootstrap_test_assignment_session(&api, &source.worker);
         let token =
             seed_test_workspace_owner_token(api.store.as_ref(), "obsolete-worker-owner").await;
         let ticket = browser_ticket_backend(&api)
@@ -697,21 +767,16 @@ async fn replaced_orchestrator_cannot_start_or_assign_under_retained_current_del
         } else {
             None
         };
-        // Backend ownership changes independently of the retained assignment row.
-        let replacement =
-            RuntimeWorkerRef::new(&source.worker.runtime_id, WorkerId::now_v7().to_string());
-        seed_worker_source_member(&api, &replacement.runtime_id, &replacement.worker_id);
-        let mut summary = runtime.workers.lock().unwrap()[0].clone();
-        summary.worker = replacement.clone();
-        runtime.workers.lock().unwrap().push(summary);
-        rusqlite::Connection::open(&api.config.database_path).unwrap().execute(
-            "UPDATE worker_singleton_owners SET worker_id=?1,generation=generation+1 WHERE workspace_id=?2 AND singleton_key=?3",
-            rusqlite::params![replacement.worker_id, TEST_WORKSPACE_ID, crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY],
-        ).unwrap();
-        assert_eq!(
-            find_workspace_orchestrator(&api).unwrap().worker,
-            replacement
-        );
+        // Body replacement preserves Subject assignment, but rotates the real
+        // create reservation/singleton generation through normal Subject launch.
+        remove_test_assignment_body(&api, &source.worker).await;
+        let replacement = create_test_assignment_body(
+            &api,
+            &source.worker.runtime_id,
+            &ensure_test_assignment_subject(&api),
+        )
+        .await;
+        assert_eq!(test_assignment_body(&api).unwrap().worker, replacement);
         assert_eq!(
             observed_start_delegation(&api, &ticket.id, Some(&source)).unwrap(),
             delegation

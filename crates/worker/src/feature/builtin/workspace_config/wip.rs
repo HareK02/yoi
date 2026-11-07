@@ -182,12 +182,13 @@ fn failure(code: ProtocolErrorCode, message: &str) -> WipOperationError {
 
 fn map_error(error: ConfigAttachError) -> WipOperationError {
     match error {
+        ConfigAttachError::Backend(source) => source.into_attach_invocation_error(),
         ConfigAttachError::InvalidRequest => {
-            failure(ProtocolErrorCode::InvalidArguments, error.message())
+            failure(ProtocolErrorCode::InvalidArguments, &error.message())
         }
-        ConfigAttachError::Denied => failure(ProtocolErrorCode::PermissionDenied, error.message()),
+        ConfigAttachError::Denied => failure(ProtocolErrorCode::PermissionDenied, &error.message()),
         ConfigAttachError::Unavailable => {
-            failure(ProtocolErrorCode::ResourceLimitExceeded, error.message())
+            failure(ProtocolErrorCode::ResourceLimitExceeded, &error.message())
         }
         ConfigAttachError::OutcomeUnknown => {
             WipOperationError::OutcomeUnknown(error.message().into())

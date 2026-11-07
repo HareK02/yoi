@@ -1,0 +1,41 @@
+error: error content type must be a concrete type/subtype without parameters
+ --> tests/ui/invalid_error_media.rs:7:58
+  |
+7 |     #[get("/wildcard", additional_error_content_types = ["application/*"])]
+  |                                                          ^^^^^^^^^^^^^^^
+
+error: additional error content types must be distinct from each other and application/json
+  --> tests/ui/invalid_error_media.rs:13:87
+   |
+13 |     #[get("/duplicate", additional_error_content_types = ["application/problem+json", "APPLICATION/PROBLEM+JSON"])]
+   |                                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: additional error content types must be distinct from each other and application/json
+  --> tests/ui/invalid_error_media.rs:19:57
+   |
+19 |     #[get("/default", additional_error_content_types = ["application/json"])]
+   |                                                         ^^^^^^^^^^^^^^^^^^
+
+error: additional_error_content_types require a public error response type
+  --> tests/ui/invalid_error_media.rs:25:11
+   |
+25 |     #[get("/infallible", additional_error_content_types = ["application/problem+json"])]
+   |           ^^^^^^^^^^^^^
+
+error: additional_error_content_types must not be empty
+  --> tests/ui/invalid_error_media.rs:31:11
+   |
+31 |     #[get("/empty", additional_error_content_types = [])]
+   |           ^^^^^^^^
+
+error: duplicate `additional_error_content_types` route option
+  --> tests/ui/invalid_error_media.rs:37:69
+   |
+37 |     #[get("/duplicate-option", additional_error_content_types = [], additional_error_content_types = [])]
+   |                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: error content type must be a concrete type/subtype without parameters
+  --> tests/ui/invalid_error_media.rs:43:63
+   |
+43 |     #[get("/parameterized", additional_error_content_types = ["application/problem+json; charset=utf-8"])]
+   |                                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

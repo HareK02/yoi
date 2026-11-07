@@ -947,19 +947,36 @@ impl HookRegistry {
         &self,
         context: &WorkerStoppingContext,
     ) -> Result<(), HookExecutionError> {
+        let mut failures = Vec::new();
+        self.on_worker_stopping_report(context, &mut failures).await;
+        failures
+            .into_iter()
+            .find(|error| error.policy == HookFailurePolicy::FailClosed)
+            .map_or(Ok(()), Err)
+    }
+
+    /// Run the same policy-governed chain once, retaining even attention/fail-open errors.
+    /// Continuing a lifecycle chain is not evidence that its cleanup succeeded. This report
+    /// does not infer failures from the bounded, shared diagnostics buffer. The caller owns
+    /// collected failures even if its chain deadline cancels the current callback.
+    pub(crate) async fn on_worker_stopping_report(
+        &self,
+        context: &WorkerStoppingContext,
+        failures: &mut Vec<HookExecutionError>,
+    ) {
         for registration in &self.worker_stopping {
             if let Err(error) = registration.call(context).await {
                 self.record_diagnostic(error.clone());
-                match error.policy {
-                    HookFailurePolicy::FailOpenWithDiagnostic
-                    | HookFailurePolicy::AttentionRequired => {
-                        tracing::warn!(owner = %error.owner, error = %error.source, "worker-stopping hook requires attention");
-                    }
-                    HookFailurePolicy::FailClosed => return Err(error),
+                let fail_closed = error.policy == HookFailurePolicy::FailClosed;
+                if !fail_closed {
+                    tracing::warn!(owner = %error.owner, error = %error.source, "worker-stopping hook requires attention");
+                }
+                failures.push(error);
+                if fail_closed {
+                    break;
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -1206,6 +1223,137 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.category, HookErrorCategory::InvalidInput);
+    }
+
+    #[derive(Clone)]
+    struct FailingStoppingHook {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        name: &'static str,
+        entered: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait]
+    impl Hook<WorkerStopping> for FailingStoppingHook {
+        async fn call(&self, _: &WorkerStoppingContext) -> Result<(), HookError> {
+            self.calls.lock().unwrap().push(self.name);
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+                return std::future::pending().await;
+            }
+            Err(HookError::new(HookErrorCategory::Dependency, self.name))
+        }
+    }
+
+    fn stopping_context() -> WorkerStoppingContext {
+        WorkerStoppingContext {
+            invocation: rewrite_context().invocation,
+            reason: "owned shutdown".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_report_retains_all_policies_once_and_preserves_fail_closed_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut builder = HookRegistryBuilder::new();
+        for (name, failure) in [
+            ("attention", HookFailurePolicy::AttentionRequired),
+            ("open", HookFailurePolicy::FailOpenWithDiagnostic),
+            ("closed", HookFailurePolicy::FailClosed),
+            ("unreached", HookFailurePolicy::AttentionRequired),
+        ] {
+            builder
+                .add_named_worker_stopping(
+                    name,
+                    HookExecutionPolicy::new(failure, 1_000),
+                    FailingStoppingHook {
+                        calls: calls.clone(),
+                        name,
+                        entered: None,
+                    },
+                )
+                .unwrap();
+        }
+        let registry = builder.build();
+        let mut failures = Vec::new();
+        registry
+            .on_worker_stopping_report(&stopping_context(), &mut failures)
+            .await;
+        assert_eq!(*calls.lock().unwrap(), ["attention", "open", "closed"]);
+        assert_eq!(
+            failures
+                .iter()
+                .map(|error| error.source.diagnostic.as_str())
+                .collect::<Vec<_>>(),
+            ["attention", "open", "closed"]
+        );
+        assert!(
+            failures
+                .iter()
+                .all(|error| error.source.category == HookErrorCategory::Dependency)
+        );
+        assert_eq!(registry.diagnostics().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stopping_compatibility_result_keeps_fail_open_policy_without_repeating_callback() {
+        for failure in [
+            HookFailurePolicy::AttentionRequired,
+            HookFailurePolicy::FailOpenWithDiagnostic,
+            HookFailurePolicy::FailClosed,
+        ] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut builder = HookRegistryBuilder::new();
+            builder
+                .add_named_worker_stopping(
+                    "stop",
+                    HookExecutionPolicy::new(failure, 1_000),
+                    FailingStoppingHook {
+                        calls: calls.clone(),
+                        name: "stop",
+                        entered: None,
+                    },
+                )
+                .unwrap();
+            let registry = builder.build();
+            let result = registry.on_worker_stopping(&stopping_context()).await;
+            assert_eq!(result.is_err(), failure == HookFailurePolicy::FailClosed);
+            assert_eq!(*calls.lock().unwrap(), ["stop"]);
+            assert_eq!(registry.diagnostics().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_stopping_chain_preserves_failures_already_collected_by_owner() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut builder = HookRegistryBuilder::new();
+        for (name, pending) in [("completed-failure", false), ("in-flight", true)] {
+            builder
+                .add_named_worker_stopping(
+                    name,
+                    HookExecutionPolicy::new(HookFailurePolicy::AttentionRequired, 1_000),
+                    FailingStoppingHook {
+                        calls: calls.clone(),
+                        name,
+                        entered: pending.then(|| entered.clone()),
+                    },
+                )
+                .unwrap();
+        }
+        let registry = builder.build();
+        let context = stopping_context();
+        let mut failures = Vec::new();
+        {
+            let chain = registry.on_worker_stopping_report(&context, &mut failures);
+            tokio::pin!(chain);
+            tokio::select! {
+                _ = &mut chain => panic!("second callback must remain in flight"),
+                _ = entered.notified() => {},
+            }
+        }
+        assert_eq!(*calls.lock().unwrap(), ["completed-failure", "in-flight"]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].source.diagnostic, "completed-failure");
     }
 
     #[test]

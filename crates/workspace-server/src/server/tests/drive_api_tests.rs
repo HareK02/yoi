@@ -138,7 +138,9 @@ async fn drive_http_receipts_cas_stable_url_and_workspace_refs_follow_storage_au
     .await;
     assert_eq!(text["text"], "# Shared\n");
     let wrong=mutate(&api,&token,"foreign",json!({"operation":"delete","id":{"workspace_id":"foreign","node_id":id},"expected_mutation_id":rev}),StatusCode::FORBIDDEN).await;
-    assert_eq!(wrong["code"], "denied");
+    assert_eq!(wrong["yoi_failure"]["details"]["code"], "denied");
+    assert!(wrong["yoi_failure"]["details"].get("storage").is_none());
+    assert!(!wrong.to_string().contains("foreign"));
     user_call(
         &api,
         &token,
@@ -497,6 +499,276 @@ async fn drive_two_workers_and_non_owner_use_grants_without_workdir_or_profile_a
     .await;
 }
 
+fn public_drive_error(
+    failure: client_support::ClientError<DriveHttpApiError>,
+    expected_status: u16,
+    expected_code: DriveApiErrorCode,
+) -> DriveHttpApiError {
+    let client_support::ClientError::Public { status, error } = failure else {
+        panic!("expected decoded Drive HTTP error, got {failure:?}");
+    };
+    assert_eq!(status.as_u16(), expected_status);
+    assert_eq!(error.code, expected_code);
+    // Decoding result facts is not permission to encode the received Problem again.
+    assert!(api_macros::HttpError::custom_response(&error).is_none());
+    assert!(
+        serde_json::to_value(&error)
+            .unwrap()
+            .get("yoi_failure")
+            .is_none()
+    );
+    error
+}
+
+#[tokio::test]
+async fn drive_http_client_preserves_limit_rejection_and_unknown_without_reexecution() {
+    let temp = tempfile::tempdir().unwrap();
+    let api = test_api(temp.path()).await;
+    seed_test_workspace_owner_token(api.store.as_ref(), "drive-errors").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = build_router(api.clone());
+    let _server = AbortServer(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let client = ServerApiClient::builder(&url)
+        .unwrap()
+        .authorizer(TestBearerAuthorizer("api-token-drive-errors"))
+        .request_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let workspace = TEST_WORKSPACE_ID.to_owned();
+    let root = client.drive_root(workspace.clone()).await.unwrap();
+    let error = public_drive_error(
+        client
+            .drive_upload(
+                workspace.clone(),
+                DriveUploadQuery {
+                    operation: DriveUploadOperation::Create,
+                    request_id: "limit-no-write".into(),
+                    entry_workspace_id: workspace.clone(),
+                    parent_id: Some(root.entry.node_id.clone()),
+                    name: Some("oversized".into()),
+                    id: None,
+                    expected_mutation_id: None,
+                    content_type: "text/plain".into(),
+                    size: DRIVE_FILE_MAX_BYTES + 1,
+                    sha256: digest(b""),
+                },
+                Vec::new().into(),
+            )
+            .await
+            .unwrap_err(),
+        413,
+        DriveApiErrorCode::Limit,
+    );
+    let details = error.details().unwrap();
+    assert_eq!(details.operation, DriveHttpOperation::Upload);
+    assert_eq!(
+        details.classification,
+        DriveFailureClassification::NotCommitted
+    );
+    assert!(details.storage.is_none());
+    let error = public_drive_error(
+        client
+            .drive_metadata(
+                workspace.clone(),
+                DriveEntryQuery {
+                    entry_workspace_id: workspace.clone(),
+                    id: "01".into(),
+                },
+            )
+            .await
+            .unwrap_err(),
+        400,
+        DriveApiErrorCode::Invalid,
+    );
+    assert_eq!(
+        error.details().unwrap().operation,
+        DriveHttpOperation::Request
+    );
+    assert!(error.details().unwrap().storage.is_none());
+
+    // Inject only a storage fault. HTTP authentication and current transaction
+    // authorization remain the production implementations, not this callback.
+    let fixture = api.drive().await.unwrap();
+    let fault = fixture.with_authorizer(|connection, _| {
+        connection.execute_batch("CREATE TRIGGER fail_http_receipt BEFORE INSERT ON drive_receipts BEGIN SELECT RAISE(ABORT, 'private SQL /host/identity'); END;")?;
+        Ok(())
+    });
+    tokio::task::spawn_blocking(move || fault.check_authorized(false))
+        .await
+        .unwrap()
+        .unwrap();
+    let error = public_drive_error(
+        client
+            .drive_mutate(
+                workspace.clone(),
+                DriveMutationRequest {
+                    request_id: "unknown-no-retry".into(),
+                    mutation: DriveMutation::CreateFolder {
+                        parent: root.entry.clone(),
+                        name: "candidate".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap_err(),
+        503,
+        DriveApiErrorCode::OutcomeUnknown,
+    );
+    let details = error.details().unwrap();
+    assert_eq!(details.classification, DriveFailureClassification::Unknown);
+    assert_eq!(details.operation, DriveHttpOperation::Mutate);
+    let storage = details.storage.unwrap();
+    assert_eq!(
+        storage.operation,
+        workspace_drive::failure::DriveFailureOperation::CreateFolder
+    );
+    assert_eq!(
+        storage.reason,
+        workspace_drive::failure::DriveFailureReason::MetadataFailure
+    );
+    assert!(!format!("{error:?}").contains("private SQL"));
+    assert!(
+        error.source_failure().is_none(),
+        "remote diagnostics are not a local source"
+    );
+    let status = client
+        .drive_request_status(workspace.clone(), "unknown-no-retry".into())
+        .await
+        .unwrap();
+    assert_eq!(status.state, DriveRequestState::Uncommitted);
+    let page = client
+        .drive_list(
+            workspace,
+            DriveListQuery {
+                entry_workspace_id: TEST_WORKSPACE_ID.into(),
+                id: root.entry.node_id,
+                limit: Some(10),
+                after: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        page.entries.is_empty(),
+        "the client must not reexecute an Unknown mutation"
+    );
+    let cleanup = fixture.with_authorizer(|connection, _| {
+        connection.execute_batch("DROP TRIGGER fail_http_receipt")?;
+        Ok(())
+    });
+    tokio::task::spawn_blocking(move || cleanup.check_authorized(false))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn drive_rejection_normalizer_preserves_typed_problem_status_body_and_headers() {
+    for (status, retain_extension) in [
+        (StatusCode::BAD_REQUEST, true),
+        (StatusCode::PAYLOAD_TOO_LARGE, true),
+        (StatusCode::BAD_REQUEST, false),
+        (StatusCode::PAYLOAD_TOO_LARGE, false),
+    ] {
+        let error = <DriveHttpApiError as api_macros::HttpRequestError>::from_request_rejection(
+            status.as_u16(),
+            "private rejection diagnostic".into(),
+        );
+        let encoded = api_macros::HttpError::custom_response(&error).unwrap();
+        let expected = encoded.body.as_ref().to_vec();
+        let app = Router::new()
+            .route(
+                "/",
+                get(move || async move {
+                    let error =
+                        <DriveHttpApiError as api_macros::HttpRequestError>::from_request_rejection(
+                            status.as_u16(),
+                            String::new(),
+                        );
+                    let mut response = api_macros::axum::http_error_response(status, error);
+                    if !retain_extension {
+                        response.extensions_mut().clear();
+                    }
+                    response
+                        .headers_mut()
+                        .insert("x-drive-probe", HeaderValue::from_static("retained"));
+                    response
+                }),
+            )
+            .layer(middleware::from_fn(drive::normalize_rejections));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+        assert_eq!(response.headers()["x-drive-probe"], "retained");
+        assert_eq!(
+            to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_slice()
+        );
+    }
+}
+
+#[tokio::test]
+async fn drive_client_decoder_checks_actual_status_and_media_before_accepting_details() {
+    let app = Router::new().route(
+        "/api/w/{workspace_id}/drive/root",
+        get(|AxumPath(case): AxumPath<String>| async move {
+            let error = <DriveHttpApiError as api_macros::HttpRequestError>::from_request_rejection(
+                400,
+                String::new(),
+            );
+            let encoded = api_macros::HttpError::custom_response(&error).unwrap();
+            let (status, media) = match case.as_str() {
+                "wrong-status" => (StatusCode::PAYLOAD_TOO_LARGE, "application/problem+json"),
+                "wrong-json" => (StatusCode::BAD_REQUEST, "application/json"),
+                "wrong-media" => (StatusCode::BAD_REQUEST, "text/plain"),
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    "application/problem+json; charset=utf-8",
+                ),
+            };
+            (status, [(CONTENT_TYPE, media)], encoded.body.into_bytes()).into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let _server = AbortServer(tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    }));
+    let client = ServerApiClient::builder(&url)
+        .unwrap()
+        .request_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for (case, actual_status) in [("wrong-status", 413), ("wrong-json", 400)] {
+        let error = client.drive_root(case.into()).await.unwrap_err();
+        assert!(matches!(error, client_support::ClientError::Failure(
+            client_support::ClientFailure::ErrorResponseDecode { status }
+        ) if status == actual_status));
+    }
+    let error = client.drive_root("wrong-media".into()).await.unwrap_err();
+    assert!(matches!(
+        error,
+        client_support::ClientError::Failure(
+            client_support::ClientFailure::UnsupportedErrorResponse { status: 400 }
+        )
+    ));
+    let received = public_drive_error(
+        client.drive_root("valid".into()).await.unwrap_err(),
+        400,
+        DriveApiErrorCode::Invalid,
+    );
+    assert!(received.details().is_some());
+}
+
 struct AbortServer(tokio::task::JoinHandle<()>);
 impl Drop for AbortServer {
     fn drop(&mut self) {
@@ -634,7 +906,7 @@ async fn drive_stream_abort_invalid_query_and_storage_loss_never_publish_or_leak
         .await
         .unwrap();
     assert_eq!(
-        response_json(response, StatusCode::PAYLOAD_TOO_LARGE).await["code"],
+        response_json(response, StatusCode::PAYLOAD_TOO_LARGE).await["yoi_failure"]["details"]["code"],
         "limit"
     );
     let malformed = user_call(
@@ -649,7 +921,7 @@ async fn drive_stream_abort_invalid_query_and_storage_loss_never_publish_or_leak
         StatusCode::BAD_REQUEST,
     )
     .await;
-    assert_eq!(malformed["code"], "invalid");
+    assert_eq!(malformed["yoi_failure"]["details"]["code"], "invalid");
     mutate(&api,&token,"fake-actor",json!({"operation":"create_folder","parent":reference(&root),"name":"fake","actor":"owner"}),StatusCode::BAD_REQUEST).await;
     let saved=mutate(&api,&token,"real",json!({"operation":"create_text","parent":reference(&root),"name":"real","text":"persisted","content_type":"text/plain"}),StatusCode::OK).await;
     let blob_root = api.config.drive_blob_root().unwrap();
@@ -658,19 +930,41 @@ async fn drive_stream_abort_invalid_query_and_storage_loss_never_publish_or_leak
         fs::remove_file(file.unwrap().path()).unwrap();
     }
     let id = saved["entry"]["entry"]["node_id"].as_str().unwrap();
-    let error = user_call(
-        &api,
-        &token,
-        "GET",
-        &format!(
-            "{}/read-text?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}",
-            base()
-        ),
-        None,
-        StatusCode::SERVICE_UNAVAILABLE,
-    )
-    .await;
-    assert_eq!(error["code"], "storage_unavailable");
+    let response = build_router(api.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "{}/read-text?entry_workspace_id={TEST_WORKSPACE_ID}&id={id}",
+                    base()
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let local = response
+        .extensions()
+        .get::<Arc<DriveHttpApiError>>()
+        .expect("local typed error");
+    assert!(matches!(
+        local.source_failure().unwrap().source_error(),
+        workspace_drive::Error::Blob(_)
+    ));
+    let error = response_json(response, StatusCode::SERVICE_UNAVAILABLE).await;
+    assert_eq!(
+        error["yoi_failure"]["details"]["code"],
+        "storage_unavailable"
+    );
+    assert_eq!(error["yoi_failure"]["details"]["operation"], "read_text");
+    assert_eq!(
+        error["yoi_failure"]["details"]["classification"],
+        "not_committed"
+    );
+    assert_eq!(
+        error["yoi_failure"]["details"]["storage"]["reason"],
+        "blob_failure"
+    );
     assert!(!error.to_string().contains(temp.path().to_str().unwrap()));
     user_call(
         &api,
@@ -736,7 +1030,7 @@ async fn drive_verified_upload_revoked_during_reception_cannot_commit_or_replay(
         .await
         .unwrap();
     assert_eq!(
-        response_json(response, StatusCode::FORBIDDEN).await["code"],
+        response_json(response, StatusCode::FORBIDDEN).await["yoi_failure"]["details"]["code"],
         "denied"
     );
     let status = user_call(
@@ -826,7 +1120,7 @@ async fn drive_read_entrypoints_use_current_grants_and_cannot_fallback_to_browse
         .await
         .unwrap();
     assert_eq!(
-        response_json(response, StatusCode::FORBIDDEN).await["code"],
+        response_json(response, StatusCode::FORBIDDEN).await["yoi_failure"]["details"]["code"],
         "denied"
     );
     user_call(

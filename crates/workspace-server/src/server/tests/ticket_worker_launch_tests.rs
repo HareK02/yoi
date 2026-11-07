@@ -12,7 +12,10 @@ use worker_runtime::execution::{
 // published Profile projection; leave Worker creation/control to the real Runtime.
 #[derive(Default)]
 struct LaunchExecutionBackend {
+    lose_initial_ack: std::sync::atomic::AtomicBool,
+    fail_stop: std::sync::atomic::AtomicBool,
     execution: DeterministicExecutionBackend,
+    provider_close_gate: Mutex<Option<Arc<super::workdir_session_close_tests::ProviderCloseGate>>>,
     bundles: Mutex<std::collections::HashMap<String, worker_runtime::config_bundle::ConfigBundle>>,
     creates: Mutex<Vec<worker_runtime::catalog::CreateWorkerRequest>>,
     submits: Mutex<
@@ -122,6 +125,35 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
         self.execution.working_directory(id)
     }
 
+    fn open_workdir_session(
+        &self,
+        id: &str,
+    ) -> std::result::Result<
+        WorkdirSessionHandle,
+        worker_runtime::working_directory::WorkingDirectoryDiagnostic,
+    > {
+        let binding = self
+            .execution
+            .materializer
+            .bind_working_directory(id, None)?;
+        let scope = manifest::Scope::writable(binding.root()).unwrap();
+        let session: WorkdirSessionHandle = Arc::new(
+            workdir::LocalWorkdirSession::materialized_bound_with_environment(
+                workdir::Workdir::new(id),
+                binding.root().to_owned(),
+                binding.root().to_owned(),
+                manifest::SharedScope::new(scope),
+                workdir::WorkdirSessionCapabilities::ALL,
+                binding.command_environment(),
+                binding.session_resources()?,
+            ),
+        );
+        Ok(match self.provider_close_gate.lock().unwrap().as_ref() {
+            Some(gate) => gate.wrap(session),
+            None => session,
+        })
+    }
+
     fn create_working_directory(
         &self,
         request: &worker_runtime::catalog::WorkingDirectoryRequest,
@@ -166,10 +198,45 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
             .lock()
             .unwrap()
             .push((worker.clone(), input.clone()));
-        self.execution.dispatch_input(worker, input)
+        let mut result = self.execution.dispatch_input(worker, input);
+        if self
+            .lose_initial_ack
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Lose only the response acknowledgement, after the real fixture
+            // execution committed its durable receipt. Never redispatch it.
+            result.submission = None;
+        }
+        result
+    }
+
+    fn termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<Option<worker_runtime::execution::WorkerExecutionTermination>, String>
+    {
+        self.execution.termination_receipt(worker)
+    }
+
+    fn stop_worker_operation(
+        &self,
+        request: worker_runtime::execution::WorkerExecutionStopRequest,
+    ) -> WorkerExecutionResult {
+        if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.stop_worker(&request.worker_ref);
+        }
+        // Preserve the fixture's actual joined execution and operation-bound
+        // termination receipt; an accepted legacy stop alone is not that evidence.
+        self.execution.stop_worker_operation(request)
     }
 
     fn stop_worker(&self, worker: &worker_runtime::identity::WorkerRef) -> WorkerExecutionResult {
+        if self.fail_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return WorkerExecutionResult::errored(
+                worker_runtime::execution::WorkerExecutionOperation::Stop,
+                "TEST_ONLY_PRIVATE_STOP_CREDENTIAL /private/path",
+            );
+        }
         self.execution.stop_worker(worker)
     }
 }
@@ -180,11 +247,15 @@ pub(super) struct LaunchFixture {
     backend: Arc<LaunchExecutionBackend>,
     runtime_id: String,
     runtime_server: Option<tokio::task::JoinHandle<()>>,
+    runtime_router: Option<Router>,
     runtime_identity: Option<RuntimeIdentityMaterial>,
 }
 
 impl Drop for LaunchFixture {
     fn drop(&mut self) {
+        if let Some(gate) = self.backend.provider_close_gate.lock().unwrap().as_ref() {
+            gate.release();
+        }
         if let Some(server) = &self.runtime_server {
             server.abort();
         }
@@ -192,13 +263,38 @@ impl Drop for LaunchFixture {
 }
 
 impl LaunchFixture {
+    pub(super) fn hold_provider_close(
+        &self,
+        gate: Arc<super::workdir_session_close_tests::ProviderCloseGate>,
+    ) {
+        *self.backend.provider_close_gate.lock().unwrap() = Some(gate);
+    }
+
+    pub(super) fn runtime_router(&self) -> Router {
+        self.runtime_router.clone().unwrap()
+    }
+
+    pub(super) fn publish_profile(&self, profile: &str) {
+        self.backend.publish_profile(&self.api, profile);
+    }
+
+    pub(super) fn seed_remote_session_for_cleanup(&self, worker: &RuntimeWorkerRef) {
+        seed_worker_session_at_root(
+            &self
+                ._temp
+                .path()
+                .join(".test-embedded-runtime-store/source-runtime/workers")
+                .join(&worker.worker_id),
+        );
+    }
+
     // Reuse the authenticated Runtime HTTP harness for Drive/source lifetime
     // assertions without duplicating its trust/bootstrap/listener lifecycle.
     pub(super) async fn with_source_workdir() -> (
         Self,
         worker_runtime::working_directory::WorkingDirectoryBinding,
     ) {
-        let fixture = Self::new(true).await;
+        let fixture = Self::new_with_runtime_store(true, true).await;
         init_clean_git_workspace(fixture._temp.path());
         let (_, Json(created)) = create_workspace_working_directory(
             &fixture.api,
@@ -224,6 +320,10 @@ impl LaunchFixture {
     }
 
     async fn new(remote: bool) -> Self {
+        Self::new_with_runtime_store(remote, false).await
+    }
+
+    async fn new_with_runtime_store(remote: bool, persistent: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path());
         let store = SqliteWorkspaceStore::open_for_test(config.database_path.clone()).unwrap();
@@ -247,6 +347,7 @@ impl LaunchFixture {
             backend,
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             runtime_server: None,
+            runtime_router: None,
             runtime_identity: None,
         };
         if remote {
@@ -282,11 +383,26 @@ impl LaunchFixture {
                 Arc::new(InMemoryWorkspaceClaimReplayProtection::default()),
             )
             .unwrap();
-            let runtime = worker_runtime::Runtime::with_execution_backend(
-                worker_runtime::RuntimeOptions::default(),
-                fixture.backend.clone(),
-            )
+            let runtime = if persistent {
+                worker_runtime::Runtime::with_fs_store_and_execution_backend(
+                    worker_runtime::fs_store::FsRuntimeStoreOptions {
+                        root: fixture
+                            ._temp
+                            .path()
+                            .join(".test-embedded-runtime-store/source-runtime"),
+                        runtime_id: fixture.runtime_id.clone(),
+                        display_name: None,
+                    },
+                    fixture.backend.clone(),
+                )
+            } else {
+                worker_runtime::Runtime::with_execution_backend(
+                    worker_runtime::RuntimeOptions::default(),
+                    fixture.backend.clone(),
+                )
+            }
             .unwrap();
+            runtime.bind_runtime_identity(&fixture.runtime_id).unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let binding = WorkspaceRuntimeBinding {
@@ -318,18 +434,17 @@ impl LaunchFixture {
                 .unwrap()
                 .unwrap();
             let runtime_id = fixture.runtime_id.clone();
+            let router = worker_runtime::http_server::runtime_http_router_with_workspace_auth(
+                runtime,
+                None,
+                worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
+                    verifier,
+                    runtime_id,
+                },
+            );
+            fixture.runtime_router = Some(router.clone());
             fixture.runtime_server = Some(tokio::spawn(async move {
-                worker_runtime::http_server::serve_runtime_http_with_workspace_auth(
-                    runtime,
-                    listener,
-                    None,
-                    worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
-                        verifier,
-                        runtime_id,
-                    },
-                )
-                .await
-                .unwrap();
+                axum::serve(listener, router).await.unwrap();
             }));
             let mut remote_config = RemoteRuntimeConfig {
                 runtime_id: fixture.runtime_id.clone(),
@@ -856,6 +971,7 @@ async fn generic_ticket_worker_unknown_input_outcome_preserves_assignment_and_la
         .input(
             &WorkerOperationContext::Backend,
             WorkerInputRequest {
+                source: None,
                 kind: WorkerInputKind::User,
                 content: "Continue Ticket research".into(),
                 submission_request_id: Some("unknown-worker-submit".into()),
@@ -1054,6 +1170,90 @@ async fn read_only_ticket_targets_allow_extra_external_grants_without_widening_c
     );
 }
 
+/// Production create owner and Backend adapters share the same executor; only
+/// its response acknowledgement and cleanup boundary are fault-injected.
+#[tokio::test(flavor = "multi_thread")]
+async fn initial_input_ack_loss_preserves_creation_facts_across_embedded_and_remote() {
+    use runtime_api::startup::*;
+    for failed_cleanup in [false, true] {
+        let mut observed = Vec::new();
+        for remote in [false, true] {
+            let fixture = LaunchFixture::new(remote).await;
+            let ticket = fixture.ticket();
+            let payload = fixture.payload(&ticket, "lost-initial-ack", "builtin:companion", false);
+            fixture
+                .backend
+                .lose_initial_ack
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            fixture
+                .backend
+                .fail_stop
+                .store(failed_cleanup, std::sync::atomic::Ordering::SeqCst);
+            let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+            let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+                &serde_json::to_vec(&body).unwrap(),
+                status.as_u16(),
+                PROBLEM_CONTENT_TYPE,
+                StartupBoundary::Browser,
+            ) else {
+                panic!("must retain typed creation facts: {body}");
+            };
+            assert_eq!(failure.operation().acceptance, CreationAcceptance::Accepted);
+            assert_eq!(failure.operation().execution, ExecutionOutcome::Unknown);
+            let finalize = failure.operation().finalize.unwrap();
+            assert_eq!(finalize.stage, FinalizeStage::InitialInput);
+            assert_eq!(
+                finalize.compensation,
+                if failed_cleanup {
+                    CompensationOutcome::Unknown
+                } else {
+                    CompensationOutcome::Completed
+                }
+            );
+            assert_eq!(body["yoi_failure"]["reason"], "invalid_response");
+            assert!(
+                !body
+                    .to_string()
+                    .contains("TEST_ONLY_PRIVATE_STOP_CREDENTIAL")
+            );
+            let creates = fixture.backend.creates.lock().unwrap().clone();
+            assert_eq!(creates.len(), 1);
+            let worker_id = creates[0].worker_id.to_string();
+            let worker = RuntimeWorkerRef::new(&fixture.runtime_id, &worker_id);
+            let Some(DecodeStoredWorkerCreateFailure::Known(saved)) =
+                fixture.api.worker_create_failure(&worker).unwrap()
+            else {
+                panic!("retain queryable create result");
+            };
+            assert_eq!(saved.public_facts(), failure.public_facts());
+            assert_eq!(
+                fixture.backend.submits_for(&worker_id).len(),
+                1,
+                "observation failure never redispatches"
+            );
+            assert_eq!(
+                fixture
+                    .backend
+                    .execution
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .any(|worker| worker.worker_id.to_string() == worker_id),
+                failed_cleanup
+            );
+            let mut facts = failure.public_facts();
+            facts.operation.correlation = None;
+            observed.push((status, body["yoi_failure"]["reason"].clone(), facts));
+        }
+        assert_eq!(
+            observed[0], observed[1],
+            "same owner facts through Embedded and Remote"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_and_preserves_open_case()
  {
@@ -1072,10 +1272,19 @@ async fn worker_assignment_finalize_failure_compensates_real_embedded_runtime_an
         .unwrap();
     let payload = fixture.payload(&ticket_id, "compensated-worker", "builtin:companion", false);
     let (status, body) = fixture.post(TEST_WORKSPACE_ID, payload).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["yoi_failure"]["domain"], "startup_boundary");
+    assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
+    let operation = &body["yoi_startup"]["operation"];
+    assert_eq!(operation["acceptance"], "accepted");
+    assert_eq!(operation["execution"], "accepted");
+    assert_eq!(operation["finalize"]["stage"], "ticket_assignment_bind");
+    assert_eq!(operation["finalize"]["compensation"], "completed");
+    assert!(body["detail"].as_str().unwrap().contains("finalization"));
     assert!(
-        body["message"].as_str().unwrap().contains("compensat"),
-        "{body}"
+        !body
+            .to_string()
+            .contains("injected Worker assignment failure")
     );
     let creates = fixture
         .backend
@@ -1232,6 +1441,7 @@ impl crate::hosts::WorkspaceWorkerRuntime for LostSpawnResponseRuntime {
         assert_eq!(result.state, InternalWorkerOperationState::Accepted);
         assert!(result.worker.is_some());
         WorkerSpawnResult {
+            failure: None,
             state: InternalWorkerOperationState::Rejected,
             worker: None,
             acceptance_evidence: Vec::new(),
@@ -1300,13 +1510,10 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
     assert_eq!(receipt.claim_state, "pending");
     assert!(receipt.assignment_id.is_none());
     let original_worker = receipt.worker.clone().unwrap();
-    assert!(
-        fixture
-            .runtime
-            .worker(&original_worker.worker_id)
-            .worker
-            .is_some()
-    );
+    assert!(matches!(
+        fixture.runtime.worker(&original_worker.worker_id).outcome,
+        crate::hosts::WorkerLookupOutcome::Found { .. }
+    ));
     assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
 
     browser_ticket_backend(&fixture.api)
@@ -1359,13 +1566,10 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
             .is_none()
     );
     assert_eq!(fixture.runtime.spawn_requests().len(), initial_spawns + 1);
-    assert!(
-        fixture
-            .runtime
-            .worker(&original_worker.worker_id)
-            .worker
-            .is_some()
-    );
+    assert!(matches!(
+        fixture.runtime.worker(&original_worker.worker_id).outcome,
+        crate::hosts::WorkerLookupOutcome::Found { .. }
+    ));
     assert_eq!(
         fixture
             .api
@@ -1743,9 +1947,88 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
         .stop_worker(
             &coder,
             WorkerLifecycleRequest {
+                stop_intent: None,
                 reason: None,
                 ticket_assignment: None,
             },
         )
         .unwrap();
+}
+
+// Real Runtime creation and SQLite finalization fail independently; only Stop is
+// injected. Reconciliation must retain the create reservation while absence is unknown.
+#[tokio::test(flavor = "multi_thread")]
+async fn accepted_creation_finalize_and_failed_stop_retain_unknown_compensation_and_reservation() {
+    let fixture = LaunchFixture::new(false).await;
+    let ticket_id = fixture.ticket();
+    rusqlite::Connection::open(&fixture.api.config.database_path).unwrap().execute_batch(
+        "CREATE TRIGGER fail_startup_finalize BEFORE INSERT ON ticket_current_worker_assignments WHEN NEW.role='worker' BEGIN SELECT RAISE(ABORT, 'TEST_ONLY_PRIVATE_DB_CREDENTIAL'); END;"
+    ).unwrap();
+    fixture
+        .backend
+        .fail_stop
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = fixture
+        .post(
+            TEST_WORKSPACE_ID,
+            fixture.payload(
+                &ticket_id,
+                "unknown-compensation",
+                "builtin:companion",
+                false,
+            ),
+        )
+        .await;
+    fixture
+        .backend
+        .fail_stop
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["yoi_failure"]["reason"], "finalize_failed");
+    let operation = &body["yoi_startup"]["operation"];
+    assert_eq!(operation["acceptance"], "accepted");
+    assert_eq!(operation["execution"], "accepted");
+    assert_eq!(operation["finalize"]["compensation"], "unknown");
+    assert!(
+        operation["correlation"]
+            .as_str()
+            .unwrap()
+            .starts_with("worker-")
+    );
+    for secret in [
+        "TEST_ONLY_PRIVATE_STOP_CREDENTIAL",
+        "/private/path",
+        "TEST_ONLY_PRIVATE_DB_CREDENTIAL",
+    ] {
+        assert!(!body.to_string().contains(secret), "{body}");
+    }
+    assert_eq!(
+        fixture
+            .api
+            .authority
+            .ticket(&ticket_id)
+            .unwrap()
+            .state
+            .as_str(),
+        "open"
+    );
+    let created = fixture.backend.creates.lock().unwrap();
+    let created: Vec<_> = created
+        .iter()
+        .filter(|request| request.display_name.as_deref() == Some("Explicit Ticket Worker"))
+        .collect();
+    assert_eq!(created.len(), 1);
+    let worker_id = created[0].worker_id.to_string();
+    let reserved: i64 = fixture.api.config_store.with_conn(|conn| conn.query_row(
+        "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='reserved'",
+        rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0),
+    ).map_err(Error::from)).unwrap();
+    // A reservation may already be completed by Runtime admission, but it must
+    // remain present (never released as absent) until Runtime absence is confirmed.
+    let retained: i64 = fixture.api.config_store.with_conn(|conn| conn.query_row(
+        "SELECT COUNT(*) FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+        rusqlite::params![TEST_WORKSPACE_ID, fixture.runtime_id, worker_id], |row| row.get(0),
+    ).map_err(Error::from)).unwrap();
+    assert_eq!(retained, 1);
+    assert!(reserved <= retained);
 }

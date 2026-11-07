@@ -16,7 +16,10 @@
 //! execution data, not proof of liveness.
 
 use crate::{SegmentId, SessionId};
+use error_contract::{DecodeFailure, WireDetails};
+use protocol::startup_failure::StoredStartupFailureAttachment;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -181,6 +184,168 @@ pub struct WorkerMetadata {
     /// absence is also the legacy representation and never grants visibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subjektiv_session_attribution: Option<SubjektivSessionAttributionState>,
+    /// Projected startup cause bound to its Session and ownership observation.
+    /// Pointer/ownership changes retain this evidence, but the read accessor
+    /// rejects a stale binding before decoding. This is not execution state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_failure: Option<SessionStartupFailure>,
+}
+
+/// Opaque cause and the exact local binding under which it was saved.
+///
+/// Only the CAS save path constructs this binding from its matched expectation.
+/// Attribution is fingerprinted rather than copied: its existing diagnostics may
+/// contain credentials or private paths and must not enter this new attachment.
+/// The fingerprint is an equality fence, not encryption or ownership authority.
+/// Deserialization merely restores evidence, not current ownership or authority;
+/// consumers read it through `WorkerMetadata::decode_startup_failure`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SessionStartupFailure {
+    Bound(StartupFailureBinding),
+    /// Malformed or future binding representations remain alongside lifecycle metadata.
+    Undecodable(serde_json::Value),
+}
+
+impl std::fmt::Debug for SessionStartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionStartupFailure")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupFailureBinding {
+    version: u16,
+    worker_name: String,
+    session_id: SessionId,
+    workspace_id: Option<String>,
+    attribution_fingerprint: [u8; 32],
+    attachment: StoredStartupFailureAttachment,
+}
+
+// The compact JSON serialization of this typed Option is the fingerprint input:
+// None is `null`; Some retains every enum field in its declared Serialize order.
+// There are no maps whose iteration order could vary. Changing that representation
+// requires a new binding version. Version 1 uses SHA-256 over precisely these bytes.
+// This enum and SessionId serialize infallibly
+// to JSON; no caller-controlled Serialize implementation participates here.
+fn attribution_fingerprint(attribution: &Option<SubjektivSessionAttributionState>) -> [u8; 32] {
+    let encoded = serde_json::to_vec(attribution).expect("typed attribution serializes to JSON");
+    Sha256::digest(encoded).into()
+}
+
+impl SessionStartupFailure {
+    fn from_expected(
+        expected: &StartupFailureExpectation,
+        attachment: &StoredStartupFailureAttachment,
+    ) -> Self {
+        Self::Bound(StartupFailureBinding {
+            version: 1,
+            worker_name: expected.worker_name.clone(),
+            session_id: expected.session_id,
+            workspace_id: expected.workspace_id.clone(),
+            attribution_fingerprint: attribution_fingerprint(&expected.attribution),
+            attachment: attachment.clone(),
+        })
+    }
+}
+
+impl StartupFailureBinding {
+    fn binding_mismatch(&self, metadata: &WorkerMetadata) -> Option<StartupFailureBindingMismatch> {
+        let mismatch = StartupFailureBindingMismatch {
+            worker_name: self.worker_name != metadata.worker_name,
+            session_id: Some(self.session_id)
+                != metadata.active.as_ref().map(|active| active.session_id),
+            workspace_id: self.workspace_id != metadata.workspace_id,
+            attribution: self.attribution_fingerprint
+                != attribution_fingerprint(&metadata.subjektiv_session_attribution),
+        };
+        (mismatch.worker_name
+            || mismatch.session_id
+            || mismatch.workspace_id
+            || mismatch.attribution)
+            .then_some(mismatch)
+    }
+}
+
+/// Each `true` field identifies a binding that differs from current metadata.
+/// Values and legacy diagnostic text are not copied into the diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupFailureBindingMismatch {
+    pub worker_name: bool,
+    /// Also true when there is no longer an active Session.
+    pub session_id: bool,
+    pub workspace_id: bool,
+    pub attribution: bool,
+}
+
+/// A current binding must match before the consumer's typed codec runs.
+/// `Present` is only cause evidence, never execution or retry authorization.
+pub enum StartupFailureRead<D> {
+    Missing,
+    /// Binding encoding is versioned independently of the domain error envelope.
+    UnsupportedBindingVersion(u16),
+    CorruptBinding,
+    /// Retained cause belongs to a different Session/ownership observation.
+    /// No cause decoding is attempted, even for unknown or corrupt attachments.
+    Mismatch(StartupFailureBindingMismatch),
+    /// Known, unsupported and corrupt causes remain distinct in the codec.
+    Present(DecodeFailure<D>),
+}
+
+/// The observed ownership and cause values for one startup-cause write.
+///
+/// Segment movement within the same Session does not invalidate this expectation.
+/// Attribution is compared in full, including legacy diagnostics, never inferred
+/// from those diagnostics. The existing cause comparison includes its entire saved
+/// binding, not just attachment bytes. A cause write changes neither attribution
+/// nor ownership; it builds the new binding from this matched expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupFailureExpectation {
+    pub worker_name: String,
+    pub workspace_id: Option<String>,
+    pub session_id: SessionId,
+    pub attribution: Option<SubjektivSessionAttributionState>,
+    pub startup_failure: Option<SessionStartupFailure>,
+}
+
+impl StartupFailureExpectation {
+    /// Capture an expectation only when metadata identifies an active Session.
+    pub fn from_metadata(metadata: &WorkerMetadata) -> Option<Self> {
+        Some(Self {
+            worker_name: metadata.worker_name.clone(),
+            workspace_id: metadata.workspace_id.clone(),
+            session_id: metadata.active.as_ref()?.session_id,
+            attribution: metadata.subjektiv_session_attribution.clone(),
+            startup_failure: metadata.startup_failure.clone(),
+        })
+    }
+
+    /// Compare the complete observation without adopting newer ownership or causes.
+    pub fn matches(&self, metadata: &WorkerMetadata) -> bool {
+        metadata.worker_name == self.worker_name
+            && metadata.workspace_id == self.workspace_id
+            && metadata.active.as_ref().map(|active| active.session_id) == Some(self.session_id)
+            && metadata.subjektiv_session_attribution == self.attribution
+            && metadata.startup_failure == self.startup_failure
+    }
+}
+
+/// Local persistence evidence, never a replacement for the received startup cause.
+#[derive(Debug)]
+pub enum StartupFailureSaveResult {
+    /// The attachment and containing directory were synced successfully.
+    Persisted,
+    /// The observed Session, ownership, attribution, or cause no longer matches.
+    /// No write was attempted. Missing metadata is also a conflict, not creation.
+    Conflict,
+    /// This attempt did not publish metadata. The caller still owns its cause.
+    NotSaved(WorkerStoreError),
+    /// Publication may have happened; reconcile retained metadata before retrying.
+    /// For the filesystem stores this means rename succeeded but directory sync failed.
+    OutcomeUnknown(WorkerStoreError),
 }
 
 impl WorkerMetadata {
@@ -196,7 +361,42 @@ impl WorkerMetadata {
             peers: Vec::new(),
             resolved_manifest_snapshot: None,
             subjektiv_session_attribution: None,
+            startup_failure: None,
         }
+    }
+
+    /// Absence is legacy/missing evidence, not a cause inferred from diagnostics.
+    /// A retained cause whose Session or ownership observation no longer matches
+    /// yields `Mismatch`, never `Missing` or a decoded cause for the new owner.
+    /// Segment movement within the same Session does not invalidate the binding.
+    /// Matched attachments use only the consumer's typed codec, preserving known,
+    /// unsupported and corrupt results. No result authorizes execution or retry.
+    pub fn decode_startup_failure<D: WireDetails>(&self) -> StartupFailureRead<D> {
+        let Some(failure) = &self.startup_failure else {
+            return StartupFailureRead::Missing;
+        };
+        #[derive(Deserialize)]
+        struct BindingVersion {
+            version: u16,
+        }
+        let failure = match failure {
+            SessionStartupFailure::Bound(binding) if binding.version == 1 => binding,
+            SessionStartupFailure::Bound(binding) => {
+                return StartupFailureRead::UnsupportedBindingVersion(binding.version);
+            }
+            SessionStartupFailure::Undecodable(raw) => {
+                return match serde_json::from_value::<BindingVersion>(raw.clone()) {
+                    Ok(header) if header.version != 1 => {
+                        StartupFailureRead::UnsupportedBindingVersion(header.version)
+                    }
+                    _ => StartupFailureRead::CorruptBinding,
+                };
+            }
+        };
+        if let Some(mismatch) = failure.binding_mismatch(self) {
+            return StartupFailureRead::Mismatch(mismatch);
+        }
+        StartupFailureRead::Present(failure.attachment.decode())
     }
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
@@ -263,6 +463,25 @@ pub trait WorkerMetadataStore: Send + Sync {
             }
         })?;
         Ok(matched)
+    }
+
+    /// Persist a received cause only against the exact observed Session and owner.
+    ///
+    /// Implementations must serialize this comparison and publication with their
+    /// other read/modify/write operations. The filesystem stores use the same
+    /// process-local mutex as `update_by_name`; this is not a cross-process lock.
+    /// Uncoordinated direct writes are outside that guarantee. A default backend
+    /// refuses rather than offering a non-atomic read/write approximation.
+    /// The borrowed attachment is never consumed or changed on any result.
+    fn compare_and_swap_startup_failure(
+        &self,
+        _expected: &StartupFailureExpectation,
+        _failure: &StoredStartupFailureAttachment,
+    ) -> StartupFailureSaveResult {
+        StartupFailureSaveResult::NotSaved(WorkerStoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic startup failure persistence is unsupported by this backend",
+        )))
     }
 
     /// Set the active pointer while preserving spawned children, workspace ownership, and manifest snapshot.
@@ -404,6 +623,90 @@ pub trait WorkerMetadataStore: Send + Sync {
     }
 }
 
+/// Whether an atomic metadata replacement reached its publication point.
+struct MetadataWriteFailure {
+    published: bool,
+    error: WorkerStoreError,
+}
+
+fn write_metadata_atomically(
+    metadata: &WorkerMetadata,
+    path: &Path,
+) -> Result<(), MetadataWriteFailure> {
+    write_metadata_with_directory_sync(metadata, path, |parent| {
+        std::fs::File::open(parent)?.sync_all()
+    })
+}
+
+// Keep the directory durability boundary explicit: a failure here follows rename,
+// unlike failures writing/syncing the temporary file. Tests replace only this IO
+// boundary, retaining the real serialization, temporary file and rename path.
+fn write_metadata_with_directory_sync(
+    metadata: &WorkerMetadata,
+    path: &Path,
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<(), MetadataWriteFailure> {
+    let mut published = false;
+    let mut temp = None;
+    let result = (|| -> Result<(), WorkerStoreError> {
+        use std::io::Write;
+        let mut content = serde_json::to_vec_pretty(metadata)?;
+        content.push(b'\n');
+        let parent = path.parent().expect("metadata path has parent");
+        fs::create_dir_all(parent)?;
+        let temporary_path = parent.join(format!(
+            ".metadata.json.tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
+        temp = Some(temporary_path.clone());
+        file.write_all(&content)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary_path, path)?;
+        published = true;
+        sync_directory(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        if let Some(temp) = temp {
+            let _ = fs::remove_file(temp);
+        }
+    }
+    result.map_err(|error| MetadataWriteFailure { published, error })
+}
+
+fn save_startup_failure_locked<S: WorkerMetadataStore>(
+    store: &S,
+    update_lock: &Mutex<()>,
+    expected: &StartupFailureExpectation,
+    failure: &StoredStartupFailureAttachment,
+    publish: impl FnOnce(&WorkerMetadata) -> Result<(), MetadataWriteFailure>,
+) -> StartupFailureSaveResult {
+    let _guard = update_lock.lock().expect("metadata update lock poisoned");
+    let mut metadata = match store.read_by_name(&expected.worker_name) {
+        Ok(Some(metadata)) if expected.matches(&metadata) => metadata,
+        Ok(_) => return StartupFailureSaveResult::Conflict,
+        Err(error) => return StartupFailureSaveResult::NotSaved(error),
+    };
+    metadata.startup_failure = Some(SessionStartupFailure::from_expected(expected, failure));
+    match publish(&metadata) {
+        Ok(()) => StartupFailureSaveResult::Persisted,
+        Err(MetadataWriteFailure {
+            published: false,
+            error,
+        }) => StartupFailureSaveResult::NotSaved(error),
+        Err(MetadataWriteFailure {
+            published: true,
+            error,
+        }) => StartupFailureSaveResult::OutcomeUnknown(error),
+    }
+}
+
 /// Metadata store for one canonical Worker aggregate.
 ///
 /// The Worker key is fixed by Runtime authority and metadata lives directly at
@@ -489,31 +792,7 @@ impl WorkerAggregateStore {
 impl WorkerMetadataStore for WorkerAggregateStore {
     fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
         self.validate_name(&metadata.worker_name)?;
-        let mut content = serde_json::to_vec_pretty(metadata)?;
-        content.push(b'\n');
-        let path = self.metadata_path();
-        let temp = self.root.join(format!(
-            ".metadata.json.tmp-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        let result = (|| -> Result<(), WorkerStoreError> {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            file.write_all(&content)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp, &path)?;
-            std::fs::File::open(&self.root)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp);
-        }
-        result
+        write_metadata_atomically(metadata, &self.metadata_path()).map_err(|failure| failure.error)
     }
 
     fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
@@ -551,6 +830,16 @@ impl WorkerMetadataStore for WorkerAggregateStore {
         update(&mut metadata);
         self.write(&metadata)?;
         Ok(metadata)
+    }
+
+    fn compare_and_swap_startup_failure(
+        &self,
+        expected: &StartupFailureExpectation,
+        failure: &StoredStartupFailureAttachment,
+    ) -> StartupFailureSaveResult {
+        save_startup_failure_locked(self, &self.update_lock, expected, failure, |metadata| {
+            write_metadata_atomically(metadata, &self.metadata_path())
+        })
     }
 
     fn compare_and_swap_active(
@@ -627,32 +916,7 @@ impl FsWorkerStore {
 impl WorkerMetadataStore for FsWorkerStore {
     fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
         let path = self.metadata_path(&metadata.worker_name)?;
-        let mut content = serde_json::to_vec_pretty(metadata)?;
-        content.push(b'\n');
-        let parent = path.parent().expect("metadata path has parent");
-        fs::create_dir_all(parent)?;
-        let temp = parent.join(format!(
-            ".metadata.json.tmp-{}-{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        let result = (|| -> Result<(), WorkerStoreError> {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            file.write_all(&content)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp, &path)?;
-            std::fs::File::open(parent)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp);
-        }
-        result
+        write_metadata_atomically(metadata, &path).map_err(|failure| failure.error)
     }
 
     fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
@@ -683,6 +947,20 @@ impl WorkerMetadataStore for FsWorkerStore {
         update(&mut metadata);
         self.write(&metadata)?;
         Ok(metadata)
+    }
+
+    fn compare_and_swap_startup_failure(
+        &self,
+        expected: &StartupFailureExpectation,
+        failure: &StoredStartupFailureAttachment,
+    ) -> StartupFailureSaveResult {
+        let path = match self.metadata_path(&expected.worker_name) {
+            Ok(path) => path,
+            Err(error) => return StartupFailureSaveResult::NotSaved(error),
+        };
+        save_startup_failure_locked(self, &self.update_lock, expected, failure, |metadata| {
+            write_metadata_atomically(metadata, &path)
+        })
     }
 
     fn compare_and_swap_active(
@@ -1007,6 +1285,15 @@ where
         self.worker_metadata_store
             .update_by_name(worker_name, update)
     }
+    fn compare_and_swap_startup_failure(
+        &self,
+        expected: &StartupFailureExpectation,
+        failure: &StoredStartupFailureAttachment,
+    ) -> StartupFailureSaveResult {
+        self.worker_metadata_store
+            .compare_and_swap_startup_failure(expected, failure)
+    }
+
     fn compare_and_swap_active(
         &self,
         worker_name: &str,
@@ -1512,3 +1799,7 @@ mod tests {
         assert_eq!(winners, 1);
     }
 }
+
+#[cfg(test)]
+#[path = "startup_failure_tests.rs"]
+mod startup_failure_tests;

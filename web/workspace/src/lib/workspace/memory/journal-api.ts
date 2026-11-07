@@ -1,3 +1,4 @@
+import { subjectJournalHref } from "#lib/workspace/subjektiv/routes.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 
 export type JournalMetadata = {
@@ -411,9 +412,7 @@ export function journalHref(
     if (value != null && value !== "") params.set(key, value);
   }
   const suffix = params.toString();
-  return `/w/${encodeURIComponent(workspaceId)}/memory/${
-    encodeURIComponent(subjectId)
-  }/journal${suffix ? `?${suffix}` : ""}`;
+  return `${subjectJournalHref(workspaceId, subjectId)}${suffix ? `?${suffix}` : ""}`;
 }
 export function boundedParam(
   params: URLSearchParams,

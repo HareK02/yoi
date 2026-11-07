@@ -1,6 +1,10 @@
 //! Connected Backend → production Runtime factory → real Controller → Journal → signed
 //! Host startup reader → persisted first input. Only the external model stream is scripted.
 //! Browser authentication is outside this regression: creation enters the real scoped handler.
+//! Policy regressions reuse the parent's canonical source/SQLite RuntimeFixture with
+//! recording Runtime execution; those cases do not claim real Controller/model execution.
+//! Pending-head repair starts from never-started saved catalog/metadata fixtures, not
+//! a successful create or a stopped Controller. Its repair and Host I/O are production.
 use super::*;
 use agen::llm_client::{
     LlmClient, Request,
@@ -13,13 +17,69 @@ use std::sync::{Arc, Mutex};
 
 use super::super::restored_parent_control_tests::connected_restore_tempdir;
 
+#[path = "session_embedded_binding_tests.rs"]
+mod signed_session_binding;
+
+fn connected_subject_permissions(
+    subject: &str,
+) -> Vec<server_api::authorization::ScopedPermission> {
+    JOURNAL_OPERATIONS
+        .iter()
+        .copied()
+        .chain([
+            "memory.extract.read",
+            "memory.extract.supply",
+            "memory.resident.read",
+            "memory.resident.supply",
+            "memory.consolidation.request",
+            "memory.consolidation.supply",
+            "memory.surface.prepare",
+            "memory.surface.supply",
+            "memory.surface.publish",
+            "memory.surface.fail",
+            "memory.staging.list",
+            "memory.staging.read",
+            "memory.candidate.decide",
+            "memory.query",
+            "memory.read",
+            "memory.changes.list",
+        ])
+        .map(|operation| server_api::authorization::ScopedPermission {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::Subject {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                subject_id: subject.into(),
+            },
+        })
+        .collect()
+}
+
 #[derive(Clone, Default)]
 struct ConnectedJournalModel {
     dialogs: Arc<Mutex<Vec<Request>>>,
     journal_inputs: Arc<Mutex<Vec<String>>>,
+    journal_observations: Arc<Mutex<Vec<Value>>>,
+    lifecycle_storage: Arc<Mutex<Option<crate::WorkspaceFeatureStorage>>>,
+    clock: Arc<Mutex<Option<std::time::Instant>>>,
+    http_observations: Arc<Mutex<Vec<Value>>>,
+    poll_observations: Arc<Mutex<Vec<Value>>>,
 }
 
 impl ConnectedJournalModel {
+    fn elapsed_micros(&self) -> u64 {
+        self.clock.lock().unwrap().as_ref().map_or(0, |clock| {
+            clock.elapsed().as_micros().min(u64::MAX as u128) as u64
+        })
+    }
+
+    fn observe_bounded(observations: &Mutex<Vec<Value>>, value: Value) {
+        let mut observations = observations.lock().unwrap();
+        if observations.len() == 64 {
+            observations.remove(0);
+        }
+        observations.push(value);
+    }
+
     fn journal_response(request: &Request) -> Vec<Event> {
         // Consume the actual Controller-rendered input, not a fixture generation or
         // a Source tool response. Decode also checks complete bodies/ranges/digests.
@@ -219,6 +279,27 @@ impl LlmClient for ConnectedJournalModel {
                 inputs.push(envelope);
             }
             drop(inputs);
+            let mut observations = self.journal_observations.lock().unwrap();
+            if observations.len() == 16 {
+                observations.remove(0);
+            }
+            observations.push(json!({
+                "observed_at": Utc::now().to_rfc3339(),
+                "elapsed_micros": self.elapsed_micros(),
+                "lifecycle_manager": self.lifecycle_storage.lock().unwrap().as_ref()
+                    .map(|storage| { let timing = storage.lifecycle_observation(); json!({
+                        "acquisitions":timing.acquisitions,"sync_attempts":timing.sync_attempts,
+                        "sync_nanoseconds":timing.sync_nanoseconds,"lock_attempts":timing.lock_attempts,
+                        "lock_nanoseconds":timing.lock_nanoseconds,"failed_syncs":timing.failed_syncs,
+                        "failed_locks":timing.failed_locks,
+                    }) }),
+                "tool_results": request.items.iter().rev().filter_map(|item| match item {
+                    Item::ToolResult { call_id, is_error, summary, .. } =>
+                        Some(json!({"call_id":call_id,"is_error":is_error,"summary":summary.chars().take(256).collect::<String>()})),
+                    _ => None,
+                }).take(16).collect::<Vec<_>>(),
+            }));
+            drop(observations);
             Self::journal_response(&request)
         } else if request.tools.iter().any(|tool| {
             matches!(
@@ -276,22 +357,41 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
     RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
 }
 
+// Keep the fixture Host reactor runnable while a synchronous Runtime Stop
+// waits for Controller/Feature shutdown and its final Host callbacks.
+async fn connected_stop_worker(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> std::result::Result<crate::hosts::WorkerLifecycleResult, RuntimeRegistryError> {
+    let runtime = api.runtime.clone();
+    let worker = worker.clone();
+    tokio::task::spawn_blocking(move || {
+        runtime.stop_worker(&worker, WorkerLifecycleRequest::default())
+    })
+    .await
+    .unwrap()
+}
+
 async fn connected_wait_for_recording(
     api: &WorkspaceApi,
     store: &crate::subjektiv::SubjektivStore,
     attr: &crate::subjektiv::SubjectSessionAttribution,
+    model: &ConnectedJournalModel,
+    phase: &str,
 ) {
     let host = JournalHostContext::validated_session(store, attr.clone()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut tick = tokio::time::interval(std::time::Duration::from_millis(25));
         loop {
-            tick.tick().await;
+            let poll_started = model.elapsed_micros();
             let jobs = api
                 .store
                 .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
                 .unwrap();
-            let generation_closed =
-                store
+            let ready = !jobs.is_empty()
+                && jobs
+                    .iter()
+                    .all(|job| job.state == BackendJobState::Completed)
+                && store
                     .journal_for_session(&host)
                     .unwrap()
                     .is_some_and(|journal| {
@@ -299,33 +399,62 @@ async fn connected_wait_for_recording(
                             .active_journal_generation(&host, &journal)
                             .unwrap()
                             .is_none()
-                    });
-            if !jobs.is_empty()
-                && generation_closed
-                && jobs
-                    .iter()
-                    .all(|job| job.state == BackendJobState::Completed)
+                    })
                 && !store.journal_retention_required(&host).unwrap()
+                && jobs.iter().all(|job| {
+                    subjektiv_journal::require_job_effects_ended(api, job).is_ok()
+                        && api.store.list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id)
+                            .unwrap().iter().all(|attempt| {
+                                attempt.worker.is_none() || (
+                                    attempt.worker_cleanup_state == Some(BackendJobWorkerCleanupState::Completed)
+                                    && crate::backend_job_host_effects::JobHostEffects::try_fence_retained(
+                                        &api.config.database_path, attempt,
+                                    ).is_ok()
+                                )
+                            })
+                })
                 && api
                     .runtime
                     .worker(&RuntimeWorkerRef::new(&attr.runtime_id, &attr.worker_id))
                     .unwrap()
                     .worker_state
-                    .is_some_and(|state| state.catalog_status() == protocol::WorkerStatus::Idle)
-            {
+                    .is_some_and(|state| state.catalog_status() == protocol::WorkerStatus::Idle);
+            ConnectedJournalModel::observe_bounded(&model.poll_observations,
+                json!({"phase":phase,"start_micros":poll_started,
+                    "end_micros":model.elapsed_micros()}));
+            if ready {
                 break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
     .await
     .unwrap_or_else(|_| {
+        let jobs = api.store
+            .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
+            .unwrap();
+        let attempts = jobs.iter().map(|job| {
+            let history = api.store.list_backend_job_attempts(TEST_WORKSPACE_ID, &job.request.job_id).unwrap();
+            let workers = history.iter().filter_map(|attempt| attempt.worker.as_ref())
+                .map(|worker| (worker.clone(), api.runtime.worker(worker)))
+                .collect::<Vec<_>>();
+            (job.request.job_id.clone(), history, workers)
+        }).collect::<Vec<_>>();
         panic!(
-            "real Controller recording did not complete: {:?}",
-            api.store
-                .list_backend_journal_jobs(TEST_WORKSPACE_ID, &attr.session_id, None, 100)
-                .unwrap()
+            "real Controller recording did not complete: phase={phase}; jobs={jobs:?}; attempts={attempts:?}; recovery_owners={:?}; cleanup_owners={:?}; model_observations={:?}; http_observations={:?}; poll_observations={:?}",
+            api.backend_job_recovery.recovery_owner_ids(),
+            api.backend_job_recovery.cleanup_owner_ids(),
+            model.journal_observations.lock().unwrap(),
+            model.http_observations.lock().unwrap(),
+            model.poll_observations.lock().unwrap(),
         )
     });
+    eprintln!(
+        "recording progress timing: phase={phase}; model={:?}; http={:?}; polls={:?}",
+        model.journal_observations.lock().unwrap(),
+        model.http_observations.lock().unwrap(),
+        model.poll_observations.lock().unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -378,14 +507,25 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     .await
     .unwrap();
     seed_test_delivery_binding(&api);
+    *model.clock.lock().unwrap() = Some(std::time::Instant::now());
+    *model.lifecycle_storage.lock().unwrap() = Some(api.feature_storage.clone());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let observed = requests.clone();
+    let timing_model = model.clone();
     let app = build_router(api.clone()).layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| {
             let observed = observed.clone();
+            let timing_model = timing_model.clone();
             async move {
                 let path = request.uri().path().to_string();
+                let started = timing_model.elapsed_micros();
+                ConnectedJournalModel::observe_bounded(&timing_model.http_observations,
+                    json!({"event":"ingress","path":path.chars().take(256).collect::<String>(),"start_micros":started}));
                 let response = next.run(request).await;
+                ConnectedJournalModel::observe_bounded(&timing_model.http_observations,
+                    json!({"event":"return","path":path.chars().take(256).collect::<String>(),
+                        "start_micros":started,"end_micros":timing_model.elapsed_micros(),
+                        "status":response.status().as_u16()}));
                 observed.lock().unwrap().push((path, response.status()));
                 response
             }
@@ -396,56 +536,10 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("connected-handoff").unwrap())
         .unwrap();
-    let owner =
-        seed_test_workspace_owner_token(api.store.as_ref(), "connected-journal-owner").await;
-    // This fixture exercises Journal continuity, not unset-policy refusal. Assign
-    // the companion's exact activation keys through authenticated administration;
-    // no filesystem, shell or delegation permission is granted to its body.
-    let update = server_api::authorization::SubjectPermissionsUpdate {
-        operation_id: "connected-journal-activation".into(),
-        expected_change_id: None,
-        execution: [
-            "task",
-            "subjektiv",
-            "web",
-            "image",
-            "sub_worker",
-            "worker",
-            "workspace_worker_discovery",
-            "objective",
-            "manage_workdir",
-            "workdir_catalog",
-            "drive",
-            "ticket",
-        ]
-        .into_iter()
-        .map(|name| server_api::authorization::ScopedPermission {
-            operation: name.into(),
-            resource: server_api::authorization::PermissionResource::Feature,
-        })
-        .collect(),
-        delegation: Vec::new(),
-    };
-    let response = build_router(api.clone())
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
-                    subject.id
-                ))
-                .header("authorization", format!("Bearer {owner}"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_vec(&update).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
-        .await
-        .unwrap();
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    // Exercise creation-time authority through real recording and startup callbacks,
+    // without a management grant or an execution/delegation policy replacement.
+    let initial_policy = store.current_subject_policy(&subject.id).unwrap().unwrap();
+    assert!(initial_policy.delegation.grants.is_empty());
     let old = connected_create(&api, &subject.id, "connected-old-body").await;
     let old_attr = store
         .subject_session_attributions(&subject.id)
@@ -453,7 +547,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         .into_iter()
         .find(|attr| attr.worker_id == old.worker_id)
         .unwrap();
-    connected_wait_for_recording(&api, &store, &old_attr).await;
+    connected_wait_for_recording(&api, &store, &old_attr, &model, "first-body").await;
     let old_host = JournalHostContext::validated_session(&store, old_attr.clone()).unwrap();
     let old_binding = JournalWriterBinding {
         subject_id: subject.id.clone(),
@@ -461,9 +555,10 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         worker_id: old.worker_id.clone(),
         binding_id: old_host.writer_binding_id().unwrap().into(),
     };
-    // Inject a durable result-acceptance gap after real Journal completion. This must
-    // reject before writer revocation and confirm cancellation of the actual Controller
-    // guard; merely returning Err would strand the body and its execution-admission fence.
+    // Corrupt only the saved Job projection after real completion, deliberately
+    // leaving its attempt/checkpoint completed. This is a fail-closed consumer
+    // contrast, not a simulated transaction interruption or a recovery mechanism.
+    // The pre-revoke refusal must cancel the actual Controller guard before retry.
     let recorded = api
         .store
         .list_backend_journal_jobs(TEST_WORKSPACE_ID, &old_attr.session_id, None, 100)
@@ -498,7 +593,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         rusqlite::params![TEST_WORKSPACE_ID, uncertain_job], |r| Ok((r.get(0)?, r.get(1)?)),
     ).unwrap();
     conn.execute(
-        "UPDATE backend_jobs SET state='unknown',result_json=NULL,result_digest=NULL WHERE workspace_id=?1 AND job_id=?2",
+        "UPDATE backend_jobs SET state='pending',result_json=NULL,result_digest=NULL WHERE workspace_id=?1 AND job_id=?2",
         rusqlite::params![TEST_WORKSPACE_ID, uncertain_job],
     )
     .unwrap();
@@ -510,7 +605,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         serde_json::from_value(incomplete.clone()).unwrap(),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("Unknown"), "{error}");
+    assert!(error.to_string().contains("still pending"), "{error}");
     assert!(store.journal_writer_active(&old_binding).unwrap());
     assert!(
         !api.config_store
@@ -549,10 +644,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
             .unwrap()
             .is_none()
     );
-    let stopped = api
-        .runtime
-        .stop_worker(&old, WorkerLifecycleRequest::default())
-        .unwrap();
+    let stopped = connected_stop_worker(&api, &old).await.unwrap();
     assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
     let removed = WorkerRemovalService::new(&api)
         .execute_target_removal(
@@ -613,7 +705,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
         .find(|attr| attr.worker_id == next.worker_id)
         .unwrap();
     assert_ne!(next_attr.session_id, old_attr.session_id);
-    connected_wait_for_recording(&api, &store, &next_attr).await;
+    connected_wait_for_recording(&api, &store, &next_attr, &model, "next-body").await;
 
     // Read actual Session files produced by the real Controller; no fixture Session append,
     // startup-item injection, fake disconnect or store-only simulation is used in this test.
@@ -748,6 +840,11 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
             )
             .unwrap(),
         before
+    );
+    assert_eq!(
+        store.current_subject_policy(&subject.id).unwrap(),
+        Some(initial_policy),
+        "recording and startup must not rewrite the initial policy"
     );
     for (worker, session) in [
         (&old, old_attr.session_id.as_str()),
@@ -944,6 +1041,12 @@ struct RestoreAuthProbe {
     operations: Mutex<Vec<Value>>,
     repairs: Mutex<Vec<bool>>,
     repair_operations: Mutex<Vec<Value>>,
+    stops: Mutex<
+        Vec<(
+            worker_runtime::execution::WorkerExecutionStopRequest,
+            worker_runtime::execution::WorkerExecutionResult,
+        )>,
+    >,
     gate_repair: std::sync::atomic::AtomicBool,
     repairing: tokio::sync::Notify,
     release_repair: tokio::sync::Notify,
@@ -1007,7 +1110,10 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for RestoreAuthFactory
     async fn spawn_controller(
         &self,
         mut request: worker_runtime::execution::WorkerExecutionSpawnRequest,
-    ) -> std::result::Result<worker_runtime::worker_backend::RuntimeWorkerController, String> {
+    ) -> std::result::Result<
+        worker_runtime::worker_backend::RuntimeWorkerController,
+        worker_runtime::worker_backend::RuntimeRestoreFailure,
+    > {
         if request.request.backend_job.is_some() {
             return self.inner.spawn_controller(request).await;
         }
@@ -1045,7 +1151,7 @@ impl worker_runtime::worker_backend::RuntimeWorkerFactory for RestoreAuthFactory
     async fn preflight_restore(
         &self,
         request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), worker_runtime::worker_backend::RuntimeRestoreFailure> {
         self.inner.preflight_restore(request).await
     }
 
@@ -1264,17 +1370,15 @@ async fn restore_auth_event(
     .expect("real Controller acknowledgement timed out")
 }
 
-// Only initial creation is substituted for the pending-head case: it writes a
-// genuine first-Session Worker, but publishes no Controller/head. Every restore,
-// repair, Host authorization, activation and Stop delegates to production.
-struct PendingHeadSeedBackend {
+// Caller replay is explicit so the test can inspect the lost-response boundary.
+// No spawn/Stop success is substituted; the pending-head catalog is seeded below,
+// before opening the Runtime that will own its first real restore.
+struct CallerReplayBackend {
     inner: Arc<worker_runtime::worker_backend::WorkerRuntimeExecutionBackend<RestoreAuthFactory>>,
-    seed: std::sync::atomic::AtomicBool,
-    root: std::path::PathBuf,
-    model: RestoreAuthModel,
+    probe: Arc<RestoreAuthProbe>,
 }
 
-impl worker_runtime::execution::WorkerExecutionBackend for PendingHeadSeedBackend {
+impl worker_runtime::execution::WorkerExecutionBackend for CallerReplayBackend {
     fn backend_id(&self) -> &str {
         self.inner.backend_id()
     }
@@ -1282,85 +1386,7 @@ impl worker_runtime::execution::WorkerExecutionBackend for PendingHeadSeedBacken
         &self,
         request: worker_runtime::execution::WorkerExecutionSpawnRequest,
     ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
-        if !self.seed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return self.inner.spawn_worker(request);
-        }
-        let root = self
-            .root
-            .join("workers")
-            .join(request.worker_ref.worker_id.to_string());
-        let name = format!("worker-runtime-{}", request.worker_ref.worker_id);
-        let model = self.model.clone();
-        let settings = request.request.memory_settings.clone().unwrap();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    use session_store::WorkerMetadataStore as _;
-                    let mut manifest = manifest::WorkerManifest::from_toml(&format!(
-                        r#"
-[worker]
-name = "{name}"
-pwd = "./"
-[scope]
-allow = []
-[model]
-scheme = "anthropic"
-model_id = "test-model"
-auth = {{ kind = "none" }}
-[engine]
-max_tokens = 100
-[feature.subjektiv.profile]
-enabled = true
-[feature.subjektiv.profile.extraction]
-enabled = false
-"#
-                    ))
-                    .unwrap();
-                    manifest
-                        .feature
-                        .subjektiv
-                        .bind_workspace_settings(settings)
-                        .unwrap();
-                    let sessions =
-                        session_store::WorkerSessionStore::new(root.join("session")).unwrap();
-                    let metadata = session_store::WorkerAggregateStore::new(&root, &name).unwrap();
-                    let engine = agen::Engine::<
-                        _,
-                        agen::state::Mutable,
-                        worker::SessionHistoryMetadata,
-                    >::new_annotated(model);
-                    let mut head = worker::Worker::new(
-                        manifest.clone(),
-                        engine,
-                        session_store::CombinedStore::new(sessions.clone(), metadata.clone()),
-                        worker::WorkerWorkspaceContext::unavailable(
-                            Some(worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap()),
-                            "initial creation interrupted before first head",
-                        ),
-                        worker::WorkerFilesystemAuthority::None,
-                        manifest::Scope::empty(),
-                    )
-                    .await
-                    .unwrap();
-                    head.enable_worker_metadata_write_through().unwrap();
-                    let mut saved = metadata.read_by_name(&name).unwrap().unwrap();
-                    assert!(saved.active.as_ref().unwrap().segment_id.is_none());
-                    saved.resolved_manifest_snapshot = Some(
-                        manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap(),
-                    );
-                    metadata.write(&saved).unwrap();
-                    drop(head);
-                });
-        })
-        .join()
-        .unwrap();
-        worker_runtime::execution::WorkerExecutionSpawnResult::Connected {
-            worker_state: protocol::WorkerStateSnapshot::initial(),
-            workdir_attachments: Vec::new(),
-        }
+        self.inner.spawn_worker(request)
     }
     fn fetch_workspace_config(
         &self,
@@ -1450,7 +1476,13 @@ enabled = false
         &self,
         request: worker_runtime::execution::WorkerExecutionStopRequest,
     ) -> worker_runtime::execution::WorkerExecutionResult {
-        self.inner.stop_worker_operation(request)
+        let result = self.inner.stop_worker_operation(request.clone());
+        self.probe
+            .stops
+            .lock()
+            .unwrap()
+            .push((request, result.clone()));
+        result
     }
     fn worker_snapshot(
         &self,
@@ -1460,9 +1492,199 @@ enabled = false
     }
 }
 
-// One real connected seed and stopped queue setup shared by the publication
-// denial and explicit-repair regressions. Only timing and response delivery are
-// intercepted: every callback still passes the production signer/router/store.
+// This is initial never-started data, not successful Runtime creation or proof of
+// shutdown. Runtime's typed store is private to its crate: seed only its saved wire
+// boundary, then let the production reader validate it on open. No existing head,
+// catalog record or termination receipt is removed, replaced or synthesized.
+async fn seed_unstarted_pending_head(
+    api: &WorkspaceApi,
+    root: &std::path::Path,
+    subject_id: &str,
+    model: RestoreAuthModel,
+) -> (
+    RuntimeWorkerRef,
+    worker_runtime::config_bundle::ConfigBundle,
+) {
+    use session_store::{Store as _, WorkerMetadataStore as _};
+
+    assert!(
+        !root.exists(),
+        "pending fixture must own a fresh Runtime store"
+    );
+    let state = api
+        .config_store
+        .load_workspace_config(TEST_WORKSPACE_ID)
+        .unwrap()
+        .unwrap();
+    let projection =
+        crate::profile_settings::project_profiles_from_workspace_config(TEST_WORKSPACE_ID, &state)
+            .unwrap();
+    let bundle = crate::profile_settings::build_virtual_profile_config_bundle(
+        &projection,
+        &state,
+        TEST_WORKSPACE_ID,
+        &api.config.workspace_created_at,
+        "builtin:companion",
+    )
+    .unwrap()
+    .unwrap();
+    let archive = bundle.profile_source_archive.clone().unwrap();
+    let settings = api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let singleton = crate::subjektiv::subject_worker_singleton_key(subject_id).unwrap();
+    // Reserve only: this supplies the real Host's Worker/Subject binding, but is
+    // deliberately not completed as an accepted create operation.
+    let reservation = api
+        .config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            "pending-head-fixture-reservation",
+            &"f".repeat(64),
+            Some(&singleton),
+            &settings,
+        )
+        .unwrap();
+    let worker = RuntimeWorkerRef::new(
+        EMBEDDED_WORKER_RUNTIME_ID,
+        reservation.worker_id.to_string(),
+    );
+    let worker_ref = worker_runtime::identity::WorkerRef::try_from(&worker).unwrap();
+    let runtime = worker_runtime::Runtime::with_fs_store(
+        worker_runtime::FsRuntimeStoreOptions::new(root)
+            .with_runtime_id(EMBEDDED_WORKER_RUNTIME_ID),
+    )
+    .unwrap();
+    let bundle_ref = runtime
+        .store_config_bundle(bundle.clone())
+        .unwrap()
+        .reference;
+    drop(runtime);
+    let snapshot_path = root.join("runtime.json");
+    let mut snapshot: Value =
+        serde_json::from_slice(&std::fs::read(&snapshot_path).unwrap()).unwrap();
+    snapshot["workspace_owners"][TEST_WORKSPACE_ID] = json!("embedded-backend");
+    std::fs::write(
+        &snapshot_path,
+        serde_json::to_vec_pretty(&snapshot).unwrap(),
+    )
+    .unwrap();
+    let request = worker_runtime::catalog::CreateWorkerRequest {
+        plugin_execution: None,
+        worker_id: reservation.worker_id,
+        create_fingerprint: reservation.create_fingerprint,
+        profile: worker_runtime::catalog::ProfileSelector::Builtin("builtin:companion".into()),
+        display_name: Some("restore-auth-body".into()),
+        profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Embedded {
+            archive: archive.clone(),
+        },
+        config_bundle: Some(bundle_ref.clone()),
+        initial_input: None,
+        workdir_attachment_requests: Vec::new(),
+        workdir_attachments: Vec::new(),
+        worker_observation_enabled: false,
+        worker_observation_grants: Vec::new(),
+        workspace_api: Some(api.workspace_api_ref(EMBEDDED_WORKER_RUNTIME_ID)),
+        memory_settings: Some(reservation.memory_settings.clone()),
+        subjektiv_attached: true,
+        backend_job: None,
+    };
+    let aggregate = root.join("workers").join(worker.worker_id.as_str());
+    std::fs::create_dir_all(&aggregate).unwrap();
+    let record = json!({
+        "schema_version": snapshot["schema_version"],
+        "workdir_attachments_guard": {
+            "generation": uuid::Uuid::now_v7().to_string(),
+            "owners": {},
+        },
+        "worker_ref": worker_ref,
+        "worker_id": request.worker_id,
+        "profile": request.profile,
+        "display_name": request.display_name,
+        "profile_source": archive.reference,
+        "config_bundle": bundle_ref,
+        "status": "stopped",
+        "workspace_id": TEST_WORKSPACE_ID,
+        "execution_state": {
+            "state": "available",
+            "execution": { "request": request, "restore_intent": "explicit" },
+        },
+    });
+    std::fs::write(
+        aggregate.join("worker.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+
+    let name = format!("worker-runtime-{}", worker.worker_id);
+    let mut manifest = manifest::WorkerManifest::from_toml(&format!(
+        r#"
+[worker]
+name = "{name}"
+pwd = "./"
+[scope]
+allow = []
+[model]
+scheme = "anthropic"
+model_id = "test-model"
+auth = {{ kind = "none" }}
+[engine]
+max_tokens = 100
+[feature.subjektiv.profile]
+enabled = true
+[feature.subjektiv.profile.extraction]
+enabled = false
+"#
+    ))
+    .unwrap();
+    manifest
+        .feature
+        .subjektiv
+        .bind_workspace_settings(reservation.memory_settings)
+        .unwrap();
+    let sessions = session_store::WorkerSessionStore::new(aggregate.join("session")).unwrap();
+    let metadata = session_store::WorkerAggregateStore::new(&aggregate, &name).unwrap();
+    let engine =
+        agen::Engine::<_, agen::state::Mutable, worker::SessionHistoryMetadata>::new_annotated(
+            model,
+        );
+    let mut head = worker::Worker::new(
+        manifest.clone(),
+        engine,
+        session_store::CombinedStore::new(sessions.clone(), metadata.clone()),
+        worker::WorkerWorkspaceContext::unavailable(
+            Some(worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap()),
+            "initial creation interrupted before first head",
+        ),
+        worker::WorkerFilesystemAuthority::None,
+        manifest::Scope::empty(),
+    )
+    .await
+    .unwrap();
+    head.enable_worker_metadata_write_through().unwrap();
+    let mut saved = metadata.read_by_name(&name).unwrap().unwrap();
+    let active = saved.active.as_ref().unwrap();
+    assert!(active.segment_id.is_none());
+    assert!(
+        sessions
+            .list_segments(active.session_id)
+            .unwrap()
+            .is_empty()
+    );
+    saved.resolved_manifest_snapshot =
+        Some(manifest::write_persisted_worker_manifest_snapshot(&manifest).unwrap());
+    metadata.write(&saved).unwrap();
+    // Worker::new has not bootstrapped a Controller, submitted input, or called
+    // the Host. Dropping this metadata builder is not termination evidence.
+    drop(head);
+    (worker, bundle)
+}
+
+// The normal branch uses a real connected seed and owned Stop. The pending-head
+// branch starts from unstarted catalog/source data instead. Restore/Host/repair
+// and all execution cleanup remain production operations in both branches.
 struct ConnectedRestoreFixture {
     api: WorkspaceApi,
     execution:
@@ -1531,22 +1753,95 @@ async fn connected_restore_fixture_with_pending_head(
         })
         .unwrap(),
     );
-    let seeded_execution = Arc::new(PendingHeadSeedBackend {
+    let replay_execution = Arc::new(CallerReplayBackend {
         inner: execution.clone(),
-        seed: std::sync::atomic::AtomicBool::new(pending_head),
-        root: config.embedded_runtime_store_root.clone(),
-        model: model.clone(),
+        probe: probe.clone(),
     });
+    // The setup API never spawns a Worker. For pending-head only, use a separate
+    // empty Runtime so the final catalog can be written before its owner opens it.
+    let mut setup_config = config.clone();
+    if pending_head {
+        setup_config.embedded_runtime_store_root = dir.path().join("pending-head-setup-runtime");
+    }
     let api = WorkspaceApi::new_with_execution_backend_and_broker(
-        config,
-        control,
-        seeded_execution,
-        broker,
+        setup_config,
+        control.clone(),
+        replay_execution.clone(),
+        broker.clone(),
         HostExecutors::default(),
-        Some(dispatcher),
+        if pending_head {
+            None
+        } else {
+            Some(dispatcher.clone())
+        },
     )
     .await
     .unwrap();
+    let store = open_subjektiv_store(&api).unwrap();
+    let subject = store
+        .create_subject(crate::subjektiv::SubjectRole::new("restore-host-auth").unwrap())
+        .unwrap();
+    let owner =
+        seed_test_workspace_owner_token(api.store.as_ref(), "restore-host-auth-owner").await;
+    let update = server_api::authorization::SubjectPermissionsUpdate {
+        operation_id: "restore-host-auth-permissions".into(),
+        expected_change_id: Some(
+            store
+                .current_subject_policy(&subject.id)
+                .unwrap()
+                .unwrap()
+                .change_id,
+        ),
+        execution: connected_subject_permissions(&subject.id),
+        delegation: vec![],
+    };
+    let response = build_router(api.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
+                    subject.id
+                ))
+                .header("authorization", format!("Bearer {owner}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&update).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let pending_worker = if pending_head {
+        Some(
+            seed_unstarted_pending_head(
+                &api,
+                &config.embedded_runtime_store_root,
+                &subject.id,
+                model.clone(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let api = if pending_head {
+        shutdown_workspace_feature_storage(&api).await.unwrap();
+        drop(store);
+        drop(api);
+        WorkspaceApi::new_with_execution_backend_and_broker(
+            config,
+            control,
+            replay_execution,
+            broker,
+            HostExecutors::default(),
+            Some(dispatcher),
+        )
+        .await
+        .unwrap()
+    } else {
+        api
+    };
+    let store = open_subjektiv_store(&api).unwrap();
     seed_test_delivery_binding(&api);
     let requests = Arc::new(Mutex::new(Vec::new()));
     let observed = requests.clone();
@@ -1597,88 +1892,69 @@ async fn connected_restore_fixture_with_pending_head(
         }),
         probe: probe.clone(),
     };
-    let store = open_subjektiv_store(&api).unwrap();
-    let subject = store
-        .create_subject(crate::subjektiv::SubjectRole::new("restore-host-auth").unwrap())
+    let worker = if let Some((worker, bundle)) = pending_worker {
+        // Runtime bundle caches are intentionally not persisted. Supply the
+        // exact reserved launch snapshot, never a newly resolved Profile.
+        let expected = worker_runtime::catalog::ConfigBundleRef {
+            id: bundle.metadata.id.clone(),
+            digest: bundle.metadata.digest.clone(),
+        };
+        let synced = api
+            .runtime
+            .sync_config_bundle(EMBEDDED_WORKER_RUNTIME_ID, bundle)
+            .unwrap();
+        assert_eq!(
+            synced.state,
+            crate::hosts::InternalWorkerOperationState::Accepted
+        );
+        assert_eq!(synced.availability.unwrap().reference, expected);
+        let summary = api.runtime.worker(&worker).unwrap();
+        assert_eq!(summary.state, "stopped");
+        assert!(summary.restore_observation_token.is_some());
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(
+                api.config
+                    .embedded_runtime_store_root
+                    .join("workers")
+                    .join(&worker.worker_id)
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
         .unwrap();
-    let owner =
-        seed_test_workspace_owner_token(api.store.as_ref(), "restore-host-auth-owner").await;
-    let update = server_api::authorization::SubjectPermissionsUpdate {
-        operation_id: "restore-host-auth-permissions".into(),
-        expected_change_id: None,
-        execution: [
-            "task",
-            "subjektiv",
-            "web",
-            "image",
-            "sub_worker",
-            "worker",
-            "workspace_worker_discovery",
-            "objective",
-            "manage_workdir",
-            "workdir_catalog",
-            "drive",
-            "ticket",
-        ]
-        .into_iter()
-        .map(|name| server_api::authorization::ScopedPermission {
-            operation: name.into(),
-            resource: server_api::authorization::PermissionResource::Feature,
-        })
-        .collect(),
-        delegation: vec![],
-    };
-    let response = build_router(api.clone())
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri(format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
-                    subject.id
-                ))
-                .header("authorization", format!("Bearer {owner}"))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(serde_json::to_vec(&update).unwrap()))
-                .unwrap(),
+        assert!(record["restore_guard"]["execution_termination"].is_null());
+        assert!(probe.handles.lock().unwrap().is_empty());
+        assert!(probe.stops.lock().unwrap().is_empty());
+        worker
+    } else {
+        let Json(created) = scoped_create_workspace_worker(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            HeaderMap::new(),
+            Json(CreateWorkspaceWorkerRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+                display_name: "restore-auth-body".into(),
+                singleton_key: None,
+                profile: Some("builtin:companion".into()),
+                ticket_assignment: None,
+                initial_submit: vec![],
+                workdir_attachments: vec![],
+                feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                    subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                        subject_id: subject.id.clone(),
+                    }),
+                },
+                control_operation_id: None,
+                execution_grant: None,
+            }),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let Json(created) = scoped_create_workspace_worker(
-        State(api.clone()),
-        AxumPath(ScopedWorkspacePath {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        }),
-        HeaderMap::new(),
-        Json(CreateWorkspaceWorkerRequest {
-            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
-            display_name: "restore-auth-body".into(),
-            singleton_key: None,
-            profile: Some("builtin:companion".into()),
-            ticket_assignment: None,
-            initial_submit: vec![],
-            workdir_attachments: vec![],
-            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
-                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
-                    subject_id: subject.id.clone(),
-                }),
-            },
-            control_operation_id: None,
-            execution_grant: None,
-        }),
-    )
-    .await
-    .unwrap();
-    let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
-    if pending_head {
-        assert_eq!(
-            api.runtime
-                .stop_worker(&worker, WorkerLifecycleRequest::default())
-                .unwrap()
-                .state,
-            InternalWorkerOperationState::Accepted
-        );
-    } else {
+        RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
+    };
+    if !pending_head {
         let handle = probe.handles.lock().unwrap()[0].clone();
         let mut events = handle.subscribe();
         handle
@@ -1730,10 +2006,7 @@ async fn connected_restore_fixture_with_pending_head(
     } if notification_request_id == "saved-notice")
         })
         .await;
-        let stopped = api
-            .runtime
-            .stop_worker(&worker, WorkerLifecycleRequest::default())
-            .unwrap();
+        let stopped = connected_stop_worker(&api, &worker).await.unwrap();
         assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
         assert!(handle.protocol_is_closed());
         // Pause/Shutdown can admit real Journal work for the seed turn. Finish that
@@ -2049,10 +2322,21 @@ async fn restore_after_real_prepare_rejects_revoked_host_trust_without_publicati
     );
     // Only this fixture's retained operation is cleaned up, after its durable
     // evidence has been checked. Cleanup is not the restore outcome above.
-    let cleanup = execution.stop_worker(&worker_ref);
+    let stop = worker_runtime::execution::WorkerExecutionStopRequest {
+        worker_ref: worker_ref.clone(),
+        operation_id: worker_runtime::execution::WorkerLifecycleOperationId::new(),
+    };
+    let cleanup = execution.stop_worker_operation(stop.clone());
     assert!(
         cleanup.is_accepted(),
         "fixture restore cleanup: {cleanup:?}"
+    );
+    assert!(
+        cleanup
+            .termination
+            .as_ref()
+            .is_some_and(|receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)),
+        "fixture cleanup must join its original prepared owner: {cleanup:?}"
     );
     shutdown_workspace_feature_storage(&api).await.unwrap();
 }
@@ -2380,9 +2664,21 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
         assert_eq!(probe.activations.load(SeqCst), 0);
         assert_eq!(probe.publications.load(SeqCst), 0);
         assert_eq!(fixture.model.calls.load(SeqCst), model_before);
-        assert!(
-            matches!(metadata.read_by_name(&name).unwrap().unwrap().subjektiv_session_attribution,
-            Some(session_store::SubjektivSessionAttributionState::Failed { session_id: id, .. }) if id == session_id)
+        let saved_failure = metadata.read_by_name(&name).unwrap().unwrap();
+        // Trust rejection occurs before the Session domain handler. An unsigned
+        // legacy 401 attests neither a Session refusal nor absence of earlier effects.
+        assert!(matches!(saved_failure.subjektiv_session_attribution,
+            Some(session_store::SubjektivSessionAttributionState::OutcomeUnknown { session_id: id, .. }) if id == session_id));
+        let session_store::worker_metadata::StartupFailureRead::Present(
+            error_contract::DecodeFailure::Known(cause),
+        ) = saved_failure
+            .decode_startup_failure::<protocol::session_failure::SessionRegistrationCause>()
+        else {
+            panic!("recovery must retain its typed Session unknown cause")
+        };
+        assert_eq!(
+            *cause.facts().cause(),
+            protocol::session_failure::SessionRegistrationCause::outcome_unknown()
         );
         let denied = record();
         assert_eq!(
@@ -2536,21 +2832,272 @@ async fn connected_explicit_repair(scenario: ConnectedRepair) {
     let worker_ref = worker_runtime::identity::WorkerRef::try_from(worker).unwrap();
     if revoked {
         assert!(fixture.execution.worker_snapshot(&worker_ref).is_none());
+        let stop = worker_runtime::execution::WorkerExecutionStopRequest {
+            worker_ref: worker_ref.clone(),
+            operation_id: worker_runtime::execution::WorkerLifecycleOperationId::new(),
+        };
+        let cleanup = fixture.execution.stop_worker_operation(stop.clone());
+        assert!(cleanup.is_accepted(), "fixture repair cleanup: {cleanup:?}");
         assert!(
-            fixture.execution.stop_worker(&worker_ref).is_accepted(),
-            "fixture-owned repair resource cleanup"
+            cleanup.termination.as_ref().is_some_and(
+                |receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)
+            ),
+            "fixture cleanup must join its original repair owner: {cleanup:?}"
         );
     } else {
         assert!(fixture.execution.worker_snapshot(&worker_ref).is_some());
         // Teardown is outside the measured restore window: Stop may admit an
         // independent Journal job, not a second execution of the restored body.
+        let before_stop = fixture.execution.worker_snapshot(&worker_ref);
+        let original_stop_count = probe.stops.lock().unwrap().len();
+        let mut stopped = connected_stop_worker(api, worker).await;
+        let uncertain = {
+            let stops = probe.stops.lock().unwrap();
+            stops[original_stop_count..]
+                .last()
+                .and_then(|(request, result)| {
+                    result
+                        .message
+                        .as_deref()
+                        .filter(|message| {
+                            message.contains("admission is unknown and waiter is retained")
+                        })
+                        .and_then(|message| message.strip_prefix("Shutdown command "))
+                        .and_then(|message| message.split_whitespace().next()?.parse::<u64>().ok())
+                        .map(|command| (request.clone(), command))
+                })
+        };
+        if let Some((request, _)) = &uncertain {
+            // A bounded admission wait is not definitive rejection. Reconcile
+            // the retained operation/command once, without a readiness method,
+            // replacement Controller, new Stop identity, or a new input.
+            let pending = record();
+            assert_eq!(
+                pending["execution_state"]["state"],
+                "reconciliation_required"
+            );
+            assert_eq!(pending["execution_state"]["execution"]["operation"], "stop");
+            assert_eq!(
+                pending["execution_state"]["execution"]["intent"]["operation_id"],
+                serde_json::to_value(request.operation_id).unwrap()
+            );
+            assert!(pending["restore_guard"]["execution_termination"].is_null());
+            stopped = connected_stop_worker(api, worker).await;
+        }
+        let task_finished = probe
+            .controller_tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(tokio::task::AbortHandle::is_finished)
+            .collect::<Vec<_>>();
+        let stops = probe.stops.lock().unwrap();
+        let stopped = stopped.unwrap_or_else(|error| {
+            panic!(
+                "Runtime teardown error: {error:?}; worker={worker_ref:?}; restore_operation={operation}; \
+                 before_stop={before_stop:?}; original_stop_count={original_stop_count}; \
+                 callee_stops={stops:?}; controller_tasks_finished={task_finished:?}"
+            )
+        });
         assert_eq!(
-            api.runtime
-                .stop_worker(worker, WorkerLifecycleRequest::default())
-                .unwrap()
-                .state,
-            InternalWorkerOperationState::Accepted
+            stopped.state,
+            InternalWorkerOperationState::Accepted,
+            "Runtime teardown must stop the restored owner: {stopped:?}; \
+             worker={worker_ref:?}; restore_operation={operation}; before_stop={before_stop:?}; \
+             original_stop_count={original_stop_count}; callee_stops={stops:?}; \
+             controller_tasks_finished={task_finished:?}"
+        );
+        let (stop, result) = stops[original_stop_count..]
+            .last()
+            .expect("teardown must obtain a typed Stop from the real adapter");
+        assert_eq!(stop.worker_ref, worker_ref);
+        assert!(result.is_accepted(), "real adapter teardown: {result:?}");
+        assert!(
+            task_finished.iter().all(|finished| *finished),
+            "real Controller tasks must finish: {task_finished:?}"
+        );
+        if let Some((original, command)) = uncertain {
+            assert!(stops[original_stop_count..].iter().all(|(request, _)| {
+                request.operation_id == original.operation_id
+                    && request.worker_ref == original.worker_ref
+            }));
+            assert_eq!(
+                result.termination.as_ref().unwrap().shutdown_command_id,
+                Some(command)
+            );
+        }
+        assert!(
+            result.termination.as_ref().is_some_and(
+                |receipt| receipt.confirms_scope_shutdown(&worker_ref, stop.operation_id)
+            ),
+            "restored Controller must report and join under its own Stop: {stop:?}: {result:?}"
+        );
+        assert_eq!(
+            record()["restore_guard"]["execution_termination"],
+            serde_json::to_value(result.termination.as_ref().unwrap()).unwrap(),
+            "Runtime must retain the exact real adapter termination, not a predecessor receipt"
         );
     }
     shutdown_workspace_feature_storage(api).await.unwrap();
+}
+
+fn replace_recording_fixture_policy(
+    f: &RuntimeFixture,
+    execution: Vec<server_api::authorization::ScopedPermission>,
+) {
+    let subject = &f
+        .request
+        .grants
+        .subjektiv_journal
+        .as_ref()
+        .unwrap()
+        .subject_id;
+    let previous = f.store.subject_permissions(subject).unwrap().unwrap();
+    f.store
+        .set_subject_permissions(
+            subject,
+            &server_api::authorization::SubjectPermissionsUpdate {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_change_id: Some(previous.change_id),
+                execution,
+                delegation: vec![],
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn journal_supply_denial_precedes_generation_claim_and_dispatch_then_exact_grant_allows_processing()
+ {
+    let f = RuntimeFixture::new().await;
+    let grant = f.request.grants.subjektiv_journal.as_ref().unwrap();
+    let execution = connected_subject_permissions(&grant.subject_id);
+    assert!(
+        execution
+            .iter()
+            .any(|permission| permission.operation == "journal.job.input.supply")
+    );
+    replace_recording_fixture_policy(
+        &f,
+        execution
+            .iter()
+            .filter(|permission| permission.operation != "journal.job.input.supply")
+            .cloned()
+            .collect(),
+    );
+    assert!(f.execution.take_inputs().is_empty());
+    let error = f
+        .api
+        .dispatch_backend_job_reservation(f.reserved.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("journal.job.input.supply"),
+        "{error:?}"
+    );
+    assert!(
+        f.execution.take_inputs().is_empty(),
+        "denied input must not reach Runtime/model dispatch"
+    );
+    assert!(
+        f.store
+            .active_journal_generation(&f.host, &f.id)
+            .unwrap()
+            .is_none()
+    );
+    let attempt = f
+        .api
+        .store
+        .get_backend_job_attempt(
+            TEST_WORKSPACE_ID,
+            &f.request.job_id,
+            &f.reserved.attempt.attempt_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempt.state, BackendJobAttemptState::Reserved);
+    assert!(attempt.worker.is_none());
+    let saved = f
+        .api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &f.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.request, f.request,
+        "refusal preserves immutable capture and selection"
+    );
+
+    replace_recording_fixture_policy(&f, execution);
+    let dispatched = f
+        .api
+        .dispatch_backend_job_reservation(f.reserved.clone())
+        .unwrap();
+    let worker = dispatched.attempt.worker.as_ref().unwrap();
+    assert_eq!(f.execution.take_inputs().len(), 1);
+    let JournalJobResponse::State(state) =
+        subjektiv_journal::execute(&f.api, worker, JournalJobRequest::ReadState).unwrap()
+    else {
+        panic!("actual Journal state required")
+    };
+    assert_eq!(state.selected_ranges, grant.selected_ranges);
+    assert_eq!(dispatched.job.request, f.request);
+
+    // The body really holds Memory and session permissions. A Journal capability
+    // cannot inherit those merely because their Subject resource is identical.
+    for operation in [
+        "memory.read",
+        "memory.consolidation.supply",
+        "session.record",
+    ] {
+        let needed = server_api::authorization::OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: server_api::authorization::PermissionResource::Subject {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                subject_id: grant.subject_id.clone(),
+            },
+        };
+        assert!(subject_authorization::authorize_scope(&f.api, &f.source, &needed).is_ok());
+        assert!(
+            subject_authorization::authorize_scope(&f.api, worker, &needed).is_err(),
+            "Journal domain ceiling must reject {operation}"
+        );
+    }
+
+    // Exercise the signed bound Subject API for the Job, not only the internal
+    // permission helper. Metadata resolution must not require body singleton ownership.
+    let mut api = f.api.clone();
+    let identity = RuntimeIdentityMaterial::generate(&worker.runtime_id).unwrap();
+    configure_runtime_request_auth(&mut api, &identity, &worker.runtime_id);
+    for (operation, expected) in [
+        ("journal.job.input.supply", StatusCode::OK),
+        ("memory.read", StatusCode::FORBIDDEN),
+    ] {
+        let response = build_router(api.clone())
+            .oneshot(runtime_source_request(
+                &identity,
+                Some(&worker.worker_id),
+                "POST",
+                &format!("/api/w/{TEST_WORKSPACE_ID}/authorization/bound-check"),
+                serde_json::to_vec(&json!({"operation":operation,"target":{"kind":"subject"}}))
+                    .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 2 * 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status, expected, "{operation}: {body}");
+        if status == StatusCode::OK {
+            assert_eq!(
+                body,
+                json!({"scope":{"kind":"subject","workspace_id":TEST_WORKSPACE_ID,"subject_id":grant.subject_id}})
+            );
+        } else {
+            assert!(body.get("scope").is_none());
+        }
+    }
 }

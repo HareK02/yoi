@@ -37,8 +37,6 @@ impl<C: agen::llm_client::client::LlmClient + 'static, St: session_store::Store>
             && self.backend_job().is_none()
             && crate::feature::builtin::memory::ordinary_subjektiv_features_enabled(self.manifest())
             && let Ok(Some(connection)) = self.subjektiv_host_connection()
-            && (connection.host.journal_startup_granted()
-                || connection.host.journal_compaction_granted())
         {
             self.install_session_context_source(Arc::new(
                 crate::feature::builtin::journal::JournalContextSource::new(
@@ -66,12 +64,44 @@ pub struct SubjektivHostSettings {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SubjektivHostError {
+    #[error("{cause}")]
+    SessionRegistration {
+        cause: protocol::session_failure::SessionRegistrationCause,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     #[error("{message}")]
     Conflict { code: String, message: String },
     #[error("{0}")]
     InvalidArgument(String),
+    #[error("Subjektiv operation permission denied: {0}")]
+    PermissionDenied(String),
     #[error("{0}")]
     Unavailable(String),
+}
+
+impl SubjektivHostError {
+    pub fn session_registration(
+        cause: protocol::session_failure::SessionRegistrationCause,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::SessionRegistration {
+            cause,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    pub fn session_registration_cause(
+        &self,
+    ) -> protocol::session_failure::SessionRegistrationCause {
+        use protocol::session_failure::SessionRegistrationCause;
+        match self {
+            Self::SessionRegistration { cause, .. } => cause.clone(),
+            // Old Host implementations have not attested a domain verdict. Their prose
+            // must not become a permission or binding decision at the caller.
+            _ => SessionRegistrationCause::outcome_unknown(),
+        }
+    }
 }
 
 impl From<SubjektivHostError> for ToolError {
@@ -81,7 +111,13 @@ impl From<SubjektivHostError> for ToolError {
                 Self::StructuredConflict { code, message }
             }
             SubjektivHostError::InvalidArgument(message) => Self::InvalidArgument(message),
+            SubjektivHostError::PermissionDenied(message) => {
+                Self::ExecutionFailed(format!("Subjektiv operation permission denied: {message}"))
+            }
             SubjektivHostError::Unavailable(message) => Self::ExecutionFailed(message),
+            SubjektivHostError::SessionRegistration { cause, .. } => {
+                Self::ExecutionFailed(cause.to_string())
+            }
         }
     }
 }
@@ -92,6 +128,17 @@ impl From<SubjektivHostError> for ToolError {
 /// identifier is not a grant. No method grants ambient filesystem access.
 pub trait SubjektivHost: Send + Sync + 'static {
     fn settings(&self) -> SubjektivHostSettings;
+    /// Revalidate current authority before protected access or prompt supply.
+    /// Standalone Hosts must explicitly implement their local permission policy.
+    fn authorize_operation(
+        &self,
+        _context: &SubjektivHostContext,
+        operation: &str,
+    ) -> Result<(), SubjektivHostError> {
+        Err(SubjektivHostError::PermissionDenied(format!(
+            "operation `{operation}` has no explicit Host authorization policy"
+        )))
+    }
     /// Startup reads are a body-only capability, independent of recording Jobs.
     fn journal_startup_granted(&self) -> bool {
         false
@@ -147,6 +194,17 @@ pub trait SubjektivHost: Send + Sync + 'static {
     /// Optional real Backend identity, used only for prompt provenance.
     fn workspace_id(&self) -> Option<String> {
         None
+    }
+    /// Text-only public conversation access. Restricted Job and standalone Hosts
+    /// inherit denial, not the connected Subject body's posting capability.
+    fn chat(
+        &self,
+        _context: &SubjektivHostContext,
+        _operation: ChatWorkerOperation,
+    ) -> Result<ChatWorkerResponse, SubjektivHostError> {
+        Err(SubjektivHostError::PermissionDenied(
+            "conversation access is not granted by this Host".into(),
+        ))
     }
     fn memory(
         &self,
@@ -224,6 +282,85 @@ impl BackendSubjektivHost {
     }
 }
 
+/// Session registration is an internal operation boundary, not a Browser HTTP
+/// classifier. Only the domain's codec attestation can establish a denial.
+/// Neither legacy bodies nor transport error prose are retained in metadata.
+pub(crate) fn record_backend_session(
+    client: &dyn WorkspaceClient,
+    session_id: &str,
+    create_if_missing: bool,
+) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
+    use protocol::session_failure::SessionRegistrationCause;
+    let response = client
+        .execute_server_operation(WorkspaceServerOperation::SubjektivRecordSession(
+            SubjektivRecordSessionRequest {
+                session_id: session_id.into(),
+                create_if_missing,
+            },
+        ))
+        .map_err(|error| {
+            let cause = match &error {
+                crate::WorkspaceClientError::Unavailable(_) => {
+                    SessionRegistrationCause::transport()
+                }
+                crate::WorkspaceClientError::Request(_)
+                | crate::WorkspaceClientError::AuthorizationRejected { .. } => {
+                    SessionRegistrationCause::outcome_unknown()
+                }
+                crate::WorkspaceClientError::InvalidPath(_) => {
+                    SessionRegistrationCause::invalid_response()
+                }
+            };
+            SubjektivHostError::session_registration(cause, error)
+        })?;
+    if !response.is_success() {
+        let cause = match serde_json::from_str::<RepositoryApiError>(&response.body) {
+            Ok(error) => match error.failure {
+                Some(failure) => match failure.decode::<SessionRegistrationCause>() {
+                    error_contract::DecodeFailure::Known(received) => {
+                        received.facts().cause().clone()
+                    }
+                    error_contract::DecodeFailure::Unsupported(_) => {
+                        SessionRegistrationCause::outcome_unknown()
+                    }
+                    error_contract::DecodeFailure::Corrupt(_) => {
+                        SessionRegistrationCause::invalid_response()
+                    }
+                },
+                None => SessionRegistrationCause::outcome_unknown(),
+            },
+            Err(_) => SessionRegistrationCause::invalid_response(),
+        };
+        return Err(SubjektivHostError::SessionRegistration {
+            cause,
+            source: None,
+        });
+    }
+    let output = serde_json::from_str(&response.body).map_err(|error| {
+        SubjektivHostError::session_registration(
+            SessionRegistrationCause::invalid_response(),
+            error,
+        )
+    })?;
+    validate_session_registration(output, session_id)
+}
+
+pub(crate) fn validate_session_registration(
+    output: SubjektivRecordSessionResponse,
+    session_id: &str,
+) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
+    if output.session_id != session_id
+        || output.subject_id.trim().is_empty()
+        || output.subject_id.chars().any(char::is_control)
+    {
+        return Err(SubjektivHostError::SessionRegistration {
+            cause: protocol::session_failure::SessionRegistrationCause::invalid_response(),
+            source: None,
+        });
+    }
+    Ok(output)
+}
+
 fn decode<T: serde::de::DeserializeOwned>(
     response: crate::WorkspaceResponse,
 ) -> Result<T, SubjektivHostError> {
@@ -233,6 +370,9 @@ fn decode<T: serde::de::DeserializeOwned>(
             .as_ref()
             .map(|error| error.message.clone())
             .unwrap_or(response.body);
+        if matches!(response.status, 401 | 403) {
+            return Err(SubjektivHostError::PermissionDenied(message));
+        }
         if let Some(code) = parsed.as_ref().and_then(|error| {
             error
                 .diagnostics
@@ -267,6 +407,23 @@ fn decode<T: serde::de::DeserializeOwned>(
 }
 
 impl SubjektivHost for BackendSubjektivHost {
+    fn authorize_operation(
+        &self,
+        _context: &SubjektivHostContext,
+        operation: &str,
+    ) -> Result<(), SubjektivHostError> {
+        self.client
+            .authorize_subject_operation(operation)
+            .map_err(|error| match error {
+                // WorkspaceClient preserves a distinct denial classification for
+                // 401/403. Transport and other HTTP errors must remain unavailable.
+                error if error.is_authorization_denial() => {
+                    SubjektivHostError::PermissionDenied(error.to_string())
+                }
+                other => SubjektivHostError::Unavailable(other.to_string()),
+            })
+    }
+
     fn memory_journal(
         &self,
         _context: &SubjektivHostContext,
@@ -363,11 +520,27 @@ impl SubjektivHost for BackendSubjektivHost {
     fn consolidation_granted(&self) -> bool {
         self.consolidation_granted
     }
+    fn chat(
+        &self,
+        context: &SubjektivHostContext,
+        operation: ChatWorkerOperation,
+    ) -> Result<ChatWorkerResponse, SubjektivHostError> {
+        self.authorize_operation(context, chat_operation_name(&operation))?;
+        // Backend revalidates current singleton ownership and conversation access
+        // at the read/write boundary; this preflight cannot replace those checks.
+        self.execute(WorkspaceServerOperation::ChatWorker(ChatWorkerRequest {
+            operation,
+        }))
+    }
     fn memory(
         &self,
-        _context: &SubjektivHostContext,
+        context: &SubjektivHostContext,
         operation: SubjektivMemoryBackendOperation,
     ) -> Result<SubjektivMemoryBackendResponse, SubjektivHostError> {
+        self.authorize_operation(
+            context,
+            crate::feature::builtin::memory::subject_memory_operation_name(&operation),
+        )?;
         // Preserve the bounded resident-context request timeout.
         if matches!(
             operation,
@@ -400,8 +573,11 @@ impl SubjektivHost for BackendSubjektivHost {
                 SubjektivSessionBackendRequest { operation },
             ))
             .map_err(|error| SubjektivHostError::Unavailable(error.to_string()))?;
-        // Session domain diagnostics are typed even on non-2xx responses.
-        if let Ok(value) = serde_json::from_str(&response.body) {
+        // Session domain diagnostics are typed even on non-2xx responses, but
+        // authentication/permission rejection must never become a data response.
+        if !matches!(response.status, 401 | 403)
+            && let Ok(value) = serde_json::from_str(&response.body)
+        {
             return Ok(value);
         }
         decode(response)
@@ -411,6 +587,7 @@ impl SubjektivHost for BackendSubjektivHost {
         context: &SubjektivHostContext,
         operation: MemoryStageCandidateOperation,
     ) -> Result<SubjektivStageCandidateResponse, SubjektivHostError> {
+        self.authorize_operation(context, "memory.staging.write")?;
         self.execute(WorkspaceServerOperation::SubjektivStageCandidate(
             SubjektivStageCandidateRequest {
                 session_id: context.session_id.clone(),
@@ -423,18 +600,14 @@ impl SubjektivHost for BackendSubjektivHost {
         context: &SubjektivHostContext,
         create_if_missing: bool,
     ) -> Result<SubjektivRecordSessionResponse, SubjektivHostError> {
-        self.execute(WorkspaceServerOperation::SubjektivRecordSession(
-            SubjektivRecordSessionRequest {
-                session_id: context.session_id.clone(),
-                create_if_missing,
-            },
-        ))
+        record_backend_session(self.client.as_ref(), &context.session_id, create_if_missing)
     }
     fn request_consolidation(
         &self,
-        _context: &SubjektivHostContext,
+        context: &SubjektivHostContext,
         operation: MemoryConsolidateStagingOperation,
     ) -> Result<MemoryConsolidationOutput, SubjektivHostError> {
+        self.authorize_operation(context, "memory.consolidation.request")?;
         let response = self
             .client
             .execute(WorkspaceRequest::json(
@@ -463,6 +636,15 @@ pub struct BackendJournalJobHost {
     client: Arc<dyn WorkspaceClient>,
     workspace_id: String,
 }
+#[async_trait::async_trait]
+impl crate::job::JobInputAuthority for BackendJournalJobHost {
+    async fn authorize_supply(&self) -> Result<(), String> {
+        self.client
+            .authorize_subject_operation("journal.job.input.supply")
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl BackendJournalJobHost {
     pub fn new(
         client: Arc<dyn WorkspaceClient>,
@@ -496,7 +678,8 @@ impl BackendJournalJobHost {
             features: crate::feature::FeatureRegistryBuilder::new()
                 .with_module(JournalJobToolsFeature::new(host.clone())),
             satisfied_requirements: vec![],
-            finalizer: Some(Arc::new(JournalJobFinalizer::new(host))),
+            finalizer: Some(Arc::new(JournalJobFinalizer::new(host.clone()))),
+            input_authority: Some(host),
         }
     }
     fn post<T: serde::de::DeserializeOwned>(
@@ -529,6 +712,13 @@ impl JournalJobHost for BackendJournalJobHost {
     }
 }
 
+fn chat_operation_name(operation: &ChatWorkerOperation) -> &'static str {
+    match operation {
+        ChatWorkerOperation::Read { .. } => "chat.read",
+        ChatWorkerOperation::Send { .. } => "chat.send",
+    }
+}
+
 /// Live connection with Worker-supplied authority. Not serializable and never
 /// inherited by an ordinary SubWorker.
 #[derive(Clone)]
@@ -538,6 +728,10 @@ pub struct SubjektivHostConnection {
 }
 
 impl SubjektivHostConnection {
+    pub fn authorize_operation(&self, operation: &str) -> Result<(), SubjektivHostError> {
+        self.host.authorize_operation(&self.context, operation)
+    }
+
     pub fn journal_startup_context(&self) -> Result<JournalStartupSnapshot, SubjektivHostError> {
         if !self.host.journal_startup_granted() {
             return Err(SubjektivHostError::Unavailable(
@@ -582,6 +776,13 @@ impl SubjektivHostConnection {
         request: MemoryJournalRequest,
     ) -> Result<MemoryJournalResponse, SubjektivHostError> {
         self.host.memory_journal(&self.context, request)
+    }
+    pub fn chat(
+        &self,
+        operation: ChatWorkerOperation,
+    ) -> Result<ChatWorkerResponse, SubjektivHostError> {
+        self.authorize_operation(chat_operation_name(&operation))?;
+        self.host.chat(&self.context, operation)
     }
     pub fn memory(
         &self,
@@ -675,6 +876,42 @@ pub(crate) fn test_connection(client: Arc<dyn WorkspaceClient>) -> SubjektivHost
 }
 
 #[cfg(test)]
+pub(crate) fn test_subject_authorization_response(
+    request: &WorkspaceRequest,
+    workspace_id: &str,
+    allowed: &[&str],
+) -> Option<crate::worker::WorkspaceResponse> {
+    use server_api::authorization::{BoundAuthorizationTarget, BoundOperationAuthorizationRequest};
+    if !request.path.ends_with("/authorization/bound-check") {
+        return None;
+    }
+    assert_eq!(request.method, WorkspaceRequestMethod::Post);
+    assert_eq!(
+        request.path,
+        format!("/api/w/{workspace_id}/authorization/bound-check")
+    );
+    let input: BoundOperationAuthorizationRequest =
+        serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+    assert_eq!(input.target, BoundAuthorizationTarget::Subject {});
+    let granted = allowed.contains(&input.operation.as_str());
+    Some(crate::worker::WorkspaceResponse {
+        content_type: None,
+        status: if granted { 200 } else { 403 },
+        body: if granted {
+            serde_json::json!({
+                "scope": {"kind": "subject", "workspace_id": workspace_id, "subject_id": "subject-fixture"}
+            }).to_string()
+        } else {
+            serde_json::json!({"message": "operation not granted by Subject fixture"}).to_string()
+        },
+    })
+}
+
+#[cfg(test)]
+#[path = "subjektiv_session_registration_tests.rs"]
+mod session_registration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -689,6 +926,28 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Mutex;
 
+    #[test]
+    fn non_chat_local_hosts_do_not_inherit_public_conversation_access() {
+        let host = Arc::new(LocalHost::default());
+        let context = SubjektivHostContext {
+            worker_id: "worker".into(),
+            session_id: "session".into(),
+        };
+        let read = ChatWorkerOperation::Read {
+            conversation_id: "conversation".into(),
+            query: ChatMessagePageQuery::default(),
+        };
+        assert!(matches!(
+            host.chat(&context, read.clone()),
+            Err(SubjektivHostError::PermissionDenied(_))
+        ));
+        let connection = SubjektivHostConnection::new(host, context).unwrap();
+        assert!(matches!(
+            connection.chat(read),
+            Err(SubjektivHostError::PermissionDenied(_))
+        ));
+    }
+
     #[derive(Default)]
     struct LocalHost {
         startup: Option<JournalStartupSnapshot>,
@@ -696,10 +955,25 @@ mod tests {
         startup_calls: std::sync::atomic::AtomicUsize,
         contexts: Mutex<Vec<SubjektivHostContext>>,
         attributed: Mutex<Vec<(SubjektivHostContext, bool)>>,
+        journal_operations: Vec<&'static str>,
         journal_observer:
             Option<Arc<dyn Fn(&SubjektivHostContext, JournalRecordingReason) + Send + Sync>>,
     }
     impl SubjektivHost for LocalHost {
+        fn authorize_operation(
+            &self,
+            _context: &SubjektivHostContext,
+            operation: &str,
+        ) -> Result<(), SubjektivHostError> {
+            match operation {
+                "memory.resident.read" | "memory.resident.supply" => Ok(()),
+                operation if self.journal_operations.contains(&operation) => Ok(()),
+                _ => Err(SubjektivHostError::PermissionDenied(format!(
+                    "test local Host did not grant `{operation}`"
+                ))),
+            }
+        }
+
         fn journal_startup_granted(&self) -> bool {
             self.startup.is_some() || self.startup_error
         }
@@ -798,6 +1072,132 @@ mod tests {
             _: MemoryConsolidateStagingOperation,
         ) -> Result<MemoryConsolidationOutput, SubjektivHostError> {
             Err(SubjektivHostError::Unavailable("no candidates".into()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BoundAuthorizationClient {
+        status: u16,
+        requests: Mutex<Vec<WorkspaceRequest>>,
+    }
+
+    impl WorkspaceClient for BoundAuthorizationClient {
+        fn workspace_id(&self) -> Option<&str> {
+            Some("test-workspace")
+        }
+        fn kind(&self) -> &str {
+            "test-bound-authorization"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn execute(
+            &self,
+            request: WorkspaceRequest,
+        ) -> Result<crate::WorkspaceResponse, crate::WorkspaceClientError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(crate::WorkspaceResponse {
+                content_type: None,
+                status: self.status,
+                body: if self.status == 200 {
+                    r#"{"scope":null}"#.into()
+                } else {
+                    r#"{"message":"test rejection"}"#.into()
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn bound_subject_authorization_separates_denial_from_unavailable_without_identity_input() {
+        for status in [200, 403, 503] {
+            let client = Arc::new(BoundAuthorizationClient {
+                status,
+                requests: Mutex::new(vec![]),
+            });
+            let connection = SubjektivHostConnection::new(
+                Arc::new(BackendSubjektivHost {
+                    client: client.clone(),
+                    settings: SubjektivHostSettings {
+                        language: "English".into(),
+                    },
+                    workspace_id: "test-workspace".into(),
+                    consolidation_granted: false,
+                }),
+                SubjektivHostContext {
+                    worker_id: "host-worker".into(),
+                    session_id: "host-session".into(),
+                },
+            )
+            .unwrap();
+            let result = connection.authorize_operation("memory.resident.supply");
+            match status {
+                200 => assert!(result.is_ok()),
+                403 => assert!(matches!(
+                    result,
+                    Err(SubjektivHostError::PermissionDenied(_))
+                )),
+                503 => assert!(matches!(result, Err(SubjektivHostError::Unavailable(_)))),
+                _ => unreachable!(),
+            }
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method, WorkspaceRequestMethod::Post);
+            assert_eq!(
+                requests[0].path,
+                "/api/w/test-workspace/authorization/bound-check"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(requests[0].body.as_deref().unwrap())
+                    .unwrap(),
+                serde_json::json!({
+                    "operation": "memory.resident.supply",
+                    "target": {"kind": "subject"},
+                })
+            );
+            drop(requests);
+            if status == 403 {
+                assert!(matches!(
+                    connection.host.memory(
+                        &connection.context,
+                        SubjektivMemoryBackendOperation::ResidentContext(Default::default()),
+                    ),
+                    Err(SubjektivHostError::PermissionDenied(_))
+                ));
+                assert!(matches!(
+                    connection.host.request_consolidation(
+                        &connection.context,
+                        MemoryConsolidateStagingOperation { force: false },
+                    ),
+                    Err(SubjektivHostError::PermissionDenied(_))
+                ));
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert!(
+                    requests.iter().all(|request| {
+                        request.path == "/api/w/test-workspace/authorization/bound-check"
+                    }),
+                    "denied direct Host calls must not reach protected Memory reads or Job admission"
+                );
+                let operations: Vec<String> = requests
+                    .iter()
+                    .map(|request| {
+                        serde_json::from_str::<serde_json::Value>(request.body.as_deref().unwrap())
+                            .unwrap()["operation"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                    .collect();
+                assert_eq!(
+                    operations,
+                    [
+                        "memory.resident.supply",
+                        "memory.resident.read",
+                        "memory.consolidation.request"
+                    ]
+                );
+            }
         }
     }
 
@@ -920,6 +1320,7 @@ enabled = true
         let read_store = store.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let host = Arc::new(LocalHost {
+            journal_operations: vec!["journal.recording.request"],
             journal_observer: Some(Arc::new(move |context, reason| {
                 let session_id = context.session_id.parse().unwrap();
                 let logs = read_store
@@ -1010,6 +1411,7 @@ enabled = true
         let reasons = Arc::new(Mutex::new(Vec::new()));
         let observed = reasons.clone();
         let host = Arc::new(LocalHost {
+            journal_operations: vec!["journal.recording.request"],
             journal_observer: Some(Arc::new(move |_, reason| {
                 observed.lock().unwrap().push(reason);
             })),
@@ -1120,6 +1522,7 @@ enabled = true
             };
             let host = Arc::new(LocalHost {
                 startup: Some(snapshot.clone()),
+                journal_operations: vec!["journal.startup.read", "journal.startup.supply"],
                 ..LocalHost::default()
             });
             let store = CombinedStore::new(
@@ -1200,13 +1603,25 @@ enabled = true
                     prompt_provenance.logical_name,
                     "internal.subjektiv_journal_startup"
                 );
-                assert_eq!(
-                    body.trim_end(),
-                    format!(
-                        "## Prior Journal context\n\n```json\n{}\n```",
-                        serde_json::to_string(&saved).unwrap()
-                    )
-                );
+                let yaml = body.strip_prefix("## Prior Journal context\n\n").unwrap();
+                let view: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+                if empty {
+                    assert_eq!(view["omitted"].as_bool(), Some(true));
+                } else {
+                    assert_eq!(
+                        view["journals"][0]["current_position"].as_str(),
+                        Some(snapshot.journals[0].current_position.as_str())
+                    );
+                }
+                for hidden in [
+                    "consistent-token",
+                    "previous-session",
+                    "state_token",
+                    "subject_id",
+                    "process_order",
+                ] {
+                    assert!(!body.contains(hidden));
+                }
                 body.as_str()
             });
             assert!(
@@ -1290,49 +1705,79 @@ enabled = true
     }
 
     #[tokio::test]
-    async fn direct_startup_read_error_rejects_exposure_without_initialized_head() {
+    async fn direct_startup_read_denial_supply_denial_and_unavailable_never_expose_a_head_or_provider()
+     {
         use session_store::Store;
-        let temp = tempfile::tempdir().unwrap();
-        let _sandbox =
-            crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
-        let mut manifest = WorkerManifest::from_toml(&format!("[worker]\nname='startup-error-{}'\n[model]\nscheme='anthropic'\nmodel_id='scripted'\n[engine]\n[scope]\nallow=[]", uuid::Uuid::now_v7())).unwrap();
-        manifest.feature.subjektiv.profile.enabled = true;
-        manifest.feature.subjektiv.profile.extraction.enabled = false;
-        let store = CombinedStore::new(
-            FsStore::new(temp.path().join("sessions")).unwrap(),
-            FsWorkerStore::new(temp.path().join("workers")).unwrap(),
-        );
-        let host = Arc::new(LocalHost {
-            startup_error: true,
-            ..LocalHost::default()
-        });
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let prepared = WorkerBootstrap::new(
-            manifest,
-            store.clone(),
-            crate::PromptCatalogSource::builtins_only(),
-            WorkerWorkspaceContext::local_filesystem(None),
-            WorkerFilesystemAuthority::None,
-            WorkerBootstrapLayout::Direct {
-                runtime_base: temp.path().join("runtime"),
-            },
-        )
-        .with_model_client(ScriptedClient(tx))
-        .with_subjektiv_host(host.clone())
-        .prepare()
-        .await
-        .unwrap();
-        let (session, segment) = (
-            prepared.worker().session_id(),
-            prepared.worker().segment_id(),
-        );
-        assert!(prepared.start().await.is_err());
-        assert!(!store.exists(session, segment).unwrap());
-        assert!(rx.try_recv().is_err());
-        assert_eq!(
-            host.startup_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        for (operations, unavailable, expected_reads, diagnostic) in [
+            (
+                vec!["journal.startup.read", "journal.startup.supply"],
+                true,
+                1,
+                "startup read failed",
+            ),
+            (vec![], false, 0, "journal.startup.read"),
+            (
+                vec!["journal.startup.read"],
+                false,
+                1,
+                "journal.startup.supply",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let _sandbox =
+                crate::runtime::worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
+            let mut manifest = WorkerManifest::from_toml(&format!("[worker]\nname='startup-error-{}'\n[model]\nscheme='anthropic'\nmodel_id='scripted'\n[engine]\n[scope]\nallow=[]", uuid::Uuid::now_v7())).unwrap();
+            manifest.feature.subjektiv.profile.enabled = true;
+            manifest.feature.subjektiv.profile.extraction.enabled = false;
+            let store = CombinedStore::new(
+                FsStore::new(temp.path().join("sessions")).unwrap(),
+                FsWorkerStore::new(temp.path().join("workers")).unwrap(),
+            );
+            let host = Arc::new(LocalHost {
+                startup: Some(JournalStartupSnapshot {
+                    subject_id: "subject".into(),
+                    journals: vec![],
+                    omitted: true,
+                }),
+                startup_error: unavailable,
+                journal_operations: operations,
+                ..LocalHost::default()
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let prepared = WorkerBootstrap::new(
+                manifest,
+                store.clone(),
+                crate::PromptCatalogSource::builtins_only(),
+                WorkerWorkspaceContext::local_filesystem(None),
+                WorkerFilesystemAuthority::None,
+                WorkerBootstrapLayout::Direct {
+                    runtime_base: temp.path().join("runtime"),
+                },
+            )
+            .with_model_client(ScriptedClient(tx))
+            .with_subjektiv_host(host.clone())
+            .prepare()
+            .await
+            .unwrap();
+            let (session, segment) = (
+                prepared.worker().session_id(),
+                prepared.worker().segment_id(),
+            );
+            let error = match prepared.start().await {
+                Ok(_) => panic!("unauthorized or unavailable Journal startup exposed a controller"),
+                Err(error) => error,
+            };
+            let crate::WorkerBootstrapError::Controller { source, .. } = error else {
+                panic!("expected startup failure, got {error:?}");
+            };
+            assert!(source.to_string().contains(diagnostic), "{source}");
+            assert!(!store.exists(session, segment).unwrap());
+            assert!(rx.try_recv().is_err());
+            assert_eq!(
+                host.startup_calls.load(std::sync::atomic::Ordering::SeqCst),
+                expected_reads
+            );
+        }
     }
 
     async fn launch_case(enabled: bool, attach: bool) {

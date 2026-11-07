@@ -1,5 +1,16 @@
 //! Host-owned Repository, Workdir and Worker attachment Objects.
 //! Inventory is resolved from Workspace authority on demand, not a second catalog.
+//!
+//! Result Records distinguish Entry coordinates from identity/selector strings. An Entry's wire
+//! value is a string; only its declared type makes it navigable. Provider metadata (capabilities,
+//! nullable selectors, occupancy and removal outcomes) stays JSON, not a hidden reference catalog.
+//! A Workdir source's config mapping is not a live entrance: only a current Attachment publishes one.
+//!
+//! Coordinates never acquire destinations or grant content access. Inspect/Invoke recheck current
+//! provider authority and observation validators, including connection generations. Post-attach
+//! lookup is separate from mutation success; rediscover unavailable references, never repeat attach.
+
+mod result;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -78,6 +89,7 @@ struct Provider {
     catalog: bool,
     manage: bool,
     config_content: bool,
+    checkout_content: bool,
 }
 
 /// Register Object ownership once, then contribute independent management operations.
@@ -94,9 +106,9 @@ pub fn mount_workspace_workdir_wip(
         permissions,
         catalog,
         manage,
+        checkout_content: registry.has_subtree("/checkouts"),
         config_content: registry
-            .routes()
-            .any(|route| route == crate::feature::builtin::workspace_config::CONTENT_ROOT),
+            .has_subtree(crate::feature::builtin::workspace_config::CONTENT_ROOT),
     };
     for domain in [Domain::Repository, Domain::Workdir, Domain::Attachment] {
         let namespace =
@@ -194,8 +206,29 @@ impl Provider {
             ))
         }
     }
-    fn request(&self, path: &str) -> Result<Json, WipOperationError> {
+    fn list_operation(domain: Domain) -> &'static str {
+        match domain {
+            Domain::Repository => "repository.list",
+            Domain::Workdir => "workdir.list",
+            Domain::Attachment => "workdir.attachment.list",
+        }
+    }
+    fn list_request(&self, domain: Domain, path: &str) -> Result<Json, WipOperationError> {
+        let resource = PermissionResource::Workspace {
+            workspace_id: self.backend.workspace_id().map_err(map_tool_error)?.into(),
+        };
+        self.request(path, Self::list_operation(domain), &resource)
+    }
+    fn request(
+        &self,
+        path: &str,
+        operation: &str,
+        resource: &PermissionResource,
+    ) -> Result<Json, WipOperationError> {
         let workspace = self.backend.workspace_id().map_err(map_tool_error)?;
+        self.backend
+            .authorize(operation, resource)
+            .map_err(map_tool_error)?;
         let response = self
             .backend
             .client
@@ -228,11 +261,14 @@ impl Provider {
         })
     }
     fn inventory(&self, domain: Domain) -> Result<Vec<Json>, WipOperationError> {
-        let response = self.request(match domain {
-            Domain::Repository => "repositories",
-            Domain::Workdir => "workers/self/workdir-catalog?limit=1",
-            Domain::Attachment => "workers/self/workdir-attachments?limit=1",
-        })?;
+        let response = self.list_request(
+            domain,
+            match domain {
+                Domain::Repository => "repositories",
+                Domain::Workdir => "workers/self/workdir-catalog?limit=1",
+                Domain::Attachment => "workers/self/workdir-attachments?limit=1",
+            },
+        )?;
         response
             .get("items")
             .and_then(Json::as_array)
@@ -242,12 +278,24 @@ impl Provider {
             })
     }
     fn raw_item(&self, domain: Domain, id: &str) -> Result<Json, WipOperationError> {
+        let workspace_id = self
+            .backend
+            .workspace_id()
+            .map_err(map_tool_error)?
+            .to_owned();
         match domain {
             Domain::Attachment => self
-                .request(&format!(
-                    "workers/self/workdir-attachments?limit=1&connection_id={}",
-                    encode_path_segment(id)
-                ))?
+                .request(
+                    &format!(
+                        "workers/self/workdir-attachments?limit=1&connection_id={}",
+                        encode_path_segment(id)
+                    ),
+                    "workdir.attachment.read",
+                    &PermissionResource::WorkdirAttachment {
+                        workspace_id,
+                        connection_id: id.into(),
+                    },
+                )?
                 .get("items")
                 .and_then(Json::as_array)
                 .cloned()
@@ -268,12 +316,34 @@ impl Provider {
                 } else {
                     "working-directories"
                 };
-                self.request(&format!("{prefix}/{}", encode_path_segment(id)))?
-                    .get("item")
-                    .cloned()
-                    .ok_or_else(|| {
-                        WipOperationError::OutcomeUnknown("invalid Workspace inventory item".into())
-                    })
+                let (operation, resource) = if matches!(domain, Domain::Repository) {
+                    (
+                        "repository.read",
+                        PermissionResource::Repository {
+                            workspace_id,
+                            repository_key: id.into(),
+                        },
+                    )
+                } else {
+                    (
+                        "workdir.read",
+                        PermissionResource::Workdir {
+                            working_directory_id: id.into(),
+                            path: ".".into(),
+                            recursive: true,
+                        },
+                    )
+                };
+                self.request(
+                    &format!("{prefix}/{}", encode_path_segment(id)),
+                    operation,
+                    &resource,
+                )?
+                .get("item")
+                .cloned()
+                .ok_or_else(|| {
+                    WipOperationError::OutcomeUnknown("invalid Workspace inventory item".into())
+                })
             }
         }
     }
@@ -363,46 +433,103 @@ impl Provider {
             if let Some(id) = raw.get("working_directory_id").and_then(Json::as_str) {
                 result.insert("workdir_path".into(), json!(item_path(Domain::Workdir, id)));
             }
-            // Content references are resolved from current Backend authority,
-            // never inferred from the alias or an OS session. An old lifetime
-            // cannot refer to a replacement connection at the same root.
-            if self.config_content
-                && raw.get("alias").and_then(Json::as_str)
-                    == Some(crate::feature::builtin::workspace_config::ATTACHMENT_ALIAS)
-                && let Ok(Some(current)) =
-                    crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
-                        self.backend.client.clone(),
-                    )
-                    .current()
-                && current.connection_id == id
-                && raw.get("working_directory_id").and_then(Json::as_str)
-                    == Some(current.working_directory_id.as_str())
-                && raw.get("alias").and_then(Json::as_str) == Some(current.alias.as_str())
+            self.content_reference(raw, &mut result)?;
+        }
+        result.insert("path".into(), json!(item_path(domain, id)));
+        Ok(Json::Object(result))
+    }
+    fn content_reference(
+        &self,
+        raw: &Json,
+        result: &mut serde_json::Map<String, Json>,
+    ) -> Result<(), WipOperationError> {
+        let alias = raw.get("alias").and_then(Json::as_str);
+        let id = raw.get("connection_id").and_then(Json::as_str);
+        let workdir = raw.get("working_directory_id").and_then(Json::as_str);
+        let state = if alias == Some(crate::feature::builtin::workspace_config::ATTACHMENT_ALIAS) {
+            if !self.config_content {
+                "unpublished"
+            } else if let Some(current) =
+                crate::feature::builtin::workspace_config::backend::WorkspaceConfigBackend::new(
+                    self.backend.client.clone(),
+                )
+                .current()
+                .map_err(
+                    crate::feature::builtin::workspace_config::failure::ConfigFailure::into_source,
+                )?
+                && Some(current.connection_id.as_str()) == id
+                && Some(current.working_directory_id.as_str()) == workdir
+                && Some(current.alias.as_str()) == alias
             {
                 result.insert("content_path".into(), json!(current.content_path));
                 result.insert("name".into(), json!(current.name));
                 result.insert("purpose".into(), json!(current.purpose));
                 result.insert("access".into(), json!(current.access));
+                "available"
+            } else {
+                "disconnected"
             }
-            if !result.contains_key("content_path")
-                && let Some(alias) = raw.get("alias").and_then(Json::as_str)
-                && let Ok(selected) = self.backend.session_router.resolve(Some(alias))
-                && raw.get("working_directory_id").and_then(Json::as_str)
-                    == Some(selected.session.workdir().id().as_str())
-                && selected
-                    .session
-                    .capabilities()
-                    .supports(workdir::WorkdirSessionCapability::Read)
+        } else if !self.checkout_content {
+            "unpublished"
+        } else if let Some(alias) = alias
+            && let Ok(selected) = self.backend.session_router.resolve(Some(alias))
+            && workdir == Some(selected.session.workdir().id().as_str())
+        {
+            if selected
+                .session
+                .capabilities()
+                .supports(workdir::WorkdirSessionCapability::Read)
             {
+                // Alias and Workdir identity alone do not identify a connection lifetime.
+                // Refuse an entrance when the Backend no longer recognizes this exact link.
+                if !self
+                    .backend
+                    .client
+                    .authorize_workdir_attachment_operation("workdir.attachment.read", alias, id)
+                    .is_ok_and(|current| Some(current.as_str()) == id)
+                {
+                    result.insert("content_state".into(), json!("unavailable"));
+                    return Ok(());
+                }
                 result.insert(
                     "checkout_path".into(),
                     json!(crate::checkout::checkout_root(alias)),
                 );
-                result.insert("checkout_slug".into(), json!(encode_identity(alias)));
+                "available"
+            } else {
+                "unsupported"
             }
+        } else {
+            "disconnected"
+        };
+        result.insert("content_state".into(), json!(state));
+        Ok(())
+    }
+
+    fn attached_reference(&self, alias: &str, workdir: &str) -> Option<Json> {
+        if !self.catalog {
+            return None;
         }
-        result.insert("path".into(), json!(item_path(domain, id)));
-        Ok(Json::Object(result))
+        // Resolve only the selected alias through current authority, never scan all pages.
+        // Attach has no response connection ID: this is a separate current observation,
+        // not proof that the connection cannot change before later Inspect.
+        let connection = self
+            .backend
+            .client
+            .authorize_workdir_attachment_operation("workdir.attachment.read", alias, None)
+            .ok()?;
+        self.authorize(
+            "WorkdirAttachmentRead",
+            &self.read_input(Domain::Attachment, &connection),
+        )
+        .ok()?;
+        let raw = self.raw_item(Domain::Attachment, &connection).ok()?;
+        if raw.get("alias").and_then(Json::as_str) != Some(alias)
+            || raw.get("working_directory_id").and_then(Json::as_str) != Some(workdir)
+        {
+            return None;
+        }
+        self.projected(Domain::Attachment, &raw).ok()
     }
 }
 
@@ -429,7 +556,7 @@ impl WipOperationHandler for CollectionHandler {
             };
             match self
                 .provider
-                .request(path)
+                .list_request(self.domain, path)
                 .ok()
                 .and_then(|p| p.get("digest").and_then(Json::as_str).map(str::to_owned))
             {
@@ -523,7 +650,7 @@ impl WipOperationHandler for CollectionHandler {
                             .unwrap_or_default();
                         format!("workers/self/workdir-catalog?limit={limit}{suffix}")
                     };
-                    let page = self.provider.request(&path)?;
+                    let page = self.provider.list_request(self.domain, &path)?;
                     let raws = page
                         .get("items")
                         .and_then(Json::as_array)
@@ -635,11 +762,11 @@ impl WipOperationHandler for CollectionHandler {
                     operation: WorkdirOperation::Create,
                 };
                 let output = tool
-                    .execute(&input.to_string(), context.execution)
+                    .execute_lifecycle(&input.to_string(), context.execution)
                     .await
-                    .map_err(map_tool_error)?;
+                    .map_err(map_lifecycle_error)?;
                 let raw = output_json(output)?;
-                json!({"item": self.provider.projected(Domain::Workdir, &raw["item"])?, "runtime_id":raw["runtime_id"]})
+                json!({"item": self.provider.projected(Domain::Workdir, &raw["item"])?, "runtime_id":raw["runtime_id"], "diagnostics":raw["diagnostics"]})
             }
             _ => {
                 return Err(failure(
@@ -782,26 +909,20 @@ impl WipOperationHandler for ItemHandler {
                     backend: self.provider.backend.clone(),
                     operation: op,
                 }
-                .execute(&input.to_string(), context.execution)
+                .execute_lifecycle(&input.to_string(), context.execution)
                 .await
-                .map_err(map_tool_error)?;
+                .map_err(map_lifecycle_error)?;
                 let raw = output_json(output)?;
                 if operation == "attach" {
                     let mut result = raw;
                     result["workdir_path"] = json!(item_path(Domain::Workdir, &self.id));
                     result["attachments_path"] = json!(ATTACHMENTS);
-                    if let Some(alias) = input.get("alias").and_then(Json::as_str)
-                        && self
-                            .provider
-                            .backend
-                            .session_router
-                            .resolve(Some(alias))
-                            .is_ok()
-                    {
-                        result["checkout_path"] = json!(crate::checkout::checkout_root(alias));
-                        result["checkout_slug"] = json!(encode_identity(alias));
-                    }
-                    // Backend attachment list supplies the durable lifetime identity.
+                    result["attachment"] = result
+                        .get("alias")
+                        .and_then(Json::as_str)
+                        .and_then(|alias| self.provider.attached_reference(alias, &self.id))
+                        .map(|value| json!({"$case":"available", "value":value}))
+                        .unwrap_or_else(|| json!({"$case":"unavailable"}));
                     result
                 } else {
                     raw
@@ -823,7 +944,7 @@ impl WipOperationHandler for ItemHandler {
                         .backend
                         .detach_managed(alias, Some(&self.id))
                         .await
-                        .map_err(map_tool_error)?,
+                        .map_err(map_lifecycle_error)?,
                 )?
             }
             _ => {
@@ -866,11 +987,24 @@ fn failure(code: ProtocolErrorCode, message: impl Into<String>) -> WipOperationE
         message: message.into(),
     })
 }
+fn map_lifecycle_error(error: super::LifecycleError) -> WipOperationError {
+    let original = map_tool_error(error.source);
+    match (original, error.report) {
+        (WipOperationError::Protocol(error), Some(report)) => {
+            WipOperationError::protocol_with_failure(error, report)
+        }
+        (WipOperationError::OutcomeUnknown(message), Some(report)) => {
+            WipOperationError::outcome_unknown_with_failure(message, report)
+        }
+        (original, _) => original,
+    }
+}
 fn map_tool_error(error: ToolError) -> WipOperationError {
     match error {
         ToolError::InvalidArgument(message) => {
             failure(ProtocolErrorCode::InvalidArguments, message)
         }
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         ToolError::StructuredConflict { code, .. } => {
@@ -985,6 +1119,7 @@ fn operation(
     name: &str,
     summary: &str,
     parameters: Vec<ParameterDeclaration>,
+    returns: TypeExpr,
 ) -> OperationDeclaration {
     OperationDeclaration {
         name: name.into(),
@@ -995,7 +1130,7 @@ fn operation(
         parameters,
         returns: ReturnDeclaration {
             documentation: None,
-            r#type: TypeExpr::Json,
+            r#type: returns,
         },
     }
 }
@@ -1023,15 +1158,17 @@ fn collection_descriptor(domain: Domain, management: bool) -> InterfaceDescripto
                     parameter("runtime_id", false, TypeExpr::String),
                     parameter("display_name", false, TypeExpr::String),
                 ],
+                result::created(domain),
             )]
         } else {
             vec![operation(
                 "list",
-                "List a bounded page of visible Objects with item paths",
+                "List a bounded page of visible Objects with typed Entries",
                 vec![
                     parameter("limit", false, TypeExpr::Integer),
                     parameter("cursor", false, TypeExpr::String),
                 ],
+                result::page(domain),
             )]
         },
     )
@@ -1047,14 +1184,21 @@ fn item_descriptor(domain: Domain, management: bool) -> InterfaceDescriptor {
                         "attach",
                         ATTACH_DESCRIPTION,
                         vec![parameter("alias", true, TypeExpr::String)],
+                        result::attached(),
                     ),
                     operation(
                         "delete",
                         DELETE_DESCRIPTION,
                         vec![parameter("reason", true, TypeExpr::String)],
+                        TypeExpr::Json,
                     ),
                 ],
-                Domain::Attachment => vec![operation("detach", DETACH_DESCRIPTION, vec![])],
+                Domain::Attachment => vec![operation(
+                    "detach",
+                    DETACH_DESCRIPTION,
+                    vec![],
+                    TypeExpr::Json,
+                )],
                 Domain::Repository => vec![],
             }
         } else {
@@ -1062,6 +1206,7 @@ fn item_descriptor(domain: Domain, management: bool) -> InterfaceDescriptor {
                 "read",
                 "Read this Object through current Workspace authority",
                 vec![],
+                result::item(domain),
             )]
         },
     )
@@ -1083,8 +1228,13 @@ pub(crate) mod tests {
         pub(crate) workdirs: Vec<Json>,
         pub(crate) attachments: Vec<Json>,
         pub(crate) requests: Vec<WorkspaceRequest>,
+        pub(crate) authorizations: Vec<server_api::authorization::OperationAuthorizationRequest>,
+        pub(crate) bound_authorizations:
+            Vec<server_api::authorization::BoundOperationAuthorizationRequest>,
+        pub(crate) authorization_denied: bool,
         pub(crate) denied: bool,
-        config_current: Option<Json>,
+        pub(crate) config_current: Option<Json>,
+        create_failure: Option<WorkspaceResponse>,
         generation: usize,
     }
     impl Default for CatalogClient {
@@ -1097,8 +1247,12 @@ pub(crate) mod tests {
                     workdirs: vec![],
                     attachments: vec![],
                     requests: vec![],
+                    authorizations: vec![],
+                    bound_authorizations: vec![],
+                    authorization_denied: false,
                     denied: false,
                     config_current: None,
+                    create_failure: None,
                     generation: 0,
                 }),
             }
@@ -1122,9 +1276,53 @@ pub(crate) mod tests {
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             let mut state = self.state.lock().unwrap();
+            if request.path.ends_with("/authorization/bound-check") {
+                let auth: server_api::authorization::BoundOperationAuthorizationRequest =
+                    serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                let connection = match &auth.target {
+                    server_api::authorization::BoundAuthorizationTarget::WorkdirAttachment {
+                        alias,
+                        expected_connection_id,
+                    } => state
+                        .attachments
+                        .iter()
+                        .find(|item| {
+                            item["alias"].as_str() == Some(alias.as_str())
+                                && expected_connection_id
+                                    .as_deref()
+                                    .is_none_or(|id| item["connection_id"].as_str() == Some(id))
+                        })
+                        .and_then(|item| item["connection_id"].as_str())
+                        .map(str::to_owned),
+                    _ => panic!("unexpected bound target"),
+                };
+                state.bound_authorizations.push(auth);
+                return Ok(WorkspaceResponse {
+                    content_type: None,
+                    status: if state.authorization_denied { 403 } else if connection.is_none() { 409 } else { 200 },
+                    body: json!({"scope":{"kind":"workdir_attachment", "workspace_id":"test-workspace", "connection_id":connection.unwrap_or_default()}}).to_string(),
+                });
+            }
+            if request.path.ends_with("/authorization/check") {
+                state
+                    .authorizations
+                    .push(serde_json::from_str(request.body.as_deref().unwrap()).unwrap());
+                return Ok(WorkspaceResponse {
+                    content_type: None,
+                    status: if state.authorization_denied { 403 } else { 200 },
+                    body: r#"{"scope":null}"#.into(),
+                });
+            }
             state.requests.push(request.clone());
+            if request.method == WorkspaceRequestMethod::Post
+                && request.path.ends_with("/working-directories")
+                && let Some(response) = state.create_failure.take()
+            {
+                return Ok(response);
+            }
             if state.denied {
                 return Ok(WorkspaceResponse {
+                    content_type: None,
                     status: 403,
                     body: "SECRET /host/path".into(),
                 });
@@ -1222,6 +1420,7 @@ pub(crate) mod tests {
                         Some(r) => json!({"item":r}),
                         None => {
                             return Ok(WorkspaceResponse {
+                                content_type: None,
                                 status: 404,
                                 body: String::new(),
                             });
@@ -1238,6 +1437,7 @@ pub(crate) mod tests {
                         Some(r) => json!({"item":r}),
                         None => {
                             return Ok(WorkspaceResponse {
+                                content_type: None,
                                 status: 404,
                                 body: String::new(),
                             });
@@ -1250,10 +1450,19 @@ pub(crate) mod tests {
                     json!({"workspace_id":"test-workspace", "runtime_id":"runtime", "item":raw, "diagnostics":[]})
                 }
                 (WorkspaceRequestMethod::Post, "workers/self/workdir-attachments") => {
-                    state.generation += 1;
-                    let raw = json!({"alias":body["alias"], "working_directory_id":body["working_directory_id"], "connection_id":format!("connection-{}", state.generation), "capabilities":{"bits":63}});
-                    state.attachments.push(raw);
-                    json!({"workspace_id":"test-workspace", "alias":body["alias"], "working_directory_id":body["working_directory_id"], "capabilities":{"bits":63}, "environment":workdir::WorkdirSessionEnvironment::root(workdir::WorkdirSessionCapabilities::ALL), "attached":true})
+                    let existing = state
+                        .attachments
+                        .iter()
+                        .find(|raw| raw["working_directory_id"] == body["working_directory_id"])
+                        .cloned();
+                    let already_attached = existing.is_some();
+                    let raw = existing.unwrap_or_else(|| {
+                        state.generation += 1;
+                        let raw = json!({"alias":body["alias"], "working_directory_id":body["working_directory_id"], "connection_id":format!("connection-{}", state.generation), "capabilities":{"bits":63}});
+                        state.attachments.push(raw.clone());
+                        raw
+                    });
+                    json!({"workspace_id":"test-workspace", "alias":raw["alias"], "working_directory_id":raw["working_directory_id"], "capabilities":{"bits":63}, "environment":workdir::WorkdirSessionEnvironment::root(workdir::WorkdirSessionCapabilities::ALL), "attached":true, "already_attached":already_attached})
                 }
                 (WorkspaceRequestMethod::Delete, p)
                     if p.starts_with("workers/self/workdir-attachments/") =>
@@ -1269,6 +1478,7 @@ pub(crate) mod tests {
                         .position(|r| r["alias"] == alias && r["connection_id"] == expected)
                     else {
                         return Ok(WorkspaceResponse {
+                            content_type: None,
                             status: 409,
                             body: "stale".into(),
                         });
@@ -1282,6 +1492,7 @@ pub(crate) mod tests {
                 other => panic!("unexpected catalog request: {other:?}"),
             };
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: value.to_string(),
             })
@@ -1331,13 +1542,7 @@ pub(crate) mod tests {
                 .is_none()
         );
         client.state.lock().unwrap().denied = true;
-        assert!(
-            p.projected(Domain::Attachment, &raw)
-                .ok()
-                .unwrap()
-                .get("content_path")
-                .is_none()
-        );
+        assert!(p.projected(Domain::Attachment, &raw).is_err());
     }
 
     #[test]
@@ -1353,6 +1558,69 @@ pub(crate) mod tests {
         assert!(!projected.to_string().contains("SECRET"));
     }
 
+    #[tokio::test]
+    async fn physical_entrance_requires_publication_session_capability_and_exact_connection() {
+        let client = Arc::new(CatalogClient::default());
+        let raw = json!({"alias":"checkout", "connection_id":"current", "working_directory_id":"wd", "capabilities":{"bits":63}});
+        client.state.lock().unwrap().attachments.push(raw.clone());
+        let mut p = provider(client.clone(), true, true, None);
+        let project = |p: &Provider, raw: &Json| p.projected(Domain::Attachment, raw).ok().unwrap();
+        assert_eq!(project(&p, &raw)["content_state"], "unpublished");
+        p.checkout_content = true;
+        assert_eq!(project(&p, &raw)["content_state"], "disconnected");
+        let alias = workdir::WorkdirAttachmentAlias::new("checkout").unwrap();
+        p.backend
+            .session_router
+            .attach(
+                alias.clone(),
+                WorkspaceAttachedWorkdirSession::handle_for_workdir_with_capabilities(
+                    client.clone(),
+                    "checkout",
+                    "wd",
+                    WorkdirSessionCapabilities::EMPTY,
+                ),
+            )
+            .unwrap();
+        assert_eq!(project(&p, &raw)["content_state"], "unsupported");
+        p.backend.session_router.detach(&alias).await.unwrap();
+        p.backend
+            .session_router
+            .attach(
+                alias,
+                WorkspaceAttachedWorkdirSession::handle_for_workdir(client, "checkout", "wd"),
+            )
+            .unwrap();
+        assert_eq!(project(&p, &raw)["content_state"], "available");
+        let mut old = raw.clone();
+        old["connection_id"] = json!("old");
+        let old = project(&p, &old);
+        assert_eq!(old["content_state"], "unavailable");
+        assert!(old.get("checkout_path").is_none());
+    }
+
+    #[test]
+    fn result_contract_validates_entry_coordinates_without_guessing_plain_strings() {
+        let p = provider(Arc::new(CatalogClient::default()), true, true, None);
+        let descriptor = item_descriptor(Domain::Repository, false);
+        let mut raw = json!({"repository_key":"key", "display_name":"not an Entry /?", "default_selector":"refs/heads/feature"});
+        let projected = p.projected(Domain::Repository, &raw).ok().unwrap();
+        descriptor
+            .validate_result("read", &json_to_wip(&projected).unwrap())
+            .unwrap();
+        let mut bad = projected;
+        bad["path"] = json!("not-an-absolute-entry");
+        assert!(
+            descriptor
+                .validate_result("read", &json_to_wip(&bad).unwrap())
+                .is_err()
+        );
+        raw["repository_key"] = json!("repo/name");
+        let projected = p.projected(Domain::Repository, &raw).ok().unwrap();
+        descriptor
+            .validate_result("read", &json_to_wip(&projected).unwrap())
+            .unwrap();
+    }
+
     fn provider(
         client: Arc<CatalogClient>,
         catalog: bool,
@@ -1364,6 +1632,7 @@ pub(crate) mod tests {
             catalog,
             manage,
             config_content: false,
+            checkout_content: false,
             permissions,
         }
     }
@@ -1377,6 +1646,7 @@ pub(crate) mod tests {
     }
     fn context() -> WipCallContext {
         WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::default(),
             security_context: "test".into(),
         }
@@ -1426,6 +1696,97 @@ pub(crate) mod tests {
         for invalid in ["~", "~xx", "~é", "~6162", "a.b", "..", "~C3A9"] {
             assert!(decode_identity(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[tokio::test]
+    async fn catalog_create_keeps_unknown_and_typed_cause_without_retry_or_provider_prose() {
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
+            WorkdirManagementVisibility,
+        };
+        let cause = WorkdirManagementFailure {
+            operation: WorkdirManagementOperation::Create,
+            reason: WorkdirManagementReason::NotFound,
+        };
+        let projected = error_contract::project_failure::<error_contract::Browser, _>(
+            &error_contract::FailureFacts::new(cause).unwrap(),
+            &WorkdirManagementVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+        let mut body =
+            serde_json::to_value(server_api::WorkdirManagementApiError::projected(projected))
+                .unwrap();
+        body["detail"] = json!("SECRET /private/path safe to retry");
+        body["yoi_failure"]["explanation"] = body["detail"].clone();
+        let client = Arc::new(CatalogClient::default());
+        client.state.lock().unwrap().create_failure = Some(WorkspaceResponse {
+            status: 400,
+            content_type: Some(error_contract::problem::PROBLEM_CONTENT_TYPE.into()),
+            body: body.to_string(),
+        });
+        let handler = CollectionHandler {
+            provider: provider(client.clone(), true, true, None),
+            domain: Domain::Workdir,
+        };
+        let result = handler
+            .call(
+                "create",
+                &arguments(json!({"repository_key":"registered-key"})),
+                context(),
+            )
+            .await;
+        let Err(WipOperationError::OutcomeUnknownWithFailure { message, failure }) = result else {
+            panic!(
+                "typed cause must not turn native Unknown into a protocol rejection or typed return"
+            )
+        };
+        assert!(message.contains("do not automatically retry"));
+        assert!(failure.summary.contains("not found"));
+        assert!(failure.summary.contains("do not resend automatically"));
+        let content = failure.content.unwrap();
+        let report: Json = serde_json::from_str(&content).unwrap();
+        assert_eq!(report["failure"]["reason"], "working_directory_not_found");
+        assert_eq!(report["result"]["http_status"], 400);
+        assert_eq!(report["result"]["mutation"], "not_reported");
+        assert!(!content.contains("SECRET"));
+        assert!(!content.contains("/private/path"));
+        assert_eq!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.method == WorkspaceRequestMethod::Post
+                    && request.path.ends_with("/working-directories"))
+                .count(),
+            1
+        );
+        client.state.lock().unwrap().authorization_denied = true;
+        assert!(
+            handler
+                .call(
+                    "create",
+                    &arguments(json!({"repository_key":"registered-key"})),
+                    context()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| request.method == WorkspaceRequestMethod::Post
+                    && request.path.ends_with("/working-directories"))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1674,6 +2035,52 @@ pub(crate) mod tests {
             Err(WipMountError::OperationCollision { .. })
         ));
     }
+    #[tokio::test]
+    async fn wip_inventory_and_dynamic_items_recheck_authority_before_reads() {
+        let client = Arc::new(CatalogClient::default());
+        let p = provider(client.clone(), true, true, None);
+        client.state.lock().unwrap().authorization_denied = true;
+        for domain in [Domain::Repository, Domain::Workdir, Domain::Attachment] {
+            assert!(p.inventory(domain).is_err());
+            assert!(p.raw_item(domain, "target").is_err());
+            let handler = CollectionHandler {
+                provider: p.clone(),
+                domain,
+            };
+            assert!(
+                handler
+                    .call("list", &BTreeMap::new(), context())
+                    .await
+                    .is_err()
+            );
+            let resolver = ItemResolver {
+                provider: p.clone(),
+                domain,
+            };
+            assert!(resolver.resolve(&encode_identity("target")).is_none());
+        }
+        assert!(client.state.lock().unwrap().requests.is_empty());
+        client.state.lock().unwrap().authorization_denied = false;
+        let raw = p
+            .raw_item(Domain::Repository, "registered-key")
+            .ok()
+            .unwrap();
+        assert_eq!(raw["repository_key"], "registered-key");
+        let reads = client.state.lock().unwrap().requests.len();
+        client.state.lock().unwrap().authorization_denied = true;
+        assert!(p.raw_item(Domain::Repository, "registered-key").is_err());
+        assert_eq!(client.state.lock().unwrap().requests.len(), reads);
+        let state = client.state.lock().unwrap();
+        let last = state.authorizations.last().unwrap();
+        assert_eq!(last.operation, "repository.read");
+        assert_eq!(
+            last.resource,
+            PermissionResource::Repository {
+                workspace_id: "test-workspace".into(),
+                repository_key: "registered-key".into()
+            }
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1692,6 +2099,7 @@ mod lifetime_tests {
             catalog: true,
             manage: true,
             config_content: false,
+            checkout_content: false,
         };
         let handler = CollectionHandler {
             provider: p.clone(),
@@ -1699,6 +2107,7 @@ mod lifetime_tests {
         };
         let args = BTreeMap::from([("limit".into(), Value::Integer(50))]);
         let context = || WipCallContext {
+            result_namespaces: Default::default(),
             execution: ToolExecutionContext::default(),
             security_context: "test".into(),
         };
@@ -1757,7 +2166,7 @@ mod lifetime_tests {
             .detach_managed("checkout", Some("old-lifetime"))
             .await
             .unwrap_err();
-        assert!(matches!(error, ToolError::StructuredConflict { .. }));
+        assert!(matches!(error.source, ToolError::StructuredConflict { .. }));
         assert_eq!(hooks.load(Ordering::SeqCst), 0);
         assert!(backend.session_router.session(&alias).is_some());
         assert_eq!(
@@ -1788,6 +2197,7 @@ mod logical_capability_tests {
             catalog: true,
             manage: true,
             config_content: false,
+            checkout_content: false,
             permissions: None,
         };
         let item = ItemHandler {

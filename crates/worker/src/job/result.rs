@@ -124,6 +124,24 @@ impl JobResultFeature {
             .clone()
     }
 
+    pub(super) fn unconfirmed_submission(&self) -> Option<::job::JobResultSubmission> {
+        let state = self.state.lock().expect("Job submission state poisoned");
+        state.unconfirmed.as_ref()?;
+        Some(::job::JobResultSubmission {
+            job_id: self.job_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            input_digest: self.input_digest.clone(),
+            result: state.prepared.clone()?,
+        })
+    }
+
+    /// Revoke every clone and join the exact serialized finalizer/sink operation. Cancellation
+    /// alone does not prove a synchronous Host sink or an asynchronous finalizer has returned.
+    pub(super) async fn revoke_and_join(&self) {
+        self.cancellation.cancel();
+        let _operation = self.serial.lock().await;
+    }
+
     fn definition(&self) -> ToolDefinition {
         let feature = self.clone();
         Arc::new(move || {
@@ -190,11 +208,12 @@ impl Tool for JobResultFeature {
         ::job::result_digest(&prepared, self.max_result_bytes)
             .map_err(|e| ToolError::InvalidArgument(e.to_string()))?;
         let mut state = self.state.lock().expect("Job submission state poisoned");
-        if self
-            .cancelled
-            .lock()
-            .expect("Job cancellation state poisoned")
-            .contains(&context.execution_id())
+        if self.cancellation.is_cancelled()
+            || self
+                .cancelled
+                .lock()
+                .expect("Job cancellation state poisoned")
+                .contains(&context.execution_id())
         {
             return Err(ToolError::Cancelled(ToolOutput {
                 summary: "Job result submission cancelled".into(),

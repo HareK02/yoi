@@ -1,6 +1,6 @@
 import "./base.dcdl" // {
     slug = "coder";
-    description = "Code implementation with optional Git/MR review recipe; no universal Ticket conclusion gate.";
+    description = "Bounded code implementation for a Ticket's assigned Subject; Profile selection confers no assignee/body authority. Optional Git/MR review recipe and no universal Ticket conclusion gate.";
     scope = "workspace_write";
     model = { ref = "codex-oauth/gpt-6.1-sol"; };
     engine = {

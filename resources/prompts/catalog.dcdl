@@ -15,6 +15,8 @@ commonWorkspaceWorkerDiscovery = import "./common/workspace-worker-discovery.md"
 commonWorkerOrchestration = import "./common/worker-orchestration.md";
 commonWorkspace = import "./common/workspace.md";
 commonWriting = import "./common/writing.md";
+commonNotifications = import "./common/notifications.md";
+roleAsyncChat = import "./role/async-chat.md";
 roleCoder = import "./role/coder.md";
 roleTicketWorker = import "./role/ticket-worker.md";
 roleIntake = import "./role/intake.md";
@@ -58,8 +60,10 @@ in
         worker_orchestration = commonWorkerOrchestration.content;
         workspace = commonWorkspace.content;
         writing = commonWriting.content;
+        notifications = commonNotifications.content;
     };
     role = {
+        async_chat = roleAsyncChat.content;
         coder = roleCoder.content;
         ticket_worker = roleTicketWorker.content;
         intake = roleIntake.content;

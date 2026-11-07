@@ -1,0 +1,17 @@
+error: client_error_hook requires the `reqwest` adapter
+ --> tests/ui/operation_hook_invalid_combinations.rs:7:41
+  |
+7 |     #[get("/error", client_error_hook = true)]
+  |                                         ^^^^
+
+error: client_error_hook requires a public error response type
+  --> tests/ui/operation_hook_invalid_combinations.rs:13:47
+   |
+13 |     #[post("/infallible", client_error_hook = true)]
+   |                                               ^^^^
+
+error: duplicate `client_error_hook` route option
+  --> tests/ui/operation_hook_invalid_combinations.rs:19:51
+   |
+19 |     #[get("/duplicate", client_error_hook = true, client_error_hook = false)]
+   |                                                   ^^^^^^^^^^^^^^^^^

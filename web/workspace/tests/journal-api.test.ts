@@ -221,7 +221,7 @@ Deno.test("Journal links retain exact selected entry and bounded URL offsets", (
     }),
     "https://example.com",
   );
-  assertEquals(url.pathname, "/w/workspace/memory/subject%2Fa/journal");
+  assertEquals(url.pathname, "/w/workspace/subjektiv/subject%2Fa/journal");
   assertEquals(url.searchParams.get("entry"), "entry&selected");
   assertEquals(
     boundedParam(new URLSearchParams({ q: "あ".repeat(5) }), "q", 14),

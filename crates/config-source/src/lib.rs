@@ -1885,9 +1885,7 @@ fn is_builtin_path(path: &VirtualPath) -> bool {
 
 fn validate_workspace_path(path: &VirtualPath) -> Result<(), ConfigTreeError> {
     if is_builtin_path(path) {
-        return Err(ConfigTreeError::InvalidPath(format!(
-            "{path}: builtin namespace is read-only"
-        )));
+        return Err(ConfigTreeError::BuiltinReadOnly(path.clone()));
     }
     Ok(())
 }
@@ -2289,6 +2287,8 @@ fn format_digest(bytes: &[u8]) -> String {
 pub enum ConfigTreeError {
     #[error("invalid virtual config path: {0}")]
     InvalidPath(String),
+    #[error("{0}: builtin namespace is read-only")]
+    BuiltinReadOnly(VirtualPath),
     #[error("invalid virtual config import: {0}")]
     InvalidImport(String),
     #[error("virtual config import escapes the tree: {0}")]
@@ -4091,5 +4091,54 @@ mod tests {
             .evaluate_contract(&ToolchainContract::new(1, vec![path("a.dcdl")], 1))
             .unwrap_err();
         assert_eq!(diagnostics[0].kind, "cycle");
+    }
+}
+
+#[cfg(test)]
+mod plugin_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_closed_schema_matches_shared_native_wasm_projection_and_diagnostic_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../resources/config-schema/fixtures/plugin-preflight.json"
+        ))
+        .unwrap();
+        let bundle = WorkspaceConfigSchemaBundle::compose([ConfigSchemaContribution::new(
+            "plugin-preflight",
+            "plugins",
+            "1",
+            fixture["schema"].as_str().unwrap(),
+        )
+        .unwrap()])
+        .unwrap();
+        let path = VirtualPath::parse("main.dcdl").unwrap();
+        let contract = ToolchainContract::with_schema_bundle(1, vec![path.clone()], 1, bundle);
+        for case in fixture["cases"].as_array().unwrap() {
+            let snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+                path.clone(),
+                ConfigContentType::Decodal,
+                case["source"].as_str().unwrap(),
+            )
+            .unwrap()])
+            .unwrap();
+            let result = SnapshotEnvironment::new(snapshot).evaluate_contract(&contract);
+            match case.get("diagnostic") {
+                Some(kind) => {
+                    let errors = result.unwrap_err();
+                    assert_eq!(errors[0].kind, kind.as_str().unwrap());
+                    assert_eq!(errors[0].path.as_str(), "main.dcdl");
+                }
+                None => {
+                    let evaluated = result.unwrap();
+                    assert_eq!(
+                        evaluated.projections[0]
+                            .data_json
+                            .pointer("/plugins/enabled/echo/config/mode"),
+                        Some(&case["mode"])
+                    );
+                }
+            }
+        }
     }
 }

@@ -282,6 +282,15 @@ impl WorkdirSession for AuthorizedWorkdirSession {
         mut request: WorkdirScopeAuthorizationRequest,
     ) -> Result<(), WorkdirError> {
         let path = request.path.clone();
+        // A delegated writable scope also performs read-only checks (for example
+        // Bash's cwd). This point check must not demand writable capabilities
+        // from the temporary read-authorized provider session. Keep the same path
+        // ceilings, but attenuate the rules to the operation actually checked.
+        if request.permission == WorkdirToolScopePermission::Read {
+            for rule in &mut request.rules {
+                rule.permission = WorkdirToolScopePermission::Read;
+            }
+        }
         self.with_authorized(
             match request.permission {
                 WorkdirToolScopePermission::Read => READ,
@@ -632,6 +641,34 @@ mod tests {
             cwd: WorkdirPath::root(),
             tool_call_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn writable_scope_read_checks_require_only_current_read_authority() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("allowed")).unwrap();
+        let client = AuthorizationClient::new(vec![permission(READ, "allowed", true)]);
+        let session = session(&root, client.clone());
+        let request = WorkdirScopeAuthorizationRequest {
+            rules: vec![WorkdirToolScopeRule {
+                target: WorkdirPath::new("allowed").unwrap(),
+                recursive: true,
+                permission: WorkdirToolScopePermission::Write,
+                symlink_policy: manifest::SymlinkPolicy::Resolved,
+            }],
+            path: WorkdirPath::new("allowed").unwrap(),
+            permission: WorkdirToolScopePermission::Read,
+        };
+        session.authorize_scope_path(request.clone()).await.unwrap();
+        let mut write = request.clone();
+        write.permission = WorkdirToolScopePermission::Write;
+        assert!(session.authorize_scope_path(write).await.is_err());
+        let mut outside = request.clone();
+        outside.path = WorkdirPath::root();
+        assert!(session.authorize_scope_path(outside).await.is_err());
+        client.revoked.store(true, Ordering::SeqCst);
+        assert!(session.authorize_scope_path(request).await.is_err());
+        session.close().await.unwrap();
     }
 
     #[tokio::test]

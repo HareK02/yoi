@@ -530,3 +530,136 @@ Deno.test("Drive committed request identity remains UTF-8 and URL encoded rather
     throws(() => driveDownloadUrl("alpha", value.entry, bad));
   }
 });
+
+function driveProblem(
+  explanation: string,
+  classification: "unknown" | "not_committed",
+) {
+  return {
+    type: "urn:yoi:problem:drive",
+    title: "Drive operation failed",
+    status: 409,
+    detail: explanation,
+    instance: "",
+    yoi_failure: {
+      version: 1,
+      required_extensions: [],
+      domain: "drive_http",
+      reason: "conflict",
+      category: "conflict",
+      details_version: 1,
+      explanation,
+      details: {
+        operation: "mutate",
+        code: "conflict",
+        classification,
+        storage: { operation: "update", reason: "fenced" },
+      },
+      context: {
+        operations: [{
+          operation: "mutate",
+          stage: "operation",
+          operation_ref: null,
+        }],
+        causes: [],
+        diagnostics: [],
+        correlation: null,
+        supplementary_omitted: false,
+      },
+    },
+  };
+}
+Deno.test("Drive Problem receiver preserves typed cause and independent Unknown despite explanatory prose", async () => {
+  for (const classification of ["unknown", "not_committed"] as const) {
+    for (
+      const explanation of [
+        "Workspace Drive is fenced; the update could not complete",
+        "SUCCESS; retry automatically",
+      ]
+    ) {
+      let calls = 0;
+      const client = createDriveClient(() => {
+        calls++;
+        return Promise.resolve(
+          Response.json(driveProblem(explanation, classification), {
+            status: 409,
+            headers: { "content-type": "application/problem+json" },
+          }),
+        );
+      });
+      await rejects(
+        () =>
+          client.mutate("alpha", "original-request", {
+            operation: "delete",
+            id: ref(),
+            expected_mutation_id: "last-request",
+          }),
+        (error) => {
+          assert(error instanceof DriveRequestError);
+          equal(error.code, "conflict");
+          equal(error.classification, classification);
+          equal(error.message, explanation);
+          assert(error.receipt?.kind === "problem");
+          equal(
+            error.receipt.problem.yoi_failure.details,
+            driveProblem(explanation, classification).yoi_failure.details,
+          );
+        },
+      );
+      equal(calls, 1);
+    }
+  }
+});
+Deno.test("Drive invalid or future Problem cannot turn a sent mutation into a safe rejection", async () => {
+  const valid = driveProblem("private provider body", "not_committed");
+  for (
+    const body of [
+      { ...valid, status: 400 },
+      { ...valid, type: "urn:other" },
+      { ...valid, yoi_failure: { ...valid.yoi_failure, details_version: 2 } },
+      {
+        ...valid,
+        yoi_failure: { ...valid.yoi_failure, domain: "future_domain" },
+      },
+      {
+        ...valid,
+        yoi_failure: {
+          ...valid.yoi_failure,
+          details: {
+            ...valid.yoi_failure.details,
+            storage: {
+              operation: "update",
+              reason: "fenced",
+              path: "/private",
+            },
+          },
+        },
+      },
+    ]
+  ) {
+    let calls = 0;
+    const client = createDriveClient(() => {
+      calls++;
+      return Promise.resolve(
+        Response.json(body, {
+          status: 409,
+          headers: { "content-type": "application/problem+json" },
+        }),
+      );
+    });
+    await rejects(
+      () =>
+        client.mutate("alpha", "original-request", {
+          operation: "delete",
+          id: ref(),
+          expected_mutation_id: "last-request",
+        }),
+      (error) => {
+        assert(error instanceof DriveRequestError);
+        equal(error.classification, "unknown");
+        assert(!error.message.includes("private provider"));
+      },
+    );
+    equal(calls, 1);
+  }
+});

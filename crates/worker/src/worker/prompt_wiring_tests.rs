@@ -25,6 +25,7 @@ impl WorkspaceClient for GuidanceHost {
         if request.path.ends_with("/authorization/check") {
             return Ok(WorkspaceResponse {
                 status: 200,
+                content_type: None,
                 body: "{}".into(),
             });
         }
@@ -42,6 +43,7 @@ impl WorkspaceClient for GuidanceHost {
         };
         Ok(WorkspaceResponse {
             status: 200,
+                content_type: None,
             body: serde_json::to_string(&source).unwrap(),
         })
     }
@@ -104,7 +106,12 @@ async fn fresh_builtin_profiles_materialize_validation_guidance() {
             report.error_message()
         );
         if orchestration {
-            worker.register_worker_orchestration_instruction();
+            // This construction fixture supplies only the declaration; live spawn wiring
+            // is covered by the SubWorker composition tests.
+            worker.register_feature_instruction(crate::feature::FeatureInstructionDeclaration::new(
+                crate::feature::FeatureInstructionId::builtin("worker.orchestration"),
+                "common.worker_orchestration", "Worker orchestration guidance",
+            ).unwrap());
         }
         worker.set_system_prompt_template(
             SystemPromptTemplate::parse(

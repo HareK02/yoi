@@ -523,6 +523,10 @@ impl StandaloneWorkerAllocation {
         &self.cwd
     }
 
+    pub(crate) fn lease(&self) -> &StandaloneWorkerLease {
+        &self.lease
+    }
+
     pub fn into_lease(self) -> StandaloneWorkerLease {
         self.lease
     }
@@ -536,6 +540,30 @@ pub struct StandaloneWorkerLease {
 }
 
 impl StandaloneWorkerLease {
+    /// Revalidate this already-held lease before Job recovery. This neither acquires a lease
+    /// nor proves any previous execution or Host effect has ended.
+    pub(crate) fn verify_current_id(&self) -> Result<Uuid, StandaloneStoreError> {
+        if self.released {
+            return Err(StandaloneStoreError::LeaseOwnershipLost);
+        }
+        let parent = self.path.parent().expect("lease parent");
+        let _guard = LeaseMutationGuard::acquire(parent)?;
+        let metadata = fs::symlink_metadata(&self.path).map_err(StandaloneStoreError::Io)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(StandaloneStoreError::LeaseOwnershipLost);
+        }
+        let bytes = fs::read(&self.path).map_err(StandaloneStoreError::Io)?;
+        let current: LeaseRecord =
+            serde_json::from_slice(&bytes).map_err(StandaloneStoreError::Json)?;
+        if current.lease_id != self.lease_id
+            || current.pid != std::process::id()
+            || current.liveness() != LeaseLiveness::Live
+        {
+            return Err(StandaloneStoreError::LeaseOwnershipLost);
+        }
+        Ok(current.lease_id)
+    }
+
     pub fn release(mut self) -> Result<(), StandaloneStoreError> {
         self.release_inner()
     }
@@ -898,6 +926,48 @@ permission = "write"
             persisted["manifest"]["manifest"]["feature"]["memory"]["profile"]["enabled"],
             false
         );
+    }
+
+    #[test]
+    fn lease_verification_is_read_only_and_rejects_replacement_or_changed_process_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let store = StandaloneWorkerStore::open(root.path().join("workers")).unwrap();
+        let allocation = store
+            .allocate(root.path(), StaleLeasePolicy::Reject)
+            .unwrap();
+        let lease = allocation.lease();
+        let original = fs::read(&lease.path).unwrap();
+        assert_eq!(lease.verify_current_id().unwrap(), lease.lease_id);
+        assert_eq!(fs::read(&lease.path).unwrap(), original);
+
+        let mut record: LeaseRecord = serde_json::from_slice(&original).unwrap();
+        record.lease_id = Uuid::now_v7();
+        let successor = serde_json::to_vec(&record).unwrap();
+        fs::write(&lease.path, &successor).unwrap();
+        assert!(matches!(
+            lease.verify_current_id(),
+            Err(StandaloneStoreError::LeaseOwnershipLost)
+        ));
+        assert_eq!(fs::read(&lease.path).unwrap(), successor);
+
+        record.lease_id = lease.lease_id;
+        record.pid = std::process::id().wrapping_add(1);
+        fs::write(&lease.path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(matches!(
+            lease.verify_current_id(),
+            Err(StandaloneStoreError::LeaseOwnershipLost)
+        ));
+        record.pid = std::process::id();
+        record.process_start_marker = record
+            .process_start_marker
+            .map(|marker| marker.wrapping_add(1));
+        fs::write(&lease.path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(matches!(
+            lease.verify_current_id(),
+            Err(StandaloneStoreError::LeaseOwnershipLost)
+        ));
+        fs::write(&lease.path, original).unwrap();
+        assert_eq!(lease.verify_current_id().unwrap(), lease.lease_id);
     }
 
     #[test]

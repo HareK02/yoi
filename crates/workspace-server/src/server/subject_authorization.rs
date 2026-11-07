@@ -16,131 +16,818 @@
 use super::*;
 use server_api::authorization::{
     OperationAuthorizationRequest, PermissionResource, ScopedPermission, SubjectPermissions,
-    WorkerDelegationRequest, WorkerExecutionGrant,
+    WorkerDelegationRequest, WorkerExecutionGrant, canonical_worker_operation,
 };
 use std::collections::BTreeSet;
+
+/// Policy representation is chosen by the adopted authority, never by whether a
+/// legacy read happens to succeed. An empty/missing canonical policy stays empty.
+enum CurrentSubjectPolicy {
+    Legacy(SubjectPermissions),
+    Canonical(server_api::authorization::CurrentSubjectPolicy),
+}
+
+impl CurrentSubjectPolicy {
+    fn change_id(&self) -> &str {
+        match self {
+            Self::Legacy(policy) => &policy.change_id,
+            Self::Canonical(policy) => &policy.change_id,
+        }
+    }
+
+    fn allows(
+        &self,
+        authority: &WorkerAuthorityView,
+        needed: &ScopedPermission,
+        delegation: bool,
+        subject_id: &str,
+    ) -> ApiResult<bool> {
+        self.allows_with(
+            authority,
+            needed,
+            delegation,
+            subject_id,
+            |operation, assignment| current_key_allowed(authority, operation, assignment),
+        )
+    }
+
+    fn allows_in_registry(
+        &self,
+        authority: &WorkerAuthorityView,
+        needed: &ScopedPermission,
+        delegation: bool,
+        subject_id: &str,
+        registry: &worker::feature::permissions::FeaturePermissionRegistry,
+    ) -> ApiResult<bool> {
+        self.allows_with(
+            authority,
+            needed,
+            delegation,
+            subject_id,
+            |operation, assignment| {
+                key_allowed_in_registry(authority, registry, operation, assignment)
+            },
+        )
+    }
+
+    fn allows_with(
+        &self,
+        authority: &WorkerAuthorityView,
+        needed: &ScopedPermission,
+        delegation: bool,
+        subject_id: &str,
+        key_allowed: impl Fn(
+            &str,
+            Option<&feature_permissions::PermissionAssignment>,
+        ) -> ApiResult<bool>,
+    ) -> ApiResult<bool> {
+        let constraints = match self {
+            Self::Legacy(policy) => {
+                if !key_allowed(&needed.operation, None)? {
+                    return Ok(false);
+                }
+                Some(policy)
+            }
+            Self::Canonical(policy) => {
+                let assignment = if delegation {
+                    &policy.delegation
+                } else {
+                    &policy.execution
+                };
+                if !key_allowed(&needed.operation, Some(assignment))? {
+                    return Ok(false);
+                }
+                if policy.legacy_constraints.is_none()
+                    && matches!(&needed.resource, PermissionResource::Subject { subject_id: requested, .. } if requested != subject_id)
+                {
+                    return Ok(false);
+                }
+                policy.legacy_constraints.as_ref()
+            }
+        };
+        let Some(constraints) = constraints else {
+            // The Feature key permits operation use. Its caller still owns the
+            // domain checks (assignment, provider scope, attempt/writer, CAS).
+            return Ok(true);
+        };
+        let lane = if delegation {
+            &constraints.delegation
+        } else {
+            &constraints.execution
+        };
+        for granted in lane {
+            if granted.validate().is_ok()
+                && canonical_worker_operation(&granted.operation).unwrap_or(&granted.operation)
+                    == canonical_worker_operation(&needed.operation).unwrap_or(&needed.operation)
+                && authority.resources_cover(&granted.resource, &needed.resource)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn legacy_read(&self, authority: &WorkerAuthorityView) -> ApiResult<SubjectPermissions> {
+        match self {
+            Self::Legacy(policy) => {
+                let filter = |lane: &[ScopedPermission]| -> ApiResult<Vec<ScopedPermission>> {
+                    let mut output = Vec::new();
+                    for permission in lane {
+                        if current_key_allowed(authority, &permission.operation, None)? {
+                            output.push(permission.clone());
+                        }
+                    }
+                    Ok(output)
+                };
+                Ok(SubjectPermissions {
+                    change_id: policy.change_id.clone(),
+                    execution: filter(&policy.execution)?,
+                    delegation: filter(&policy.delegation)?,
+                })
+            }
+            Self::Canonical(policy) => {
+                authority.refresh_permission_registry()?;
+                let registry = authority.permission_registry.read().map_err(|_| {
+                    Error::Config("current Feature permission registry is unavailable".into())
+                })?;
+                let filter = |assignment: &feature_permissions::PermissionAssignment,
+                              constraints: &[ScopedPermission]|
+                 -> ApiResult<Vec<ScopedPermission>> {
+                    let resolved = registry.host().resolve(Some(assignment));
+                    let mut represented = BTreeSet::new();
+                    let mut output = Vec::new();
+                    for permission in constraints {
+                        let operation = canonical_worker_operation(&permission.operation)
+                            .unwrap_or(&permission.operation);
+                        if let Ok(key) = feature_permissions::PermissionKey::parse(operation) {
+                            if resolved.projection().allowed.contains_key(&key) {
+                                represented.insert(key);
+                                output.push(permission.clone());
+                            }
+                        }
+                    }
+                    if resolved
+                        .projection()
+                        .allowed
+                        .keys()
+                        .any(|key| !represented.contains(key))
+                    {
+                        return Err(denied(
+                            "current key policy requires the per-operation consumer; no legacy all-target fallback is available",
+                        ));
+                    }
+                    Ok(output)
+                };
+                let constraints = policy.legacy_constraints.as_ref();
+                Ok(SubjectPermissions {
+                    change_id: policy.change_id.clone(),
+                    execution: filter(
+                        &policy.execution,
+                        constraints
+                            .map(|policy| policy.execution.as_slice())
+                            .unwrap_or_default(),
+                    )?,
+                    delegation: filter(
+                        &policy.delegation,
+                        constraints
+                            .map(|policy| policy.delegation.as_slice())
+                            .unwrap_or_default(),
+                    )?,
+                })
+            }
+        }
+    }
+}
+
+/// Legacy vectors keep exact domain limits but cannot keep a removed/disabled
+/// Feature key alive. Scalar activation names remain the legacy-only exception
+/// (including MCP); they never imply any dotted operation.
+fn current_key_allowed(
+    authority: &WorkerAuthorityView,
+    operation: &str,
+    assignment: Option<&feature_permissions::PermissionAssignment>,
+) -> ApiResult<bool> {
+    let operation = canonical_worker_operation(operation).unwrap_or(operation);
+    if !operation.contains('.') {
+        return Ok(assignment.is_none());
+    }
+    authority.refresh_permission_registry()?;
+    let registry = authority
+        .permission_registry
+        .read()
+        .map_err(|_| Error::Config("current Feature permission registry is unavailable".into()))?;
+    key_allowed_in_registry(authority, &registry, operation, assignment)
+}
+
+fn key_allowed_in_registry(
+    authority: &WorkerAuthorityView,
+    registry: &worker::feature::permissions::FeaturePermissionRegistry,
+    operation: &str,
+    assignment: Option<&feature_permissions::PermissionAssignment>,
+) -> ApiResult<bool> {
+    let operation = canonical_worker_operation(operation).unwrap_or(operation);
+    if !operation.contains('.') {
+        return Ok(assignment.is_none());
+    }
+    let key = feature_permissions::PermissionKey::parse(operation).map_err(Error::InvalidInput)?;
+    let catalog = registry.host().catalog();
+    if catalog.workspace.as_str() != authority.workspace_id {
+        return Err(denied(
+            "Feature permission registry belongs to another Workspace",
+        ));
+    }
+    let namespace_id = key.namespace();
+    let Some(owner) = catalog
+        .namespaces
+        .iter()
+        .find(|entry| entry.namespace == namespace_id)
+    else {
+        return Ok(false);
+    };
+    // Trusted registration metadata chooses the callee owner, never wire claims.
+    let feature = worker::feature::FeatureId::new(owner.feature.as_str())
+        .map_err(|error| denied(error.to_string()))?;
+    let Some(namespace) = registry.namespace_handle(&feature, &namespace_id) else {
+        return Ok(false);
+    };
+    let exact = feature_permissions::PermissionAssignment {
+        grants: vec![feature_permissions::PermissionReference::Namespace(
+            feature_permissions::NamespacePermissions {
+                namespace: namespace_id,
+                keys: vec![key.clone()],
+            },
+        )],
+        ..Default::default()
+    };
+    let resolved = registry.host().resolve(Some(assignment.unwrap_or(&exact)));
+    registry
+        .host()
+        .allows(namespace, &resolved, &key)
+        .map_err(|error| Error::Config(error.to_string()).into())
+}
 
 fn denied(message: impl Into<String>) -> ApiError {
     Error::WorkspacePermissionDenied(message.into()).into()
 }
 
-fn policy(api: &WorkspaceApi, subject_id: &str) -> ApiResult<Option<SubjectPermissions>> {
-    let store = open_subjektiv_store(api)?;
-    let subject = store
-        .subject(subject_id)
-        .map_err(subjektiv_store_error)?
-        .ok_or_else(|| denied("Subject permission source no longer exists"))?;
-    if subject.state != crate::subjektiv::SubjectState::Active {
-        return Err(denied("Subject permission source is retired"));
+/// Minimal shared authority for Worker control and removal. In particular this
+/// must not retain WorkspaceApi or Runtime: the embedded removal dispatcher is
+/// itself owned by Runtime. Policy, lineage and body ownership keep one checker.
+#[derive(Clone)]
+pub(super) struct WorkerAuthorityView {
+    workspace_id: String,
+    store: Arc<dyn ControlPlaneStore>,
+    config_store: Arc<crate::SqliteWorkspaceStore>,
+    feature_storage: crate::WorkspaceFeatureStorage,
+    subjektiv_registration: crate::RegisteredFeature,
+    plugin_artifact_root: PathBuf,
+    subject_authority_store: Option<crate::subjektiv::SubjektivStore>,
+    permission_registry:
+        Arc<std::sync::RwLock<worker::feature::permissions::FeaturePermissionRegistry>>,
+}
+
+impl From<&WorkspaceApi> for WorkerAuthorityView {
+    fn from(api: &WorkspaceApi) -> Self {
+        Self {
+            workspace_id: api.workspace_id().into(),
+            store: api.store.clone(),
+            config_store: api.config_store.clone(),
+            feature_storage: api.feature_storage.clone(),
+            subjektiv_registration: api.subjektiv_registration.clone(),
+            plugin_artifact_root: ServerConfig::server_data_root_for_data_dir(
+                &api.config.data_root,
+            )
+            .join("plugin-artifacts"),
+            permission_registry: api.permission_registry.clone(),
+            subject_authority_store: api.subject_authority_store.clone(),
+        }
     }
-    Ok(store
-        .subject_permissions(subject_id)
-        .map_err(subjektiv_store_error)?)
+}
+
+impl WorkerAuthorityView {
+    fn refresh_permission_registry(&self) -> ApiResult<()> {
+        let mut registry = self.permission_registry.write().map_err(|_| {
+            Error::Config("current Feature permission registry is unavailable".into())
+        })?;
+        self.config_store.sync_plugin_permission_registry(
+            &self.plugin_artifact_root,
+            &self.workspace_id,
+            &mut registry,
+        )?;
+        Ok(())
+    }
+
+    fn subject_store(&self) -> ApiResult<crate::subjektiv::SubjektivStore> {
+        if let Some(reader) = &self.subject_authority_store {
+            return Ok(reader.clone());
+        }
+        crate::subjektiv::SubjektivStore::open(&self.feature_storage, &self.subjektiv_registration)
+            .map_err(|error| subjektiv_store_error(error).into())
+    }
+
+    fn require_not_deleted(&self, worker: &RuntimeWorkerRef) -> ApiResult<()> {
+        let deleting = self.config_store.with_conn(|connection| {
+            Ok(connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM subject_deletion_workers WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3)",
+                rusqlite::params![self.workspace_id, worker.runtime_id, worker.worker_id],
+                |row| row.get::<_, bool>(0),
+            )?)
+        })?;
+        if deleting
+            || self
+                .subject_store()?
+                .worker_subject_deleted(&worker.runtime_id, &worker.worker_id)
+                .map_err(subjektiv_store_error)?
+        {
+            return Err(denied("Worker belonged to an explicitly deleted Subject"));
+        }
+        Ok(())
+    }
+
+    fn policy(&self, subject_id: &str) -> ApiResult<Option<CurrentSubjectPolicy>> {
+        let store = self.subject_store()?;
+        let subject = store
+            .subject(subject_id)
+            .map_err(subjektiv_store_error)?
+            .ok_or_else(|| denied("Subject permission source no longer exists"))?;
+        if subject.state != crate::subjektiv::SubjectState::Active {
+            return Err(denied("Subject permission source is retired"));
+        }
+        let canonical = self.config_store.with_conn(|connection| {
+            crate::config_adoption::canonical(connection, &self.workspace_id)
+        })?;
+        if canonical {
+            return Ok(self
+                .config_store
+                .adopted_subject_policy(&self.workspace_id, subject_id)?
+                .map(|policy| {
+                    CurrentSubjectPolicy::Canonical(
+                        server_api::authorization::CurrentSubjectPolicy {
+                            change_id: policy.change_id,
+                            execution: policy.source.execution.assignment(),
+                            delegation: policy.source.delegation.assignment(),
+                            legacy_constraints: policy.legacy_constraints,
+                        },
+                    )
+                }));
+        }
+        Ok(store
+            .subject_policy_source(subject_id)
+            .map_err(subjektiv_store_error)?
+            .map(|source| match source {
+                server_api::authorization::SubjectPolicySource::Legacy(policy) => {
+                    CurrentSubjectPolicy::Legacy(policy)
+                }
+                server_api::authorization::SubjectPolicySource::Feature(policy) => {
+                    CurrentSubjectPolicy::Canonical(policy)
+                }
+            }))
+    }
+
+    fn resources_cover(
+        &self,
+        granted: &PermissionResource,
+        requested: &PermissionResource,
+    ) -> ApiResult<bool> {
+        resources_cover_store(self.store.as_ref(), granted, requested)
+    }
+
+    fn current_body_subject(&self, worker: &RuntimeWorkerRef) -> ApiResult<Option<String>> {
+        let retained = self
+            .store
+            .retained_worker_singleton_lease(&self.workspace_id, worker)?;
+        let Some(retained) = retained else {
+            return Ok(None);
+        };
+        let Some(subject) = retained.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) else {
+            return Ok(None);
+        };
+        // This also rejects a retained lease from a released/replaced body. Never
+        // fall through to non-Subject compatibility after ownership has ended.
+        let current = self
+            .store
+            .require_current_worker_singleton_owner(&self.workspace_id, worker)?
+            .ok_or_else(|| denied("Subject body no longer owns its singleton"))?;
+        if current.key != retained.key {
+            return Err(denied("Subject body ownership changed"));
+        }
+        Ok(Some(subject.to_owned()))
+    }
+
+    fn live_child_grant(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> ApiResult<Option<WorkerExecutionGrant>> {
+        let store = self.subject_store()?;
+        let Some(grant) = store
+            .worker_execution_grant(&worker.runtime_id, &worker.worker_id)
+            .map_err(subjektiv_store_error)?
+        else {
+            return Ok(None);
+        };
+        let source = self
+            .policy(&grant.subject_id)?
+            .ok_or_else(|| denied("Subject permissions are unset"))?;
+        if source.change_id() != grant.source_change_id {
+            return Err(denied(
+                "delegated execution grant was revoked by permission replacement",
+            ));
+        }
+        let mut current = grant.clone();
+        let mut visited = HashSet::new();
+        for _ in 0..64 {
+            if !visited.insert((current.runtime_id.clone(), current.worker_id.clone())) {
+                return Err(denied("cyclic execution grant lineage"));
+            }
+            if current.subject_id != grant.subject_id
+                || current.source_change_id != source.change_id()
+            {
+                return Err(denied("delegated execution source changed"));
+            }
+            for permission in current
+                .permissions
+                .iter()
+                .chain(current.redelegation.iter())
+            {
+                if !source.allows(self, permission, true, &grant.subject_id)? {
+                    return Err(denied(
+                        "delegated execution exceeds the current Subject ceiling",
+                    ));
+                }
+            }
+            let origin =
+                RuntimeWorkerRef::new(&current.origin_runtime_id, &current.origin_worker_id);
+            match store
+                .worker_execution_grant(&origin.runtime_id, &origin.worker_id)
+                .map_err(subjektiv_store_error)?
+            {
+                Some(parent) => {
+                    if current
+                        .permissions
+                        .iter()
+                        .chain(current.redelegation.iter())
+                        .any(|permission| {
+                            !parent
+                                .redelegation
+                                .iter()
+                                .any(|ceiling| ceiling.covers(permission))
+                        })
+                    {
+                        return Err(denied(
+                            "execution grant exceeds its immediate parent's redelegation ceiling",
+                        ));
+                    }
+                    current = parent;
+                }
+                None => {
+                    if self.current_body_subject(&origin)?.as_deref()
+                        != Some(grant.subject_id.as_str())
+                    {
+                        return Err(denied(
+                            "delegation origin is no longer the current Subject body",
+                        ));
+                    }
+                    return Ok(Some(grant));
+                }
+            }
+        }
+        Err(denied(
+            "execution grant lineage exceeds the bounded delegation depth",
+        ))
+    }
+
+    fn subject_permissions(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> ApiResult<Option<Vec<ScopedPermission>>> {
+        if let Some(grant) = self.live_child_grant(worker)? {
+            return Ok(Some(grant.permissions));
+        }
+        let Some(subject) = self.current_body_subject(worker)? else {
+            return Ok(None);
+        };
+        Ok(Some(match self.policy(&subject)? {
+            Some(policy) => policy.legacy_read(self)?.execution,
+            None => Vec::new(),
+        }))
+    }
+
+    /// Saved individual-Worker permissions remain unchanged. Their canonical
+    /// projection authorizes operation use only; without an explicit current
+    /// WorkerOperation capability, the original exact target still restricts
+    /// Backend control. Neither covers nor delegation ceilings are widened.
+    fn authorize_control_use(
+        &self,
+        controller: &RuntimeWorkerRef,
+        target: &RuntimeWorkerRef,
+        permission: &str,
+    ) -> ApiResult<()> {
+        self.require_not_deleted(controller)?;
+        if self
+            .store
+            .worker_registry_projection(&self.workspace_id, controller)?
+            .is_some_and(|record| record.job.is_some())
+        {
+            return Err(denied("Job domain grants do not authorize Worker control"));
+        }
+        let operation = if permission == "notify" {
+            "worker.messaging".to_owned()
+        } else {
+            format!("worker.{permission}")
+        };
+        let requested = ScopedPermission {
+            operation: operation.clone(),
+            resource: PermissionResource::WorkerOperation {
+                workspace_id: self.workspace_id.clone(),
+            },
+        };
+        let permissions = if let Some(grant) = self.live_child_grant(controller)? {
+            grant.permissions
+        } else if let Some(subject) = self.current_body_subject(controller)? {
+            if let Some(policy) = self.policy(&subject)? {
+                if policy.allows(self, &requested, false, &subject)?
+                    || policy.allows(
+                        self,
+                        &ScopedPermission {
+                            operation: operation.clone(),
+                            resource: PermissionResource::Worker {
+                                runtime_id: target.runtime_id.clone(),
+                                worker_id: target.worker_id.clone(),
+                            },
+                        },
+                        false,
+                        &subject,
+                    )?
+                {
+                    return Ok(());
+                }
+            }
+            return Err(denied(format!(
+                "Worker operation {operation} is not granted for this target"
+            )));
+        } else {
+            return Ok(()); // Preserve ordinary Workers' existing Backend contract.
+        };
+        if permissions.iter().any(|granted| granted.covers(&requested)) {
+            return Ok(());
+        }
+        if permissions.iter().any(|granted| {
+            granted.validate().is_ok()
+                && canonical_worker_operation(&granted.operation) == Some(operation.as_str())
+                && matches!(&granted.resource, PermissionResource::Worker { runtime_id, worker_id }
+                    if runtime_id == &target.runtime_id && worker_id == &target.worker_id)
+        }) {
+            return Ok(());
+        }
+        Err(denied(format!(
+            "Worker operation {operation} is not granted for this target"
+        )))
+    }
+
+    pub(super) fn authorize_control_permission(
+        &self,
+        controller: &RuntimeWorkerRef,
+        target: &RuntimeWorkerRef,
+        permission: &str,
+    ) -> Result<WorkerControlGrantRecord> {
+        self.authorize_control_use(controller, target, permission)
+            .map_err(|error| error.error)?;
+        let grant = self
+            .store
+            .get_active_worker_control_grant(&self.workspace_id, controller, target)?
+            .ok_or_else(|| Error::UnknownWorker {
+                worker: target.clone(),
+            })?;
+        if !grant
+            .permissions
+            .iter()
+            .any(|candidate| candidate == permission)
+        {
+            return Err(Error::InvalidInput(format!(
+                "worker control permission {permission} was not granted"
+            )));
+        }
+        Ok(grant)
+    }
+}
+
+fn policy(api: &WorkspaceApi, subject_id: &str) -> ApiResult<Option<CurrentSubjectPolicy>> {
+    WorkerAuthorityView::from(api).policy(subject_id)
 }
 
 fn current_body_subject(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<Option<String>> {
-    let retained = api
-        .store
-        .retained_worker_singleton_lease(&api.config.workspace_id, worker)?;
-    let Some(retained) = retained else {
-        return Ok(None);
-    };
-    let Some(subject) = retained.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX) else {
-        return Ok(None);
-    };
-    // This also rejects a retained lease from a released/replaced body. Never
-    // fall through to non-Subject compatibility after ownership has ended.
-    let current = api
-        .store
-        .require_current_worker_singleton_owner(&api.config.workspace_id, worker)?
-        .ok_or_else(|| denied("Subject body no longer owns its singleton"))?;
-    if current.key != retained.key {
-        return Err(denied("Subject body ownership changed"));
-    }
-    Ok(Some(subject.to_owned()))
+    WorkerAuthorityView::from(api).current_body_subject(worker)
 }
 
 fn live_child_grant(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<Option<WorkerExecutionGrant>> {
-    let store = open_subjektiv_store(api)?;
-    let Some(grant) = store
-        .worker_execution_grant(&worker.runtime_id, &worker.worker_id)
-        .map_err(subjektiv_store_error)?
+    WorkerAuthorityView::from(api).live_child_grant(worker)
+}
+
+/// Job domain capabilities attenuate this policy; they are never non-Subject
+/// compatibility. A missing frozen origin cannot mint new operation permissions.
+fn job_permissions(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<Option<Vec<ScopedPermission>>> {
+    job_permissions_with_policy(api, worker, |subject| policy(api, subject), None)
+}
+
+fn job_permissions_with_policy(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    current_policy: impl FnOnce(&str) -> ApiResult<Option<CurrentSubjectPolicy>>,
+    registry: Option<&worker::feature::permissions::FeaturePermissionRegistry>,
+) -> ApiResult<Option<Vec<ScopedPermission>>> {
+    let Some(binding) = api
+        .store
+        .worker_registry_projection(api.workspace_id(), worker)?
+        .and_then(|projection| projection.job)
     else {
         return Ok(None);
     };
-    let source =
-        policy(api, &grant.subject_id)?.ok_or_else(|| denied("Subject permissions are unset"))?;
-    if source.change_id != grant.source_change_id {
-        return Err(denied(
-            "delegated execution grant was revoked by permission replacement",
-        ));
+    let job = api
+        .store
+        .get_backend_job(api.workspace_id(), &binding.job_id)?
+        .ok_or_else(|| denied("Job authorization binding has no intent"))?;
+    let subject_id = job
+        .request
+        .grants
+        .subjektiv_consolidation
+        .as_ref()
+        .map(|grant| &grant.subject_id)
+        .or_else(|| {
+            job.request
+                .grants
+                .subjektiv_journal
+                .as_ref()
+                .map(|grant| &grant.subject_id)
+        });
+    let Some(subject_id) = subject_id else {
+        // Generic Jobs have no Subject operation capability, even if their Profile
+        // exposes a protected Feature or their source owns a Subject body.
+        return Ok(Some(Vec::new()));
+    };
+    // This shared check validates current attempt, worker, input digest and deadline
+    // for both Job kinds, independently of its optional consolidation payload.
+    subjektiv_job::active_grant(api, api.workspace_id(), worker)?;
+    let origin = job
+        .request
+        .source_worker
+        .as_ref()
+        .ok_or_else(|| denied("saved Job has no frozen operation-authority origin"))?;
+    if current_body_subject(api, origin)?.as_deref() != Some(subject_id.as_str()) {
+        return Err(denied("Job origin is no longer the current Subject body"));
     }
-    let mut current = grant.clone();
-    let mut visited = HashSet::new();
-    for _ in 0..64 {
-        if !visited.insert((current.runtime_id.clone(), current.worker_id.clone())) {
-            return Err(denied("cyclic execution grant lineage"));
-        }
-        if current.subject_id != grant.subject_id
-            || current.source_change_id != source.change_id
-            || current
-                .permissions
-                .iter()
-                .chain(current.redelegation.iter())
-                .any(|permission| {
-                    !source
-                        .delegation
-                        .iter()
-                        .any(|ceiling| ceiling.covers(permission))
-                })
-        {
-            return Err(denied(
-                "delegated execution exceeds the current Subject ceiling",
-            ));
-        }
-        let origin = RuntimeWorkerRef::new(&current.origin_runtime_id, &current.origin_worker_id);
-        match store
-            .worker_execution_grant(&origin.runtime_id, &origin.worker_id)
-            .map_err(subjektiv_store_error)?
-        {
-            Some(parent) => {
-                if current
-                    .permissions
-                    .iter()
-                    .chain(current.redelegation.iter())
-                    .any(|permission| {
-                        !parent
-                            .redelegation
-                            .iter()
-                            .any(|ceiling| ceiling.covers(permission))
-                    })
-                {
-                    return Err(denied(
-                        "execution grant exceeds its immediate parent's redelegation ceiling",
-                    ));
-                }
-                current = parent;
+    let Some(policy) = current_policy(subject_id)? else {
+        return Ok(Some(Vec::new()));
+    };
+    // Domain grants are immutable capabilities, not policy snapshots. Resolve
+    // only this Job kind's operations against current policy, never a whole Set.
+    let operations: &[&str] = if job.request.grants.subjektiv_consolidation.is_some() {
+        &[
+            "memory.consolidation.supply",
+            "memory.staging.list",
+            "memory.staging.read",
+            "memory.read",
+            "memory.query",
+            "memory.resident.read",
+            "memory.resident.supply",
+            "memory.candidate.decide",
+            "memory.proposal.validate",
+            "memory.changes.list",
+            "memory.receipt.read",
+            "memory.surface.prepare",
+            "memory.surface.supply",
+            "memory.surface.publish",
+            "memory.surface.fail",
+        ]
+    } else {
+        &[
+            "journal.job.input.read",
+            "journal.job.input.supply",
+            "journal.state.read",
+            "journal.text.read",
+            "journal.operation.query",
+            "journal.operation.list",
+            "journal.operation.coverage.read",
+            "journal.entry.create",
+            "journal.entry.fix",
+            "journal.entry.rewrite",
+            "journal.position.update",
+            "journal.unchanged.confirm",
+            "journal.checkpoint",
+            "journal.finish",
+        ]
+    };
+    let authority = WorkerAuthorityView::from(api);
+    let mut permissions = Vec::new();
+    for operation in operations {
+        let permission = ScopedPermission {
+            operation: (*operation).into(),
+            resource: PermissionResource::Subject {
+                workspace_id: api.workspace_id().into(),
+                subject_id: subject_id.clone(),
+            },
+        };
+        if match registry {
+            Some(registry) => {
+                policy.allows_in_registry(&authority, &permission, false, subject_id, registry)?
             }
-            None => {
-                if current_body_subject(api, &origin)?.as_deref() != Some(grant.subject_id.as_str())
-                {
-                    return Err(denied(
-                        "delegation origin is no longer the current Subject body",
-                    ));
-                }
-                return Ok(Some(grant));
-            }
+            None => policy.allows(&authority, &permission, false, subject_id)?,
+        } {
+            permissions.push(permission);
         }
     }
-    Err(denied(
-        "execution grant lineage exceeds the bounded delegation depth",
-    ))
+    Ok(Some(permissions))
+}
+
+/// Resolve only Host-held Job identity; authorization still validates the live
+/// attempt, frozen origin and current policy before returning the resource.
+pub(super) fn job_subject(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<Option<String>> {
+    let Some(binding) = api
+        .store
+        .worker_registry_projection(api.workspace_id(), worker)?
+        .and_then(|projection| projection.job)
+    else {
+        return Ok(None);
+    };
+    let job = api
+        .store
+        .get_backend_job(api.workspace_id(), &binding.job_id)?
+        .ok_or_else(|| denied("Job authorization binding has no intent"))?;
+    Ok(job
+        .request
+        .grants
+        .subjektiv_consolidation
+        .map(|grant| grant.subject_id)
+        .or_else(|| {
+            job.request
+                .grants
+                .subjektiv_journal
+                .map(|grant| grant.subject_id)
+        }))
+}
+
+pub(super) fn authorize_job_input(
+    api: &WorkspaceApi,
+    request: &BackendJobRequest,
+) -> ApiResult<()> {
+    let binding = request
+        .grants
+        .subjektiv_consolidation
+        .as_ref()
+        .map(|grant| (&grant.subject_id, "memory.consolidation.supply"))
+        .or_else(|| {
+            request
+                .grants
+                .subjektiv_journal
+                .as_ref()
+                .map(|grant| (&grant.subject_id, "journal.job.input.supply"))
+        });
+    let Some((subject_id, operation)) = binding else {
+        return Ok(());
+    };
+    let origin = request
+        .source_worker
+        .as_ref()
+        .ok_or_else(|| denied("saved Job has no frozen operation-authority origin"))?;
+    if current_body_subject(api, origin)?.as_deref() != Some(subject_id.as_str()) {
+        return Err(denied("Job origin is no longer the current Subject body"));
+    }
+    authorize(
+        api,
+        origin,
+        &OperationAuthorizationRequest {
+            operation: operation.into(),
+            resource: PermissionResource::Subject {
+                workspace_id: api.workspace_id().into(),
+                subject_id: subject_id.clone(),
+            },
+        },
+    )
+}
+
+pub(super) fn has_subject_authority(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<bool> {
+    validate_worker(api, worker)?;
+    let authority = WorkerAuthorityView::from(api);
+    Ok(api
+        .store
+        .worker_registry_projection(api.workspace_id(), worker)?
+        .is_some_and(|projection| projection.job.is_some())
+        || authority.live_child_grant(worker)?.is_some()
+        || authority.current_body_subject(worker)?.is_some())
 }
 
 /// None is explicitly the preexisting non-Subject contract, not an all-powerful
@@ -149,17 +836,54 @@ pub(super) fn worker_permissions(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
 ) -> ApiResult<Option<Vec<ScopedPermission>>> {
-    if let Some(grant) = live_child_grant(api, worker)? {
-        return Ok(Some(grant.permissions));
+    let authority = WorkerAuthorityView::from(api);
+    authority.require_not_deleted(worker)?;
+    if let Some(permissions) = job_permissions(api, worker)? {
+        return Ok(Some(permissions));
     }
-    let Some(subject) = current_body_subject(api, worker)? else {
-        return Ok(None);
+    authority.subject_permissions(worker)
+}
+
+fn validate_worker(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> ApiResult<()> {
+    let authority = WorkerAuthorityView::from(api);
+    authority.require_not_deleted(worker)?;
+    if job_permissions(api, worker)?.is_none() && authority.live_child_grant(worker)?.is_none() {
+        if let Some(subject) = authority.current_body_subject(worker)? {
+            authority.policy(&subject)?;
+        }
+    }
+    Ok(())
+}
+
+/// Host-only identity shared by plan creation and live Plugin operations. The
+/// identity is an immutable ceiling, not a permission: recheck the live lineage
+/// on every use, including byte delivery and cache hits.
+pub(super) fn plugin_execution_identity(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+) -> ApiResult<crate::plugin_plan::HostExecutionIdentity> {
+    validate_worker(api, worker)?;
+    let (principal_id, delegation_id) = if let Some(grant) = live_child_grant(api, worker)? {
+        (
+            format!("subject:{}", grant.subject_id),
+            Some(grant.source_change_id),
+        )
+    } else if let Some(subject) = current_body_subject(api, worker)? {
+        (format!("subject:{subject}"), None)
+    } else if let Some(subject) = job_subject(api, worker)? {
+        (format!("subject:{subject}"), None)
+    } else {
+        (
+            format!("worker:{}/{}", worker.runtime_id, worker.worker_id),
+            None,
+        )
     };
-    Ok(Some(
-        policy(api, &subject)?
-            .map(|policy| policy.execution)
-            .unwrap_or_default(),
-    ))
+    Ok(crate::plugin_plan::HostExecutionIdentity {
+        runtime_id: worker.runtime_id.clone(),
+        worker_id: worker.worker_id.clone(),
+        principal_id,
+        delegation_id,
+    })
 }
 
 pub(super) fn authorize(
@@ -170,14 +894,192 @@ pub(super) fn authorize(
     authorize_scope(api, worker, request).map(|_| ())
 }
 
+fn resources_cover(
+    api: &WorkspaceApi,
+    granted: &PermissionResource,
+    requested: &PermissionResource,
+) -> ApiResult<bool> {
+    resources_cover_store(api.store.as_ref(), granted, requested)
+}
+
+fn resources_cover_store(
+    store: &dyn ControlPlaneStore,
+    granted: &PermissionResource,
+    requested: &PermissionResource,
+) -> ApiResult<bool> {
+    if granted.covers(requested) {
+        return Ok(true);
+    }
+    let (workspace_id, granted_id, requested_id, kind) = match (granted, requested) {
+        (
+            PermissionResource::Ticket {
+                workspace_id: a,
+                ticket_id: ai,
+            },
+            PermissionResource::Ticket {
+                workspace_id: b,
+                ticket_id: bi,
+            },
+        ) if a == b => (a, ai, bi, WorkspaceResourceKind::Ticket),
+        (
+            PermissionResource::Objective {
+                workspace_id: a,
+                objective_id: ai,
+            },
+            PermissionResource::Objective {
+                workspace_id: b,
+                objective_id: bi,
+            },
+        ) if a == b => (a, ai, bi, WorkspaceResourceKind::Objective),
+        _ => return Ok(false),
+    };
+    // Resolve public aliases using identity metadata only. Never fetch Ticket,
+    // Objective or MR bodies to answer an authorization query. Missing aliases
+    // and unrelated resources have the same refusal.
+    let granted_id = store.resolve_resource_reference(workspace_id, kind, granted_id)?;
+    let requested_id = store.resolve_resource_reference(workspace_id, kind, requested_id)?;
+    Ok(granted_id.is_some() && granted_id == requested_id)
+}
+
+// A frozen Ticket grant can name resources that do not exist until its Coder
+// runs. Derive only that currently assigned implementation's own children and
+// linked MRs, for the exact granted operation. This is not Workspace coverage,
+// a new grant, or permission for a former assignee to continue executing.
+fn ticket_execution_resource(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    granted: &ScopedPermission,
+    needed: &ScopedPermission,
+) -> ApiResult<bool> {
+    let PermissionResource::Ticket {
+        workspace_id,
+        ticket_id,
+    } = &granted.resource
+    else {
+        return Ok(false);
+    };
+    if workspace_id != api.workspace_id() || granted.operation != needed.operation {
+        return Ok(false);
+    }
+    let Some(ticket) = api.store.resolve_resource_reference(
+        workspace_id,
+        WorkspaceResourceKind::Ticket,
+        ticket_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    if api
+        .store
+        .get_current_ticket_worker_assignment(workspace_id, &ticket)?
+        .is_none_or(|assignment| assignment.worker != *worker)
+    {
+        return Ok(false);
+    }
+    let Some(grant) = open_subjektiv_store(api)?
+        .worker_execution_grant(&worker.runtime_id, &worker.worker_id)
+        .map_err(subjektiv_store_error)?
+    else {
+        return Ok(false);
+    };
+    let owns_ticket = api.store.list_current_ticket_assignment_tracking(workspace_id, &ticket)?.into_iter().any(|assignment| matches!(assignment.principal, ticket::TicketAssignmentPrincipalSnapshot::Subject { subject_id } if subject_id == grant.subject_id));
+    if !owns_ticket {
+        return Ok(false);
+    }
+    match (&needed.resource, needed.operation.as_str()) {
+        (PermissionResource::SubWorker { runtime_id, worker_id, .. }, "subworker.spawn" | "subworker.observe" | "subworker.send_input" | "subworker.stop") => Ok(runtime_id == &worker.runtime_id && worker_id == &worker.worker_id),
+        (PermissionResource::MergeRequest { workspace_id: requested, merge_request_id }, "merge_request.read" | "merge_request.readiness" | "merge_request.review") if requested == workspace_id => {
+            api.config_store.with_conn(|connection| {
+                Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations WHERE workspace_id=?1 AND ticket_id=?2 AND merge_request_id=?3)", rusqlite::params![workspace_id, ticket, merge_request_id], |row| row.get(0))?)
+            }).map_err(Into::into)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(super) struct MergeCompletionSubject {
+    subject: String,
+    lease: crate::store::WorkerSingletonLease,
+    assignment_id: String,
+}
+
+pub(super) fn merge_completion_subject(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    ticket: &str,
+) -> ApiResult<MergeCompletionSubject> {
+    let subject = current_assignment_subject_source(api, worker)?;
+    let lease = api
+        .store
+        .require_current_worker_singleton_owner(api.workspace_id(), worker)?
+        .ok_or_else(|| denied("MR completion requires the current Subject body"))?;
+    let assignment = api.store.list_current_ticket_assignment_tracking(api.workspace_id(), ticket)?
+        .into_iter().find(|row| matches!(&row.principal, ticket::TicketAssignmentPrincipalSnapshot::Subject { subject_id } if subject_id == &subject))
+        .ok_or_else(|| denied("MR completion requires the Ticket assigned Subject"))?;
+    Ok(MergeCompletionSubject {
+        subject,
+        lease,
+        assignment_id: assignment.assignment_id,
+    })
+}
+
+impl MergeCompletionSubject {
+    pub(super) fn complete(
+        &self,
+        api: &WorkspaceApi,
+        source: &server_api::ServerRuntimeSource,
+        store: &merge_request::MergeRequestStore,
+        completion: merge_request::CompleteMergeRequest,
+    ) -> ApiResult<merge_request::MergeEvent> {
+        let gate = subjektiv_journal::lifecycle_lock(api, &self.subject)?;
+        let _gate = gate
+            .lock()
+            .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
+        let authority = WorkerAuthorityView::from(api);
+        authority.refresh_permission_registry()?;
+        let feature = open_subjektiv_store(api)?;
+        feature.with_chat_transaction(&self.subject, |native| {
+            Ok((|| -> ApiResult<_> {
+                let registry = api.permission_registry.read().map_err(|_| Error::Config("current Feature registry unavailable".into()))?;
+                let needed = ScopedPermission {
+                    operation: "merge_request.complete".into(),
+                    resource: PermissionResource::MergeRequest { workspace_id: api.workspace_id().into(), merge_request_id: completion.merge_request_id.clone() },
+                };
+                let admit = |connection: &rusqlite::Connection| -> std::result::Result<(), merge_request::MergeRequestError> {
+                    let check = || -> ApiResult<()> {
+                        let policy = crate::SqliteWorkspaceStore::subject_body_policy_on_connection(
+                            connection, api.workspace_id(), &self.subject, &self.lease, native.policy_source(), source,
+                        )?;
+                        let current: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role='orchestrator' AND assignment_id=?3 AND principal_kind='subject' AND principal_id=?4)",
+                            rusqlite::params![api.workspace_id(), completion.ticket_id, self.assignment_id, self.subject], |row| row.get(0),
+                        ).map_err(Error::from)?;
+                        if !current { return Err(denied("Ticket assigned Subject changed before MR completion")); }
+                        let policy = match policy {
+                            server_api::authorization::SubjectPolicySource::Legacy(value) => CurrentSubjectPolicy::Legacy(value),
+                            server_api::authorization::SubjectPolicySource::Feature(value) => CurrentSubjectPolicy::Canonical(value),
+                        };
+                        if !policy.allows_in_registry(&authority, &needed, false, &self.subject, &registry)? {
+                            return Err(denied("Current Subject policy denies MR completion"));
+                        }
+                        Ok(())
+                    };
+                    check().map_err(|error| merge_request::MergeRequestError::Unauthorized(error.error.to_string()))
+                };
+                store.complete_with_admission(completion.clone(), admit).map_err(Error::from).map_err(Into::into)
+            })())
+        }).map_err(chat::domain)?
+    }
+}
+
 pub(super) fn authorize_scope(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
     request: &OperationAuthorizationRequest,
 ) -> ApiResult<Option<PermissionResource>> {
     request.validate().map_err(denied)?;
-    if let PermissionResource::Workspace { workspace_id } = &request.resource {
-        if workspace_id != &api.config.workspace_id {
+    if let Some(workspace_id) = request.resource.workspace_id() {
+        if workspace_id != api.config.workspace_id {
             return Err(denied("resource belongs to another Workspace"));
         }
     }
@@ -185,14 +1087,73 @@ pub(super) fn authorize_scope(
         operation: request.operation.clone(),
         resource: request.resource.clone(),
     };
-    let Some(permissions) = worker_permissions(api, worker)? else {
+    let authority = WorkerAuthorityView::from(api);
+    authority.require_not_deleted(worker)?;
+    let permissions = if let Some(permissions) = job_permissions(api, worker)? {
+        permissions
+    } else if let Some(grant) = authority.live_child_grant(worker)? {
+        grant.permissions
+    } else if let Some(subject) = authority.current_body_subject(worker)? {
+        let Some(policy) = authority.policy(&subject)? else {
+            return Err(denied("Subject permissions are unset"));
+        };
+        if matches!(policy, CurrentSubjectPolicy::Canonical(_)) {
+            if policy.allows(&authority, &needed, false, &subject)? {
+                // A key does not issue a broader resource capability. Return the
+                // concrete operation context, leaving domain/provider checks intact.
+                return Ok(Some(needed.resource));
+            }
+            if matches!(&needed.resource, PermissionResource::WorkerOperation { .. }) {
+                if let CurrentSubjectPolicy::Canonical(ref canonical) = policy {
+                    if let Some(constraints) = &canonical.legacy_constraints {
+                        for permission in &constraints.execution {
+                            if canonical_worker_operation(&permission.operation)
+                                == Some(needed.operation.as_str())
+                                && matches!(permission.resource, PermissionResource::Worker { .. })
+                                && policy.allows(&authority, permission, false, &subject)?
+                            {
+                                return Ok(Some(needed.resource));
+                            }
+                        }
+                    }
+                }
+            }
+            return Err(denied(format!(
+                "operation `{}` is not granted for the requested resource",
+                request.operation
+            )));
+        }
+        policy.legacy_read(&authority)?.execution
+    } else {
         return Ok(None);
     };
-    if let Some(permission) = permissions
-        .iter()
-        .find(|permission| permission.covers(&needed))
+    // Read-only migration of saved target-scoped permissions. Do not mutate the
+    // assignment/grant or use this projection for delegation; Backend separately
+    // checks the original exact target at every control effect.
+    if matches!(&needed.resource, PermissionResource::WorkerOperation { workspace_id }
+        if workspace_id == api.workspace_id())
+        && permissions.iter().any(|permission| {
+            permission.validate().is_ok()
+                && canonical_worker_operation(&permission.operation)
+                    == Some(needed.operation.as_str())
+                && matches!(permission.resource, PermissionResource::Worker { .. })
+        })
     {
-        return Ok(Some(permission.resource.clone()));
+        return Ok(Some(needed.resource));
+    }
+    for permission in &permissions {
+        if permission.operation == needed.operation
+            && (resources_cover(api, &permission.resource, &needed.resource)?
+                || ticket_execution_resource(api, worker, permission, &needed)?)
+        {
+            return Ok(Some(if permission.resource.covers(&needed.resource) {
+                permission.resource.clone()
+            } else {
+                // Alias resolution proved exact identity; return the spelling the
+                // caller requested rather than a scope it cannot lexically match.
+                needed.resource.clone()
+            }));
+        }
     }
     Err(denied(format!(
         "operation `{}` is not granted for the requested resource",
@@ -226,6 +1187,8 @@ pub(super) fn prepare_delegation(
     singleton_key: Option<&str>,
     subject_connection: bool,
 ) -> ApiResult<Option<WorkerExecutionGrant>> {
+    // A deleted grant must never become an ordinary non-Subject delegation source.
+    validate_worker(api, source)?;
     let child = live_child_grant(api, source)?;
     let body = if child.is_none() {
         current_body_subject(api, source)?
@@ -249,13 +1212,17 @@ pub(super) fn prepare_delegation(
         denied("Subject delegation requires explicit least-authority permissions")
     })?;
     requested.validate().map_err(denied)?;
+    enum Ceiling {
+        Scoped(Vec<ScopedPermission>),
+        Subject(CurrentSubjectPolicy),
+    }
     let (subject_id, origin_runtime_id, origin_worker_id, source_change_id, ceiling) = match child {
         Some(grant) => (
             grant.subject_id,
             source.runtime_id.clone(),
             source.worker_id.clone(),
             grant.source_change_id,
-            grant.redelegation,
+            Ceiling::Scoped(grant.redelegation),
         ),
         None => {
             let subject = body.expect("checked Subject body");
@@ -268,20 +1235,26 @@ pub(super) fn prepare_delegation(
                 subject,
                 source.runtime_id.clone(),
                 source.worker_id.clone(),
-                source_policy.change_id,
-                source_policy.delegation,
+                source_policy.change_id().to_owned(),
+                Ceiling::Subject(source_policy),
             )
         }
     };
-    if requested
+    let authority = WorkerAuthorityView::from(api);
+    for permission in requested
         .permissions
         .iter()
         .chain(requested.redelegation.iter())
-        .any(|permission| !ceiling.iter().any(|allowed| allowed.covers(permission)))
     {
-        return Err(denied(
-            "requested delegation exceeds explicit operations, resources or redelegation ceiling",
-        ));
+        let allowed = match &ceiling {
+            Ceiling::Scoped(ceiling) => ceiling.iter().any(|allowed| allowed.covers(permission)),
+            Ceiling::Subject(policy) => policy.allows(&authority, permission, true, &subject_id)?,
+        };
+        if !allowed {
+            return Err(denied(
+                "requested delegation exceeds explicit operations, resources or redelegation ceiling",
+            ));
+        }
     }
     if requested.redelegation.iter().any(|permission| {
         !requested
@@ -307,16 +1280,127 @@ pub(super) fn prepare_delegation(
     }))
 }
 
+pub(super) fn revalidate_execution_grant(
+    api: &WorkspaceApi,
+    grant: &WorkerExecutionGrant,
+) -> ApiResult<()> {
+    let origin = RuntimeWorkerRef::new(&grant.origin_runtime_id, &grant.origin_worker_id);
+    let requested = WorkerDelegationRequest {
+        permissions: grant.permissions.clone(),
+        redelegation: grant.redelegation.clone(),
+    };
+    let mut current = prepare_delegation(
+        api,
+        &origin,
+        Some(&requested),
+        &grant.runtime_id,
+        &grant.profile,
+        &grant.profile_digest,
+        None,
+        false,
+    )?
+    .ok_or_else(|| denied("execution grant origin lost its Subject authority"))?;
+    current.worker_id = grant.worker_id.clone();
+    if &current != grant {
+        return Err(denied(
+            "execution grant source or immutable delegation changed before use",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn bind_reserved_grant(
     api: &WorkspaceApi,
     grant: &WorkerExecutionGrant,
     worker_id: &str,
 ) -> ApiResult<()> {
+    bind_reserved_grant_observed(api, grant, worker_id, || {})
+}
+
+fn bind_reserved_grant_observed(
+    api: &WorkspaceApi,
+    grant: &WorkerExecutionGrant,
+    worker_id: &str,
+    before_feature: impl FnOnce(),
+) -> ApiResult<()> {
     let mut bound = grant.clone();
     bound.worker_id = worker_id.to_owned();
-    Ok(open_subjektiv_store(api)?
-        .bind_worker_execution_grant(&bound)
-        .map_err(subjektiv_store_error)?)
+    revalidate_execution_grant(api, &bound)?;
+    let store = open_subjektiv_store(api)?;
+    before_feature();
+    store
+        .bind_worker_execution_grant_with_host_lease(&bound, || {
+            // The Feature owner has acquired its actual connection/IMMEDIATE
+            // transaction. Retain registry fencing through its COMMIT.
+            let registry = api.permission_registry.read().map_err(|_| {
+                subjektiv::SubjektivError::AuthorizationDenied(
+                    "current Feature permission registry is unavailable".into(),
+                )
+            })?;
+            let host = registry.host().clone();
+            Ok((registry, host))
+        })
+        .map_err(subjektiv_store_error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn bind_reserved_grant_before_feature(
+    api: &WorkspaceApi,
+    grant: &WorkerExecutionGrant,
+    worker_id: &str,
+    observe: impl FnOnce(),
+) -> ApiResult<()> {
+    bind_reserved_grant_observed(api, grant, worker_id, observe)
+}
+
+/// Persist only the confirmed execution delegation's reply direction, never an
+/// inferred inverse of an ordinary A -> B control grant. A reservation is not a
+/// Worker registry row: this runs after normal creation has committed that row.
+/// Initial Runtime execution may already have started; replies are unavailable
+/// until this write, and initial input is not queued or redispatched to hide that
+/// window. Spawn replay repairs a failed write under the same allocation identity
+/// without replacing the Worker or reissuing a revoked saved grant.
+pub(super) fn persist_reply_grant(
+    api: &WorkspaceApi,
+    controller: &RuntimeWorkerRef,
+    child: &RuntimeWorkerRef,
+    allocation_key: &str,
+) -> ApiResult<()> {
+    let authority = WorkerAuthorityView::from(api);
+    authority.require_not_deleted(child)?;
+    let Some(bound) = authority.live_child_grant(child)? else {
+        return Ok(()); // Ordinary Workers do not acquire reverse control.
+    };
+    let origin = RuntimeWorkerRef::new(&bound.origin_runtime_id, &bound.origin_worker_id);
+    if &origin != controller {
+        return Err(denied(
+            "reply grant origin does not match authenticated spawn source",
+        ));
+    }
+    if api
+        .store
+        .get_worker_registry(api.workspace_id(), child)?
+        .is_none()
+    {
+        return Err(denied(
+            "reply grant requires the committed Worker registry identity",
+        ));
+    }
+    api.store
+        .create_worker_control_grant(&WorkerControlGrantRecord {
+            workspace_id: api.workspace_id().into(),
+            grant_id: new_id("wcg"),
+            controller: child.clone(),
+            subject: origin,
+            relation: "reply".into(),
+            origin: "execution_grant".into(),
+            permissions: vec!["notify".into()],
+            operation_id: format!("worker-reply:{allocation_key}"),
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            revoked_at: None,
+        })?;
+    Ok(())
 }
 
 /// Host-owned binding for an already authenticated Backend operation. No model
@@ -442,6 +1526,7 @@ pub(super) async fn interrupt_subject_workers(
         let cancellation = match api.host_executors.host() {
             Ok(host) => host.run(move || -> ApiResult<_> {
                 Ok(cancellation_api.runtime.cancel_worker(&cancellation_worker, WorkerLifecycleRequest {
+                    stop_intent: None,
                     reason: Some("Subject permission assignment changed; new operations are fenced".into()), ticket_assignment: None,
                 }).map_err(RuntimeRegistryError::into_error)?)
             }).await,
@@ -463,6 +1548,8 @@ pub(super) async fn interrupt_subject_workers(
                 error.error
             )),
         }
+        let session_lock = current_worker_session_lock(api, &worker);
+        let _session_guard = session_lock.lock().await;
         match close_worker_workdir_sessions(&api.workdir_sessions, &worker).await {
             Ok(()) => evidence.backend_command_sessions_closed = true,
             Err(error) => evidence
@@ -472,6 +1559,52 @@ pub(super) async fn interrupt_subject_workers(
         results.push(evidence);
     }
     results
+}
+
+impl WorkspaceApi {
+    /// Trusted Host plan creation uses the same identity as live Plugin operations.
+    /// Principal and delegation are derived here, never accepted from public JSON.
+    pub async fn plugin_execution_identity(
+        &self,
+        worker: &RuntimeWorkerRef,
+    ) -> crate::Result<crate::plugin_plan::HostExecutionIdentity> {
+        self.store
+            .get_workspace_runtime_binding(self.workspace_id(), &worker.runtime_id)
+            .await?
+            .filter(|binding| binding.revoked_at.is_none())
+            .ok_or_else(|| {
+                Error::WorkspacePermissionDenied("Plugin Runtime trust revoked".into())
+            })?;
+        let api = self.clone();
+        let worker = worker.clone();
+        self.host_executors
+            .host()?
+            .run(move || {
+                let member = api.store.get_worker_registry(api.workspace_id(), &worker)?;
+                let reserved = api
+                    .store
+                    .has_active_worker_create_reservation(api.workspace_id(), &worker)?;
+                if member.is_none() && !reserved {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Plugin Worker is not registered".into(),
+                    ));
+                }
+                api.store
+                    .require_current_worker_singleton_owner(api.workspace_id(), &worker)?;
+                let summary = api.runtime.worker(&worker).map_err(|_| {
+                    Error::WorkspacePermissionDenied("Plugin Worker unavailable".into())
+                })?;
+                if summary.workspace.workspace_id.as_deref() != Some(api.workspace_id()) {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "foreign Plugin Worker".into(),
+                    ));
+                }
+                super::plugin_host::with_authority_database(&api, || {
+                    plugin_execution_identity(&api, &worker).map_err(|error| error.error)
+                })
+            })
+            .await
+    }
 }
 
 pub(super) fn administration_actor(
@@ -486,4 +1619,237 @@ pub(super) fn administration_actor(
         .actor
         .as_ref()
         .ok_or_else(|| denied("Subject permission administration requires an authenticated owner"))
+}
+
+struct SubjectEffectAuthority {
+    api: WorkspaceApi,
+    worker: RuntimeWorkerRef,
+    subject: String,
+    operation: String,
+    runtime_source: Option<server_api::ServerRuntimeSource>,
+    #[cfg(test)]
+    before_registry: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    after_reservation: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthority {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
+        let reject = |error: ApiError| match error.error {
+            Error::WorkspacePermissionDenied(message) | Error::RepositoryConflict(message) => {
+                subjektiv::SubjektivError::AuthorizationDenied(message)
+            }
+            error => subjektiv::SubjektivError::Storage(
+                feature_storage::FeatureStorageError::operation(error.to_string()),
+            ),
+        };
+        // Admission order: Feature DB -> catalog registry -> Host writer. Resolve
+        // through that already held transaction, never a recursive catalog writer.
+        #[cfg(test)]
+        if let Some(observe) = &self.before_registry {
+            observe();
+        }
+        #[cfg(test)]
+        if let Some(observe) = &self.api.subject_effect_admission_observer {
+            observe(&self.operation);
+        }
+        let mut registry = self.api.permission_registry.write().map_err(|_| {
+            subjektiv::SubjektivError::AuthorizationDenied("Feature registry is unavailable".into())
+        })?;
+        let catalog = Arc::new(
+            self.api
+                .config_store
+                .subject_authority_reader()
+                .map_err(|error| reject(error.into()))?,
+        );
+        #[cfg(test)]
+        if let Some(observe) = &self.after_reservation {
+            observe();
+        }
+        // All Host reads, including the canonical provider and nested Job/owner
+        // checks, must share the reserved connection rather than the ordinary one.
+        let mut api = self.api.clone();
+        api.config_store = catalog.clone();
+        api.store = catalog.clone();
+        let authority = WorkerAuthorityView::from(&api);
+        if let Some(source) = &self.runtime_source {
+            catalog
+                .with_conn(|connection| {
+                    crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                        connection,
+                        api.workspace_id(),
+                        source,
+                        &self.worker,
+                    )
+                })
+                .map_err(|error| reject(error.into()))?;
+        }
+        catalog
+            .with_conn(|connection| {
+                catalog.sync_plugin_permission_registry_in_connection(
+                    connection,
+                    &authority.plugin_artifact_root,
+                    api.workspace_id(),
+                    &mut registry,
+                )
+            })
+            .map_err(|error| reject(error.into()))?;
+        let source = admission
+            .current_policy_with_canonical_source(
+                &self.subject,
+                Arc::new(crate::config_adoption::CanonicalConfigurationSource {
+                    store: catalog.as_ref().clone(),
+                    host: registry.host().clone(),
+                }),
+            )?
+            .ok_or_else(|| {
+                subjektiv::SubjektivError::AuthorizationDenied("Subject policy is unset".into())
+            })?;
+        let requested = ScopedPermission {
+            operation: self.operation.clone(),
+            resource: PermissionResource::Subject {
+                workspace_id: self.api.workspace_id().into(),
+                subject_id: self.subject.clone(),
+            },
+        };
+        let permissions = job_permissions_with_policy(
+            &api,
+            &self.worker,
+            |subject| {
+                if subject != self.subject {
+                    return Err(denied("Subject Job Subject changed"));
+                }
+                Ok(Some(CurrentSubjectPolicy::Canonical(source.clone())))
+            },
+            Some(&registry),
+        )
+        .map_err(reject)?;
+        if let Some(permissions) = permissions {
+            if !permissions
+                .iter()
+                .any(|permission| permission.covers(&requested))
+            {
+                return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                    "Subject operation is outside the live Job grant".into(),
+                ));
+            }
+        } else {
+            if authority
+                .current_body_subject(&self.worker)
+                .map_err(reject)?
+                .as_deref()
+                != Some(self.subject.as_str())
+            {
+                let owner = api
+                    .store
+                    .require_current_worker_singleton_owner(api.workspace_id(), &self.worker)
+                    .map_err(|error| {
+                        subjektiv::SubjektivError::AuthorizationDenied(error.to_string())
+                    })?;
+                if owner.is_none_or(|owner| {
+                    owner.key
+                        != format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", self.subject)
+                }) {
+                    return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                        "Subject effect Worker ownership changed".into(),
+                    ));
+                }
+            }
+            if !CurrentSubjectPolicy::Canonical(source)
+                .allows_in_registry(&authority, &requested, false, &self.subject, &registry)
+                .map_err(reject)?
+            {
+                return Err(subjektiv::SubjektivError::AuthorizationDenied(
+                    "Current policy denies the Subject operation".into(),
+                ));
+            }
+        }
+        Ok(Box::new((catalog, registry)))
+    }
+}
+
+#[cfg(test)]
+pub(super) fn subject_effect_store(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+) -> subjektiv::SubjektivStore {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+        runtime_source: None,
+        #[cfg(test)]
+        before_registry: None,
+        #[cfg(test)]
+        after_reservation: None,
+    }))
+}
+
+/// Retain the binding from the authenticated request projection, never a fresh
+/// trust lookup. Trusted internal/non-request stores do not fabricate this source.
+pub(super) fn authenticated_subject_effect_store(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+    source: &server_api::ServerRuntimeSource,
+) -> subjektiv::SubjektivStore {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+        runtime_source: Some(source.clone()),
+        #[cfg(test)]
+        before_registry: None,
+        #[cfg(test)]
+        after_reservation: None,
+    }))
+}
+
+#[cfg(test)]
+pub(super) fn memory_effect_store_before_registry(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> subjektiv::SubjektivStore {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+        runtime_source: None,
+        before_registry: Some(observe),
+        after_reservation: None,
+    }))
+}
+
+#[cfg(test)]
+pub(super) fn memory_effect_store_after_reservation(
+    api: &WorkspaceApi,
+    store: &subjektiv::SubjektivStore,
+    worker: &RuntimeWorkerRef,
+    subject: &str,
+    operation: &str,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> subjektiv::SubjektivStore {
+    store.with_subject_effect_authority(Arc::new(SubjectEffectAuthority {
+        api: api.clone(),
+        worker: worker.clone(),
+        subject: subject.into(),
+        operation: operation.into(),
+        runtime_source: None,
+        before_registry: None,
+        after_reservation: Some(observe),
+    }))
 }

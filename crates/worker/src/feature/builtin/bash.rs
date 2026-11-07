@@ -2,6 +2,8 @@
 //! routing. No output is indexable; committed result entries directly address immutable files.
 //! Root namespace knowledge grants nothing: every publication and read checks the current view.
 
+pub(crate) mod permission_declaration;
+
 use crate::{
     file_operation::{self, Contract},
     permission::permission_action_for,
@@ -436,6 +438,7 @@ fn fail(code: ProtocolErrorCode, message: &str) -> WipOperationError {
 fn tool_error(error: ToolError) -> WipOperationError {
     match error {
         ToolError::InvalidArgument(_) => fail(ProtocolErrorCode::InvalidArguments, "invalid Bash arguments"),
+        ToolError::ExecutionFailure(output) => WipOperationError::ExecutionFailure(output),
         ToolError::Cancelled(output) => WipOperationError::Cancelled(output),
         ToolError::Interrupted(output) => WipOperationError::Interrupted(output),
         _ => WipOperationError::OutcomeUnknown("Bash execution failed; effects or process termination may be unconfirmed; do not automatically restart the command".into()),

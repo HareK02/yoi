@@ -39,7 +39,6 @@ fn shared_lifecycle_enums_round_trip_all_host_states() {
         (JobState::Pending, "pending"),
         (JobState::Completed, "completed"),
         (JobState::Failed, "failed"),
-        (JobState::Unknown, "unknown"),
         (JobState::Cancelled, "cancelled"),
     ] {
         assert_eq!(serde_json::to_value(state).unwrap(), json!(name));
@@ -54,7 +53,6 @@ fn shared_lifecycle_enums_round_trip_all_host_states() {
         (JobAttemptState::Dispatched, "dispatched"),
         (JobAttemptState::Completed, "completed"),
         (JobAttemptState::Failed, "failed"),
-        (JobAttemptState::Unknown, "unknown"),
         (JobAttemptState::Cancelled, "cancelled"),
     ] {
         assert_eq!(serde_json::to_value(state).unwrap(), json!(name));
@@ -63,6 +61,9 @@ fn shared_lifecycle_enums_round_trip_all_host_states() {
             state
         );
     }
+    // Previous uncertain lifecycle values belong only to versioned migration input.
+    assert!(serde_json::from_value::<JobState>(json!("unknown")).is_err());
+    assert!(serde_json::from_value::<JobAttemptState>(json!("unknown")).is_err());
     assert!(serde_json::from_value::<JobState>(json!("running")).is_err());
     assert!(serde_json::from_value::<JobAttemptState>(json!("idle")).is_err());
 }
@@ -110,13 +111,6 @@ fn outcome_is_a_neutral_read_snapshot_with_optional_result_and_failure() {
             None,
             Some("execution"),
             Some("known failure"),
-        ),
-        (
-            JobState::Unknown,
-            JobAttemptState::Unknown,
-            None,
-            Some("interrupted"),
-            Some("requires reconciliation"),
         ),
         (
             JobState::Cancelled,

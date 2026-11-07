@@ -347,6 +347,9 @@ fn append_trailing_section(
     }
     out.push('\n');
 
+    let notifications = prompts.render_name("common.notifications", Value::UNDEFINED)?;
+    out.push_str(notifications.trim_end());
+    out.push_str("\n\n");
     if ctx.workdir_sessions.is_empty() {
         let boundaries = prompts.working_boundaries_section(&scope.summary())?;
         out.push_str(boundaries.trim_end_matches(&['\n', ' '][..]));
@@ -481,6 +484,25 @@ mod tests {
     }
 
     #[test]
+    fn notification_guidance_is_in_system_prompt_not_repeated_in_each_message() {
+        let catalog = PromptCatalog::builtins_only().unwrap();
+        let guidance = catalog
+            .render_name("common.notifications", Value::UNDEFINED)
+            .unwrap();
+        for role in ["default", "role.async_chat", "role.coder"] {
+            let (prompt, _) = ticket_workflow_fixture(role, MergeRequestFeatureConfig::default());
+            assert_eq!(prompt.matches(guidance.trim()).count(), 1, "{role}");
+        }
+        let notice = catalog
+            .notify_wrapper("conversation: C-1\nsender: user\ntext: hi\n")
+            .unwrap();
+        assert_eq!(
+            notice.trim(),
+            "[Notification]\nconversation: C-1\nsender: user\ntext: hi"
+        );
+    }
+
+    #[test]
     fn effective_ticket_instructions_allow_review_not_required_without_mr_gate() {
         let (prompt, tools) =
             ticket_workflow_fixture("role.ticket_worker", MergeRequestFeatureConfig::default());
@@ -606,7 +628,7 @@ mod tests {
                 "only `open`",
                 "stable tag IDs, not display names",
                 "no ready step or separate Queue is required",
-                "Orchestrator's self-reported handling",
+                "assigned Subject's self-reported handling",
                 "Answers during waiting or ongoing handling continue the same assignment row",
                 "explicit reissue creates a new row/assignment_id",
                 "Respect an explicit user approval condition",
@@ -684,9 +706,9 @@ mod tests {
         )));
         for (policy, name, input) in [
             (
-                "Use `TicketOrchestratorAssign` for explicit initial delegation or reissue",
+                "Use `TicketOrchestratorAssign` for explicit initial assignment, reassignment or reissue to the selected Subject principal",
                 "TicketOrchestratorAssign",
-                serde_json::json!({"ticket":"T-743","principal":{"kind":"workspace_agent","agent_key":"workspace-orchestrator"},"expected_assignment_id":null,"operation_id":"delegate-research"}),
+                serde_json::json!({"ticket":"T-743","principal":{"kind":"subject","subject_id":"subject-a"},"expected_assignment_id":null,"operation_id":"delegate-research"}),
             ),
             (
                 "research returned to a human can be `open` + handling `done`",

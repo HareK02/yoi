@@ -104,10 +104,10 @@ export function assignmentOperation(
   observed: Pick<TicketDetail, "assignments">,
   operationId: string,
   clear = false,
-  principal: SetTicketRoleAssignmentRequest["principal"] = {
-    kind: "workspace_agent",
-    agent_key: "workspace-orchestrator",
-  },
+  principal?: Extract<
+    SetTicketRoleAssignmentRequest["principal"],
+    { kind: "subject" }
+  >,
 ): ObservedOperation {
   const current = observed.assignments.find((row) =>
     row.role === "orchestrator"
@@ -125,6 +125,11 @@ export function assignmentOperation(
       })}`,
       "DELETE",
     );
+  }
+  if (
+    !principal || principal.kind !== "subject" || !principal.subject_id.trim()
+  ) {
+    throw new Error("Select a Subject for the new assignment");
   }
   const request: SetTicketRoleAssignmentRequest = {
     operation_id: operationId,
@@ -212,7 +217,8 @@ export function answerOperation(
   operationKey: string,
 ): ObservedOperation {
   if (
-    !observed.current || !observed.last_event_id || !observed.tracking ||
+    observed.principal.kind !== "subject" || !observed.current ||
+    !observed.last_event_id || !observed.tracking ||
     observed.tracking.status === "done"
   ) throw new Error("Read actionable current assignment before answering");
   const request: TicketAssignmentAnswer = {

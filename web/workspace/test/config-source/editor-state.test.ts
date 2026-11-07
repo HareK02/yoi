@@ -137,7 +137,7 @@ Deno.test("main entrypoint always enables the fixed schema wrapper", async () =>
   );
 });
 
-Deno.test("commit formats every working Decodal source without a preview roundtrip", async () => {
+Deno.test("config adoption formats changed sources and validates a request bound to observed editing metadata", async () => {
   const source = await Deno.readTextFile(
     new URL(
       "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
@@ -154,16 +154,59 @@ Deno.test("commit formats every working Decodal source without a preview roundtr
     "all changed Decodal entries should be formatted rather than only the selected source",
   );
   assert(
-    source.includes("await formatWorkingSources();") &&
-      source.includes("entrypoints: entrypoints()") &&
-      source.includes("Committed formatted source tree"),
-    "commit should format first and send the working changes directly to Backend authority",
+    source.includes("expected_head: editingMetadata.history_head") &&
+      source.includes("expected_catalog_digest: editingMetadata.catalog_digest") &&
+      source.includes("expected_legacy_export: editingMetadata.expected_legacy_export") &&
+      source.includes("base_digest: baseDigest") &&
+      source.includes("entrypoints: entrypoints()"),
+    "adoption should carry the observed history head and migration conditions separately from the source digest",
+  );
+  const commit = source.slice(
+    source.indexOf("async function commit()"),
+    source.indexOf("async function discardAndReload()"),
+  );
+  const formatted = commit.indexOf("await formatWorkingSources()");
+  const validated = commit.indexOf("await previewConfigTree(");
+  const submitted = commit.indexOf("await submitPending(false)");
+  assert(
+    formatted >= 0 && validated > formatted && submitted > validated,
+    "a new adoption should format and validate with Server authority before submission; local analysis alone is insufficient",
+  );
+});
+
+Deno.test("config editor wires retained unknown requests to an explicit reconciliation action", async () => {
+  const source = await Deno.readTextFile(
+    new URL(
+      "../../src/lib/workspace/config-source/ConfigSourceEditor.svelte",
+      import.meta.url,
+    ),
+  );
+
+  assert(
+    source.includes("reconcileConfigTree(pending.workspaceId, pending.request)") &&
+      source.includes("commitConfigTree(pending.workspaceId, pending.request)"),
+    "reconciliation and explicit resubmission should use the retained workspace and complete request, not a new operation identity",
+  );
+  const reconciliation = source.slice(
+    source.indexOf("async function reconcilePending("),
+    source.indexOf("async function submitPending("),
   );
   assert(
-    !source.includes("previewConfigTree") &&
-      !source.includes("requestCandidatePreview") &&
-      !source.includes("toolchain_fingerprint"),
-    "normal commit must not depend on a separate preview or client-echoed toolchain fingerprint",
+    reconciliation.includes('result.status === "adopted"') &&
+      reconciliation.includes("applyReceipt(result.receipt)") &&
+      !reconciliation.includes("pendingAdoption = null"),
+    "unknown evidence must leave the request retained; only an adopted receipt can be applied",
+  );
+  const action = source.slice(
+    source.indexOf("async function reconcile()"),
+    source.indexOf("async function commit()"),
+  );
+  assert(
+    source.includes("onclick={reconcile}") &&
+      action.includes("await reconcilePending()") &&
+      !action.includes("commitConfigTree(") &&
+      !action.includes("submitPending("),
+    "the explicit reconciliation control must look up the retained outcome without submitting an adoption",
   );
 });
 

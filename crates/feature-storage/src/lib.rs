@@ -11,6 +11,10 @@ use rusqlite::backup::Backup;
 use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
+mod legacy_owner;
+mod owner;
+pub use owner::DatabaseIdentity;
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATION_TABLE: &str = "__yoi_feature_schema_migrations";
 const SNAPSHOT_FORMAT: &str = "yoi-feature-storage-v1";
@@ -18,10 +22,21 @@ const SNAPSHOT_MANIFEST: &str = "manifest.txt";
 const MAX_IDENTIFIER_BYTES: usize = 128;
 
 pub type Result<T> = std::result::Result<T, FeatureStorageError>;
+pub type FeatureHistoryValidation =
+    for<'connection> fn(&Transaction<'connection>, &[(u32, String)]) -> Result<()>;
 pub type FeatureMigrationApply = for<'connection> fn(&Transaction<'connection>) -> Result<()>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FeatureStorageError {
+    #[error("Feature storage identity conflict: {0}")]
+    Identity(String),
+    #[error(
+        "Feature storage outcome unknown for {identity:?}: {detail}; reconcile the same request, do not recreate it"
+    )]
+    OutcomeUnknown {
+        identity: DatabaseIdentity,
+        detail: String,
+    },
     #[error("invalid {kind} storage identifier `{value}`")]
     InvalidIdentifier { kind: &'static str, value: String },
     #[error("Feature `{0}` is not registered with this Host storage manager")]
@@ -93,6 +108,11 @@ impl FeatureMigration {
         }
     }
 
+    /// Executes this registered migration, also useful for immutable schema references.
+    pub fn apply(&self, transaction: &Transaction<'_>) -> Result<()> {
+        (self.apply)(transaction)
+    }
+
     pub fn version(&self) -> u32 {
         self.version
     }
@@ -106,6 +126,7 @@ impl FeatureMigration {
 pub struct FeatureRegistration {
     feature_id: &'static str,
     migrations: &'static [FeatureMigration],
+    history_validation: Option<FeatureHistoryValidation>,
 }
 
 impl FeatureRegistration {
@@ -113,7 +134,16 @@ impl FeatureRegistration {
         Self {
             feature_id,
             migrations,
+            history_validation: None,
         }
+    }
+
+    /// Installs this Feature's finite published receipt/shape compatibility check.
+    /// The check must reject unknown histories; it grants neither adoption nor
+    /// domain authority. Known extension receipts are retained, never rewritten.
+    pub const fn with_history_validation(mut self, validate: FeatureHistoryValidation) -> Self {
+        self.history_validation = Some(validate);
+        self
     }
 
     pub fn feature_id(&self) -> &'static str {
@@ -121,13 +151,33 @@ impl FeatureRegistration {
     }
 }
 
+#[cfg(feature = "test-support")]
+mod lifecycle_observation;
+#[cfg(feature = "test-support")]
+pub use lifecycle_observation::LifecycleObservation;
+
+#[cfg(feature = "test-support")]
+#[path = "open_observation.rs"]
+mod open_observation;
+#[cfg(feature = "test-support")]
+pub use open_observation::OpenObservation;
+
 #[derive(Clone, Debug)]
 pub struct RegisteredFeature {
     manager_id: Uuid,
     feature_id: String,
+    #[cfg(feature = "test-support")]
+    observation: Arc<open_observation::Counters>,
 }
 
 impl RegisteredFeature {
+    /// Instance-local physical-operation counters for fixture assertions. The
+    /// observer retains no database and cannot replace or suppress durable I/O.
+    #[cfg(feature = "test-support")]
+    pub fn open_observation(&self) -> OpenObservation {
+        self.observation.snapshot()
+    }
+
     pub fn feature_id(&self) -> &str {
         &self.feature_id
     }
@@ -137,7 +187,8 @@ impl RegisteredFeature {
 ///
 /// Features own schemas and domain transactions; the Host owns authentication before calls.
 /// This separation is an in-process API boundary, not a sandbox for arbitrary native code.
-/// The constructing Host owns state-root protection, path validation, and execution leases.
+/// The owner checks physical identity and holds advisory process-wide lifecycle leases.
+/// The constructing Host still protects the root against native code bypassing this owner.
 /// Registration alone creates no database and does not delete existing data for disabled Features.
 #[derive(Clone)]
 pub struct FeatureStorage {
@@ -148,14 +199,49 @@ struct FeatureStorageInner {
     id: Uuid,
     root: PathBuf,
     state: Mutex<FeatureStorageState>,
+    lifecycle_established: Arc<owner::EstablishedLocks>,
+    #[cfg(feature = "test-support")]
+    lifecycle_observation: Arc<lifecycle_observation::Counters>,
 }
 
 struct FeatureStorageState {
     running: bool,
-    registrations: HashMap<String, &'static [FeatureMigration]>,
+    registrations: HashMap<String, FeatureRegistration>,
     connections: HashMap<(String, String), Weak<FeatureDatabaseInner>>,
     maintenance: HashSet<String>,
     deletion_fences: HashSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum Admission<'a> {
+    Provision {
+        request: &'a str,
+        evidence: &'a str,
+    },
+    Adopt {
+        request: &'a str,
+        evidence: &'a str,
+        validate: &'a dyn Fn(&Transaction<'_>) -> Result<()>,
+    },
+}
+
+impl Admission<'_> {
+    fn request(&self) -> &str {
+        match self {
+            Self::Provision { request, .. } | Self::Adopt { request, .. } => request,
+        }
+    }
+    fn evidence(&self) -> &str {
+        match self {
+            Self::Provision { evidence, .. } | Self::Adopt { evidence, .. } => evidence,
+        }
+    }
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Provision { .. } => "provision",
+            Self::Adopt { .. } => "adopt",
+        }
+    }
 }
 
 impl FeatureStorage {
@@ -173,8 +259,18 @@ impl FeatureStorage {
                     maintenance: HashSet::new(),
                     deletion_fences: HashSet::new(),
                 }),
+                lifecycle_established: Arc::default(),
+                #[cfg(feature = "test-support")]
+                lifecycle_observation: Arc::default(),
             }),
         }
+    }
+
+    /// Read-only cumulative lifecycle diagnostics shared by this manager's Host
+    /// and Feature handles, independent of per-registration open observations.
+    #[cfg(feature = "test-support")]
+    pub fn lifecycle_observation(&self) -> LifecycleObservation {
+        self.inner.lifecycle_observation.snapshot()
     }
 
     pub fn for_server_database(database_path: impl AsRef<Path>) -> Result<Self> {
@@ -186,6 +282,109 @@ impl FeatureStorage {
             ))
         })?;
         Ok(Self::new(parent.join("feature-storage")))
+    }
+
+    /// Admits the Host control-plane database under the same physical identity
+    /// and lifecycle contract as Feature DBs. The Host's explicit configuration
+    /// selects this path; the domain prepare function must validate existing
+    /// receipts/shapes before modifying a nonempty database. It may own several
+    /// schema transactions; admission is complete only after physical identity
+    /// commits and the owner receipt is reconciled.
+    pub fn open_host_catalog<E>(
+        &self,
+        path: &Path,
+        request: &str,
+        authority_evidence: &str,
+        prepare: impl FnOnce(&mut Connection) -> std::result::Result<(), E>,
+    ) -> std::result::Result<FeatureDatabase, E>
+    where
+        E: From<FeatureStorageError>,
+    {
+        let scope = "_host_catalog";
+        let feature = "catalog";
+        let operation = || -> Result<_> {
+            check_admission(request, authority_evidence)?;
+            // Outside the public scope identifier grammar: a Workspace cannot
+            // collide with, delete or restore the Host catalog lifecycle.
+            let lifecycle = self.lifecycle(scope);
+            let lease = lifecycle.lock(true)?;
+            let known = lifecycle.lookup(scope, feature)?;
+            let established = known.is_some();
+            let binding = if let Some(binding) = known {
+                binding.check_file(path)?;
+                lifecycle.reserve(
+                    scope,
+                    feature,
+                    path,
+                    request,
+                    lifecycle.request_kind(request)?.as_deref().ok_or_else(|| {
+                        FeatureStorageError::Identity("catalog request differs".into())
+                    })?,
+                    authority_evidence,
+                )?
+            } else {
+                lifecycle.reserve(
+                    scope,
+                    feature,
+                    path,
+                    request,
+                    lifecycle
+                        .request_kind(request)?
+                        .as_deref()
+                        .unwrap_or(if path.exists() { "adopt" } else { "provision" }),
+                    authority_evidence,
+                )?
+            };
+            let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            configure_connection(&connection)?;
+            Ok((lifecycle, lease, binding, connection, established))
+        };
+        let (lifecycle, _lease, binding, mut connection, established) =
+            operation().map_err(E::from)?;
+        // Never silently repair a corrupt stored identity on an established DB.
+        let identity_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='__yoi_storage_identity')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(FeatureStorageError::from)
+            .map_err(E::from)?;
+        if established && !identity_exists {
+            return Err(E::from(FeatureStorageError::Identity(
+                "stored DB identity is missing".into(),
+            )));
+        }
+        if identity_exists {
+            binding.check_database(&connection).map_err(E::from)?;
+        }
+        prepare(&mut connection)?;
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(FeatureStorageError::from)
+            .map_err(E::from)?;
+        binding.persist(&tx).map_err(E::from)?;
+        tx.commit()
+            .map_err(FeatureStorageError::from)
+            .map_err(E::from)?;
+        lifecycle
+            .complete(&binding)
+            .map_err(|error| E::from(binding.unknown(error)))?;
+        Ok(FeatureDatabase {
+            inner: Arc::new(FeatureDatabaseInner {
+                scope_id: scope.into(),
+                feature_id: feature.into(),
+                accepting_operations: Arc::new(AtomicBool::new(true)),
+                query_only: false,
+                connection: Mutex::new(Some(connection)),
+                root: self.inner.root.clone(),
+                lifecycle_established: self.inner.lifecycle_established.clone(),
+                #[cfg(feature = "test-support")]
+                lifecycle_observation: self.inner.lifecycle_observation.clone(),
+                path: path.into(),
+                binding,
+            }),
+        })
     }
 
     /// Restricts storage to a Host-issued scope.
@@ -213,12 +412,12 @@ impl FeatureStorage {
         if state.registrations.contains_key(&feature_id) {
             return Err(FeatureStorageError::FeatureAlreadyRegistered(feature_id));
         }
-        state
-            .registrations
-            .insert(feature_id.clone(), registration.migrations);
+        state.registrations.insert(feature_id.clone(), registration);
         Ok(RegisteredFeature {
             manager_id: self.inner.id,
             feature_id,
+            #[cfg(feature = "test-support")]
+            observation: Arc::default(),
         })
     }
 
@@ -248,6 +447,20 @@ impl FeatureStorage {
         Ok(())
     }
 
+    fn check_registration(&self, registration: &RegisteredFeature) -> Result<()> {
+        if registration.manager_id != self.inner.id {
+            return Err(FeatureStorageError::ForeignRegistration);
+        }
+        let state = self.lock_state()?;
+        ensure_running(&state)?;
+        if !state.registrations.contains_key(&registration.feature_id) {
+            return Err(FeatureStorageError::FeatureNotRegistered(
+                registration.feature_id.clone(),
+            ));
+        }
+        Ok(())
+    }
+
     fn open(&self, scope_id: &str, registration: &RegisteredFeature) -> Result<FeatureDatabase> {
         self.open_with_directory_sync(scope_id, registration, sync_directory)
     }
@@ -257,6 +470,42 @@ impl FeatureStorage {
         scope_id: &str,
         registration: &RegisteredFeature,
         mut sync: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<FeatureDatabase> {
+        self.check_registration(registration)?;
+        // A Host request for initial provisioning is not past ownership evidence.
+        // Existing unbound files require explicit adoption. Missing bound files
+        // never become a request to create a replacement database.
+        let lifecycle = self.lifecycle(scope_id);
+        let lease = lifecycle.lock(false)?;
+        let mut binding = lifecycle.lookup(scope_id, &registration.feature_id)?;
+        let _lease = if binding.is_none() {
+            drop(lease);
+            let exclusive = lifecycle.lock(true)?;
+            binding = lifecycle.lookup(scope_id, &registration.feature_id)?;
+            exclusive
+        } else {
+            lease
+        };
+        self.open_locked(scope_id, registration, binding, None, &mut sync)
+    }
+
+    fn lifecycle(&self, scope_id: &str) -> owner::Lifecycle {
+        owner::Lifecycle {
+            root: self.inner.root.clone(),
+            scope: scope_id.into(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
+        }
+    }
+
+    fn open_locked(
+        &self,
+        scope_id: &str,
+        registration: &RegisteredFeature,
+        binding: Option<owner::Binding>,
+        admission: Option<Admission<'_>>,
+        sync: &mut impl FnMut(&Path) -> std::io::Result<()>,
     ) -> Result<FeatureDatabase> {
         if registration.manager_id != self.inner.id {
             return Err(FeatureStorageError::ForeignRegistration);
@@ -274,30 +523,99 @@ impl FeatureStorage {
             .ok_or_else(|| {
                 FeatureStorageError::FeatureNotRegistered(registration.feature_id.clone())
             })?;
-        if let Some(connection) = state.connections.get(&key).and_then(Weak::upgrade) {
-            return Ok(FeatureDatabase { inner: connection });
+        if admission.is_none() {
+            if let Some(connection) = state.connections.get(&key).and_then(Weak::upgrade) {
+                let handle = FeatureDatabase { inner: connection };
+                handle.inner.verify()?;
+                return Ok(handle);
+            }
         }
-
-        let feature_dir = self.feature_dir(scope_id);
-        durable_create_directory(&feature_dir, &mut sync)?;
-        let path = feature_dir.join(format!("{}.sqlite", registration.feature_id));
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )?;
+        let path = self
+            .feature_dir(scope_id)
+            .join(format!("{}.sqlite", registration.feature_id));
+        let lifecycle = self.lifecycle(scope_id);
+        let newly_bound = binding.is_none();
+        let binding = if let Some(binding) = binding {
+            binding.check_file(&path)?;
+            binding
+        } else {
+            #[cfg(feature = "test-support")]
+            let mut counted_sync = |path: &Path| {
+                registration.observation.sync_attempt();
+                let result = sync(path);
+                if result.is_ok() {
+                    registration.observation.sync_success();
+                }
+                result
+            };
+            #[cfg(feature = "test-support")]
+            durable_create_directory(&self.feature_dir(scope_id), &mut counted_sync)?;
+            #[cfg(not(feature = "test-support"))]
+            durable_create_directory(&self.feature_dir(scope_id), sync)?;
+            if let Some(admission) = admission {
+                lifecycle.reserve(
+                    scope_id,
+                    &registration.feature_id,
+                    &path,
+                    admission.request(),
+                    admission.kind(),
+                    admission.evidence(),
+                )?
+            } else {
+                lifecycle.reserve(
+                    scope_id,
+                    &registration.feature_id,
+                    &path,
+                    &format!("initial:{scope_id}:{}", registration.feature_id),
+                    "provision",
+                    "Host initial provisioning",
+                )?
+            }
+        };
+        #[cfg(feature = "test-support")]
+        registration.observation.open_attempt();
+        let mut connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        #[cfg(feature = "test-support")]
+        registration.observation.open_success();
         configure_connection(&connection)?;
-        migrate(&connection, &registration.feature_id, migrations)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(Admission::Adopt { validate, .. }) = admission {
+            validate(&tx)?;
+        }
+        if !newly_bound {
+            binding.check_database(&tx)?;
+        }
+        migrate(&tx, &registration.feature_id, migrations)?;
+        binding.persist(&tx)?;
+        tx.commit()?;
+        lifecycle
+            .complete(&binding)
+            .map_err(|error| binding.unknown(error))?;
+        #[cfg(feature = "test-support")]
+        registration.observation.initialized();
         let connection = Arc::new(FeatureDatabaseInner {
             scope_id: scope_id.to_string(),
             feature_id: registration.feature_id.clone(),
-            accepting_operations: AtomicBool::new(true),
+            accepting_operations: Arc::new(AtomicBool::new(true)),
+            query_only: false,
             connection: Mutex::new(Some(connection)),
+            root: self.inner.root.clone(),
+            lifecycle_established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            lifecycle_observation: self.inner.lifecycle_observation.clone(),
+            path,
+            binding,
         });
         state.connections.insert(key, Arc::downgrade(&connection));
         Ok(FeatureDatabase { inner: connection })
     }
 
     fn backup_scope(&self, scope_id: &str, destination: &Path) -> Result<()> {
+        let lifecycle = self.lifecycle(scope_id);
+        let _lease = lifecycle.lock(false)?;
+        if lifecycle.fenced(scope_id)? {
+            return Err(FeatureStorageError::ScopeMaintenance(scope_id.into()));
+        }
         // Keep manager lifecycle and deletion/restore mutually exclusive for the
         // duration. Feature transactions use SQLite's online backup snapshot rules.
         let state = self.lock_state()?;
@@ -344,42 +662,161 @@ impl FeatureStorage {
         result
     }
 
-    fn restore_scope(&self, scope_id: &str, snapshot: &Path) -> Result<()> {
+    fn restore_scope(
+        &self,
+        scope_id: &str,
+        snapshot: &Path,
+        source: &ScopedFeatureStorage,
+    ) -> Result<()> {
+        self.restore_scope_with_copy(scope_id, snapshot, source, backup_database)
+    }
+
+    fn restore_scope_with_copy(
+        &self,
+        scope_id: &str,
+        snapshot: &Path,
+        source: &ScopedFeatureStorage,
+        mut copy: impl FnMut(&Path, &Path) -> Result<()>,
+    ) -> Result<()> {
+        if source.scope_id != scope_id {
+            return Err(FeatureStorageError::Identity(
+                "restore source scope differs".into(),
+            ));
+        }
+        // Canonical roots define a deterministic order for a cross-owner copy.
+        // Same-owner recovery needs one exclusive lease, not a shared-to-exclusive upgrade.
+        let source_root = fs::canonicalize(&source.manager.inner.root)?;
+        durable_create_directory(&self.inner.root, &mut sync_directory)?;
+        let target_root = fs::canonicalize(&self.inner.root)?;
+        let source_lifecycle = source.manager.lifecycle(scope_id);
+        let lifecycle = self.lifecycle(scope_id);
+        let (_source_lease, _target_lease) = if source_root == target_root {
+            (None, lifecycle.lock(true)?)
+        } else if source_root < target_root {
+            (Some(source_lifecycle.lock(false)?), lifecycle.lock(true)?)
+        } else {
+            let target = lifecycle.lock(true)?;
+            (Some(source_lifecycle.lock(false)?), target)
+        };
+        if lifecycle.fenced_for_restore(scope_id)? {
+            return Err(FeatureStorageError::ScopeMaintenance(scope_id.into()));
+        }
         let feature_ids = read_snapshot_manifest(snapshot, scope_id)?;
+        // Hold the source erasure fence through target publication. A fresh root
+        // or an old snapshot cannot erase this source-owner dependency.
+        if source_lifecycle.fenced_for_restore(scope_id)? {
+            return Err(FeatureStorageError::ScopeMaintenance(scope_id.into()));
+        }
+        // Length-prefixed provenance avoids ambiguous request/manifest concatenation.
+        let mut evidence = String::new();
+        let mut field = |value: &str| {
+            evidence.push_str(&format!("{}:{value}", value.len()));
+        };
+        let path_key = |path: &Path| {
+            path.as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        field(&path_key(&source_root));
+        field(&path_key(&fs::canonicalize(snapshot)?));
+        field(&fs::read_to_string(snapshot.join(SNAPSHOT_MANIFEST))?);
+        for feature in &feature_ids {
+            let (physical, request) = source_lifecycle.verify_snapshot(
+                scope_id,
+                feature,
+                &snapshot.join("features").join(format!("{feature}.sqlite")),
+            )?;
+            field(feature);
+            field(&physical);
+            field(&request);
+        }
         self.begin_maintenance(scope_id, true)?;
         let scope_dir = self.scope_dir(scope_id);
-        let temporary = self
-            .inner
-            .root
-            .join(format!(".restore-{scope_id}-{}", Uuid::now_v7()));
+        let temporary = self.inner.root.join(format!(".restore-{scope_id}"));
         let result = (|| {
+            lifecycle.reserve_restore(scope_id, &evidence, &temporary, &scope_dir)?;
             if scope_dir.exists() {
-                return Err(FeatureStorageError::DestinationExists(
-                    scope_dir.display().to_string(),
-                ));
+                // Rename/receipt response loss: only this exact saved restore
+                // may reconcile the published inode. An unrelated existing
+                // destination never becomes adoption authority.
+                for feature_id in &feature_ids {
+                    let request = format!("restore:{scope_id}:{feature_id}:{evidence}");
+                    if lifecycle.request_kind(&request)?.as_deref() != Some("restore") {
+                        return Err(FeatureStorageError::DestinationExists(
+                            scope_dir.display().to_string(),
+                        ));
+                    }
+                    let path = scope_dir
+                        .join("features")
+                        .join(format!("{feature_id}.sqlite"));
+                    let binding = lifecycle
+                        .reserve(scope_id, feature_id, &path, &request, "restore", &evidence)?;
+                    let connection =
+                        Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+                    binding.check_database(&connection)?;
+                    lifecycle.complete(&binding)?;
+                }
+                lifecycle.publish_restore(scope_id, &evidence)?;
+                return Ok(());
             }
             let temporary_features = temporary.join("features");
             fs::create_dir_all(&temporary_features)?;
+            let mut bindings = Vec::new();
             for feature_id in &feature_ids {
-                backup_database(
-                    &snapshot
-                        .join("features")
-                        .join(format!("{feature_id}.sqlite")),
-                    &temporary_features.join(format!("{feature_id}.sqlite")),
+                let target = temporary_features.join(format!("{feature_id}.sqlite"));
+                if !target.exists() {
+                    // SQLite may create an empty destination before copying. Only
+                    // the verified-copy rename promotes it to reusable staging.
+                    let copying = temporary_features.join(format!("{feature_id}.copying"));
+                    copy(
+                        &snapshot
+                            .join("features")
+                            .join(format!("{feature_id}.sqlite")),
+                        &copying,
+                    )?;
+                    source_lifecycle.verify_snapshot(scope_id, feature_id, &copying)?;
+                    fs::rename(&copying, &target)?;
+                    sync_directory(&temporary_features)?;
+                }
+                let request = format!("restore:{scope_id}:{feature_id}:{evidence}");
+                let binding = lifecycle.reserve(
+                    scope_id, feature_id, &target, &request, "restore", &evidence,
                 )?;
+                let mut connection =
+                    Connection::open_with_flags(&target, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+                configure_connection(&connection)?;
+                verify_database(&connection)?;
+                if binding.check_database(&connection).is_err() {
+                    source_lifecycle.verify_snapshot(scope_id, feature_id, &target)?;
+                }
+                binding.restore_identity(&mut connection)?;
+                bindings.push(binding);
             }
-            fs::create_dir_all(&self.inner.root)?;
+            legacy_owner::restore_marker(&self.inner.root, scope_id, &temporary)?;
+            sync_directory(&temporary_features)?;
+            sync_directory(&temporary)?;
             fs::rename(&temporary, &scope_dir)?;
+            sync_directory(&self.inner.root)?;
+            for binding in &bindings {
+                lifecycle
+                    .complete(binding)
+                    .map_err(|error| binding.unknown(error))?;
+            }
+            lifecycle.publish_restore(scope_id, &evidence)?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&temporary);
-        }
+        // Failed/pending restore is retained for exact reconciliation, not
+        // deleted and recreated as if its physical side effects never happened.
         self.end_maintenance(scope_id)?;
         result
     }
 
     fn delete_scope(&self, scope_id: &str) -> Result<()> {
+        let lifecycle = self.lifecycle(scope_id);
+        let _lease = lifecycle.lock(true)?;
+        lifecycle.delete(scope_id)?;
         let connections = {
             let mut state = self.lock_state()?;
             ensure_running(&state)?;
@@ -489,6 +926,13 @@ pub struct ScopedFeatureStorage {
 pub type WorkspaceFeatureStorage = ScopedFeatureStorage;
 
 impl ScopedFeatureStorage {
+    /// Manager-wide lifecycle totals, including other scopes and retained handles.
+    /// This scope handle neither filters the observation nor changes storage I/O.
+    #[cfg(feature = "test-support")]
+    pub fn lifecycle_observation(&self) -> LifecycleObservation {
+        self.manager.lifecycle_observation()
+    }
+
     pub fn scope_id(&self) -> &str {
         &self.scope_id
     }
@@ -510,6 +954,184 @@ impl ScopedFeatureStorage {
         self.manager.open(&self.scope_id, registration)
     }
 
+    /// Observes the current completed ownership identity without provisioning or
+    /// adoption. Consumers can bind a new intent to this value, then pass it to
+    /// `open_existing` on every resume; a replacement between the calls is rejected.
+    pub fn existing_identity(&self, registration: &RegisteredFeature) -> Result<DatabaseIdentity> {
+        self.manager.check_registration(registration)?;
+        if !self.manager.inner.root.join(".owner.sqlite").is_file() {
+            return Err(FeatureStorageError::Identity(
+                "expected ownership record is missing".into(),
+            ));
+        }
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(false)?;
+        let binding = lifecycle
+            .lookup(&self.scope_id, &registration.feature_id)?
+            .ok_or_else(|| FeatureStorageError::Identity("no completed ownership record".into()))?;
+        let path = self
+            .manager
+            .feature_dir(&self.scope_id)
+            .join(format!("{}.sqlite", registration.feature_id));
+        binding.check_file(&path)?;
+        Ok(binding.identity)
+    }
+
+    /// Opens only an already-owned DB. Missing files and unfinished adoption
+    /// never become requests to create a replacement.
+    pub fn open_existing(
+        &self,
+        registration: &RegisteredFeature,
+        expected: &DatabaseIdentity,
+    ) -> Result<FeatureDatabase> {
+        self.manager.check_registration(registration)?;
+        if !self.manager.inner.root.join(".owner.sqlite").is_file() {
+            return Err(FeatureStorageError::Identity(
+                "expected ownership record is missing".into(),
+            ));
+        }
+        if expected.scope != self.scope_id || expected.feature != registration.feature_id {
+            return Err(FeatureStorageError::Identity(
+                "expected Workspace/Feature differs".into(),
+            ));
+        }
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(false)?;
+        let binding = lifecycle
+            .lookup(&self.scope_id, &registration.feature_id)?
+            .ok_or_else(|| FeatureStorageError::Identity("no completed ownership record".into()))?;
+        if binding.identity != *expected {
+            return Err(FeatureStorageError::Identity(
+                "expected physical DB differs".into(),
+            ));
+        }
+        self.manager.open_locked(
+            &self.scope_id,
+            registration,
+            Some(binding),
+            None,
+            &mut sync_directory,
+        )
+    }
+
+    /// Host-authorized adoption, not inferred from existence. Validate persisted
+    /// domain attribution and supported shape in the same identity transaction.
+    /// Exact retries reconcile the reserved inode/UUID after response loss.
+    pub fn adopt_existing(
+        &self,
+        registration: &RegisteredFeature,
+        request: &str,
+        authority_evidence: &str,
+        validate: impl Fn(&Transaction<'_>) -> Result<()>,
+    ) -> Result<FeatureDatabase> {
+        self.manager.check_registration(registration)?;
+        check_admission(request, authority_evidence)?;
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(true)?;
+        self.manager.open_locked(
+            &self.scope_id,
+            registration,
+            None,
+            Some(Admission::Adopt {
+                request,
+                evidence: authority_evidence,
+                validate: &validate,
+            }),
+            &mut sync_directory,
+        )
+    }
+
+    /// Explicit new provisioning. An existing unbound file is never adopted.
+    /// The Host authenticates this operation before supplying its stable request.
+    pub fn provision(
+        &self,
+        registration: &RegisteredFeature,
+        request: &str,
+        authority_evidence: &str,
+    ) -> Result<FeatureDatabase> {
+        self.manager.check_registration(registration)?;
+        check_admission(request, authority_evidence)?;
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(true)?;
+        self.manager.open_locked(
+            &self.scope_id,
+            registration,
+            None,
+            Some(Admission::Provision {
+                request,
+                evidence: authority_evidence,
+            }),
+            &mut sync_directory,
+        )
+    }
+
+    /// Validate optional storage for a lifecycle consumer without authorizing
+    /// adoption or provisioning. Existing files require completed physical
+    /// ownership; missing bound files fail closed. This is not an open permit:
+    /// subsequent database access must still validate stored identity and fences.
+    pub fn verify_owned_if_present(&self, registration: &RegisteredFeature) -> Result<()> {
+        self.manager.check_registration(registration)?;
+        if !self.manager.inner.root.try_exists()? {
+            return Ok(());
+        }
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(false)?;
+        let path = self
+            .manager
+            .feature_dir(&self.scope_id)
+            .join(format!("{}.sqlite", registration.feature_id));
+        if let Some(binding) = lifecycle.lookup(&self.scope_id, &registration.feature_id)? {
+            binding.check_file(&path)?;
+        } else if path.try_exists()? {
+            return Err(FeatureStorageError::Identity(
+                "lifecycle consumer cannot adopt unowned Feature storage".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Host startup compatibility for a registered optional Feature. Does not
+    /// provision missing optional storage. An existing legacy DB still requires
+    /// explicit adoption authority and persisted attribution validation.
+    pub fn adopt_legacy_if_present(
+        &self,
+        registration: &RegisteredFeature,
+        request: &str,
+        authority_evidence: &str,
+        validate_existing: impl Fn(&Transaction<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.manager.check_registration(registration)?;
+        check_admission(request, authority_evidence)?;
+        let path = self
+            .manager
+            .feature_dir(&self.scope_id)
+            .join(format!("{}.sqlite", registration.feature_id));
+        if !self.manager.inner.root.exists() {
+            return Ok(());
+        }
+        let lifecycle = self.manager.lifecycle(&self.scope_id);
+        let _lease = lifecycle.lock(true)?;
+        if let Some(binding) = lifecycle.lookup(&self.scope_id, &registration.feature_id)? {
+            binding.check_file(&path)?;
+            return Ok(());
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+        self.manager.open_locked(
+            &self.scope_id,
+            registration,
+            None,
+            Some(Admission::Adopt {
+                request,
+                evidence: authority_evidence,
+                validate: &validate_existing,
+            }),
+            &mut sync_directory,
+        )?;
+        Ok(())
+    }
+
     /// Backs up each Feature DB, including disabled/unregistered ones, using SQLite online backup.
     /// Avoids file copies that omit WAL; checks integrity and foreign keys before publishing by rename.
     /// Each DB is internally consistent, but no common-point snapshot across DBs or Host authority is guaranteed.
@@ -521,14 +1143,27 @@ impl ScopedFeatureStorage {
 
     /// Restores a snapshot only into an uncreated scope with no connections.
     /// Rejects scope mismatches and corrupt DBs; publishes the validated temporary directory by rename.
+    /// Restores using this same owner's retained source receipts and erasure fence.
+    /// A missing DB can be recovered; explicit erasure cannot be undone.
     pub fn restore(&self, snapshot: impl AsRef<Path>) -> Result<()> {
         self.manager
-            .restore_scope(&self.scope_id, snapshot.as_ref())
+            .restore_scope(&self.scope_id, snapshot.as_ref(), self)
     }
 
-    /// Closes connections in the scope and deletes only its storage tree. Retries are idempotent.
-    /// Keeps the same manager's admission fence after physical deletion, preventing cached tasks
-    /// from recreating databases before the Host finalizes deletion. Host deletion reservation is a separate responsibility.
+    /// Copies a snapshot from an explicitly selected source owner. Host authorization
+    /// remains required; source provenance is not itself a domain grant. The source
+    /// owner's deletion fence is held and checked even when the target root is new.
+    pub fn restore_from(
+        &self,
+        snapshot: impl AsRef<Path>,
+        source: &ScopedFeatureStorage,
+    ) -> Result<()> {
+        self.manager
+            .restore_scope(&self.scope_id, snapshot.as_ref(), source)
+    }
+
+    /// Closes connections and deletes only this storage tree. Retries are idempotent.
+    /// Keeps a durable fence shared by all managers/processes; restore cannot clear it.
     pub fn delete(&self) -> Result<()> {
         self.manager.delete_scope(&self.scope_id)
     }
@@ -546,14 +1181,166 @@ pub struct FeatureDatabase {
     inner: Arc<FeatureDatabaseInner>,
 }
 
+/// Short-lived shared physical lifecycle lease. Cooperating maintenance in any
+/// manager/process waits until drop. It pins a verified DB, not current domain
+/// permission, and must not be held across a long Job/network wait.
+pub struct DatabaseGuard<'a> {
+    database: &'a FeatureDatabase,
+    _lease: fs::File,
+}
+
+impl DatabaseGuard<'_> {
+    pub fn identity(&self) -> &DatabaseIdentity {
+        self.database.identity()
+    }
+}
+
+/// Native writer reservation on a separately owned connection. It prevents other
+/// connections/processes from changing authority while another database commits an
+/// effect. It is not a distributed atomic transaction and performs no domain writes.
+pub struct DatabaseWriterFence {
+    connection: Connection,
+    _lease: fs::File,
+}
+impl DatabaseWriterFence {
+    /// Read current authority through the already reserved native transaction;
+    /// opening another writer transaction here would contend with this fence.
+    pub fn with_connection<T, E>(
+        &self,
+        read: impl FnOnce(&Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        read(&self.connection)
+    }
+}
+impl Drop for DatabaseWriterFence {
+    fn drop(&mut self) {
+        let _ = self.connection.execute_batch("ROLLBACK");
+    }
+}
+
 struct FeatureDatabaseInner {
     scope_id: String,
     feature_id: String,
-    accepting_operations: AtomicBool,
+    accepting_operations: Arc<AtomicBool>,
+    query_only: bool,
     connection: Mutex<Option<Connection>>,
+    root: PathBuf,
+    lifecycle_established: Arc<owner::EstablishedLocks>,
+    #[cfg(feature = "test-support")]
+    lifecycle_observation: Arc<lifecycle_observation::Counters>,
+    path: PathBuf,
+    binding: owner::Binding,
 }
 
 impl FeatureDatabase {
+    /// Independent, identity-checked read connection for nested authority checks.
+    /// The caller must retain the original native authority transaction across its
+    /// use: this reader grants neither a writer reservation nor a stable policy.
+    /// It shares owner shutdown and uses SQLite read-only mode, so it cannot be
+    /// upgraded into a writer or deadlock by reentering the owner's connection.
+    pub fn query_reader(&self) -> Result<Self> {
+        self.inner.ensure_accepting()?;
+        let connection =
+            Connection::open_with_flags(&self.inner.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "query_only", true)?;
+        let lifecycle = owner::Lifecycle {
+            root: self.inner.root.clone(),
+            scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
+        };
+        let _lease = lifecycle.lock(false)?;
+        lifecycle.verify(&self.inner.binding, &self.inner.path, &connection)?;
+        Ok(Self {
+            inner: Arc::new(FeatureDatabaseInner {
+                scope_id: self.inner.scope_id.clone(),
+                feature_id: self.inner.feature_id.clone(),
+                accepting_operations: self.inner.accepting_operations.clone(),
+                query_only: true,
+                connection: Mutex::new(Some(connection)),
+                root: self.inner.root.clone(),
+                lifecycle_established: self.inner.lifecycle_established.clone(),
+                #[cfg(feature = "test-support")]
+                lifecycle_observation: self.inner.lifecycle_observation.clone(),
+                path: self.inner.path.clone(),
+                binding: self.inner.binding.clone(),
+            }),
+        })
+    }
+
+    /// Pins identity and reserves the native writer after any preceding lock wait.
+    /// Existing owner connections remain usable for reads, never writes. Acquire
+    /// effect-DB admission first, then this authority reservation, in a fixed order.
+    pub fn writer_fence(&self) -> Result<DatabaseWriterFence> {
+        if self.inner.query_only {
+            return Err(FeatureStorageError::operation(
+                "query readers cannot reserve writers",
+            ));
+        }
+        let lifecycle = owner::Lifecycle {
+            root: self.inner.root.clone(),
+            scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
+        };
+        let lease = lifecycle.lock(false)?;
+        self.inner.ensure_accepting()?;
+        let connection =
+            Connection::open_with_flags(&self.inner.path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        lifecycle.verify(&self.inner.binding, &self.inner.path, &connection)?;
+        self.inner.ensure_accepting()?;
+        Ok(DatabaseWriterFence {
+            connection,
+            _lease: lease,
+        })
+    }
+
+    pub fn identity(&self) -> &DatabaseIdentity {
+        &self.inner.binding.identity
+    }
+
+    /// Pins the checked DB for a short release decision. Retain only the identity
+    /// across long Job waits and reacquire/recheck current authority on resume.
+    pub fn with_identity<T>(
+        &self,
+        expected: &DatabaseIdentity,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        if self.identity() != expected {
+            return Err(FeatureStorageError::Identity(
+                "authorization targets another DB".into(),
+            ));
+        }
+        self.with_connection(operation)
+    }
+
+    pub fn guard(&self, expected: &DatabaseIdentity) -> Result<DatabaseGuard<'_>> {
+        if self.identity() != expected {
+            return Err(FeatureStorageError::Identity(
+                "authorization targets another DB".into(),
+            ));
+        }
+        let lease = owner::Lifecycle {
+            root: self.inner.root.clone(),
+            scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
+        }
+        .lock(false)?;
+        self.inner.ensure_accepting()?;
+        self.inner.verify()?;
+        Ok(DatabaseGuard {
+            database: self,
+            _lease: lease,
+        })
+    }
+
     pub fn scope_id(&self) -> &str {
         &self.inner.scope_id
     }
@@ -585,21 +1372,45 @@ impl FeatureDatabase {
     where
         E: From<FeatureStorageError>,
     {
+        self.try_with_connection_mut(|connection| operation(connection))
+    }
+
+    /// Host adapter for repositories that own their transaction boundaries.
+    /// The shared lifecycle guard covers the entire closure, including commit or
+    /// rollback. Do not retain it across network waits or recursive storage calls.
+    pub fn try_with_connection_mut<T, E>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<FeatureStorageError>,
+    {
+        let lifecycle = owner::Lifecycle {
+            root: self.inner.root.clone(),
+            scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
+        };
+        let _lease = lifecycle.lock(false).map_err(E::from)?;
         self.inner.ensure_accepting().map_err(E::from)?;
-        let connection = self
+        let mut connection = self
             .inner
             .connection
             .lock()
-            .map_err(|_| {
-                FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
-            })
-            .map_err(E::from)?;
+            .map_err(|_| E::from(FeatureStorageError::DatabaseClosed))?;
         self.inner.ensure_accepting().map_err(E::from)?;
         let connection = connection
-            .as_ref()
-            .ok_or(FeatureStorageError::DatabaseClosed)
+            .as_mut()
+            .ok_or_else(|| E::from(FeatureStorageError::DatabaseClosed))?;
+        lifecycle
+            .verify(&self.inner.binding, &self.inner.path, connection)
             .map_err(E::from)?;
-        operation(connection)
+        let result = operation(connection)?;
+        lifecycle
+            .verify(&self.inner.binding, &self.inner.path, connection)
+            .map_err(|error| E::from(self.inner.binding.unknown(error)))?;
+        Ok(result)
     }
 
     /// Updates multiple tables within one Feature DB in an IMMEDIATE transaction.
@@ -621,30 +1432,41 @@ impl FeatureDatabase {
     where
         E: From<FeatureStorageError>,
     {
-        self.inner.ensure_accepting().map_err(E::from)?;
-        let mut connection = self
-            .inner
-            .connection
-            .lock()
-            .map_err(|_| {
-                FeatureStorageError::Operation("Feature database lock was poisoned".to_string())
-            })
-            .map_err(E::from)?;
-        self.inner.ensure_accepting().map_err(E::from)?;
-        let connection = connection
-            .as_mut()
-            .ok_or(FeatureStorageError::DatabaseClosed)
-            .map_err(E::from)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(FeatureStorageError::from)
-            .map_err(E::from)?;
-        let value = operation(&transaction)?;
-        transaction
-            .commit()
-            .map_err(FeatureStorageError::from)
-            .map_err(E::from)?;
-        Ok(value)
+        self.try_transaction_admitted(|_| Ok(()), operation)
+    }
+
+    /// Runs admission after the native writer lock is acquired. The returned lease
+    /// remains alive through commit/rollback; it must not reenter this database.
+    pub fn try_transaction_admitted<T, E, L>(
+        &self,
+        admission: impl FnOnce(&Transaction<'_>) -> std::result::Result<L, E>,
+        operation: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<FeatureStorageError>,
+    {
+        self.try_with_connection_mut(|connection| {
+            let tx = connection
+                .transaction_with_behavior(if self.inner.query_only {
+                    TransactionBehavior::Deferred
+                } else {
+                    TransactionBehavior::Immediate
+                })
+                .map_err(FeatureStorageError::from)
+                .map_err(E::from)?;
+            let _admission = admission(&tx)?;
+            let value = match operation(&tx) {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(tx);
+                    return Err(error);
+                }
+            };
+            tx.commit().map_err(|error| {
+                E::from(self.inner.binding.unknown(FeatureStorageError::from(error)))
+            })?;
+            Ok(value)
+        })
     }
 
     pub fn schema_version(&self) -> Result<u32> {
@@ -661,6 +1483,27 @@ impl FeatureDatabase {
 }
 
 impl FeatureDatabaseInner {
+    fn verify(&self) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| FeatureStorageError::DatabaseClosed)?;
+        owner::Lifecycle {
+            root: self.root.clone(),
+            scope: self.scope_id.clone(),
+            established: self.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.lifecycle_observation.clone(),
+        }
+        .verify(
+            &self.binding,
+            &self.path,
+            connection
+                .as_ref()
+                .ok_or(FeatureStorageError::DatabaseClosed)?,
+        )
+    }
+
     fn ensure_accepting(&self) -> Result<()> {
         if self.accepting_operations.load(Ordering::Acquire) {
             Ok(())
@@ -681,6 +1524,15 @@ impl FeatureDatabaseInner {
         connection.take();
         Ok(())
     }
+}
+
+fn check_admission(request: &str, evidence: &str) -> Result<()> {
+    if request.trim().is_empty() || evidence.trim().is_empty() {
+        return Err(FeatureStorageError::Identity(
+            "request and Host authority evidence are required".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_identifier<'a>(kind: &'static str, value: &'a str) -> Result<&'a str> {
@@ -806,11 +1658,11 @@ fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
 }
 
 fn migrate(
-    connection: &Connection,
+    transaction: &Transaction<'_>,
     feature_id: &str,
-    migrations: &[FeatureMigration],
+    registration: FeatureRegistration,
 ) -> Result<()> {
-    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    let migrations = registration.migrations;
     transaction.execute_batch(&format!(
         r#"
 CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
@@ -830,32 +1682,36 @@ CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
 
-    let supported = migrations.last().map_or(0, |migration| migration.version);
-    if let Some((actual, _)) = applied.last()
-        && *actual > supported
-    {
-        return Err(FeatureStorageError::UnsupportedSchema {
-            feature: feature_id.to_string(),
-            actual: *actual,
-            supported,
-        });
-    }
-    for (index, (version, name)) in applied.iter().enumerate() {
-        let Some(expected) = migrations.get(index) else {
+    if let Some(validate) = registration.history_validation {
+        validate(transaction, &applied)?;
+    } else {
+        let supported = migrations.last().map_or(0, |migration| migration.version);
+        if let Some((actual, _)) = applied.last()
+            && *actual > supported
+        {
             return Err(FeatureStorageError::UnsupportedSchema {
                 feature: feature_id.to_string(),
-                actual: *version,
+                actual: *actual,
                 supported,
             });
-        };
-        if *version != expected.version || name != expected.name {
-            return Err(FeatureStorageError::MigrationHistory {
-                feature: feature_id.to_string(),
-                detail: format!(
-                    "stored migration {version} (`{name}`) does not match expected {} (`{}`)",
-                    expected.version, expected.name
-                ),
-            });
+        }
+        for (index, (version, name)) in applied.iter().enumerate() {
+            let Some(expected) = migrations.get(index) else {
+                return Err(FeatureStorageError::UnsupportedSchema {
+                    feature: feature_id.to_string(),
+                    actual: *version,
+                    supported,
+                });
+            };
+            if *version != expected.version || name != expected.name {
+                return Err(FeatureStorageError::MigrationHistory {
+                    feature: feature_id.to_string(),
+                    detail: format!(
+                        "stored migration {version} (`{name}`) does not match expected {} (`{}`)",
+                        expected.version, expected.name
+                    ),
+                });
+            }
         }
     }
 
@@ -873,7 +1729,6 @@ CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE} (
             params![migration.version, migration.name],
         )?;
     }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -1026,6 +1881,9 @@ fn temporary_sibling(destination: &Path, operation: &str) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+mod identity_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
@@ -1079,6 +1937,149 @@ mod tests {
 
     fn registration(feature_id: &'static str) -> FeatureRegistration {
         FeatureRegistration::new(feature_id, MIGRATIONS)
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn lifecycle_observation_is_manager_local_and_counts_retained_feature_operations() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        let manager = FeatureStorage::new(&root);
+        let observer = manager.clone();
+        // Even managers sharing a physical root must not share observation state.
+        let other = FeatureStorage::new(&root);
+        let feature = manager.register(registration("test-feature")).unwrap();
+        let database = manager.scope("workspace").unwrap().open(&feature).unwrap();
+        assert_eq!(
+            other.lifecycle_observation(),
+            LifecycleObservation::default()
+        );
+        let other_feature = other.register(registration("test-feature")).unwrap();
+        let other_database = other
+            .scope("workspace")
+            .unwrap()
+            .open(&other_feature)
+            .unwrap();
+        assert_eq!(database.identity(), other_database.identity());
+        let identity = database.identity().clone();
+        let lock_path = root.join(".lifecycle/workspace.lock");
+        let lock_inode = fs::metadata(&lock_path).unwrap().ino();
+        let other_before = other.lifecycle_observation();
+        let opens_before = feature.open_observation();
+        let before = observer.lifecycle_observation();
+
+        database
+            .with_connection(|connection| {
+                let synchronous: u32 =
+                    connection.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+                assert_eq!(synchronous, 2, "durability policy remains FULL");
+                Ok(())
+            })
+            .unwrap();
+        let after_read = observer.lifecycle_observation();
+        let read = after_read.since(before);
+        assert_eq!(read.acquisitions, 1);
+        assert_eq!(
+            read.sync_attempts, 0,
+            "same durable lifecycle needs no re-sync"
+        );
+        assert_eq!(read.lock_attempts, 1);
+        assert_eq!(read.sync_nanoseconds, 0);
+        assert!(read.lock_nanoseconds > 0);
+        assert_eq!((read.failed_syncs, read.failed_locks), (0, 0));
+
+        insert(&database.clone(), "observed commit").unwrap();
+        let after_write = observer.lifecycle_observation();
+        let write = after_write.since(after_read);
+        assert_eq!(write.acquisitions, 1);
+        assert_eq!(write.sync_attempts, 0);
+        assert_eq!(write.lock_attempts, 1);
+        assert_eq!(write.sync_nanoseconds, 0);
+        assert!(write.lock_nanoseconds > 0);
+        assert_eq!((write.failed_syncs, write.failed_locks), (0, 0));
+        assert_eq!(after_write, manager.lifecycle_observation());
+        assert_eq!(other_before, other.lifecycle_observation());
+        assert_eq!(opens_before, feature.open_observation());
+        assert_eq!(database.identity(), &identity);
+        assert_eq!(fs::metadata(&lock_path).unwrap().ino(), lock_inode);
+        // Re-read committed data through the independent manager's verified DB.
+        assert_eq!(values(&other_database).unwrap(), ["observed commit"]);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn lifecycle_observation_includes_retained_host_catalog_operations() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = FeatureStorage::new(temp.path().join("storage"));
+        let database = manager
+            .open_host_catalog::<FeatureStorageError>(
+                &temp.path().join("host.sqlite"),
+                "host-provision",
+                "isolated test Host",
+                |connection| {
+                    connection.execute_batch(
+                        "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);",
+                    )?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let before = manager.lifecycle_observation();
+        assert_eq!(before.acquisitions, 1);
+        assert_eq!(before.sync_attempts, 1);
+        assert_eq!(before.lock_attempts, 1);
+        let identity = database.identity().clone();
+        insert(&database, "host commit").unwrap();
+        assert_eq!(values(&database).unwrap(), ["host commit"]);
+        let delta = manager.lifecycle_observation().since(before);
+        assert_eq!(delta.acquisitions, 2);
+        assert_eq!(delta.sync_attempts, 0);
+        assert_eq!(delta.lock_attempts, 2);
+        assert_eq!(delta.sync_nanoseconds, 0);
+        assert!(delta.lock_nanoseconds > 0);
+        assert_eq!((delta.failed_syncs, delta.failed_locks), (0, 0));
+        assert_eq!(database.identity(), &identity);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn lifecycle_observation_counts_failed_directory_attempts_without_suppressing_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("storage");
+        fs::create_dir(&root).unwrap();
+        let obstacle = root.join(".lifecycle");
+        fs::write(&obstacle, b"not a directory").unwrap();
+        let manager = FeatureStorage::new(&root);
+        let feature = manager.register(registration("test-feature")).unwrap();
+        let scoped = manager.scope("workspace").unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                scoped.open(&feature),
+                Err(FeatureStorageError::Io(_))
+            ));
+        }
+        let failed = manager.lifecycle_observation();
+        assert_eq!(failed.acquisitions, 2);
+        assert_eq!(failed.sync_attempts, 2);
+        assert_eq!(failed.failed_syncs, 2);
+        assert!(failed.sync_nanoseconds > 0);
+        assert_eq!(failed.lock_attempts, 0);
+        assert_eq!(failed.lock_nanoseconds, 0);
+        assert_eq!(failed.failed_locks, 0);
+        assert_eq!(feature.open_observation(), OpenObservation::default());
+        assert!(!root.join("workspace/features/test-feature.sqlite").exists());
+
+        fs::remove_file(obstacle).unwrap();
+        let database = scoped.open(&feature).unwrap();
+        insert(&database, "retry committed").unwrap();
+        assert_eq!(values(&database).unwrap(), ["retry committed"]);
+        let retried = manager.lifecycle_observation().since(failed);
+        assert!(retried.acquisitions > 0);
+        assert_eq!(retried.sync_attempts, 1);
+        assert_eq!(retried.lock_attempts, retried.acquisitions);
+        assert_eq!((retried.failed_syncs, retried.failed_locks), (0, 0));
     }
 
     #[test]
@@ -1519,17 +2520,17 @@ mod tests {
         let feature = workspace.register(registration("feature-a")).unwrap();
         let database = workspace.open(&feature).unwrap();
         insert(&database, "snapshot-value").unwrap();
-        workspace.backup(&snapshot).unwrap();
-        insert(&database, "after-snapshot").unwrap();
-        workspace.delete().unwrap();
-        assert!(matches!(
-            workspace.open(&feature).err().unwrap(),
-            FeatureStorageError::ScopeMaintenance(_)
-        ));
         drop(database);
         drop(workspace);
-        drop(manager);
-
+        manager.shutdown().unwrap();
+        // An unregistered/disabled Feature still belongs to its source owner.
+        let manager = FeatureStorage::new(&root);
+        let workspace = manager.workspace("workspace-a").unwrap();
+        workspace.backup(&snapshot).unwrap();
+        drop(workspace);
+        manager.shutdown().unwrap();
+        // Simulate lost data files, not an explicit erasure request. Owner receipts survive.
+        fs::remove_dir_all(root.join("workspace-a")).unwrap();
         let manager = FeatureStorage::new(&root);
         let workspace = manager.workspace("workspace-a").unwrap();
         workspace.restore(&snapshot).unwrap();
@@ -1538,6 +2539,19 @@ mod tests {
             values(&workspace.open(&feature).unwrap()).unwrap(),
             ["snapshot-value"]
         );
+        workspace.delete().unwrap();
+        assert!(matches!(
+            workspace.restore(&snapshot),
+            Err(FeatureStorageError::ScopeMaintenance(_))
+        ));
+        let fresh = FeatureStorage::new(temp.path().join("fresh-target"));
+        assert!(matches!(
+            fresh
+                .scope("workspace-a")
+                .unwrap()
+                .restore_from(&snapshot, &workspace),
+            Err(FeatureStorageError::ScopeMaintenance(_))
+        ));
     }
 
     #[test]

@@ -10,9 +10,13 @@
 //! Removal reserves only its target under the Runtime state mutex, releasing it before
 //! filesystem/Git inspection and unlink; conflicting target use is rejected promptly.
 
+#[cfg(test)]
+mod controller_fixture;
 mod runtime_management_api;
+#[cfg(test)]
+mod workdir_close_tests;
 
-use crate::auth::{RuntimeAuthContext, new_token_id, unix_now_seconds};
+use crate::auth::{RuntimeAuthContext, unix_now_seconds};
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, RepositoryRefObservationRequest, WorkerDetail,
     WorkerLifecycleAck, WorkerSummary, WorkingDirectoryRepositoryAccessRequest,
@@ -253,6 +257,7 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
         local_token: local_token.map(Arc::<str>::from),
         workspace_auth: workspace_auth.map(Arc::new),
         workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
+        closed_workdir_sessions: Default::default(),
         ssh_keyscan_program: Arc::new(ssh_keyscan_program),
     };
 
@@ -364,6 +369,7 @@ struct RuntimeHttpState {
     local_token: Option<Arc<str>>,
     workspace_auth: Option<Arc<WorkspaceRuntimeHttpAuth>>,
     workdir_sessions: Arc<Mutex<HashMap<String, RuntimeHttpWorkdirSession>>>,
+    closed_workdir_sessions: Arc<Mutex<WorkdirSessionAdmission>>,
     ssh_keyscan_program: Arc<PathBuf>,
 }
 
@@ -373,9 +379,73 @@ pub struct WorkspaceRuntimeHttpAuth {
     pub runtime_id: String,
 }
 
+type RuntimeHttpWorkdirCloseResult = Result<(), RuntimeHttpWorkdirError>;
+
 struct RuntimeHttpWorkdirSession {
     owner: RuntimeWorkspaceScope,
     session: WorkdirSessionHandle,
+    owner_worker_id: Option<String>,
+    operations: Arc<tokio::sync::RwLock<()>>,
+    close_attempt: Option<tokio::sync::watch::Receiver<Option<RuntimeHttpWorkdirCloseResult>>>,
+}
+
+// Closed IDs protect unknown opens only within their admission window. A
+// nondecreasing clock prevents a wall-clock rollback from reviving pruned IDs.
+// Reserve receipt capacity at admission: closing a live session cannot fail just
+// because unknown DELETEs consumed the budget in the meantime.
+#[derive(Default)]
+struct WorkdirSessionAdmission {
+    clock_ms: u64,
+    receipts: HashMap<(RuntimeWorkspaceScope, String), (u64, bool)>,
+}
+
+impl WorkdirSessionAdmission {
+    const CAPACITY: usize = 16_384;
+
+    fn now(&mut self) -> u64 {
+        self.clock_ms = self.clock_ms.max(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        );
+        self.receipts
+            .retain(|_, (deadline, _)| *deadline >= self.clock_ms);
+        self.clock_ms
+    }
+
+    fn deadline(&mut self, id: &WorkdirSessionId) -> Option<u64> {
+        let now = self.now();
+        id.admitted_deadline_ms(now)
+    }
+
+    fn reserve(
+        &mut self,
+        owner: RuntimeWorkspaceScope,
+        id: &WorkdirSessionId,
+        closed: bool,
+    ) -> Result<(), RuntimeHttpWorkdirError> {
+        let Some(deadline) = self.deadline(id) else {
+            return if closed {
+                Ok(())
+            } else {
+                Err(RuntimeHttpWorkdirError::invalid_request())
+            };
+        };
+        let key = (owner, id.as_str().to_owned());
+        if !self.receipts.contains_key(&key) && self.receipts.len() >= Self::CAPACITY {
+            return Err(RuntimeHttpWorkdirError::from(
+                workdir::WorkdirError::Unavailable(
+                    "Workdir session admission is at capacity".into(),
+                ),
+            ));
+        }
+        self.receipts
+            .entry(key)
+            .and_modify(|(_, was_closed)| *was_closed |= closed)
+            .or_insert((deadline, closed));
+        Ok(())
+    }
 }
 
 /// `GET /v1/runtime` response.
@@ -518,11 +588,7 @@ pub type RuntimeHttpWorkerCompletionsRequest = runtime_api::CompletionRequest;
 pub type RuntimeHttpWorkerCompletionsResponse = runtime_api::CompletionResponse;
 
 /// Worker lifecycle request body used by stop/cancel endpoints.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeHttpWorkerLifecycleRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
+pub type RuntimeHttpWorkerLifecycleRequest = runtime_api::WorkerLifecycleRequest;
 
 /// Worker lifecycle acknowledgement response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,6 +607,8 @@ pub struct RuntimeHttpErrorResponse {
 pub struct RuntimeHttpErrorDetail {
     pub code: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<runtime_api::WorkerStartupFailure>,
 }
 
 #[cfg(feature = "ws-server")]
@@ -654,7 +722,7 @@ async fn observe_workspace_prompt_projection(
     state
         .runtime
         .observe_workspace_prompt_projection(request.projection)
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(RuntimeHttpRestError::runtime_control)?;
     Ok(Json(RuntimeHttpWorkspacePromptProjectionResponse {
         workspace_id,
         source_digest,
@@ -719,7 +787,12 @@ async fn authorize_working_directory_repository_access(
         .runtime
         .authorize_working_directory_repository_access_from_resource(request)
         .await
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(|error| {
+            RuntimeHttpRestError::runtime_workdir(
+                error,
+                workdir::management_failure::WorkdirManagementOperation::RepositoryAccess,
+            )
+        })?;
     Ok(Json(RuntimeHttpRepositoryAccessResponse {
         authorized: true,
     }))
@@ -785,7 +858,12 @@ async fn observe_repository_ref(
         .runtime
         .observe_repository_ref_from_resource(request)
         .await
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(|error| {
+            RuntimeHttpRestError::runtime_workdir(
+                error,
+                workdir::management_failure::WorkdirManagementOperation::RepositoryRef,
+            )
+        })?;
     Ok(Json(observation))
 }
 
@@ -797,7 +875,12 @@ async fn list_working_directories(
         tokio::task::spawn_blocking(move || state.runtime.list_working_directories())
             .await
             .map_err(RuntimeHttpRestError::working_directory_join)?
-            .map_err(RuntimeHttpRestError::runtime)?;
+            .map_err(|error| {
+                RuntimeHttpRestError::runtime_workdir(
+                    error,
+                    workdir::management_failure::WorkdirManagementOperation::List,
+                )
+            })?;
     Ok(Json(RuntimeHttpWorkingDirectoriesResponse {
         working_directories,
     }))
@@ -822,7 +905,12 @@ async fn create_working_directory(
         .runtime
         .create_working_directory_from_resource(request)
         .await
-        .map_err(RuntimeHttpRestError::runtime)?;
+        .map_err(|error| {
+            RuntimeHttpRestError::runtime_workdir(
+                error,
+                workdir::management_failure::WorkdirManagementOperation::Create,
+            )
+        })?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -836,7 +924,12 @@ async fn get_working_directory(
         tokio::task::spawn_blocking(move || state.runtime.working_directory(&working_directory_id))
             .await
             .map_err(RuntimeHttpRestError::working_directory_join)?
-            .map_err(RuntimeHttpRestError::runtime)?;
+            .map_err(|error| {
+                RuntimeHttpRestError::runtime_workdir(
+                    error,
+                    workdir::management_failure::WorkdirManagementOperation::Detail,
+                )
+            })?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -859,27 +952,63 @@ async fn open_workdir_session(
                 .ok_or_else(RuntimeHttpWorkdirError::invalid_request)
         })
         .transpose()?;
+    // Deadline validation and pruning share the admission fence with DELETE.
+    let mut closed = state
+        .closed_workdir_sessions
+        .lock()
+        .map_err(|_| RuntimeHttpWorkdirError::internal())?;
+    closed.now();
+    if closed
+        .receipts
+        .get(&(owner.clone(), request.session_id.as_str().to_owned()))
+        .is_some_and(|(_, closed)| *closed)
+    {
+        return Err(RuntimeHttpWorkdirError::not_found());
+    }
+    let mut sessions = state
+        .workdir_sessions
+        .lock()
+        .map_err(|_| RuntimeHttpWorkdirError::internal())?;
+    let session_id = request.session_id;
+    if let Some(record) = sessions.get(session_id.as_str()) {
+        if record.owner != owner
+            || record.session.workdir().id().as_str() != working_directory_id
+            || record.owner_worker_id != request.owner_worker_id
+            || record.close_attempt.is_some()
+        {
+            return Err(RuntimeHttpWorkdirError::not_found());
+        }
+        return Ok(Json(OpenWorkdirSessionResponse {
+            session_id,
+            workdir_id: record.session.workdir().id().clone(),
+            capabilities: record.session.capabilities(),
+            environment: record.session.environment(),
+        }));
+    }
+    closed.reserve(owner.clone(), &session_id, false)?;
     let session = state
         .runtime
         .open_workdir_session_scoped(&owner, &working_directory_id, owner_worker_ref.as_ref())
         .map_err(RuntimeHttpWorkdirError::runtime)?;
-    let session_id =
-        WorkdirSessionId::new(new_token_id().map_err(|_| RuntimeHttpWorkdirError::internal())?)
-            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
     let response = OpenWorkdirSessionResponse {
         session_id: session_id.clone(),
         workdir_id: session.workdir().id().clone(),
         capabilities: session.capabilities(),
         environment: session.environment(),
     };
-    state
-        .workdir_sessions
-        .lock()
-        .map_err(|_| RuntimeHttpWorkdirError::internal())?
-        .insert(
-            session_id.as_str().to_string(),
-            RuntimeHttpWorkdirSession { owner, session },
-        );
+    tracing::debug!(session_id = session_id.as_str(), workdir_id = %working_directory_id,
+        owner_worker_id = ?request.owner_worker_id, workspace_id = %owner.workspace_id,
+        "Runtime Workdir session retained");
+    sessions.insert(
+        session_id.as_str().to_owned(),
+        RuntimeHttpWorkdirSession {
+            owner,
+            session,
+            owner_worker_id: request.owner_worker_id,
+            operations: Default::default(),
+            close_attempt: None,
+        },
+    );
     Ok(Json(response))
 }
 
@@ -891,40 +1020,51 @@ async fn run_workdir_session_operation(
 ) -> Result<Json<WorkdirSessionOperationResult>, RuntimeHttpWorkdirError> {
     let Json(request) = body.map_err(|_| RuntimeHttpWorkdirError::invalid_request())?;
     let owner = required_workdir_owner(auth)?;
-    let source = {
+    let (source, _operation) = {
         let sessions = state
             .workdir_sessions
             .lock()
             .map_err(|_| RuntimeHttpWorkdirError::internal())?;
         let record = sessions
             .get(&session_id)
-            .filter(|record| record.owner == owner)
+            .filter(|record| record.owner == owner && record.close_attempt.is_none())
             .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
-        record.session.clone()
+        let operation = record
+            .operations
+            .clone()
+            .try_read_owned()
+            .map_err(|_| RuntimeHttpWorkdirError::not_found())?;
+        (record.session.clone(), operation)
     };
-    let session = source.as_ref();
-    let operation = request.operation;
+    let result = tokio::spawn(async move {
+        let session = source.as_ref();
+        let _operation = _operation;
+        let operation = request.operation;
 
-    let result = match operation {
-        WorkdirSessionOperation::CommandOutput(request) if request.wait => {
-            let cursor = request.cursor;
-            let output = match tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                session.command_output(request),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => CommandOutput {
-                    chunks: Vec::new(),
-                    next_cursor: cursor,
-                    terminal: None,
-                },
-            };
-            WorkdirSessionOperationResult::CommandOutput(output)
-        }
-        operation => dispatch_workdir_session_operation(session, operation).await?,
-    };
+        let result = match operation {
+            WorkdirSessionOperation::CommandOutput(request) if request.wait => {
+                let cursor = request.cursor;
+                let output = match tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    session.command_output(request),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => CommandOutput {
+                        chunks: Vec::new(),
+                        next_cursor: cursor,
+                        terminal: None,
+                    },
+                };
+                WorkdirSessionOperationResult::CommandOutput(output)
+            }
+            operation => dispatch_workdir_session_operation(session, operation).await?,
+        };
+        Ok::<_, RuntimeHttpWorkdirError>(result)
+    })
+    .await
+    .map_err(|_| RuntimeHttpWorkdirError::internal())??;
     Ok(Json(result))
 }
 
@@ -934,24 +1074,74 @@ async fn close_workdir_session(
     auth: Option<Extension<RuntimeAuthContext>>,
 ) -> Result<StatusCode, RuntimeHttpWorkdirError> {
     let owner = required_workdir_owner(auth)?;
-    let session = {
+    let mut completion = {
+        let mut closed = state
+            .closed_workdir_sessions
+            .lock()
+            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
         let mut sessions = state
             .workdir_sessions
             .lock()
             .map_err(|_| RuntimeHttpWorkdirError::internal())?;
-        if sessions
-            .get(&session_id)
-            .is_some_and(|record| record.owner == owner)
-        {
-            sessions.remove(&session_id).map(|record| record.session)
+        let Some(record) = sessions
+            .get_mut(&session_id)
+            .filter(|record| record.owner == owner)
+        else {
+            if let Ok(id) = WorkdirSessionId::new(session_id.clone()) {
+                closed.reserve(owner, &id, true)?;
+            }
+            return Ok(StatusCode::NO_CONTENT);
+        };
+        if let Some(completion) = &record.close_attempt {
+            completion.clone()
         } else {
-            None
+            let (result_tx, completion) = tokio::sync::watch::channel(None);
+            record.close_attempt = Some(completion.clone());
+            let session = record.session.clone();
+            let registry = state.workdir_sessions.clone();
+            let receipts = state.closed_workdir_sessions.clone();
+            let operations = record.operations.clone();
+            let owner = record.owner.clone();
+            // The task, not an HTTP waiter, owns provider teardown. In particular,
+            // Local close marks itself closed before awaiting command teardown;
+            // cancelling that future would make a later provider close a false ack.
+            tokio::spawn(async move {
+                let _operations = operations.write().await;
+                let result = session.close().await.map_err(RuntimeHttpWorkdirError::from);
+                let mut receipts = receipts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let result = match registry.lock() {
+                    Ok(mut sessions) => {
+                        if result.is_ok() {
+                            sessions.remove(&session_id);
+                            // Capacity was reserved at open. Expired IDs need no receipt.
+                            if let Ok(id) = WorkdirSessionId::new(session_id.clone()) {
+                                let _ = receipts.reserve(owner, &id, true);
+                            }
+                            tracing::debug!(session_id = %session_id, "Runtime Workdir provider close and use release confirmed");
+                        } else if let Some(record) = sessions.get_mut(&session_id) {
+                            record.close_attempt = None;
+                        }
+                        result
+                    }
+                    Err(_) => Err(RuntimeHttpWorkdirError::internal()),
+                };
+                result_tx.send_replace(Some(result));
+            });
+            completion
         }
     };
-    if let Some(session) = session {
-        session.close().await?;
+    loop {
+        if let Some(result) = completion.borrow_and_update().clone() {
+            result?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        completion
+            .changed()
+            .await
+            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
     }
-    Ok(StatusCode::NO_CONTENT)
 }
 
 fn required_workdir_owner(
@@ -980,7 +1170,12 @@ async fn cleanup_working_directory(
     })
     .await
     .map_err(RuntimeHttpRestError::working_directory_join)?
-    .map_err(RuntimeHttpRestError::runtime)?;
+    .map_err(|error| {
+        RuntimeHttpRestError::runtime_workdir(
+            error,
+            workdir::management_failure::WorkdirManagementOperation::Cleanup,
+        )
+    })?;
     Ok(Json(RuntimeHttpWorkingDirectoryResponse {
         working_directory,
     }))
@@ -1415,6 +1610,14 @@ fn authorize_runtime_protocol_method(
             message,
             ..
         } => protocol::Method::NotifyTracked {
+            receipt_scope: if matches!(
+                transport_source,
+                Some(protocol::AuthenticatedInputSource::Account { .. })
+            ) {
+                protocol::NotificationReceiptScope::BrowserConsole
+            } else {
+                protocol::NotificationReceiptScope::Source
+            },
             source: transport_source.cloned().unwrap_or_else(|| {
                 protocol::AuthenticatedInputSource::Backend {
                     operation_id: notification_request_id.clone(),
@@ -1854,8 +2057,8 @@ async fn stop_worker(
     let ack = match auth_workspace_scope(&state, auth.as_ref())? {
         Some(scope) => state
             .runtime
-            .stop_worker_scoped(&scope, &worker_ref, request.reason),
-        None => state.runtime.stop_worker(&worker_ref, request.reason),
+            .stop_worker_request_scoped(&scope, &worker_ref, request),
+        None => state.runtime.stop_worker_request(&worker_ref, request),
     }
     .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
@@ -1870,6 +2073,7 @@ async fn cancel_worker(
 ) -> RestResult<RuntimeHttpWorkerLifecycleResponse> {
     let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
     let request = parse_optional_lifecycle_request(body)?;
+    validate_cancel_request(&request)?;
     let ack = match auth_workspace_scope(&state, auth.as_ref())? {
         Some(scope) => state
             .runtime
@@ -1892,6 +2096,19 @@ fn worker_ref_for(
         )
     })?;
     Ok(WorkerRef::new(worker_id))
+}
+
+fn validate_cancel_request(
+    request: &runtime_api::WorkerLifecycleRequest,
+) -> Result<(), RuntimeHttpRestError> {
+    if request.stop_intent.is_some() {
+        return Err(RuntimeHttpRestError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "stop_intent is only valid for stop, not cancel",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_optional_lifecycle_request(
@@ -2102,10 +2319,18 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     {
         return Some("workers:input");
     }
-    if path == "/v1/subject-create-recovery" && *method == Method::POST {
+    if matches!(
+        path,
+        "/v1/subject-create-recovery"
+            | "/v1/subject-delete-worker"
+            | "/v1/subject-job-removal-purge"
+    ) && *method == Method::POST
+    {
         return Some("workers:delete");
     }
     if path.ends_with("/stop")
+        || path.ends_with("/stop/outcome")
+        || path.ends_with("/stop/admit")
         || path.ends_with("/cancel")
         || (path == "/v1/subject-release" && *method == Method::POST)
     {
@@ -2135,7 +2360,7 @@ fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static s
     None
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RuntimeHttpWorkdirError {
     status: StatusCode,
     payload: WorkdirTransportError,
@@ -2256,9 +2481,13 @@ impl IntoResponse for RuntimeHttpWorkdirError {
 
 #[derive(Debug)]
 struct RuntimeHttpRestError {
+    management: Option<workdir::management_failure::WorkdirManagementFailure>,
+    control: Option<protocol::control_failure::RuntimeControlCause>,
+    create_failure: Option<runtime_api::startup::WorkerCreateFailure>,
     status: StatusCode,
     code: String,
     message: String,
+    startup: Option<runtime_api::WorkerStartupFailure>,
 }
 
 impl RuntimeHttpRestError {
@@ -2267,13 +2496,82 @@ impl RuntimeHttpRestError {
             status,
             code: code.into(),
             message: message.into(),
+            startup: None,
+            control: None,
+            management: None,
+            create_failure: None,
         }
     }
 
     fn runtime(error: RuntimeError) -> Self {
+        // Working-directory refusal/cleanup classification is owned by that domain.
+        // Do not replace its existing 400/403/409/503 boundary with a generic control 502.
+        let control = if matches!(&error, RuntimeError::WorkingDirectory(_)) {
+            None
+        } else {
+            Some(error.control_cause())
+        };
         let status = status_for_runtime_error(&error);
         let code = code_for_runtime_error(&error);
-        Self::new(status, code, error.to_string())
+        let create_failure = error.create_failure();
+        let startup = match &error {
+            RuntimeError::WorkerExecutionRejected { result, .. } => startup_transfer(result),
+            _ => None,
+        };
+        let code = if startup.is_none() && control.is_some() {
+            error.control_cause().reason().to_owned()
+        } else {
+            code
+        };
+        let message = if let Some(startup) = &startup {
+            worker::startup_failure::internal_startup_failure_summary(&startup.primary).to_owned()
+        } else if control.is_some() {
+            error.control_cause().explanation().to_owned()
+        } else {
+            error.to_string()
+        };
+        Self {
+            status,
+            code,
+            message,
+            startup,
+            control,
+            management: None,
+            create_failure,
+        }
+    }
+
+    fn runtime_workdir(
+        error: RuntimeError,
+        operation: workdir::management_failure::WorkdirManagementOperation,
+    ) -> Self {
+        let management = match &error {
+            RuntimeError::WorkingDirectory(diagnostic) => diagnostic.reason.map(|reason| {
+                workdir::management_failure::WorkdirManagementFailure { operation, reason }
+            }),
+            _ => None,
+        };
+        let mut response = Self::runtime(error);
+        if let Some(cause) = management {
+            response.status = StatusCode::from_u16(cause.reason.runtime_http_status())
+                .expect("closed Runtime HTTP status");
+            response.management = Some(cause);
+        }
+        response
+    }
+
+    fn runtime_control(error: RuntimeError) -> Self {
+        let cause = error.control_cause();
+        // Select the public facts before constructing a transferable DTO. The
+        // problem adapter is not permission to retain raw paths/provider text in
+        // RuntimeApiError.error for another transport or direct typed caller.
+        let mut response = Self::new(
+            status_for_runtime_error(&error),
+            cause.reason(),
+            cause.explanation(),
+        );
+        response.control = Some(cause);
+        response
     }
 
     fn working_directory_join(_error: tokio::task::JoinError) -> Self {
@@ -2305,18 +2603,57 @@ impl RuntimeHttpRestError {
 
 impl IntoResponse for RuntimeHttpRestError {
     fn into_response(self) -> Response {
+        if let Some(failure) = self.create_failure {
+            return runtime_api::server_support::http_error_response(
+                self.status,
+                runtime_api::RuntimeApiError::new(self.status.as_u16(), self.code, self.message)
+                    .with_create_failure(failure),
+            );
+        }
+        if let Some(cause) = self.management {
+            return runtime_api::server_support::http_error_response(
+                self.status,
+                runtime_api::RuntimeApiError::new(self.status.as_u16(), self.code, self.message)
+                    .with_management(cause),
+            );
+        }
+        if self.startup.is_none() {
+            if let Some(cause) = self.control {
+                return api_macros_control_response(cause);
+            }
+        }
         let body = RuntimeHttpErrorResponse {
             error: RuntimeHttpErrorDetail {
                 code: self.code,
                 message: self.message,
+                startup: self.startup,
             },
         };
         (self.status, Json(body)).into_response()
     }
 }
 
+/// Explicit transfer mapping, not another execution/lifecycle result. HTTP request
+/// authentication has already established this internal Runtime caller's scope.
+fn startup_transfer(
+    result: &crate::execution::WorkerExecutionResult,
+) -> Option<runtime_api::WorkerStartupFailure> {
+    let primary = worker::startup_failure::reproject_internal_startup_failure(
+        result.startup_failure.as_ref()?,
+    )
+    .ok()?;
+    Some(runtime_api::WorkerStartupFailure {
+        primary,
+        secondary: result.secondary_failures.clone(),
+        resources: result.startup_resources,
+        persistence: result.startup_failure_persistence,
+        io_kind: result.startup_io_kind,
+    })
+}
+
 fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
     match error {
+        RuntimeError::WorkerCreateFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
@@ -2371,17 +2708,23 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         {
             StatusCode::NOT_FOUND
         }
-        RuntimeError::InvalidRequest(message)
-            if message.contains("already created with a different fingerprint") =>
-        {
-            StatusCode::CONFLICT
-        }
+        RuntimeError::WorkerCreateConflict { .. } => StatusCode::CONFLICT,
         RuntimeError::RuntimeStopped
+        | RuntimeError::RestoreObservationStale { .. }
         | RuntimeError::RestoreObservationConflict { .. }
+        | RuntimeError::RestoreAdmissionBusy { .. }
+        | RuntimeError::StopObservationConflict { .. }
+        | RuntimeError::StopRequestConflict { .. }
+        | RuntimeError::StopAdmissionBusy { .. }
+        | RuntimeError::WorkdirAttachmentsRequestConflict { .. }
+        | RuntimeError::WorkdirAttachmentsGenerationStale { .. }
         | RuntimeError::RuntimeStoreAlreadyOpen { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
-        | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
+        | RuntimeError::WorkerExecutionRejected { .. }
+        | RuntimeError::RecordingSourceUnavailable { .. }
+        | RuntimeError::RecordingOwnershipUnknown { .. }
+        | RuntimeError::RecordingExecutionUnconfirmed { .. } => StatusCode::CONFLICT,
         RuntimeError::WorkspaceOwnerMismatch { .. } => StatusCode::FORBIDDEN,
         RuntimeError::LimitTooLarge { .. }
         | RuntimeError::InvalidRequest(_)
@@ -2401,9 +2744,23 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
 
 fn code_for_runtime_error(error: &RuntimeError) -> String {
     match error {
+        RuntimeError::RecordingSourceUnavailable { .. } => "source_unavailable".to_string(),
+        RuntimeError::RecordingOwnershipUnknown { .. } => "ownership_unknown".to_string(),
+        RuntimeError::RecordingExecutionUnconfirmed { .. } => "execution_unconfirmed".to_string(),
         RuntimeError::RuntimeStopped => "runtime_stopped".to_string(),
+        RuntimeError::RestoreObservationStale { .. } => "restore_observation_stale".to_string(),
         RuntimeError::RestoreObservationConflict { .. } => {
             "restore_observation_conflict".to_string()
+        }
+        RuntimeError::RestoreAdmissionBusy { .. } => "restore_admission_busy".to_string(),
+        RuntimeError::StopObservationConflict { .. } => "stop_observation_conflict".to_string(),
+        RuntimeError::StopRequestConflict { .. } => "stop_request_conflict".to_string(),
+        RuntimeError::StopAdmissionBusy { .. } => "stop_admission_busy".to_string(),
+        RuntimeError::WorkdirAttachmentsRequestConflict { .. } => {
+            "workdir_attachments_request_conflict".to_string()
+        }
+        RuntimeError::WorkdirAttachmentsGenerationStale { .. } => {
+            "workdir_attachments_generation_stale".to_string()
         }
         RuntimeError::RuntimeStoreAlreadyOpen { .. } => "runtime_store_already_open".to_string(),
         RuntimeError::WorkerNotFound { .. } => "worker_not_found".to_string(),
@@ -2416,14 +2773,11 @@ fn code_for_runtime_error(error: &RuntimeError) -> String {
         RuntimeError::ExecutionBackendUnavailable { .. } => {
             "execution_backend_unavailable".to_string()
         }
+        RuntimeError::WorkerCreateFailed { .. } => "worker_create_failed".to_string(),
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected".to_string(),
         RuntimeError::WorkspaceOwnerMismatch { .. } => "workspace_owner_mismatch".to_string(),
         RuntimeError::LimitTooLarge { .. } => "limit_too_large".to_string(),
-        RuntimeError::InvalidRequest(message)
-            if message.contains("already created with a different fingerprint") =>
-        {
-            "worker_create_conflict".to_string()
-        }
+        RuntimeError::WorkerCreateConflict { .. } => "worker_create_conflict".to_string(),
         RuntimeError::InvalidRequest(_) => "invalid_request".to_string(),
         RuntimeError::WorkingDirectory(diagnostic) => diagnostic.code.clone(),
         RuntimeError::InvalidInitialInputKind { .. } => "invalid_initial_input_kind".to_string(),
@@ -2458,6 +2812,10 @@ pub enum RuntimeHttpServerError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "fs-store")]
+    mod attachment_operation_tests;
+    #[cfg(feature = "fs-store")]
+    mod attachment_sync_tests;
     mod command_transport_tests;
     mod runtime_workdir_failure_tests;
     #[cfg(feature = "fs-store")]
@@ -2485,6 +2843,46 @@ mod tests {
     use runtime_api::WorkerRestoreState;
     use sha2::Digest as _;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn recording_holds_preserve_problem_causes_without_private_source_details() {
+        for (error, code) in [
+            (
+                RuntimeError::RecordingSourceUnavailable {
+                    message: "source detail".into(),
+                },
+                "recording_source_unavailable",
+            ),
+            (
+                RuntimeError::RecordingOwnershipUnknown {
+                    message: "owner detail".into(),
+                },
+                "recording_ownership_unknown",
+            ),
+            (
+                RuntimeError::RecordingExecutionUnconfirmed {
+                    message: "execution detail".into(),
+                },
+                "recording_execution_unconfirmed",
+            ),
+        ] {
+            let response = RuntimeHttpRestError::runtime(error).into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/problem+json"
+            );
+            let bytes = to_bytes(response.into_body(), 16384).await.unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for private in ["source detail", "owner detail", "execution detail"] {
+                assert!(!text.contains(private));
+            }
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["yoi_failure"]["domain"], "runtime_control");
+            assert_eq!(body["yoi_failure"]["reason"], code);
+            assert_eq!(body["yoi_failure"]["details"], code);
+        }
+    }
 
     #[derive(Clone)]
     struct TestRuntimeAuthorizer(String);
@@ -2871,11 +3269,15 @@ mod tests {
             runtime: Runtime::new_memory(),
             local_token: None,
             workspace_auth: Some(Arc::new(workspace_test_auth(vec![trust.clone()]))),
+            closed_workdir_sessions: Default::default(),
             workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
                 "session-1".into(),
                 RuntimeHttpWorkdirSession {
                     owner: RuntimeWorkspaceScope::new("workspace-a", "https://backend.test"),
                     session,
+                    owner_worker_id: None,
+                    operations: Default::default(),
+                    close_attempt: None,
                 },
             )]))),
             ssh_keyscan_program: Arc::new(PathBuf::from("ssh-keyscan")),
@@ -2979,6 +3381,7 @@ mod tests {
             .unwrap()
             .expect("account source header must resolve");
         let wire = serde_json::to_string(&protocol::Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "notification-1".into(),
             message: "hello".into(),
             source: protocol::AuthenticatedInputSource::Account {
@@ -2991,9 +3394,11 @@ mod tests {
         assert!(matches!(
             authorize_runtime_protocol_method(decoded, Some(&source)),
             protocol::Method::NotifyTracked {
+                receipt_scope: protocol::NotificationReceiptScope::BrowserConsole,
+                notification_request_id,
                 source: protocol::AuthenticatedInputSource::Account { account_id },
                 ..
-            } if account_id == "account-1"
+            } if account_id == "account-1" && notification_request_id == "notification-1"
         ));
     }
 
@@ -3051,6 +3456,7 @@ mod tests {
         let profile = ProfileSelector::Builtin("builtin:coder".to_string());
         let bundle = test_bundle(profile.clone());
         CreateWorkerRequest {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
             profile,
@@ -3106,6 +3512,15 @@ mod tests {
 
     #[test]
     fn retention_routes_require_worker_delete_permission() {
+        for suffix in ["freeze", "capture"] {
+            assert_eq!(
+                required_runtime_permission(
+                    &Method::POST,
+                    &format!("/v1/workers/worker-1/retention/{suffix}")
+                ),
+                Some("workers:delete")
+            );
+        }
         assert_eq!(
             required_runtime_permission(&Method::GET, "/v1/workers/worker-1/retention/inventory",),
             Some("workers:delete")
@@ -3171,11 +3586,15 @@ mod tests {
             .expect("runtime"),
             local_token: Some(Arc::from("token")),
             workspace_auth: None,
+            closed_workdir_sessions: Default::default(),
             workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
                 "session-1".to_string(),
                 RuntimeHttpWorkdirSession {
                     owner: owner.clone(),
                     session: session.clone(),
+                    owner_worker_id: None,
+                    operations: Default::default(),
+                    close_attempt: None,
                 },
             )]))),
             ssh_keyscan_program: Arc::new(PathBuf::from("ssh-keyscan")),
@@ -3296,6 +3715,41 @@ mod tests {
         .expect_err("cross-workspace session access must fail");
         assert_eq!(error.status, StatusCode::NOT_FOUND);
 
+        for unauthorized in [
+            None,
+            Some(Extension(RuntimeAuthContext {
+                workspace_id: "workspace-b".into(),
+                ..auth.clone()
+            })),
+            Some(Extension(RuntimeAuthContext {
+                server_id: "server-b".into(),
+                ..auth.clone()
+            })),
+        ] {
+            let missing_auth = unauthorized.is_none();
+            let result =
+                close_workdir_session(State(state.clone()), Path("session-1".into()), unauthorized)
+                    .await;
+            if missing_auth {
+                assert_eq!(result.unwrap_err().status, StatusCode::FORBIDDEN);
+            } else {
+                assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
+            }
+            assert!(
+                state
+                    .workdir_sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key("session-1")
+            );
+            session
+                .stat(StatRequest {
+                    path: WorkdirPath::new("hello.txt").unwrap(),
+                })
+                .await
+                .expect("unauthorized close must not reach provider");
+        }
+
         assert_eq!(
             close_workdir_session(
                 State(state.clone()),
@@ -3331,7 +3785,72 @@ mod tests {
 
     struct AcceptingBackend;
 
+    impl AcceptingBackend {
+        fn fixture_stop_result(
+            request: crate::execution::WorkerExecutionStopRequest,
+        ) -> WorkerExecutionResult {
+            // Only execution is substituted in these HTTP/retention fixtures.
+            // Model its bound stop report explicitly; do not relax Runtime's
+            // production requirement or claim real Controller/Host coverage.
+            let execution_id =
+                uuid::Uuid::parse_str(&request.worker_ref.worker_id.to_string()).unwrap();
+            let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+            result.execution_id = Some(execution_id);
+            result.termination = Some(crate::execution::WorkerExecutionTermination {
+                scope: crate::execution::WorkerExecutionTerminationScope::Controller,
+                worker_ref: request.worker_ref,
+                stop_operation_id: request.operation_id,
+                execution_id,
+                shutdown_command_id: None,
+                submissions: Vec::new(),
+                feature_failures: Vec::new(),
+            });
+            result
+        }
+    }
+
     impl WorkerExecutionBackend for AcceptingBackend {
+        fn preflight_subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn fence_subject_delete_worker(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            // This replaces admission exclusion only, not scope termination.
+            Ok(())
+        }
+        fn confirm_subject_delete_worker_absent(
+            &self,
+            _request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> Result<(), String> {
+            // This stateless execution substitute owns no Controller or resources.
+            // Runtime separately checks its confirmed durable fence and originals;
+            // this boundary check supplies no historical termination evidence.
+            Ok(())
+        }
+        fn subject_delete_worker_stop(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+            stop: crate::execution::WorkerExecutionStopRequest,
+            canonical: Option<&crate::execution::WorkerExecutionTermination>,
+        ) -> Result<WorkerExecutionResult, String> {
+            if stop.worker_ref.worker_id != request.worker_id {
+                return Err("fixture Subject Stop Worker mismatch".into());
+            }
+            // Runtime supplies the original Stop child; canonical evidence must
+            // match that child unchanged, not be retagged for another operation.
+            Ok(self.reconcile_stop_worker_operation(stop, canonical))
+        }
         fn recover_subject_create(
             &self,
             _request: &runtime_api::SubjectCreateRecoveryRequest,
@@ -3390,20 +3909,89 @@ mod tests {
         fn stop_worker(&self, _worker_ref: &WorkerRef) -> WorkerExecutionResult {
             WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
         }
+
+        fn termination_receipt(
+            &self,
+            _worker_ref: &WorkerRef,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            // No receipt is retained by this unit fixture. Without a supplied
+            // original, deterministic construction alone is not Stop evidence.
+            Ok(None)
+        }
+
+        fn reconcile_termination_receipt(
+            &self,
+            worker_ref: &WorkerRef,
+            saved: &crate::execution::WorkerExecutionTermination,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            let expected =
+                Self::fixture_stop_result(crate::execution::WorkerExecutionStopRequest {
+                    worker_ref: worker_ref.clone(),
+                    operation_id: saved.stop_operation_id,
+                });
+            // Compare the whole bound fixture receipt, including scope, execution,
+            // shutdown command, submissions and Feature failures, not just IDs.
+            Ok(expected
+                .termination
+                .filter(|receipt| receipt == saved)
+                .map(|_| saved.clone()))
+        }
+
+        fn reconcile_stop_worker_operation(
+            &self,
+            request: crate::execution::WorkerExecutionStopRequest,
+            saved: Option<&crate::execution::WorkerExecutionTermination>,
+        ) -> WorkerExecutionResult {
+            let Some(saved) = saved else {
+                return self.stop_worker_operation(request);
+            };
+            let mut result = Self::fixture_stop_result(request);
+            if result.termination.as_ref() != Some(saved) {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "canonical Stop does not match the whole bound fixture receipt",
+                );
+            }
+            result.termination = Some(saved.clone());
+            result
+        }
+
+        fn stop_worker_operation(
+            &self,
+            request: crate::execution::WorkerExecutionStopRequest,
+        ) -> WorkerExecutionResult {
+            Self::fixture_stop_result(request)
+        }
     }
 
     #[cfg(feature = "fs-store")]
-    #[derive(Default)]
     struct RejectingRestoreBackend {
+        inner: Arc<super::controller_fixture::Backend>,
         restores: Mutex<Vec<WorkerRef>>,
         inputs: Mutex<Vec<WorkerRef>>,
-        stops: Mutex<Vec<WorkerRef>>,
+        stops: Mutex<Vec<crate::execution::WorkerExecutionStopRequest>>,
+        stop_results: Mutex<Vec<WorkerExecutionResult>>,
+        canonical_queries: Mutex<Vec<crate::execution::WorkerExecutionTermination>>,
+    }
+
+    #[cfg(feature = "fs-store")]
+    impl RejectingRestoreBackend {
+        fn new(inner: Arc<super::controller_fixture::Backend>) -> Self {
+            Self {
+                inner,
+                restores: Mutex::new(Vec::new()),
+                inputs: Mutex::new(Vec::new()),
+                stops: Mutex::new(Vec::new()),
+                stop_results: Mutex::new(Vec::new()),
+                canonical_queries: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     #[cfg(feature = "fs-store")]
     impl WorkerExecutionBackend for RejectingRestoreBackend {
         fn backend_id(&self) -> &str {
-            "http-test"
+            self.inner.backend_id()
         }
 
         fn spawn_worker(
@@ -3436,9 +4024,34 @@ mod tests {
             )
         }
 
-        fn stop_worker(&self, worker_ref: &WorkerRef) -> WorkerExecutionResult {
-            self.stops.lock().unwrap().push(worker_ref.clone());
-            WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop)
+        fn stop_worker_operation(
+            &self,
+            request: crate::execution::WorkerExecutionStopRequest,
+        ) -> WorkerExecutionResult {
+            self.stops.lock().unwrap().push(request.clone());
+            let result = self.inner.stop_worker_operation(request);
+            self.stop_results.lock().unwrap().push(result.clone());
+            result
+        }
+
+        fn stop_worker(&self, _worker_ref: &WorkerRef) -> WorkerExecutionResult {
+            panic!("HTTP lifecycle must retain its typed Stop operation");
+        }
+
+        fn termination_receipt(
+            &self,
+            worker_ref: &WorkerRef,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            self.inner.termination_receipt(worker_ref)
+        }
+
+        fn reconcile_termination_receipt(
+            &self,
+            worker_ref: &WorkerRef,
+            saved: &crate::execution::WorkerExecutionTermination,
+        ) -> Result<Option<crate::execution::WorkerExecutionTermination>, String> {
+            self.canonical_queries.lock().unwrap().push(saved.clone());
+            self.inner.reconcile_termination_receipt(worker_ref, saved)
         }
     }
 
@@ -3495,6 +4108,35 @@ mod tests {
     async fn read_json<T: for<'de> Deserialize<'de>>(response: Response) -> T {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn read_control_cause(
+        response: Response,
+    ) -> protocol::control_failure::RuntimeControlCause {
+        let status = response.status().as_u16();
+        let media = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(media, "application/problem+json");
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let error_contract::DecodeFailure::Known(failure) =
+            error_contract::problem::decode_problem_details::<
+                protocol::control_failure::RuntimeControlCause,
+            >(
+                &body,
+                status,
+                &media,
+                &runtime_api::control_failure::ControlBoundary,
+                error_contract::Budget::new(16384, 16384),
+            )
+        else {
+            panic!("HTTP response did not preserve its typed cause and actual metadata")
+        };
+        *failure.facts().cause()
     }
 
     #[tokio::test]
@@ -3621,13 +4263,80 @@ mod tests {
                 input.submission_request_id
             );
         }
-        client
-            .stop_worker(
+        let stop_request = runtime_api::WorkerLifecycleRequest {
+            reason: Some("generated fenced stop".into()),
+            stop_intent: Some(runtime_api::WorkerStopIntent {
+                expected_observation_token: client
+                    .get_worker(generated_worker_id.clone())
+                    .await
+                    .unwrap()
+                    .worker
+                    .restore_observation_token
+                    .unwrap(),
+                request_id: "generated-stop".into(),
+            }),
+        };
+        assert_eq!(
+            client
+                .worker_stop_outcome(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::NotFound
+        );
+        let invalid_cancel = client
+            .cancel_worker(generated_worker_id.clone(), stop_request.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(invalid_cancel, runtime_api::client_support::ClientError::Public { status, .. } if status == StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            client
+                .coordinate_worker_stop(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Pending
+        );
+        assert_eq!(
+            client
+                .coordinate_worker_stop(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Pending
+        );
+        assert_eq!(
+            client
+                .get_worker(generated_worker_id.clone())
+                .await
+                .unwrap()
+                .worker
+                .status,
+            runtime_api::WorkerStatus::Idle
+        );
+        let mut stop_receipt = client
+            .stop_worker(generated_worker_id.clone(), stop_request.clone())
+            .await
+            .unwrap()
+            .ack;
+        let cancelled = client
+            .cancel_worker(
                 generated_worker_id.clone(),
                 runtime_api::WorkerLifecycleRequest::default(),
             )
             .await
             .unwrap();
+        assert!(!cancelled.ack.replayed);
+        assert!(!stop_receipt.replayed);
+        stop_receipt.replayed = true; // Outcome and retry return historical evidence.
+        assert_eq!(
+            client
+                .worker_stop_outcome(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap(),
+            runtime_api::WorkerStopOutcome::Stopped {
+                ack: stop_receipt.clone()
+            }
+        );
         client
             .restore_worker(
                 generated_worker_id.clone(),
@@ -3645,6 +4354,32 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            client
+                .stop_worker(generated_worker_id.clone(), stop_request.clone())
+                .await
+                .unwrap()
+                .ack,
+            stop_receipt
+        );
+        assert_eq!(
+            client
+                .get_worker(generated_worker_id.clone())
+                .await
+                .unwrap()
+                .worker
+                .status,
+            runtime_api::WorkerStatus::Idle
+        );
+        let mut changed_stop = stop_request.clone();
+        changed_stop.reason = Some("different request input".into());
+        let conflict = client
+            .stop_worker(generated_worker_id.clone(), changed_stop)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(conflict, runtime_api::client_support::ClientError::Public { status, .. } if status == StatusCode::CONFLICT)
+        );
         let conflict = client.create_worker(conflicting_request).await.unwrap_err();
         assert!(
             matches!(
@@ -3793,14 +4528,17 @@ mod tests {
             request_id: "stale-http-restore".into(),
             preparation: None,
         };
-        let response =
-            authed_json_request(app.clone(), Method::POST, &restore_uri, token, &stale).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let conflict: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(conflict.error.code, "restore_observation_conflict");
+        let coordinate_uri = format!("{restore_uri}/coordinate");
+        for uri in [&restore_uri, &coordinate_uri] {
+            let response = authed_json_request(app.clone(), Method::POST, uri, token, &stale).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                read_control_cause(response).await,
+                protocol::control_failure::RuntimeControlCause::RestoreObservationStale
+            );
+        }
 
         let mut restore_request = runtime.test_restore_request(&created.worker.worker_ref);
-        let coordinate_uri = format!("{restore_uri}/coordinate");
         let mut coordination = runtime_api::WorkerRestoreCoordinationRequest {
             expected_observation_token: restore_request.expected_observation_token.clone(),
             request_id: restore_request.request_id.clone(),
@@ -3844,6 +4582,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let admitted: runtime_api::WorkerRestoreCoordinationResponse = read_json(response).await;
         assert!(admitted.result.is_none() && admitted.preparation.is_some());
+        let admitted_observation = runtime.worker_detail(&created.worker.worker_ref).unwrap();
+        let mut mismatched_owner = restore_request.clone();
+        mismatched_owner.expected_observation_token = "different-owner-input".into();
+        for uri in [&restore_uri, &coordinate_uri] {
+            let response =
+                authed_json_request(app.clone(), Method::POST, uri, token, &mismatched_owner).await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                read_control_cause(response).await,
+                protocol::control_failure::RuntimeControlCause::RestoreObservationConflict
+            );
+        }
+        assert_eq!(
+            runtime.worker_detail(&created.worker.worker_ref).unwrap(),
+            admitted_observation
+        );
         assert_eq!(
             runtime
                 .worker_detail(&created.worker.worker_ref)
@@ -3943,34 +4697,52 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[tokio::test]
-    async fn rest_saved_active_worker_restore_rejection_is_observable_and_can_be_stopped_removed() {
-        let temp = tempfile::tempdir().unwrap();
-        let options = crate::fs_store::FsRuntimeStoreOptions::new(temp.path().join("runtime"));
-        let runtime = Runtime::with_fs_store_and_execution_backend(
-            options.clone(),
-            Arc::new(AcceptingBackend),
-        )
-        .unwrap();
-        runtime
-            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
-                "builtin:coder".to_string(),
-            )))
+    async fn rest_saved_active_worker_restore_rejection_retains_unproven_stop_and_source() {
+        let mut fixture = super::controller_fixture::ControllerFixture::persisted();
+        let created = fixture.worker.clone();
+        let options =
+            crate::fs_store::FsRuntimeStoreOptions::new(fixture.root_path().join("runtime"))
+                .with_runtime_id("http-controller-fixture");
+        let mut input = WorkerInput::user("materialize the original saved Session");
+        input.submission_request_id = Some("http-cold-original".into());
+        fixture
+            .runtime()
+            .send_input(&created.worker_ref, input)
             .unwrap();
-        let mut request = task_request("saved active Worker");
-        request.workspace_api = Some(WorkspaceApiRef {
-            workspace_id: "local".to_string(),
-            base_url: "http://127.0.0.1:8787".to_string(),
-        });
-        let created = runtime
-            .create_worker_scoped(&RuntimeWorkspaceScope::new("local", "local-token"), request)
-            .unwrap();
-        assert_eq!(created.status, crate::catalog::WorkerStatus::Idle);
-        assert!(created.worker_state.is_some());
-        drop(runtime);
+        // Reclaim the actual seed Controller without saving a Runtime canonical
+        // Stop. The cold adapter must not infer this historical join from absence.
+        let raw_stop =
+            fixture
+                .backend()
+                .stop_worker_operation(crate::execution::WorkerExecutionStopRequest {
+                    worker_ref: created.worker_ref.clone(),
+                    operation_id: crate::execution::WorkerLifecycleOperationId::new(),
+                });
+        assert!(raw_stop.is_accepted(), "{raw_stop:?}");
+        super::controller_fixture::assert_real_termination(
+            &created.worker_ref,
+            raw_stop.termination.as_ref().unwrap(),
+        );
+        let saved_session = fixture.saved_session();
+        assert!(
+            fixture
+                .runtime()
+                .execution_termination(&created.worker_ref)
+                .unwrap()
+                .is_none()
+        );
+        fixture.assert_persisted_request(fixture.runtime());
+        fixture.close_catalog();
 
-        let backend = Arc::new(RejectingRestoreBackend::default());
+        let backend = Arc::new(RejectingRestoreBackend::new(fixture.empty_backend()));
+        assert!(
+            backend
+                .termination_receipt(&created.worker_ref)
+                .unwrap()
+                .is_none()
+        );
         let runtime =
-            Runtime::with_fs_store_and_execution_backend(options, backend.clone()).unwrap();
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
         // Startup attempted automatic restore without turning rejection into a
         // fabricated live Worker or silently changing its saved lifecycle status.
         assert_eq!(
@@ -4005,7 +4777,7 @@ mod tests {
             Method::POST,
             &format!("{worker_uri}/restore"),
             token,
-            &runtime.test_restore_request(&created.worker_ref),
+            &fixture.restore_request(&runtime),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -4030,8 +4802,28 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "worker_execution_rejected");
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let error_contract::DecodeFailure::Known(failure) =
+            error_contract::problem::decode_problem_details::<
+                protocol::control_failure::RuntimeControlCause,
+            >(
+                &body,
+                StatusCode::CONFLICT.as_u16(),
+                "application/problem+json",
+                &runtime_api::control_failure::ControlBoundary,
+                error_contract::Budget::new(16384, 16384),
+            )
+        else {
+            panic!("Input rejection must retain the owner-selected cause")
+        };
+        assert_eq!(
+            failure.facts().cause(),
+            &protocol::control_failure::RuntimeControlCause::ExecutionRejected
+        );
         assert_eq!(
             *backend.inputs.lock().unwrap(),
             vec![created.worker_ref.clone()]
@@ -4080,8 +4872,10 @@ mod tests {
         // even though automatic restore never connected a live execution.
         let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::InvalidRequest
+        );
         assert!(backend.stops.lock().unwrap().is_empty());
 
         let response = authed_empty_request(
@@ -4091,39 +4885,176 @@ mod tests {
             token,
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let stopped: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
-        assert_eq!(stopped.ack.worker_ref, created.worker_ref);
-        assert_eq!(stopped.ack.status, crate::catalog::WorkerStatus::Stopped);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(
-            *backend.stops.lock().unwrap(),
-            vec![created.worker_ref.clone()]
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::ExecutionRejected
+        );
+        let stops = backend.stops.lock().unwrap();
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0].worker_ref, created.worker_ref);
+        let original_stop_id = stops[0].operation_id;
+        drop(stops);
+        assert!(
+            backend
+                .stop_results
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|result| result.termination.is_none())
+        );
+        assert!(
+            runtime
+                .execution_termination(&created.worker_ref)
+                .unwrap()
+                .is_none()
         );
 
         let response = authed_empty_request(app.clone(), Method::GET, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::OK);
         let detail: RuntimeHttpWorkerResponse = read_json(response).await;
-        assert_eq!(detail.worker.status, crate::catalog::WorkerStatus::Stopped);
+        assert_ne!(detail.worker.status, crate::catalog::WorkerStatus::Stopped);
 
+        let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "pending unproven Stop must forbid removal"
+        );
+        assert_eq!(
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::InvalidRequest
+        );
+        assert_eq!(
+            backend.stops.lock().unwrap().len(),
+            1,
+            "DELETE must not mint a replacement Stop"
+        );
+        let record = runtime
+            .test_runtime_store()
+            .read_worker_record(&created.worker_ref)
+            .unwrap();
+        let crate::fs_store::PersistedWorkerExecutionState::ReconciliationRequired(
+            crate::fs_store::PersistedWorkerLifecycleOperation::Stop(pending),
+        ) = record.execution_state
+        else {
+            panic!("unproven Stop must retain its durable owner");
+        };
+        assert_eq!(pending.operation_id, original_stop_id);
+        assert_eq!(pending.request.as_ref().unwrap(), fixture.create_request());
+        let document: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                options
+                    .root
+                    .join("workers")
+                    .join(created.worker_id.to_string())
+                    .join("worker.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(document["restore_guard"]["execution_termination"].is_null());
+        assert_eq!(
+            fixture.saved_session(),
+            saved_session,
+            "cold refusal must preserve the original Session"
+        );
+        let response = authed_empty_request(app, Method::GET, &worker_uri, token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[tokio::test]
+    async fn rest_cold_stopped_worker_deletion_reuses_real_canonical_stop_without_launch() {
+        let mut fixture = super::controller_fixture::ControllerFixture::persisted();
+        let created = fixture.worker.clone();
+        let mut input = WorkerInput::user("persist a real Session before the canonical Stop");
+        input.submission_request_id = Some("http-canonical-original".into());
+        fixture
+            .runtime()
+            .send_input(&created.worker_ref, input)
+            .unwrap();
+        let token = "local-token";
+        let worker_uri = format!("/v1/workers/{}", created.worker_id);
+        let app = runtime_http_router(fixture.runtime().clone(), token.into());
+        let response = authed_empty_request(
+            app.clone(),
+            Method::POST,
+            &format!("{worker_uri}/stop"),
+            token,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stopped: RuntimeHttpWorkerLifecycleResponse = read_json(response).await;
+        assert_eq!(stopped.ack.status, crate::catalog::WorkerStatus::Stopped);
+        let original = fixture
+            .runtime()
+            .execution_termination(&created.worker_ref)
+            .unwrap()
+            .unwrap();
+        super::controller_fixture::assert_real_termination(&created.worker_ref, &original);
+        assert_eq!(
+            fixture
+                .backend()
+                .termination_receipt(&created.worker_ref)
+                .unwrap(),
+            Some(original.clone())
+        );
+        let saved_session = fixture.saved_session();
+        let options =
+            crate::fs_store::FsRuntimeStoreOptions::new(fixture.root_path().join("runtime"))
+                .with_runtime_id("http-controller-fixture");
+        drop(app);
+        fixture.assert_persisted_request(fixture.runtime());
+        fixture.close_catalog();
+        let backend = Arc::new(RejectingRestoreBackend::new(fixture.empty_backend()));
+        assert!(
+            backend
+                .termination_receipt(&created.worker_ref)
+                .unwrap()
+                .is_none()
+        );
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        let app = runtime_http_router(runtime.clone(), token.into());
+        assert_eq!(
+            runtime.worker_detail(&created.worker_ref).unwrap().status,
+            crate::catalog::WorkerStatus::Stopped
+        );
+        assert_eq!(
+            runtime.execution_termination(&created.worker_ref).unwrap(),
+            Some(original.clone())
+        );
+        fixture.assert_persisted_request(&runtime);
+        assert_eq!(fixture.saved_session(), saved_session);
         let response = authed_empty_request(app.clone(), Method::DELETE, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::OK);
         let removed: RuntimeHttpWorkerDeleteResponse = read_json(response).await;
         assert_eq!(removed.worker.worker_id, created.worker_id);
         assert!(removed.worker.deleted);
-        // Removal asks the backend to reconfirm shutdown even for a saved
-        // Stopped Worker; it must use the same WorkerRef as the original stop.
-        assert_eq!(
-            *backend.stops.lock().unwrap(),
-            vec![created.worker_ref.clone(), created.worker_ref.clone()]
+        assert!(
+            backend.restores.lock().unwrap().is_empty(),
+            "Stopped catalog must not launch a restore"
         );
         assert!(
-            !temp
-                .path()
-                .join("runtime/workers")
+            backend.stops.lock().unwrap().is_empty(),
+            "deletion must read the original Stop, not issue another"
+        );
+        assert!(
+            backend
+                .canonical_queries
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|saved| saved == &original)
+        );
+        assert!(
+            !options
+                .root
+                .join("workers")
                 .join(created.worker_id.to_string())
                 .exists()
         );
-
         let response = authed_empty_request(app, Method::GET, &worker_uri, token).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -4272,9 +5203,14 @@ mod tests {
             authed_empty_request(app, Method::GET, &format!("/v1/workers/{missing}"), token).await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let error: RuntimeHttpErrorResponse = read_json(response).await;
-        assert_eq!(error.error.code, "worker_not_found");
-        assert!(error.error.message.contains(&missing.to_string()));
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        let error: serde_json::Value = read_json(response).await;
+        assert_eq!(error["yoi_failure"]["reason"], "worker_missing");
+        assert_eq!(error["yoi_failure"]["details"], "worker_missing");
+        assert!(!error.to_string().contains(&missing.to_string()));
     }
 
     #[tokio::test]
@@ -4693,6 +5629,7 @@ mod tests {
         for (code, expected_status) in cases {
             let error = RuntimeError::WorkingDirectory(
                 crate::working_directory::WorkingDirectoryDiagnostic {
+                    reason: None,
                     code: code.to_string(),
                     message: "bounded diagnostic".to_string(),
                 },
@@ -5006,6 +5943,7 @@ mod ws_tests {
     fn ws_create_request() -> CreateWorkerRequest {
         let bundle = ws_test_bundle(ProfileSelector::Builtin("builtin:companion".to_string()));
         CreateWorkerRequest {
+            plugin_execution: None,
             worker_id: WorkerId::now_v7(),
             create_fingerprint: "test-create".to_string(),
             profile: ProfileSelector::Builtin("builtin:companion".to_string()),
@@ -5292,6 +6230,7 @@ mod ws_tests {
         let (mut stream, _) = connect_async(request).await.unwrap();
         let _ = next_frame(&mut stream).await;
         let notification = protocol::Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "notification-1".into(),
             message: "hello".into(),
             source: protocol::AuthenticatedInputSource::Account {
@@ -5341,42 +6280,7 @@ mod ws_tests {
         ));
     }
 
-    #[tokio::test]
-    async fn protocol_ws_stop_closes_old_stream_and_restore_requires_new_connection() {
-        let (runtime, backend, worker_ref, url) = spawn_runtime_server().await;
-        let (mut old_stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
-        let _ = next_frame(&mut old_stream).await;
-        runtime.stop_worker(&worker_ref, None).unwrap();
-        runtime
-            .restore_worker(&worker_ref, runtime.test_restore_request(&worker_ref))
-            .unwrap();
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDelta {
-                text: "new execution".into(),
-            },
-        );
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), old_stream.next())
-            .await
-            .expect("the old protocol connection must close on stop");
-        assert!(matches!(closed, Some(Ok(Message::Close(_))) | None));
-
-        let (mut new_stream, _) = connect_async(authed_ws_request(&url)).await.unwrap();
-        assert!(matches!(
-            next_frame(&mut new_stream).await,
-            protocol::Event::Snapshot { .. }
-        ));
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDone {
-                text: "restored execution".into(),
-            },
-        );
-        assert!(matches!(
-            next_frame(&mut new_stream).await,
-            protocol::Event::TextDone { text } if text == "restored execution"
-        ));
-    }
+    include!("http_server/controller_ws_tests.rs");
 
     #[tokio::test]
     async fn protocol_ws_cursor_resume_is_duplicate_safe_and_filters_workers() {
@@ -5415,43 +6319,6 @@ mod ws_tests {
     }
 
     #[tokio::test]
-    async fn protocol_ws_old_cursor_never_replays_stopped_execution_after_new_snapshot() {
-        let (runtime, backend, worker_ref, url) = spawn_runtime_server().await;
-        let old = backend.publish(
-            &worker_ref,
-            protocol::Event::TextDelta {
-                text: "old cursor".into(),
-            },
-        );
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDone {
-                text: "old output".into(),
-            },
-        );
-        backend.publish(&worker_ref, protocol::Event::Shutdown);
-        runtime.stop_worker(&worker_ref, None).unwrap();
-        runtime
-            .restore_worker(&worker_ref, runtime.test_restore_request(&worker_ref))
-            .unwrap();
-        let resume_url = format!("{url}?cursor={}", old.cursor);
-        let (mut stream, _) = connect_async(authed_ws_request(&resume_url)).await.unwrap();
-        assert!(matches!(
-            next_frame(&mut stream).await,
-            protocol::Event::Snapshot { .. }
-        ));
-        backend.publish(
-            &worker_ref,
-            protocol::Event::TextDone {
-                text: "new output".into(),
-            },
-        );
-        assert!(
-            matches!(next_frame(&mut stream).await, protocol::Event::TextDone { text } if text == "new output")
-        );
-    }
-
-    #[tokio::test]
     async fn protocol_ws_reports_malformed_cursor_and_method_frame() {
         let (_runtime, _backend, _worker_ref, url) = spawn_runtime_server().await;
         let malformed_url = format!("{url}?cursor=bad");
@@ -5471,4 +6338,10 @@ mod ws_tests {
             protocol::Event::Error { .. }
         ));
     }
+}
+
+fn api_macros_control_response(cause: protocol::control_failure::RuntimeControlCause) -> Response {
+    let error = runtime_api::RuntimeApiError::new(500, cause.reason(), cause.explanation())
+        .with_control(cause);
+    runtime_api::server_support::http_error_response(StatusCode::INTERNAL_SERVER_ERROR, error)
 }

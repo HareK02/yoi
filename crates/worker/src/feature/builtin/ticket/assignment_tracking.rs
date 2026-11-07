@@ -79,7 +79,7 @@ pub(super) fn description(name: &str) -> &'static str {
             "Read bounded immutable history for one assignment_id, including released/replaced delegations. Continue with the returned event identity. Historical results do not grant execution rights or create a new request."
         }
         "TicketAssignmentTrackingUpdate" => {
-            "Record the current Workspace Orchestrator's self-reported handling of one delegation with assignment_id, observed last_event_id CAS and an exact-retry operation key. Direct waiting-to-done and post-close result recording are allowed. Answers during waiting continue the same row; explicit reissue after done requires a new Assign row, not overwriting the previous result. Send the complete tracking payload. Exact retry uses the same operation_key and full input; different input with that key is rejected. On CAS/stale conflict reread current authority and reconcile; unknown outcome is not success or failure and must not become a fresh operation automatically. Backend authenticates the current registered Orchestrator; model role names never authorize. This neither closes/reopens the Ticket, releases actual work, restores grants, starts/stops Workers nor approves/merges MRs. Released/replaced assignments reject new updates; exact retry receipts are not fresh observations."
+            "Record the current assigned Subject's self-reported handling of one delegation with assignment_id, observed last_event_id CAS and an exact-retry operation key. Direct waiting-to-done and post-close result recording are allowed. Answers during waiting continue the same row; explicit reissue after done requires a new Assign row, not overwriting the previous result. Send the complete tracking payload. Exact retry uses the same operation_key and full input; different input with that key is rejected. On CAS/stale conflict reread current authority and reconcile; unknown outcome is not success or failure and must not become a fresh operation automatically. Backend authenticates the current Subject body; model role names never authorize. This neither closes/reopens the Ticket, releases actual work, restores grants, starts/stops Workers nor approves/merges MRs. Released/replaced assignments reject new updates; exact retry receipts are not fresh observations."
         }
         _ => unreachable!("unknown assignment tracking tool"),
     }
@@ -107,119 +107,238 @@ fn encode_segment(value: &str) -> String {
         .collect()
 }
 
+pub(super) fn authorize_ticket_target(
+    client: &dyn WorkspaceClient,
+    operation: &str,
+    ticket_id: &str,
+) -> Result<(), ToolError> {
+    let workspace_id = client
+        .workspace_id()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidArgument(
+                "Ticket authorization requires Backend Workspace identity".into(),
+            )
+        })?;
+    client
+        .authorize_operation(
+            operation,
+            &server_api::authorization::PermissionResource::Ticket {
+                workspace_id: workspace_id.into(),
+                ticket_id: ticket_id.into(),
+            },
+        )
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))
+}
+
 #[derive(Clone)]
 struct TrackingTool {
     client: Arc<dyn WorkspaceClient>,
     kind: TrackingToolKind,
 }
 
+// Internal command DTOs belong to the shared execution boundary, not a native schema.
+enum Command {
+    Query(QueryInput),
+    History(HistoryInput),
+    Update(UpdateInput),
+}
+
+impl Command {
+    fn kind(&self) -> TrackingToolKind {
+        match self {
+            Self::Query(..) => TrackingToolKind::Query,
+            Self::History(..) => TrackingToolKind::History,
+            Self::Update(..) => TrackingToolKind::Update,
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for TrackingTool {
-    async fn execute(&self, input: &str, _: ToolExecutionContext) -> Result<ToolOutput, ToolError> {
-        let workspace = self
-            .client
-            .workspace_id()
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| {
-                ToolError::InvalidArgument(
-                    "Assignment tracking requires Backend Workspace identity; no local fallback"
-                        .into(),
-                )
-            })?;
-        let prefix = format!("/workspaces/{}/tickets", encode_segment(workspace));
-        let parse_error = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
-        let (method, path, body) = match self.kind {
-            TrackingToolKind::Query => {
-                let input: QueryInput = serde_json::from_str(input).map_err(parse_error)?;
-                required("ticket", &input.ticket)?;
-                let mut path = format!(
+    async fn execute(
+        &self,
+        input: &str,
+        ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let command = match self.kind {
+            TrackingToolKind::Query => Command::Query(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            TrackingToolKind::History => Command::History(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+            TrackingToolKind::Update => Command::Update(
+                serde_json::from_str(input)
+                    .map_err(|error| ToolError::InvalidArgument(error.to_string()))?,
+            ),
+        };
+        execute_domain(self.client.clone(), command, ctx).await
+    }
+}
+
+/// Preserve the regular Tool presentation for internal callers.
+#[cfg(test)]
+pub(super) async fn execute_native(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    ctx: ToolExecutionContext,
+) -> Option<Result<ToolOutput, ToolError>> {
+    execute_native_value(client, tool_name, command, ctx)
+        .await
+        .map(|result| result.map(|content| tool_output(tool_name, content)))
+}
+
+/// Return the shared domain projection before Tool presentation serialization.
+pub(super) async fn execute_native_value(
+    client: Arc<dyn WorkspaceClient>,
+    tool_name: &str,
+    command: Value,
+    ctx: ToolExecutionContext,
+) -> Option<Result<Value, ToolError>> {
+    let parse = |error: serde_json::Error| ToolError::InvalidArgument(error.to_string());
+    let command = match tool_name {
+        "TicketAssignmentTrackingQuery" => serde_json::from_value(command).map(Command::Query),
+        "TicketAssignmentTrackingHistory" => serde_json::from_value(command).map(Command::History),
+        "TicketAssignmentTrackingUpdate" => serde_json::from_value(command).map(Command::Update),
+        _ => return None,
+    };
+    Some(match command {
+        Ok(command) => execute_value(client, command, ctx).await,
+        Err(error) => Err(parse(error)),
+    })
+}
+
+async fn execute_domain(
+    client: Arc<dyn WorkspaceClient>,
+    command: Command,
+    ctx: ToolExecutionContext,
+) -> Result<ToolOutput, ToolError> {
+    let name = command.kind().name();
+    execute_value(client, command, ctx)
+        .await
+        .map(|content| tool_output(name, content))
+}
+
+fn tool_output(name: &str, content: Value) -> ToolOutput {
+    ToolOutput {
+        summary: name.into(),
+        content: Some(content.to_string()),
+        attachments: vec![],
+    }
+}
+
+async fn execute_value(
+    client: Arc<dyn WorkspaceClient>,
+    command: Command,
+    _ctx: ToolExecutionContext,
+) -> Result<Value, ToolError> {
+    let kind = command.kind();
+    let workspace = client
+        .workspace_id()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            ToolError::InvalidArgument(
+                "Assignment tracking requires Backend Workspace identity; no local fallback".into(),
+            )
+        })?;
+    let prefix = format!("/workspaces/{}/tickets", encode_segment(workspace));
+    let (method, path, body, ticket_id) = match command {
+        Command::Query(input) => {
+            required("ticket", &input.ticket)?;
+            let mut path = format!(
+                "{prefix}/{}/assignment-tracking",
+                encode_segment(&input.ticket)
+            );
+            if let Some(assignment_id) = input.assignment_id {
+                required("assignment_id", &assignment_id)?;
+                path.push_str(&format!(
+                    "?assignment_id={}",
+                    encode_segment(&assignment_id)
+                ));
+            }
+            (WorkspaceRequestMethod::Get, path, None, input.ticket)
+        }
+        Command::History(input) => {
+            required("ticket", &input.ticket)?;
+            required("assignment_id", &input.assignment_id)?;
+            let limit = input.limit.unwrap_or(100);
+            if !(1..=100).contains(&limit) {
+                return Err(ToolError::InvalidArgument(
+                    "limit must be between 1 and 100".into(),
+                ));
+            }
+            let mut path = format!(
+                "{prefix}/{}/assignment-tracking/history?assignment_id={}&limit={limit}",
+                encode_segment(&input.ticket),
+                encode_segment(&input.assignment_id)
+            );
+            if let Some(after) = input.after_event_id {
+                required("after_event_id", &after)?;
+                path.push_str(&format!("&after_event_id={}", encode_segment(&after)));
+            }
+            (WorkspaceRequestMethod::Get, path, None, input.ticket)
+        }
+        Command::Update(input) => {
+            for (name, value) in [
+                ("ticket", &input.ticket),
+                ("assignment_id", &input.assignment_id),
+                ("expected_last_event_id", &input.expected_last_event_id),
+                ("operation_key", &input.operation_key),
+            ] {
+                required(name, value)?;
+            }
+            // Unknown fields (including author, role, runtime and worker) are
+            // rejected before transport; authenticated context belongs to Backend.
+            let body = json!({"assignment_id": input.assignment_id, "expected_last_event_id": input.expected_last_event_id, "operation_key": input.operation_key, "tracking": input.tracking});
+            (
+                WorkspaceRequestMethod::Post,
+                format!(
                     "{prefix}/{}/assignment-tracking",
                     encode_segment(&input.ticket)
-                );
-                if let Some(assignment_id) = input.assignment_id {
-                    required("assignment_id", &assignment_id)?;
-                    path.push_str(&format!(
-                        "?assignment_id={}",
-                        encode_segment(&assignment_id)
-                    ));
-                }
-                (WorkspaceRequestMethod::Get, path, None)
-            }
-            TrackingToolKind::History => {
-                let input: HistoryInput = serde_json::from_str(input).map_err(parse_error)?;
-                required("ticket", &input.ticket)?;
-                required("assignment_id", &input.assignment_id)?;
-                let limit = input.limit.unwrap_or(100);
-                if !(1..=100).contains(&limit) {
-                    return Err(ToolError::InvalidArgument(
-                        "limit must be between 1 and 100".into(),
-                    ));
-                }
-                let mut path = format!(
-                    "{prefix}/{}/assignment-tracking/history?assignment_id={}&limit={limit}",
-                    encode_segment(&input.ticket),
-                    encode_segment(&input.assignment_id)
-                );
-                if let Some(after) = input.after_event_id {
-                    required("after_event_id", &after)?;
-                    path.push_str(&format!("&after_event_id={}", encode_segment(&after)));
-                }
-                (WorkspaceRequestMethod::Get, path, None)
-            }
-            TrackingToolKind::Update => {
-                let input: UpdateInput = serde_json::from_str(input).map_err(parse_error)?;
-                for (name, value) in [
-                    ("ticket", &input.ticket),
-                    ("assignment_id", &input.assignment_id),
-                    ("expected_last_event_id", &input.expected_last_event_id),
-                    ("operation_key", &input.operation_key),
-                ] {
-                    required(name, value)?;
-                }
-                // Unknown fields (including author, role, runtime and worker) are
-                // rejected before transport; authenticated context belongs to Backend.
-                let body = json!({"assignment_id": input.assignment_id, "expected_last_event_id": input.expected_last_event_id, "operation_key": input.operation_key, "tracking": input.tracking});
-                (
-                    WorkspaceRequestMethod::Post,
-                    format!(
-                        "{prefix}/{}/assignment-tracking",
-                        encode_segment(&input.ticket)
-                    ),
-                    Some(body.to_string()),
-                )
-            }
-        };
-        let request = match body {
-            Some(body) => WorkspaceRequest::json(method, path, body),
-            None => WorkspaceRequest::get(path),
-        };
-        let response = self
-            .client
-            .execute(request)
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if !response.is_success() {
-            let detail: String = response.body.chars().take(1024).collect();
-            return Err(ToolError::ExecutionFailed(format!(
-                "Assignment tracking request failed with HTTP status {}: {}",
-                response.status, detail
-            )));
+                ),
+                Some(body.to_string()),
+                input.ticket,
+            )
         }
-        if response.body.len() > 1024 * 1024 {
-            return Err(ToolError::ExecutionFailed(
-                "Assignment tracking response exceeds 1 MiB; request a smaller history page".into(),
-            ));
-        }
-        let content: Value = serde_json::from_str(&response.body).map_err(|error| {
-            ToolError::ExecutionFailed(format!(
-                "Backend returned invalid assignment tracking JSON: {error}"
-            ))
-        })?;
-        Ok(ToolOutput {
-            summary: self.kind.name().into(),
-            content: Some(content.to_string()),
-            attachments: Vec::new(),
-        })
+    };
+    let request = match body {
+        Some(body) => WorkspaceRequest::json(method, path, body),
+        None => WorkspaceRequest::get(path),
+    };
+    authorize_ticket_target(
+        client.as_ref(),
+        match kind {
+            TrackingToolKind::Query => "ticket.assignment.query",
+            TrackingToolKind::History => "ticket.assignment.history",
+            TrackingToolKind::Update => "ticket.assignment.update",
+        },
+        &ticket_id,
+    )?;
+    let response = client
+        .execute(request)
+        .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
+    if !response.is_success() {
+        let detail: String = response.body.chars().take(1024).collect();
+        return Err(ToolError::ExecutionFailed(format!(
+            "Assignment tracking request failed with HTTP status {}: {}",
+            response.status, detail
+        )));
     }
+    if response.body.len() > 1024 * 1024 {
+        return Err(ToolError::ExecutionFailed(
+            "Assignment tracking response exceeds 1 MiB; request a smaller history page".into(),
+        ));
+    }
+    let content: Value = serde_json::from_str(&response.body).map_err(|error| {
+        ToolError::ExecutionFailed(format!(
+            "Backend returned invalid assignment tracking JSON: {error}"
+        ))
+    })?;
+    Ok(content)
 }
 
 pub(super) fn definition(
@@ -240,6 +359,9 @@ pub(super) fn definition(
 }
 
 #[cfg(test)]
+pub(super) mod authorization_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::worker::{WorkspaceClientError, WorkspaceResponse};
@@ -251,6 +373,13 @@ mod tests {
         requests: Mutex<Vec<WorkspaceRequest>>,
     }
     impl WorkspaceClient for Transport {
+        fn authorize_operation(
+            &self,
+            _: &str,
+            _: &server_api::authorization::PermissionResource,
+        ) -> Result<(), WorkspaceClientError> {
+            Ok(())
+        }
         fn workspace_id(&self) -> Option<&str> {
             self.workspace.as_deref()
         }
@@ -272,6 +401,7 @@ mod tests {
         Arc::new(Transport {
             workspace: Some("workspace".into()),
             response: WorkspaceResponse {
+                content_type: None,
                 status,
                 body: body.into(),
             },
@@ -421,6 +551,7 @@ mod tests {
         let client = Arc::new(Transport {
             workspace: None,
             response: WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{}".into(),
             },
@@ -467,5 +598,108 @@ mod tests {
         assert!(reads.contains(&"TicketAssignmentTrackingQuery"));
         assert!(reads.contains(&"TicketAssignmentTrackingHistory"));
         assert!(!reads.contains(&"TicketAssignmentTrackingUpdate"));
+    }
+}
+
+#[cfg(test)]
+mod native_command_tests {
+    use super::authorization_tests::{AuthorizedClient, ticket};
+    use super::*;
+
+    #[tokio::test]
+    async fn internal_tracking_commands_share_authorization_and_full_cas_payload_with_tools() {
+        for (kind, operation, input) in [
+            (
+                TrackingToolKind::Query,
+                "ticket.assignment.query",
+                json!({"ticket":"T-A", "assignment_id":"old/delegation?"}),
+            ),
+            (
+                TrackingToolKind::History,
+                "ticket.assignment.history",
+                json!({"ticket":"T-A", "assignment_id":"a", "after_event_id":"event/7?", "limit":5}),
+            ),
+            (
+                TrackingToolKind::Update,
+                "ticket.assignment.update",
+                json!({"ticket":"T-A", "assignment_id":"a", "expected_last_event_id":"observed", "operation_key":"stable", "tracking":{"status":"done", "waiting_reason":null, "progress":"Compared", "next_action":null, "result":"Returned"}}),
+            ),
+        ] {
+            let client =
+                AuthorizedClient::new(json!({"assignment_id":"a", "last_event_id":"next"}));
+            assert!(
+                execute_native(
+                    client.clone(),
+                    kind.name(),
+                    input.clone(),
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert!(client.requests.lock().unwrap().is_empty());
+            client.grant(operation, ticket("T-A"));
+            let (_, tool) = definition(client.clone(), kind)();
+            let ordinary = tool
+                .execute(&input.to_string(), ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            let native = execute_native(
+                client.clone(),
+                kind.name(),
+                input.clone(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let value = execute_native_value(
+                client.clone(),
+                kind.name(),
+                input.clone(),
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                value,
+                serde_json::from_str::<Value>(ordinary.content.as_deref().unwrap()).unwrap()
+            );
+            assert_eq!(native.content, ordinary.content);
+            assert_eq!(native.summary, ordinary.summary);
+            assert_eq!(ordinary.summary, kind.name());
+            assert!(native.attachments.is_empty());
+            assert_eq!(client.requests.lock().unwrap().len(), 3);
+            {
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests[0], requests[1]);
+                assert_eq!(requests[1], requests[2]);
+            }
+            client.grants.lock().unwrap().clear();
+            assert!(
+                execute_native_value(
+                    client.clone(),
+                    kind.name(),
+                    input,
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            assert_eq!(client.requests.lock().unwrap().len(), 3);
+            assert!(
+                execute_native_value(
+                    client,
+                    "Unknown",
+                    Value::Null,
+                    ToolExecutionContext::direct()
+                )
+                .await
+                .is_none()
+            );
+        }
     }
 }

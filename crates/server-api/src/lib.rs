@@ -1,4 +1,6 @@
 #![doc = include_str!("../README.md")]
+mod worker_create_error;
+pub use worker_create_error::WorkerCreateApiError;
 
 use std::collections::BTreeMap;
 
@@ -7,9 +9,48 @@ pub use api_macros::axum as server_support;
 pub use api_macros::reqwest as client_support;
 pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, WebSocketOperation};
 pub mod authorization;
+mod configuration_error;
+pub mod configuration_failure;
+pub use configuration_error::ConfigurationApiError;
+mod repository_error;
+pub mod repository_failure;
+pub use repository_error::RepositoryBoundary;
+mod repository_access_error;
+pub mod repository_access_failure;
+pub use repository_access_error::RepositoryAccessApiError;
+mod chat;
+pub mod configuration_adoption;
+pub mod configuration_publication;
+pub use configuration_publication::*;
+pub mod feature_permissions;
+pub use chat::*;
+pub use configuration_adoption::*;
+mod subject_body;
+pub use subject_body::*;
+mod chat_transport;
+pub use chat_transport::*;
 mod drive;
+mod workdir_error;
+pub mod workdir_management_error;
+pub use workdir_error::{WorkdirHttpApiError, WorkdirHttpBoundary};
+pub use workdir_management_error::WorkdirManagementApiError;
+mod drive_error;
+pub mod drive_failure;
+pub use drive_error::{DriveHttpApiError, DriveHttpBoundary};
+pub use drive_failure::{DriveHttpFailureDetails, DriveHttpFailureVisibility, DriveHttpOperation};
 mod notification;
+mod plugin;
+pub mod plugin_data;
+pub mod plugin_host;
+pub mod plugin_service;
+pub use plugin_data::*;
+pub use plugin_service::*;
+mod plugin_types;
 pub use notification::*;
+pub use plugin::*;
+pub use plugin_host::*;
+#[cfg(feature = "typescript")]
+pub use plugin_types::{plugin_api_typescript, plugin_host_typescript};
 mod ticket_browse;
 pub use ticket_browse::*;
 pub mod repository_openapi_typescript;
@@ -29,6 +70,8 @@ pub use workspace_config::*;
 #[serde(deny_unknown_fields)]
 pub struct SubjectPermissionsResponse {
     pub permissions: Option<authorization::SubjectPermissions>,
+    pub can_manage: bool,
+    pub operations: Vec<authorization::PermissionOperationDescriptor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -57,19 +100,81 @@ pub struct SubjectPermissionInterruption {
 struct ServerJsonSafeU64(#[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))] u64);
 type JsonSafeU64Pair = [ServerJsonSafeU64; 2];
 
+pub use runtime_api::control_failure;
+
 pub type ServerApiError = runtime_api::RuntimeApiError;
 pub type ServerApiClientError = client_support::ClientError<ServerApiError>;
 
 /// Error body shared by the existing repository routes and their generated adapters.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RepositoryApiError {
+    #[serde(skip)]
+    repository: Option<repository_failure::RepositoryFailureDetails>,
+    #[serde(skip)]
+    repository_problem: Option<Vec<u8>>,
+    #[serde(skip)]
+    control: Option<protocol::control_failure::RuntimeControlCause>,
     pub error: String,
     pub message: String,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
+    /// An origin-projected error-contract attachment, not raw HTTP error text.
+    /// Receiving it does not authorize redisclosure to a different audience.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<protocol::startup_failure::StartupFailureAttachment>,
     #[serde(skip, default = "default_repository_error_status")]
     status: u16,
+}
+
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct RepositoryProblemPublicationSchema {
+    #[schemars(rename = "type", length(max = 2048))]
+    type_uri: String,
+    #[schemars(length(min = 1, max = 2048))]
+    title: String,
+    #[schemars(range(min = 400, max = 599))]
+    status: u16,
+    #[schemars(length(min = 1, max = 2048))]
+    detail: String,
+    #[schemars(length(max = 2048))]
+    instance: String,
+    yoi_failure: error_contract::codec::FailureEnvelope<RepositoryProblemCauseSchema>,
+}
+
+// The details owners have exclusive wire shapes, rather than two overlapping
+// Problem objects: Repository is a closed object and control is a string enum.
+struct RepositoryProblemCauseSchema;
+impl JsonSchema for RepositoryProblemCauseSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RepositoryProblemCauseSchema".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"oneOf": [
+            repository_failure::RepositoryFailureDetails::json_schema(generator),
+            protocol::control_failure::RuntimeControlCause::json_schema(generator)
+        ]})
+    }
+}
+impl api_macros::openapi::OpenApiSchema for RepositoryProblemPublicationSchema {}
+
+impl api_macros::openapi::OpenApiSchema for RepositoryApiError {
+    fn response_schema(
+        builder: &mut api_macros::openapi::OpenApiBuilder,
+        content_type: &str,
+    ) -> Result<serde_json::Value, api_macros::openapi::OpenApiError> {
+        match content_type {
+            "application/json" => builder.schema_ref::<Self>(),
+            "application/problem+json" => {
+                builder.schema_ref::<RepositoryProblemPublicationSchema>()
+            }
+            _ => Err(api_macros::openapi::OpenApiError::InvalidContract(
+                "unsupported control error representation".into(),
+            )),
+        }
+    }
 }
 
 const fn default_repository_error_status() -> u16 {
@@ -77,6 +182,14 @@ const fn default_repository_error_status() -> u16 {
 }
 
 impl RepositoryApiError {
+    pub fn control_cause(&self) -> Option<protocol::control_failure::RuntimeControlCause> {
+        self.control
+    }
+
+    pub fn with_control(mut self, cause: protocol::control_failure::RuntimeControlCause) -> Self {
+        self.control = Some(cause);
+        self
+    }
     pub fn new(
         status: u16,
         error: impl Into<String>,
@@ -87,14 +200,98 @@ impl RepositoryApiError {
             error: error.into(),
             message: message.into(),
             diagnostics,
+            repository: None,
+            repository_problem: None,
+            failure: None,
+            control: None,
             status,
         }
+    }
+
+    pub fn with_failure(
+        mut self,
+        failure: protocol::startup_failure::StartupFailureAttachment,
+    ) -> Self {
+        self.failure = Some(failure);
+        self
     }
 }
 
 impl api_macros::HttpError for RepositoryApiError {
+    fn custom_response(&self) -> Option<api_macros::HttpErrorResponse> {
+        if let Some(body) = &self.repository_problem {
+            return Some(api_macros::HttpErrorResponse {
+                status: self.status,
+                content_type: error_contract::problem::PROBLEM_CONTENT_TYPE,
+                body: body.clone().into(),
+            });
+        }
+        self.control.and_then(|cause| {
+            runtime_api::RuntimeApiError::new(500, cause.reason(), cause.explanation())
+                .with_control(cause)
+                .custom_response()
+        })
+    }
     fn status_code(&self) -> u16 {
         self.status
+    }
+}
+
+impl api_macros::reqwest::HttpClientError for RepositoryApiError {
+    fn decode_error(
+        response: &api_macros::reqwest::ReceivedResponse,
+    ) -> Result<Self, api_macros::reqwest::ClientFailure> {
+        use api_macros::reqwest::ClientFailure;
+        let media = response
+            .content_type()?
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if media.eq_ignore_ascii_case("application/problem+json") {
+            match response.decode_problem::<repository_failure::RepositoryFailureDetails>(
+                &RepositoryBoundary,
+                repository_error::budget(),
+            ) {
+                error_contract::DecodeFailure::Known(received) => {
+                    let details = *received.facts().cause();
+                    let mut error = Self::new(
+                        response.status().as_u16(),
+                        details.reason.as_str(),
+                        "Repository returned a typed failure.",
+                        Vec::new(),
+                    );
+                    error.repository = Some(details);
+                    return Ok(error);
+                }
+                error_contract::DecodeFailure::Corrupt(_) => {
+                    return Err(ClientFailure::ErrorResponseDecode {
+                        status: response.status().as_u16(),
+                    });
+                }
+                error_contract::DecodeFailure::Unsupported(_) => {}
+            }
+            let source = runtime_api::RuntimeApiError::decode_error(response)?;
+            let cause = source
+                .control_cause()
+                .ok_or(ClientFailure::UnsupportedErrorResponse {
+                    status: response.status().as_u16(),
+                })?;
+            return Ok(Self::new(
+                response.status().as_u16(),
+                cause.reason(),
+                cause.explanation(),
+                Vec::new(),
+            )
+            .with_control(cause));
+        }
+        let mut error: Self = serde_json::from_slice(response.body()).map_err(|_| {
+            ClientFailure::ErrorResponseDecode {
+                status: response.status().as_u16(),
+            }
+        })?;
+        error.status = response.status().as_u16();
+        Ok(error)
     }
 }
 
@@ -136,6 +333,8 @@ pub struct WorkdirOperationApiError {
     pub denial_reason: Option<workdir::WorkdirDenialReason>,
     #[serde(skip)]
     pub failure_reason: Option<workdir::WorkdirFailureReason>,
+    #[serde(skip)]
+    pub failure_details: Option<workdir::failure::WorkdirFailureDetails>,
 }
 
 /// Internal operational correlation. Producers supply fixed-length ID fingerprints and
@@ -163,6 +362,7 @@ impl WorkdirOperationApiError {
             workdir_log: None,
             denial_reason: None,
             failure_reason: None,
+            failure_details: None,
         }
     }
 
@@ -178,6 +378,7 @@ impl WorkdirOperationApiError {
             workdir_log: None,
             denial_reason: error.denial_reason,
             failure_reason: error.failure_reason,
+            failure_details: None,
         }
     }
 }
@@ -205,6 +406,43 @@ macro_rules! impl_openapi_schema {
 }
 
 impl_openapi_schema!(
+    PluginHostRequest,
+    PluginHostResponse,
+    PluginHostError,
+    ChatCreateConversationRequest,
+    ChatConversation,
+    ChatUserMessageRequest,
+    ChatSendMessageRequest,
+    ChatMessagePageQuery,
+    ChatMessagePage,
+    ChatMessage,
+    ChatReceiveResponse,
+    ChatWorkerRequest,
+    ChatWorkerResponse,
+    PluginInstallRequest,
+    PluginAddArtifactRequest,
+    PluginRevokeRequest,
+    PluginUninstallRequest,
+    PluginDataPurgeState,
+    PluginDataPurgeRequest,
+    PluginDataPurgeResponse,
+    PluginListRequest,
+    PluginUploadResponse,
+    PluginInstallation,
+    PluginListResponse,
+    PluginOperationResponse,
+    PluginArtifactDeliveryRequest,
+    PluginArtifactDeliveryMetadata,
+    PluginWorkerDiagnostics,
+    SubjectBodyApiError,
+    SubjectBodyFailedRequest,
+    SubjectBodyRequestResolution,
+    SubjectBodyResponse,
+    SubjectBodyStartRequest,
+    SubjectBodyRecoverRequest,
+    SubjectBodyStopRequest,
+    SubjectBodyMutationResponse,
+    SubjectBodyStopOutcomeResponse,
     SubjectPermissionsResponse,
     SubjectPermissionsMutationResponse,
     SubjectPermissionInterruption,
@@ -250,7 +488,6 @@ impl_openapi_schema!(
     WorkspaceCatalogListResponse,
     CreateWorkspaceRepositoryRequest,
     CreateWorkspaceRepositoryResponse,
-    RepositoryApiError,
     WorkdirOperationApiError,
     RepositoryListResponse,
     RepositoryDetailResponse,
@@ -296,6 +533,8 @@ impl_openapi_schema!(
     WorkspaceConfigGrantResponse,
     ExternalWorkdirGrantCreateRequest,
     ExternalWorkdirGrantResponse,
+    ExternalWorkdirConnectionObservation,
+    ExternalWorkdirConnectionClosedReason,
     WorkspaceResponse,
     WorkspaceMetadataSettingsResponse,
     UpdateWorkspaceMetadataRequest,
@@ -338,6 +577,8 @@ impl_openapi_schema!(
     MemoryConsolidationResponse,
     SubjektivSubjectCreateRequest,
     SubjektivSubjectBehaviorUpdateRequest,
+    SubjektivSubjectDeleteRequest,
+    SubjektivSubjectDeleteResponse,
     SubjektivSubjectListQuery,
     SubjektivSubjectListResponse,
     SubjektivSubjectResponse,
@@ -363,7 +604,6 @@ impl_openapi_schema!(
     CancelTicketImplementationRequest,
     ClearTicketRoleAssignmentQuery,
     CompleteMergeRequestRequest,
-    CreateTicketOrchestrationPlanRequest,
     CreateTicketRecordRequest,
     CreateTicketRelationRequest,
     DefaultIntakeReadyBodyRequest,
@@ -415,9 +655,6 @@ impl_openapi_schema!(
     TicketListHttpQuery,
     TicketListResponse,
     TicketMarkReadyRequest,
-    TicketOrchestrationPlanRecord,
-    TicketOrchestrationPlanRecordList,
-    TicketOrchestrationPlanSearchRequest,
     TicketAssignmentsQuery,
     TicketAssignmentsPage,
     TicketAssignmentAnswerRequest,
@@ -449,6 +686,11 @@ impl_openapi_schema!(
     WorkspaceTicketTagListRequest,
     WorkspaceTicketTagMutationRequest,
     TicketTagsSetRequest,
+    TicketLinkSummaryResponse,
+    TicketParentRequest,
+    TicketParentResponse,
+    TicketChildrenQuery,
+    TicketChildrenResponse,
     WorkspaceTicketTagList,
     WorkspaceTicketTag,
     RuntimeManagementApiError,
@@ -561,6 +803,15 @@ pub struct WorkspaceWorkerSessionHistoryResponse {
 /// Response loss does not imply rollback.
 #[api(reqwest, axum, openapi)]
 pub trait ServerApi {
+    /// Runtime Host owner boundary; human plugin-management authority is not accepted here.
+    #[post("/api/w/{workspace_id}/plugin-host", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], normalize_body_errors = true)]
+    async fn plugin_host(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: PluginHostRequest,
+    ) -> Result<PluginHostResponse, PluginHostError>;
+
     #[get("/health", status = 200, error_status = 400)]
     async fn health(&self) -> Result<HealthResponse, RepositoryApiError>;
 
@@ -996,6 +1247,8 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1003,13 +1256,15 @@ pub trait ServerApi {
         &self,
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
-    ) -> Result<RepositoryAccessProjection, RepositoryApiError>;
+    ) -> Result<RepositoryAccessProjection, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/credentials",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1017,13 +1272,15 @@ pub trait ServerApi {
         &self,
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
-    ) -> Result<RepositorySshCredentialListResponse, RepositoryApiError>;
+    ) -> Result<RepositorySshCredentialListResponse, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/credentials",
         status = 201,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1032,13 +1289,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[body] request: CreateRepositorySshCredentialRequest,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/credentials/generate",
         status = 201,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1047,13 +1306,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[body] request: GenerateRepositorySshCredentialRequest,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1062,13 +1323,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] credential_id: String,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}",
         status = 204,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1078,13 +1341,15 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] credential_id: String,
         #[body] request: DeleteRepositorySshCredentialRequest,
-    ) -> Result<(), RepositoryApiError>;
+    ) -> Result<(), RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/public-key",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1093,13 +1358,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] credential_id: String,
-    ) -> Result<RepositorySshPublicKey, RepositoryApiError>;
+    ) -> Result<RepositorySshPublicKey, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/credentials/{credential_id}/rotate",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1109,13 +1376,15 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] credential_id: String,
         #[body] request: RotateRepositorySshCredentialRequest,
-    ) -> Result<RepositorySshCredential, RepositoryApiError>;
+    ) -> Result<RepositorySshCredential, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1123,7 +1392,7 @@ pub trait ServerApi {
         &self,
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
-    ) -> Result<RepositorySshHostTrustListResponse, RepositoryApiError>;
+    ) -> Result<RepositorySshHostTrustListResponse, RepositoryAccessApiError>;
 
     #[post(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts",
@@ -1131,6 +1400,8 @@ pub trait ServerApi {
         alternate_status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1139,13 +1410,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[body] request: PutRepositorySshHostTrustRequest,
-    ) -> Result<RepositorySshHostTrustMutationResponse, RepositoryApiError>;
+    ) -> Result<RepositorySshHostTrustMutationResponse, RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
         status = 200,
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1154,13 +1427,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] host_trust_id: String,
-    ) -> Result<RepositorySshHostTrust, RepositoryApiError>;
+    ) -> Result<RepositorySshHostTrust, RepositoryAccessApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/settings/repository-access/host-trusts/{host_trust_id}",
         status = 204,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -1170,7 +1445,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] host_trust_id: String,
         #[body] request: DeleteRepositorySshHostTrustRequest,
-    ) -> Result<(), RepositoryApiError>;
+    ) -> Result<(), RepositoryAccessApiError>;
 
     #[get(
         "/api/w/{workspace_id}/config/source-tree",
@@ -1196,6 +1471,20 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
     ) -> Result<WorkspacePromptProjection, RepositoryApiError>;
+
+    #[post(
+        "/api/w/{workspace_id}/config/source-tree/preview",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true
+    )]
+    async fn workspace_config_tree_preview(
+        &self,
+        #[path] workspace_id: String,
+        #[body] request: ConfigCommitRequest,
+    ) -> Result<WorkspaceConfigTreeResponse, RepositoryApiError>;
 
     #[post(
         "/api/w/{workspace_id}/config/source-tree/commit",
@@ -1386,6 +1675,20 @@ pub trait ServerApi {
         #[body] request: authorization::OperationAuthorizationRequest,
     ) -> Result<authorization::OperationAuthorizationResponse, RepositoryApiError>;
 
+    #[post(
+        "/api/w/{workspace_id}/authorization/bound-check",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        openapi = false,
+    )]
+    async fn bound_operation_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: authorization::BoundOperationAuthorizationRequest,
+    ) -> Result<authorization::OperationAuthorizationResponse, RepositoryApiError>;
+
     #[get(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permissions",
         status = 200,
@@ -1427,6 +1730,7 @@ pub trait ServerApi {
     )]
     async fn subjektiv_subject_create(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: SubjektivSubjectCreateRequest,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
@@ -1456,6 +1760,55 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] subject_id: String,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+    #[get("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body", status = 200, error_status = 404,
+        additional_error_statuses = [400, 401, 403, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjectBodyResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/start", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_start(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyStartRequest,
+    ) -> Result<SubjectBodyMutationResponse, SubjectBodyApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/recover", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_recover(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyRecoverRequest,
+    ) -> Result<SubjectBodyMutationResponse, SubjectBodyApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/stop", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_stop(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyStopRequest,
+    ) -> Result<SubjectBodyMutationResponse, SubjectBodyApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/body/stop/outcome", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502], bearer_auth = true, browser_auth = true)]
+    async fn subjektiv_subject_body_stop_outcome(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectBodyStopRequest,
+    ) -> Result<SubjectBodyStopOutcomeResponse, SubjectBodyApiError>;
+
     #[patch(
         "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/behavior",
         status = 200,
@@ -1527,19 +1880,21 @@ pub trait ServerApi {
         #[path] memory_id: String,
         #[query] query: SubjektivMemoryChangesQuery,
     ) -> Result<SubjektivMemoryListChangesResponse, RepositoryApiError>;
-    #[post(
-        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/retire",
+    #[delete(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500],
         bearer_auth = true,
         browser_auth = true,
     )]
-    async fn subjektiv_subject_retire(
+    async fn subjektiv_subject_delete(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] subject_id: String,
-    ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;
+        #[body] request: SubjektivSubjectDeleteRequest,
+    ) -> Result<SubjektivSubjectDeleteResponse, RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/subjektiv/staging",
         status = 200,
@@ -1566,6 +1921,44 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: SubjektivRecordSessionRequest,
     ) -> Result<SubjektivRecordSessionResponse, RepositoryApiError>;
+    #[post("/api/w/{workspace_id}/chat/conversations", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn chat_create_conversation(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: ChatCreateConversationRequest,
+    ) -> Result<ChatConversation, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/chat/conversations/{conversation_id}/messages", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn chat_messages(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] conversation_id: String,
+        #[query] query: ChatMessagePageQuery,
+    ) -> Result<ChatMessagePage, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/chat/conversations/{conversation_id}/messages", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn chat_receive(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] conversation_id: String,
+        #[body] request: ChatUserMessageRequest,
+    ) -> Result<ChatReceiveResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/subjektiv/chat/worker", status = 200, error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500], openapi = false)]
+    async fn chat_worker_operation(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: ChatWorkerRequest,
+    ) -> Result<ChatWorkerResponse, RepositoryApiError>;
+
     #[post(
         "/api/w/{workspace_id}/subjektiv/memory",
         operation_id = "subjektiv_memory_backend",
@@ -1692,25 +2085,23 @@ pub trait ServerApi {
         "/api/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_list_alias(&self) -> Result<WorkerListResponse, RepositoryApiError>;
 
     #[post(
         "/api/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_create_alias(
         &self,
         #[extension] context: ServerRequestContext,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
 
     #[get(
         "/api/w/{workspace_id}/orchestrator",
@@ -1741,34 +2132,45 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/worker-control/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
-        openapi = false,
-    )]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn worker_control_list(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkerControlListResponse, RepositoryApiError>;
+    #[get(
+        "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/permissions/{permission}",
+        status = 204,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
+    async fn worker_control_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+        #[path] permission: String,
+    ) -> Result<(), RepositoryApiError>;
     #[post(
         "/api/w/{workspace_id}/worker-control/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        openapi = false,
-    )]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn worker_control_spawn(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
     #[post(
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/input",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        openapi = false,
-    )]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn worker_control_input(
         &self,
         #[extension] context: ServerRequestContext,
@@ -1781,9 +2183,8 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/worker-control/workers/{runtime_id}/{worker_id}/cancel",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
-        openapi = false,
-    )]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn worker_control_cancel(
         &self,
         #[extension] context: ServerRequestContext,
@@ -1797,8 +2198,7 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
-        openapi = false,
-    )]
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn worker_control_stop(
         &self,
         #[extension] context: ServerRequestContext,
@@ -1812,8 +2212,7 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
-        openapi = false,
-    )]
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn worker_control_restore(
         &self,
         #[extension] context: ServerRequestContext,
@@ -1851,9 +2250,8 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/worker-discovery/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
-        openapi = false,
-    )]
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
+        openapi = false, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_discovery(
         &self,
         #[extension] context: ServerRequestContext,
@@ -1865,10 +2263,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_list(
         &self,
         #[path] workspace_id: String,
@@ -1878,25 +2275,23 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_create(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CreateWorkspaceWorkerRequest,
-    ) -> Result<BrowserCreateWorkerResponse, RepositoryApiError>;
+    ) -> Result<BrowserCreateWorkerResponse, WorkerCreateApiError>;
 
     #[get(
         "/api/w/{workspace_id}/workers/{worker_ref}",
         status = 200,
         error_status = 404,
-        additional_error_statuses = [400, 401, 403, 500, 502, 503],
+        additional_error_statuses = [400, 401, 403, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_detail(
         &self,
         #[path] workspace_id: String,
@@ -1907,10 +2302,9 @@ pub trait ServerApi {
         "/api/workers/launch-options",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_launch_options_alias(
         &self,
     ) -> Result<WorkerLaunchOptionsResponse, RepositoryApiError>;
@@ -1919,10 +2313,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/workers/launch-options",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn workspace_worker_launch_options(
         &self,
         #[path] workspace_id: String,
@@ -2047,6 +2440,7 @@ pub trait ServerApi {
     #[post(
         "/api/w/{workspace_id}/workers/remove",
         status = 200,
+        alternate_status = 202,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 503],
         openapi = false,
@@ -2062,20 +2456,18 @@ pub trait ServerApi {
         "/api/runtimes",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_list_alias(&self) -> Result<RuntimeListResponse, RepositoryApiError>;
 
     #[get(
         "/api/w/{workspace_id}/runtimes",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_list(
         &self,
         #[path] workspace_id: String,
@@ -2086,10 +2478,9 @@ pub trait ServerApi {
         status = 201,
         alternate_status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_create(
         &self,
         #[extension] actor: RequestActor,
@@ -2101,10 +2492,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}",
         status = 200,
         error_status = 404,
-        additional_error_statuses = [400, 401, 403, 500, 502, 503],
+        additional_error_statuses = [400, 401, 403, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_detail(
         &self,
         #[path] workspace_id: String,
@@ -2115,10 +2505,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_update(
         &self,
         #[extension] actor: RequestActor,
@@ -2131,10 +2520,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_remove(
         &self,
         #[extension] actor: RequestActor,
@@ -2147,10 +2535,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/trust-key",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_trust_key_reveal(
         &self,
         #[extension] actor: RequestActor,
@@ -2180,8 +2567,7 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_connection_test(
         &self,
         #[extension] actor: RequestActor,
@@ -2193,10 +2579,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_list_alias(
         &self,
         #[path] runtime_id: String,
@@ -2207,10 +2592,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_create_alias(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2222,10 +2606,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_list(
         &self,
         #[path] workspace_id: String,
@@ -2237,10 +2620,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_create(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2253,10 +2635,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/config-bundles",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_config_bundle_sync_alias(
         &self,
         #[path] runtime_id: String,
@@ -2267,10 +2648,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/config-bundles",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_config_bundle_sync(
         &self,
         #[path] workspace_id: String,
@@ -2282,10 +2662,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_config_bundle_availability_alias(
         &self,
         #[path] runtime_id: String,
@@ -2297,10 +2676,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_config_bundle_availability(
         &self,
         #[path] workspace_id: String,
@@ -2313,10 +2691,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/workers/{worker_id}",
         status = 200,
         error_status = 404,
-        additional_error_statuses = [400, 401, 403, 500, 502, 503],
+        additional_error_statuses = [400, 401, 403, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_detail_alias(
         &self,
         #[path] runtime_id: String,
@@ -2327,10 +2704,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}",
         status = 200,
         error_status = 404,
-        additional_error_statuses = [400, 401, 403, 500, 502, 503],
+        additional_error_statuses = [400, 401, 403, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_detail(
         &self,
         #[path] workspace_id: String,
@@ -2344,8 +2720,7 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_restore_alias(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2360,8 +2735,7 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_restore(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2376,10 +2750,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/pin",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_pin(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2392,10 +2765,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/pin",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_unpin(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2408,10 +2780,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/cleanup-plan",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_cleanup_plan(
         &self,
         #[path] workspace_id: String,
@@ -2422,10 +2793,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/cleanup-executions",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_cleanup_execute(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2438,10 +2808,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/workers/{worker_id}/input",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_input_alias(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2454,10 +2823,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/input",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_input(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2471,10 +2839,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-upload-grants",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_attachment_upload_grant(
         &self,
         #[extension] actor: RequestActor,
@@ -2488,11 +2855,10 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 413, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 413, 500, 502, 503, 504],
         bearer_auth = true,
         browser_auth = true,
-        normalize_body_errors = true
-    )]
+        normalize_body_errors = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_attachment_upload(
         &self,
         #[extension] actor: RequestActor,
@@ -2507,10 +2873,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachment-uploads/{upload_id}",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_attachment_upload_cancel(
         &self,
         #[extension] actor: RequestActor,
@@ -2524,10 +2889,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/attachments/{artifact_id}",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_attachment_delete(
         &self,
         #[path] workspace_id: String,
@@ -2540,10 +2904,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/workers/{worker_id}/completions",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_completions_alias(
         &self,
         #[path] runtime_id: String,
@@ -2555,10 +2918,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/completions",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_completions(
         &self,
         #[path] workspace_id: String,
@@ -2573,8 +2935,7 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_stop_alias(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2589,8 +2950,7 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_stop(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2604,10 +2964,9 @@ pub trait ServerApi {
         "/api/runtimes/{runtime_id}/workers/{worker_id}/cancel",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_cancel_alias(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2620,10 +2979,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/cancel",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn runtime_worker_cancel(
         &self,
         #[extension] context: ServerRequestContext,
@@ -2639,7 +2997,9 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_list(
         &self,
@@ -2652,7 +3012,9 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_list_alias(&self) -> Result<RepositoryListResponse, RepositoryApiError>;
 
@@ -2662,7 +3024,9 @@ pub trait ServerApi {
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_detail(
         &self,
@@ -2676,7 +3040,9 @@ pub trait ServerApi {
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_detail_alias(
         &self,
@@ -2691,6 +3057,8 @@ pub trait ServerApi {
         additional_error_statuses = [401, 403, 404, 409, 413, 415, 422, 500],
         bearer_auth = true,
         browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"],
         normalize_body_errors = true
     )]
     async fn repository_create(
@@ -2736,9 +3104,11 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/repositories/{repository_key}/log",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
+        additional_error_statuses = [401, 403, 404, 500, 502],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_log(
         &self,
@@ -2751,9 +3121,11 @@ pub trait ServerApi {
         "/api/repositories/{repository_key}/log",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
+        additional_error_statuses = [401, 403, 404, 500, 502],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_log_alias(
         &self,
@@ -2788,10 +3160,9 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/hosts/{host_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn host_worker_list(
         &self,
         #[path] workspace_id: String,
@@ -2802,10 +3173,9 @@ pub trait ServerApi {
         "/api/hosts/{host_id}/workers",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503, 504],
         bearer_auth = true,
-        browser_auth = true
-    )]
+        browser_auth = true, client_error_hook = true, additional_error_content_types = ["application/problem+json"])]
     async fn host_worker_list_alias(
         &self,
         #[path] host_id: String,
@@ -2816,6 +3186,8 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -2823,7 +3195,7 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
         #[path] runtime_id: String,
-    ) -> Result<WorkingDirectoryListResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryListResponse, WorkdirManagementApiError>;
 
     #[post(
         "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
@@ -2831,6 +3203,8 @@ pub trait ServerApi {
         alternate_status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -2839,13 +3213,15 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[body] request: WorkingDirectoryCreateRequest,
-    ) -> Result<WorkingDirectoryCreateResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryCreateResponse, WorkdirManagementApiError>;
 
     #[get(
         "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -2854,13 +3230,15 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] runtime_id: String,
         #[path] working_directory_id: String,
-    ) -> Result<WorkingDirectoryDetailResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryDetailResponse, WorkdirManagementApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories/{working_directory_id}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -2871,57 +3249,182 @@ pub trait ServerApi {
         #[path] runtime_id: String,
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
-    ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryRemovalResponse, WorkdirManagementApiError>;
+    #[post("/api/w/{workspace_id}/plugin-uploads", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_upload(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[binary] body: BinaryBody,
+    ) -> Result<PluginUploadResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_install(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: PluginInstallRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_list(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[query] query: PluginListRequest,
+    ) -> Result<PluginListResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/worker-diagnostics/{runtime_id}/{worker_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_worker_diagnostics(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] runtime_id: String,
+        #[path] worker_id: String,
+    ) -> Result<PluginWorkerDiagnostics, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/{installation_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_show(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+    ) -> Result<PluginInstallation, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/artifacts", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_artifact_add(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginAddArtifactRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/revoke", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_revoke(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginRevokeRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/uninstall", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_uninstall(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginUninstallRequest,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/{installation_id}/data-state", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_data_observe(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+    ) -> Result<PluginDataPurgeState, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/{installation_id}/data-purge", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_data_purge(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] installation_id: String,
+        #[body] request: PluginDataPurgeRequest,
+    ) -> Result<PluginDataPurgeResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugins/service-consumers/{consumer_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_service_diagnostics(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] consumer_id: String,
+    ) -> Result<PluginServiceDiagnostics, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/plugins/service-consumers/recover", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    async fn plugin_service_recover(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[body] request: PluginServiceRecoveryRequest,
+    ) -> Result<PluginServiceDiagnostics, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/plugin-operations/{operation_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,429,503], bearer_auth = true, browser_auth = true)]
+    async fn plugin_operation(
+        &self,
+        #[extension] actor: RequestActor,
+        #[path] workspace_id: String,
+        #[path] operation_id: String,
+    ) -> Result<PluginOperationResponse, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/workers/self/plugin-artifacts/authorize", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 413, 500, 502, 503, 504], openapi = false, normalize_body_errors = true, additional_error_content_types = ["application/problem+json"], client_error_hook = true)]
+    async fn plugin_artifact_authorize(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: PluginArtifactDeliveryRequest,
+    ) -> Result<PluginArtifactDeliveryMetadata, RepositoryApiError>;
+
+    #[post("/api/w/{workspace_id}/workers/self/plugin-artifacts/pull", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 413, 500, 502, 503, 504], openapi = false, normalize_body_errors = true, additional_error_content_types = ["application/problem+json"], client_error_hook = true)]
+    async fn plugin_artifact_pull(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[body] request: PluginArtifactDeliveryRequest,
+    ) -> Result<BinaryBody, RepositoryApiError>;
+
     // Ordinary operations accept member browser sessions or trusted Worker request
     // context. The service resolves Worker grants; no operation accepts an actor or
     // grant ID from the caller. Grant management is Workspace-owner-only.
-    #[get("/api/w/{workspace_id}/drive/root", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    #[get("/api/w/{workspace_id}/drive/root", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,502,503,504], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_root(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
-    ) -> Result<DriveEntry, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/capabilities", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveEntry, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/capabilities", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_capabilities(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
-    ) -> Result<DriveCapabilities, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/metadata", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveCapabilities, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/metadata", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_metadata(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveEntryQuery,
-    ) -> Result<DriveEntry, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/list", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveEntry, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/list", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_list(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveListQuery,
-    ) -> Result<DriveListResponse, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/search", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveListResponse, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/search", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_search(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveSearchQuery,
-    ) -> Result<DriveListResponse, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/read-text", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveListResponse, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/read-text", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_read_text(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveReadTextQuery,
-    ) -> Result<DriveReadTextResponse, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/read-chunk", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveReadTextResponse, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/read-chunk", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_read_chunk(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveReadChunkQuery,
-    ) -> Result<BinaryBody, DriveApiError>;
+    ) -> Result<BinaryBody, DriveHttpApiError>;
     // Download safety/cache headers are service-produced typed response metadata;
     // Content-Type/Content-Length remain controlled by the binary transport.
     #[get(
@@ -2935,6 +3438,8 @@ pub trait ServerApi {
         ])],
         error_status = 400,
         additional_error_statuses = [401,403,404,409,413,503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -2943,79 +3448,79 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveDownloadQuery,
-    ) -> Result<server_api_responses::DriveDownload, DriveApiError>;
-    #[post("/api/w/{workspace_id}/drive/mutate", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    ) -> Result<server_api_responses::DriveDownload, DriveHttpApiError>;
+    #[post("/api/w/{workspace_id}/drive/mutate", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
     async fn drive_mutate(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: DriveMutationRequest,
-    ) -> Result<DriveMutationResponse, DriveApiError>;
-    #[put("/api/w/{workspace_id}/drive/upload", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    ) -> Result<DriveMutationResponse, DriveHttpApiError>;
+    #[put("/api/w/{workspace_id}/drive/upload", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
     async fn drive_upload(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveUploadQuery,
         #[binary] body: BinaryBody,
-    ) -> Result<DriveMutationResponse, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/requests/{request_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveMutationResponse, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/requests/{request_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_request_status(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] request_id: String,
-    ) -> Result<DriveRequestStatusResponse, DriveApiError>;
-    #[post("/api/w/{workspace_id}/drive/grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
+    ) -> Result<DriveRequestStatusResponse, DriveHttpApiError>;
+    #[post("/api/w/{workspace_id}/drive/grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true, normalize_body_errors = true)]
     async fn drive_grant_create(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: DriveGrantCreateRequest,
-    ) -> Result<DriveGrantResponse, DriveApiError>;
-    #[delete("/api/w/{workspace_id}/drive/grants/{grant_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveGrantResponse, DriveHttpApiError>;
+    #[delete("/api/w/{workspace_id}/drive/grants/{grant_id}", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_grant_revoke(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] grant_id: String,
-    ) -> Result<DriveGrantResponse, DriveApiError>;
-    #[get("/api/w/{workspace_id}/drive/grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], bearer_auth = true, browser_auth = true)]
+    ) -> Result<DriveGrantResponse, DriveHttpApiError>;
+    #[get("/api/w/{workspace_id}/drive/grants", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,503], additional_error_content_types = ["application/problem+json"], client_error_hook = true, bearer_auth = true, browser_auth = true)]
     async fn drive_grant_list(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[query] query: DriveGrantListQuery,
-    ) -> Result<DriveGrantListResponse, DriveApiError>;
+    ) -> Result<DriveGrantListResponse, DriveHttpApiError>;
 
-    #[get("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    #[get("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false, additional_error_content_types = ["application/problem+json"])]
     async fn current_worker_workspace_config_get(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<WorkspaceConfigCurrentResponse, WorkspaceConfigApiError>;
-    #[post("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false, additional_error_content_types = ["application/problem+json"])]
     async fn current_worker_workspace_config_attach(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: WorkspaceConfigAttachRequest,
     ) -> Result<WorkspaceConfigAttachment, WorkspaceConfigApiError>;
-    #[post("/api/w/{workspace_id}/workers/self/workspace-config/observe", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/observe", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false, additional_error_content_types = ["application/problem+json"])]
     async fn current_worker_workspace_config_observe(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: WorkspaceConfigObserveRequest,
     ) -> Result<WorkspaceConfigObserveResponse, WorkspaceConfigApiError>;
-    #[post("/api/w/{workspace_id}/workers/self/workspace-config/read", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/read", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false, additional_error_content_types = ["application/problem+json"])]
     async fn current_worker_workspace_config_read(
         &self,
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: WorkspaceConfigReadRequest,
     ) -> Result<WorkspaceConfigReadResponse, WorkspaceConfigApiError>;
-    #[post("/api/w/{workspace_id}/workers/self/workspace-config/commit", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false)]
+    #[post("/api/w/{workspace_id}/workers/self/workspace-config/commit", status = 200, error_status = 400, additional_error_statuses = [401,403,404,409,413,500,503], openapi = false, additional_error_content_types = ["application/problem+json"])]
     async fn current_worker_workspace_config_commit(
         &self,
         #[extension] context: ServerRequestContext,
@@ -3043,6 +3548,7 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
         openapi = false,
+        client_error_hook = true
     )]
     async fn current_worker_workdir_catalog(
         &self,
@@ -3068,6 +3574,8 @@ pub trait ServerApi {
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         openapi = false,
     )]
     async fn current_worker_workdir_attach(
@@ -3075,12 +3583,14 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CurrentWorkerWorkdirAttachRequest,
-    ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
+    ) -> Result<CurrentWorkerWorkdirAttachmentResponse, WorkdirManagementApiError>;
     #[delete(
         "/api/w/{workspace_id}/workers/self/workdir-attachments/{alias}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         openapi = false,
     )]
     async fn current_worker_workdir_detach(
@@ -3089,12 +3599,13 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] alias: String,
         #[query] query: CurrentWorkerWorkdirDetachQuery,
-    ) -> Result<CurrentWorkerWorkdirAttachmentResponse, RepositoryApiError>;
+    ) -> Result<CurrentWorkerWorkdirAttachmentResponse, WorkdirManagementApiError>;
     #[post(
         "/api/w/{workspace_id}/workers/self/workdir-session/operations",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
         openapi = false,
     )]
     async fn current_worker_workdir_operation(
@@ -3102,13 +3613,15 @@ pub trait ServerApi {
         #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: CurrentWorkerWorkdirOperationRequest,
-    ) -> Result<CurrentWorkerWorkdirOperationResponse, WorkdirOperationApiError>;
+    ) -> Result<CurrentWorkerWorkdirOperationResponse, WorkdirHttpApiError>;
 
     #[post(
         "/api/w/{workspace_id}/external-workdir-grants",
         status = 201,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -3117,13 +3630,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[body] request: ExternalWorkdirGrantCreateRequest,
-    ) -> Result<ExternalWorkdirGrantResponse, RepositoryApiError>;
+    ) -> Result<ExternalWorkdirGrantResponse, WorkdirManagementApiError>;
 
     #[get(
         "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
+        additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -3132,13 +3647,15 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] grant_id: String,
-    ) -> Result<ExternalWorkdirGrantResponse, RepositoryApiError>;
+    ) -> Result<ExternalWorkdirGrantResponse, WorkdirManagementApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/external-workdir-grants/{grant_id}",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 409, 500],
+        additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -3147,20 +3664,22 @@ pub trait ServerApi {
         #[extension] actor: RequestActor,
         #[path] workspace_id: String,
         #[path] grant_id: String,
-    ) -> Result<ExternalWorkdirGrantResponse, RepositoryApiError>;
+    ) -> Result<ExternalWorkdirGrantResponse, WorkdirManagementApiError>;
 
     #[get(
         "/api/w/{workspace_id}/working-directories",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
     async fn workspace_workdir_list(
         &self,
         #[path] workspace_id: String,
-    ) -> Result<WorkingDirectoryListResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryListResponse, WorkdirManagementApiError>;
 
     #[post(
         "/api/w/{workspace_id}/working-directories",
@@ -3168,6 +3687,8 @@ pub trait ServerApi {
         alternate_status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -3175,13 +3696,15 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
         #[body] request: WorkingDirectoryCreateRequest,
-    ) -> Result<WorkingDirectoryCreateResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryCreateResponse, WorkdirManagementApiError>;
 
     #[get(
         "/api/w/{workspace_id}/working-directories/{working_directory_id}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -3189,13 +3712,15 @@ pub trait ServerApi {
         &self,
         #[path] workspace_id: String,
         #[path] working_directory_id: String,
-    ) -> Result<WorkingDirectoryDetailResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryDetailResponse, WorkdirManagementApiError>;
 
     #[delete(
         "/api/w/{workspace_id}/working-directories/{working_directory_id}",
         status = 200,
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 409, 500, 502, 503],
+        additional_error_content_types = ["application/problem+json"],
+        client_error_hook = true,
         bearer_auth = true,
         browser_auth = true
     )]
@@ -3205,7 +3730,7 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[path] working_directory_id: String,
         #[body] request: WorkingDirectoryRemovalRequest,
-    ) -> Result<WorkingDirectoryRemovalResponse, RepositoryApiError>;
+    ) -> Result<WorkingDirectoryRemovalResponse, WorkdirManagementApiError>;
     #[get("/api/tickets", status = 200, error_status = 400, additional_error_statuses = [500], bearer_auth = true, browser_auth = true)]
     async fn ticket_list_alias(
         &self,
@@ -3252,6 +3777,40 @@ pub trait ServerApi {
         #[body] request: TicketTagsSetRequest,
     ) -> Result<WorkspaceTicketTagList, RepositoryApiError>;
 
+    #[get("/api/w/{workspace_id}/tickets/{id}/link-summary", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_link_summary_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketLinkSummaryResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/parent", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_parent_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+    ) -> Result<TicketParentResponse, RepositoryApiError>;
+
+    #[put("/api/w/{workspace_id}/tickets/{id}/parent", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 422, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_parent_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[body] request: TicketParentRequest,
+    ) -> Result<TicketParentResponse, RepositoryApiError>;
+
+    #[get("/api/w/{workspace_id}/tickets/{id}/children", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
+    async fn ticket_children_query(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] id: String,
+        #[query] request: TicketChildrenQuery,
+    ) -> Result<TicketChildrenResponse, RepositoryApiError>;
+
     /// Lightweight browser list; deliberately excludes live MR evidence and external observations.
     #[post("/api/w/{workspace_id}/tickets/browse", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_browse(
@@ -3269,6 +3828,7 @@ pub trait ServerApi {
     #[get("/api/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_get_alias(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] id: String,
     ) -> Result<TicketDetail, RepositoryApiError>;
     #[post("/api/w/{workspace_id}/tickets/default-intake-ready-body", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
@@ -3298,13 +3858,6 @@ pub trait ServerApi {
         #[path] workspace_id: String,
         #[body] request: TicketRelationSearchRequest,
     ) -> Result<TicketRelationRecordList, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/orchestration-plans/search", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_orchestration_plan_query(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[body] request: TicketOrchestrationPlanSearchRequest,
-    ) -> Result<TicketOrchestrationPlanRecordList, RepositoryApiError>;
     #[get("/api/w/{workspace_id}/tickets/{id}/record", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_record_get(
         &self,
@@ -3592,18 +4145,10 @@ pub trait ServerApi {
         #[path] id: String,
         #[body] request: TicketRelationRemoveRequest,
     ) -> Result<TicketRelationRecord, RepositoryApiError>;
-    #[post("/api/w/{workspace_id}/tickets/{id}/orchestration-plans", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
-    async fn ticket_orchestration_plan_record(
-        &self,
-        #[extension] context: ServerRequestContext,
-        #[path] workspace_id: String,
-        #[path] id: String,
-        #[body] request: CreateTicketOrchestrationPlanRequest,
-    ) -> Result<TicketOrchestrationPlanRecord, RepositoryApiError>;
-
     #[get("/api/w/{workspace_id}/tickets/{id}", status = 200, error_status = 404, additional_error_statuses = [400, 401, 403, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_get(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
     ) -> Result<TicketDetail, RepositoryApiError>;
@@ -3637,6 +4182,7 @@ pub trait ServerApi {
     #[post("/api/w/{workspace_id}/tickets/{id}/show", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_show(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: TicketShowRequest,
@@ -3672,6 +4218,7 @@ pub trait ServerApi {
     #[post("/api/w/{workspace_id}/tickets/{id}/implementation-cancellations", status = 200, error_status = 400, additional_error_statuses = [401, 403, 404, 409, 500], bearer_auth = true, browser_auth = true)]
     async fn ticket_implementation_cancel(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[path] id: String,
         #[body] request: CancelTicketImplementationRequest,
@@ -4955,6 +5502,8 @@ pub struct WorkspacePermissionSummary {
     pub manage_secrets: bool,
     pub manage_runtimes: bool,
     pub delete_workspace: bool,
+    /// Explicit Subject deletion authority for the current authenticated actor.
+    pub delete_subjects: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -5350,12 +5899,32 @@ pub struct MemoryConsolidationResponse {
 #[serde(rename_all = "snake_case")]
 pub enum SubjektivSubjectState {
     Active,
-    Retired,
+    /// Saved compatibility only; not a current lifecycle operation.
+    #[serde(rename = "retired")]
+    LegacyRetired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectDeleteRequest {
+    /// Stable identity retained for every retry, including unknown outcomes.
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubjektivSubjectDeleteResponse {
+    pub subject_id: String,
+    pub operation_id: String,
+    /// False confirms the deletion fence, not external stop or erasure completion.
+    pub completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivSubjectCreateRequest {
+    /// Stable across exact retries; changed input with the same ID conflicts.
+    pub operation_id: String,
     pub role: String,
     #[serde(default)]
     pub behavior_md: String,
@@ -5403,8 +5972,12 @@ pub struct SubjektivSubjectResponse {
     pub memory_fingerprint: String,
     pub created_at: String,
     pub updated_at: String,
-    /// Current keyed-singleton owner, when one exists. This is a live Yoi
-    /// projection, not state duplicated in the subjektiv store.
+    /// Current owner remains present even when its Runtime cannot be observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_body: Option<SubjectBodyRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub current_worker_diagnostics: Vec<Diagnostic>,
+    /// Available launch metadata, not evidence of absence when observation failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_worker: Option<WorkerLaunchWorkerSummary>,
 }
@@ -6988,7 +7561,6 @@ pub struct RepositoryLogResponse {
 }
 
 pub const TICKET_RELATIONS_QUERY_PATH: &str = "/tickets/relations/search";
-pub const TICKET_ORCHESTRATION_PLANS_QUERY_PATH: &str = "/tickets/orchestration-plans/search";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -7006,6 +7578,19 @@ pub struct Diagnostic {
     pub code: String,
     pub severity: DiagnosticSeverity,
     pub message: String,
+}
+
+/// A management observation alongside an unchanged inventory/lookup result.
+/// Optional typed evidence is projected independently of severity and status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkingDirectoryManagementDiagnostic {
+    pub code: String,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<protocol::startup_failure::StartupFailureAttachment>,
 }
 
 /// Public Workdir materializer classification.
@@ -7442,6 +8027,41 @@ pub struct ExternalWorkdirGrantResponse {
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub generation: u64,
     pub status: String,
+    /// Cleanup observations do not revise the grant's committed authority fence.
+    pub cleanup_state: String,
+    pub cleanup_failures: Vec<protocol::startup_failure::StartupFailureAttachment>,
+    /// Connection evidence is independent of grant authority and cleanup completion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_observations: Vec<ExternalWorkdirConnectionObservation>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalWorkdirConnectionClosedReason {
+    ActivationFailed,
+    RegistrationSendFailed,
+    HeartbeatTimeout,
+    SendFailed,
+    CommandChannelClosed,
+    InvalidFrame,
+    PeerClosed,
+    RevokeAcknowledged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct ExternalWorkdirConnectionObservation {
+    /// Authority generation at observation time, checked again by the owner query.
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub grant_generation: u64,
+    /// A rejected reconnect can propose the next connection generation.
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub connection_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_reason: Option<ExternalWorkdirConnectionClosedReason>,
+    pub failures: Vec<protocol::startup_failure::StartupFailureAttachment>,
 }
 
 /// Browser/Rust-client Workdir materialization request.
@@ -7472,7 +8092,7 @@ pub struct WorkingDirectoryCreateRequest {
 pub struct WorkingDirectoryListResponse {
     pub workspace_id: String,
     pub items: Vec<WorkingDirectorySummary>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<WorkingDirectoryManagementDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7483,7 +8103,7 @@ pub struct WorkingDirectoryDetailResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
     pub item: WorkingDirectorySummary,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<WorkingDirectoryManagementDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -7629,7 +8249,7 @@ pub struct WorkingDirectoryCreateResponse {
     pub workspace_id: String,
     pub runtime_id: String,
     pub item: WorkingDirectorySummary,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Vec<WorkingDirectoryManagementDiagnostic>,
     #[serde(skip, default = "default_workdir_create_status")]
     #[cfg_attr(feature = "typescript", ts(skip))]
     #[schemars(skip)]
@@ -7978,6 +8598,9 @@ pub struct TicketAssignmentSummary {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[cfg_attr(feature = "typescript", ts(tag = "kind", rename_all = "snake_case"))]
 pub enum TicketAssignmentPrincipal {
+    Subject {
+        subject_id: String,
+    },
     User {
         account_id: String,
     },
@@ -8028,6 +8651,8 @@ pub struct TicketRoleAssignmentSummary {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketActionEligibility {
+    /// Request-bound browser owner eligibility; never a grant for a later mutation.
+    pub can_set_parent: bool,
     pub can_assign_orchestrator: bool,
     pub can_unassign_orchestrator: bool,
     pub can_queue: bool,
@@ -8143,6 +8768,9 @@ impl TicketAttention {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketQueryRequest {
+    /// Work-decomposition filter; absent means all Tickets, none means no direct parent.
+    #[cfg_attr(feature = "typescript", ts(type = "TicketParentFilter | null"))]
+    pub parent: Option<ticket::TicketParentFilter>,
     /// Exact reason of the current closed-case judgment; reopened/history-only reasons do not match.
     #[cfg_attr(feature = "typescript", ts(type = "TicketClosureReason | null"))]
     pub closure_reason: Option<ticket::TicketClosureReason>,
@@ -8265,6 +8893,8 @@ pub struct TicketShowRequest {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketDetail {
+    #[cfg_attr(feature = "typescript", ts(type = "TicketParentLink"))]
+    pub parent_link: ticket::TicketParentLink,
     pub created_by: Option<String>,
     pub initial_post: TicketEventDetail,
     pub id: String,
@@ -8516,6 +9146,11 @@ transparent_ticket_dto!(
     ticket::WorkspaceTagMutation
 );
 transparent_ticket_dto!(TicketTagsSetRequest, ticket::TicketTagSetRequest);
+transparent_ticket_dto!(TicketLinkSummaryResponse, ticket::TicketLinkSummary);
+transparent_ticket_dto!(TicketParentRequest, ticket::TicketParentSetRequest);
+transparent_ticket_dto!(TicketParentResponse, ticket::TicketParentLink);
+transparent_ticket_dto!(TicketChildrenQuery, ticket::TicketChildrenRequest);
+transparent_ticket_dto!(TicketChildrenResponse, ticket::TicketChildrenPage);
 transparent_ticket_dto!(WorkspaceTicketTagList, Vec<ticket::WorkspaceTag>);
 transparent_ticket_dto!(WorkspaceTicketTag, ticket::WorkspaceTag);
 transparent_ticket_dto!(TicketRecordRef, ticket::TicketRef);
@@ -8526,14 +9161,6 @@ transparent_ticket_dto!(TicketDoctorResponse, ticket::TicketDoctorReport);
 transparent_ticket_dto!(TicketRelationRecord, ticket::TicketRelation);
 transparent_ticket_dto!(TicketRelationRecordList, Vec<ticket::TicketRelation>);
 transparent_ticket_dto!(TicketRelationRecordView, ticket::TicketRelationView);
-transparent_ticket_dto!(
-    TicketOrchestrationPlanRecord,
-    ticket::OrchestrationPlanRecord
-);
-transparent_ticket_dto!(
-    TicketOrchestrationPlanRecordList,
-    Vec<ticket::OrchestrationPlanRecord>
-);
 transparent_ticket_dto!(CreateTicketRecordRequest, ticket::NewTicket);
 transparent_ticket_dto!(EditTicketRecordItemRequest, ticket::TicketItemEdit);
 transparent_ticket_dto!(EditTicketPostRequest, ticket::TicketPostEdit);
@@ -8541,10 +9168,6 @@ transparent_ticket_dto!(TicketPostSnapshots, (ticket::Ticket, ticket::Ticket));
 transparent_ticket_dto!(TicketThreadEventRequest, ticket::NewTicketEvent);
 transparent_ticket_dto!(TicketIntakeSummaryRequest, ticket::TicketIntakeSummary);
 transparent_ticket_dto!(CreateTicketRelationRequest, ticket::NewTicketRelation);
-transparent_ticket_dto!(
-    CreateTicketOrchestrationPlanRequest,
-    ticket::NewOrchestrationPlanRecord
-);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -8568,13 +9191,6 @@ pub struct TicketRelationRemoveRequest {
 pub struct TicketRelationSearchRequest {
     pub ticket: Option<ticket::TicketIdOrSlug>,
     pub kind: Option<ticket::TicketRelationKind>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct TicketOrchestrationPlanSearchRequest {
-    pub ticket: Option<ticket::TicketIdOrSlug>,
-    pub kind: Option<ticket::OrchestrationPlanKind>,
 }
 
 /// Selected existing live Workdir attachment, including its current connection
@@ -9445,23 +10061,52 @@ pub struct RuntimeWorkerInputRequest {
     #[serde(default)]
     pub kind: Option<String>,
     pub content: String,
+    /// Stable Notify identity. Non-Notify unary input does not share this replay contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<protocol::Segment>>,
+}
+
+/// Input acceptance is not model processing or completion. Missing legacy evidence is unknown.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerInputDisposition {
+    Accepted,
+    Rejected,
+    #[default]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerInputResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<protocol::control_failure::RuntimeControlCause>,
     pub state: WorkerOperationState,
+    #[serde(default)]
+    pub disposition: WorkerInputDisposition,
     pub runtime_id: String,
     pub worker_id: String,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerStopIntent {
+    pub expected_observation_token: String,
+    pub request_id: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerLifecycleRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_intent: Option<WorkerStopIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -9471,6 +10116,16 @@ pub struct RuntimeWorkerLifecycleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerLifecycleResult {
+    /// Independent post-operation failures; they do not change the accepted Runtime result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleanup_failures: Vec<protocol::startup_failure::StartupFailureAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<protocol::control_failure::RuntimeControlCause>,
+    /// Historical receipt replay, not a new stop or evidence of current state.
+    #[serde(default)]
+    pub replayed: bool,
     pub state: WorkerOperationState,
     pub runtime_id: String,
     pub worker_id: String,
@@ -9612,6 +10267,8 @@ pub struct RuntimeCleanupExecutionResult {
     pub action: CleanupTargetKind,
     pub status: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal: Option<WorkerRemovalObservation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10055,12 +10712,84 @@ pub struct WorkerRemoveRequest {
     pub reason: String,
 }
 
+/// A saved removal intent is not evidence of physical Worker deletion.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemovalState {
+    Waiting,
+    Held,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemovalPhase {
+    AwaitingQuiescence,
+    Recording,
+    AwaitingEffectsEnd,
+    Released,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemovalCause {
+    RecordingDisabled,
+    SourceUnavailable,
+    OwnershipUnknown,
+    JobPending,
+    JobFailed,
+    ExecutionUnconfirmed,
+    StorageUnavailable,
+}
+
+/// Observation of the current saved removal operation, not a retry or release grant.
+/// Even a completed Journal phase does not prove physical Worker deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRemovalObservation {
+    pub operation_id: String,
+    pub state: WorkerRemovalState,
+    pub phase: WorkerRemovalPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub cause: Option<WorkerRemovalCause>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRemoveResponse {
     pub removed: bool,
     pub runtime_id: String,
     pub worker_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<WorkerRemovalState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<WorkerRemovalPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<WorkerRemovalCause>,
+}
+
+impl WorkerRemoveResponse {
+    pub fn observation(&self) -> Option<WorkerRemovalObservation> {
+        Some(WorkerRemovalObservation {
+            operation_id: self.operation_id.clone()?,
+            state: self.state?,
+            phase: self.phase?,
+            cause: self.cause,
+        })
+    }
+}
+
+impl api_macros::HttpSuccess for WorkerRemoveResponse {
+    fn status_code(&self) -> u16 {
+        if self.removed { 200 } else { 202 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -10503,6 +11232,10 @@ pub struct RuntimeWorkerWorkdirAttachmentSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct WorkerSummary {
+    /// Saved removal progress remains observable across reloads and subscriptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "typescript", ts(optional))]
+    pub removal: Option<WorkerRemovalObservation>,
     /// Opaque Runtime-owned observation fence used by explicit Restore intent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
@@ -10733,6 +11466,7 @@ pub struct BrowserWorkspaceOrchestratorResponse {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerOperationState {
+    Unknown,
     Accepted,
     Unsupported,
     Rejected,
@@ -10769,6 +11503,12 @@ pub struct WorkerRestoreRequest {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerRestoreResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<protocol::startup_failure::StartupFailureObservations>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_explanation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<protocol::control_failure::RuntimeControlCause>,
     pub state: WorkerRestoreState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "typescript", ts(optional = nullable))]
@@ -11019,6 +11759,16 @@ pub fn memory_api_typescript() -> String {
         MemoryStagingRecord::decl(&config),
         MemoryStagingEntry::decl(&config),
         MemoryStagingListResponse::decl(&config),
+        authorization::PermissionResource::decl(&config),
+        authorization::ScopedPermission::decl(&config),
+        authorization::SubjectPermissions::decl(&config),
+        authorization::SubjectPermissionsUpdate::decl(&config),
+        authorization::PermissionResourceKind::decl(&config),
+        authorization::PermissionOperationAvailability::decl(&config),
+        authorization::PermissionOperationDescriptor::decl(&config),
+        SubjectPermissionsResponse::decl(&config),
+        SubjectPermissionsMutationResponse::decl(&config),
+        SubjectPermissionInterruption::decl(&config),
     ];
     // These browser DTOs include nested types owned by `memory` and the Worker
     // launch API. Keep their exported names explicit so the generated Web
@@ -11026,11 +11776,15 @@ pub fn memory_api_typescript() -> String {
     // `ts-rs` solely for this read-only projection.
     let subjektiv_browser_declarations = r#"export type SubjektivSubjectState = "active" | "retired";
 
-export type SubjektivSubjectCreateRequest = { role: string, behavior_md?: string, };
+export type SubjektivSubjectCreateRequest = { operation_id: string, role: string, behavior_md?: string, };
+
+export type SubjektivSubjectDeleteRequest = { operation_id: string, };
+
+export type SubjektivSubjectDeleteResponse = { subject_id: string, operation_id: string, completed: boolean, };
 
 export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_md: string, behavior_md: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_body?: import("./subject-body-api").SubjectBodyRef | null, current_worker_diagnostics?: Array<Diagnostic>, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 
@@ -12124,6 +12878,56 @@ mod tests {
     }
 
     #[test]
+    fn parent_routes_require_explicit_observation_and_use_typed_bounded_contracts() {
+        for (name, method, path) in [
+            (
+                "ticket_parent_get",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/tickets/{id}/parent",
+            ),
+            (
+                "ticket_parent_set",
+                HttpMethod::Put,
+                "/api/w/{workspace_id}/tickets/{id}/parent",
+            ),
+            (
+                "ticket_children_query",
+                HttpMethod::Get,
+                "/api/w/{workspace_id}/tickets/{id}/children",
+            ),
+        ] {
+            let operation = ServerApiMetadata::OPERATIONS
+                .iter()
+                .find(|operation| operation.operation_id == name)
+                .unwrap();
+            assert_eq!(operation.method, method);
+            assert_eq!(operation.path, path);
+        }
+        let wire = serde_json::json!({"expected":{"parent_ticket_id":null,"last_operation_key":null},"parent":null,"operation_key":"unlink"});
+        assert!(serde_json::from_value::<TicketParentRequest>(wire.clone()).is_ok());
+        for field in ["parent_ticket_id", "last_operation_key"] {
+            let mut missing = wire.clone();
+            missing["expected"].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<TicketParentRequest>(missing).is_err());
+        }
+        let mut missing = wire;
+        missing.as_object_mut().unwrap().remove("parent");
+        assert!(serde_json::from_value::<TicketParentRequest>(missing).is_err());
+        assert!(
+            serde_json::from_value::<TicketQueryRequest>(
+                serde_json::json!({"parent":{"kind":"none"}})
+            )
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<TicketQueryRequest>(
+                serde_json::json!({"parent":{"kind":"none","ticket":"T-1"}})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn ticket_tag_operations_are_typed_workspace_routes() {
         for (name, method, path) in [
             (
@@ -12220,7 +13024,7 @@ mod tests {
         );
         let eligibility = serde_json::json!({
             "can_assign_orchestrator": false, "can_unassign_orchestrator": false,
-            "can_queue": true, "can_start_manual_worker": true, "queue_tickets": [], "blockers": []
+            "can_queue": true, "can_start_manual_worker": true, "can_set_parent": false, "queue_tickets": [], "blockers": []
         });
         let parsed: TicketActionEligibility = serde_json::from_value(eligibility.clone()).unwrap();
         assert_eq!(serde_json::to_value(parsed).unwrap(), eligibility);
@@ -12601,6 +13405,10 @@ mod tests {
     #[test]
     fn ticket_objective_and_merge_request_operations_are_in_server_api_metadata() {
         let operations = ServerApiMetadata::OPERATIONS;
+        assert!(operations.iter().all(|operation| {
+            !operation.operation_id.contains("orchestration_plan")
+                && !operation.path.contains("orchestration-plans")
+        }));
         assert_eq!(
             operations
                 .iter()
@@ -12625,11 +13433,6 @@ mod tests {
                 "ticket_relation_query",
                 HttpMethod::Post,
                 "/api/w/{workspace_id}/tickets/relations/search",
-            ),
-            (
-                "ticket_orchestration_plan_query",
-                HttpMethod::Post,
-                "/api/w/{workspace_id}/tickets/orchestration-plans/search",
             ),
             (
                 "merge_request_complete",
@@ -12760,6 +13563,11 @@ mod tests {
                 "workspace_prompt_projection",
                 HttpMethod::Get,
                 "/api/w/{workspace_id}/config/projections/prompts",
+            ),
+            (
+                "workspace_config_tree_preview",
+                HttpMethod::Post,
+                "/api/w/{workspace_id}/config/source-tree/preview",
             ),
             (
                 "workspace_config_tree_commit",
@@ -13102,6 +13910,53 @@ mod tests {
             serde_json::from_value::<MemoryEvidenceOrigin>(serde_json::json!({
                 "kind": "human_input",
                 "future_field": "not current schema"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_removal_wire_receipt_distinguishes_accepted_from_deleted() {
+        use api_macros::HttpSuccess;
+        let operation = ServerApiMetadata::OPERATIONS
+            .iter()
+            .find(|operation| operation.operation_id == "workspace_worker_remove")
+            .unwrap();
+        assert_eq!(
+            operation
+                .success_responses
+                .iter()
+                .map(|response| response.status)
+                .collect::<Vec<_>>(),
+            [200, 202]
+        );
+        for (state, cause) in [("waiting", "job_pending"), ("held", "job_failed")] {
+            let wire = serde_json::json!({
+                "removed": false, "runtime_id": "runtime-a", "worker_id": "worker-a",
+                "operation_id": "original-operation", "state": state,
+                "phase": "recording", "cause": cause,
+            });
+            let response: WorkerRemoveResponse = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(response.status_code(), 202);
+            assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+            assert_eq!(
+                response.observation().unwrap().operation_id,
+                "original-operation"
+            );
+        }
+        let wire = serde_json::json!({"removed": true, "runtime_id": "r", "worker_id": "w"});
+        let response: WorkerRemoveResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
+        assert!(
+            serde_json::from_value::<WorkerRemoveResponse>(serde_json::json!({
+                "removed": false, "runtime_id": "r", "worker_id": "w", "phase": "unknown",
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<WorkerRemoveResponse>(serde_json::json!({
+                "removed": false, "runtime_id": "r", "worker_id": "w", "cause": "discard",
             }))
             .is_err()
         );
@@ -13563,7 +14418,8 @@ mod tests {
                 "manage_repositories": true,
                 "manage_secrets": true,
                 "manage_runtimes": true,
-                "delete_workspace": true
+                "delete_workspace": true,
+                "delete_subjects": true
             },
             "extension_points": {
                 "store": "sqlite",
@@ -14848,7 +15704,10 @@ mod openapi_artifact_tests {
         // identity, or a one-use Reviewer capability. They remain generated Rust client/Axum
         // operations, but must not appear as unauthenticated operations in the public OpenAPI.
         const SIGNED_INTERNAL: &[&str] = &[
+            "plugin_artifact_authorize",
+            "plugin_artifact_pull",
             "operation_authorize",
+            "bound_operation_authorize",
             "current_worker_workspace_config_get",
             "current_worker_workspace_config_attach",
             "current_worker_workspace_config_observe",
@@ -14866,6 +15725,7 @@ mod openapi_artifact_tests {
             "merge_request_review_submit",
             "merge_request_reviewer_child_register",
             "runtime_resource_fetch",
+            "worker_control_authorize",
             "worker_control_cancel",
             "worker_control_input",
             "worker_control_list",
@@ -14876,6 +15736,7 @@ mod openapi_artifact_tests {
             "worker_observation_sessions",
             "subjektiv_stage_candidate",
             "subjektiv_record_session",
+            "chat_worker_operation",
             "subjektiv_memory_backend",
             "subjektiv_session_backend",
             "subjektiv_memory_consolidation",
@@ -14885,7 +15746,7 @@ mod openapi_artifact_tests {
         // Session observation retains its existing explicit non-OpenAPI boundary independently of
         // the Runtime/Worker-source signed operation inventory above.
         const OTHER_OPENAPI_EXCLUDED: &[&str] = &["worker_session", "worker_session_history"];
-        const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config"];
+        const DOCUMENTED_SIGNED_INTERNAL: &[&str] = &["workspace_runtime_config", "plugin_host"];
         const BROWSER_ONLY: &[&str] = &["merge_request_selector_repair"];
 
         let document = canonical_openapi_document().expect("canonical OpenAPI contract must build");

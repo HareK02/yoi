@@ -454,6 +454,7 @@ mod tests {
             runtime_event_sources: vec![],
             remote_runtime_sources: vec![],
             backend_base_url: Some("server-auth".into()),
+            control_plane_endpoints: Default::default(),
         };
         let identity = RuntimeIdentityMaterial::generate("runtime-auth").unwrap();
         store

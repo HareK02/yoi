@@ -73,13 +73,14 @@ test("canonical initial post and discussion share markup and editing while all m
     .toEqual(["ticket-thread-event", "divider", "ticket-thread-event", "divider", "ticket-thread-event"]);
   expect(timeline.nextElementSibling).toBe(view.form);
   expect(view.form.firstElementChild?.matches(".bevel-line")).toBe(true);
-  for (const selector of [".ticket-metadata", ".ticket-handling", ".ticket-tags", ".ticket-relations", ".ticket-orchestrator-worker", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resources"]) {
+  for (const selector of [".ticket-metadata", ".ticket-handling", ".ticket-tags", ".ticket-relations", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resources"]) {
     expect(main.querySelector(selector)).toBeNull();
     expect(rail.querySelector(selector)).not.toBeNull();
   }
   expect(view.container.querySelector(".ticket-delivery")).toBeNull();
   expect(view.queryByText("Delivery and execution")).toBeNull();
-  for (const selector of [".ticket-orchestrator-worker", ".ticket-worker-observation", ".ticket-worker-card", ".ticket-resources"]) {
+  expect(rail.querySelector(".ticket-orchestrator-worker")).toBeNull();
+  for (const selector of [".ticket-worker-observation", ".ticket-worker-card", ".ticket-resources"]) {
     expect(rail.querySelector(selector)?.hasAttribute("open")).toBe(false);
   }
   expect(within(rail).getByText("Created by")).toBeTruthy();

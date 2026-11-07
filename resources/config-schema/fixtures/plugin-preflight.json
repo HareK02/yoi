@@ -1,0 +1,21 @@
+{
+  "schema": "{ plugins = { enabled = { echo = { installation_id = String; expected_last_operation = String; package_digest = String; artifact_digest = String; tools = [...String]; logging = Bool default false; connections = { ...String } default {}; config = { mode = String; }; }; }; bindings = {} default {}; }; }",
+  "cases": [
+    {
+      "source": "{ plugins.enabled.echo = { installation_id = \"i\"; expected_last_operation = \"op\"; package_digest = \"package\"; artifact_digest = \"artifact\"; tools = [\"echo\"]; config.mode = \"test\"; }; } as WorkspaceConfigSchema",
+      "mode": "test"
+    },
+    {
+      "source": "{ plugins.enabled.echo = { installation_id = \"i\"; expected_last_operation = \"op\"; package_digest = \"package\"; artifact_digest = \"artifact\"; tools = [\"echo\"]; config = { mode = \"test\"; unknown = true; }; }; } as WorkspaceConfigSchema",
+      "diagnostic": "constraint_violation"
+    },
+    {
+      "source": "{ plugins.enabled.echo = { installation_id = \"i\"; expected_last_operation = \"op\"; package_digest = \"package\"; artifact_digest = \"artifact\"; tools = [\"echo\"]; config.mode = 42; }; } as WorkspaceConfigSchema",
+      "diagnostic": "constraint_violation"
+    },
+    {
+      "source": "{ plugins.enabled.echo = { installation_id = \"i\"; expected_last_operation = \"op\"; package_digest = \"package\"; artifact_digest = \"artifact\"; tools = [\"echo\"]; config.mode = String; }; } as WorkspaceConfigSchema",
+      "diagnostic": "materialize"
+    }
+  ]
+}

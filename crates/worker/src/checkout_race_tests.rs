@@ -282,6 +282,7 @@ fn deadline_provider(router: Arc<WorkdirSessionRouter>) -> Arc<Provider> {
 
 fn context() -> WipCallContext {
     WipCallContext {
+        result_namespaces: Default::default(),
         execution: Default::default(),
         security_context: "checkout-race-tests".into(),
     }
@@ -611,7 +612,7 @@ impl WipOperationHandler for DetachBeforePublication {
             context.execution,
         )
         .await
-        .map_err(map_tool_error)?;
+        .map_err(map_workdir_tool_error)?;
         self.file
             .provider
             .router

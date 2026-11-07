@@ -97,7 +97,10 @@ async fn remote_http_denials_forward_only_typed_reasons_and_old_missing_reason()
             format!("http://{address}").parse().unwrap(),
             "request-secret",
             Workdir::new("w").id().clone(),
-            OpenWorkdirSessionRequest::default(),
+            OpenWorkdirSessionRequest {
+                session_id: workdir::http::WorkdirSessionId::new("s").unwrap(),
+                owner_worker_id: None,
+            },
         )
         .await
         .unwrap();
@@ -187,7 +190,10 @@ async fn remote_checkout_diagnostics_preserve_mutation_outcome_and_read_failures
                     format!("http://{address}").parse().unwrap(),
                     "request-secret",
                     Workdir::new("w").id().clone(),
-                    OpenWorkdirSessionRequest::default(),
+                    OpenWorkdirSessionRequest {
+                        session_id: workdir::http::WorkdirSessionId::new("s").unwrap(),
+                        owner_worker_id: None,
+                    },
                 )
                 .await
                 .unwrap();
@@ -263,7 +269,10 @@ async fn mismatched_http_results_keep_cause_and_mutation_uncertainty() {
             format!("http://{address}").parse().unwrap(),
             "request-secret",
             Workdir::new("w").id().clone(),
-            OpenWorkdirSessionRequest::default(),
+            OpenWorkdirSessionRequest {
+                session_id: workdir::http::WorkdirSessionId::new("s").unwrap(),
+                owner_worker_id: None,
+            },
         )
         .await;
         let error = if case == "identity" {

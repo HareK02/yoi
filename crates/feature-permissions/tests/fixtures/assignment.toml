@@ -1,0 +1,17 @@
+revoked = false
+
+[[grants]]
+kind = "set"
+value = "ticket"
+
+[[grants]]
+kind = "namespace"
+[grants.value]
+namespace = "ticket"
+keys = ["ticket.hoge", "ticket.hoge.fuga.finish"]
+
+[[exclusions]]
+kind = "namespace"
+[exclusions.value]
+namespace = "ticket"
+keys = ["ticket.hoge.unlinked"]

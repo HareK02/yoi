@@ -831,7 +831,7 @@ fn published_terminal_receipt_fault(fault: TerminalFault) {
     stale.request_id = "terminal-fresh-stale-intent".into();
     assert!(matches!(
         runtime.restore_worker_operation_scoped(&scope, &worker_ref, stale),
-        Err(crate::error::RuntimeError::RestoreObservationConflict { .. })
+        Err(crate::error::RuntimeError::RestoreObservationStale { .. })
     ));
     assert_single_publication(&fixture, 1);
     assert_eq!(

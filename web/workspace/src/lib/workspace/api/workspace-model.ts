@@ -482,6 +482,7 @@ function permissions(value: unknown, path: string): WorkspacePermissionSummary {
       "manage_secrets",
       "manage_runtimes",
       "delete_workspace",
+      "delete_subjects",
     ],
     path,
   );
@@ -492,6 +493,7 @@ function permissions(value: unknown, path: string): WorkspacePermissionSummary {
     ),
     manage_secrets: boolean(item.manage_secrets, `${path}.manage_secrets`),
     manage_runtimes: boolean(item.manage_runtimes, `${path}.manage_runtimes`),
+    delete_subjects: boolean(item.delete_subjects, `${path}.delete_subjects`),
     delete_workspace: boolean(
       item.delete_workspace,
       `${path}.delete_workspace`,

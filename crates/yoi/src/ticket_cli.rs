@@ -1381,6 +1381,23 @@ mod tests {
     }
 
     impl TicketBackend for FakeBackend {
+        fn get_ticket_parent(&self, _: TicketIdOrSlug) -> ticket::Result<ticket::TicketParentLink> {
+            unreachable!("not used by CLI case fixture")
+        }
+        fn set_ticket_parent(
+            &self,
+            _: TicketIdOrSlug,
+            _: ticket::TicketParentSetRequest,
+        ) -> ticket::Result<ticket::TicketParentLink> {
+            unreachable!("not used by CLI case fixture")
+        }
+        fn query_ticket_children(
+            &self,
+            _: TicketIdOrSlug,
+            _: ticket::TicketChildrenRequest,
+        ) -> ticket::Result<ticket::TicketChildrenPage> {
+            unreachable!("not used by CLI case fixture")
+        }
         fn list(&self, filter: TicketListQuery) -> ticket::Result<Vec<TicketSummary>> {
             self.list_filter.replace(Some(filter));
             Ok(vec![])
@@ -1466,8 +1483,6 @@ mod tests {
             fn remove_ticket_relation(&self, id: TicketIdOrSlug, kind: TicketRelationKind, target: TicketIdOrSlug) -> ticket::Result<ticket::TicketRelation>;
             fn query_ticket_relations(&self, id: Option<TicketIdOrSlug>, kind: Option<TicketRelationKind>) -> ticket::Result<Vec<ticket::TicketRelation>>;
             fn relation_view(&self, id: TicketIdOrSlug) -> ticket::Result<ticket::TicketRelationView>;
-            fn add_orchestration_plan_record(&self, id: TicketIdOrSlug, record: ticket::NewOrchestrationPlanRecord) -> ticket::Result<ticket::OrchestrationPlanRecord>;
-            fn query_orchestration_plan_records(&self, id: Option<TicketIdOrSlug>, kind: Option<ticket::OrchestrationPlanKind>) -> ticket::Result<Vec<ticket::OrchestrationPlanRecord>>;
             fn doctor(&self) -> ticket::Result<ticket::TicketDoctorReport>;
         }
     }

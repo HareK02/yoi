@@ -191,7 +191,6 @@ pub enum JobState {
     Pending,
     Completed,
     Failed,
-    Unknown,
     Cancelled,
 }
 
@@ -203,7 +202,6 @@ pub enum JobAttemptState {
     Dispatched,
     Completed,
     Failed,
-    Unknown,
     Cancelled,
 }
 

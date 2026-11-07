@@ -7,7 +7,7 @@ import {
 } from "#lib/workspace/alerts/store.ts";
 import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 import { parseWorkerListResponse } from "#lib/workspace/api/workers.ts";
-import { parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
+import { loadWorkdirJson, parseWorkingDirectoryListResponse } from "#lib/workspace/api/workdirs.ts";
 import {
   workspaceMultiplexer,
   type WorkspaceMultiplexerFailure,
@@ -136,7 +136,15 @@ export function workspaceWorkersStore(
         if (disposed) return false;
         try {
           workers = [...projection.workers.values()]
-            .map((worker) => projectWorker(worker, workdirs))
+            .map((worker) => ({
+              ...projectWorker(worker, workdirs),
+              // Removal is Workspace-owned. Runtime stream events only trigger
+              // a catalog refresh; they cannot clear or complete this intent.
+              removal: catalogWorkers?.find((summary) =>
+                summary.runtime_id === worker.runtime_id &&
+                summary.worker_id === worker.worker_id
+              )?.removal,
+            }))
             .sort(compareWorkersForSidebar);
           set({
             loading,
@@ -232,11 +240,11 @@ export function workspaceWorkersStore(
         void refreshCatalog();
       };
       const loadWorkdirs = async () => {
-        const result = await loadJson(
+        const result = await loadWorkdirJson(
           fetch,
           workspaceApiPath(workspaceId, "/working-directories"),
-          { signal: workdirRequest.signal },
           parseWorkingDirectoryListResponse,
+          { signal: workdirRequest.signal },
         );
         if (disposed) return;
         if (!result.data) {

@@ -1,4 +1,3 @@
-import type { BrowserWorkspaceOrchestratorResponse } from "#lib/generated/worker-launch-api.ts";
 import type {
   TicketAssignmentPrincipalSnapshot,
   TicketAssignmentTrackingProjection,
@@ -11,7 +10,6 @@ import type {
 
 export const TICKET_STATES = ["open", "closed"] as const;
 export type TicketState = (typeof TICKET_STATES)[number];
-export type WorkspaceOrchestratorStatus = BrowserWorkspaceOrchestratorResponse;
 export function ticketWorkerMessage(ticketId: string): string {
   return `Work on Ticket ${ticketId}.`;
 }
@@ -32,7 +30,8 @@ export function ticketWorkerLaunchHref(
 }
 
 export const HANDLING_STATES = ["waiting", "inprogress", "done"] as const;
-export const ORCHESTRATOR_PRINCIPAL = {
+// 読取り専用の旧割当filter。新規割当へは使用しない。
+export const LEGACY_ORCHESTRATOR_PRINCIPAL = {
   kind: "workspace_agent",
   agent_key: "workspace-orchestrator",
 } as const;
@@ -58,6 +57,7 @@ export function handlingLabel(
 export function assignmentPrincipalLabel(
   principal: TicketAssignmentPrincipalSnapshot,
 ): string {
+  if (principal.kind === "subject") return `Subject: ${principal.subject_id}`;
   if (principal.kind === "workspace_agent") {
     return `Workspace agent: ${principal.agent_key}`;
   }
@@ -88,7 +88,8 @@ export type TicketFilters = {
   query: string;
   caseState: "all" | TicketState;
   tagIds: string[];
-  principal: "all" | "orchestrator" | "user" | "worker";
+  principal: "all" | "subject" | "orchestrator" | "user" | "worker";
+  subjectId: string;
   accountId: string;
   runtimeId: string;
   workerId: string;
@@ -109,10 +110,12 @@ export function readTicketFilters(search: URLSearchParams): TicketFilters {
     query: search.get("q") ?? "",
     caseState: state === "open" || state === "closed" ? state : "all",
     tagIds: [...new Set(search.getAll("tag"))],
-    principal: principal === "orchestrator" || principal === "user" ||
+    principal: principal === "subject" || principal === "orchestrator" ||
+        principal === "user" ||
         principal === "worker"
       ? principal
       : "all",
+    subjectId: search.get("subject") ?? "",
     accountId: search.get("account") ?? "",
     runtimeId: search.get("runtime") ?? "",
     workerId: search.get("worker") ?? "",
@@ -128,7 +131,15 @@ export function readTicketFilters(search: URLSearchParams): TicketFilters {
 export function filterPrincipal(
   filters: TicketFilters,
 ): TicketAssignmentPrincipalSnapshot | null {
-  if (filters.principal === "orchestrator") return ORCHESTRATOR_PRINCIPAL;
+  if (filters.principal === "subject") {
+    if (!filters.subjectId.trim()) {
+      throw new Error("Select a Subject for the assignment filter");
+    }
+    return { kind: "subject", subject_id: filters.subjectId.trim() };
+  }
+  if (filters.principal === "orchestrator") {
+    return LEGACY_ORCHESTRATOR_PRINCIPAL;
+  }
   if (filters.principal === "user") {
     if (!filters.accountId.trim()) {
       throw new Error("Enter an account ID for the user principal filter");

@@ -16,11 +16,41 @@ use crate::{Error, Result};
 /// Explicit domain-owned purge inventory. The deletion operation tombstone is intentionally
 /// excluded so retries and audit remain available after the Workspace row is gone.
 const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
+    "plugin_service_recovery_audit",
+    // Consumer deletion cascades its released proofs. Their retention guard stays
+    // installed: deleting proofs directly while the consumer exists is forbidden.
+    "plugin_service_consumers",
+    "plugin_service_released_proofs",
+    "plugin_service_retention",
+    "typed_ticket_service_outbox",
+    "plugin_data_receipts",
+    "plugin_data_purges",
+    "plugin_data_holders",
+    "plugin_data_cells",
+    "plugin_data_cursors",
+    "plugin_effect_receipts",
+    "plugin_invocations",
+    "worker_plugin_launches",
+    "plugin_execution_plans",
+    "plugin_references",
+    "plugin_operations",
+    "plugin_uploads",
+    "plugin_artifacts",
+    "plugin_installations",
     "artifacts",
     "audit_events",
+    "backend_job_delivery_pre_content_history",
+    "backend_job_attempt_pre_content_history",
+    "backend_job_pre_content_history",
+    "backend_job_attempt_upgrade_history",
+    "backend_job_upgrade_history",
+    "backend_job_reconciliation",
+    "backend_job_execution_fences",
+    "backend_job_recovery_probes",
     "backend_job_deliveries",
     "backend_job_attempts",
     "backend_jobs",
+    "external_workdir_connection_observations",
     "external_workdir_grants",
     "flow_source_contents",
     "flow_sources",
@@ -80,8 +110,9 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "typed_ticket_content_changes",
     "typed_ticket_events",
     "typed_ticket_labels",
-    "typed_ticket_orchestration_plans",
     "typed_ticket_raw_frontmatter",
+    "typed_ticket_parent_operations",
+    "typed_ticket_parent_links",
     "typed_ticket_relations",
     "typed_ticket_risk_flags",
     "typed_ticket_targets",
@@ -94,6 +125,13 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "workdir_registry",
     "workdir_removal_operations",
     "worker_control_grants",
+    // Snapshot children precede their fence parent and canonical Worker removal
+    // receipts (subject_deletion_workers.prior_removal_operation_id).
+    "subject_deletion_removals",
+    "subject_deletion_allocations",
+    "subject_deletion_jobs",
+    "subject_deletion_workers",
+    "subject_deletions",
     "subject_worker_releases",
     "subject_create_recoveries",
     "worker_create_reservations",
@@ -113,6 +151,10 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_tombstones",
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",
+    "workspace_configuration_publication_observations",
+    "workspace_configuration_receipts",
+    "workspace_configuration_policies",
+    "workspace_configuration_authorities",
     "workspace_config_entries",
     "workspace_config_grants",
     "workspace_drive_grants",
@@ -486,16 +528,23 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
             }
             let workspace_id = operation.response.workspace_id.clone();
 
-            // Ticket case/assignment judgments and their operation receipts are
-            // immutable under ordinary domain operations, including Ticket
-            // deletion and FK cascades. Only this owner-authorized whole-Workspace
-            // purge may discard them.
+            // Service recovery audit, Ticket case/assignment judgments and their
+            // operation receipts are immutable under ordinary domain operations,
+            // including Ticket deletion and FK cascades. Only this owner-authorized
+            // whole-Workspace purge may discard them.
             // SQLite transactional DDL holds the writer lock: no concurrent writer
             // can observe the suspended guards, and any error rolls back both
             // data and schema. Restore the exact schema-owned definitions before
             // commit; update guards remain installed throughout.
             let mut ticket_delete_guards = Vec::new();
             for (table, trigger) in [
+                ("plugin_service_recovery_audit", "plugin_service_audit_retained"),
+                ("plugin_data_receipts", "plugin_data_receipt_retained"),
+                ("plugin_data_purges", "plugin_data_purge_retained"),
+                ("plugin_effect_receipts", "plugin_effect_retained"),
+                ("plugin_invocations", "plugin_invocation_retained"),
+                ("worker_plugin_launches", "worker_plugin_launch_retained"),
+                ("plugin_execution_plans", "plugin_plan_replay_retained"),
                 ("notification_source_preparation_failures", "notification_source_preparation_failures_no_delete"),
                 ("notification_job_targets", "notification_job_targets_no_delete"),
                 ("notification_job_legacy_receipts", "notification_job_legacy_no_delete"),
@@ -521,6 +570,9 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ("typed_ticket_assignment_tracking_operations", "typed_ticket_assignment_tracking_operations_no_delete"),
                 ("typed_ticket_case_history", "typed_ticket_case_history_no_delete"),
                 ("typed_ticket_legacy_workflow_snapshot", "typed_ticket_legacy_workflow_no_delete"),
+                ("workspace_configuration_authorities", "workspace_configuration_authorities_no_delete"),
+                ("workspace_configuration_publication_observations", "workspace_configuration_publication_no_delete"),
+                ("workspace_configuration_receipts", "workspace_configuration_receipts_no_delete"),
             ] {
                 let definition: String = tx.query_row(
                     "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name=?2",
@@ -1037,8 +1089,8 @@ mod tests {
                             ticket_id: initial.meta.id.clone(),
                             assignment_id: assignment_id.clone(),
                             role: crate::store::TicketAssignmentRole::Orchestrator,
-                            principal: crate::store::TicketAssignmentPrincipal::WorkspaceAgent {
-                                agent_key: "workspace-orchestrator".into(),
+                            principal: crate::store::TicketAssignmentPrincipal::Subject {
+                                subject_id: "deletion-fixture-subject".into(),
                             },
                             assigned_by: "owner".into(),
                             assigned_at: "2026-01-01T00:00:00Z".into(),
@@ -1082,7 +1134,7 @@ mod tests {
                                 actor: "orchestrator".into(),
                                 runtime_id: "fixture-runtime".into(),
                                 worker_id: "fixture-worker".into(),
-                                agent_key: "workspace-orchestrator".into(),
+                                subject_id: "deletion-fixture-subject".into(),
                                 authentication_binding_id: "fixture-binding".into(),
                             },
                         )?;
@@ -1129,6 +1181,19 @@ mod tests {
                         )?;
                         conn.execute("INSERT INTO notification_source_preparation_failures(source_sequence,code) SELECT sequence,'source_lookup_failed' FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
                         conn.execute("INSERT INTO notification_source_offers(source_sequence,last_offered) SELECT sequence,1 FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
+                        let policy = crate::policy_config::AdoptedSubjectPolicy {
+                            source: crate::policy_config::SubjectAssignmentSource {
+                                subject_id: "retained-subject".into(),
+                                execution: Default::default(),
+                                delegation: Default::default(),
+                            },
+                            change_id: "retained-policy-change".into(),
+                            legacy_constraints: None,
+                        };
+                        conn.execute("INSERT INTO workspace_configuration_authorities VALUES(?1,'transfer','physical','export')", [workspace])?;
+                        conn.execute("INSERT INTO workspace_configuration_policies VALUES(?1,'retained-subject',?2)", params![workspace, serde_json::to_string(&policy).unwrap()])?;
+                        conn.execute("INSERT INTO workspace_configuration_receipts VALUES(?1,'adopt','fingerprint','{}')", [workspace])?;
+                        conn.execute("INSERT INTO workspace_configuration_publication_observations(workspace_id,operation_id,stage,runtime_id,outcome) VALUES(?1,'adopt','dispatch','','observed')", [workspace])?;
                         Ok(())
                     })
                     .unwrap();
@@ -1138,6 +1203,14 @@ mod tests {
                     for table in ["typed_ticket_case_history", "typed_ticket_legacy_workflow_snapshot", "ticket_worker_assignment_events", "typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_operations", "ticket_assignment_operations", "ticket_assignment_content_inputs"] {
                         assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
                         assert!(conn.execute(&format!("UPDATE {table} SET ticket_id=ticket_id WHERE workspace_id=?1"), [workspace]).is_err());
+                    }
+                    for (table, column) in [
+                        ("workspace_configuration_authorities", "transfer_identity"),
+                        ("workspace_configuration_publication_observations", "stage"),
+                        ("workspace_configuration_receipts", "request_fingerprint"),
+                    ] {
+                        assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
+                        assert!(conn.execute(&format!("UPDATE {table} SET {column}={column} WHERE workspace_id=?1"), [workspace]).is_err());
                     }
                     assert!(conn.execute("DELETE FROM notification_source_preparation_failures WHERE source_sequence IN (SELECT sequence FROM notification_sources WHERE workspace_id=?1)",[workspace]).is_err());
                     assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_source_preparation_failures p JOIN notification_sources s ON s.sequence=p.source_sequence WHERE s.workspace_id=?1",[workspace],|r|r.get::<_,i64>(0))?,1);
@@ -1164,6 +1237,10 @@ mod tests {
                 .unwrap()
                 .operation;
             let tables = [
+                "workspace_configuration_publication_observations",
+                "workspace_configuration_authorities",
+                "workspace_configuration_policies",
+                "workspace_configuration_receipts",
                 "typed_ticket_case_history",
                 "typed_ticket_case_metadata",
                 "typed_ticket_legacy_workflow_snapshot",
@@ -1274,6 +1351,380 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn workspace_purge_removes_plugin_references_and_catalog_without_cross_workspace_loss() {
+        let position = |table| {
+            WORKSPACE_DELETION_PURGE_TABLES
+                .iter()
+                .position(|name| *name == table)
+                .unwrap()
+        };
+        assert!(position("plugin_service_recovery_audit") < position("plugin_service_consumers"));
+        assert!(position("plugin_service_consumers") < position("plugin_service_released_proofs"));
+        assert!(position("plugin_service_consumers") < position("plugin_execution_plans"));
+        assert!(position("plugin_service_consumers") < position("plugin_installations"));
+        let (store, owner, workspace_id) = setup();
+        for workspace in ["workspace-a", "workspace-b"] {
+            store.with_conn(|conn| {
+                let digest = format!("sha256:{}", "a".repeat(64));
+                conn.execute("INSERT INTO plugin_installations VALUES(?1,'installation','alias','package','operation',0)", [workspace])?;
+                conn.execute("INSERT INTO plugin_artifacts VALUES(?1,'installation',?2,?2,'1',1,'{}',0,NULL)", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_uploads VALUES(?1,'upload','actor',9999999999,?2,1,'{}')", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_operations VALUES(?1,'operation','actor','install','key',?2,'{}')", params![workspace,"f".repeat(64)])?;
+                for kind in ["config","pending","active","restorable"] {
+                    conn.execute("INSERT INTO plugin_references VALUES(?1,?2,'owner','installation',?3)", params![workspace,kind,digest])?;
+                }
+                conn.execute("INSERT INTO plugin_execution_plans VALUES(?1,'plan','actor','create',?2,'{}','active')", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_invocations(workspace_id,invocation_id,plan_id,plan_fingerprint,installation_id,runtime_id,worker_id,execution_json,consumer_key,consumer_json,created_at_ms,expires_at_ms) VALUES(?1,'invocation','plan',?2,'installation','runtime','worker','{}','[\"tool_call\",\"call\"]','{}',1,1000)", params![workspace,digest])?;
+                conn.execute("INSERT INTO plugin_effect_receipts(workspace_id,invocation_id,effect_key,fingerprint,admitted_at_ms,state,error_json) VALUES(?1,'invocation','key',?2,2,'pending',?3)", params![workspace,digest,r#"{"code":"indeterminate","effect":"indeterminate","diagnostic_id":"safe"}"#])?;
+                conn.execute("INSERT INTO plugin_service_consumers(workspace_id,consumer_id,runtime_id,worker_id,installation_id,plan_id,service_name,subscriptions_json,cursor) VALUES(?1,'consumer','runtime','worker','installation','plan','service','[\"changed\",\"deleted\"]',1)", [workspace])?;
+                conn.execute("INSERT INTO plugin_service_released_proofs(workspace_id,consumer_id,lease_token,released_at_ms) VALUES(?1,'consumer','released-token',2)", [workspace])?;
+                conn.execute("INSERT INTO plugin_service_recovery_audit(workspace_id,operation_key,consumer_id,fingerprint,actor,reason,action_json,at_ms) VALUES(?1,'recovery','consumer','fingerprint','owner','Explicit recovery','{}',3)", [workspace])?;
+                conn.execute("INSERT INTO plugin_service_retention(workspace_id,removed_through) VALUES(?1,1)", [workspace])?;
+                conn.execute("INSERT INTO typed_ticket_service_outbox(event_id,workspace_id,ticket_id,event_type,occurred_at,domain_event_ref,content_digest,correlation_id,causation_id) VALUES(?1,?2,'deleted-ticket','deleted','2026-01-01T00:00:00Z','deleted-ticket:0',?3,'correlation','causation')", params![if workspace == "workspace-a" { "a".repeat(32) } else { "b".repeat(32) },workspace,"c".repeat(64)])?;
+                for table in ["plugin_effect_receipts", "plugin_invocations", "plugin_execution_plans"] {
+                    assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
+                }
+                Ok(())
+            }).unwrap();
+        }
+        let counts = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    [
+                        "plugin_service_recovery_audit",
+                        "plugin_service_consumers",
+                        "plugin_service_released_proofs",
+                        "plugin_service_retention",
+                        "typed_ticket_service_outbox",
+                        "plugin_effect_receipts",
+                        "plugin_invocations",
+                        "plugin_execution_plans",
+                        "plugin_references",
+                        "plugin_operations",
+                        "plugin_uploads",
+                        "plugin_artifacts",
+                        "plugin_installations",
+                    ]
+                    .map(|table| {
+                        Ok(conn.query_row(
+                            &format!("SELECT count(*) FROM {table} WHERE workspace_id=?1"),
+                            [workspace],
+                            |r| r.get::<_, i64>(0),
+                        )?)
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let service_rows = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    [
+                        "plugin_service_recovery_audit",
+                        "plugin_service_consumers",
+                        "plugin_service_released_proofs",
+                        "plugin_service_retention",
+                        "typed_ticket_service_outbox",
+                    ]
+                    .map(|table| {
+                        let mut statement = conn.prepare(&format!(
+                            "SELECT * FROM {table} WHERE workspace_id=?1 ORDER BY 1"
+                        ))?;
+                        let columns = statement.column_count();
+                        let rows = statement
+                            .query_map([workspace], |row| {
+                                (0..columns)
+                                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                                    .collect::<rusqlite::Result<Vec<_>>>()
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(rows)
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let service_guards = || {
+            store
+                .with_conn(|conn| {
+                    let mut statement = conn.prepare(
+                        "SELECT name,sql FROM sqlite_schema WHERE type='trigger'
+                         AND tbl_name IN ('plugin_service_consumers',
+                             'plugin_service_released_proofs','plugin_service_recovery_audit')
+                         ORDER BY name",
+                    )?;
+                    let guards = statement
+                        .query_map([], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(guards)
+                })
+                .unwrap()
+        };
+        let assert_service_retained = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    for (table, column) in [
+                        ("plugin_service_recovery_audit", "actor"),
+                        ("plugin_service_released_proofs", "released_at_ms"),
+                    ] {
+                        assert!(
+                            conn.execute(
+                                &format!("DELETE FROM {table} WHERE workspace_id=?1"),
+                                [workspace],
+                            )
+                            .is_err(),
+                            "ordinary deletion must retain {table}"
+                        );
+                        assert!(
+                            conn.execute(
+                                &format!(
+                                    "UPDATE {table} SET {column}={column} WHERE workspace_id=?1"
+                                ),
+                                [workspace],
+                            )
+                            .is_err(),
+                            "ordinary updates must not rewrite {table}"
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let guards_before = service_guards();
+        let target_service_before = service_rows("workspace-a");
+        let other_service_before = service_rows("workspace-b");
+        assert_service_retained("workspace-a");
+        assert_service_retained("workspace-b");
+        let other = counts("workspace-b");
+        assert_eq!(
+            counts("workspace-a"),
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1]
+        );
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .unwrap();
+        let operation = store
+            .reserve_workspace_deletion(
+                &owner,
+                &workspace_id,
+                &WorkspaceDeletionRequest {
+                    operation_id: "purge-plugins".into(),
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                    confirmation: "Alpha".into(),
+                },
+            )
+            .unwrap()
+            .operation;
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER plugin_purge_failure BEFORE DELETE ON workspaces WHEN OLD.workspace_id='workspace-a' BEGIN SELECT RAISE(ABORT,'injected purge failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        let error = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("injected purge failure"),
+            "{error}"
+        );
+        assert_eq!(
+            counts("workspace-a"),
+            vec![1, 1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1]
+        );
+        assert_eq!(counts("workspace-b"), other);
+        assert_eq!(service_rows("workspace-a"), target_service_before);
+        assert_eq!(service_rows("workspace-b"), other_service_before);
+        assert_eq!(service_guards(), guards_before);
+        assert_service_retained("workspace-a");
+        assert_service_retained("workspace-b");
+        store
+            .with_conn(|conn| {
+                crate::plugin_host::verify_receipt_schema(conn)?;
+                conn.execute_batch("DROP TRIGGER plugin_purge_failure")?;
+                Ok(())
+            })
+            .unwrap();
+        let completed = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap();
+        assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
+        assert_eq!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap(),
+            completed
+        );
+        assert_eq!(counts("workspace-a"), vec![0; 13]);
+        assert_eq!(counts("workspace-b"), other);
+        assert_eq!(service_rows("workspace-b"), other_service_before);
+        assert_eq!(service_guards(), guards_before);
+        assert_service_retained("workspace-b");
+        store
+            .with_conn(|conn| {
+                crate::plugin_host::verify_receipt_schema(conn)?;
+                assert_eq!(
+                    conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))?,
+                    "ok"
+                );
+                assert!(
+                    conn.execute(
+                        "DELETE FROM plugin_effect_receipts WHERE workspace_id='workspace-b'",
+                        []
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                        .get::<_, i64>(
+                        0
+                    ))?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn workspace_purge_removes_subject_deletion_snapshots_and_preserves_other_workspace() {
+        let (store, owner, workspace_id) = setup();
+        let tables = [
+            "subject_deletion_removals",
+            "subject_deletion_allocations",
+            "subject_deletion_jobs",
+            "subject_deletion_workers",
+            "subject_deletions",
+            "worker_removal_operations",
+        ];
+        // Check the explicit FK ordering as well as execution (the purge defers FKs).
+        let position = |table| {
+            WORKSPACE_DELETION_PURGE_TABLES
+                .iter()
+                .position(|name| *name == table)
+                .unwrap()
+        };
+        for child in &tables[..4] {
+            assert!(position(*child) < position("subject_deletions"));
+        }
+        assert!(position("subject_deletion_removals") < position("subject_deletion_workers"));
+        assert!(position("subject_deletion_removals") < position("worker_removal_operations"));
+        assert!(position("subject_deletion_workers") < position("worker_removal_operations"));
+        for workspace in ["workspace-a", "workspace-b"] {
+            store.with_conn(|conn| {
+                conn.execute("INSERT INTO worker_removal_operations(
+                    operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,
+                    worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,
+                    archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at)
+                    VALUES(?1,?1,'fingerprint',?1,'runtime','worker','1','policy','digest',
+                        'purge','purge','forever','purge','[]','executing','removed','1','1')", [workspace])?;
+                conn.execute("INSERT INTO subject_deletions(workspace_id,subject_id,operation_id,completed,jobs_erased)
+                    VALUES(?1,'subject','subject-delete',1,1)", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_workers(workspace_id,subject_id,runtime_id,worker_id,is_job,prior_removal_operation_id,originals_absent)
+                    VALUES(?1,'subject','runtime','worker',1,NULL,0)", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_removals(workspace_id,subject_id,runtime_id,worker_id,operation_id,input_fingerprint,request_json)
+                    VALUES(?1,'subject','runtime','worker',?1,'fingerprint',json_object('operation_id',?1,'input_fingerprint','fingerprint'))", [workspace])?;
+                // Settle canonical removal so Workspace deletion's independent
+                // preflight is unblocked; the reconciliation row still needs purge.
+                conn.execute("UPDATE worker_removal_operations SET state='succeeded' WHERE operation_id=?1", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_jobs VALUES(?1,'subject','job')", [workspace])?;
+                conn.execute("INSERT INTO subject_deletion_allocations VALUES(?1,'subject','allocation')", [workspace])?;
+                Ok(())
+            }).unwrap();
+        }
+        let rows = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    tables
+                        .iter()
+                        .map(|table| {
+                            let mut statement = conn
+                                .prepare(&format!("SELECT * FROM {table} WHERE workspace_id=?1"))?;
+                            let count = statement.column_count();
+                            Ok(statement
+                                .query_map([workspace], |row| {
+                                    (0..count)
+                                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                                        .collect::<rusqlite::Result<Vec<_>>>()
+                                })?
+                                .collect::<rusqlite::Result<Vec<_>>>()?)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        let before = rows("workspace-a");
+        let other = rows("workspace-b");
+        assert!(before.iter().all(|table| table.len() == 1));
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .unwrap();
+        let operation = store
+            .reserve_workspace_deletion(
+                &owner,
+                &workspace_id,
+                &WorkspaceDeletionRequest {
+                    operation_id: "purge-subject-snapshots".into(),
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                    confirmation: "Alpha".into(),
+                },
+            )
+            .unwrap()
+            .operation;
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER reject_subject_snapshot_purge BEFORE DELETE ON workspaces
+                BEGIN SELECT RAISE(ABORT,'injected purge failure'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .is_err()
+        );
+        assert_eq!(
+            rows("workspace-a"),
+            before,
+            "rollback restores snapshots and canonical receipt"
+        );
+        assert_eq!(rows("workspace-b"), other);
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER reject_subject_snapshot_purge")?;
+                Ok(())
+            })
+            .unwrap();
+        let completed = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap();
+        assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
+        assert!(rows("workspace-a").iter().all(|table| table.is_empty()));
+        assert_eq!(rows("workspace-b"), other);
+        assert_eq!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap(),
+            completed
+        );
+        store
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

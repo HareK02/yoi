@@ -1,5 +1,9 @@
 import { extname, join, normalize } from "jsr:@std/path@1.1.4";
 import { journalBrowserFixture } from "./journal_browser_fixture.ts";
+import {
+  createSubjectPermissionsFixture,
+  permissionFixtureSubjects,
+} from "./subject_permissions_fixture.ts";
 
 const port = Number(Deno.args[0]);
 const buildRoot = Deno.args[1];
@@ -11,6 +15,16 @@ if (
   throw new Error("usage: server.ts <port> <build-root> [section-count: 3..100]");
 }
 
+// 既存Memory scenarioとpaginationを変えないよう、明示選択時だけ有効にする。
+const navigationMode = Deno.args[3] === "navigation";
+const permissionsMode = Deno.args[3] === "permissions" || navigationMode;
+if (permissionsMode) {
+  // 権限の証拠は親から渡された実製品buildを使って採取する。
+  // build欠落時に/healthを成功させたり、fixture HTMLで代替したりしない。
+  await Deno.stat(join(buildRoot, "index.html"));
+  await Deno.stat(join(buildRoot, "_app/immutable"));
+}
+const permissionsFixture = createSubjectPermissionsFixture();
 const workspaceId = "memory-review";
 const representativeSubjectId =
   "release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review";
@@ -30,6 +44,12 @@ const memoryPageCursor = "fixture-memory-page-2";
 const changePageCursor = "fixture-change-page-2";
 const createdSubjectIds = new Set<string>();
 const subjectCreateRequests: unknown[] = [];
+type SubjectCreateInput = { operation_id: string; role: string; behavior_md: string };
+const subjectCreateReceipts = new Map<
+  string,
+  { request: SubjectCreateInput; subject: ReturnType<typeof subject> }
+>();
+const subjectCreateOutcomes: { outcome: string; subject_id?: string }[] = [];
 let createdSubjectCount = 0;
 
 const paragraphs = Array.from(
@@ -81,6 +101,17 @@ const subjects = [
   subject(ungeneratedSubjectId, "Ungenerated subject", "active", "fingerprint-0"),
   subject(errorSubjectId, "Unavailable subject", "retired", "fingerprint-3"),
 ];
+if (permissionsMode) {
+  subjects.push(
+    ...permissionFixtureSubjects.map(([id, role]) => subject(id, role, "active", "fingerprint-0")),
+  );
+}
+if (navigationMode) {
+  subjects.push(
+    subject("staging", "Subject named staging", "active", "fingerprint-0"),
+    subject("encoded/Subject ?#日本%", "Encoded identity Subject", "active", "fingerprint-0"),
+  );
+}
 const pagedSubject = subject(pagedSubjectId, "Subject on the next page", "active", "fingerprint-1");
 
 function connectedWorker(displayName: string) {
@@ -123,7 +154,7 @@ function subject(
     memory_fingerprint: memoryFingerprint,
     created_at: "2026-01-01T00:00:00Z",
     updated_at: "2026-01-02T03:04:05Z",
-    ...(currentWorker ? { current_worker: currentWorker } : {}),
+    ...(currentWorker ? { current_worker: currentWorker, current_body: { runtime_id: currentWorker.runtime_id, worker_id: currentWorker.worker_id, generation: "17" } } : {}),
   };
 }
 
@@ -132,7 +163,13 @@ function memoriesFor(subjectId: string) {
   if (subjectId === emptySubjectId || subjectId === ungeneratedSubjectId) return [];
   if (subjectId === staleSubjectId) {
     return [
-      memorySummary("stale-memory-1", "change-earlier", "lesson", "resolved", "A resolved stale-surface lesson"),
+      memorySummary(
+        "stale-memory-1",
+        "change-earlier",
+        "lesson",
+        "resolved",
+        "A resolved stale-surface lesson",
+      ),
     ];
   }
   if (subjectId === failedSubjectId) {
@@ -227,7 +264,12 @@ function surfaceFor(subjectId: string) {
 function memoryDetail(memoryId: string, requestedChangeId: string | null) {
   const currentChangeId = memoryId === derivedMemoryId ? "change-parent" : "change-current";
   const changeId = requestedChangeId ?? currentChangeId;
-  const states: Record<string, string> = { "change-original": "retracted", "change-earlier": "resolved", "change-current": "active", "change-parent": "active" };
+  const states: Record<string, string> = {
+    "change-original": "retracted",
+    "change-earlier": "resolved",
+    "change-current": "active",
+    "change-parent": "active",
+  };
   return {
     memory_id: memoryId,
     change_id: changeId,
@@ -361,8 +403,35 @@ async function staticResponse(pathname: string): Promise<Response> {
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/health") return new Response("ok");
+  // 合成HTTPの閲覧主体。実Backendの認証や権限付与の証拠にはしない。
+  if (url.pathname === "/api/auth/whoami") {
+    return json({
+      authentication_reference: "memory-review-fixture-authentication",
+      session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+      actor: {
+        user_id: "fixture-user",
+        account_id: "owner",
+        handle: "fixture",
+        display_name: "Synthetic Memory owner",
+        auth_method: "browser_session",
+      },
+    });
+  }
+  if (url.pathname === "/api/hosting/access") return json({ is_admin: false });
+  if (permissionsMode) {
+    const response = await permissionsFixture(request);
+    if (response) return response;
+  }
   if (url.pathname === "/fixture/subject-create-requests") {
     return json({ count: subjectCreateRequests.length, requests: subjectCreateRequests });
+  }
+  if (url.pathname === "/fixture/subject-create-evidence") {
+    return json({
+      authority: "synthetic-http-NOT-real-Backend",
+      requests: subjectCreateRequests,
+      outcomes: subjectCreateOutcomes,
+      created: subjects.filter((item) => createdSubjectIds.has(item.id)),
+    });
   }
   if (url.pathname === "/api/workspaces") {
     return json([{
@@ -393,6 +462,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
         manage_secrets: false,
         manage_runtimes: false,
         delete_workspace: false,
+        delete_subjects: false,
       },
       extension_points: {
         store: "fixture",
@@ -409,7 +479,13 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     return json({ workspace_id: workspaceId, items: [], diagnostics: [] });
   }
   if (url.pathname === `/api/w/${workspaceId}/workers`) {
-    return json({ workspace_id: workspaceId, limit: 200, items: [], source: "fixture", diagnostics: [] });
+    return json({
+      workspace_id: workspaceId,
+      limit: 200,
+      items: [],
+      source: "fixture",
+      diagnostics: [],
+    });
   }
   if (url.pathname === `/api/w/${workspaceId}/workers/launch-options`) {
     return json({
@@ -444,26 +520,54 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     });
   }
 
+  if (navigationMode && url.pathname === `/api/w/${workspaceId}/memory/staging`) {
+    return json({ limit: 200, returned_count: 0, total_valid_count: 0, invalid_count: 0, truncated: false, order: "fixture", record_authority: "synthetic-http", items: [], diagnostics: [] });
+  }
   const subjectsPath = `/api/w/${workspaceId}/subjektiv/subjects`;
   if (url.pathname === subjectsPath) {
     if (request.method === "POST") {
       const payload = await request.json().catch(() => null) as {
+        operation_id?: unknown;
         role?: unknown;
         behavior_md?: unknown;
       } | null;
       subjectCreateRequests.push(payload);
-      if (!payload || typeof payload.role !== "string" || payload.role.trim().length === 0) {
-        return json({ error: "Bad Request", message: "subject role must not be empty" }, 400);
+      const reject = (message: string, status = 400) => {
+        subjectCreateOutcomes.push({ outcome: `rejected-${status}` });
+        return json({ error: status === 409 ? "Conflict" : "Bad Request", message }, status);
+      };
+      if (
+        !payload || typeof payload.operation_id !== "string" ||
+        payload.operation_id.trim().length === 0
+      ) return reject("subject create operation_id is required");
+      if (typeof payload.role !== "string" || payload.role.trim().length === 0) {
+        return reject("subject role must not be empty");
       }
       if (payload.role === "Permission denied") {
+        subjectCreateOutcomes.push({ outcome: "rejected-403" });
         return json({ error: "Forbidden", message: "workspace permission denied" }, 403);
       }
       if (typeof payload.behavior_md !== "string") {
-        return json({ error: "Bad Request", message: "subject behavior must be a string" }, 400);
+        return reject("subject behavior must be a string");
+      }
+      const input: SubjectCreateInput = {
+        operation_id: payload.operation_id,
+        role: payload.role,
+        behavior_md: payload.behavior_md,
+      };
+      const receipt = subjectCreateReceipts.get(input.operation_id);
+      if (receipt) {
+        if (
+          receipt.request.role !== input.role || receipt.request.behavior_md !== input.behavior_md
+        ) return reject("operation_id already used with different input", 409);
+        subjectCreateOutcomes.push({ outcome: "replay", subject_id: receipt.subject.id });
+        return json(receipt.subject, 201);
       }
       createdSubjectCount += 1;
       const id = `created-subject-${String(createdSubjectCount).padStart(4, "0")}`;
-      const created = subject(id, payload.role, "active", "fingerprint-empty", payload.behavior_md);
+      const created = subject(id, input.role, "active", "fingerprint-empty", input.behavior_md);
+      subjectCreateReceipts.set(input.operation_id, { request: input, subject: created });
+      subjectCreateOutcomes.push({ outcome: "created", subject_id: id });
       createdSubjectIds.add(id);
       subjects.unshift(created);
       return json(created, 201);
@@ -492,6 +596,22 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
     const foundSubject = subjects.find((item) => item.id === subjectId);
     if (!foundSubject) return json({}, 404);
 
+    // 合成HTTPでもBody GETを明示する。未対応APIへのHTML fallbackを観測成功にしない。
+    // mutationはこのfixtureでは提供せず、IA検証で起動停止の成功を偽装しない。
+    if (parts.length === 2 && parts[1] === "body" && request.method === "GET") {
+      const worker = foundSubject.current_worker;
+      return json({
+        workspace_id: workspaceId,
+        subject_id: subjectId,
+        current: worker ? { runtime_id: worker.runtime_id, worker_id: worker.worker_id, generation: "17" } : null,
+        observation: worker ? {
+          kind: "available",
+          worker: { ...worker, resource_key: "W-fixture", availability: "observed", worker_state: { last_command_id: 1, state: { kind: "idle" } }, restore_observation_token: "synthetic-body-observation" },
+        } : { kind: "absent" },
+        can_start: foundSubject.state === "active",
+        can_stop: foundSubject.state === "active",
+      });
+    }
     if (parts.length === 2 && parts[1] === "journal-browser") {
       return await journalBrowserFixture(request, subjectId);
     }
@@ -521,7 +641,15 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       const paginated = subjectId === representativeSubjectId;
       const continued = paginated && url.searchParams.get("cursor") === memoryPageCursor;
       const items = continued
-        ? [memorySummary("memory-page-two", "change-original", "lesson", "active", "Memory on the next page")]
+        ? [
+          memorySummary(
+            "memory-page-two",
+            "change-original",
+            "lesson",
+            "active",
+            "Memory on the next page",
+          ),
+        ]
         : memoriesFor(subjectId);
       return json({
         items,
@@ -536,7 +664,9 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
       }
       if (parts.length === 3) {
         const requested = url.searchParams.get("change_id");
-        const knownChanges = memoryId === derivedMemoryId ? ["change-parent"] : ["change-original", "change-earlier", "change-current"];
+        const knownChanges = memoryId === derivedMemoryId
+          ? ["change-parent"]
+          : ["change-original", "change-earlier", "change-current"];
         if (requested !== null && !knownChanges.includes(requested)) return json({}, 404);
         return json(memoryDetail(memoryId, requested));
       }

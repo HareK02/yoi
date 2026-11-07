@@ -70,7 +70,7 @@ pub(crate) async fn execute_edit(
     tracker: Tracker,
     params: EditParams,
     ctx: agen::tool::ToolExecutionContext,
-) -> Result<crate::checkout::CheckoutToolOutput, ToolError> {
+) -> Result<crate::checkout::CheckoutToolOutput, crate::WorkdirToolError> {
     let path = &target.path;
     tracing::debug!(path = %path, replace_all = params.edit.replace_all, "Edit");
     params
@@ -159,7 +159,7 @@ pub(crate) fn routed_edit_tool(
             router: router.clone(),
             tracker: tracker.clone(),
         });
-        (meta, tool)
+        (meta, crate::workdir_audit::with_receipts(tool))
     })
 }
 
@@ -279,7 +279,7 @@ mod tests {
             .execute(&inp.to_string(), Default::default())
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        crate::workdir_error::assert_report(err, "invalid_argument", "invalid_request");
     }
 
     #[tokio::test]
@@ -300,7 +300,7 @@ mod tests {
             .execute(&inp.to_string(), Default::default())
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::InvalidArgument(_)));
+        crate::workdir_error::assert_report(err, "invalid_argument", "invalid_request");
     }
 
     #[tokio::test]
@@ -344,12 +344,8 @@ mod tests {
             .execute(&inp.to_string(), Default::default())
             .await
             .unwrap_err();
-        match err {
-            ToolError::ExecutionFailed(message) => assert_eq!(
-                message,
-                "The target file's content or existence changed since it was last observed; read the file again before retrying: a.txt"
-            ),
-            other => panic!("expected execution failure, got {other:?}"),
-        }
+        let report = crate::workdir_error::assert_report(err, "execution_failed", "conflict");
+        assert_eq!(report["failure"]["details"]["operation"], "edit");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "something else");
     }
 }

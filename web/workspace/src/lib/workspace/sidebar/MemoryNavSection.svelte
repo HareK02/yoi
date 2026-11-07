@@ -1,27 +1,13 @@
 <script lang="ts">
   import { workspaceRoute } from "#lib/workspace/api/http.ts";
+  import { ownsRoutePath } from './route-ownership.ts';
 
-  type Props = {
-    currentPath?: string;
-    workspaceId: string;
-  };
-
-  let { currentPath = "/", workspaceId }: Props = $props();
-  let subjectsHref = $derived(
-    workspaceId ? workspaceRoute(workspaceId, "/memory") : "/",
-  );
-  let subjectsActive = $derived(
-    currentPath === subjectsHref || currentPath.startsWith(`${subjectsHref}/`),
-  );
+  let { workspaceId, currentPath = '/' }: { workspaceId: string; currentPath?: string } = $props();
+  const href = $derived(workspaceRoute(workspaceId, "/memory/staging"));
+  const active = $derived(ownsRoutePath(href, currentPath));
 </script>
 
 <section class="sidebar-nav-section sidebar-nav-section--category">
   <h2 class="sidebar-nav-section__header">Memory</h2>
-
-  <a
-    class="sidebar-link"
-    class:active={subjectsActive}
-    href={subjectsHref}
-    aria-current={subjectsActive ? "page" : undefined}
-  >Subjects</a>
+  <a class="sidebar-link" class:active {href} aria-current={active ? 'page' : undefined}>Staging</a>
 </section>

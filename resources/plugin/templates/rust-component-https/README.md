@@ -1,0 +1,5 @@
+# Connection-bound HTTPS Tool雛形
+
+接続先とsecretをguestが選べないよう、宣言slotからcall-local resourceを取得する。副作用の観測を失敗時にも保持し、自動再送やrollback成功を装わない。HTTP error statusはresponseとして扱う。
+
+このソースをComponentへbuildできることは、HTTPS Hostの実装・認可・receipt保存を提供した証拠にはならない。packageの要求grantはWorkspace bindingや実行権限を自己発行しない。

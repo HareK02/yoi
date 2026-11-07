@@ -78,12 +78,12 @@ impl Fixture {
     fn assign(&self, id: &str, assignment: &str, status: Option<&str>, current: bool) {
         self.authority.store.with_conn(|conn| {
             conn.execute("INSERT INTO ticket_worker_assignments(workspace_id,ticket_id,assignment_id,role,principal_kind,principal_id,assigned_by,assigned_at)
-                VALUES('w',?1,?2,'orchestrator','workspace_agent','workspace-orchestrator','owner-account','1')",params![id,assignment])?;
+                VALUES('w',?1,?2,'orchestrator','subject','subject-a','owner-account','1')",params![id,assignment])?;
             conn.execute("UPDATE ticket_worker_assignments SET tracking_json=?1,tracking_updated_at=?2 WHERE workspace_id='w' AND assignment_id=?3",
                 params![status.map(|s| serde_json::json!({"status":s,"waiting_reason":null,"progress":null,"next_action":null,"result":null}).to_string()),status.map(|_|"1"),assignment])?;
             if current {
                 conn.execute("INSERT INTO ticket_current_worker_assignments(workspace_id,ticket_id,role,assignment_id,principal_kind,principal_id,updated_at)
-                    VALUES('w',?1,'orchestrator',?2,'workspace_agent','workspace-orchestrator','1')",params![id,assignment])?;
+                    VALUES('w',?1,'orchestrator',?2,'subject','subject-a','1')",params![id,assignment])?;
             }
             Ok(())
         }).unwrap();
@@ -100,9 +100,9 @@ impl Fixture {
         }).unwrap();
     }
 }
-fn agent() -> ticket::TicketAssignmentPrincipalSnapshot {
-    ticket::TicketAssignmentPrincipalSnapshot::WorkspaceAgent {
-        agent_key: "workspace-orchestrator".into(),
+fn assigned_subject() -> ticket::TicketAssignmentPrincipalSnapshot {
+    ticket::TicketAssignmentPrincipalSnapshot::Subject {
+        subject_id: "subject-a".into(),
     }
 }
 fn ids(response: &TicketBrowseQueryResponse) -> Vec<String> {
@@ -264,7 +264,7 @@ async fn ticket_browse_all_filters_are_applied_before_limit_and_batch_fields_mat
         query: Some("NEEDLE".into()),
         states: vec![TicketState::Closed],
         tag_ids: vec!["b".into(), "a".into(), "a".into()],
-        assigned_principal: Some(agent()),
+        assigned_principal: Some(assigned_subject()),
         handling_status: Some(ticket::TicketAssignmentTrackingStatus::Done),
         closure_reason: Some(TicketClosureReason::Other("custom reason".into())),
         limit: Some(1),
@@ -372,7 +372,7 @@ async fn ticket_browse_assignment_current_missing_unknown_and_cleared_semantics(
         f.authority.ticket_assignment_tracking(&unknown).unwrap()
     );
     let mut assigned = ids(&f.run(TicketBrowseQueryRequest {
-        assigned_principal: Some(agent()),
+        assigned_principal: Some(assigned_subject()),
         ..Default::default()
     }));
     assigned.sort();
@@ -617,4 +617,94 @@ async fn ticket_browse_plain_page_sql_uses_recent_index_without_history_or_graph
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn parent_filters_match_browse_and_authoritative_queries_and_bind_cursor_scope() {
+    let f = Fixture::new().await;
+    let parent = f.ticket("Parent", Some("1"));
+    let other = f.ticket("Other", Some("1"));
+    let a = f.ticket("Child A", Some("1"));
+    let b = f.ticket("Child B", Some("1"));
+    for (child, key) in [(&a, "a"), (&b, "b")] {
+        f.backend
+            .set_ticket_parent(
+                child.clone().into(),
+                ticket::TicketParentSetRequest {
+                    expected: Default::default(),
+                    parent: Some(parent.clone()),
+                    operation_key: key.into(),
+                },
+            )
+            .unwrap();
+    }
+    let key = f
+        .backend
+        .show(parent.clone().into())
+        .unwrap()
+        .meta
+        .resource_key
+        .unwrap();
+    let parent_filter = Some(ticket::TicketParentFilter::Parent { ticket: key });
+    let page = f.run(TicketBrowseQueryRequest {
+        parent: parent_filter.clone(),
+        limit: Some(1),
+        ..Default::default()
+    });
+    assert_eq!(page.items.len(), 1);
+    assert!(page.page.has_more);
+    let mismatch = TicketBrowseQueryRequest {
+        parent: Some(ticket::TicketParentFilter::Parent {
+            ticket: other.clone(),
+        }),
+        cursor: page.page.next_cursor.clone(),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert!(f.authority.query_ticket_browse(mismatch).is_err());
+    let mut expected = vec![a.clone(), b.clone()];
+    expected.sort();
+    let mut browse = ids(&f.run(TicketBrowseQueryRequest {
+        parent: parent_filter.clone(),
+        ..Default::default()
+    }));
+    browse.sort();
+    assert_eq!(browse, expected);
+    let authoritative = f
+        .authority
+        .query_tickets(server_api::TicketQueryRequest {
+            parent: parent_filter,
+            ..Default::default()
+        })
+        .unwrap();
+    let mut actual: Vec<_> = authoritative
+        .items
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    actual.sort();
+    assert_eq!(actual, expected);
+    let observed = f
+        .backend
+        .get_ticket_parent(a.clone().into())
+        .unwrap()
+        .observation;
+    f.backend
+        .set_ticket_parent(
+            a.clone().into(),
+            ticket::TicketParentSetRequest {
+                expected: observed,
+                parent: None,
+                operation_key: "unlink".into(),
+            },
+        )
+        .unwrap();
+    let mut roots = ids(&f.run(TicketBrowseQueryRequest {
+        parent: Some(ticket::TicketParentFilter::None {}),
+        ..Default::default()
+    }));
+    roots.sort();
+    let mut expected_roots = vec![parent, other, a];
+    expected_roots.sort();
+    assert_eq!(roots, expected_roots);
 }

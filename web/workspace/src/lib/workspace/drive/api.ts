@@ -13,6 +13,13 @@ import type {
   DriveReadTextResponse,
   DriveRequestStatusResponse,
 } from "#lib/generated/drive-api.ts";
+import type { DomainFailureDetails } from "#lib/generated/domain-failures.ts";
+import { decodeDomainFailureDetails } from "#lib/workspace/failure/domains.ts";
+import { failureNotice } from "#lib/workspace/failure/model.ts";
+import {
+  type FailureReceipt,
+  receiveProblem,
+} from "#lib/workspace/failure/receive.ts";
 import { workspaceApiPath } from "#lib/workspace/api/http.ts";
 
 export type {
@@ -37,9 +44,12 @@ export class DriveRequestError extends Error {
   constructor(
     public readonly code: DriveApiError["code"],
     public readonly classification: DriveApiError["classification"],
+    public readonly receipt?: FailureReceipt<DomainFailureDetails>,
   ) {
     super(
-      classification === "unknown"
+      receipt
+        ? failureNotice(receipt).explanation
+        : classification === "unknown"
         ? "Drive outcome unknown; check request status"
         : `Drive request failed: ${code}`,
     );
@@ -258,6 +268,65 @@ export function parseDriveApiError(value: unknown): DriveApiError {
     message: string(v.message),
   };
 }
+// HTTP status and mutation classification come from domain result fields, never
+// explanation/category/retry hints. Unknown/invalid contracts stay unconfirmed.
+export async function receiveDriveApiError(response: Response): Promise<{
+  error: DriveApiError;
+  receipt?: FailureReceipt<DomainFailureDetails>;
+}> {
+  if (
+    response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ===
+      "application/problem+json"
+  ) {
+    let receipt = await receiveProblem(response, decodeDomainFailureDetails);
+    if (receipt.kind === "problem") {
+      const { yoi_failure: failure, status, type } = receipt.problem;
+      const details = failure.details;
+      const statuses = {
+        denied: 403,
+        not_found: 404,
+        conflict: 409,
+        invalid: 400,
+        limit: 413,
+        storage_unavailable: 503,
+        outcome_unknown: 503,
+      } as const;
+      if (failure.domain !== "drive_http" || !("code" in details)) {
+        receipt = { kind: "unsupported" };
+      } else if (
+        status !== statuses[details.code] || type !== "urn:yoi:problem:drive" ||
+        (details.code === "outcome_unknown" &&
+          details.classification !== "unknown")
+      ) {
+        receipt = { kind: "invalid" };
+      } else {
+        return {
+          error: {
+            code: details.code,
+            classification: details.classification,
+            message: failureNotice(receipt).explanation,
+          },
+          receipt,
+        };
+      }
+    }
+    return {
+      error: {
+        code: "outcome_unknown",
+        classification: "unknown",
+        message: failureNotice(receipt).explanation,
+      },
+      receipt,
+    };
+  }
+  const payload: unknown = JSON.parse(
+    new TextDecoder("utf-8", { fatal: true }).decode(
+      await readBoundedDriveBytes(response, DRIVE_JSON_MAX_BYTES),
+    ),
+  );
+  return { error: parseDriveApiError(payload) };
+}
+
 export async function readBoundedDriveBytes(
   response: Response,
   maximum = DRIVE_RESPONSE_MAX_BYTES,
@@ -434,13 +503,8 @@ export function createDriveClient(fetchFn: typeof fetch = fetch): DriveClient {
   }
   async function checked(res: Response): Promise<void> {
     if (res.ok) return;
-    const payload: unknown = JSON.parse(
-      new TextDecoder("utf-8", { fatal: true }).decode(
-        await readBoundedDriveBytes(res, DRIVE_JSON_MAX_BYTES),
-      ),
-    );
-    const error = parseDriveApiError(payload);
-    throw new DriveRequestError(error.code, error.classification);
+    const { error, receipt } = await receiveDriveApiError(res);
+    throw new DriveRequestError(error.code, error.classification, receipt);
   }
   async function json<T>(
     path: string,

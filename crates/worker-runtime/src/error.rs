@@ -12,8 +12,37 @@ pub enum RuntimeError {
     #[error("initial worker input must be user input, got {kind}")]
     InvalidInitialInputKind { kind: String },
 
+    #[error("worker {worker_id} Restore observation is stale; request was not accepted")]
+    RestoreObservationStale { worker_id: WorkerId },
+
     #[error("worker {worker_id} Restore observation conflicts with the current operation")]
     RestoreObservationConflict { worker_id: WorkerId },
+
+    #[error(
+        "worker {worker_id} lifecycle lock is busy; release caller gates and retry the same Restore intent"
+    )]
+    RestoreAdmissionBusy { worker_id: WorkerId },
+
+    #[error("worker {worker_id} Stop observation conflicts with the current lifecycle")]
+    StopObservationConflict { worker_id: WorkerId },
+
+    #[error(
+        "worker {worker_id} Stop request ID is already bound to different input or another pending stop"
+    )]
+    StopRequestConflict { worker_id: WorkerId },
+
+    #[error(
+        "worker {worker_id} lifecycle lock is busy; release caller gates and retry the same Stop intent"
+    )]
+    StopAdmissionBusy { worker_id: WorkerId },
+
+    #[error(
+        "worker {worker_id} attachment operation request ID is bound to different input or pending authority"
+    )]
+    WorkdirAttachmentsRequestConflict { worker_id: WorkerId },
+
+    #[error("worker {worker_id} attachment generation is stale; request was not accepted")]
+    WorkdirAttachmentsGenerationStale { worker_id: WorkerId },
 
     #[error("worker {worker_id} was not found")]
     WorkerNotFound { worker_id: WorkerId },
@@ -42,8 +71,20 @@ pub enum RuntimeError {
         result: WorkerExecutionResult,
     },
 
+    /// Creation failed after connection; the original error remains internal source
+    /// evidence. Display deliberately never renders it or the startup attachment.
+    #[error("worker creation failed")]
+    WorkerCreateFailed {
+        failure: Box<runtime_api::startup::WorkerCreateFailure>,
+        #[source]
+        source: Box<RuntimeError>,
+    },
+
     #[error("limit {requested} exceeds maximum {max}")]
     LimitTooLarge { requested: usize, max: usize },
+
+    #[error("worker {worker_id} was already created with different request identity input")]
+    WorkerCreateConflict { worker_id: WorkerId },
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -56,6 +97,15 @@ pub enum RuntimeError {
         owner_server_id: String,
         requester_server_id: String,
     },
+
+    #[error("recording source unavailable: {message}")]
+    RecordingSourceUnavailable { message: String },
+
+    #[error("recording ownership unknown: {message}")]
+    RecordingOwnershipUnknown { message: String },
+
+    #[error("recording execution unconfirmed: {message}")]
+    RecordingExecutionUnconfirmed { message: String },
 
     #[error(transparent)]
     WorkingDirectory(#[from] WorkingDirectoryDiagnostic),
@@ -125,4 +175,75 @@ pub enum RuntimeError {
 
     #[error("runtime state lock was poisoned")]
     StatePoisoned,
+}
+
+impl RuntimeError {
+    /// Only an owning create boundary or a Spawn result can identify a creation
+    /// failure. Independent Input errors retain their ordinary API contract.
+    pub fn create_failure(&self) -> Option<runtime_api::startup::WorkerCreateFailure> {
+        match self {
+            Self::WorkerCreateFailed { failure, .. } => Some((**failure).clone()),
+            Self::WorkerExecutionRejected { result, .. } => {
+                crate::execution::startup_create_failure(result)
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        }
+    }
+
+    /// The original execution result, including primary facts and independent secondary
+    /// failures. Display is presentation only and must not be parsed to recover causes.
+    pub fn execution_result(&self) -> Option<&WorkerExecutionResult> {
+        match self {
+            Self::WorkerExecutionRejected { result, .. } => Some(result),
+            Self::WorkerCreateFailed { source, .. } => source.execution_result(),
+            _ => None,
+        }
+    }
+}
+
+impl RuntimeError {
+    pub fn control_cause(&self) -> protocol::control_failure::RuntimeControlCause {
+        use RuntimeError as E;
+        use protocol::control_failure::RuntimeControlCause;
+        let error = self;
+        use RuntimeControlCause as C;
+        match error {
+            E::WorkerCreateFailed { source, .. } => source.control_cause(),
+            E::WorkerNotFound { .. } => C::WorkerMissing,
+            E::WorkerCreateConflict { .. } => C::CreateRequestConflict,
+            E::RuntimeStopped => C::RuntimeStopped,
+            E::InvalidInitialInputKind { .. } | E::LimitTooLarge { .. } | E::InvalidRequest(_) => {
+                C::InvalidRequest
+            }
+            E::RestoreObservationStale { .. } => C::RestoreObservationStale,
+            E::RestoreObservationConflict { .. } => C::RestoreObservationConflict,
+            E::RestoreAdmissionBusy { .. } => C::RestoreAdmissionBusy,
+            E::StopObservationConflict { .. } => C::StopObservationConflict,
+            E::StopRequestConflict { .. } => C::StopRequestConflict,
+            E::StopAdmissionBusy { .. } => C::StopAdmissionBusy,
+            E::WorkerExecutionUnavailable { .. } | E::ExecutionBackendUnavailable { .. } => {
+                C::ExecutionUnavailable
+            }
+            E::WorkerExecutionRejected { .. }
+            | E::WorkdirAttachmentsRequestConflict { .. }
+            | E::WorkdirAttachmentsGenerationStale { .. } => C::ExecutionRejected,
+            E::WorkerDeletePersistenceFailed { .. } | E::StoreIo { .. } => C::PersistenceFailed,
+            E::StoreCommitOutcomeUnknown { .. } => C::PersistenceOutcomeUnknown,
+            E::WorkspaceOwnerMismatch { .. } => C::WorkspaceBindingMismatch,
+            E::WorkingDirectory(_) => C::WorkingDirectoryFailed,
+            E::ConfigBundleMissing { .. }
+            | E::ConfigBundleDigestMismatch { .. }
+            | E::InvalidProfileSelector { .. }
+            | E::UnsupportedConfigDeclaration { .. } => C::ConfigurationUnavailable,
+            E::RuntimeStoreAlreadyOpen { .. } | E::StoreMissing { .. } | E::StoreCorrupt { .. } => {
+                C::StoreUnavailable
+            }
+            E::RecordingSourceUnavailable { .. } => C::RecordingSourceUnavailable,
+            E::RecordingOwnershipUnknown { .. } => C::RecordingOwnershipUnknown,
+            E::RecordingExecutionUnconfirmed { .. } => C::RecordingExecutionUnconfirmed,
+            E::StatePoisoned => C::StateUnavailable,
+        }
+    }
 }

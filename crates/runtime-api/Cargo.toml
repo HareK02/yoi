@@ -6,13 +6,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-api-macros = { workspace = true, features = ["reqwest", "axum"] }
+api-macros = { workspace = true, features = ["reqwest", "axum", "openapi", "error-contract"] }
 manifest.workspace = true
-protocol.workspace = true
+plugin-plan = { path = "../plugin-plan" }
+protocol = { workspace = true, features = ["json-schema"] }
+error-contract = { workspace = true, features = ["json-schema"] }
+schemars.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
 session-store.workspace = true
 serde = { workspace = true, features = ["derive"] }
 workdir.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

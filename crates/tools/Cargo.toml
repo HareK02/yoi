@@ -9,6 +9,7 @@ async-trait = { workspace = true }
 fs-operation.workspace = true
 html5ever = "0.26"
 agen = { workspace = true }
+error-contract = { workspace = true, features = ["json-schema"] }
 manifest = { workspace = true }
 secrets = { workspace = true }
 markup5ever_rcdom = "0.2"
@@ -26,5 +27,7 @@ workdir = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+jsonschema = { version = "0.33.0", default-features = false }
+error-contract = { workspace = true, features = ["test-support"] }
 filetime = "0.2.27"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

@@ -116,7 +116,7 @@ impl ProfileRuntimeWorkerFactory {
         .await;
         let mut worker = worker_result.map_err(|error| {
             self.retain_construction_failure(request, &error);
-            cause(restore_worker_cause(&error))
+            RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Recovery, error)
         })?;
         let tasks = worker.retain_startup_feature_cleanup();
         let sessions = worker.workdir_sessions();
@@ -141,11 +141,13 @@ impl ProfileRuntimeWorkerFactory {
                     .map_err(|_| cause("recovery Backend Job binding failed"))?;
             }
             worker
-                .finalize_subjektiv_session_attribution(
+                .finalize_subjektiv_session_attribution_retaining_startup_failure(
                     request.request.subjektiv_attached,
                     SubjektivSessionAttributionLifecycle::RestoredSession,
                 )
-                .map_err(|error| cause(restore_worker_cause(&error)))?;
+                .map_err(|error| {
+                    RuntimeRestoreFailure::from_worker(RuntimeRestoreStage::Recovery, error)
+                })?;
             if pending {
                 worker::WorkerController::recover_pending_head(&mut worker, &root)
                     .await
@@ -161,21 +163,38 @@ impl ProfileRuntimeWorkerFactory {
             tasks
                 .shutdown()
                 .await
-                .map_err(|_| cause("recovery Feature settlement failed"))?;
+                .map_err(|_| RuntimeRestoreCleanupFailure::Feature)?;
             sessions
                 .close_all()
                 .await
-                .map_err(|_| cause("recovery Workdir close failed"))?;
+                .map_err(|_| RuntimeRestoreCleanupFailure::Workdir)?;
             if let Some(allocation) = allocation {
                 allocation
                     .release()
-                    .map_err(|_| cause("recovery allocation release failed"))?;
+                    .map_err(|_| RuntimeRestoreCleanupFailure::Allocation)?;
             }
-            Ok::<_, RuntimeRestoreFailure>(())
+            Ok::<_, RuntimeRestoreCleanupFailure>(())
         }
         .await;
-        result?;
-        cleanup?;
+        match (result, cleanup) {
+            (Err(mut primary), cleanup) => {
+                primary.cleanup = match cleanup {
+                    Ok(()) => RuntimeRestoreCleanup::Confirmed,
+                    Err(failure) => {
+                        primary.cleanup_failure = Some(failure);
+                        RuntimeRestoreCleanup::Failed(failure)
+                    }
+                };
+                return Err(primary);
+            }
+            (Ok(()), Err(cleanup)) => {
+                let mut failure = cause("restore recovery cleanup failed");
+                failure.cleanup_failure = Some(cleanup);
+                failure.cleanup = RuntimeRestoreCleanup::Failed(cleanup);
+                return Err(failure);
+            }
+            (Ok(()), Ok(())) => {}
+        }
         self.failed_restore_resources
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

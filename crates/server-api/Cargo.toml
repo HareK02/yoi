@@ -7,11 +7,14 @@ publish = false
 
 [features]
 default = []
-typescript = ["dep:ts-rs", "protocol/typescript"]
+typescript = ["dep:ts-rs", "protocol/typescript", "error-contract/typescript"]
 
 [dependencies]
-api-macros = { workspace = true, features = ["reqwest", "axum", "openapi"] }
+error-contract = { workspace = true, features = ["json-schema"] }
+feature-permissions.workspace = true
+api-macros = { workspace = true, features = ["reqwest", "axum", "openapi", "error-contract"] }
 memory.workspace = true
+plugin-plan.workspace = true
 merge-request.workspace = true
 protocol = { workspace = true, features = ["json-schema"] }
 runtime-api.workspace = true
@@ -21,10 +24,13 @@ serde_json.workspace = true
 sha2.workspace = true
 ticket.workspace = true
 ts-rs = { version = "12.0.1", optional = true }
+url.workspace = true
 webauthn-rs-proto = "0.5.5"
 workdir.workspace = true
+workspace-drive.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio.workspace = true
 
 [[example]]
@@ -39,6 +45,14 @@ name = "generate_worker_launch_api_types"
 
 [[example]]
 name = "generate_companion_api_types"
+
+[[example]]
+name = "generate_chat_api_types"
+required-features = ["typescript"]
+
+[[example]]
+name = "generate_subject_body_api_types"
+required-features = ["typescript"]
 
 [[example]]
 name = "generate_memory_api_types"
@@ -58,4 +72,8 @@ required-features = ["typescript"]
 
 [[example]]
 name = "generate_drive_api_types"
+required-features = ["typescript"]
+
+[[example]]
+name = "generate_plugin_api_types"
 required-features = ["typescript"]

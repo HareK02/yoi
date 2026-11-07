@@ -8,6 +8,13 @@ struct Transport {
     available: bool,
 }
 impl WorkspaceClient for Transport {
+    fn authorize_operation(
+        &self,
+        _: &str,
+        _: &server_api::authorization::PermissionResource,
+    ) -> Result<(), WorkspaceClientError> {
+        Ok(())
+    }
     fn workspace_id(&self) -> Option<&str> {
         self.available.then_some("workspace")
     }
@@ -30,16 +37,17 @@ fn transport(status: u16, body: Value) -> Arc<Transport> {
         requests: Mutex::new(vec![]),
         available: true,
         response: Ok(WorkspaceResponse {
+            content_type: None,
             status,
             body: body.to_string(),
         }),
     })
 }
-fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
+pub(super) fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
     vec![
         (
             PublicAssignmentKind::Assign,
-            json!({"ticket":"T-743", "principal":{"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}, "expected_assignment_id":null, "operation_id":"assign-1"}),
+            json!({"ticket":"T-743", "principal":{"kind":"subject", "subject_id":"subject-a"}, "expected_assignment_id":null, "operation_id":"assign-1"}),
             json!({"workspace_id":"workspace", "ticket_id":"T-743", "assignment":null}),
         ),
         (
@@ -73,6 +81,36 @@ fn cases() -> Vec<(PublicAssignmentKind, Value, Value)> {
             json!({"assignment_id":"delegation", "input_event_id":"ticket-event:8", "event_index":8}),
         ),
     ]
+}
+// Paired inputs exercise the two public contracts against identical domain requests.
+pub(super) fn native_args(kind: PublicAssignmentKind, input: &Value) -> BTreeMap<String, WipValue> {
+    let value = match kind {
+        PublicAssignmentKind::Assign => {
+            let mut principal = input["principal"].clone();
+            let case = principal.as_object_mut().unwrap().remove("kind").unwrap();
+            json!({"principal":{"$case":case,"value":principal},"observed":{"assignment_id":if input["expected_assignment_id"].is_null(){json!({"$case":"null"})}else{json!({"$case":"value","value":input["expected_assignment_id"]})}},"operation_id":input["operation_id"]})
+        }
+        PublicAssignmentKind::Clear => {
+            json!({"assignment_id":input["assignment_id"],"operation_id":input["operation_id"]})
+        }
+        PublicAssignmentKind::Assignments => {
+            json!({"page":{"cursor":input["after_assignment_id"],"limit":input["limit"]}})
+        }
+        PublicAssignmentKind::Diagnostics => {
+            json!({"assignment_id":input["assignment_id"],"page":{"after_input_event_id":input["after_input_event_id"],"after_start_operation_id":input["after_start_operation_id"],"limit":input["limit"]}})
+        }
+        PublicAssignmentKind::Answer => {
+            json!({"observed":{"assignment_id":input["assignment_id"],"expected_last_event_id":input["expected_last_event_id"]},"operation_key":input["operation_key"],"body":input["body"]})
+        }
+        PublicAssignmentKind::ImplementationResult => {
+            json!({"kind":input["kind"],"body":input["body"]})
+        }
+        PublicAssignmentKind::ImplementationResultQuery => json!({"result_id":input["result_id"]}),
+    };
+    match json_to_wip(&value).unwrap() {
+        WipValue::Record(fields) => fields,
+        _ => unreachable!(),
+    }
 }
 #[tokio::test]
 async fn public_assignment_schemas_require_observations_and_exclude_model_actor_claims() {
@@ -127,6 +165,26 @@ async fn public_assignment_schemas_require_observations_and_exclude_model_actor_
         assert!(client.requests.lock().unwrap().is_empty());
     }
 }
+#[tokio::test]
+async fn new_assignment_rejects_retained_legacy_principals_before_transport() {
+    for principal in [
+        json!({"kind":"workspace_agent", "agent_key":"workspace-orchestrator"}),
+        json!({"kind":"user", "account_id":"owner"}),
+        json!({"kind":"worker", "runtime_id":"r", "worker_id":"old-body"}),
+    ] {
+        let client = transport(200, json!({}));
+        let (_, tool) = definition(client.clone(), PublicAssignmentKind::Assign)();
+        let input = json!({"ticket":"T-743", "principal":principal,
+            "expected_assignment_id":null, "operation_id":"legacy-is-not-new-authority"});
+        assert!(matches!(
+            tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                .await,
+            Err(ToolError::InvalidArgument(_))
+        ));
+        assert!(client.requests.lock().unwrap().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn assign_reissue_and_clear_forward_observed_identity_and_exact_retry_without_new_key() {
     for (kind, mut input, response) in cases().into_iter().filter(|(kind, _, _)| {
@@ -452,14 +510,17 @@ async fn public_assignment_rejections_and_unknown_outcomes_never_auto_retry_or_r
     for (kind, input, _) in cases() {
         for response in [
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 403,
                 body: "permission denied".into(),
             }),
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 409,
                 body: "stale assignment or operation fingerprint mismatch".into(),
             }),
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "invalid response after dispatch".into(),
             }),
@@ -730,21 +791,19 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
         ),
         permissions: None,
         ticket_reference: "T-743".into(),
+        collection_route: "/tickets".into(),
+        merge_request_route: "/merge-requests".into(),
+        objective_route: "/objectives".into(),
         observations: Arc::new(Mutex::new(TicketObservationState::default())),
     };
-    let args: BTreeMap<_, _> = input
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(key, _)| key.as_str() != "ticket")
-        .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
-        .collect();
+    let args = native_args(kind, &input);
     for call_id in ["call-a", "call-b"] {
         handler
             .call(
                 "implementation_result",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::new(call_id, "wip", 3),
                     security_context: "worker".into(),
                 },
@@ -769,6 +828,7 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
                 "implementation_result",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::new("", "wip", 0),
                     security_context: "worker".into(),
                 },
@@ -793,6 +853,7 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
                     "implementation_result",
                     &forged,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::new("call-c", "wip", 0),
                         security_context: "worker".into(),
                     },
@@ -821,21 +882,20 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
             ),
             permissions: None,
             ticket_reference: "T-743".into(),
+            collection_route: "/tickets".into(),
+            merge_request_route: "/merge-requests".into(),
+            objective_route: "/objectives".into(),
             observations: Arc::new(Mutex::new(TicketObservationState::default())),
         };
         input.as_object_mut().unwrap().remove("ticket");
-        let args: BTreeMap<_, _> = input
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(key, value)| (key.clone(), json_to_wip(value).unwrap()))
-            .collect();
+        let args = native_args(kind, &input);
         let operation = native_ticket_operation(kind.name()).unwrap().operation;
         handler
             .call(
                 operation,
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into(),
                 },
@@ -851,6 +911,7 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
                     operation,
                     &forged,
                     WipCallContext {
+                        result_namespaces: Default::default(),
                         execution: ToolExecutionContext::direct(),
                         security_context: "worker".into()
                     }
@@ -875,21 +936,19 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
             rules: vec![],
         }),
         ticket_reference: "T-743".into(),
+        collection_route: "/tickets".into(),
+        merge_request_route: "/merge-requests".into(),
+        objective_route: "/objectives".into(),
         observations: Arc::new(Mutex::new(TicketObservationState::default())),
     };
-    let args = input
-        .as_object()
-        .unwrap()
-        .iter()
-        .filter(|(k, _)| k.as_str() != "ticket")
-        .map(|(k, v)| (k.clone(), json_to_wip(v).unwrap()))
-        .collect();
+    let args = native_args(PublicAssignmentKind::Answer, &input);
     assert!(matches!(
         denied
             .call(
                 "assignment_answer",
                 &args,
                 WipCallContext {
+                    result_namespaces: Default::default(),
                     execution: ToolExecutionContext::direct(),
                     security_context: "worker".into()
                 }

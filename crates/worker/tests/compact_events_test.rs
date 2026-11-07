@@ -1935,6 +1935,7 @@ async fn manual_compact_cancel_clears_progress_before_returning_idle() {
     let completion_request_id = "subworker-completion-during-compact";
     handle
         .send(Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: completion_request_id.into(),
             message: "subworker completed".into(),
             source: protocol::AuthenticatedInputSource::UntrustedWire,
@@ -2898,6 +2899,22 @@ impl CompactionJournalHost {
 }
 
 impl worker::subjektiv::SubjektivHost for CompactionJournalHost {
+    fn authorize_operation(
+        &self,
+        _: &worker::subjektiv::SubjektivHostContext,
+        operation: &str,
+    ) -> Result<(), worker::subjektiv::SubjektivHostError> {
+        // This fixture retains legacy Journal input even when fresh compaction
+        // reads are disabled. Supply permissions are independent of read capability.
+        match operation {
+            "journal.compaction.read" if self.granted => Ok(()),
+            "journal.startup.supply" | "journal.compaction.supply" => Ok(()),
+            _ => Err(worker::subjektiv::SubjektivHostError::PermissionDenied(
+                format!("compaction fixture did not grant {operation}"),
+            )),
+        }
+    }
+
     fn settings(&self) -> worker::subjektiv::SubjektivHostSettings {
         worker::subjektiv::SubjektivHostSettings {
             language: "English".into(),
@@ -3093,40 +3110,73 @@ fn assert_journal_provenance(
     expected_json: Option<&str>,
     catalog: &worker::PromptCatalog,
     workspace_id: Option<&str>,
+    worker: &Worker<MockClient, TestStore>,
 ) {
     use sha2::{Digest, Sha256};
+    let seed = replacement_seed(worker);
+    let payload: serde_json::Value = seed[1]
+        .metadata
+        .input_metadata
+        .as_ref()
+        .unwrap()
+        .feature_payload()
+        .unwrap()
+        .decode("journal:compaction", 1)
+        .unwrap();
     let projection = catalog.projection();
-    assert!(body.contains(&format!(
-        "Prompt provenance: `internal.subjektiv_journal_compaction`, source `{}`, projection `{}`.",
-        projection.source_digest, projection.catalog_digest,
-    )));
-    if let Some(workspace_id) = workspace_id {
-        assert!(body.contains(&format!("Host Workspace: `{workspace_id}`.")));
-    } else {
-        assert!(!body.contains("Host Workspace:"));
+    assert_eq!(
+        payload["prompt_provenance"]["source_digest"],
+        projection.source_digest
+    );
+    assert_eq!(
+        payload["prompt_provenance"]["projection_digest"],
+        projection.catalog_digest
+    );
+    assert_eq!(
+        payload["prompt_provenance"]["workspace_id"],
+        serde_json::to_value(workspace_id).unwrap()
+    );
+    for hidden in [
+        "Prompt provenance:",
+        "Snapshot SHA-256",
+        "Host Workspace:",
+        "state_token",
+        "process_byte",
+        "process_order",
+        "source_session_id",
+        "source_end",
+    ] {
+        assert!(!body.contains(hidden), "model context leaked {hidden}");
     }
     if let Some(expected_json) = expected_json {
-        // Hash the actual rendered JSON, including escapes and UTF-8 bytes,
-        // not a parsed/re-serialized or pretty-printed approximation.
-        let rendered_json = body.lines().rfind(|line| !line.is_empty()).unwrap();
-        assert_eq!(rendered_json.as_bytes(), expected_json.as_bytes());
-        let expected_hash = Sha256::digest(rendered_json.as_bytes())
+        let snapshot: subjektiv::journal::startup::JournalStartupSnapshot =
+            serde_json::from_str(expected_json).unwrap();
+        assert_eq!(
+            payload["snapshot"],
+            serde_json::from_str::<serde_json::Value>(expected_json).unwrap()
+        );
+        let expected_hash = Sha256::digest(expected_json.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let declared_hash = body
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("Snapshot SHA-256 (the exact JSON bytes below): `")
-                    .and_then(|value| value.strip_suffix("`."))
-            })
-            .expect("snapshot SHA-256 must be persisted in the same rendered body");
-        assert_eq!(declared_hash, expected_hash);
+        assert_eq!(payload["snapshot_sha256"], expected_hash);
+        if !snapshot.journals.is_empty() {
+            let yaml = &body[body.find("\njournals:").unwrap() + 1..];
+            let view: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            assert_eq!(
+                view["journals"][0]["current_position"].as_str(),
+                Some(snapshot.journals[0].current_position.as_str())
+            );
+            assert_eq!(
+                view["journals"][0]["entries"][0]["body"].as_str(),
+                Some(snapshot.journals[0].entries[0].body.as_str())
+            );
+            assert!(!body.contains(&snapshot.journals[0].state_token));
+            assert!(!body.contains(&snapshot.journals[0].journal_id));
+        }
     } else {
-        assert!(
-            !body.contains("Snapshot SHA-256"),
-            "failed/disabled reads must not invent a snapshot hash"
-        );
+        assert!(payload["snapshot"].is_null());
+        assert!(payload["snapshot_sha256"].is_null());
     }
 }
 
@@ -3293,10 +3343,7 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
             Some(&serde_json::to_string(&snapshot).unwrap()),
             &frozen_catalog,
             Some(COMPACTION_HOST_WORKSPACE_ID),
-        );
-        assert!(
-            body.contains(&serde_json::to_string(&snapshot).unwrap()),
-            "contents, references, fixed source_end and partial processing checkpoint must match"
+            &fixture.worker,
         );
         assert!(!body.contains(&format!("JOURNAL_POSITION_{}:", 100 + index)));
         assert_eq!(host.reads.lock().unwrap().len(), index + 1);
@@ -3430,16 +3477,6 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
         .unwrap();
     let restored_body = journal_body(&fixture.worker);
     assert_eq!(restored_body, *old_bodies.last().unwrap());
-    assert_journal_provenance(
-        &restored_body,
-        old_bodies
-            .last()
-            .unwrap()
-            .lines()
-            .rfind(|line| !line.is_empty()),
-        &initial_catalog,
-        Some(COMPACTION_HOST_WORKSPACE_ID),
-    );
     fixture
         .worker
         .run_text("normal turn after typed history restore")
@@ -3479,7 +3516,12 @@ async fn journal_three_compactions_freeze_one_snapshot_preserve_full_summary_tai
 #[tokio::test]
 async fn journal_empty_disabled_and_available_compaction_preserve_inputs_without_failure_warnings()
 {
-    assert_journal_compaction_cases(&["absent", "available", "disabled", "no-host"]).await;
+    assert_journal_compaction_cases(&["absent", "available", "disabled"]).await;
+}
+
+#[tokio::test]
+async fn journal_retained_input_without_host_refuses_compaction_before_provider_or_rewrite() {
+    assert_journal_compaction_cases(&["no-host"]).await;
 }
 
 #[tokio::test]
@@ -3497,6 +3539,7 @@ async fn assert_journal_compaction_cases(cases: &[&'static str]) {
         let mut snapshot = compaction_snapshot(0);
         if case == "absent" {
             snapshot.journals.clear();
+            snapshot.omitted = false;
         }
         if case == "over-byte-budget" {
             snapshot.journals[0].current_position =
@@ -3543,12 +3586,29 @@ async fn assert_journal_compaction_cases(cases: &[&'static str]) {
         // This observes the real Feature warning while compacting into FsStore.
         let logs = diagnostics::CapturedWarnings::default();
         use tracing::instrument::WithSubscriber;
-        fixture
+        let before_segment = fixture.worker.segment_id();
+        let before_requests = observed.requests().len();
+        let result = fixture
             .worker
             .compact(0)
             .with_subscriber(logs.subscriber())
-            .await
-            .unwrap();
+            .await;
+        if case == "no-host" {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retained protected input journal requires its matching source")
+            );
+            assert_eq!(observed.requests().len(), before_requests);
+            assert_eq!(fixture.worker.segment_id(), before_segment);
+            assert_eq!(
+                journal_body(&fixture.worker),
+                "PREVIOUS_JOURNAL_DELEGATED_CONTEXT"
+            );
+            continue;
+        }
+        result.unwrap();
         let log = logs.text();
         let failure = match case {
             "unavailable" => Some(("snapshot", "host_unavailable")),
@@ -3613,6 +3673,7 @@ async fn assert_journal_compaction_cases(cases: &[&'static str]) {
                 expected_json.as_deref(),
                 &fixture.worker.prompts().load_full(),
                 Some(COMPACTION_HOST_WORKSPACE_ID),
+                &fixture.worker,
             );
             let seed = replacement_seed(&fixture.worker);
             let metadata = seed[1].metadata.input_metadata.as_ref().unwrap();
@@ -3691,7 +3752,7 @@ async fn assert_journal_compaction_cases(cases: &[&'static str]) {
             "fallback retains only the newly frozen reference, not an old snapshot as latest"
         );
         assert_eq!(body.contains("JOURNAL_POSITION_0"), case == "available");
-        assert_eq!(body.contains("journal-reference-0"), case == "available");
+        assert!(!body.contains("journal-reference-0"));
         assert_eq!(
             host.reads.lock().unwrap().len(),
             usize::from(!matches!(case, "disabled" | "no-host")),

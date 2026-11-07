@@ -10,17 +10,21 @@ autobins = false
 default = []
 
 [dependencies]
+error-contract.workspace = true
+feature-permissions.workspace = true
 async-trait = { workspace = true }
 agen = { workspace = true, features = ["codex"] }
 session-store = { workspace = true }
 secrets = { workspace = true }
 manifest = { workspace = true }
+yoi-plugin-runtime = { path = "../plugin-runtime" }
 job = { workspace = true }
 mcp = { workspace = true }
 protocol = { workspace = true, features = ["json-schema"] }
 client = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }
 thiserror = { workspace = true }
@@ -30,6 +34,7 @@ tracing = { workspace = true }
 tools = { workspace = true }
 workdir = { workspace = true }
 server-api = { workspace = true }
+runtime-api.workspace = true
 minijinja = "2.19.0"
 chrono = "0.4"
 config-source = { path = "../config-source" }
@@ -64,3 +69,4 @@ dotenv = "0.15.0"
 futures = { workspace = true }
 serial_test = "3.4.0"
 tempfile = { workspace = true }
+syn = { version = "2", features = ["full", "visit"] }

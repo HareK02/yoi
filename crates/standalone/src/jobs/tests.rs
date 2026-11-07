@@ -1,3 +1,6 @@
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
+
 use super::*;
 use agen::llm_client::{ClientError, Request, event::Event};
 use async_trait::async_trait;
@@ -21,6 +24,8 @@ fn request(id: &str) -> JobRequest {
 }
 fn sink(jobs: &StandaloneJobs, id: &str, attempt: &str) -> BoundResultSink {
     BoundResultSink {
+        storage_recovered: jobs.storage_recovered.clone(),
+        revoked: Arc::new(AtomicBool::new(false)),
         store: jobs.store.clone(),
         job_id: id.into(),
         attempt_id: attempt.into(),
@@ -75,10 +80,12 @@ impl LlmClient for DomainTestClient {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>>, ClientError> {
         self.requests.lock().unwrap().push(request);
         self.entered.notify_one();
-        if let Some(release) = &self.failure_release {
+        if let Some(release) = &self.failure_release
+            && self.scripts.lock().unwrap().is_empty()
+        {
             release.notified().await;
             return Err(ClientError::Config(
-                "known scripted provider failure".into(),
+                "TEST_ONLY_SECRET /private/provider/path raw_http_body".into(),
             ));
         }
         if self.stall {
@@ -106,16 +113,23 @@ fn domain_request(id: &str) -> JobRequest {
     intent
 }
 impl JobDomainProvider for RecordingDomainProvider {
+    fn callbacks_use_attempt_fence(&self) -> bool {
+        true
+    }
+
     fn grant(
         &self,
         snapshot: &JobSnapshot,
         fence: Arc<dyn JobAttemptFence>,
-    ) -> Result<worker::job::JobFeatureGrant, String> {
+    ) -> Result<worker::job::JobFeatureGrant, JobServiceError> {
         if snapshot.domain_grant != Some(domain_grant(&snapshot.request.job_id)) {
-            return Err("foreign or mismatched immutable domain grant".into());
+            return Err(JobServiceError::Configuration(
+                "foreign or mismatched immutable domain grant".into(),
+            ));
         }
         self.0.lock().unwrap().push((snapshot.clone(), fence));
         Ok(worker::job::JobFeatureGrant {
+            input_authority: None,
             satisfied_requirements: vec!["feature.subjektiv"],
             ..Default::default()
         })
@@ -131,6 +145,453 @@ async fn await_job(jobs: &StandaloneJobs, id: &str) -> JobSnapshot {
         .await
         .unwrap()
         .unwrap()
+}
+
+// The model and stopping hook are the only substituted boundaries. Dispatch, result
+// persistence, the owned Internal Worker and service cleanup remain production code.
+#[derive(Clone, Default)]
+struct ControlledShutdown {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    block: bool,
+    fail: bool,
+}
+impl worker::feature::FeatureModule for ControlledShutdown {
+    fn descriptor(&self) -> worker::feature::FeatureDescriptor {
+        worker::feature::FeatureDescriptor::builtin("job-cleanup-test", "Controlled shutdown")
+            .with_hook(worker::feature::HookDeclaration::new(
+                "stop",
+                worker::feature::FeatureHookPoint::WorkerStopping,
+            ))
+    }
+    fn install(
+        &self,
+        context: &mut worker::feature::FeatureInstallContext<'_>,
+    ) -> Result<(), worker::feature::FeatureInstallError> {
+        context.hooks().add_worker_stopping(
+            "stop",
+            worker::hook::HookExecutionPolicy::fail_closed(),
+            self.clone(),
+        )
+    }
+}
+#[async_trait]
+impl worker::hook::Hook<worker::hook::WorkerStopping> for ControlledShutdown {
+    async fn call(
+        &self,
+        _: &worker::hook::WorkerStoppingContext,
+    ) -> Result<(), worker::hook::HookError> {
+        self.entered.notify_one();
+        if self.block {
+            self.release.notified().await;
+        }
+        if self.fail {
+            Err(worker::hook::HookError::new(
+                worker::hook::HookErrorCategory::Internal,
+                "scripted Feature shutdown failure",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl JobDomainProvider for ControlledShutdown {
+    fn callbacks_use_attempt_fence(&self) -> bool {
+        true
+    }
+
+    fn grant(
+        &self,
+        _: &JobSnapshot,
+        _: Arc<dyn JobAttemptFence>,
+    ) -> Result<worker::job::JobFeatureGrant, JobServiceError> {
+        Ok(worker::job::JobFeatureGrant {
+            input_authority: None,
+            features: worker::feature::FeatureRegistryBuilder::new().with_module(self.clone()),
+            satisfied_requirements: vec!["feature.subjektiv"],
+            ..Default::default()
+        })
+    }
+}
+struct ReleaseShutdownOnDrop(Arc<tokio::sync::Notify>);
+impl Drop for ReleaseShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn overdue_timeout_keeps_owned_future_and_capacity_until_feature_shutdown_returns() {
+    let temp = tempfile::tempdir().unwrap();
+    let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    let hook = ControlledShutdown {
+        block: true,
+        ..Default::default()
+    };
+    let _release_on_failure = ReleaseShutdownOnDrop(hook.release.clone());
+    jobs.bind_domain(Arc::new(hook.clone())).unwrap();
+    let mut intent = domain_request("overdue");
+    intent.limits.timeout_seconds = 1;
+    intent.limits.max_concurrent_jobs = 1;
+    intent.serialization_key = Some("owned-resource".into());
+    let reserved = jobs
+        .request_granted(intent.clone(), domain_grant("overdue"))
+        .unwrap();
+    jobs.request(request("next")).unwrap();
+    let model = DomainTestClient {
+        stall: true,
+        ..Default::default()
+    };
+    jobs.start_with_model_client("overdue", model.clone())
+        .await
+        .unwrap();
+    await_model(&model).await;
+    let dispatched = jobs.get("overdue").unwrap();
+    assert_eq!(dispatched.executions.len(), 1);
+    let ownership = dispatched.executions[0].clone();
+    assert_eq!(
+        ownership.run_id,
+        worker::job::execution_run_id(&intent, &reserved.attempt.attempt_id)
+            .unwrap()
+            .to_string()
+    );
+    assert!(!ownership.writes_revoked);
+    assert!(ownership.cleanup_receipt.is_none());
+    tokio::time::timeout(Duration::from_secs(5), hook.entered.notified())
+        .await
+        .unwrap();
+    // Grace expiry is diagnostic only: a dropped wait must not detach the owner
+    // or make the Journal dispatcher abandon the eventual settled result.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), jobs.wait("overdue"))
+            .await
+            .is_err()
+    );
+    let mut completion = {
+        let executions = jobs.executions.lock().unwrap();
+        let execution = &executions.jobs["overdue"];
+        assert!(!execution.task.is_finished());
+        assert!(execution._owned.lock().unwrap().is_none());
+        execution.complete.clone()
+    };
+    let failed = jobs.get("overdue").unwrap();
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.attempt.failure.as_deref(), Some("timeout"));
+    assert_eq!(failed.executions, vec![ownership.clone()]);
+    assert!(jobs.reserve_quiescent_closure().is_err());
+    assert!(jobs.retry("overdue").is_err());
+    assert!(
+        jobs.resume_granted("overdue", &failed.attempt.attempt_id)
+            .is_err()
+    );
+    assert!(matches!(
+        jobs.start_with_model_client("next", DomainTestClient::success())
+            .await,
+        Err(JobServiceError::Capacity)
+    ));
+    let mut conflicting = request("conflicting");
+    conflicting.serialization_key = intent.serialization_key.clone();
+    assert!(jobs.request(conflicting).is_err());
+    hook.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        completion.wait_for(|state| matches!(state, Some(Ok(())))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let cleaned = await_job(&jobs, "overdue").await;
+    assert!(cleaned.executions_released());
+    assert_eq!(cleaned.request, reserved.request);
+    assert_eq!(cleaned.attempt, failed.attempt);
+    assert_eq!(cleaned.executions[0].owner_id, ownership.owner_id);
+    assert_eq!(cleaned.executions[0].run_id, ownership.run_id);
+    assert_eq!(
+        cleaned.executions[0].cleanup_receipt,
+        Some(format!("owned-run:{}", ownership.run_id))
+    );
+    jobs.start_with_model_client("next", DomainTestClient::success())
+        .await
+        .unwrap();
+    assert_eq!(await_job(&jobs, "next").await.state, JobState::Completed);
+    jobs.shutdown().await.unwrap();
+}
+
+#[test]
+fn job_failure_mapping_uses_variants_not_error_prose() {
+    use worker::job::JobExecutionError as E;
+    for (error, expected) in [
+        (
+            E::UnsupportedProfile("timeout TEST_ONLY_SECRET".into()),
+            JobFailureCause::UnsupportedProfile,
+        ),
+        (
+            E::Worker(Box::new(worker::WorkerError::InvalidState(
+                "cancelled TEST_ONLY_SECRET".into(),
+            ))),
+            JobFailureCause::Worker,
+        ),
+        (
+            E::ResultUnconfirmed("missing result TEST_ONLY_SECRET".into()),
+            JobFailureCause::ResultUnconfirmed,
+        ),
+        (E::Cancelled, JobFailureCause::Cancelled),
+        (E::MissingResult, JobFailureCause::MissingResult),
+    ] {
+        assert_eq!(JobFailureCause::execution(&error), expected);
+        let encoded = expected.attachment().unwrap();
+        assert!(!encoded.as_storage_str().contains("TEST_ONLY_SECRET"));
+    }
+}
+
+fn assert_failure_cause(
+    observation: JobFailureObservation<error_contract::Tool>,
+    cause: JobFailureCause,
+) {
+    match observation {
+        JobFailureObservation::Known(projected) => {
+            assert_eq!(*projected.details(), cause);
+            let encoded = error_contract::encode_projected_failure(
+                &projected,
+                error_contract::Budget::new(8192, 8192),
+            )
+            .unwrap();
+            let encoded = std::str::from_utf8(encoded.as_bytes()).unwrap();
+            assert!(!encoded.contains("TEST_ONLY_SECRET"));
+            assert!(!encoded.contains("/private/"));
+        }
+        _ => panic!("expected supported current-policy projection"),
+    }
+}
+
+fn visible_failures(
+    jobs: &StandaloneJobs,
+    id: &str,
+) -> JobFailureObservations<error_contract::Tool> {
+    jobs.failure_observations(
+        id,
+        &JobFailureVisibility {
+            can_view_cause: true,
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn execution_failure_and_cleanup_failure_survive_reopen_without_releasing_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("jobs.sqlite3");
+    let jobs = StandaloneJobs::open(&path, temp.path().into()).unwrap();
+    jobs.bind_domain(Arc::new(ControlledShutdown {
+        fail: true,
+        ..Default::default()
+    }))
+    .unwrap();
+    jobs.request_granted(
+        domain_request("execution-error"),
+        domain_grant("execution-error"),
+    )
+    .unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    release.notify_one();
+    let model = DomainTestClient {
+        failure_release: Some(release),
+        ..Default::default()
+    };
+    jobs.start_with_model_client("execution-error", model.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), jobs.wait("execution-error"))
+            .await
+            .unwrap(),
+        Err(JobServiceError::Cleanup(_))
+    ));
+    let saved = jobs.get("execution-error").unwrap();
+    assert_eq!(saved.state, JobState::Failed);
+    assert!(saved.result.is_none());
+    assert!(!saved.executions_released());
+    let observed = visible_failures(&jobs, "execution-error");
+    assert_failure_cause(observed.primary, JobFailureCause::Worker);
+    assert_failure_cause(observed.cleanup, JobFailureCause::CleanupUnconfirmed);
+    assert!(matches!(
+        observed.post_result,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert!(matches!(
+        observed.result_receipt,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert!(
+        !serde_json::to_string(&saved)
+            .unwrap()
+            .contains("TEST_ONLY_SECRET")
+    );
+    // Reopen is a read, not transfer of the original retained cleanup handles.
+    let reopened = StandaloneJobs::open(&path, temp.path().into()).unwrap();
+    assert_eq!(reopened.get("execution-error").unwrap(), saved);
+    assert_failure_cause(
+        visible_failures(&reopened, "execution-error").primary,
+        JobFailureCause::Worker,
+    );
+    assert_failure_cause(
+        visible_failures(&reopened, "execution-error").cleanup,
+        JobFailureCause::CleanupUnconfirmed,
+    );
+    assert!(reopened.retry("execution-error").is_err());
+    assert!(jobs.try_shutdown().is_err());
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_result_with_feature_shutdown_failure_retains_typed_owner_and_blocks_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    jobs.bind_domain(Arc::new(ControlledShutdown {
+        fail: true,
+        ..Default::default()
+    }))
+    .unwrap();
+    jobs.request_granted(
+        domain_request("cleanup-error"),
+        domain_grant("cleanup-error"),
+    )
+    .unwrap();
+    jobs.start_with_model_client("cleanup-error", DomainTestClient::success())
+        .await
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), jobs.wait("cleanup-error"))
+            .await
+            .unwrap(),
+        Err(JobServiceError::Cleanup(_))
+    ));
+    let accepted = jobs.get("cleanup-error").unwrap();
+    assert_eq!(accepted.state, JobState::Completed);
+    assert_eq!(accepted.result, Some(json!({"valid":true})));
+    assert!(!accepted.executions_released());
+    {
+        let executions = jobs.executions.lock().unwrap();
+        let owned = executions.jobs["cleanup-error"]._owned.lock().unwrap();
+        let owned = owned.as_ref().unwrap().as_ref().unwrap();
+        assert!(!owned.feature_shutdown_complete());
+        assert!(!owned.feature_shutdown_failures().is_empty());
+        assert_eq!(owned.run_id.to_string(), accepted.executions[0].run_id);
+    }
+    assert!(jobs.reserve_quiescent_closure().is_err());
+    assert!(
+        jobs.reclaim_input(
+            "cleanup-error",
+            &accepted.input_digest,
+            JobInputRetirementReason::Completed
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        jobs.shutdown().await,
+        Err(JobServiceError::Cleanup(_))
+    ));
+    assert!(jobs.store.lock().unwrap().is_some());
+    assert_eq!(jobs.get("cleanup-error").unwrap(), accepted);
+    let reopened =
+        StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    assert_eq!(reopened.get("cleanup-error").unwrap(), accepted);
+    let observed = visible_failures(&reopened, "cleanup-error");
+    assert!(matches!(
+        observed.primary,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert_failure_cause(observed.cleanup, JobFailureCause::CleanupUnconfirmed);
+}
+
+#[tokio::test]
+async fn accepted_result_with_ordinary_worker_failure_confirms_independent_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    jobs.request(request("post-result-error")).unwrap();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let model = DomainTestClient {
+        failure_release: Some(release.clone()),
+        ..DomainTestClient::success()
+    };
+    model.scripts.lock().unwrap().pop_back();
+    release.notify_one();
+    jobs.start_with_model_client("post-result-error", model)
+        .await
+        .unwrap();
+    let mut completion = jobs.executions.lock().unwrap().jobs["post-result-error"]
+        .complete
+        .clone();
+    completion.wait_for(Option::is_some).await.unwrap();
+    {
+        let executions = jobs.executions.lock().unwrap();
+        let owned = executions.jobs["post-result-error"]._owned.lock().unwrap();
+        let owned = owned.as_ref().unwrap().as_ref().unwrap();
+        assert!(owned.feature_shutdown_complete());
+        assert!(owned.worker_failure().is_some());
+        assert!(!owned.requires_worker_cleanup_reconciliation());
+        assert!(owned.result.is_ok());
+    }
+    let accepted = tokio::time::timeout(Duration::from_secs(5), jobs.wait("post-result-error"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, JobState::Completed);
+    assert_eq!(accepted.result, Some(json!({"valid":true})));
+    assert!(accepted.executions_released());
+    assert_eq!(
+        jobs.with_execution_diagnostic(
+            "post-result-error",
+            &accepted.attempt.attempt_id,
+            |report| {
+                assert_eq!(report.run_id.to_string(), accepted.executions[0].run_id);
+                assert!(report.feature_shutdown_complete());
+                assert!(!report.requires_worker_cleanup_reconciliation());
+                assert!(report.result.is_ok());
+                matches!(
+                    report.worker_failure(),
+                    Some(worker::WorkerError::Engine(_))
+                )
+            }
+        ),
+        Some(true),
+        "typed ordinary failure survives execution-slot release"
+    );
+    assert!(
+        jobs.with_execution_diagnostic("post-result-error", "foreign-attempt", |_| ())
+            .is_none()
+    );
+    assert!(jobs.retry("post-result-error").is_err());
+    assert!(jobs.reserve_quiescent_closure().is_ok());
+    jobs.shutdown().await.unwrap();
+    assert!(jobs.store.lock().unwrap().is_none());
+    let reopened =
+        StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    let saved = reopened.get("post-result-error").unwrap();
+    assert_eq!(saved, accepted);
+    assert!(saved.outcome().failure_category.is_none());
+    let observed = visible_failures(&reopened, "post-result-error");
+    assert!(matches!(
+        observed.primary,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert!(matches!(
+        observed.cleanup,
+        JobFailureObservation::LegacyWithoutFacts
+    ));
+    assert_failure_cause(observed.post_result, JobFailureCause::Worker);
+    assert!(matches!(
+        reopened
+            .failure_observations::<error_contract::Tool>(
+                "post-result-error",
+                &JobFailureVisibility {
+                    can_view_cause: false
+                }
+            )
+            .unwrap()
+            .post_result,
+        JobFailureObservation::NotVisible
+    ));
 }
 
 #[tokio::test]
@@ -285,12 +746,13 @@ async fn domain_fence_is_live_only_for_current_dispatched_attempt_and_revoked_on
         StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().to_path_buf()).unwrap();
     let provider = Arc::new(RecordingDomainProvider::default());
     jobs.bind_domain(provider.clone()).unwrap();
+    let mut intent = domain_request("fenced");
+    intent.limits.timeout_seconds = 1;
     let reserved = jobs
-        .request_granted(domain_request("fenced"), domain_grant("fenced"))
+        .request_granted(intent, domain_grant("fenced"))
         .unwrap();
-    let failure_release = Arc::new(tokio::sync::Notify::new());
     let first = DomainTestClient {
-        failure_release: Some(failure_release.clone()),
+        stall: true,
         ..Default::default()
     };
     jobs.start_with_model_client("fenced", first.clone())
@@ -299,13 +761,27 @@ async fn domain_fence_is_live_only_for_current_dispatched_attempt_and_revoked_on
     await_model(&first).await;
     let old_fence = provider.0.lock().unwrap()[0].1.clone();
     old_fence.ensure_live().unwrap();
-    failure_release.notify_one();
     let failed = await_job(&jobs, "fenced").await;
     assert_eq!(failed.state, JobState::Failed);
     assert!(failed.result.is_none());
     assert!(old_fence.ensure_live().is_err());
-    // Only known failure permits a retry; cancellation remains terminal.
-    let retried = jobs.retry("fenced").unwrap();
+    assert!(failed.executions_released());
+    assert!(
+        jobs.retry("fenced").is_err(),
+        "generic retry cannot bypass the domain"
+    );
+    jobs.reconcile_granted_attempt(
+        "fenced",
+        &failed.attempt.attempt_id,
+        "test-domain-reconciled",
+    )
+    .unwrap();
+    let retried = jobs
+        .resume_granted("fenced", &failed.attempt.attempt_id)
+        .unwrap();
+    assert_eq!(retried.request, reserved.request);
+    assert_eq!(retried.input_digest, reserved.input_digest);
+    assert_eq!(retried.attempt.number, 2);
     assert_ne!(retried.attempt.attempt_id, reserved.attempt.attempt_id);
     assert_eq!(retried.domain_grant, reserved.domain_grant);
     assert!(old_fence.ensure_live().is_err());
@@ -377,6 +853,358 @@ async fn bound_domain_does_not_change_root_generic_result_only_execution() {
 }
 
 #[tokio::test]
+async fn host_restart_rejects_live_lease_then_fails_only_unconfirmed_dispatch_without_cleanup() {
+    // Real Worker lease admission and Job SQLite; no Worker/process is spawned
+    // for the interrupted rows. Releasing a lease is NOT execution drain proof.
+    use crate::store::{StaleLeasePolicy, StandaloneStoreError, StandaloneWorkerStore};
+    let temp = tempfile::tempdir().unwrap();
+    let workers = StandaloneWorkerStore::open(&temp.path().join("state")).unwrap();
+    let allocation = workers
+        .allocate(temp.path(), StaleLeasePolicy::Reject)
+        .unwrap();
+    let worker = allocation.worker_id();
+    let path = workers.jobs_path(worker);
+    let lease = allocation.into_lease();
+    let prior = StandaloneJobs::open_for_host(&path, temp.path().into(), &lease).unwrap();
+    let reserved = prior.request(request("interrupted")).unwrap();
+    let dispatched = prior
+        .with_store_write(|store| store.dispatch("interrupted", &reserved.attempt.attempt_id, 8))
+        .unwrap();
+    let receipt = prior.request(request("accepted")).unwrap();
+    prior
+        .with_store_write(|store| store.dispatch("accepted", &receipt.attempt.attempt_id, 8))
+        .unwrap();
+    let accepted = prior
+        .with_store_write(|store| store.accept(&result("accepted", &receipt.attempt.attempt_id)))
+        .unwrap();
+    let unstarted = prior.request(request("unstarted")).unwrap();
+    assert!(matches!(
+        workers.acquire_lease(worker, StaleLeasePolicy::Recover),
+        Err(StandaloneStoreError::WorkerLeased(_))
+    ));
+    assert!(
+        StandaloneJobs::open_for_host(&path, temp.path().into(), &lease).is_err(),
+        "same live lease/empty local map is not a restart"
+    );
+    assert_eq!(prior.get("interrupted").unwrap(), dispatched);
+    let old_sink = sink(&prior, "interrupted", &reserved.attempt.attempt_id);
+    lease.release().unwrap();
+    let replacement_lease = workers
+        .acquire_lease(worker, StaleLeasePolicy::Recover)
+        .unwrap();
+    let reopened =
+        StandaloneJobs::open_for_host(&path, temp.path().into(), &replacement_lease).unwrap();
+    let failed = reopened.get("interrupted").unwrap();
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed.attempt.state, JobAttemptState::Failed);
+    assert_eq!(failed.attempt.attempt_id, reserved.attempt.attempt_id);
+    assert!(
+        failed
+            .attempt
+            .failure
+            .as_deref()
+            .unwrap()
+            .starts_with("host_restart_execution_unconfirmed:")
+    );
+    assert!(!failed.version_stopped);
+    assert_eq!(failed.request, reserved.request);
+    assert_eq!(failed.executions, dispatched.executions);
+    assert!(!failed.executions_released());
+    assert!(
+        old_sink
+            .submit(result("interrupted", &reserved.attempt.attempt_id))
+            .is_err()
+    );
+    assert!(reopened.retry("interrupted").is_err());
+    assert_eq!(reopened.get("accepted").unwrap(), accepted);
+    assert_eq!(reopened.get("unstarted").unwrap(), unstarted);
+    reopened.bind_model_client(Box::new(DomainTestClient::success()));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        reopened.resume_reserved_result_jobs(reopened.reserved_result_attempts().unwrap()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let resumed = reopened.get("unstarted").unwrap();
+    assert_eq!(resumed.state, JobState::Completed);
+    assert_eq!(resumed.attempt.attempt_id, unstarted.attempt.attempt_id);
+    assert_eq!(resumed.attempt.number, 1);
+    assert!(!resumed.version_stopped);
+    assert_eq!(reopened.get("interrupted").unwrap(), failed);
+    assert!(matches!(
+        reopened.try_shutdown(),
+        Err(JobServiceError::ShutdownIncomplete)
+    ));
+    // The fixture never had a real prior runner to join; do not forge its receipt.
+}
+
+#[derive(Default)]
+struct CountingFinalizer(std::sync::atomic::AtomicUsize);
+#[async_trait]
+impl worker::job::JobResultFinalizer for CountingFinalizer {
+    fn validate_profile(&self, _: &manifest::WorkerManifest) -> Result<(), String> {
+        Ok(())
+    }
+    async fn finalize(
+        &self,
+        result: Value,
+        _: manifest::WorkerManifest,
+        _: Box<dyn LlmClient>,
+        _: worker::feature::background::BackgroundTaskCancellation,
+    ) -> Result<Value, agen::tool::ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(result)
+    }
+}
+
+struct UnconfirmedSink {
+    bound: BoundResultSink,
+    commit_before_error: bool,
+}
+impl JobResultSink for UnconfirmedSink {
+    fn submit(&self, submission: JobResultSubmission) -> Result<(), String> {
+        if self.commit_before_error {
+            self.bound.submit(submission)?;
+        }
+        Err("injected result persistence/acknowledgement outage".into())
+    }
+}
+
+#[tokio::test]
+async fn sealed_non_journal_result_recovers_store_or_ack_loss_without_running_model_again() {
+    // Real owned Worker, result Feature and temporary SQLite store; only the
+    // model and sink acknowledgement boundary are substituted. No process death.
+    for committed in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let jobs =
+            StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+        let intent = request("receipt");
+        let reserved = jobs.request(intent.clone()).unwrap();
+        let dispatched = jobs
+            .with_store(|store| store.dispatch("receipt", &reserved.attempt.attempt_id, 8))
+            .unwrap();
+        let model = DomainTestClient::success();
+        let finalizer = Arc::new(CountingFinalizer::default());
+        let prepared = worker::job::prepare_job_with_grant(
+            &intent,
+            temp.path(),
+            Some(Box::new(model.clone())),
+            worker::job::JobFeatureGrant {
+                finalizer: Some(finalizer.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let owned = tokio::time::timeout(
+            Duration::from_secs(5),
+            prepared.run_owned(
+                reserved.attempt.attempt_id.clone(),
+                Arc::new(UnconfirmedSink {
+                    bound: sink(&jobs, "receipt", &reserved.attempt.attempt_id),
+                    commit_before_error: committed,
+                }),
+                |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            owned.result,
+            Err(worker::job::JobExecutionError::ResultUnconfirmed(_))
+        ));
+        assert!(owned.feature_shutdown_complete());
+        assert_eq!(
+            owned.unconfirmed_submission(),
+            Some(&result("receipt", &reserved.attempt.attempt_id))
+        );
+        assert_eq!(
+            jobs.get("receipt").unwrap().state,
+            if committed {
+                JobState::Completed
+            } else {
+                JobState::Pending
+            }
+        );
+        let model_calls = model.requests.lock().unwrap().len();
+        let owned = Ok(owned);
+        // Fail the real settlement write, not merely the sink's acknowledgement.
+        // A failed save cannot publish attachments or discharge cleanup. The same
+        // typed report/sealed payload remains available; no model or finalizer rerun.
+        let fault = rusqlite::Connection::open(temp.path().join("jobs.sqlite3")).unwrap();
+        fault.execute_batch(if committed {
+            "CREATE TRIGGER fail_settlement BEFORE UPDATE OF result_receipt_failure_json ON job_attempts
+             BEGIN SELECT RAISE(ABORT,'injected attachment persistence failure'); END;"
+        } else {
+            "CREATE TRIGGER fail_settlement BEFORE UPDATE OF result_json ON job_attempts
+             BEGIN SELECT RAISE(ABORT,'injected result persistence failure'); END;"
+        }).unwrap();
+        let error = settle_owned_execution(
+            &jobs.store,
+            "receipt",
+            &reserved.attempt.attempt_id,
+            &reserved.input_digest,
+            &dispatched.executions[0],
+            true,
+            None,
+            true,
+            &owned,
+        )
+        .unwrap_err();
+        let observed_error = observed_settlement_error(Arc::new(error));
+        assert!(
+            matches!(observed_error, JobServiceError::SettlementFailure { source }
+            if matches!(source.as_ref(), JobServiceError::Store(JobStoreError::Sqlite(_))))
+        );
+        let unsaved = jobs.get("receipt").unwrap();
+        assert_eq!(
+            unsaved.state,
+            if committed {
+                JobState::Completed
+            } else {
+                JobState::Pending
+            }
+        );
+        assert!(!unsaved.executions_released());
+        assert!(matches!(
+            visible_failures(&jobs, "receipt").result_receipt,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        fault.execute_batch("DROP TRIGGER fail_settlement").unwrap();
+        recover_settlement(|| {
+            settle_owned_execution(
+                &jobs.store,
+                "receipt",
+                &reserved.attempt.attempt_id,
+                &reserved.input_digest,
+                &dispatched.executions[0],
+                true,
+                None,
+                true,
+                &owned,
+            )
+        })
+        .await
+        .unwrap();
+        let saved = jobs.get("receipt").unwrap();
+        assert_eq!(saved.state, JobState::Completed);
+        assert_eq!(saved.result, Some(json!({"valid":true})));
+        assert_eq!(saved.attempt.attempt_id, reserved.attempt.attempt_id);
+        assert_eq!(saved.attempt.number, 1);
+        assert!(saved.executions_released());
+        assert_eq!(model.requests.lock().unwrap().len(), model_calls);
+        assert_eq!(
+            finalizer.0.load(Ordering::SeqCst),
+            1,
+            "sealed side effect must not be repeated"
+        );
+        let observed = visible_failures(&jobs, "receipt");
+        assert!(matches!(
+            observed.primary,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        assert_failure_cause(observed.result_receipt, JobFailureCause::ResultUnconfirmed);
+        jobs.shutdown().await.unwrap();
+        let reopened =
+            StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+        assert_eq!(reopened.get("receipt").unwrap(), saved);
+        assert_failure_cause(
+            visible_failures(&reopened, "receipt").result_receipt,
+            JobFailureCause::ResultUnconfirmed,
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), model_calls);
+        assert_eq!(
+            finalizer.0.load(Ordering::SeqCst),
+            1,
+            "sealed side effect must not be repeated"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_settlement_is_not_retried_and_cannot_fail_a_later_attempt() {
+    let temp = tempfile::tempdir().unwrap();
+    let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    let reserved = jobs.request(request("stale")).unwrap();
+    let dispatched = jobs
+        .with_store(|store| store.dispatch("stale", &reserved.attempt.attempt_id, 8))
+        .unwrap();
+    let owner = dispatched.executions[0].clone();
+    jobs.with_store(|store| {
+        store.finish(
+            "stale",
+            &reserved.attempt.attempt_id,
+            JobAttemptState::Failed,
+            Some("first failure"),
+        )?;
+        store.confirm_execution_cleanup("stale", &owner, "fixture-owned-run-joined")
+    })
+    .unwrap();
+    let next = jobs.retry("stale").unwrap();
+    let mut calls = 0;
+    let outcome = recover_settlement(|| {
+        calls += 1;
+        settle_owned_execution(
+            &jobs.store,
+            "stale",
+            &reserved.attempt.attempt_id,
+            &reserved.input_digest,
+            &owner,
+            true,
+            None,
+            false,
+            &Err(worker::job::JobExecutionError::MissingResult),
+        )
+    })
+    .await;
+    assert!(matches!(
+        outcome,
+        Err(JobServiceError::Store(JobStoreError::AttemptMismatch))
+    ));
+    assert_eq!(calls, 1);
+    assert_eq!(jobs.get("stale").unwrap(), next);
+    jobs.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_revocation_fences_callbacks_and_results_even_when_terminal_write_is_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    let reserved = jobs.request(request("revoked")).unwrap();
+    let dispatched = jobs
+        .with_store(|store| store.dispatch("revoked", &reserved.attempt.attempt_id, 8))
+        .unwrap();
+    let revoked = Arc::new(AtomicBool::new(false));
+    let fence = BoundAttemptFence {
+        revoked: revoked.clone(),
+        effect_gate: Arc::new(Mutex::new(())),
+        store: jobs.store.clone(),
+        job_id: "revoked".into(),
+        attempt_id: reserved.attempt.attempt_id.clone(),
+        input_digest: reserved.input_digest.clone(),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+    };
+    let mut sink = sink(&jobs, "revoked", &reserved.attempt.attempt_id);
+    sink.revoked = revoked.clone();
+    assert!(fence.enter().is_ok());
+    // Fault boundary: the cancellation's terminal write has not committed.
+    // No DB terminal state or elapsed deadline is available as revocation proof.
+    revoked.store(true, Ordering::Release);
+    assert!(fence.enter().is_err());
+    assert!(
+        sink.submit(result("revoked", &reserved.attempt.attempt_id))
+            .is_err()
+    );
+    assert_eq!(jobs.get("revoked").unwrap(), dispatched);
+    assert!(!dispatched.executions_released());
+    assert!(matches!(
+        jobs.shutdown().await,
+        Err(JobServiceError::ShutdownIncomplete)
+    ));
+}
+
+#[tokio::test]
 async fn host_result_capability_cannot_cross_job_attempt_digest_or_deadline() {
     let temp = tempfile::tempdir().unwrap();
     let jobs =
@@ -418,12 +1246,13 @@ async fn host_result_capability_cannot_cross_job_attempt_digest_or_deadline() {
     changed.result = serde_json::json!({"valid":false});
     assert!(expired.submit(changed).is_err());
     assert_eq!(jobs.get("second").unwrap().state, JobState::Pending);
-    jobs.shutdown().await.unwrap();
-    assert!(
-        bound
-            .submit(result("first", &first.attempt.attempt_id))
-            .is_err()
-    );
+    assert!(matches!(
+        jobs.shutdown().await,
+        Err(JobServiceError::ShutdownIncomplete)
+    ));
+    assert!(jobs.store.lock().unwrap().is_some());
+    assert!(!jobs.get("first").unwrap().executions_released());
+    assert!(!jobs.get("second").unwrap().executions_released());
 }
 
 #[tokio::test]
@@ -437,17 +1266,18 @@ async fn cleanup_cannot_reclassify_success_or_durable_cancellation_and_stale_han
         &jobs.store,
         "cancelled",
         &cancelled.attempt.attempt_id,
-        JobAttemptState::Unknown,
+        JobAttemptState::Failed,
         "cleanup",
     )
     .unwrap();
     assert_eq!(jobs.get("cancelled").unwrap().state, JobState::Cancelled);
     let accepted = jobs.request(request("accepted")).unwrap();
-    jobs.with_store(|store| store.dispatch("accepted", &accepted.attempt.attempt_id, 8))
+    jobs.start_with_model_client("accepted", DomainTestClient::success())
+        .await
         .unwrap();
-    sink(&jobs, "accepted", &accepted.attempt.attempt_id)
-        .submit(result("accepted", &accepted.attempt.attempt_id))
-        .unwrap();
+    let completed = await_job(&jobs, "accepted").await;
+    assert!(completed.executions_released());
+    let bound = sink(&jobs, "accepted", &accepted.attempt.attempt_id);
     finish_if_pending(
         &jobs.store,
         "accepted",
@@ -459,6 +1289,15 @@ async fn cleanup_cannot_reclassify_success_or_durable_cancellation_and_stale_han
     assert_eq!(jobs.get("accepted").unwrap().state, JobState::Completed);
     jobs.shutdown().await.unwrap();
     assert!(jobs.store.lock().unwrap().is_none());
+    // Repeated close uses the retained proof of this service's real shutdown,
+    // not an absent store/map as a newly inferred completion.
+    jobs.try_shutdown().unwrap();
+    jobs.shutdown().await.unwrap();
+    assert!(
+        bound
+            .submit(result("accepted", &accepted.attempt.attempt_id))
+            .is_err()
+    );
     for operation in [
         jobs.cancel("cancelled"),
         jobs.acknowledge("accepted"),
@@ -469,8 +1308,17 @@ async fn cleanup_cannot_reclassify_success_or_durable_cancellation_and_stale_han
     }
 }
 
+#[test]
+fn absent_store_and_empty_execution_map_do_not_create_shutdown_confirmation() {
+    let temp = tempfile::tempdir().unwrap();
+    let jobs = StandaloneJobs::open(&temp.path().join("jobs.sqlite3"), temp.path().into()).unwrap();
+    jobs.close();
+    jobs.store.lock().unwrap().take();
+    assert!(matches!(jobs.try_shutdown(), Err(JobServiceError::Closed)));
+}
+
 #[tokio::test]
-async fn cancelled_shutdown_future_keeps_execution_barrier_and_unknown_input() {
+async fn cancelled_shutdown_waiter_keeps_execution_barrier_and_failed_input_on_reopen() {
     // Actual generic runner + SQLite; only the provider stream is scripted/blocked.
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("jobs.sqlite3");
@@ -505,12 +1353,21 @@ async fn cancelled_shutdown_future_keeps_execution_barrier_and_unknown_input() {
         .unwrap();
     assert!(jobs.store.lock().unwrap().is_none());
     let reopened = StandaloneJobs::open(&path, temp.path().into()).unwrap();
-    let unknown = reopened.get(&reserved.request.job_id).unwrap();
-    assert_eq!(unknown.attempt.state, JobAttemptState::Unknown);
-    assert_eq!(unknown.input_disposition, JobInputDisposition::Available);
-    assert_eq!(unknown.request, reserved.request);
-    assert_eq!(unknown.input_digest, reserved.input_digest);
-    assert!(reopened.retry(&unknown.request.job_id).is_err());
+    let stopped = reopened.get(&reserved.request.job_id).unwrap();
+    assert_eq!(stopped.state, JobState::Failed);
+    assert_eq!(stopped.attempt.state, JobAttemptState::Failed);
+    assert_eq!(
+        stopped.attempt.failure.as_deref(),
+        Some("Host cancellation/shutdown")
+    );
+    assert_eq!(stopped.input_disposition, JobInputDisposition::Available);
+    assert_eq!(stopped.request, reserved.request);
+    assert_eq!(stopped.input_digest, reserved.input_digest);
+    assert!(stopped.executions_released());
+    assert!(!stopped.version_stopped);
+    let retry = reopened.retry(&stopped.request.job_id).unwrap();
+    assert_eq!(retry.attempt.number, 2);
+    assert_eq!(retry.request, reserved.request);
     reopened.shutdown().await.unwrap();
 }
 
@@ -528,6 +1385,8 @@ async fn input_retirement_service_fences_live_attempt_and_preserves_session_rece
     jobs.with_store(|store| store.dispatch("input-retirement", &reserved.attempt.attempt_id, 8))
         .unwrap();
     let fence = BoundAttemptFence {
+        revoked: Arc::new(AtomicBool::new(false)),
+        effect_gate: Arc::new(Mutex::new(())),
         store: jobs.store.clone(),
         job_id: "input-retirement".into(),
         attempt_id: reserved.attempt.attempt_id.clone(),
@@ -567,5 +1426,10 @@ async fn input_retirement_service_fences_live_attempt_and_preserves_session_rece
             .is_empty()
     );
     assert_eq!(jobs.request_granted(original, grant).unwrap(), erased);
-    jobs.shutdown().await.unwrap();
+    assert!(matches!(
+        jobs.shutdown().await,
+        Err(JobServiceError::ShutdownIncomplete)
+    ));
+    assert!(jobs.store.lock().unwrap().is_some());
+    assert!(!jobs.get("input-retirement").unwrap().executions_released());
 }

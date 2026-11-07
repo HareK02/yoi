@@ -26,8 +26,16 @@ use crate::config_source::{
     EvaluatedConfigCandidate, WorkspaceConfigSchemaProvider, WorkspaceConfigState,
     evaluate_workspace_config_state,
 };
+use crate::repository_access_failure::{
+    RepositoryAccessFailure, RepositoryAccessOperation as AccessOperation,
+    RepositoryAccessReason as AccessReason,
+};
 use crate::store::{ControlPlaneStore, SqliteWorkspaceStore};
 use crate::{Error, Result};
+
+fn access_failure(operation: AccessOperation, reason: AccessReason, source: Error) -> Error {
+    RepositoryAccessFailure::new(operation, reason, source).into()
+}
 
 const REPOSITORY_ACCESS_SCHEMA_SOURCE: &str = r#"{
     repository_access = {
@@ -138,9 +146,13 @@ fn validate_repository_access_source(
     source: &server_api::RepositorySource,
 ) -> Result<()> {
     if crate::repository_source::is_plain_http_repository_source(source) {
-        return Err(Error::InvalidInput(format!(
-            "repository_source_plain_http_unsupported: Repository `{repository_key}` uses unsupported plain HTTP; register an HTTPS or SSH source instead"
-        )));
+        return Err(access_failure(
+            AccessOperation::ProjectAccess,
+            AccessReason::PlainHttpSourceUnsupported,
+            Error::InvalidInput(format!(
+                "repository_source_plain_http_unsupported: Repository `{repository_key}` uses unsupported plain HTTP; register an HTTPS or SSH source instead"
+            )),
+        ));
     }
     Ok(())
 }
@@ -189,66 +201,132 @@ fn project_repository_access_evaluation(
     projection_digest: &str,
     evaluation: &config_source::EvaluationResult,
 ) -> Result<RepositoryAccessProjection> {
-    let projection = evaluation.projections.first().ok_or_else(|| {
-        Error::InvalidInput("Workspace config produced no active projection".to_string())
-    })?;
-    let config: VirtualWorkspaceConfig = serde_json::from_value(projection.data_json.clone())
-        .map_err(|error| {
-            Error::InvalidInput(format!("invalid Repository access config: {error}"))
-        })?;
+    let config = repository_access_source(evaluation)?;
     if !config.repository_access.is_empty() {
         secrets.ensure_workspace_default_credential(workspace_id)?;
     }
+    project_repository_access_bindings(
+        workspace_id,
+        projection_digest,
+        config,
+        |key| store.get_repository_by_key(workspace_id, key),
+        |id| secrets.get_credential(workspace_id, id, &[]),
+        |id| secrets.get_host_trust(workspace_id, id, &[]),
+    )
+}
+
+/// Validate against the same catalog transaction that will adopt the source.
+/// This reads only public credential/trust metadata: no default key generation,
+/// unsealing, filesystem writes or second connection under the writer lock.
+/// Both preview and adoption use the owning projection's semantic checks.
+pub(crate) fn validate_repository_access_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    candidate: &EvaluatedConfigCandidate,
+) -> Result<()> {
+    project_repository_access_bindings(
+        workspace_id,
+        &candidate.evaluation.projection_digest,
+        repository_access_source(&candidate.evaluation)?,
+        |key| crate::store::read_repository_by_key(tx, workspace_id, key),
+        |id| read_credential(tx, workspace_id, id),
+        |id| read_host_trust(tx, workspace_id, id),
+    )
+    .map(|_| ())
+}
+
+fn repository_access_source(
+    evaluation: &config_source::EvaluationResult,
+) -> Result<VirtualWorkspaceConfig> {
+    let projection = evaluation.projections.first().ok_or_else(|| {
+        Error::InvalidInput("Workspace config produced no active projection".to_string())
+    })?;
+    serde_json::from_value(projection.data_json.clone())
+        .map_err(|error| Error::InvalidInput(format!("invalid Repository access config: {error}")))
+}
+
+fn project_repository_access_bindings(
+    workspace_id: &str,
+    projection_digest: &str,
+    config: VirtualWorkspaceConfig,
+    repository: impl Fn(&str) -> Result<Option<crate::store::RepositoryRecord>>,
+    credential: impl Fn(&str) -> Result<Option<RepositorySshCredential>>,
+    host_trust: impl Fn(&str) -> Result<Option<RepositorySshHostTrust>>,
+) -> Result<RepositoryAccessProjection> {
     let mut bindings = Vec::with_capacity(config.repository_access.len());
     for (repository_key, access) in config.repository_access {
         server_api::validate_repository_key(&repository_key)
             .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
         validate_identifier("credential_id", &access.ssh.credential)?;
         validate_identifier("host_trust_id", &access.ssh.host_trust)?;
-        let repository = store
-            .get_repository_by_key(workspace_id, &repository_key)?
-            .ok_or_else(|| Error::InvalidInput(format!("unknown Repository `{repository_key}`")))?;
+        let repository = repository(&repository_key)?.ok_or_else(|| {
+            access_failure(
+                AccessOperation::ProjectAccess,
+                AccessReason::UnknownRepository,
+                Error::InvalidInput(format!("unknown Repository `{repository_key}`")),
+            )
+        })?;
         validate_repository_access_source(&repository_key, &repository.source)?;
         if repository.source.kind != server_api::RepositorySourceKind::Ssh {
-            return Err(Error::InvalidInput(format!(
-                "Repository `{repository_key}` is not an ssh:// Repository"
-            )));
+            return Err(access_failure(
+                AccessOperation::ProjectAccess,
+                AccessReason::SshSourceRequired,
+                Error::InvalidInput(format!(
+                    "Repository `{repository_key}` is not an ssh:// Repository"
+                )),
+            ));
         }
-        let credential = secrets
-            .get_credential(workspace_id, &access.ssh.credential, &[])?
-            .ok_or_else(|| {
+        let credential = credential(&access.ssh.credential)?.ok_or_else(|| {
+            access_failure(
+                AccessOperation::ProjectAccess,
+                AccessReason::BindingCredentialNotFound,
                 Error::InvalidInput(format!(
                     "unknown Repository SSH credential `{}`",
                     access.ssh.credential
-                ))
-            })?;
+                )),
+            )
+        })?;
         if credential.status != "active" {
-            return Err(Error::InvalidInput(format!(
-                "Repository SSH credential `{}` is not active",
-                access.ssh.credential
-            )));
+            return Err(access_failure(
+                AccessOperation::ProjectAccess,
+                AccessReason::CredentialInactive,
+                Error::InvalidInput(format!(
+                    "Repository SSH credential `{}` is not active",
+                    access.ssh.credential
+                )),
+            ));
         }
-        let host_trust = secrets
-            .get_host_trust(workspace_id, &access.ssh.host_trust, &[])?
-            .ok_or_else(|| {
+        let host_trust = host_trust(&access.ssh.host_trust)?.ok_or_else(|| {
+            access_failure(
+                AccessOperation::ProjectAccess,
+                AccessReason::BindingHostTrustNotFound,
                 Error::InvalidInput(format!(
                     "unknown Repository SSH host trust `{}`",
                     access.ssh.host_trust
-                ))
-            })?;
+                )),
+            )
+        })?;
         let (hostname, port) =
             repository_ssh_endpoint(repository_key.as_str(), &repository.source.uri)?.ok_or_else(
                 || {
-                    Error::InvalidInput(format!(
-                        "Repository `{repository_key}` must use an SSH source"
-                    ))
+                    access_failure(
+                        AccessOperation::ProjectAccess,
+                        AccessReason::SshSourceRequired,
+                        Error::InvalidInput(format!(
+                            "Repository `{repository_key}` must use an SSH source"
+                        )),
+                    )
                 },
             )?;
         if hostname != host_trust.hostname || port != host_trust.port {
-            return Err(Error::InvalidInput(format!(
-                "Repository `{repository_key}` SSH host does not match host trust `{}`",
-                access.ssh.host_trust
-            )));
+            return Err(access_failure(
+                AccessOperation::ProjectAccess,
+                AccessReason::HostEndpointMismatch,
+                Error::InvalidInput(format!(
+                    "Repository `{repository_key}` SSH host does not match host trust `{}`",
+                    access.ssh.host_trust
+                )),
+            ));
         }
         bindings.push(RepositorySshAccessBinding {
             repository_key,
@@ -549,9 +627,13 @@ impl RepositorySecretService {
             }
             ensure_workspace_exists(&tx, workspace_id)?;
             if credential_row_exists(&tx, workspace_id, &credential_id)? {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "Repository SSH credential `{credential_id}` already exists"
-                )));
+                return Err(access_failure(
+                    AccessOperation::CreateCredential,
+                    AccessReason::CredentialAlreadyExists,
+                    Error::WorkspaceConfigConflict(format!(
+                        "Repository SSH credential `{credential_id}` already exists"
+                    )),
+                ));
             }
             tx.execute(
                 r#"INSERT INTO repository_ssh_credentials (
@@ -638,8 +720,12 @@ impl RepositorySecretService {
     ) -> Result<RepositorySshCredential> {
         let credential_id = validate_identifier("credential_id", credential_id)?;
         if credential_id == WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID {
-            return Err(Error::WorkspaceConfigConflict(
-                "Workspace default SSH credential is immutable".to_string(),
+            return Err(access_failure(
+                AccessOperation::RotateCredential,
+                AccessReason::WorkspaceDefaultCredentialImmutable,
+                Error::WorkspaceConfigConflict(
+                    "Workspace default SSH credential is immutable".to_string(),
+                ),
             ));
         }
         let operation_id = validate_identifier("operation_id", &request.operation_id)?;
@@ -693,14 +779,23 @@ impl RepositorySecretService {
                 tx.commit()?;
                 return Ok(replayed);
             }
-            let current = read_credential(&tx, workspace_id, &credential_id)?
-                .ok_or_else(|| Error::InvalidRecordId(credential_id.clone()))?;
+            let current = read_credential(&tx, workspace_id, &credential_id)?.ok_or_else(|| {
+                access_failure(
+                    AccessOperation::RotateCredential,
+                    AccessReason::CredentialNotFound,
+                    Error::InvalidRecordId(credential_id.clone()),
+                )
+            })?;
             if current.public_key_fingerprint != request.expected_public_key_fingerprint
                 || current.status != "active"
             {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "credential `{credential_id}` key fingerprint/status changed"
-                )));
+                return Err(access_failure(
+                    AccessOperation::RotateCredential,
+                    AccessReason::CredentialObservationChanged,
+                    Error::WorkspaceConfigConflict(format!(
+                        "credential `{credential_id}` key fingerprint/status changed"
+                    )),
+                ));
             }
             tx.execute(
                 r#"INSERT INTO repository_ssh_credential_keys (
@@ -753,9 +848,13 @@ impl RepositorySecretService {
                 ],
             )?;
             if updated != 1 {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "credential `{credential_id}` key fingerprint changed"
-                )));
+                return Err(access_failure(
+                    AccessOperation::RotateCredential,
+                    AccessReason::CredentialObservationChanged,
+                    Error::WorkspaceConfigConflict(format!(
+                        "credential `{credential_id}` key fingerprint changed"
+                    )),
+                ));
             }
             insert_audit(
                 &tx,
@@ -794,17 +893,25 @@ impl RepositorySecretService {
     ) -> Result<()> {
         let credential_id = validate_identifier("credential_id", credential_id)?;
         if credential_id == WORKSPACE_DEFAULT_REPOSITORY_SSH_CREDENTIAL_ID {
-            return Err(Error::WorkspaceConfigConflict(
-                "Workspace default SSH credential is immutable".to_string(),
+            return Err(access_failure(
+                AccessOperation::DeleteCredential,
+                AccessReason::WorkspaceDefaultCredentialImmutable,
+                Error::WorkspaceConfigConflict(
+                    "Workspace default SSH credential is immutable".to_string(),
+                ),
             ));
         }
         let operation_id = validate_identifier("operation_id", &request.operation_id)?;
         validate_key_fingerprint(&request.expected_public_key_fingerprint)?;
         let references = credential_references(projection, &credential_id);
         if !references.is_empty() {
-            return Err(Error::WorkspaceConfigConflict(format!(
-                "credential `{credential_id}` is referenced by active Workspace config"
-            )));
+            return Err(access_failure(
+                AccessOperation::DeleteCredential,
+                AccessReason::CredentialReferenced,
+                Error::WorkspaceConfigConflict(format!(
+                    "credential `{credential_id}` is referenced by active Workspace config"
+                )),
+            ));
         }
         let fingerprint = simple_operation_fingerprint(
             "delete_credential",
@@ -819,11 +926,21 @@ impl RepositorySecretService {
                 return Ok(());
             }
             let current = read_credential(&tx, workspace_id, &credential_id)?
-                .ok_or_else(|| Error::InvalidRecordId(credential_id.clone()))?;
+                .ok_or_else(|| {
+                    access_failure(
+                        AccessOperation::DeleteCredential,
+                        AccessReason::CredentialNotFound,
+                        Error::InvalidRecordId(credential_id.clone()),
+                    )
+                })?;
             if current.public_key_fingerprint != request.expected_public_key_fingerprint {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "credential `{credential_id}` key fingerprint changed"
-                )));
+                return Err(access_failure(
+                    AccessOperation::DeleteCredential,
+                    AccessReason::CredentialKeyChanged,
+                    Error::WorkspaceConfigConflict(format!(
+                        "credential `{credential_id}` key fingerprint changed"
+                    )),
+                ));
             }
             let retained_by_workdir_create: bool = tx.query_row(
                 r#"SELECT EXISTS(
@@ -835,9 +952,13 @@ impl RepositorySecretService {
                 |row| row.get(0),
             )?;
             if retained_by_workdir_create {
-                return Err(Error::RepositoryConflict(format!(
-                    "credential `{credential_id}` is retained by a retryable Workdir create operation"
-                )));
+                return Err(access_failure(
+                    AccessOperation::DeleteCredential,
+                    AccessReason::CredentialRetained,
+                    Error::RepositoryConflict(format!(
+                        "credential `{credential_id}` is retained by a retryable Workdir create operation"
+                    )),
+                ));
             }
             insert_audit(&tx, workspace_id, "credential_deleted", &credential_id, &operation_id, actor_account_id, &now)?;
             let deleted = tx.execute(
@@ -845,9 +966,13 @@ impl RepositorySecretService {
                 params![workspace_id, credential_id, request.expected_public_key_fingerprint],
             )?;
             if deleted != 1 {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "credential `{credential_id}` key fingerprint changed"
-                )));
+                return Err(access_failure(
+                    AccessOperation::DeleteCredential,
+                    AccessReason::CredentialKeyChanged,
+                    Error::WorkspaceConfigConflict(format!(
+                        "credential `{credential_id}` key fingerprint changed"
+                    )),
+                ));
             }
             insert_operation(&tx, workspace_id, &operation_id, &fingerprint, "credential", &credential_id, &operation_id, &now)?;
             tx.commit()?;
@@ -939,9 +1064,13 @@ impl RepositorySecretService {
                 (None, None) => {}
                 (Some(current), Some(expected)) if current.fingerprint == expected => {}
                 _ => {
-                    return Err(Error::WorkspaceConfigConflict(format!(
-                        "host trust `{host_trust_id}` create/update operation precondition failed"
-                    )));
+                    return Err(access_failure(
+                        AccessOperation::PutHostTrust,
+                        AccessReason::HostTrustObservationChanged,
+                        Error::WorkspaceConfigConflict(format!(
+                            "host trust `{host_trust_id}` create/update operation precondition failed"
+                        )),
+                    ));
                 }
             }
             if current.is_none() {
@@ -1045,9 +1174,13 @@ impl RepositorySecretService {
         let operation_id = validate_identifier("operation_id", &request.operation_id)?;
         validate_key_fingerprint(&request.expected_fingerprint)?;
         if !host_trust_references(projection, &host_trust_id).is_empty() {
-            return Err(Error::WorkspaceConfigConflict(format!(
-                "host trust `{host_trust_id}` is referenced by active Workspace config"
-            )));
+            return Err(access_failure(
+                AccessOperation::DeleteHostTrust,
+                AccessReason::HostTrustReferenced,
+                Error::WorkspaceConfigConflict(format!(
+                    "host trust `{host_trust_id}` is referenced by active Workspace config"
+                )),
+            ));
         }
         let fingerprint = simple_operation_fingerprint(
             "delete_host_trust",
@@ -1062,11 +1195,21 @@ impl RepositorySecretService {
                 return Ok(());
             }
             let current = read_host_trust(&tx, workspace_id, &host_trust_id)?
-                .ok_or_else(|| Error::InvalidRecordId(host_trust_id.clone()))?;
+                .ok_or_else(|| {
+                    access_failure(
+                        AccessOperation::DeleteHostTrust,
+                        AccessReason::HostTrustNotFound,
+                        Error::InvalidRecordId(host_trust_id.clone()),
+                    )
+                })?;
             if current.fingerprint != request.expected_fingerprint {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "host trust `{host_trust_id}` key fingerprint changed"
-                )));
+                return Err(access_failure(
+                    AccessOperation::DeleteHostTrust,
+                    AccessReason::HostTrustKeyChanged,
+                    Error::WorkspaceConfigConflict(format!(
+                        "host trust `{host_trust_id}` key fingerprint changed"
+                    )),
+                ));
             }
             insert_audit(&tx, workspace_id, "host_trust_deleted", &host_trust_id, &operation_id, actor_account_id, &now)?;
             let deleted = tx.execute(
@@ -1074,9 +1217,13 @@ impl RepositorySecretService {
                 params![workspace_id, host_trust_id, request.expected_fingerprint],
             )?;
             if deleted != 1 {
-                return Err(Error::WorkspaceConfigConflict(format!(
-                    "host trust `{host_trust_id}` key fingerprint changed"
-                )));
+                return Err(access_failure(
+                    AccessOperation::DeleteHostTrust,
+                    AccessReason::HostTrustKeyChanged,
+                    Error::WorkspaceConfigConflict(format!(
+                        "host trust `{host_trust_id}` key fingerprint changed"
+                    )),
+                ));
             }
             insert_operation(&tx, workspace_id, &operation_id, &fingerprint, "host_trust", &host_trust_id, &operation_id, &now)?;
             tx.commit()?;
@@ -1178,9 +1325,13 @@ impl RepositorySecretService {
             return Ok(None);
         };
         if matches.len() > 1 {
-            return Err(Error::InvalidInput(format!(
-                "Repository `{repository_key}` matches multiple SSH host trusts for {hostname}:{port}; configure an explicit Repository access binding"
-            )));
+            return Err(access_failure(
+                AccessOperation::DefaultSshBinding,
+                AccessReason::AmbiguousHostTrust,
+                Error::InvalidInput(format!(
+                    "Repository `{repository_key}` matches multiple SSH host trusts for {hostname}:{port}; configure an explicit Repository access binding"
+                )),
+            ));
         }
         self.ensure_workspace_default_credential(workspace_id)?;
         Ok(Some(RepositorySshAccessBinding {
@@ -1202,11 +1353,11 @@ impl RepositorySecretService {
             let credential: String = conn.query_row(
                 "SELECT current_operation_id FROM repository_ssh_credentials WHERE workspace_id=?1 AND credential_id=?2 AND status='active'",
                 params![workspace_id, binding.credential_id], |row| row.get(0),
-            ).optional()?.ok_or_else(|| Error::InvalidInput("Repository SSH credential is unavailable or inactive".into()))?;
+            ).optional()?.ok_or_else(|| access_failure(AccessOperation::LeaseSshAccess, AccessReason::CredentialUnavailableOrInactive, Error::InvalidInput("Repository SSH credential is unavailable or inactive".into())))?;
             let host: String = conn.query_row(
                 "SELECT current_operation_id FROM repository_ssh_host_trusts WHERE workspace_id=?1 AND host_trust_id=?2",
                 params![workspace_id, binding.host_trust_id], |row| row.get(0),
-            ).optional()?.ok_or_else(|| Error::InvalidInput("Repository SSH host trust is unavailable".into()))?;
+            ).optional()?.ok_or_else(|| access_failure(AccessOperation::LeaseSshAccess, AccessReason::HostTrustUnavailable, Error::InvalidInput("Repository SSH host trust is unavailable".into())))?;
             Ok((credential, host))
         })?;
         self.lease_ssh_materialization_access_operation(
@@ -1261,7 +1412,7 @@ impl RepositorySecretService {
                 "SELECT EXISTS(SELECT 1 FROM repository_ssh_credentials WHERE workspace_id=?1 AND credential_id=?2 AND status='active')",
                 params![workspace_id, credential_id], |row| row.get(0),
             )?;
-            if !active { return Err(Error::InvalidInput("Repository SSH credential is unavailable or inactive".into())); }
+            if !active { return Err(access_failure(AccessOperation::LeaseSshAccess, AccessReason::CredentialUnavailableOrInactive, Error::InvalidInput("Repository SSH credential is unavailable or inactive".into()))); }
             let credential_fingerprint: String = conn.query_row(
                 "SELECT public_key_fingerprint FROM repository_ssh_credential_keys WHERE workspace_id = ?1 AND credential_id = ?2 AND operation_id = ?3",
                 params![workspace_id, credential_id, credential_operation_id],
@@ -2276,6 +2427,10 @@ mod tests {
     use server_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};
     use ssh_key::private::Ed25519Keypair;
 
+    mod failure_contract {
+        include!("repository_access_failure/tests.rs");
+    }
+
     fn test_private_key(seed: u8) -> (String, String) {
         let key = PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32]));
         let private = key.to_openssh(ssh_key::LineEnding::LF).unwrap().to_string();
@@ -2333,11 +2488,9 @@ mod tests {
             uri: "http://git.example.test/team/project.git".to_string(),
         };
         let error = validate_repository_access_source("remote", &mismatched).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("repository_source_plain_http_unsupported")
-        );
+        assert!(matches!(error, Error::RepositoryAccess(ref failure)
+                if failure.details().reason == AccessReason::PlainHttpSourceUnsupported
+                    && matches!(failure.source_error(), Error::InvalidInput(_))));
     }
 
     #[test]
@@ -2692,11 +2845,9 @@ mod tests {
         );
         let error = project_repository_access_state(&*store, &service, "workspace-a", &unknown)
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unknown Repository SSH credential")
-        );
+        assert!(matches!(error, Error::RepositoryAccess(ref failure)
+                if failure.details().reason == AccessReason::BindingCredentialNotFound
+                    && matches!(failure.source_error(), Error::InvalidInput(_))));
     }
 
     #[test]
@@ -2858,7 +3009,9 @@ mod tests {
                 &projection,
             )
             .unwrap_err();
-        assert!(matches!(retained, Error::RepositoryConflict(_)));
+        assert!(matches!(retained, Error::RepositoryAccess(ref failure)
+            if failure.details().reason == AccessReason::CredentialRetained
+                && matches!(failure.source_error(), Error::RepositoryConflict(_))));
 
         store
             .finish_workdir_create_operation(
@@ -2981,7 +3134,9 @@ mod tests {
         };
         assert!(matches!(
             service.rotate_credential("workspace-a", "deploy", stale, "owner-a"),
-            Err(Error::WorkspaceConfigConflict(_))
+            Err(Error::RepositoryAccess(ref failure))
+                if failure.details().reason == AccessReason::CredentialObservationChanged
+                    && matches!(failure.source_error(), Error::WorkspaceConfigConflict(_))
         ));
         let reused = RotateRepositorySshCredentialRequest {
             private_key: test_private_key(23).0,
@@ -3244,7 +3399,9 @@ mod tests {
             service
                 .delete_credential("workspace-a", "deploy", stale, "owner-a", &projection)
                 .unwrap_err(),
-            Error::WorkspaceConfigConflict(_)
+            Error::RepositoryAccess(ref failure)
+                if failure.details().reason == AccessReason::CredentialKeyChanged
+                    && matches!(failure.source_error(), Error::WorkspaceConfigConflict(_))
         ));
         let request = DeleteRepositorySshCredentialRequest {
             operation_id: "delete-key".into(),
@@ -3340,7 +3497,9 @@ mod tests {
                 &projection,
             )
             .unwrap_err();
-        assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
+        assert!(matches!(error, Error::RepositoryAccess(ref failure)
+            if failure.details().reason == AccessReason::CredentialReferenced
+                && matches!(failure.source_error(), Error::WorkspaceConfigConflict(_))));
         assert!(
             service
                 .get_credential("workspace-a", "deploy", &[])

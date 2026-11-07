@@ -1,5 +1,59 @@
 use super::*;
 
+#[tokio::test]
+async fn subject_current_worker_lookup_failure_is_not_reported_as_no_body() {
+    let workspace = tempfile::tempdir().unwrap();
+    let api = test_api(workspace.path()).await;
+    let subject = open_subjektiv_store(&api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("companion").unwrap())
+        .unwrap();
+    assert!(
+        subjektiv_subject_response(&api, subject.clone())
+            .unwrap()
+            .current_worker
+            .is_none()
+    );
+    let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
+    let memory = api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    // Real reservation SQL owns the body, but no Runtime Worker exists yet.
+    // This is an unavailable observation, not evidence that another launch is safe.
+    api.config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            "runtime-test",
+            "subject-start",
+            &"f".repeat(64),
+            Some(&singleton_key),
+            &memory,
+        )
+        .unwrap();
+    assert!(
+        api.store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &singleton_key)
+            .unwrap()
+            .is_some()
+    );
+    let projection = subjektiv_subject_response(&api, subject.clone()).unwrap();
+    assert!(projection.current_body.is_some());
+    assert!(projection.current_worker.is_none());
+    assert!(
+        projection
+            .current_worker_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "subject_body_observation_unavailable")
+    );
+    let body = subject_body::snapshot(&api, &subject.id).unwrap();
+    assert_eq!(body.current, projection.current_body);
+    assert!(matches!(
+        body.observation,
+        server_api::SubjectBodyObservation::Unavailable { .. }
+    ));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity() {
     let workspace = tempfile::tempdir().unwrap();
@@ -16,6 +70,36 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
         let subject = subjektiv
             .create_subject(
                 crate::subjektiv::SubjectRole::new(format!("companion-{index}")).unwrap(),
+            )
+            .unwrap();
+        subjektiv
+            .set_subject_permissions(
+                &subject.id,
+                &server_api::authorization::SubjectPermissionsUpdate {
+                    operation_id: format!("subject-callback-grant-{index}"),
+                    expected_change_id: Some(
+                        subjektiv
+                            .current_subject_policy(&subject.id)
+                            .unwrap()
+                            .unwrap()
+                            .change_id,
+                    ),
+                    execution: [
+                        "memory.resident.read",
+                        "session.record",
+                        "journal.startup.read",
+                    ]
+                    .into_iter()
+                    .map(|operation| server_api::authorization::ScopedPermission {
+                        operation: operation.into(),
+                        resource: server_api::authorization::PermissionResource::Subject {
+                            workspace_id: TEST_WORKSPACE_ID.into(),
+                            subject_id: subject.id.clone(),
+                        },
+                    })
+                    .collect(),
+                    delegation: vec![],
+                },
             )
             .unwrap();
         let singleton_key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
@@ -320,7 +404,12 @@ async fn only_exact_authenticated_callbacks_can_reenter_deletion_drain() {
 #[tokio::test]
 async fn rejected_create_releases_key_but_retains_subject_occupancy_without_release_proof() {
     let workspace = tempfile::tempdir().unwrap();
-    let api = test_api(workspace.path()).await;
+    let (api, backend) = test_api_with_recording_backend(workspace.path()).await;
+    let subject = open_subjektiv_store(&api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("rejected-create").unwrap())
+        .unwrap();
+    let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
     let memory = api
         .config_store
         .get_workspace_memory_settings(TEST_WORKSPACE_ID)
@@ -332,7 +421,7 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
             EMBEDDED_RUNTIME_ID,
             "manual:rejected-create",
             &"f".repeat(64),
-            Some("subjektiv:rejected-create"),
+            Some(&key),
             &memory,
         )
         .unwrap();
@@ -348,6 +437,7 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
         spawned_workdir_ids: &[],
     };
     for _ in 0..2 {
+        *backend.recovery_failure.lock().unwrap() = Some("Runtime proof unavailable".into());
         let diagnostics = compensate_failed_workspace_worker_create(
             &api,
             EMBEDDED_RUNTIME_ID,
@@ -358,7 +448,12 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
             &context,
             &[],
         );
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "worker_spawn_compensation_create_reservation_release_failed"),
+            "{diagnostics:?}"
+        );
         assert!(
             !api.store
                 .has_active_worker_create_reservation(TEST_WORKSPACE_ID, &worker)
@@ -372,7 +467,7 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
         );
         assert_eq!(
             api.store
-                .current_worker_singleton_owner(TEST_WORKSPACE_ID, "subjektiv:rejected-create")
+                .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
                 .unwrap()
                 .expect("failed creation is not explicit Subject release authority")
                 .worker,
@@ -385,7 +480,7 @@ async fn rejected_create_releases_key_but_retains_subject_occupancy_without_rele
             EMBEDDED_RUNTIME_ID,
             "manual:retry-rejected-create",
             &"f".repeat(64),
-            Some("subjektiv:rejected-create"),
+            Some(&key),
             &memory,
         );
         assert!(
@@ -607,45 +702,66 @@ async fn unpublished_create_recovery_resumes_after_runtime_proof_before_host_com
 }
 
 #[tokio::test]
-async fn failed_subject_spawn_can_recover_on_next_explicit_create() {
-    let root = tempfile::tempdir().unwrap();
-    let (api, backend) = test_api_with_recording_backend(root.path()).await;
-    let store = open_subjektiv_store(&api).unwrap();
-    let subject = store
-        .create_subject(crate::subjektiv::SubjectRole::new("failed-spawn").unwrap())
-        .unwrap();
-    let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
-    *backend.spawn_failure.lock().unwrap() =
-        Some("Session registration failed before publication".into());
-    let rejected = api
-        .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
-        .unwrap();
-    assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
-    let old = api
-        .config_store
-        .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
-        .unwrap()
-        .unwrap();
-    assert!(
-        api.config_store
-            .subject_create_recovery_candidate(TEST_WORKSPACE_ID, &old)
+async fn failed_subject_spawn_releases_occupancy_only_after_runtime_proof() {
+    for uncertain in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (api, backend) = test_api_with_recording_backend(root.path()).await;
+        let subject = open_subjektiv_store(&api)
             .unwrap()
-            .is_some()
-    );
-    assert!(
-        backend.recovery_requests.lock().unwrap().is_empty(),
-        "failure alone must not release occupancy"
-    );
-    let result = api
-        .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
-        .unwrap();
-    assert_eq!(result.state, InternalWorkerOperationState::Accepted);
-    let current = api
-        .config_store
-        .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
-        .unwrap()
-        .unwrap();
-    assert_ne!(current.worker, old.worker);
-    assert_eq!(current.generation, old.generation + 1);
-    assert_eq!(backend.recovery_requests.lock().unwrap().len(), 1);
+            .create_subject(crate::subjektiv::SubjectRole::new("failed-spawn").unwrap())
+            .unwrap();
+        let key = crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap();
+        *backend.spawn_failure.lock().unwrap() =
+            Some("Session registration failed before publication".into());
+        if uncertain {
+            *backend.recovery_failure.lock().unwrap() = Some("Runtime absence unconfirmed".into());
+        }
+        let rejected = api
+            .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
+            .unwrap();
+        assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
+        let retained = api
+            .config_store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+            .unwrap();
+        assert_eq!(retained.is_some(), uncertain);
+        assert_eq!(backend.recovery_requests.lock().unwrap().len(), 1);
+        if uncertain {
+            assert!(
+                rejected.diagnostics.iter().any(
+                    |d| d.code == "worker_spawn_compensation_create_reservation_release_failed"
+                )
+            );
+            assert!(
+                api.config_store
+                    .subject_create_recovery_candidate(
+                        TEST_WORKSPACE_ID,
+                        retained.as_ref().unwrap()
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        let result = api
+            .spawn_workspace_worker(EMBEDDED_RUNTIME_ID, recovery_spawn_request(&subject.id))
+            .unwrap();
+        assert_eq!(result.state, InternalWorkerOperationState::Accepted);
+        let current = api
+            .config_store
+            .current_worker_singleton_owner(TEST_WORKSPACE_ID, &key)
+            .unwrap()
+            .unwrap();
+        let requests = backend.recovery_requests.lock().unwrap();
+        assert_ne!(current.worker.worker_id, requests[0].worker_id.to_string());
+        assert_eq!(current.generation, 2);
+        if uncertain {
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests[0], requests[1],
+                "compensation and explicit recovery reuse one fence"
+            );
+        } else {
+            assert_eq!(requests.len(), 1);
+        }
+    }
 }

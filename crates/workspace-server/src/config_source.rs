@@ -183,38 +183,60 @@ impl SqliteWorkspaceStore {
         schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<WorkspaceConfigState> {
         let desired_schema = schema_bundle.clone();
-        let (state, requires_toolchain_refresh, base_identity) = self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let workspace_exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
-                [workspace_id],
-                |row| row.get(0),
-            )?;
-            if !workspace_exists {
-                return Err(Error::WorkspaceIdMismatch);
-            }
-            let stored_decodal_version = tx
+        let (state, requires_toolchain_refresh, base_identity, canonical) =
+            self.with_conn_mut(|conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let workspace_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
+                    [workspace_id],
+                    |row| row.get(0),
+                )?;
+                if !workspace_exists {
+                    return Err(Error::WorkspaceIdMismatch);
+                }
+                let stored_decodal_version = tx
                 .query_row(
                     "SELECT decodal_version FROM workspace_config_trees WHERE workspace_id = ?1",
                     [workspace_id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            let requires_toolchain_refresh = stored_decodal_version
-                .as_deref()
-                .is_some_and(|version| version != DECODAL_VERSION);
-            let state = match load_state(&tx, workspace_id)? {
-                Some(state) => state,
-                None => {
-                    let state = initial_state_with_schema(schema_bundle.clone())?;
-                    insert_materialized_state(&tx, workspace_id, &state, materialized_at)?;
-                    state
-                }
-            };
-            let base_identity = load_evaluation_identity(&tx, workspace_id)?;
-            tx.commit()?;
-            Ok((state, requires_toolchain_refresh, base_identity))
-        })?;
+                let requires_toolchain_refresh = stored_decodal_version
+                    .as_deref()
+                    .is_some_and(|version| version != DECODAL_VERSION);
+                let state = match load_state(&tx, workspace_id)? {
+                    Some(state) => state,
+                    None => {
+                        let mut state = initial_state_with_schema(schema_bundle.clone())?;
+                        if has_plugin_provider(&schema_bundle) {
+                            let (contract, evaluation, _) =
+                                crate::plugin_settings::evaluate_catalog_config(
+                                    &tx,
+                                    workspace_id,
+                                    &state.snapshot,
+                                    schema_bundle.clone(),
+                                )?;
+                            state.contract = contract;
+                            state.projection_digest = evaluation.projection_digest;
+                        }
+                        insert_materialized_state(&tx, workspace_id, &state, materialized_at)?;
+                        state
+                    }
+                };
+                let base_identity = load_evaluation_identity(&tx, workspace_id)?;
+                let canonical = crate::config_adoption::canonical(&tx, workspace_id)?;
+                tx.commit()?;
+                Ok((state, requires_toolchain_refresh, base_identity, canonical))
+            })?;
+        // Once adopted, schema changes must be previewed/adopted by the owner,
+        // not persisted as a second startup writer outside the policy/history tx.
+        if canonical {
+            return Ok(state);
+        }
+        let desired_schema = crate::plugin_settings::materialization_schema(
+            desired_schema,
+            &state.contract.schema_bundle,
+        )?;
         let main_needs_normalization = state
             .snapshot
             .get(&main_config_path())
@@ -223,7 +245,17 @@ impl SqliteWorkspaceStore {
             || state.contract.schema_bundle.fingerprint != desired_schema.fingerprint
             || main_needs_normalization
         {
-            let candidate = evaluate_candidate(state, base_identity, &[], desired_schema)?;
+            let candidate = self.with_conn(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                evaluate_candidate_in_transaction(
+                    &tx,
+                    workspace_id,
+                    state,
+                    base_identity,
+                    &[],
+                    desired_schema,
+                )
+            })?;
             return self.commit_evaluated_workspace_config(workspace_id, &candidate);
         }
         Ok(state)
@@ -277,18 +309,23 @@ impl SqliteWorkspaceStore {
         request: &ConfigCommitRequest,
         schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<EvaluatedConfigCandidate> {
-        let (current, base_identity) = self.with_conn(|conn| {
+        self.with_conn(|conn| {
             let tx = conn.unchecked_transaction()?;
             let current = load_state(&tx, workspace_id)?.ok_or_else(config_not_materialized)?;
-            let identity = load_evaluation_identity(&tx, workspace_id)?;
-            tx.commit()?;
-            Ok((current, identity))
-        })?;
-        validate_entrypoint_request(&request.entrypoints)?;
-        if current.snapshot.digest != request.base_digest {
-            return Err(config_conflict("base content digest mismatch"));
-        }
-        evaluate_candidate(current, base_identity, &request.changes, schema_bundle)
+            let base_identity = load_evaluation_identity(&tx, workspace_id)?;
+            validate_entrypoint_request(&request.entrypoints)?;
+            if current.snapshot.digest != request.base_digest {
+                return Err(config_conflict("base content digest mismatch"));
+            }
+            evaluate_candidate_in_transaction(
+                &tx,
+                workspace_id,
+                current,
+                base_identity,
+                &request.changes,
+                schema_bundle,
+            )
+        })
     }
 
     pub fn evaluate_workspace_config_candidate(
@@ -310,6 +347,9 @@ impl SqliteWorkspaceStore {
     ) -> Result<WorkspaceConfigState> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if crate::config_adoption::canonical(&tx, workspace_id)? {
+                return Err(config_conflict("configuration authority is adopted; use owner adoption with the observed editing head and operation ID"));
+            }
             let workspace_exists: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id = ?1)",
                 [workspace_id],
@@ -328,8 +368,28 @@ impl SqliteWorkspaceStore {
             {
                 return Err(config_conflict("base evaluation identity mismatch"));
             }
+            if has_plugin_provider(&current.contract.schema_bundle)
+                && !has_plugin_provider(&candidate.contract.schema_bundle)
+            {
+                return Err(config_conflict("Plugin schema authority cannot be removed"));
+            }
             let snapshot = candidate.snapshot.clone();
             snapshot.validate().map_err(config_error)?;
+            if has_plugin_provider(&candidate.contract.schema_bundle) {
+                let (contract, evaluation, resolved) =
+                    crate::plugin_settings::evaluate_catalog_config(
+                        &tx,
+                        workspace_id,
+                        &snapshot,
+                        candidate.contract.schema_bundle.clone(),
+                    )?;
+                if contract != candidate.contract || evaluation != candidate.evaluation {
+                    return Err(config_conflict(
+                        "Plugin catalog/schema evaluation changed since Preview",
+                    ));
+                }
+                crate::plugin_settings::sync_config_references(&tx, workspace_id, &resolved)?;
+            }
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
             tx.execute(
                 "DELETE FROM workspace_config_entries WHERE workspace_id = ?1",
@@ -427,7 +487,9 @@ fn format_candidate_sources(
     let mut entries = Vec::with_capacity(snapshot.entries.len());
     for entry in snapshot.entries.into_values() {
         if paths.contains(&entry.path) && entry.content_type == ConfigContentType::Decodal {
-            let formatted = environment.format(&entry.content).map_err(config_error)?;
+            let formatted = environment
+                .format(&entry.content)
+                .map_err(Error::InvalidInput)?;
             entries.push(
                 ConfigEntry::new(entry.path, entry.content_type, formatted)
                     .map_err(config_error)?,
@@ -440,7 +502,7 @@ fn format_candidate_sources(
 }
 
 // Read persisted provenance, not load_state's upgraded in-memory contract.
-fn load_evaluation_identity(
+pub(crate) fn load_evaluation_identity(
     conn: &rusqlite::Connection,
     workspace_id: &str,
 ) -> Result<(String, String)> {
@@ -450,6 +512,40 @@ fn load_evaluation_identity(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .map_err(Error::from)
+}
+
+fn has_plugin_provider(bundle: &WorkspaceConfigSchemaBundle) -> bool {
+    bundle
+        .contributions
+        .iter()
+        .any(|provider| provider.provider_id == "builtin:plugins")
+}
+
+pub(crate) fn evaluate_candidate_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    current: WorkspaceConfigState,
+    base_identity: (String, String),
+    changes: &[ConfigTreeChange],
+    schema_bundle: WorkspaceConfigSchemaBundle,
+) -> Result<EvaluatedConfigCandidate> {
+    if !has_plugin_provider(&schema_bundle) {
+        return evaluate_candidate(current, base_identity, changes, schema_bundle);
+    }
+    let mut providers = schema_bundle.contributions.clone();
+    providers.retain(|provider| provider.provider_id != "builtin:plugins");
+    providers.push(crate::plugin_settings::PluginConfigSchemaProvider.contribution()?);
+    let bootstrap = WorkspaceConfigSchemaBundle::compose(providers).map_err(config_error)?;
+    let mut candidate = evaluate_candidate(current, base_identity, changes, bootstrap)?;
+    let (contract, evaluation, _) = crate::plugin_settings::evaluate_catalog_config(
+        tx,
+        workspace_id,
+        &candidate.snapshot,
+        schema_bundle,
+    )?;
+    candidate.contract = contract;
+    candidate.evaluation = evaluation;
+    Ok(candidate)
 }
 
 fn evaluate_candidate(
@@ -480,6 +576,28 @@ fn evaluate_candidate(
         contract,
         evaluation,
     })
+}
+
+pub(crate) fn sync_adopted_config_references(
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    state: &WorkspaceConfigState,
+) -> Result<()> {
+    if has_plugin_provider(&state.contract.schema_bundle) {
+        let (contract, evaluation, resolved) = crate::plugin_settings::evaluate_catalog_config(
+            tx,
+            workspace,
+            &state.snapshot,
+            state.contract.schema_bundle.clone(),
+        )?;
+        if contract != state.contract || evaluation.projection_digest != state.projection_digest {
+            return Err(config_conflict(
+                "Plugin catalog/schema changed during adoption",
+            ));
+        }
+        crate::plugin_settings::sync_config_references(tx, workspace, &resolved)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn load_state(
@@ -708,7 +826,7 @@ fn config_not_materialized() -> Error {
     Error::RegistryInconsistency("workspace config tree is not materialized".to_string())
 }
 
-fn validate_entrypoint_request(entrypoints: &[VirtualPath]) -> Result<()> {
+pub(crate) fn validate_entrypoint_request(entrypoints: &[VirtualPath]) -> Result<()> {
     if entrypoints == [main_config_path()] {
         Ok(())
     } else {
@@ -770,8 +888,12 @@ fn parse_content_type(value: &str) -> Result<ConfigContentType> {
     }
 }
 
-fn config_error(error: impl std::fmt::Display) -> Error {
-    Error::InvalidInput(error.to_string())
+fn config_error(error: config_source::ConfigTreeError) -> Error {
+    crate::configuration_failure::ConfigurationFailure::from_tree(
+        crate::configuration_failure::ConfigurationFailureOperation::Source,
+        error,
+    )
+    .into()
 }
 
 fn config_conflict(message: impl Into<String>) -> Error {

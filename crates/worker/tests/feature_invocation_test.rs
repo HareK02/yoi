@@ -155,6 +155,7 @@ impl FeatureInvocationHandler for FakeFeature {
                 "limit-message" => "x".repeat(4096),
                 _ => "prepared".into(),
             },
+            failure: None,
             context: Some(match value.as_str() {
                 "large-context" => "é".repeat(8193),
                 "limit-context" => "x".repeat(16384),
@@ -601,6 +602,7 @@ fn notify_rejects_typed_side_effect_message_payloads() {
             message: "/prepare(first)".into(),
         },
         protocol::Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "n-1".into(),
             message: "/prepare(first)".into(),
             source: protocol::AuthenticatedInputSource::UntrustedWire,

@@ -22,7 +22,6 @@ use crate::shutdown_after_idle::{
     take_shutdown_request_after_status,
 };
 use crate::spawn::registry::{PreparedSpawnedWorkerRegistryLoad, SpawnedWorkerRegistry};
-use crate::spawn::tool::sub_worker_spawn_tool;
 use crate::worker::{
     PendingSubmissionHandle, SystemItemCommitter, Worker, WorkerError, WorkerRunResult,
 };
@@ -43,6 +42,14 @@ use workdir::{
 // WorkerHandle — client-facing, Clone-able
 // ---------------------------------------------------------------------------
 
+/// Saved acceptance only; neither processing nor execution cleanup is implied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionReceipt {
+    pub submission_request_id: String,
+    pub submission_id: String,
+    pub disposition: protocol::SubmissionDisposition,
+}
+
 #[derive(Clone)]
 pub struct WorkerHandle {
     method_tx: mpsc::Sender<Method>,
@@ -62,6 +69,25 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
+    /// Read the existing receipt without resending input or activating a run.
+    /// Missing evidence is not proof of rejection and must not authorize replay.
+    pub fn reconcile_submission(
+        &self,
+        submission_request_id: &str,
+        input: &[protocol::Segment],
+        source: &protocol::AuthenticatedInputSource,
+    ) -> Result<Option<SubmissionReceipt>, String> {
+        let namespace = if matches!(source, protocol::AuthenticatedInputSource::UntrustedWire) {
+            format!("direct:{}", self.session_id)
+        } else {
+            source.namespace()
+        };
+        self.pending_activations
+            .lock()
+            .map_err(|_| "pending activation receipt state is poisoned".to_string())?
+            .reconcile_submission(submission_request_id, input, &namespace)
+    }
+
     /// Transport closure belongs to this Controller endpoint, not a WorkerRef.
     pub fn protocol_is_closed(&self) -> bool {
         self.method_tx.is_closed()
@@ -547,6 +573,7 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
 ) -> crate::spawn::tool::ParentNotificationTarget {
     crate::spawn::tool::ParentNotificationTarget::Durable(Arc::new(move |method| {
         let Method::NotifyTracked {
+            receipt_scope,
             notification_request_id,
             message,
             source,
@@ -555,6 +582,7 @@ fn durable_parent_notification_target<St: Store + Clone + Send + Sync + 'static>
             return;
         };
         let (source_namespace, provenance) = resolved_input_source(&pending_submissions, &source);
+        let source_namespace = receipt_scope.namespace(source_namespace);
         match pending_submissions.accept_notification_from_source(
             notification_request_id,
             message,
@@ -650,7 +678,15 @@ fn prepare_pending_run<St: Store + Clone>(
 // WorkerController — actor that owns a Worker
 // ---------------------------------------------------------------------------
 
-pub type ShutdownReceiver = oneshot::Receiver<()>;
+/// Sent only after Controller admission, child tasks, Workdir sessions, and observer tasks
+/// have closed. Feature cleanup failures are retained separately; this is not Backend Host
+/// operation drain, domain writer revocation, or a resource-removal receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControllerShutdownReport {
+    pub feature_failures: Vec<crate::hook::HookError>,
+}
+
+pub type ShutdownReceiver = oneshot::Receiver<ControllerShutdownReport>;
 
 pub struct WorkerController;
 
@@ -663,7 +699,7 @@ pub(crate) struct InitializedWorkerController<C: LlmClient, St: Store> {
     pub(crate) worker: Worker<C, St>,
     pub(crate) handle: WorkerHandle,
     method_rx: mpsc::Receiver<Method>,
-    shutdown_tx: oneshot::Sender<()>,
+    shutdown_tx: oneshot::Sender<ControllerShutdownReport>,
     shutdown_rx: ShutdownReceiver,
     registry_reclaim: PreparedSpawnedWorkerRegistryLoad<St>,
     shutdown_after_idle: ShutdownAfterIdleRequest,
@@ -857,7 +893,7 @@ impl WorkerController {
 
         // === 1. Initialization (channels / RuntimeDir / worker-immutable
         //         snapshots / SpawnedWorkerRegistry / alerter attach) ===
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<ControllerShutdownReport>();
         let (method_tx, method_rx) = mpsc::channel::<Method>(32);
         let (working_event_tx, _) = broadcast::channel::<Event>(256);
         let alerter = Alerter::new(working_event_tx.clone());
@@ -1067,6 +1103,7 @@ where
         let notify_buffer = worker.notify_buffer_handle();
 
         worker.finish_startup_feature_cleanup_capture();
+        worker.start_host_ready_feature_tasks();
         let controller_task = tokio::spawn(controller_loop(
             worker,
             method_rx,
@@ -1427,10 +1464,9 @@ fn validate_memory_lifecycle_targets(
     Ok(())
 }
 
-/// Register the builtin file-manipulation tools, optional memory tools,
-/// and the Worker-orchestration tools (SubWorkerSpawn + comm) on the Worker's
-/// Engine. Returns the WorkdirSession handle used to attach a `WorkerFsView` to
-/// the shared state.
+/// Compose Worker Features with Host-owned live bindings and install their
+/// staged contributions. Remaining direct registrations are Worker-lifetime
+/// infrastructure (paste/Workdir) and the image/web migration follow-ups.
 pub(crate) async fn register_worker_tools<C, St>(
     worker: &mut Worker<C, St>,
 
@@ -1463,7 +1499,6 @@ where
     let task_feature = worker.task_feature();
     let web_config = worker.manifest().web.clone();
     let mcp_config = worker.manifest().mcp.clone();
-    let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
     let spawner_workspace_context = worker.workspace_context_handle();
     let pending_submissions = worker.pending_submission_handle();
@@ -1502,7 +1537,7 @@ where
         // Keep the alias-routed schemas installed for the Worker lifetime. The
         // attachment set may be empty or mutate after registration, so target
         // resolution and provider capability checks happen per invocation.
-        let workdir_tools = if restrict_workdir_tools_to_current_capabilities {
+        let mut workdir_tools = if restrict_workdir_tools_to_current_capabilities {
             tools::routed_builtin_tools_for_current_capabilities(
                 workdir_sessions.clone(),
                 tracker.clone(),
@@ -1515,6 +1550,11 @@ where
                 bash_output.clone(),
             )
         };
+        if let Some(policy) = &spawner_manifest.permissions {
+            workdir_tools.retain(|definition| {
+                !crate::permission::tool_is_unconditionally_denied(policy, &definition().0.name)
+            });
+        }
         worker.engine_mut().register_tools(workdir_tools);
     }
     if feature_config.image.enabled && model_supports_image_attachments(&spawner_manifest.model) {
@@ -1523,9 +1563,13 @@ where
             .register_tool(tools::routed_view_image_tool(workdir_sessions));
     }
     if feature_config.web.enabled {
-        worker
-            .engine_mut()
-            .register_tools(tools::web_builtin_tools(web_config));
+        let web = tools::WebTools::new(web_config).with_authorizer(Arc::new(
+            crate::feature::builtin::web::WorkspaceWebAuthorizer(worker.workspace_client_handle()),
+        ));
+        worker.engine_mut().register_tools(vec![
+            tools::web_search_tool(web.clone()),
+            tools::web_fetch_tool(web),
+        ]);
     }
 
     let worker_enabled = feature_config.worker.enabled;
@@ -1543,6 +1587,18 @@ where
     } else {
         (FeatureRegistryBuilder::new(), None)
     };
+    match worker.plugin_tools() {
+        Some(tools) => {
+            feature_registry.add_module(tools);
+        }
+        None if !worker.manifest().plugins.is_empty() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Plugin selection requires a persisted plan and current Host preparation",
+            ));
+        }
+        None => {}
+    }
     feature_registry
         .add_module(crate::feature::builtin::chat_invocation::AttachmentInvocationFeature);
     if let Some(binding) = backend_job.as_ref() {
@@ -1552,6 +1608,18 @@ where
                 std::io::ErrorKind::InvalidInput,
                 "Backend Job result capability requires Backend Workspace API authority",
             ));
+        }
+        if binding.subjektiv_consolidation || binding.subjektiv_journal {
+            feature_registry.add_module(
+                crate::feature::builtin::backend_job_input::SubjectJobInputFeature::new(
+                    workspace_client.clone(),
+                    if binding.subjektiv_consolidation {
+                        "memory.consolidation.supply"
+                    } else {
+                        "journal.job.input.supply"
+                    },
+                ),
+            );
         }
         let mut result_feature =
             crate::feature::builtin::backend_job_result::BackendJobResultFeature::new(
@@ -1633,6 +1701,15 @@ where
         }
         feature_prompt_contribution = Some((Some(resident_summary_source), None));
     }
+    if backend_job.is_none()
+        && let Some(chat) =
+            crate::feature::builtin::subjektiv_chat::SubjektivChatFeature::from_resolved_config(
+                &worker.manifest().feature.subjektiv,
+                subjektiv_host.clone(),
+            )?
+    {
+        feature_registry.add_module(chat);
+    }
     if ordinary_subjektiv_features_enabled
         && let Some(subjektiv_memory) =
             crate::feature::builtin::subjektiv_memory::SubjektivMemoryFeature::from_resolved_config(
@@ -1655,7 +1732,6 @@ where
     if ordinary_subjektiv_features_enabled
         && lifecycle_enabled
         && let Some(host) = subjektiv_host.as_ref()
-        && (host.host.journal_startup_granted() || host.host.journal_compaction_granted())
     {
         worker.install_session_context_source(Arc::new(
             crate::feature::builtin::journal::JournalContextSource::new(
@@ -1765,8 +1841,18 @@ where
         );
     }
     let wip_mode = worker.manifest().worker.mode == manifest::WorkerMode::Wip;
+    let drive_client = worker.workspace_client_handle();
+    if feature_config.drive.enabled
+        && (!drive_client.is_available()
+            || drive_client.workspace_id().is_none_or(|id| id.is_empty()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "Drive is configured but its Backend Workspace connection is unavailable; no Drive access started",
+        ));
+    }
     let drive_feature = crate::feature::builtin::drive::DriveFeature::configured(
-        worker.workspace_client_handle(),
+        drive_client,
         feature_config.drive.enabled,
         worker.workdir_sessions(),
     )
@@ -1875,10 +1961,6 @@ where
         }
     }
 
-    if feature_config.sub_worker.enabled {
-        worker.register_worker_orchestration_instruction();
-    }
-
     let host_worker_observation_provider = worker.worker_observation_provider();
     let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
@@ -1948,17 +2030,43 @@ where
     }
     {
         let workspace_client = worker.workspace_client_handle();
-        let engine = worker.engine_mut();
 
-        if feature_config.merge_request.any() && wip_mode {
-            let namespace_route = wip_mount_registry
-                .allocate_namespace("merge-request", "merge-requests")
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("allocate Merge Request WIP namespace: {error}"),
-                    )
-                })?;
+        // Allocate cross-domain input reference coordinates before mounting either provider.
+        // Allocation is not publication or authorization; current handlers still check both.
+        let mut allocate = |enabled, owner, name| {
+            if enabled && wip_mode {
+                wip_mount_registry
+                    .allocate_namespace(owner, name)
+                    .map(Some)
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("allocate {owner} WIP namespace: {error}"),
+                        )
+                    })
+            } else {
+                Ok(None)
+            }
+        };
+        let merge_request_namespace = allocate(
+            feature_config.merge_request.any() || feature_config.ticket.enabled,
+            "merge-request",
+            "merge-requests",
+        )?;
+        let ticket_namespace = allocate(
+            feature_config.ticket.enabled || feature_config.merge_request.open,
+            "ticket",
+            "tickets",
+        )?;
+        let objective_namespace = allocate(
+            feature_config.objective.enabled || feature_config.ticket.enabled,
+            "objective",
+            "objectives",
+        )?;
+
+        if feature_config.merge_request.any()
+            && let Some(namespace_route) = &merge_request_namespace
+        {
             crate::feature::builtin::merge_request::mount_workspace_http_merge_request_wip(
                 &mut wip_mount_registry,
                 workspace_client.clone(),
@@ -1974,21 +2082,15 @@ where
             })?;
         }
 
-        if feature_config.ticket.enabled && wip_mode {
+        if feature_config.ticket.enabled
+            && let Some(namespace_route) = &ticket_namespace
+        {
             let ticket_access = crate::feature::builtin::ticket::TicketFeatureAccess {
                 authoring: feature_config.ticket.authoring,
                 thread: feature_config.ticket.thread,
                 intake: feature_config.ticket.intake,
                 workflow: feature_config.ticket.workflow,
             };
-            let namespace_route = wip_mount_registry
-                .allocate_namespace("ticket", "tickets")
-                .map_err(|error| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("allocate Ticket WIP namespace: {error}"),
-                    )
-                })?;
             crate::feature::builtin::ticket::mount_workspace_http_ticket_wip(
                 &mut wip_mount_registry,
                 workspace_client.clone(),
@@ -2004,73 +2106,37 @@ where
             })?;
         }
 
-        // Objective tools expose scoped project Objective reads and mutations through
-        // the Backend Workspace API. Workers must not guess local `.yoi/objectives`
-        // paths or read/edit Objective files directly.
-        if feature_config.objective.enabled {
-            if workspace_client.is_available() && workspace_client.workspace_id().is_some() {
-                for definition in crate::feature::builtin::objective::workspace_http_objective_tools(
-                    workspace_client.clone(),
-                ) {
-                    engine.register_tool(definition);
-                }
-                if wip_mode {
-                    let namespace_route = wip_mount_registry
-                        .allocate_namespace("objective", "objectives")
-                        .map_err(|error| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!("allocate Objective WIP namespace: {error}"),
-                            )
-                        })?;
-                    crate::feature::builtin::objective::mount_workspace_http_objective_wip(
-                        &mut wip_mount_registry,
-                        workspace_client.clone(),
-                        wip_permissions.clone(),
-                        &namespace_route,
-                    )
-                    .map_err(|error| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("mount Objective WIP projection: {error}"),
-                        )
-                    })?;
-                }
-            } else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "objective tools require Backend Workspace API authority",
-                ));
-            }
-        }
+        crate::feature::builtin::objective::composition::compose(
+            &mut feature_registry,
+            feature_config.objective.enabled,
+            workspace_client.clone(),
+            objective_namespace.map(|route| (route, wip_permissions.clone())),
+        )?;
 
         let mut observation_providers: Vec<
-            Arc<dyn crate::feature::builtin::worker_observation::WorkerObservationProvider>,
+            Arc<dyn crate::feature::contracts::WorkerObservationProvider>,
         > = Vec::new();
 
-        // Worker-orchestration tools derive child filesystem authority from the
-        // active provider-backed Workdir session. The tool remains registered
-        // without one so invocation fails deterministically until the parent
-        // attaches a Workdir.
-        if feature_config.sub_worker.enabled {
-            let spawner_workspace_root = local_workspace_root
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("/"));
-            engine.register_tool(sub_worker_spawn_tool(
-                spawner_name.clone(),
-                spawner_workspace_context,
-                parent_notifications,
-                runtime_base.clone(),
-                spawner_workspace_root,
-                workdir_tool_broker,
-                spawned_registry.clone(),
-                spawner_manifest,
-                prompts,
-            ));
+        if let Some(provider) = crate::feature::builtin::sub_worker::compose(
+            &mut feature_registry,
+            spawner_manifest,
+            spawner_workspace_context,
+            parent_notifications,
+            runtime_base,
+            local_workspace_root,
+            workdir_tool_broker,
+            spawned_registry,
+            prompts,
+        ) {
+            observation_providers.push(provider);
+        }
+        // A scoped Backend provider belongs to the Worker Feature's composition,
+        // including ordinary spawn and restore. Runtime's optional local peer
+        // provider is not its enablement or authority: every actual capture still
+        // requires current operation use and the target's Backend control grant.
+        if worker_enabled {
             observation_providers.push(Arc::new(
-                crate::feature::builtin::worker_observation::SpawnedSubWorkerObservationProvider::new(
-                    spawned_registry,
-                ),
+                crate::feature::builtin::worker_observation::WorkspaceClientWorkerObservationProvider::new(workspace_client),
             ));
         }
         if let Some(provider) = host_worker_observation_provider {
@@ -2088,7 +2154,8 @@ where
             );
         }
     }
-    let feature_install_report = worker.install_features(feature_registry);
+    let feature_install_report =
+        worker.install_features_with_wip(feature_registry, Some(&mut wip_mount_registry));
     if feature_install_report.has_errors() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2260,12 +2327,14 @@ where
             None
         }
         Method::NotifyTracked {
+            receipt_scope,
             notification_request_id,
             message,
             source,
         } => {
             let (source_namespace, provenance) =
                 resolved_input_source(pending_submissions, &source);
+            let source_namespace = receipt_scope.namespace(source_namespace);
             durably_accept_notification(
                 notification_request_id,
                 message,
@@ -2346,7 +2415,7 @@ async fn controller_loop<C, St>(
     pause_tx: mpsc::Sender<()>,
     notify_buffer: NotifyBuffer,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
-    shutdown_tx: oneshot::Sender<()>,
+    shutdown_tx: oneshot::Sender<ControllerShutdownReport>,
     shutdown_after_idle: ShutdownAfterIdleRequest,
     mut command_observer: Option<tokio::task::JoinHandle<()>>,
 ) where
@@ -2741,12 +2810,14 @@ async fn controller_loop<C, St>(
             }
 
             Method::NotifyTracked {
+                receipt_scope,
                 notification_request_id,
                 message,
                 source,
             } => {
                 let (source_namespace, provenance) =
                     resolved_input_source(&pending_submissions, &source);
+                let source_namespace = receipt_scope.namespace(source_namespace);
                 durably_accept_notification(
                     notification_request_id,
                     message,
@@ -3209,7 +3280,11 @@ async fn controller_loop<C, St>(
     drop(method_rx);
     // Feature callbacks and tasks share the Worker scope. Stop them before
     // Memory/Workdir teardown so they cannot observe a partially closed Worker.
-    worker.stop_feature_runtime("controller shutdown").await;
+    let feature_failures = worker
+        .stop_feature_runtime_report("controller shutdown")
+        .await
+        .err()
+        .unwrap_or_default();
 
     loop {
         match spawned_registry.shutdown_internal().await {
@@ -3239,7 +3314,7 @@ async fn controller_loop<C, St>(
         let _ = observer.await;
     }
 
-    let _ = shutdown_tx.send(());
+    let _ = shutdown_tx.send(ControllerShutdownReport { feature_failures });
 }
 
 /// Stage an agent-visible Internal SubWorker lifecycle event.
@@ -3663,12 +3738,14 @@ where
                         });
                     }
                     Some(Method::NotifyTracked {
+                        receipt_scope,
                         notification_request_id,
                         message,
                         source,
                     }) => {
                         let (source_namespace, provenance) =
                             resolved_input_source(pending_submissions, &source);
+                        let source_namespace = receipt_scope.namespace(source_namespace);
                         if durably_accept_notification(
                             notification_request_id,
                             message,
@@ -4033,6 +4110,147 @@ mod tests {
             assert!(requests.lock().unwrap().is_empty());
         }
 
+        #[derive(Clone)]
+        struct PublicationTask {
+            entered: Arc<tokio::sync::Notify>,
+            stopped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::feature::background::FeatureBackgroundTask for PublicationTask {
+            async fn run(
+                &self,
+                _: crate::feature::background::BackgroundTaskContext,
+                _: crate::feature::background::BackgroundTaskCancellation,
+            ) -> Result<(), crate::hook::HookError> {
+                self.entered.notify_one();
+                std::future::pending().await
+            }
+            async fn stopped(
+                &self,
+                _: crate::feature::background::BackgroundTaskContext,
+            ) -> Result<(), crate::hook::HookError> {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        impl crate::feature::FeatureModule for PublicationTask {
+            fn descriptor(&self) -> crate::feature::FeatureDescriptor {
+                crate::feature::FeatureDescriptor::builtin("publication-task", "Publication task")
+                    .with_background_task(
+                        crate::feature::BackgroundTaskDeclaration::worker_managed(
+                            "observe", "observe",
+                        ),
+                    )
+            }
+            fn install(
+                &self,
+                context: &mut crate::feature::FeatureInstallContext<'_>,
+            ) -> Result<(), crate::feature::FeatureInstallError> {
+                let mut spec = crate::feature::background::BackgroundTaskSpec::single_flight(
+                    crate::feature::BackgroundTaskDeclaration::worker_managed("observe", "observe"),
+                    Duration::from_secs(30),
+                );
+                spec.trigger =
+                    crate::feature::background::BackgroundTaskTrigger::HostReady { interval_ms: 1 };
+                context.background_tasks().register(spec, self.clone())
+            }
+        }
+
+        // Real Worker/Store, required Feature installation and Controller
+        // publication. The test task observes the final gate; the model is inert.
+        // The non-canonical branch is shared with restore after head recovery.
+        #[tokio::test]
+        async fn host_ready_tasks_wait_for_start_in_fresh_and_restore_controller_routes() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            for (canonical, publish) in [(true, false), (true, true), (false, true)] {
+                let root = TempDir::new().unwrap();
+                let manifest = manifest::WorkerManifest::from_toml(
+                    "[worker]\nname = 'publication'\n[model]\nscheme = 'anthropic'\nmodel_id = 'test'\n[engine]\n[scope]\n").unwrap();
+                let engine =
+                    Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(
+                        ScriptedClient::new(vec![]),
+                    );
+                let store = session_store::CombinedStore::new(
+                    session_store::FsStore::new(root.path().join("sessions")).unwrap(),
+                    session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
+                );
+                let mut worker = Worker::new(
+                    manifest,
+                    engine,
+                    store,
+                    crate::worker::WorkerWorkspaceContext::local_filesystem(None),
+                    crate::worker::WorkerFilesystemAuthority::None,
+                    manifest::Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker.set_system_prompt_template(
+                    crate::SystemPromptTemplate::parse(
+                        "default",
+                        crate::PromptCatalogSource::builtins_only(),
+                    )
+                    .unwrap(),
+                );
+                if !canonical {
+                    worker.materialize_durable_session_head().await.unwrap();
+                }
+                let mut initialized =
+                    WorkerController::initialize_inner(worker, root.path(), None, canonical)
+                        .await
+                        .unwrap();
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let stopped = Arc::new(AtomicBool::new(false));
+                let report = initialized.worker.install_features(
+                    crate::feature::FeatureRegistryBuilder::new().with_module(PublicationTask {
+                        entered: entered.clone(),
+                        stopped: stopped.clone(),
+                    }),
+                );
+                assert!(!report.has_errors());
+                let publication = initialized.prepare_publication().await.unwrap();
+                assert!(!stopped.load(Ordering::SeqCst));
+                assert!(
+                    futures::FutureExt::now_or_never(entered.notified()).is_none(),
+                    "preparation cannot start tasks"
+                );
+                if !publish {
+                    drop(publication);
+                    drop(initialized);
+                    assert!(futures::FutureExt::now_or_never(entered.notified()).is_none());
+                    assert!(
+                        !stopped.load(Ordering::SeqCst),
+                        "unstarted task has no on-stop effects"
+                    );
+                    continue;
+                }
+                let (handle, shutdown, controller) = initialized.start(publication);
+                tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                    .await
+                    .unwrap();
+                handle
+                    .send(Method::Shutdown {
+                        command: WorkerCommandEnvelope { command_id: 1 },
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), shutdown)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), controller)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    stopped.load(Ordering::SeqCst),
+                    "Controller shutdown joins task cleanup"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn tool_initialization_failure_does_not_reclaim_saved_children() {
             let root = TempDir::new().unwrap();
@@ -4088,6 +4306,8 @@ mod tests {
         struct DriveWorkspaceHost {
             available: bool,
             workspace: Option<&'static str>,
+            granted: bool,
+            operations: Arc<std::sync::Mutex<Vec<String>>>,
         }
 
         impl crate::worker::WorkspaceClient for DriveWorkspaceHost {
@@ -4107,21 +4327,37 @@ mod tests {
             {
                 if request.path == "/api/w/workspace-1/authorization/check" {
                     assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Post);
+                    let input: server_api::authorization::OperationAuthorizationRequest =
+                        serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+                    assert!(matches!(
+                        input.operation.as_str(),
+                        "drive.capabilities" | "drive.root"
+                    ));
+                    assert_eq!(
+                        input.resource,
+                        server_api::authorization::PermissionResource::Workspace {
+                            workspace_id: "workspace-1".into()
+                        }
+                    );
+                    self.operations.lock().unwrap().push(input.operation);
                     return Ok(crate::worker::WorkspaceResponse {
-                        status: 200,
-                        body: serde_json::json!({"scope":null}).to_string(),
+                        content_type: None,
+                        status: if self.granted { 200 } else { 403 },
+                        body: serde_json::json!({"scope":input.resource}).to_string(),
                     });
                 }
+                self.operations.lock().unwrap().push(request.path.clone());
                 // Native discovery reads metadata and the current caller's ceiling, never inventory or mutations.
                 assert_eq!(request.method, crate::worker::WorkspaceRequestMethod::Get);
                 if request.path == "/api/w/workspace-1/drive/capabilities" {
                     return Ok(crate::worker::WorkspaceResponse {
+                        content_type: None,
                         status: 200,
                         body: serde_json::json!({"write":true}).to_string(),
                     });
                 }
                 assert_eq!(request.path, "/api/w/workspace-1/drive/root");
-                Ok(crate::worker::WorkspaceResponse { status: 200, body: serde_json::json!({
+                Ok(crate::worker::WorkspaceResponse { content_type: None, status: 200, body: serde_json::json!({
                     "entry": {"workspace_id": "workspace-1", "node_id": "1"},
                     "parent": null, "name": "", "kind": "folder", "last_mutation_id": "",
                     "size": null, "content_type": null, "updated_by": "test",
@@ -4132,14 +4368,92 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn drive_controller_wiring_requires_activation_and_workspace_host_in_both_modes() {
+        async fn scoped_observation_is_composed_only_with_runtime_worker_service_without_startup_access()
+         {
+            for enabled in [false, true] {
+                let root = TempDir::new().unwrap();
+                let mut manifest = manifest::WorkerManifest::from_toml(
+                    "[worker]\nname = 'observation-wiring'\n[model]\nscheme = 'anthropic'\nmodel_id = 'test'\n[engine]\n[scope]\n"
+                ).unwrap();
+                manifest.feature.worker.enabled = enabled;
+                manifest.feature.sub_worker.enabled = false;
+                manifest.feature.workdir_catalog.enabled = false;
+                let model = ScriptedClient::new(vec![]);
+                let engine =
+                    Engine::<_, agen::state::Mutable, crate::SessionHistoryMetadata>::new_annotated(
+                        model,
+                    );
+                let store = session_store::CombinedStore::new(
+                    session_store::FsStore::new(root.path().join("sessions")).unwrap(),
+                    session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
+                );
+                let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let host = Arc::new(DriveWorkspaceHost {
+                    available: true,
+                    workspace: Some("workspace-1"),
+                    granted: false,
+                    operations: operations.clone(),
+                });
+                let mut worker = Worker::new(
+                    manifest,
+                    engine,
+                    store,
+                    crate::worker::WorkerWorkspaceContext::with_client(
+                        Some(crate::worker::WorkspaceId::new("workspace-1").unwrap()),
+                        host,
+                    ),
+                    crate::worker::WorkerFilesystemAuthority::None,
+                    manifest::Scope::empty(),
+                )
+                .await
+                .unwrap();
+                worker.set_system_prompt_template(
+                    crate::SystemPromptTemplate::parse(
+                        "default",
+                        crate::PromptCatalogSource::builtins_only(),
+                    )
+                    .unwrap(),
+                );
+                let prepared = WorkerController::initialize(worker, root.path(), None)
+                    .await
+                    .unwrap();
+                let Event::Snapshot { greeting, .. } =
+                    crate::ipc::protocol_session::subscribe_worker_protocol_session(
+                        &prepared.handle,
+                    )
+                    .snapshot_event
+                else {
+                    panic!("initial committed greeting");
+                };
+                for name in [
+                    "ViewSessionOverview",
+                    "SearchSessionEntries",
+                    "ReadSessionEntry",
+                ] {
+                    assert_eq!(
+                        greeting.tools.iter().any(|tool| tool == name),
+                        enabled,
+                        "Worker service configuration must determine observation publication, not client availability alone"
+                    );
+                }
+                assert!(
+                    operations.lock().unwrap().is_empty(),
+                    "provider composition may not authorize or read protected resources"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn drive_controller_registers_without_authorization_and_checks_each_access_in_both_modes()
+         {
             use crate::feature::FeatureModule as _;
             for mode in [manifest::WorkerMode::Tools, manifest::WorkerMode::Wip] {
-                for (enabled, available, workspace) in [
-                    (false, true, Some("workspace-1")),
-                    (true, false, Some("workspace-1")),
-                    (true, true, None),
-                    (true, true, Some("workspace-1")),
+                for (enabled, available, workspace, granted) in [
+                    (false, true, Some("workspace-1"), false),
+                    (true, false, Some("workspace-1"), false),
+                    (true, true, None, false),
+                    (true, true, Some("workspace-1"), false),
+                    (true, true, Some("workspace-1"), true),
                 ] {
                     let root = TempDir::new().unwrap();
                     let mut manifest = manifest::WorkerManifest::from_toml(
@@ -4156,10 +4470,13 @@ mod tests {
                         session_store::FsStore::new(root.path().join("sessions")).unwrap(),
                         session_store::FsWorkerStore::new(root.path().join("workers")).unwrap(),
                     );
+                    let operations = Arc::new(std::sync::Mutex::new(Vec::new()));
                     let host: Arc<dyn crate::worker::WorkspaceClient> =
                         Arc::new(DriveWorkspaceHost {
                             available,
                             workspace,
+                            granted,
+                            operations: operations.clone(),
                         });
                     let context = crate::worker::WorkerWorkspaceContext::with_client(
                         workspace.map(|id| crate::worker::WorkspaceId::new(id).unwrap()),
@@ -4201,12 +4518,17 @@ mod tests {
                     if enabled && (!available || workspace.is_none()) {
                         assert_eq!(
                             registered.unwrap_err().kind(),
-                            std::io::ErrorKind::PermissionDenied
+                            std::io::ErrorKind::NotConnected
                         );
+                        assert!(operations.lock().unwrap().is_empty());
                         assert!(requests.lock().unwrap().is_empty());
                         continue;
                     }
                     registered.unwrap();
+                    assert!(
+                        operations.lock().unwrap().is_empty(),
+                        "registration must not access Drive or authorize activation"
+                    );
                     let configured = enabled && available && workspace.is_some();
                     let tools = worker.engine().tool_server_handle();
                     tools.flush_pending();
@@ -4218,6 +4540,13 @@ mod tests {
                             tool.name
                         );
                     }
+                    if configured && mode == manifest::WorkerMode::Tools {
+                        let (_, root_tool) = tools.get_tool("DriveRoot").unwrap();
+                        let output = root_tool
+                            .execute("{}", ToolExecutionContext::direct())
+                            .await;
+                        assert_eq!(output.is_ok(), granted, "{output:?}");
+                    }
                     if mode == manifest::WorkerMode::Wip {
                         let (_, tree) = tools.get_tool("Tree").unwrap();
                         let output = tree
@@ -4226,7 +4555,7 @@ mod tests {
                                 ToolExecutionContext::new("drive-wiring-tree", "batch", 0),
                             )
                             .await;
-                        assert_eq!(output.is_ok(), configured, "{output:?}");
+                        assert_eq!(output.is_ok(), configured && granted, "{output:?}");
                         if let Ok(output) = output {
                             let tree: serde_json::Value =
                                 serde_json::from_str(&output.content.unwrap()).unwrap();
@@ -4235,6 +4564,16 @@ mod tests {
                             // not an observed empty Workspace hierarchy.
                             assert_eq!(tree["children"], serde_json::Value::Null);
                         }
+                    }
+                    if configured && !granted {
+                        assert!(
+                            operations
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .all(|operation| !operation.starts_with('/')),
+                            "denied access must not reach Drive provider"
+                        );
                     }
                     worker.run_text("Inspect enabled features").await.unwrap();
                     let requests = requests.lock().unwrap();
@@ -4247,6 +4586,8 @@ mod tests {
                 }
             }
         }
+
+        include!("controller/native_record_tests.rs");
 
         struct LargeOutputTool;
 
@@ -4771,6 +5112,7 @@ mod tests {
         let pending = PendingSubmissionHandle::for_test(dir.path());
         let (event_tx, mut event_rx) = broadcast::channel(4);
         let method = Method::NotifyTracked {
+            receipt_scope: protocol::NotificationReceiptScope::Source,
             notification_request_id: "completion-1".into(),
             message: "subworker completed".into(),
             source: protocol::AuthenticatedInputSource::UntrustedWire,
@@ -5223,7 +5565,7 @@ mod tests {
     fn controller_shutdown_orders_child_cleanup_before_workdir_close() {
         let source = include_str!("controller.rs");
         let shutdown_start = source
-            .rfind("worker.stop_feature_runtime(\"controller shutdown\")")
+            .rfind(".stop_feature_runtime_report(\"controller shutdown\")")
             .expect("controller shutdown block");
         let shutdown = &source[shutdown_start..];
         let children = shutdown

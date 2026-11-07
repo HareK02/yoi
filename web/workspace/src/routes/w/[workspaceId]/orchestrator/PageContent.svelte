@@ -3,7 +3,7 @@
   import { untrack } from "svelte";
   import { loadJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
   import { parseTicketQueryResponse, TICKET_BROWSER_API_LOAD_POLICY } from "#lib/workspace/api/ticket-browser.ts";
-  import { currentOrchestratorAssignment, handlingLabel, handlingSummary, ticketQueryRequest, closureReasonLabel } from "#lib/workspace/tickets/ticket-panel.ts";
+  import { currentOrchestratorAssignment, handlingLabel, handlingSummary, ticketQueryRequest, closureReasonLabel, assignmentPrincipalLabel } from "#lib/workspace/tickets/ticket-panel.ts";
   import { ticketHref } from "#lib/workspace/resource-links.ts";
   import type { PageData as RouteData } from "./$types";
   import type { ResolvedPageData } from "#lib/workspace/navigation/deferred.ts";
@@ -39,23 +39,25 @@
   }
 </script>
 
-<svelte:head><title>Orchestrator · {data.workspaceId}</title></svelte:head>
+<svelte:head><title>Subject handling · {data.workspaceId}</title></svelte:head>
 <div class="workspace-page orchestrator-page">
-  <header class="workspace-page-header"><h1>Orchestrator</h1><a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets`}>Ticket cases</a></header>
-  <p>Principal: workspace-orchestrator · Worker availability: {data.orchestrator.data?.online ? "Online" : data.orchestrator.error ? "Unavailable" : "Offline"}</p>
-  {#if data.orchestrator.error}<p class="workspace-callout is-error" role="alert">Worker availability: {data.orchestrator.error}</p>{/if}
-  <form class="orchestrator-filters" aria-label="Orchestrator filters" onsubmit={applyFilters}>
+  <header class="workspace-page-header"><h1>Subject handling</h1><a href={`/w/${encodeURIComponent(data.workspaceId)}/tickets`}>Ticket cases</a></header>
+  <p>Responsibility belongs to each Subject, independently of its current Worker.</p>
+  <form class="orchestrator-filters" aria-label="Subject handling filters" onsubmit={applyFilters}>
+    <input type="hidden" name="principal" value={data.filters.subjectId ? "subject" : "all"} />
+    <label>Subject identity<input name="subject" value={data.filters.subjectId} placeholder="All Subjects" oninput={(event) => { const input = event.currentTarget.form?.elements.namedItem("principal") as HTMLInputElement | null; if (input) input.value = event.currentTarget.value.trim() ? "subject" : "all"; }} /></label>
     <label>Search<input name="q" type="search" value={data.filters.query} /></label>
     <label>Handling (self-reported)<select name="handling" value={data.handling ?? ""}><option value="">All including unknown</option><option value="waiting">Waiting</option><option value="inprogress">In progress</option><option value="done">Done</option></select></label>
     <label>Ticket case<select name="case" value={data.filters.caseState}><option value="all">Open and closed</option><option value="open">Open</option><option value="closed">Closed</option></select></label>
     <button class="workspace-secondary-button" disabled={busy}>{busy ? "Loading…" : "Apply filters"}</button>
   </form>
-  <section class="orchestrator-assignments" aria-label="Current Orchestrator assignments">
+  <section class="orchestrator-assignments" aria-label="Current Subject assignments">
     {#each response.data?.items ?? [] as ticket (ticket.id)}
       {@const row = currentOrchestratorAssignment(ticket)}
       <a class="orchestrator-assignment" href={ticketHref(data.workspaceId, ticket)}>
         <div class="assignment-heading"><span>{ticket.resource_key}</span><strong>{ticket.title}</strong></div>
         <div class="assignment-meta"><span>Handling: {handlingLabel(row?.tracking?.status)} ({row?.tracking ? "self-reported" : "not reported"})</span><span>Ticket case: {ticket.state}</span></div>
+        {#if row}<p>{assignmentPrincipalLabel(row.principal)}</p>{/if}
         <p>{handlingSummary(row)}</p>
         {#if row?.tracking?.next_action}<p>Next action: {row.tracking.next_action}</p>{/if}
         {#if ticket.current_closure}<p>Close reason: {closureReasonLabel(ticket.current_closure.reason)}</p>{/if}

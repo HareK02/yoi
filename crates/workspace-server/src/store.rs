@@ -92,6 +92,14 @@ use crate::backend_job::{
 use crate::workspace_deletion::WorkspaceDeletionStore;
 use crate::{Error, Result};
 
+#[path = "subject_deletion_store.rs"]
+mod subject_deletion_store;
+pub(crate) use subject_deletion_store::{
+    SubjectDeletionRemoval, prior_removal_matches as subject_deletion_prior_removal_matches,
+    removal_reconciliation_matches as subject_deletion_removal_matches,
+    worker_kind as subject_deletion_worker_kind,
+};
+
 #[path = "activation.rs"]
 mod activation;
 pub use activation::ActivationCodeIssue;
@@ -110,6 +118,8 @@ pub use notification_routing::{
 mod assignment_tracking;
 #[path = "implementation_result.rs"]
 mod implementation_result;
+#[path = "subject_assignment_migration.rs"]
+mod subject_assignment_migration;
 pub use assignment_delivery::TicketAssignmentDelivery;
 pub use assignment_tracking::TicketOrchestratorAssignmentSourceContext;
 pub use ticket::{
@@ -119,7 +129,36 @@ pub use ticket::{
 };
 
 const OLDEST_SCHEMA_VERSION: i64 = 50;
-const LATEST_SCHEMA_VERSION: i64 = 104;
+#[path = "backend_job_recovery_store.rs"]
+mod backend_job_recovery_store;
+#[path = "backend_job_upgrade.rs"]
+pub(crate) mod backend_job_upgrade;
+#[path = "storage_formats.rs"]
+mod storage_formats;
+pub use backend_job_recovery_store::BackendJobReconciliation;
+
+#[path = "journal_removal_store.rs"]
+mod journal_removal_store;
+pub use journal_removal_store::{
+    FrozenJournalRemovalMember, JournalRemovalBinding, JournalRemovalCause, JournalRemovalMetadata,
+    JournalRemovalPhase, JournalRemovalProgress, PendingWorkerRemovalIntent,
+};
+pub(crate) use journal_removal_store::{
+    complete as complete_journal_removal,
+    record_physical_failure as record_journal_removal_physical_failure,
+};
+
+const LATEST_SCHEMA_VERSION: i64 = 129;
+const TICKET_PLAN_RETIREMENT_MIGRATION_NAME: &str =
+    "Retire Ticket orchestration plans into historical comments";
+pub(crate) const DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME: &str =
+    "Independent configuration publication and Workdir connection observations";
+const WORKER_CREATE_FAILURE_MIGRATION_NAME: &str =
+    "Worker create coordinator returned startup failure";
+pub(crate) const WORKER_CREATE_FAILURE_MAX_BYTES: usize = 32 * 1024;
+const SERVICE_OUTCOME_MIGRATION_NAME: &str = "Plugin Service retained outcomes and causes";
+const RETAINED_STARTUP_MIGRATION_NAME: &str =
+    "Worker create coordinator returned startup failure after retained Job and Service causes";
 const WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME: &str = "durable Workspace Drive grants";
 const WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME: &str = "Workspace config grants and logical Workdirs";
 const SCHEMA_BASELINE_NAME: &str = "workspace schema baseline";
@@ -446,6 +485,91 @@ const MIGRATIONS: &[Migration] = &[
         version: 104,
         name: "Converge Passkey results and Job input retention",
         apply: migrate_schema_103_variants_to_v104,
+    },
+    Migration {
+        version: 105,
+        name: "Durable Subject deletion snapshots and Job admission fences",
+        apply: subject_deletion_store::migrate,
+    },
+    Migration {
+        version: 106,
+        name: crate::plugin_catalog::MIGRATION_NAME,
+        apply: crate::plugin_catalog::migrate,
+    },
+    Migration {
+        version: 107,
+        name: "Immutable Worker Plugin plans and retained pins",
+        apply: migrate_plugin_plans_v106_to_v107,
+    },
+    Migration {
+        version: 108,
+        name: "Subject Ticket responsibility and current-body notification routing",
+        apply: migrate_subject_assignments_v107_to_v108,
+    },
+    Migration {
+        version: 109,
+        name: "Durable Plugin Host invocations and HTTPS effect receipts",
+        apply: migrate_plugin_receipts_v108_to_v109,
+    },
+    Migration {
+        version: 110,
+        name: "Worker Plugin launch selection associations",
+        apply: migrate_plugin_launches_v109_to_v110,
+    },
+    Migration {
+        version: 111,
+        name: "Typed Plugin Ticket extension data and atomic mutation receipts",
+        apply: migrate_plugin_data_v110_to_v111,
+    },
+    Migration {
+        version: 112,
+        name: "Ticket Service outbox and fenced consumers",
+        apply: migrate_plugin_services_v111_to_v112,
+    },
+    Migration {
+        version: 113,
+        name: "Ticket work-decomposition parent links",
+        apply: migrate_ticket_parents_v112_to_v113,
+    },
+    Migration {
+        version: 122,
+        name: crate::config_adoption::MIGRATION_NAME,
+        apply: migrate_configuration_adoption_to_v122,
+    },
+    Migration {
+        version: 123,
+        name: backend_job_upgrade::MIGRATION_NAME,
+        apply: migrate_backend_job_execution_to_v123,
+    },
+    Migration {
+        version: 124,
+        name: WORKER_CREATE_FAILURE_MIGRATION_NAME,
+        apply: migrate_worker_create_failure_to_v124,
+    },
+    Migration {
+        version: 125,
+        name: backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+        apply: migrate_backend_job_causes_v124_to_v125,
+    },
+    Migration {
+        version: 126,
+        name: SERVICE_OUTCOME_MIGRATION_NAME,
+        apply: migrate_plugin_service_outcomes_v125_to_v126,
+    },
+    Migration {
+        version: 127,
+        name: journal_removal_store::MIGRATION_NAME,
+        apply: journal_removal_store::migrate_to_v127,
+    },
+    Migration {
+        version: 128,
+        name: TICKET_PLAN_RETIREMENT_MIGRATION_NAME,
+        apply: migrate_ticket_plan_retirement_v127_to_v128,
+    },
+    Migration {
+        version: 129,
+        name: DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME,
+        apply: migrate_domain_failure_observations_to_v129,
     },
 ];
 
@@ -946,6 +1070,9 @@ impl TicketAssignmentRole {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TicketAssignmentPrincipal {
+    Subject {
+        subject_id: String,
+    },
     User {
         account_id: String,
     },
@@ -961,6 +1088,7 @@ pub enum TicketAssignmentPrincipal {
 impl TicketAssignmentPrincipal {
     fn kind(&self) -> &'static str {
         match self {
+            Self::Subject { .. } => "subject",
             Self::User { .. } => "user",
             Self::Worker { .. } => "worker",
             Self::WorkspaceAgent { .. } => "workspace_agent",
@@ -1319,8 +1447,73 @@ pub struct HostingAdminInitialBearer {
     pub expires_at: String,
 }
 
+/// Immutable boundary for the all-state startup recovery scan, not an execution claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackendJobRecoveryCursor {
+    pub job_id: String,
+    pub attempt_id: String,
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
+    fn plugin_upload(
+        &self,
+        root: &Path,
+        workspace: &str,
+        actor: &str,
+        bytes: &[u8],
+    ) -> Result<server_api::PluginUploadResponse>;
+    fn plugin_install(
+        &self,
+        workspace: &str,
+        actor: &str,
+        request: &server_api::PluginInstallRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_add_artifact(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginAddArtifactRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_revoke(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginRevokeRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_uninstall(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginUninstallRequest,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_show(
+        &self,
+        workspace: &str,
+        installation: &str,
+    ) -> Result<server_api::PluginInstallation>;
+    fn plugin_list(
+        &self,
+        workspace: &str,
+        request: &server_api::PluginListRequest,
+    ) -> Result<server_api::PluginListResponse>;
+    fn plugin_operation(
+        &self,
+        workspace: &str,
+        operation: &str,
+    ) -> Result<server_api::PluginOperationResponse>;
+    fn plugin_artifact_bytes(
+        &self,
+        root: &Path,
+        workspace: &str,
+        installation: &str,
+        artifact_digest: &str,
+    ) -> Result<Vec<u8>>;
+    fn plugin_gc(&self, root: &Path) -> Result<u64>;
+
     /// Bounded owner for whole synchronous operations from async callers. Move owned inputs
     /// and services into one closure covering connection/mutex waits, source authorization,
     /// receipts, CAS, audit, commit and ordered publication. Do not split checks around awaits
@@ -1481,6 +1674,14 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         now_seconds: u64,
         consumed_at: &str,
     ) -> Result<bool>;
+    fn plan_job_cleanup_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    >;
     fn plan_worker_removal(
         &self,
         request: &crate::retention::WorkerRemovalPlanRequest,
@@ -1518,6 +1719,70 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     > {
         let _ = (workspace_id, worker);
         Ok(None)
+    }
+    fn get_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+    ) -> Result<Option<JournalRemovalProgress>> {
+        let _ = prepared;
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn init_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        binding: &JournalRemovalBinding,
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (prepared, binding);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn freeze_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        members: &[FrozenJournalRemovalMember],
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (prepared, expected, members);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn update_journal_removal_progress(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        phase: JournalRemovalPhase,
+        cause: Option<JournalRemovalCause>,
+    ) -> Result<JournalRemovalProgress> {
+        let _ = (prepared, expected, phase, cause);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
+    }
+    fn list_pending_worker_removal_intents(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PendingWorkerRemovalIntent>> {
+        let _ = (workspace_id, after_operation_id, limit);
+        Err(Error::InvalidInput(
+            "Worker removal continuation persistence unavailable".into(),
+        ))
+    }
+    fn list_pending_journal_removals(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalRemovalProgress>> {
+        let _ = (workspace_id, after_operation_id, limit);
+        Err(Error::InvalidInput(
+            "Journal removal persistence unavailable".into(),
+        ))
     }
     fn fail_worker_removal(
         &self,
@@ -1836,7 +2101,8 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
     ) -> Result<BackendJobReservation>;
     fn get_backend_job(&self, workspace_id: &str, job_id: &str)
     -> Result<Option<BackendJobRecord>>;
-    /// Pending/unknown Jobs and terminal Jobs with unfinished Worker cleanup
+    fn backend_job_was_migrated(&self, workspace_id: &str, job_id: &str) -> Result<bool>;
+    /// Pending Jobs and terminal Jobs with unfinished Worker cleanup
     /// retain their resource. This is a query, not an independent lock ledger.
     fn find_active_backend_job_for_resource(
         &self,
@@ -1856,9 +2122,153 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         job_id: &str,
         attempt_id: &str,
     ) -> Result<Option<BackendJobAttemptRecord>>;
+    /// Full ordered execution history for exact-owner release CAS.
+    fn list_backend_job_attempts(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<BackendJobAttemptRecord>>;
+    fn record_backend_job_reconciliation(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        failure_category: &str,
+        failure_detail: &str,
+        next_action: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        self.record_backend_job_reconciliation_with_cause(
+            workspace_id,
+            expected,
+            failure_category,
+            failure_detail,
+            next_action,
+            None,
+            now,
+        )
+    }
+    fn record_backend_job_reconciliation_with_cause(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        failure_category: &str,
+        failure_detail: &str,
+        next_action: &str,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn probe_backend_job_recovery(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool>;
+    fn record_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        controller_evidence: &str,
+        host_evidence: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn has_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool>;
+    /// Host-only saved non-Journal result reconciliation; no model/finalizer rerun.
+    fn reconcile_backend_job_domain_result(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        submission: &BackendJobResultSubmission,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn get_backend_job_reconciliation(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<BackendJobReconciliation>>;
+    fn claim_backend_job_worker_cleanup_owned(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        now: &str,
+    ) -> Result<(BackendJobAttemptRecord, bool)>;
+    /// Diagnose failed Host preflight without claiming cleanup or proving termination.
+    fn record_backend_job_cleanup_preflight_failure(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        failure_detail: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        self.record_backend_job_cleanup_preflight_failure_with_cause(
+            workspace_id,
+            expected_history,
+            expected,
+            failure_detail,
+            None,
+            now,
+        )
+    }
+    fn record_backend_job_cleanup_preflight_failure_with_cause(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        failure_detail: &str,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    fn finish_backend_job_worker_cleanup_owned(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        state: BackendJobWorkerCleanupState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        self.finish_backend_job_worker_cleanup_owned_with_cause(
+            workspace_id,
+            expected_history,
+            expected,
+            state,
+            failure_category,
+            failure_detail,
+            None,
+            now,
+        )
+    }
+    fn finish_backend_job_worker_cleanup_owned_with_cause(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        state: BackendJobWorkerCleanupState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord>;
+    /// Read the first bounded page; use the paged variant to enumerate all owners.
     fn list_recoverable_backend_job_attempts(
         &self,
         workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.list_recoverable_backend_job_attempts_page(workspace_id, None, limit)
+    }
+    /// Read one bounded page without claiming or changing any attempt.
+    /// Startup must traverse every page, independently of admitted owner progress.
+    fn list_recoverable_backend_job_attempts_page(
+        &self,
+        workspace_id: &str,
+        after: Option<&BackendJobRecoveryCursor>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>>;
     fn claim_backend_job_attempt_dispatch(
@@ -1907,8 +2317,8 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         completion: Option<&BackendJobResultSubmission>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord>;
-    /// Bounded keyset over current Journal Unknown attempts, independent of source liveness.
-    fn list_backend_journal_unknown_attempts(
+    /// Bounded keyset over current Journal Pending attempts, independent of source liveness.
+    fn list_backend_journal_pending_attempts(
         &self,
         workspace_id: &str,
         after_job_id: Option<&str>,
@@ -1930,16 +2340,33 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         failure_category: &str,
         failure_detail: &str,
         now: &str,
-    ) -> Result<BackendJobAttemptRecord>;
-    fn recover_backend_job_worker_cleanups(
+    ) -> Result<BackendJobAttemptRecord> {
+        self.finish_backend_job_attempt_with_cause(
+            workspace_id,
+            job_id,
+            attempt_id,
+            state,
+            failure_category,
+            failure_detail,
+            None,
+            now,
+        )
+    }
+    fn finish_backend_job_attempt_with_cause(
         &self,
         workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        state: BackendJobAttemptState,
+        failure_category: &str,
+        failure_detail: &str,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
         now: &str,
-        limit: usize,
-    ) -> Result<Vec<BackendJobAttemptRecord>>;
+    ) -> Result<BackendJobAttemptRecord>;
     fn list_backend_job_worker_cleanups(
         &self,
         workspace_id: &str,
+        after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>>;
     fn claim_backend_job_worker_cleanup(
@@ -1957,6 +2384,28 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         state: BackendJobWorkerCleanupState,
         failure_category: Option<&str>,
         failure_detail: Option<&str>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        self.finish_backend_job_worker_cleanup_with_cause(
+            workspace_id,
+            job_id,
+            attempt_id,
+            state,
+            failure_category,
+            failure_detail,
+            None,
+            now,
+        )
+    }
+    fn finish_backend_job_worker_cleanup_with_cause(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+        state: BackendJobWorkerCleanupState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord>;
     fn job_notification_source(
@@ -2175,6 +2624,13 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<TicketAssignmentDelivery>>;
+    /// Recipient-scoped scan; other Subjects cannot consume this batch or its offer order.
+    fn list_pending_subject_ticket_assignment_deliveries(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketAssignmentDelivery>>;
     /// Frozen payload/request identity for exact response-loss retry.
     fn reserve_ticket_assignment_delivery(
         &self,
@@ -2191,12 +2647,27 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         content: &str,
         source: &TicketAssignmentTrackingSourceContext,
     ) -> Result<String>;
+    /// Recheck the current target and ACK immediately before sending pinned bytes.
+    /// None means a positive ACK is already saved, not an unknown acceptance.
+    fn admit_ticket_assignment_delivery_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<Option<String>>;
     fn ack_ticket_assignment_delivery(
         &self,
         workspace_id: &str,
         delivery_id: &str,
         source: &TicketAssignmentTrackingSourceContext,
     ) -> Result<()>;
+    /// Resolve only persisted source ownership metadata, never notification content.
+    /// Missing and ambiguous identities both return None.
+    fn notification_source_resource(
+        &self,
+        workspace_id: &str,
+        source_event_id: &str,
+    ) -> Result<Option<server_api::authorization::PermissionResource>>;
     fn notification_diagnostics(
         &self,
         workspace_id: &str,
@@ -2214,6 +2685,12 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         content: &str,
         target: &TicketWorkerNotificationTarget,
     ) -> Result<String>;
+    fn admit_ticket_worker_notification_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<Option<String>>;
     fn ack_ticket_worker_notification(
         &self,
         workspace_id: &str,
@@ -2514,6 +2991,84 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
         &self,
         workspace_id: &str,
     ) -> Result<Vec<ExternalWorkdirGrantRecord>>;
+    fn external_workdir_cleanup_observation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<(String, Vec<protocol::background_failure::StoredFailure>)>;
+    fn external_workdir_cleanup_operation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupOperation>>;
+    fn external_workdir_cleanup_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupIntent>>;
+    fn append_external_workdir_cleanup_intent_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupIntent,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupIntent>;
+    fn external_workdir_cleanup_has_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<bool>;
+    fn begin_external_workdir_cleanup_operation(
+        &self,
+        request: &crate::grant_cleanup_operation::CleanupRequest,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::CleanupAdmission>;
+    fn validate_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+    ) -> Result<()>;
+    fn confirm_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn mark_external_workdir_cleanup_runtime_dispatched(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn record_external_workdir_cleanup_runtime_observation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        status: crate::hosts::RuntimeOperationStatus,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn settle_external_workdir_cleanup_operation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        observation: Option<&runtime_api::WorkerWorkdirAttachmentsOperationObservation>,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn append_external_workdir_cleanup_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation>;
+    fn record_external_workdir_connection_observation(
+        &self,
+        grant: &ExternalWorkdirGrantRecord,
+        connection_generation: u64,
+        reason: server_api::ExternalWorkdirConnectionClosedReason,
+        failures: Option<&str>,
+        now: &str,
+    ) -> Result<bool>;
+    fn external_workdir_connection_observations(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Vec<crate::external_workdir_connection_observations::ConnectionObservation>>;
     fn activate_external_workdir_grant(
         &self,
         workspace_id: &str,
@@ -2641,8 +3196,22 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
 }
 
 #[derive(Clone)]
+enum StoreConnection {
+    Managed(feature_storage::FeatureDatabase),
+    AuthorityReader(Arc<Mutex<feature_storage::DatabaseWriterFence>>),
+    Fixture(Arc<Mutex<Connection>>),
+}
+
+impl From<feature_storage::FeatureStorageError> for Error {
+    fn from(error: feature_storage::FeatureStorageError) -> Self {
+        Error::Store(error.to_string())
+    }
+}
+
+#[derive(Clone)]
 pub struct SqliteWorkspaceStore {
-    conn: Arc<Mutex<Connection>>,
+    conn: StoreConnection,
+    pub(crate) plugin_manifest_cache: Arc<crate::plugin_catalog::ArtifactManifestCache>,
     db_executor: crate::db_executor::DbExecutor,
 }
 
@@ -2652,8 +3221,19 @@ pub mod fixture_support;
 
 impl SqliteWorkspaceStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        Self::from_connection(conn)
+        let path = path.as_ref();
+        let owner = feature_storage::FeatureStorage::for_server_database(path)?;
+        let database = owner.open_host_catalog(
+            path,
+            "server-catalog",
+            "Host configured Server database",
+            |conn| prepare_connection(conn),
+        )?;
+        Ok(Self {
+            conn: StoreConnection::Managed(database),
+            plugin_manifest_cache: Arc::default(),
+            db_executor: crate::db_executor::DbExecutor::shared(),
+        })
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -2697,7 +3277,8 @@ impl SqliteWorkspaceStore {
     ) -> Result<Self> {
         prepare_connection(&conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
+            plugin_manifest_cache: Arc::default(),
             db_executor,
         })
     }
@@ -2706,7 +3287,11 @@ impl SqliteWorkspaceStore {
     // fixture's admission/SQL/drain lifetime or a permanent global worker.
     #[cfg(test)]
     pub(crate) fn open_for_test(path: impl AsRef<Path>) -> Result<Self> {
-        Self::from_connection_for_test(Connection::open(path)?)
+        Ok(
+            Self::open(path)?.with_db_executor(crate::db_executor::DbExecutor::new(
+                crate::db_executor::DbExecutorLimits::default(),
+            )?),
+        )
     }
 
     #[cfg(test)]
@@ -2732,23 +3317,99 @@ impl SqliteWorkspaceStore {
         self.db_executor.clone()
     }
 
+    pub(crate) fn drive_authority(
+        &self,
+        fixture_path: &Path,
+    ) -> Result<crate::workspace_drive_host::DriveAuthority> {
+        match &self.conn {
+            StoreConnection::Managed(database) => Ok(
+                crate::workspace_drive_host::DriveAuthority::Managed(database.clone()),
+            ),
+            #[cfg(test)]
+            StoreConnection::Fixture(_) => Ok(
+                crate::workspace_drive_host::DriveAuthority::Fixture(fixture_path.to_owned()),
+            ),
+            #[cfg(not(test))]
+            StoreConnection::Fixture(_) => {
+                let _ = fixture_path;
+                Err(Error::Store(
+                    "Drive requires a managed Server catalog".into(),
+                ))
+            }
+            StoreConnection::AuthorityReader(_) => Err(Error::Store(
+                "reserved authority readers cannot issue Drive authority".into(),
+            )),
+        }
+    }
+
+    /// Independent read owner for nested checks inside this catalog's write
+    /// transaction. The outer owner, not this read connection, fences authority.
+    pub(crate) fn transaction_query_reader(&self) -> Result<Self> {
+        let StoreConnection::Managed(database) = &self.conn else {
+            return Err(Error::Store(
+                "query reader requires a managed Host catalog".into(),
+            ));
+        };
+        Ok(Self {
+            conn: StoreConnection::Managed(database.query_reader()?),
+            plugin_manifest_cache: self.plugin_manifest_cache.clone(),
+            db_executor: self.db_executor.clone(),
+        })
+    }
+
+    /// Reserve Host authority and route every nested read through that transaction.
+    /// Using the ordinary connection could deadlock against a writer that holds its
+    /// mutex while waiting for this reservation. Clones retain the reservation, not
+    /// the ordinary connection; native query-only mode rejects accidental effects.
+    pub(crate) fn subject_authority_reader(&self) -> Result<Self> {
+        let fence = match &self.conn {
+            StoreConnection::Managed(database) => database.writer_fence()?,
+            StoreConnection::Fixture(_) | StoreConnection::AuthorityReader(_) => {
+                return Err(Error::Store(
+                    "Subject effect authority requires a managed Host catalog".into(),
+                ));
+            }
+        };
+        fence.with_connection(|connection| connection.pragma_update(None, "query_only", true))?;
+        Ok(Self {
+            conn: StoreConnection::AuthorityReader(Arc::new(Mutex::new(fence))),
+            plugin_manifest_cache: self.plugin_manifest_cache.clone(),
+            db_executor: self.db_executor.clone(),
+        })
+    }
+
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
-        f(&conn)
+        match &self.conn {
+            StoreConnection::Managed(database) => database.try_with_connection(f),
+            StoreConnection::AuthorityReader(fence) => fence
+                .lock()
+                .map_err(|_| Error::Store("authority reader lock poisoned".into()))?
+                .with_connection(f),
+            StoreConnection::Fixture(connection) => {
+                let conn = connection
+                    .lock()
+                    .map_err(|_| Error::Store("sqlite connection lock poisoned".into()))?;
+                f(&conn)
+            }
+        }
     }
 
     pub(crate) fn with_conn_mut<T>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
-        f(&mut conn)
+        match &self.conn {
+            StoreConnection::Managed(database) => database.try_with_connection_mut(f),
+            StoreConnection::AuthorityReader(_) => Err(Error::Store(
+                "reserved authority readers cannot enter a write transaction".into(),
+            )),
+            StoreConnection::Fixture(connection) => {
+                let mut conn = connection
+                    .lock()
+                    .map_err(|_| Error::Store("sqlite connection lock poisoned".into()))?;
+                f(&mut conn)
+            }
+        }
     }
 
     /// Acquire SQLite write ownership before the first authority/journal read (Restore and
@@ -2767,6 +3428,58 @@ impl SqliteWorkspaceStore {
             let value = f(&tx)?;
             tx.commit()?;
             Ok(value)
+        })
+    }
+
+    /// The current catalog row authorizes Host storage setup, not model access
+    /// or past provisioning. Persisted Feature attribution must independently
+    /// match before adopting a data-bearing legacy file.
+    pub(crate) fn adopt_workspace_feature_storage(
+        &self,
+        storage: &feature_storage::ScopedFeatureStorage,
+        registration: &feature_storage::RegisteredFeature,
+        attribution_table: &str,
+    ) -> Result<()> {
+        let table = match attribution_table {
+            "store_scope" => "store_scope",
+            "drive_state" => "drive_state",
+            _ => {
+                return Err(Error::InvalidInput(
+                    "unsupported storage attribution owner".into(),
+                ));
+            }
+        };
+        self.with_immediate_transaction(|tx| {
+            let row: Option<(String,String,String)> = tx.query_row(
+                "SELECT owner_account_id,created_at,state FROM workspaces WHERE workspace_id=?1",[storage.scope_id()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?;
+            let (owner,created,state) = row.ok_or_else(|| Error::Store("Workspace storage requires a current catalog owner".into()))?;
+            if state == "deleting" {
+                // A retained deletion consumer can validate completed ownership,
+                // but cannot authorize new legacy adoption or replacement storage.
+                let reserved: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workspace_deletion_operations WHERE workspace_id=?1 AND owner_account_id=?2 AND state!='succeeded')",
+                    params![storage.scope_id(),owner], |row| row.get(0))?;
+                if !reserved {
+                    return Err(Error::Store("Workspace storage requires a retained deletion reservation".into()));
+                }
+                storage.verify_owned_if_present(registration)?;
+                return Ok(());
+            }
+            if state != "active" {
+                return Err(Error::Store("Workspace storage adoption requires an active catalog owner".into()));
+            }
+            let evidence = format!("catalog:{}:{owner}:{created}",storage.scope_id());
+            let request = format!("legacy-storage:{}:{}",storage.scope_id(),registration.feature_id());
+            storage.adopt_legacy_if_present(registration,&request,&evidence,|feature_tx| {
+                let stored: String = feature_tx.query_row(
+                    &format!("SELECT workspace_id FROM {table} WHERE singleton=1"),[],|row|row.get(0))?;
+                if stored != storage.scope_id() {
+                    return Err(feature_storage::FeatureStorageError::Identity("legacy Feature attribution differs from authorized Workspace".into()));
+                }
+                Ok(())
+            })?;
+            Ok(())
         })
     }
 
@@ -3000,6 +3713,7 @@ impl SqliteWorkspaceStore {
         validate_workspace_memory_settings_record(current_memory_settings, workspace_id)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            subject_deletion_store::require_worker_admission(&tx, workspace_id, allocation_key, singleton_key)?;
             let fixed_worker_id = prepare(&tx)?;
             let existing = tx
                 .query_row(
@@ -3527,6 +4241,83 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    /// Terminal create evidence for a specific allocation, independent of retained Subject occupancy.
+    pub(crate) fn worker_create_allocation_removed(
+        &self,
+        workspace_id: &str,
+        allocation_key: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2 AND state='removed')",
+            params![workspace_id, allocation_key], |row| row.get(0),
+        )?))
+    }
+
+    /// Read only: recover the original create reservation, never create/restore a
+    /// Worker. The workspace-store caller must separately check registry Job binding.
+    pub(crate) fn lookup_backend_job_allocation(
+        &self,
+        workspace_id: &str,
+        job: &BackendJobRecord,
+        attempt: &BackendJobAttemptRecord,
+    ) -> Result<Option<(WorkerCreateReservation, String)>> {
+        if job.workspace_id != workspace_id
+            || attempt.workspace_id != workspace_id
+            || job.request.job_id != attempt.job_id
+            || job.current_attempt != attempt.attempt
+            || job.input_digest != attempt.input_digest
+            || job.state != BackendJobState::Pending
+            || attempt.state.terminal()
+            || attempt.attempt_id
+                != crate::backend_job::attempt_id(&job.request.job_id, attempt.attempt)
+        {
+            return Err(Error::InvalidInput(
+                "allocation lookup requires the exact current Job intent".into(),
+            ));
+        }
+        job.load_executable_request()?;
+        let key = crate::backend_job::allocation_key(&attempt.attempt_id);
+        self.with_conn(|conn| {
+            let saved = conn.query_row("SELECT worker_id,runtime_id,request_fingerprint,create_fingerprint,memory_language,state,singleton_key,singleton_generation FROM worker_create_reservations WHERE workspace_id=?1 AND allocation_key=?2",params![workspace_id,key],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<String>>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<String>>(6)?,row.get::<_,Option<i64>>(7)?))).optional()?;
+            let Some((worker_id,runtime,request_fingerprint,create_fingerprint,language,state,singleton,generation))=saved else { return Ok(None); };
+            if state == "removed" || singleton.is_some() || generation.is_some() {
+                return Err(Error::RepositoryConflict("original Job allocation is removed or has different create intent".into()));
+            }
+            // The trusted reservation fixes the original create intent, including
+            // its then-selected Profile. Reading that evidence does not resolve
+            // today's Profile/default or issue any new execution grant.
+            let request_fingerprint = request_fingerprint.filter(|fingerprint| !fingerprint.is_empty())
+                .ok_or_else(|| Error::Store("original Job create fingerprint missing".into()))?;
+            let snapshot = manifest::WorkspaceMemorySettingsSnapshot {
+                workspace_id: workspace_id.into(),
+                language: language.ok_or_else(||Error::Store("Job allocation Memory snapshot missing".into()))?,
+            };
+            validate_workspace_memory_settings_snapshot(&snapshot,workspace_id)?;
+            if create_fingerprint != bound_worker_create_fingerprint(&request_fingerprint,&snapshot) {
+                return Err(Error::RepositoryConflict("Job allocation create fingerprint mismatch".into()));
+            }
+            let worker_id = worker_id.parse::<WorkerId>().map_err(|_|Error::Store("invalid original Job Worker identity".into()))?;
+            if attempt.worker.as_ref().is_some_and(|worker| worker.runtime_id != runtime || worker.worker_id != worker_id.to_string()) {
+                return Err(Error::RepositoryConflict("Job allocation differs from saved execution binding".into()));
+            }
+            Ok(Some((WorkerCreateReservation{worker_id,create_fingerprint,memory_settings:snapshot,singleton:None},runtime)))
+        })
+    }
+
+    pub(crate) fn reserved_worker_create_runtime(
+        &self,
+        workspace_id: &str,
+        allocation_key: &str,
+    ) -> Result<Option<String>> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT runtime_id FROM worker_create_reservations WHERE workspace_id = ?1 AND allocation_key = ?2",
+                params![workspace_id, allocation_key],
+                |row| row.get(0),
+            ).optional()?)
+        })
+    }
+
     pub(crate) fn current_worker_singleton_owner(
         &self,
         workspace_id: &str,
@@ -3598,13 +4389,162 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_current_subject_body<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |_| {
+            publish()
+        })
+    }
+
+    /// Check the original signed identity on the authority connection retained
+    /// through the protected result or effect, never a new trust lookup as proof.
+    pub(crate) fn require_authenticated_subject_request(
+        connection: &Connection,
+        workspace_id: &str,
+        source: &server_api::ServerRuntimeSource,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<()> {
+        let current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings WHERE workspace_id=?1 AND runtime_id=?2 AND binding_id=?3 AND revoked_at IS NULL)",
+            params![workspace_id, source.runtime_id, source.authentication_binding_id],
+            |row| row.get(0),
+        )?;
+        if !current
+            || source.runtime_id != worker.runtime_id
+            || source.worker_id.as_deref() != Some(worker.worker_id.as_str())
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Subject request authentication binding changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Current policy, signed binding and singleton ownership stay fenced through
+    /// the bounded native Feature commit. The callback must not reenter either store.
+    pub(crate) fn with_current_subject_body_policy<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        source: &crate::subjektiv::chat::ChatPolicySource,
+        request_source: &server_api::ServerRuntimeSource,
+        publish: impl FnOnce(&server_api::authorization::SubjectPolicySource) -> Result<T>,
+    ) -> Result<T> {
+        self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |tx| {
+            let policy = Self::subject_body_policy_on_connection(
+                tx,
+                workspace_id,
+                subject_id,
+                expected,
+                source,
+                request_source,
+            )?;
+            publish(&policy)
+        })
+    }
+
+    /// Reuse the exact body/policy fence on a domain-owned commit connection.
+    /// The caller holds native Feature and registry admission before Server SQL.
+    pub(crate) fn subject_body_policy_on_connection(
+        tx: &Connection,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        source: &crate::subjektiv::chat::ChatPolicySource,
+        request_source: &server_api::ServerRuntimeSource,
+    ) -> Result<server_api::authorization::SubjectPolicySource> {
+        use crate::subjektiv::chat::ChatPolicySource;
+        use server_api::authorization::SubjectPolicySource;
+        let key = crate::subjektiv::subject_worker_singleton_key(subject_id)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        if expected.key != key {
+            return Err(Error::WorkspacePermissionDenied(
+                "Subject body ownership is required".into(),
+            ));
+        }
+        require_current_worker_singleton_lease(tx, workspace_id, expected)?;
+        if current_worker_singleton_owner(tx, workspace_id, &key)?
+            .is_none_or(|(_, state)| state.as_deref() == Some("removed"))
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Subject body was released".into(),
+            ));
+        }
+        Self::require_authenticated_subject_request(
+            tx,
+            workspace_id,
+            request_source,
+            &expected.worker,
+        )?;
+        let canonical = crate::config_adoption::canonical(tx, workspace_id)?;
+        let policy = match (canonical, source) {
+            (false, ChatPolicySource::Local(Some(policy))) => policy.clone(),
+            (true, ChatPolicySource::Canonical) => {
+                let raw: Option<String> = tx.query_row(
+                    "SELECT policy_json FROM workspace_configuration_policies WHERE workspace_id=?1 AND subject_id=?2",
+                    params![workspace_id, subject_id], |row| row.get(0),
+                ).optional()?;
+                let adopted: crate::policy_config::AdoptedSubjectPolicy =
+                    serde_json::from_str(&raw.ok_or_else(|| {
+                        Error::WorkspacePermissionDenied("Subject policy is unset".into())
+                    })?)
+                    .map_err(|error| {
+                        Error::Store(format!("invalid adopted Subject policy: {error}"))
+                    })?;
+                SubjectPolicySource::Feature(adopted.current())
+            }
+            _ => {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Subject policy is unset or authority location changed".into(),
+                ));
+            }
+        };
+        Ok(policy)
+    }
+
+    fn with_current_subject_body_transaction<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        publish: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let key = crate::subjektiv::subject_worker_singleton_key(subject_id)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        if expected.key != key {
+            return Err(Error::WorkspacePermissionDenied(
+                "chat requires Subject body ownership".into(),
+            ));
+        }
+        self.with_immediate_transaction(|tx| {
+            require_current_worker_singleton_lease(tx, workspace_id, expected)?;
+            if current_worker_singleton_owner(tx, workspace_id, &expected.key)?
+                .is_none_or(|(_, state)| state.as_deref() == Some("removed"))
+            {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Subject body was released".into(),
+                ));
+            }
+            publish(tx)
+        })
+    }
+
     pub(crate) fn complete_worker_create_reservation(
         &self,
         workspace_id: &str,
         worker_id: WorkerId,
     ) -> Result<()> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_immediate_transaction(|tx| {
+            let runtime: String = tx.query_row("SELECT runtime_id FROM worker_create_reservations WHERE workspace_id=?1 AND worker_id=?2", params![workspace_id, worker_id.to_string()], |row| row.get(0))?;
+            crate::plugin_plan::transition_worker_launch_plan(tx, workspace_id, &runtime, &worker_id.to_string(), crate::plugin_plan::PlanPinState::Active)?;
+            let changed = tx.execute(
                 "UPDATE worker_create_reservations \
                  SET state = 'created', updated_at = ?3 \
                  WHERE workspace_id = ?1 AND worker_id = ?2 AND state IN ('reserved', 'created')",
@@ -3696,6 +4636,7 @@ impl SqliteWorkspaceStore {
                     )));
                 }
             }
+            crate::plugin_plan::transition_worker_launch_plan(&tx, workspace_id, &runtime_id, &worker_id.to_string(), crate::plugin_plan::PlanPinState::Released)?;
             let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
                 runtime_id,
                 worker_id.to_string(),
@@ -3754,6 +4695,7 @@ impl SqliteWorkspaceStore {
                     worker_id
                 )));
             }
+            crate::plugin_plan::transition_worker_launch_plan(&tx, workspace_id, &runtime_id, &worker_id.to_string(), crate::plugin_plan::PlanPinState::Released)?;
             let resource_id = worker_resource_id(&RuntimeWorkerRef::new(
                 runtime_id,
                 worker_id.to_string(),
@@ -4649,6 +5591,90 @@ fn insert_workspace_runtime_binding_audit(
 
 #[async_trait]
 impl ControlPlaneStore for SqliteWorkspaceStore {
+    fn plugin_upload(
+        &self,
+        root: &Path,
+        workspace: &str,
+        actor: &str,
+        bytes: &[u8],
+    ) -> Result<server_api::PluginUploadResponse> {
+        SqliteWorkspaceStore::plugin_upload(self, root, workspace, actor, bytes)
+    }
+    fn plugin_install(
+        &self,
+        workspace: &str,
+        actor: &str,
+        request: &server_api::PluginInstallRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_install(self, workspace, actor, request)
+    }
+    fn plugin_add_artifact(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginAddArtifactRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_add_artifact(self, workspace, actor, installation, request)
+    }
+    fn plugin_revoke(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginRevokeRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_revoke(self, workspace, actor, installation, request)
+    }
+    fn plugin_uninstall(
+        &self,
+        workspace: &str,
+        actor: &str,
+        installation: &str,
+        request: &server_api::PluginUninstallRequest,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_uninstall(self, workspace, actor, installation, request)
+    }
+    fn plugin_show(
+        &self,
+        workspace: &str,
+        installation: &str,
+    ) -> Result<server_api::PluginInstallation> {
+        SqliteWorkspaceStore::plugin_show(self, workspace, installation)
+    }
+    fn plugin_list(
+        &self,
+        workspace: &str,
+        request: &server_api::PluginListRequest,
+    ) -> Result<server_api::PluginListResponse> {
+        SqliteWorkspaceStore::plugin_list(self, workspace, request)
+    }
+    fn plugin_operation(
+        &self,
+        workspace: &str,
+        operation: &str,
+    ) -> Result<server_api::PluginOperationResponse> {
+        SqliteWorkspaceStore::plugin_operation(self, workspace, operation)
+    }
+    fn plugin_artifact_bytes(
+        &self,
+        root: &Path,
+        workspace: &str,
+        installation: &str,
+        artifact_digest: &str,
+    ) -> Result<Vec<u8>> {
+        SqliteWorkspaceStore::plugin_artifact_bytes(
+            self,
+            root,
+            workspace,
+            installation,
+            artifact_digest,
+        )
+    }
+    fn plugin_gc(&self, root: &Path) -> Result<u64> {
+        SqliteWorkspaceStore::plugin_gc(self, root)
+    }
+
     fn db_executor(&self) -> crate::db_executor::DbExecutor {
         self.db_executor.clone()
     }
@@ -4696,6 +5722,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             ));
         }
         self.with_conn(|conn| {
+            if kind == WorkspaceResourceKind::Ticket {
+                // Identity-only projection with the same ambiguity rule as the
+                // Ticket provider; authorization must not load protected bodies.
+                let mut statement = conn.prepare(
+                    "SELECT ticket_id FROM typed_tickets
+                     WHERE workspace_id = ?1 AND (ticket_id = ?2 OR slug = ?2)
+                     UNION SELECT resource_id FROM workspace_resource_keys
+                     WHERE workspace_id = ?1 AND resource_kind = 'ticket' AND resource_key = ?2
+                     LIMIT 2",
+                )?;
+                let ids = statement.query_map(params![workspace_id, reference], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                return Ok(match ids.as_slice() { [id] => Some(id.clone()), _ => None });
+            }
             if let Some(resource_id) = conn
                 .query_row(
                     "SELECT resource_id FROM workspace_resource_keys
@@ -5888,6 +6928,17 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             .await
     }
 
+    fn plan_job_cleanup_worker_removal(
+        &self,
+        request: &crate::retention::WorkerRemovalPlanRequest,
+        inventory: &worker_runtime::retention::WorkerRetentionInventory,
+    ) -> std::result::Result<
+        crate::retention::WorkerRemovalPlan,
+        crate::retention::WorkerRetentionError,
+    > {
+        SqliteWorkspaceStore::plan_job_cleanup_worker_removal(self, request, inventory)
+    }
+
     fn plan_worker_removal(
         &self,
         request: &crate::retention::WorkerRemovalPlanRequest,
@@ -5927,6 +6978,64 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         SqliteWorkspaceStore::recover_worker_removal_execution(self, workspace_id, worker)
     }
 
+    fn get_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+    ) -> Result<Option<JournalRemovalProgress>> {
+        SqliteWorkspaceStore::get_journal_removal(self, prepared)
+    }
+    fn init_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        binding: &JournalRemovalBinding,
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::init_journal_removal(self, prepared, binding)
+    }
+    fn freeze_journal_removal(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        members: &[FrozenJournalRemovalMember],
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::freeze_journal_removal(self, prepared, expected, members)
+    }
+    fn update_journal_removal_progress(
+        &self,
+        prepared: &crate::retention::PreparedWorkerRemoval,
+        expected: &JournalRemovalProgress,
+        phase: JournalRemovalPhase,
+        cause: Option<JournalRemovalCause>,
+    ) -> Result<JournalRemovalProgress> {
+        SqliteWorkspaceStore::update_journal_removal_progress(
+            self, prepared, expected, phase, cause,
+        )
+    }
+    fn list_pending_worker_removal_intents(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<PendingWorkerRemovalIntent>> {
+        SqliteWorkspaceStore::list_pending_worker_removal_intents(
+            self,
+            workspace_id,
+            after_operation_id,
+            limit,
+        )
+    }
+    fn list_pending_journal_removals(
+        &self,
+        workspace_id: &str,
+        after_operation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalRemovalProgress>> {
+        SqliteWorkspaceStore::list_pending_journal_removals(
+            self,
+            workspace_id,
+            after_operation_id,
+            limit,
+        )
+    }
     fn fail_worker_removal(
         &self,
         workspace_id: &str,
@@ -6165,19 +7274,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         repository_key: &str,
     ) -> Result<Option<RepositoryRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
-                          source_kind, source_uri, default_ref,
-                          source_fingerprint, observed_status, observed_at, created_at, updated_at
-                   FROM repositories
-                   WHERE workspace_id = ?1 AND repository_key = ?2"#,
-                params![workspace_id, repository_key],
-                read_repository_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
+        self.with_conn(|conn| read_repository_by_key(conn, workspace_id, repository_key))
     }
 
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>> {
@@ -7455,6 +8552,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         let deadline = backend_job_deadline(now, request.limits.timeout_seconds)?;
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, request)?;
             if let Some(job) = read_backend_job(&tx, workspace_id, &request.job_id)? {
                 if job.intent_fingerprint != fingerprint {
                     return Err(Error::InvalidInput(format!(
@@ -7532,7 +8630,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 return Ok(job);
             }
             if reason == JobInputRetirementReason::Completed {
-                job.load_executable_request()?;
+                subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
+            job.load_executable_request()?;
                 let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, &attempt_id(job_id, job.current_attempt))?
                     .ok_or_else(|| Error::Store("Backend Job current attempt missing".into()))?;
                 if job.state != BackendJobState::Completed || attempt.state != BackendJobAttemptState::Completed
@@ -7560,8 +8659,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<BackendJobReservation> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let mut job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let previous_id = attempt_id(job_id, job.current_attempt);
             let previous = read_backend_job_attempt(&tx, workspace_id, job_id, &previous_id)?
@@ -7594,7 +8695,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let next_id = attempt_id(job_id, next);
             let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
             let changed = tx.execute(
-                "UPDATE backend_jobs SET state = 'pending', current_attempt = ?3, result_json = NULL, result_digest = NULL, failure_category = NULL, failure_detail = NULL, completed_at = NULL, updated_at = ?4 WHERE workspace_id = ?1 AND job_id = ?2 AND current_attempt = ?5",
+                "UPDATE backend_jobs SET state = 'pending', current_attempt = ?3, result_json = NULL, result_digest = NULL, failure_category = NULL, failure_detail = NULL, failure_cause = NULL, completed_at = NULL, updated_at = ?4 WHERE workspace_id = ?1 AND job_id = ?2 AND current_attempt = ?5",
                 params![workspace_id, job_id, next as i64, now, job.current_attempt as i64],
             )?;
             if changed != 1 {
@@ -7619,6 +8720,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         job_id: &str,
     ) -> Result<Option<BackendJobRecord>> {
         self.with_conn(|conn| read_backend_job(conn, workspace_id, job_id))
+    }
+
+    fn backend_job_was_migrated(&self, workspace_id: &str, job_id: &str) -> Result<bool> {
+        self.with_conn(|conn| Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM backend_job_upgrade_history WHERE workspace_id=?1 AND job_id=?2)",
+            params![workspace_id, job_id], |row| row.get(0),
+        )?))
     }
 
     fn find_active_backend_job_for_resource(
@@ -7660,31 +8768,181 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| read_backend_job_attempt(conn, workspace_id, job_id, attempt_id))
     }
 
-    fn list_recoverable_backend_job_attempts(
+    fn list_backend_job_attempts(
         &self,
         workspace_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<BackendJobAttemptRecord>> {
+        self.with_conn(|conn| backend_job_recovery_store::history(conn, workspace_id, job_id))
+    }
+    fn record_backend_job_reconciliation_with_cause(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        failure_category: &str,
+        failure_detail: &str,
+        next_action: &str,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::record(
+            self,
+            workspace_id,
+            expected,
+            failure_category,
+            failure_detail,
+            next_action,
+            failure_cause,
+            now,
+        )
+    }
+    fn probe_backend_job_recovery(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool> {
+        backend_job_recovery_store::probe(self, workspace_id, expected)
+    }
+    fn record_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        controller_evidence: &str,
+        host_evidence: &str,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::record_fence(
+            self,
+            workspace_id,
+            expected,
+            controller_evidence,
+            host_evidence,
+            now,
+        )
+    }
+    fn has_backend_job_execution_fence(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+    ) -> Result<bool> {
+        self.with_conn(|conn| backend_job_recovery_store::has_fence(conn, workspace_id, expected))
+    }
+    fn reconcile_backend_job_domain_result(
+        &self,
+        workspace_id: &str,
+        expected: &BackendJobAttemptRecord,
+        submission: &BackendJobResultSubmission,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::reconcile_domain_result(
+            self,
+            workspace_id,
+            expected,
+            submission,
+            now,
+        )
+    }
+    fn get_backend_job_reconciliation(
+        &self,
+        workspace_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<BackendJobReconciliation>> {
+        self.with_conn(|conn| conn.query_row("SELECT cause,detail,next_action,updated_at FROM backend_job_reconciliation WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace_id,job_id,attempt_id],|row|Ok(BackendJobReconciliation{cause:row.get(0)?,detail:row.get(1)?,next_action:row.get(2)?,updated_at:row.get(3)?})).optional().map_err(Error::from))
+    }
+    fn claim_backend_job_worker_cleanup_owned(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        now: &str,
+    ) -> Result<(BackendJobAttemptRecord, bool)> {
+        backend_job_recovery_store::claim_cleanup_owned(
+            self,
+            workspace_id,
+            expected_history,
+            expected,
+            now,
+        )
+    }
+    fn record_backend_job_cleanup_preflight_failure_with_cause(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        failure_detail: &str,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::record_cleanup_preflight_failure(
+            self,
+            workspace_id,
+            expected_history,
+            expected,
+            failure_detail,
+            failure_cause,
+            now,
+        )
+    }
+    fn finish_backend_job_worker_cleanup_owned_with_cause(
+        &self,
+        workspace_id: &str,
+        expected_history: &[BackendJobAttemptRecord],
+        expected: &BackendJobAttemptRecord,
+        state: BackendJobWorkerCleanupState,
+        failure_category: Option<&str>,
+        failure_detail: Option<&str>,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
+        now: &str,
+    ) -> Result<BackendJobAttemptRecord> {
+        backend_job_recovery_store::finish_cleanup_owned(
+            self,
+            workspace_id,
+            expected_history,
+            expected,
+            state,
+            failure_category,
+            failure_detail,
+            failure_cause,
+            now,
+        )
+    }
+    fn list_recoverable_backend_job_attempts_page(
+        &self,
+        workspace_id: &str,
+        after: Option<&BackendJobRecoveryCursor>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // A dispatch claim has no externally meaningful identity until the
-            // deterministic Worker allocation is bound. Startup can therefore
-            // replay an interrupted claim through the same allocation key.
-            tx.execute(
-                "UPDATE backend_job_attempts SET state = 'reserved' WHERE workspace_id = ?1 AND state = 'dispatching' AND worker_id IS NULL",
-                params![workspace_id],
-            )?;
+        self.with_conn(|conn| {
+            // A deferred read snapshot keeps identities and records consistent
+            // without reserving the writer or changing the last dispatch fact.
+            let tx = conn.unchecked_transaction()?;
             let mut statement = tx.prepare(
-                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('reserved', 'dispatched') ORDER BY created_at LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('reserved', 'dispatching', 'dispatched') AND a.attempt=j.current_attempt AND j.state='pending' AND j.input_disposition='available' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
-            let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            // Identities remain stable when earlier owners update state or
+            // timestamps. Reading a page never grants allocation/Submit authority.
+            let limit = limit.min(usize::from(crate::backend_job::ABSOLUTE_MAX_CONCURRENT_JOBS));
+            let identities = statement
+                .query_map(
+                    params![
+                        workspace_id,
+                        limit as i64,
+                        after.map(|cursor| cursor.job_id.as_str()),
+                        after.map(|cursor| cursor.attempt_id.as_str()),
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             drop(statement);
-            let attempts = identities.into_iter().map(|(job_id, attempt_id)| {
-                read_backend_job_attempt(&tx, workspace_id, &job_id, &attempt_id)?
-                    .ok_or_else(|| Error::Store("recoverable Backend Job attempt disappeared".to_string()))
-            }).collect::<Result<Vec<_>>>()?;
+            let attempts = identities
+                .into_iter()
+                .map(|(job_id, attempt_id)| {
+                    read_backend_job_attempt(&tx, workspace_id, &job_id, &attempt_id)?.ok_or_else(|| {
+                        Error::Store("recoverable Backend Job attempt disappeared".to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             tx.commit()?;
             Ok(attempts)
         })
@@ -7699,8 +8957,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(BackendJobReservation, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
@@ -7717,7 +8977,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok((BackendJobReservation { job, attempt, replayed: true, resource_reused: false }, false));
             }
-            let deadline = backend_job_deadline(now, job.request.limits.timeout_seconds)?;
+            // Admission already fixed this attempt's deadline. Recovering prepare or
+            // waiting for a slot must not extend the same accepted operation's budget.
+            let deadline = &attempt.deadline_at;
             let changed = tx.execute(
                 "UPDATE backend_job_attempts SET state = 'dispatching', deadline_at = ?4, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'reserved' AND worker_id IS NULL",
                 params![workspace_id, job_id, attempt_id, deadline, now],
@@ -7739,7 +9001,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='reserved' AND j.input_disposition='available' ORDER BY a.created_at, a.attempt_id LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='reserved' AND j.input_disposition='available' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.created_at, a.attempt_id LIMIT ?2",
             )?;
             let identities = statement.query_map(params![workspace_id, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -7762,8 +9024,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(WorkerRegistryProjectionCommit, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{job_id}`")))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
@@ -7826,7 +9090,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         }
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let job = read_backend_job(&tx, workspace_id, job_id)?.ok_or_else(|| Error::InvalidInput("Backend Job missing".into()))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| {
@@ -7880,6 +9146,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job `{}`", submission.job_id)))?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, &submission.job_id, &submission.attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{}`", submission.attempt_id)))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             let (digest, result_json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
             if submission.input_digest != job.input_digest
                 || attempt.input_digest != submission.input_digest
@@ -7908,18 +9175,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(BackendJobResultAcceptance { job, attempt, replayed: true });
             }
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             job.load_executable_request()?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, &submission.job_id)?;
             if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending {
                 return Err(Error::InvalidInput(
                     "Backend Job attempt no longer accepts results".to_string(),
                 ));
             }
             let attempt_changed = tx.execute(
-                "UPDATE backend_job_attempts SET state = 'completed', result_json = ?4, result_digest = ?5, failure_category = NULL, failure_detail = NULL, worker_cleanup_state = 'pending', worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_updated_at = ?6, worker_cleanup_completed_at = NULL, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'dispatched'",
+                "UPDATE backend_job_attempts SET state = 'completed', result_json = ?4, result_digest = ?5, failure_category = NULL, failure_detail = NULL, failure_cause = NULL, worker_cleanup_state = 'pending', worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_failure_cause = NULL, worker_cleanup_updated_at = ?6, worker_cleanup_completed_at = NULL, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state = 'dispatched'",
                 params![workspace_id, submission.job_id, submission.attempt_id, result_json, digest, now],
             )?;
             let job_changed = tx.execute(
-                "UPDATE backend_jobs SET state = 'completed', result_json = ?3, result_digest = ?4, failure_category = NULL, failure_detail = NULL, completed_at = ?5, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
+                "UPDATE backend_jobs SET state = 'completed', result_json = ?3, result_digest = ?4, failure_category = NULL, failure_detail = NULL, failure_cause = NULL, completed_at = ?5, updated_at = ?5 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
                 params![workspace_id, submission.job_id, result_json, digest, now],
             )?;
             if attempt_changed != 1 || job_changed != 1 {
@@ -7935,16 +9204,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn list_backend_journal_unknown_attempts(
+    fn list_backend_journal_pending_attempts(
         &self,
         workspace_id: &str,
         after_job_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare("SELECT a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='unknown' AND j.state='unknown' AND a.attempt=j.current_attempt AND json_type(j.request_json,'$.grants.subjektiv_journal')='object' AND (?2 IS NULL OR a.job_id>?2) ORDER BY a.job_id LIMIT ?3")?;
+            let mut stmt = conn.prepare("SELECT a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j ON j.workspace_id=a.workspace_id AND j.job_id=a.job_id WHERE a.workspace_id=?1 AND a.state='dispatched' AND j.state='pending' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) AND a.attempt=j.current_attempt AND json_type(j.request_json,'$.grants.subjektiv_journal')='object' AND (?2 IS NULL OR a.job_id>?2) ORDER BY a.job_id LIMIT ?3")?;
             let ids = stmt.query_map(params![workspace_id,after_job_id,limit.clamp(1,100) as i64], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            ids.into_iter().map(|(job,id)| read_backend_job_attempt(conn,workspace_id,&job,&id)?.ok_or_else(|| Error::Store("Journal Unknown attempt disappeared".into()))).collect()
+            ids.into_iter().map(|(job,id)| read_backend_job_attempt(conn,workspace_id,&job,&id)?.ok_or_else(|| Error::Store("Journal Pending attempt disappeared".into()))).collect()
         })
     }
 
@@ -7971,13 +9240,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<BackendJobAttemptRecord> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, &expected.job_id)?;
             let job = read_backend_job(&tx, workspace_id, &expected.job_id)?.ok_or_else(|| Error::InvalidInput("Journal Job missing".into()))?;
+            subject_deletion_store::require_job_admission(&tx, workspace_id, &job.request)?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, &expected.job_id, &expected.attempt_id)?.ok_or_else(|| Error::InvalidInput("Journal attempt missing".into()))?;
             // Full snapshot CAS includes Worker, tracked Run, input and cleanup evidence.
             if &attempt != expected || job.current_attempt != attempt.attempt
                 || job.request.grants.subjektiv_journal.is_none()
                 || attempt.input_digest != job.input_digest
-                || !matches!(job.state, BackendJobState::Unknown | BackendJobState::Completed | BackendJobState::Failed) {
+                || !matches!(job.state, BackendJobState::Pending | BackendJobState::Completed | BackendJobState::Failed) {
                 return Err(Error::InvalidInput("Journal reconciliation binding changed".into()));
             }
             if let Some(submission) = completion {
@@ -7986,32 +9257,34 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 }
                 let (digest, json) = result_digest(&submission.result, job.request.limits.max_result_bytes)?;
                 if attempt.state == BackendJobAttemptState::Completed && attempt.result_digest.as_deref() == Some(digest.as_str()) { tx.commit()?; return Ok(attempt); }
-                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown {
+                if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending {
                     return Err(Error::InvalidInput("Journal completion cannot replace definitive outcome".into()));
                 }
-                tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,json,digest,now])?;
-                tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,json,digest,now])?;
+                tx.execute("UPDATE backend_job_attempts SET state='completed',result_json=?4,result_digest=?5,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,worker_cleanup_state=COALESCE(worker_cleanup_state,'pending'),worker_cleanup_updated_at=CASE WHEN worker_cleanup_state IS NULL THEN ?6 ELSE worker_cleanup_updated_at END,updated_at=?6,completed_at=?6 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='dispatched'",params![workspace_id,expected.job_id,expected.attempt_id,json,digest,now])?;
+                tx.execute("UPDATE backend_jobs SET state='completed',result_json=?3,result_digest=?4,failure_category=NULL,failure_detail=NULL,failure_cause=NULL,updated_at=?5,completed_at=?5 WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,json,digest,now])?;
                 notification_routing::jobs::capture(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?;
             } else {
                 if attempt.state == BackendJobAttemptState::Failed && attempt.failure_category.as_deref() == Some("journal_attempt_fenced") { tx.commit()?; return Ok(attempt); }
-                if attempt.state != BackendJobAttemptState::Unknown || job.state != BackendJobState::Unknown
+                if attempt.state != BackendJobAttemptState::Dispatched || job.state != BackendJobState::Pending
                     || attempt.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Completed)
                     || attempt.worker_cleanup_completed_at.is_none() {
-                    return Err(Error::InvalidInput("partial Journal Unknown requires completed canonical cleanup fence".into()));
+                    return Err(Error::InvalidInput("partial Journal Pending requires completed canonical cleanup fence".into()));
                 }
                 let purged = if let Some(worker) = &attempt.worker {
                     tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='succeeded' AND session_disposition='purge')",params![workspace_id,worker.runtime_id,worker.worker_id],|r|r.get::<_,bool>(0))?
                 } else { false };
-                if !purged { return Err(Error::InvalidInput("partial Journal Unknown has no committed stop/Purge removal receipt".into())); }
-                tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed; retained operations remain valid',updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='unknown'",params![workspace_id,expected.job_id,expected.attempt_id,now])?;
-                tx.execute("UPDATE backend_jobs SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='unknown'",params![workspace_id,expected.job_id,now])?;
+                if !purged { return Err(Error::InvalidInput("partial Journal Pending has no committed stop/Purge removal receipt".into())); }
+                let cause = crate::backend_job::BackgroundJobCause::JournalAttemptFenced.storage()
+                    .map_err(|_| Error::Store("Journal failure evidence projection unavailable".into()))?;
+                tx.execute("UPDATE backend_job_attempts SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed; retained operations remain valid',failure_cause=?5,updated_at=?4 WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 AND state='dispatched'",params![workspace_id,expected.job_id,expected.attempt_id,now,cause.as_storage_str()])?;
+                tx.execute("UPDATE backend_jobs SET state='failed',failure_category='journal_attempt_fenced',failure_detail='Canonical Worker cleanup and domain generation fence confirmed',failure_cause=?4,updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state='pending'",params![workspace_id,expected.job_id,now,cause.as_storage_str()])?;
             }
             let result = read_backend_job_attempt(&tx,workspace_id,&expected.job_id,&expected.attempt_id)?.ok_or_else(|| Error::Store("Reconciled Journal attempt missing".into()))?;
             tx.commit()?; Ok(result)
         })
     }
 
-    fn finish_backend_job_attempt(
+    fn finish_backend_job_attempt_with_cause(
         &self,
         workspace_id: &str,
         job_id: &str,
@@ -8019,14 +9292,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         state: BackendJobAttemptState,
         failure_category: &str,
         failure_detail: &str,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord> {
-        if !matches!(
-            state,
-            BackendJobAttemptState::Failed | BackendJobAttemptState::Unknown
-        ) {
+        if !matches!(state, BackendJobAttemptState::Failed) {
             return Err(Error::InvalidInput(
-                "Backend Job failure completion requires failed or unknown state".to_string(),
+                "Backend Job failure completion requires failed state".to_string(),
             ));
         }
         let detail = bounded_failure_detail(failure_detail);
@@ -8042,6 +9313,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ));
             }
             if attempt.state.terminal() {
+                // Preserve the original terminal result/evidence. Replay never
+                // backfills or replaces a cause (including legacy absence).
                 if attempt.state != state || attempt.failure_category.as_deref() != Some(failure_category) {
                     return Err(Error::InvalidInput(
                         "Backend Job terminal attempt replay conflicts with stored failure".to_string(),
@@ -8050,19 +9323,19 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 tx.commit()?;
                 return Ok(attempt);
             }
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
+            let failure_cause = crate::backend_job::prefer_retained_primary_cause(
+                attempt.failure_cause.as_ref(), failure_cause,
+            ).map_err(Error::BackendJobCauseProjection)?;
             tx.execute(
-                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, worker_cleanup_state = CASE WHEN worker_id IS NULL THEN 'completed' ELSE 'pending' END, worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = CASE WHEN worker_id IS NULL THEN ?7 ELSE NULL END, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
-                params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now],
+                "UPDATE backend_job_attempts SET state = ?4, failure_category = ?5, failure_detail = ?6, failure_cause = ?8, worker_cleanup_state = CASE WHEN state='reserved' AND worker_id IS NULL THEN 'completed' ELSE 'pending' END, worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_failure_cause = NULL, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = CASE WHEN state='reserved' AND worker_id IS NULL THEN ?7 ELSE NULL END, allocation_precluded_at = CASE WHEN state='reserved' AND runtime_id IS NULL AND worker_id IS NULL AND runtime_run_id IS NULL AND dispatched_at IS NULL THEN ?7 ELSE NULL END, completed_at = ?7, updated_at = ?7 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND state IN ('reserved', 'dispatching', 'dispatched')",
+                params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, detail, now, failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)],
             )?;
             if attempt.attempt == job.current_attempt && job.state == BackendJobState::Pending {
-                let job_state = match state {
-                    BackendJobAttemptState::Failed => BackendJobState::Failed,
-                    BackendJobAttemptState::Unknown => BackendJobState::Unknown,
-                    _ => unreachable!(),
-                };
+                let job_state = BackendJobState::Failed;
                 tx.execute(
-                    "UPDATE backend_jobs SET state = ?3, failure_category = ?4, failure_detail = ?5, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
-                    params![workspace_id, job_id, job_state.as_str(), failure_category, detail, now],
+                    "UPDATE backend_jobs SET state = ?3, failure_category = ?4, failure_detail = ?5, failure_cause = ?7, completed_at = ?6, updated_at = ?6 WHERE workspace_id = ?1 AND job_id = ?2 AND state = 'pending'",
+                    params![workspace_id, job_id, job_state.as_str(), failure_category, detail, now, failure_cause.as_ref().map(crate::backend_job::BackgroundFailure::as_storage_str)],
                 )?;
             }
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
@@ -8072,51 +9345,20 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn recover_backend_job_worker_cleanups(
-        &self,
-        workspace_id: &str,
-        now: &str,
-        limit: usize,
-    ) -> Result<Vec<BackendJobAttemptRecord>> {
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE backend_job_attempts SET worker_cleanup_state = 'pending', worker_cleanup_failure_category = 'cleanup_interrupted', worker_cleanup_failure_detail = 'Backend restart interrupted Worker cleanup; retrying canonical removal', worker_cleanup_updated_at = ?2 WHERE workspace_id = ?1 AND worker_cleanup_state = 'executing'",
-                params![workspace_id, now],
-            )?;
-            let mut statement = tx.prepare(
-                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('completed', 'failed', 'unknown') AND runtime_id IS NOT NULL AND worker_cleanup_state IN ('pending', 'failed') ORDER BY worker_cleanup_updated_at, created_at LIMIT ?2",
-            )?;
-            let identities = statement
-                .query_map(params![workspace_id, limit as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            drop(statement);
-            let attempts = identities
-                .into_iter()
-                .map(|(job_id, attempt_id)| {
-                    read_backend_job_attempt(&tx, workspace_id, &job_id, &attempt_id)?.ok_or_else(
-                        || Error::Store("recoverable Backend Job Worker cleanup disappeared".to_string()),
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            tx.commit()?;
-            Ok(attempts)
-        })
-    }
-
     fn list_backend_job_worker_cleanups(
         &self,
         workspace_id: &str,
+        after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT job_id, attempt_id FROM backend_job_attempts WHERE workspace_id = ?1 AND state IN ('completed', 'failed', 'unknown') AND runtime_id IS NOT NULL AND worker_cleanup_state IN ('pending', 'failed') ORDER BY worker_cleanup_updated_at, created_at LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR ((a.state='completed' OR (a.state='failed' AND j.failure_category='journal_execution_terminated')) AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
+            // Immutable identities keep the boundary stable while admitted
+            // owners change cleanup state/timestamps. Selection grants no claim.
             let identities = statement
-                .query_map(params![workspace_id, limit as i64], |row| {
+                .query_map(params![workspace_id, limit as i64, after.map(|(job, _)| job), after.map(|(_, attempt)| attempt)], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -8140,6 +9382,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(BackendJobAttemptRecord, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let attempt = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
             if !attempt.state.terminal() || attempt.worker.is_none() {
@@ -8155,7 +9398,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 return Ok((attempt, false));
             }
             let changed = tx.execute(
-                "UPDATE backend_job_attempts SET worker_cleanup_state = 'executing', worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_updated_at = ?4 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND worker_cleanup_state IN ('pending', 'failed')",
+                "UPDATE backend_job_attempts SET worker_cleanup_state = 'executing', worker_cleanup_failure_category = NULL, worker_cleanup_failure_detail = NULL, worker_cleanup_failure_cause = NULL, worker_cleanup_updated_at = ?4 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND worker_cleanup_state IN ('pending', 'failed')",
                 params![workspace_id, job_id, attempt_id, now],
             )?;
             if changed != 1 {
@@ -8170,7 +9413,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
-    fn finish_backend_job_worker_cleanup(
+    fn finish_backend_job_worker_cleanup_with_cause(
         &self,
         workspace_id: &str,
         job_id: &str,
@@ -8178,6 +9421,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         state: BackendJobWorkerCleanupState,
         failure_category: Option<&str>,
         failure_detail: Option<&str>,
+        failure_cause: Option<&crate::backend_job::BackgroundFailure>,
         now: &str,
     ) -> Result<BackendJobAttemptRecord> {
         if !matches!(
@@ -8189,12 +9433,19 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     .to_string(),
             ));
         }
+        if state == BackendJobWorkerCleanupState::Completed && failure_cause.is_some() {
+            return Err(Error::InvalidInput(
+                "completed cleanup cannot carry failure evidence".into(),
+            ));
+        }
         let failure_detail = failure_detail.map(bounded_failure_detail);
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            backend_job_recovery_store::require_current_contract(&tx, workspace_id, job_id)?;
             let current = read_backend_job_attempt(&tx, workspace_id, job_id, attempt_id)?
                 .ok_or_else(|| Error::InvalidInput(format!("unknown Backend Job attempt `{attempt_id}`")))?;
             if current.worker_cleanup_state == Some(state) {
+                // Existing replay authority wins; do not backfill or replace evidence.
                 tx.commit()?;
                 return Ok(current);
             }
@@ -8205,8 +9456,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             }
             let completed_at = (state == BackendJobWorkerCleanupState::Completed).then_some(now);
             let changed = tx.execute(
-                "UPDATE backend_job_attempts SET worker_cleanup_state = ?4, worker_cleanup_failure_category = ?5, worker_cleanup_failure_detail = ?6, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = ?8 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND worker_cleanup_state = 'executing'",
-                params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, failure_detail, now, completed_at],
+                "UPDATE backend_job_attempts SET worker_cleanup_state = ?4, worker_cleanup_failure_category = ?5, worker_cleanup_failure_detail = ?6, worker_cleanup_failure_cause = ?9, worker_cleanup_updated_at = ?7, worker_cleanup_completed_at = ?8 WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3 AND worker_cleanup_state = 'executing' AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=backend_job_attempts.workspace_id AND h.job_id=backend_job_attempts.job_id)",
+                params![workspace_id, job_id, attempt_id, state.as_str(), failure_category, failure_detail, now, completed_at, failure_cause.map(crate::backend_job::BackgroundFailure::as_storage_str)],
             )?;
             if changed != 1 {
                 return Err(Error::Store(
@@ -8277,6 +9528,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<(BackendJobDeliveryRecord, bool)> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let deleted:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM subject_deletion_jobs WHERE workspace_id=?1 AND job_id=?2)",params![workspace_id,job_id],|r|r.get(0))?;
+            if deleted {return Err(Error::RepositoryConflict("subject_deleted: Job delivery fenced".into()));}
             if let Some(existing) = read_backend_job_delivery(&tx, workspace_id, delivery_id)? {
                 if existing.job_id != job_id || existing.target != *target {
                     return Err(Error::InvalidInput(
@@ -8853,6 +10106,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                         chrono::Utc::now().to_rfc3339(),
                     ],
                 )?;
+                crate::plugin_plan::transition_worker_launch_plan(&tx, workspace_id, &worker.runtime_id, &worker.worker_id, crate::plugin_plan::PlanPinState::Released)?;
                 commit_worker_catalog_removal(&tx, workspace_id, worker)?
             } else if tx
                 .query_row(
@@ -9136,6 +10390,13 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             None,
         )
     }
+    fn notification_source_resource(
+        &self,
+        workspace_id: &str,
+        source_event_id: &str,
+    ) -> Result<Option<server_api::authorization::PermissionResource>> {
+        notification_diagnostics::source_resource(self, workspace_id, source_event_id)
+    }
     fn notification_diagnostics(
         &self,
         workspace_id: &str,
@@ -9158,6 +10419,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         target: &TicketWorkerNotificationTarget,
     ) -> Result<String> {
         notification_routing::prepare_worker(self, workspace_id, delivery_id, content, target)
+    }
+    fn admit_ticket_worker_notification_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        target: &TicketWorkerNotificationTarget,
+    ) -> Result<Option<String>> {
+        notification_routing::admit_worker_send(self, workspace_id, delivery_id, target)
     }
     fn ack_ticket_worker_notification(
         &self,
@@ -9222,7 +10491,21 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         }
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let result = assignment_delivery::list_in_tx(&tx, workspace_id, limit)?;
+            let result = assignment_delivery::list_in_tx(&tx, workspace_id, limit, None)?;
+            tx.commit()?;
+            Ok(result)
+        })
+    }
+    fn list_pending_subject_ticket_assignment_deliveries(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TicketAssignmentDelivery>> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let result =
+                assignment_delivery::list_in_tx(&tx, workspace_id, limit, Some(subject_id))?;
             tx.commit()?;
             Ok(result)
         })
@@ -9244,6 +10527,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         source: &TicketAssignmentTrackingSourceContext,
     ) -> Result<String> {
         assignment_delivery::prepare_content(self, workspace_id, delivery_id, content, source)
+    }
+    fn admit_ticket_assignment_delivery_send(
+        &self,
+        workspace_id: &str,
+        delivery_id: &str,
+        source: &TicketAssignmentTrackingSourceContext,
+    ) -> Result<Option<String>> {
+        assignment_delivery::admit_send(self, workspace_id, delivery_id, source)
     }
     fn ack_ticket_assignment_delivery(
         &self,
@@ -9640,7 +10931,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 runtime_id,
                 worker_id,
             } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
-            TicketAssignmentPrincipal::WorkspaceAgent { .. } => {
+            TicketAssignmentPrincipal::WorkspaceAgent { .. }
+            | TicketAssignmentPrincipal::Subject { .. } => {
                 return Err(Error::TicketAssignmentConflict(
                     "Workspace agent principal cannot occupy the Worker role".to_string(),
                 ));
@@ -10711,6 +12003,158 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn external_workdir_cleanup_observation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<(String, Vec<protocol::background_failure::StoredFailure>)> {
+        self.with_conn(|conn| {
+            let (state, raw): (String, Option<String>) = conn.query_row(
+                "SELECT cleanup_state, cleanup_error FROM external_workdir_grants WHERE workspace_id = ?1 AND grant_id = ?2",
+                params![workspace_id, grant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            // Older rows contain only a fixed category, not a structured cause.
+            // Keep their cleanup state; never reconstruct evidence from that text.
+            let failures = raw.as_deref()
+                .map(crate::grant_cleanup_operation::diagnostic_failures)
+                .unwrap_or_default();
+            Ok((state, failures))
+        })
+    }
+
+    fn external_workdir_cleanup_operation(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupOperation>> {
+        self.with_conn(|conn| crate::grant_cleanup_operation::read(conn, workspace_id, grant_id))
+    }
+    fn external_workdir_cleanup_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<crate::grant_cleanup_operation::LoadedCleanupIntent>> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::read_intent(conn, workspace_id, grant_id)
+        })
+    }
+    fn append_external_workdir_cleanup_intent_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupIntent,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupIntent> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::append_intent_failures(conn, expected, failures, now)
+        })
+    }
+    fn external_workdir_cleanup_has_intent(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::has_intent(conn, workspace_id, grant_id)
+        })
+    }
+    fn begin_external_workdir_cleanup_operation(
+        &self,
+        request: &crate::grant_cleanup_operation::CleanupRequest,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::CleanupAdmission> {
+        self.with_conn_mut(|conn| {
+            crate::grant_cleanup_operation::begin(conn, request, failures, now)
+        })
+    }
+    fn validate_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+    ) -> Result<()> {
+        self.with_conn(|conn| crate::grant_cleanup_operation::validate_release(conn, expected))
+    }
+    fn confirm_external_workdir_cleanup_release(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| crate::grant_cleanup_operation::confirm_release(conn, expected, now))
+    }
+    fn mark_external_workdir_cleanup_runtime_dispatched(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::mark_runtime_dispatched(conn, expected, now)
+        })
+    }
+    fn record_external_workdir_cleanup_runtime_observation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        status: crate::hosts::RuntimeOperationStatus,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::record_runtime_observation(
+                conn, expected, status, failures, now,
+            )
+        })
+    }
+
+    fn settle_external_workdir_cleanup_operation(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        observation: Option<&runtime_api::WorkerWorkdirAttachmentsOperationObservation>,
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::settle(conn, expected, observation, now)
+        })
+    }
+    fn append_external_workdir_cleanup_failures(
+        &self,
+        expected: &crate::grant_cleanup_operation::LoadedCleanupOperation,
+        failures: &[protocol::background_failure::BackgroundFailure],
+        now: &str,
+    ) -> Result<crate::grant_cleanup_operation::LoadedCleanupOperation> {
+        self.with_conn(|conn| {
+            crate::grant_cleanup_operation::append_failures(conn, expected, failures, now)
+        })
+    }
+
+    fn record_external_workdir_connection_observation(
+        &self,
+        grant: &ExternalWorkdirGrantRecord,
+        connection_generation: u64,
+        reason: server_api::ExternalWorkdirConnectionClosedReason,
+        failures: Option<&str>,
+        now: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            crate::external_workdir_connection_observations::record(
+                conn,
+                grant,
+                connection_generation,
+                reason,
+                failures,
+                now,
+            )
+        })
+    }
+
+    fn external_workdir_connection_observations(
+        &self,
+        workspace_id: &str,
+        grant_id: &str,
+    ) -> Result<Vec<crate::external_workdir_connection_observations::ConnectionObservation>> {
+        self.with_conn(|conn| {
+            crate::external_workdir_connection_observations::read(conn, workspace_id, grant_id)
+        })
+    }
+
     fn activate_external_workdir_grant(
         &self,
         workspace_id: &str,
@@ -10719,8 +12163,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         generation: u64,
         updated_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 r#"UPDATE external_workdir_grants
                    SET generation = ?4, status = 'online', updated_at = ?5
                    WHERE workspace_id = ?1 AND grant_id = ?2 AND provider_instance_id = ?3
@@ -10736,11 +12181,12 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             if changed > 0 {
-                conn.execute(
+                tx.execute(
                     "UPDATE workdir_registry SET materialization_status = 'present', updated_at = ?3 WHERE workspace_id = ?1 AND external_grant_id = ?2",
                     params![workspace_id, grant_id, updated_at],
                 )?;
             }
+            tx.commit()?;
             Ok(changed > 0)
         })
     }
@@ -10754,8 +12200,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         status: &str,
         updated_at: &str,
     ) -> Result<bool> {
-        self.with_conn(|conn| {
-            let changed = conn.execute(
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 r#"UPDATE external_workdir_grants
                    SET status = ?5, updated_at = ?6,
                        cleanup_state = CASE WHEN ?5 IN ('revoked', 'expired') THEN 'pending' ELSE cleanup_state END,
@@ -10773,7 +12220,10 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 ],
             )?;
             if changed > 0 {
-                conn.execute(
+                if matches!(status, "revoked" | "expired") {
+                    crate::grant_cleanup_operation::install_fresh_fence_intent(&tx, workspace_id, grant_id, updated_at)?;
+                }
+                tx.execute(
                     "UPDATE workdir_registry SET materialization_status = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND external_grant_id = ?2",
                     params![
                         workspace_id,
@@ -10783,6 +12233,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     ],
                 )?;
             }
+            tx.commit()?;
             Ok(changed > 0)
         })
     }
@@ -10794,14 +12245,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<String>> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE external_workdir_grants
-                 SET status = 'expired', updated_at = ?2, cleanup_state = 'pending',
-                     cleanup_error = NULL, cleanup_updated_at = ?2
-                 WHERE workspace_id = ?1 AND status IN ('pending', 'online', 'offline')
-                   AND expires_at IS NOT NULL AND expires_at <= ?2",
-                params![workspace_id, now],
-            )?;
+            let newly_expired = {
+                let mut statement = tx.prepare(
+                    "UPDATE external_workdir_grants
+                     SET status='expired',updated_at=?2,cleanup_state='pending',cleanup_error=NULL,cleanup_updated_at=?2
+                     WHERE workspace_id=?1 AND status IN ('pending','online','offline') AND expires_at IS NOT NULL AND expires_at<=?2
+                     RETURNING grant_id",
+                )?;
+                statement.query_map(params![workspace_id,now], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for grant in newly_expired {
+                crate::grant_cleanup_operation::install_fresh_fence_intent(&tx, workspace_id, &grant, now)?;
+            }
             tx.execute(
                 "UPDATE external_workdir_grants SET status = 'offline', updated_at = ?2
                  WHERE workspace_id = ?1 AND status = 'online'
@@ -10849,15 +12304,26 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             ));
         }
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            let existing: Option<Option<String>> = tx.query_row(
+                "SELECT cleanup_error FROM external_workdir_grants WHERE workspace_id=?1 AND grant_id=?2",
+                params![workspace_id, grant_id], |row| row.get(0),
+            ).optional()?;
+            let Some(existing) = existing else { return Ok(false); };
+            if !crate::grant_cleanup_operation::legacy_observation_only(existing.as_deref()) {
+                return Err(Error::WorkdirAttachmentConflict(
+                    "External cleanup operation requires conditional settlement".into(),
+                ));
+            }
+            let changed = tx.execute(
                 "UPDATE external_workdir_grants
                  SET cleanup_state = ?3, cleanup_error = ?4, cleanup_updated_at = ?5
                  WHERE workspace_id = ?1 AND grant_id = ?2
                    AND status IN ('revoked', 'expired')",
                 params![workspace_id, grant_id, state, error, updated_at],
-            )
-            .map(|changed| changed > 0)
-            .map_err(Error::from)
+            )?;
+            tx.commit()?;
+            Ok(changed > 0)
         })
     }
 
@@ -11575,20 +13041,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         worker: &RuntimeWorkerRef,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
-                   FROM worker_workdir_links
-                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
-                   ORDER BY linked_at DESC"#,
-            )?;
-            let rows = stmt.query_map(
-                params![workspace_id, worker.runtime_id, worker.worker_id],
-                read_worker_workdir_link_record,
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)
-        })
+        self.with_conn(|conn| list_worker_workdir_links_on(conn, workspace_id, worker))
     }
 
     fn list_workdir_worker_links(
@@ -11617,20 +13070,43 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         workspace_id: &str,
         workdir_id: &str,
     ) -> Result<Option<WorkerWorkdirLinkRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
-                   FROM worker_workdir_links
-                   WHERE workspace_id = ?1 AND workdir_id = ?2
-                   ORDER BY linked_at DESC, rowid DESC
-                   LIMIT 1"#,
-                params![workspace_id, workdir_id],
-                read_worker_workdir_link_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
+        self.with_conn(|conn| latest_workdir_worker_link_on(conn, workspace_id, workdir_id))
     }
+}
+
+pub(crate) fn list_worker_workdir_links_on(
+    conn: &Connection,
+    workspace_id: &str,
+    worker: &RuntimeWorkerRef,
+) -> Result<Vec<WorkerWorkdirLinkRecord>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+           FROM worker_workdir_links
+           WHERE workspace_id = ?1 AND runtime_id = ?2 AND worker_id = ?3 AND unlinked_at IS NULL
+           ORDER BY linked_at DESC"#,
+    )?;
+    let rows = stmt.query_map(
+        params![workspace_id, worker.runtime_id, worker.worker_id],
+        read_worker_workdir_link_record,
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Error::from)
+}
+
+pub(crate) fn latest_workdir_worker_link_on(
+    conn: &Connection,
+    workspace_id: &str,
+    workdir_id: &str,
+) -> Result<Option<WorkerWorkdirLinkRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id, runtime_id, worker_id, workdir_id, alias, capabilities, linked_at, unlinked_at, connection_id
+           FROM worker_workdir_links
+           WHERE workspace_id = ?1 AND workdir_id = ?2
+           ORDER BY linked_at DESC, rowid DESC
+           LIMIT 1"#,
+        params![workspace_id, workdir_id],
+        read_worker_workdir_link_record,
+    ).optional().map_err(Error::from)
 }
 
 fn flow_source_name(path: &str) -> Result<String> {
@@ -11752,6 +13228,24 @@ fn validate_repository_record_identity(record: &RepositoryRecord) -> Result<()> 
     server_api::validate_repository_key(&record.repository_key)
         .map_err(|error| Error::InvalidInput(format!("invalid Repository key: {error}")))?;
     Ok(())
+}
+
+pub(crate) fn read_repository_by_key(
+    conn: &Connection,
+    workspace_id: &str,
+    repository_key: &str,
+) -> Result<Option<RepositoryRecord>> {
+    conn.query_row(
+        r#"SELECT workspace_id, repository_id, repository_key, kind, provider,
+                  source_kind, source_uri, default_ref,
+                  source_fingerprint, observed_status, observed_at, created_at, updated_at
+           FROM repositories
+           WHERE workspace_id = ?1 AND repository_key = ?2"#,
+        params![workspace_id, repository_key],
+        read_repository_record,
+    )
+    .optional()
+    .map_err(Error::from)
 }
 
 fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {
@@ -12353,7 +13847,7 @@ fn read_active_backend_job_for_resource(
     // effects block even after Worker removal; cleanup is not outcome resolution.
     let id = conn.query_row(
         "SELECT job.job_id FROM backend_jobs job WHERE job.workspace_id = ?1 AND job.resource_key = ?2
-         AND (job.state IN ('pending', 'unknown') OR EXISTS (
+         AND (job.state='pending' OR EXISTS (
              SELECT 1 FROM backend_job_attempts attempt WHERE attempt.workspace_id = job.workspace_id
              AND attempt.job_id = job.job_id
              AND attempt.worker_cleanup_state IS NOT 'completed'))
@@ -12397,13 +13891,13 @@ fn read_backend_job(
     job_id: &str,
 ) -> Result<Option<BackendJobRecord>> {
     let row = conn.query_row(
-        "SELECT request_json, intent_fingerprint, state, current_attempt, result_json, result_digest, failure_category, failure_detail, created_at, updated_at, completed_at, input_digest, input_disposition FROM backend_jobs WHERE workspace_id = ?1 AND job_id = ?2",
+        "SELECT request_json, intent_fingerprint, state, current_attempt, result_json, result_digest, failure_category, failure_detail, created_at, updated_at, completed_at, input_digest, input_disposition, failure_cause FROM backend_jobs WHERE workspace_id = ?1 AND job_id = ?2",
         params![workspace_id, job_id],
         |row| Ok((
             row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?,
             row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, String>(8)?,
-            row.get::<_, String>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, String>(11)?, row.get::<_, String>(12)?,
+            row.get::<_, String>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, String>(11)?, row.get::<_, String>(12)?, row.get::<_, Option<String>>(13)?,
         )),
     ).optional()?;
     let Some((
@@ -12420,6 +13914,7 @@ fn read_backend_job(
         completed_at,
         input_digest,
         input_disposition,
+        failure_cause,
     )) = row
     else {
         return Ok(None);
@@ -12452,6 +13947,7 @@ fn read_backend_job(
         result_digest,
         failure_category,
         failure_detail,
+        failure_cause: failure_cause.map(crate::backend_job::StoredFailure::from_storage),
         created_at,
         updated_at,
         completed_at,
@@ -12465,7 +13961,7 @@ fn read_backend_job_attempt(
     attempt_id: &str,
 ) -> Result<Option<BackendJobAttemptRecord>> {
     let row = conn.query_row(
-        "SELECT attempt, input_digest, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
+        "SELECT attempt, input_digest, state, runtime_id, worker_id, runtime_run_id, dispatched_at, deadline_at, result_json, result_digest, failure_category, failure_detail, worker_cleanup_state, worker_cleanup_failure_category, worker_cleanup_failure_detail, worker_cleanup_updated_at, worker_cleanup_completed_at, created_at, updated_at, completed_at, allocation_precluded_at, failure_cause, worker_cleanup_failure_cause FROM backend_job_attempts WHERE workspace_id = ?1 AND job_id = ?2 AND attempt_id = ?3",
         params![workspace_id, job_id, attempt_id],
         |row| Ok((
             row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
@@ -12474,7 +13970,8 @@ fn read_backend_job_attempt(
             row.get::<_, Option<String>>(9)?, row.get::<_, Option<String>>(10)?, row.get::<_, Option<String>>(11)?,
             row.get::<_, Option<String>>(12)?, row.get::<_, Option<String>>(13)?, row.get::<_, Option<String>>(14)?,
             row.get::<_, Option<String>>(15)?, row.get::<_, Option<String>>(16)?, row.get::<_, String>(17)?,
-            row.get::<_, String>(18)?, row.get::<_, Option<String>>(19)?,
+            row.get::<_, String>(18)?, row.get::<_, Option<String>>(19)?, row.get::<_, Option<String>>(20)?,
+            row.get::<_, Option<String>>(21)?, row.get::<_, Option<String>>(22)?,
         )),
     ).optional()?;
     let Some((
@@ -12498,6 +13995,9 @@ fn read_backend_job_attempt(
         created_at,
         updated_at,
         completed_at,
+        allocation_precluded_at,
+        failure_cause,
+        worker_cleanup_failure_cause,
     )) = row
     else {
         return Ok(None);
@@ -12531,11 +14031,15 @@ fn read_backend_job_attempt(
         worker,
         runtime_run_id,
         dispatched_at,
+        allocation_precluded_at,
         deadline_at,
         result,
         result_digest,
         failure_category,
         failure_detail,
+        failure_cause: failure_cause.map(crate::backend_job::StoredFailure::from_storage),
+        worker_cleanup_failure_cause: worker_cleanup_failure_cause
+            .map(crate::backend_job::StoredFailure::from_storage),
         worker_cleanup_state: worker_cleanup_state
             .as_deref()
             .map(BackendJobWorkerCleanupState::parse)
@@ -13051,7 +14555,7 @@ impl SqliteWorkspaceStore {
                 )));
             }
             if let Some((assignment_id,source))=fence {
-                assignment_tracking::require_runtime_source(&tx,workspace_id,&source.runtime_id,&source.worker_id,&source.agent_key,&source.authentication_binding_id)?;
+                assignment_tracking::require_runtime_source(&tx,workspace_id,&source.runtime_id,&source.worker_id,&source.subject_id,&source.authentication_binding_id)?;
                 assignment_delivery::require_current(&tx,workspace_id,ticket_id,assignment_id)?;
             }
             let worker = worker_id.map(|id| RuntimeWorkerRef::new(runtime_id, id));
@@ -13175,6 +14679,9 @@ impl SqliteWorkspaceStore {
                 runtime_id,
                 worker_id,
             } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
+            TicketAssignmentPrincipal::Subject { subject_id } => {
+                (Some(subject_id.as_str()), None, None)
+            }
             TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
                 (Some(agent_key.as_str()), None, None)
             }
@@ -13381,6 +14888,9 @@ fn read_ticket_role_assignment_record(
             runtime_id: runtime_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
             worker_id: worker_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
         },
+        "subject" => TicketAssignmentPrincipal::Subject {
+            subject_id: principal_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
+        },
         "workspace_agent" => TicketAssignmentPrincipal::WorkspaceAgent {
             agent_key: principal_id.ok_or_else(|| rusqlite::Error::InvalidQuery)?,
         },
@@ -13449,8 +14959,8 @@ fn validate_ticket_assignment_role_principal(
     let valid = match role {
         TicketAssignmentRole::Orchestrator => matches!(
             principal,
-            TicketAssignmentPrincipal::WorkspaceAgent { agent_key }
-                if agent_key == "workspace-orchestrator"
+            TicketAssignmentPrincipal::Subject { subject_id }
+                if !subject_id.trim().is_empty() && subject_id.len() <= 1024 && !subject_id.chars().any(char::is_control)
         ),
         TicketAssignmentRole::Worker => {
             matches!(principal, TicketAssignmentPrincipal::Worker { .. })
@@ -13553,6 +15063,9 @@ fn clear_current_ticket_role_assignment_with_source_in_tx(
             runtime_id,
             worker_id,
         } => (None, Some(runtime_id.as_str()), Some(worker_id.as_str())),
+        TicketAssignmentPrincipal::Subject { subject_id } => {
+            (Some(subject_id.as_str()), None, None)
+        }
         TicketAssignmentPrincipal::WorkspaceAgent { agent_key } => {
             (Some(agent_key.as_str()), None, None)
         }
@@ -15154,8 +16667,13 @@ fn migrate_ticket_cases_v90_to_v91(conn: &Connection) -> Result<()> {
     // closure reasons and immutable case history. It opens its own transaction.
     // Leave the Workspace marker at 90 until our composed constraints commit;
     // a failed second phase is resumable through the idempotent domain migrator.
-    ticket::migrate_sqlite_ticket_schema(conn)
-        .map_err(|error| Error::Store(format!("Ticket case migration failed: {error}")))?;
+    let component = conn.unchecked_transaction()?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &component,
+        ticket::HistoricalTicketSchemaTarget::Cases10,
+    )
+    .map_err(|error| Error::Store(format!("Ticket case migration failed: {error}")))?;
+    component.commit()?;
     let invalid: i64 = conn.query_row(
         "SELECT COUNT(*) FROM typed_tickets WHERE workflow_state NOT IN ('open', 'closed')",
         [],
@@ -15201,8 +16719,11 @@ fn migrate_ticket_tracking_v91_to_v92(conn: &Connection) -> Result<()> {
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|error| Error::Store(error.to_string()))?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Tracking11,
+    )
+    .map_err(|error| Error::Store(error.to_string()))?;
     tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES (92, 'Ticket-owned assignment tracking')", [])?;
     verify_workspace_resource_constraints(&tx)?;
     tx.commit()?;
@@ -15229,8 +16750,11 @@ fn migrate_ticket_posts_v93_to_v94(conn: &Connection) -> Result<()> {
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|error| Error::Store(format!("Ticket posts migration failed: {error}")))?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Posts12,
+    )
+    .map_err(|error| Error::Store(format!("Ticket posts migration failed: {error}")))?;
     assignment_delivery::install_post_inputs(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(94,'Canonical Ticket posts')",
@@ -15257,8 +16781,11 @@ fn migrate_notification_routing_v94_to_v95(conn: &Connection) -> Result<()> {
         ));
     }
     let tx = conn.unchecked_transaction()?;
-    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
-        .map_err(|e| Error::Store(format!("Ticket content facts migration failed: {e}")))?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Content13,
+    )
+    .map_err(|e| Error::Store(format!("Ticket content facts migration failed: {e}")))?;
     notification_routing::install(&tx)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(95,?1)",
@@ -15530,27 +17057,438 @@ fn migrate_hosting_policy_v98_to_v99(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_subject_assignments_v107_to_v108(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 107 {
+        return Err(Error::Store(
+            "Subject assignment migration requires schema 107".into(),
+        ));
+    }
+    // Refuse preexisting drift before the new tail can commit any changes.
+    // Migration 107 and its historical identity remain frozen.
+    verify_schema_history(conn, 107)?;
+    crate::plugin_catalog::verify(conn)?;
+    crate::plugin_plan::verify_plan_schema(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    subject_assignment_migration::install(&tx)?;
+    notification_routing::install_subject_recipients(&tx)?;
+    subject_assignment_migration::verify(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(108,?1)",
+        ["Subject Ticket responsibility and current-body notification routing"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_plugin_data_schema(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
+    expected.execute_batch(crate::plugin_data::SCHEMA_SQL)?;
+    let mut query = expected.prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND (name LIKE 'plugin_data_%' OR name='plugin_effect_data_collision') ORDER BY name")?;
+    for item in query.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (name, sql) = item?;
+        let actual: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [&name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(&sql) {
+            return Err(Error::Store(format!(
+                "Plugin extension-data schema has drifted: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_plugin_services_v111_to_v112(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 111 {
+        return Err(Error::Store("Service migration requires schema 111".into()));
+    }
+    verify_schema_history(conn, 111)?;
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::Outbox15,
+    )
+    .map_err(|e| Error::Store(format!("Ticket outbox migration failed: {e}")))?;
+    tx.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
+    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(112,'Ticket Service outbox and fenced consumers')",[])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_worker_create_failure_schema(conn: &Connection) -> Result<()> {
+    storage_formats::verify_startup_shape(conn)
+}
+
+fn migrate_worker_create_failure_to_v124(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 123 {
+        return Err(Error::Store(
+            "Worker create failure migration requires schema 123".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 123)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(124,?1)",
+        [WORKER_CREATE_FAILURE_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+// Retain the two actually published source receipts. They are alternatives to,
+// not aliases for, Startup-124 / Job-125 / Service-126.
+const RETAINED_FAILURE_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 127,
+        name: journal_removal_store::RETAINED_BRIDGE_NAME,
+        apply: journal_removal_store::migrate_retained_to_v127,
+    },
+    Migration {
+        version: 125,
+        name: SERVICE_OUTCOME_MIGRATION_NAME,
+        apply: migrate_retained_service_outcomes_to_v125,
+    },
+    Migration {
+        version: 126,
+        name: RETAINED_STARTUP_MIGRATION_NAME,
+        apply: migrate_retained_startup_to_v126,
+    },
+];
+
+fn migrate_failure_extension(
+    conn: &Connection,
+    previous: i64,
+    version: i64,
+    name: &str,
+    sql: &str,
+) -> Result<()> {
+    if current_schema_version(conn)? != previous {
+        return Err(Error::Store(format!(
+            "failure migration requires schema {previous}"
+        )));
+    }
+    storage_formats::verify_history(conn, previous)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(sql)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+        params![version, name],
+    )?;
+    storage_formats::verify_history(&tx, version)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_backend_job_causes_v124_to_v125(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        124,
+        125,
+        backend_job_recovery_store::CAUSE_MIGRATION_NAME,
+        backend_job_recovery_store::CAUSE_SCHEMA,
+    )
+}
+
+fn migrate_plugin_service_outcomes_v125_to_v126(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        125,
+        126,
+        SERVICE_OUTCOME_MIGRATION_NAME,
+        crate::plugin_service::FAILURE_MIGRATION_SQL,
+    )
+}
+
+// These observations share a new extension receipt, not either domain's result
+// authority. Both DDL sets and the receipt commit together after Ticket Plan retirement.
+fn migrate_domain_failure_observations_to_v129(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        128,
+        129,
+        DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME,
+        &format!(
+            "{}\n{}",
+            crate::config_publication::SCHEMA,
+            crate::external_workdir_connection_observations::SCHEMA
+        ),
+    )
+}
+
+fn migrate_retained_service_outcomes_to_v125(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        124,
+        125,
+        SERVICE_OUTCOME_MIGRATION_NAME,
+        crate::plugin_service::FAILURE_MIGRATION_SQL,
+    )
+}
+
+fn migrate_retained_startup_to_v126(conn: &Connection) -> Result<()> {
+    migrate_failure_extension(
+        conn,
+        125,
+        126,
+        RETAINED_STARTUP_MIGRATION_NAME,
+        include_str!("worker_create_failure_schema.sql"),
+    )
+}
+
+fn migrate_backend_job_execution_to_v123(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 122 {
+        return Err(Error::Store(
+            "Backend Job execution migration requires schema 122".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 122)?;
+    let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let migration = (|| -> Result<()> {
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+        backend_job_upgrade::install(&tx)?;
+        tx.execute(
+            "INSERT INTO __yoi_schema_migrations(version,name) VALUES(123,?1)",
+            [backend_job_upgrade::MIGRATION_NAME],
+        )?;
+        storage_formats::verify_history(&tx, 123)?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restore = conn
+        .execute_batch(if foreign_keys {
+            "PRAGMA foreign_keys=ON;"
+        } else {
+            "PRAGMA foreign_keys=OFF;"
+        })
+        .map_err(Error::from);
+    migration.and(restore)
+}
+
+fn migrate_configuration_adoption_to_v122(conn: &Connection) -> Result<()> {
+    let current = current_schema_version(conn)?;
+    if !(113..=121).contains(&current) {
+        return Err(Error::Store(
+            "Configuration adoption migration requires a recognized schema 113..121".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, current)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(content_history_store::SCHEMA)?;
+    tx.execute_batch(crate::config_adoption::SCHEMA)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(122,?1)",
+        [crate::config_adoption::MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_ticket_plan_retirement_v127_to_v128(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 127 {
+        return Err(Error::Store(
+            "Ticket Plan retirement migration requires schema 127".into(),
+        ));
+    }
+    storage_formats::verify_history(conn, 127)?;
+    let tx = conn.unchecked_transaction()?;
+    ticket::migrate_sqlite_ticket_schema_in_transaction(&tx)
+        .map_err(|error| Error::Store(format!("Ticket Plan retirement failed: {error}")))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(128,?1)",
+        [TICKET_PLAN_RETIREMENT_MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_ticket_parents_v112_to_v113(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 112 {
+        return Err(Error::Store(
+            "Ticket parent migration requires schema 112".into(),
+        ));
+    }
+    verify_schema_history(conn, 112)?;
+    let tx = conn.unchecked_transaction()?;
+    // Published host-113 stops at Ticket16. Ticket17 belongs to host-128.
+    ticket::migrate_historical_sqlite_ticket_schema_in_transaction(
+        &tx,
+        ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+    )
+    .map_err(|e| Error::Store(format!("Ticket parent migration failed: {e}")))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(113,?1)",
+        ["Ticket work-decomposition parent links"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn verify_plugin_service_schema(conn: &Connection) -> Result<()> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
+    expected.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
+    let mut stmt = expected
+        .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")?;
+    for entry in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (name, sql) = entry?;
+        let actual: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [&name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if actual.as_deref() != Some(&sql) {
+            return Err(Error::Store("Plugin Service schema has drifted".into()));
+        }
+    }
+    Ok(())
+}
+
+fn migrate_plugin_data_v110_to_v111(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 110 {
+        return Err(Error::Store(
+            "Plugin extension-data migration requires schema 110".into(),
+        ));
+    }
+    verify_schema_history(conn, 110)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_data::REFERENCE_MIGRATION_SQL)?;
+    tx.execute_batch(crate::plugin_data::SCHEMA_SQL)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(111,?1)",
+        ["Typed Plugin Ticket extension data and atomic mutation receipts"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_plugin_launches_v109_to_v110(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 109 {
+        return Err(Error::Store(
+            "Plugin launch migration requires schema 109".into(),
+        ));
+    }
+    verify_schema_history(conn, 109)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_plan::LAUNCH_SCHEMA_SQL)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(110,?1)",
+        ["Worker Plugin launch selection associations"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_plugin_receipts_v108_to_v109(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 108 {
+        return Err(Error::Store(
+            "Plugin receipt migration requires schema 108".into(),
+        ));
+    }
+    verify_schema_history(conn, 108)?;
+    crate::plugin_catalog::verify(conn)?;
+    crate::plugin_plan::verify_plan_schema(conn)?;
+    subject_assignment_migration::verify(conn)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
+    crate::plugin_host::verify_receipt_schema(&tx)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(109,?1)",
+        ["Durable Plugin Host invocations and HTTPS effect receipts"],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure(conn)?;
+    create_workspace_schema_prefix(conn, include_str!("latest_schema.sql"))?;
+    conn.execute_batch(content_history_store::SCHEMA)?;
+    conn.execute_batch(crate::config_adoption::SCHEMA)?;
+    backend_job_upgrade::install_fresh(conn)?;
+    conn.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
+    verify_worker_create_failure_schema(conn)?;
+    conn.execute_batch(backend_job_recovery_store::CAUSE_SCHEMA)?;
+    conn.execute_batch(crate::plugin_service::FAILURE_MIGRATION_SQL)?;
+    conn.execute_batch(journal_removal_store::SCHEMA_SQL)?;
+    conn.execute_batch(crate::config_publication::SCHEMA)?;
+    conn.execute_batch(crate::external_workdir_connection_observations::SCHEMA)?;
+    ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
+        Error::Store(format!("fresh Ticket schema verification failed: {error}"))
+    })?;
+    Ok(())
+}
+
+// Historical builders must retain Ticket16 and its old Plan table. Do not
+// redirect this prefix to the evolving fresh baseline.
+fn create_workspace_schema_through_v113(conn: &Connection) -> Result<()> {
+    create_workspace_schema_prefix(conn, include_str!("frozen_schema_v113.sql"))
+}
+
+fn create_workspace_schema_prefix(conn: &Connection, schema_sql: &str) -> Result<()> {
+    create_workspace_schema_structure(conn, schema_sql)?;
     assignment_delivery::install(conn)?;
     assignment_delivery::install_post_inputs(conn)?;
     notification_routing::install(conn)?;
     notification_routing::jobs::install(conn)?;
     notification_routing::install_business_events(conn)?;
     notification_routing::upgrade_result_reports(conn)?;
-    ticket::verify_sqlite_ticket_schema(conn).map_err(|error| {
+    subject_deletion_store::install_notification_erasure(conn)?;
+    subject_assignment_migration::install(conn)?;
+    notification_routing::install_subject_recipients(conn)?;
+    ticket::verify_historical_sqlite_ticket_schema(
+        conn,
+        ticket::HistoricalTicketSchemaTarget::ParentLinks16,
+    )
+    .map_err(|error| {
         Error::Store(format!(
-            "fresh Workspace Ticket schema verification failed: {error}"
+            "Workspace Ticket schema boundary verification failed: {error}"
         ))
     })
 }
 
+fn migrate_plugin_plans_v106_to_v107(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 106 {
+        return Err(Error::Store(
+            "Plugin plan migration requires schema 106".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
+    tx.execute("INSERT INTO __yoi_schema_migrations(version,name) VALUES(107,'Immutable Worker Plugin plans and retained pins')", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
 // Fresh composition uses the posts contract. Retained fixtures pass frozen host
 // and component DDL to the shared cross-domain constraint composition below.
-fn create_workspace_schema_structure(conn: &Connection) -> Result<()> {
-    create_workspace_schema_structure_from_sql(conn, include_str!("latest_schema.sql"), true)?;
+fn create_workspace_schema_structure(conn: &Connection, schema_sql: &str) -> Result<()> {
+    // The pre-124 reference composition must not already contain the column
+    // added by migration 124. Fresh latest creation installs it after this prefix.
+    let retained_schema = backend_job_upgrade::retained_checks(schema_sql)
+        .replace(
+            "            startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR\n                (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),\n",
+            "",
+        );
+    create_workspace_schema_structure_from_sql(conn, &retained_schema, true)?;
     conn.execute_batch(include_str!("activation_schema.sql"))?;
     conn.execute_batch(include_str!("passkey_results_schema.sql"))?;
+    conn.execute_batch(crate::plugin_plan::SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_receipt::SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_plan::LAUNCH_SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_data::REFERENCE_MIGRATION_SQL)?;
+    conn.execute_batch(crate::plugin_data::SCHEMA_SQL)?;
+    conn.execute_batch(crate::plugin_service::SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -15576,10 +17514,21 @@ fn create_workspace_schema_structure_from_sql(
     CREATE UNIQUE INDEX worker_restore_intent_pending_domain ON worker_restore_intents(workspace_id,runtime_id,worker_id,domain_key) WHERE settled=0;")?;
 
     conn.execute_batch("DROP TABLE IF EXISTS typed_ticket_targets;")?;
-    conn.execute_batch(&schema_sql.replace(
-        "-- Ticket-owned assignment schema is composed by store.rs.",
-        ticket::TICKET_ASSIGNMENT_SCHEMA_SQL,
-    ))?;
+    conn.execute_batch(
+        &schema_sql
+            .replace(
+                "-- Plugin catalog schema is composed by store.rs.",
+                include_str!("plugin_catalog_schema.sql"),
+            )
+            .replace(
+                "-- Ticket-owned assignment schema is composed by store.rs.",
+                ticket::TICKET_ASSIGNMENT_SCHEMA_SQL,
+            )
+            .replace(
+                "-- Subject deletion schema is composed by store.rs.",
+                include_str!("subject_deletion_schema.sql"),
+            ),
+    )?;
     let composed_sql = r#"
         ALTER TABLE typed_tickets RENAME TO typed_tickets_legacy_v66;
         CREATE TABLE typed_tickets (
@@ -15801,6 +17750,9 @@ fn verify_workspace_resource_constraints(conn: &Connection) -> Result<()> {
     }
     if current_schema_version(conn)? >= 96 {
         notification_routing::jobs::verify(conn)?;
+    }
+    if current_schema_version(conn)? >= 105 {
+        subject_deletion_store::verify(conn)?;
     }
     Ok(())
 }
@@ -16213,10 +18165,13 @@ fn current_worker_singleton_owner(
     let owner = conn
         .query_row(
             "SELECT owner.runtime_id, owner.worker_id, owner.generation, \
-                    CASE WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
+                    CASE WHEN reservation.state='removed' AND EXISTS(SELECT 1 FROM subject_deletion_removals d WHERE d.workspace_id=owner.workspace_id AND d.runtime_id=owner.runtime_id AND d.worker_id=owner.worker_id AND owner.singleton_key IN ('subjektiv:'||d.subject_id,'subjektiv-consolidation:'||d.subject_id)) THEN 'created' \
+                    WHEN substr(owner.singleton_key,1,10)='subjektiv:' AND reservation.state='removed' \
                       AND NOT EXISTS(SELECT 1 FROM subject_worker_releases r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.completed=1) \
                       AND NOT EXISTS(SELECT 1 FROM subject_create_recoveries r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.singleton_key=owner.singleton_key AND r.singleton_generation=owner.generation AND r.create_fingerprint=reservation.create_fingerprint AND r.completed=1) \
-                    AND NOT EXISTS(SELECT 1 FROM worker_removal_operations r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.state='succeeded') THEN 'created' ELSE reservation.state END \
+                    AND NOT EXISTS(SELECT 1 FROM worker_removal_operations r WHERE r.workspace_id=owner.workspace_id AND r.worker_id=owner.worker_id AND r.runtime_id=owner.runtime_id AND r.state='succeeded') \
+                      AND NOT EXISTS(SELECT 1 FROM subject_deletion_workers d WHERE d.workspace_id=owner.workspace_id AND d.runtime_id=owner.runtime_id AND d.worker_id=owner.worker_id AND owner.singleton_key='subjektiv:'||d.subject_id AND d.originals_absent=1) \
+                    THEN 'created' ELSE reservation.state END \
              FROM worker_singleton_owners owner \
              LEFT JOIN worker_create_reservations reservation \
                ON reservation.workspace_id = owner.workspace_id \
@@ -16234,7 +18189,15 @@ fn current_worker_singleton_owner(
         )
         .optional()?;
     owner
-        .map(|(runtime_id, worker_id, generation, state)| {
+        .map(|(runtime_id, worker_id, generation, mut state)| {
+            let worker = RuntimeWorkerRef::new(runtime_id, worker_id);
+            if let Some(subject) = singleton_key.strip_prefix("subjektiv:").or_else(|| singleton_key.strip_prefix("subjektiv-consolidation:"))
+                && state.as_deref() == Some("created")
+                && subject_deletion_store::completed_removal_matches(conn, workspace_id, subject, &worker)?
+            {
+                let removed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM worker_create_reservations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state='removed')",params![workspace_id,worker.runtime_id,worker.worker_id],|r|r.get(0))?;
+                if removed { state = Some("removed".into()); }
+            }
             let generation = generation.try_into().map_err(|_| {
                 Error::Store(format!(
                     "Worker singleton key {singleton_key:?} has an invalid generation"
@@ -16244,7 +18207,7 @@ fn current_worker_singleton_owner(
                 WorkerSingletonLease {
                     key: singleton_key.to_string(),
                     generation,
-                    worker: RuntimeWorkerRef::new(runtime_id, worker_id),
+                    worker,
                 },
                 state,
             ))
@@ -16402,6 +18365,9 @@ fn workspace_schema_migration_history(conn: &Connection) -> Result<Vec<(i64, Str
 }
 
 fn verify_schema_history(conn: &Connection, current: i64) -> Result<()> {
+    if current > 113 {
+        return storage_formats::verify_history(conn, current);
+    }
     let rows = workspace_schema_migration_history(conn)?;
     let Some((baseline_version, baseline_name)) = rows.first() else {
         return Err(Error::Store(format!(
@@ -16445,6 +18411,9 @@ fn verify_schema_history(conn: &Connection, current: i64) -> Result<()> {
 
 fn workspace_schema_migration_plan(conn: &Connection) -> Result<WorkspaceSchemaMigrationPlan> {
     let current = current_schema_version(conn)?;
+    if let Some(plan) = storage_formats::published_plan(conn, current)? {
+        return Ok(plan);
+    }
     if current > LATEST_SCHEMA_VERSION {
         return Err(Error::Store(format!(
             "database schema version {current} is newer than this server supports ({LATEST_SCHEMA_VERSION}); refusing to serve with an older binary"
@@ -16456,7 +18425,7 @@ fn workspace_schema_migration_plan(conn: &Connection) -> Result<WorkspaceSchemaM
         )));
     }
     if current != 0 {
-        verify_schema_history(conn, current)?;
+        storage_formats::verify_history(conn, current)?;
     }
 
     let migrations = if current == 0 {
@@ -16550,7 +18519,8 @@ fn apply_migrations_with_secret_source(
         for step in &plan.migrations {
             let migration = MIGRATIONS
                 .iter()
-                .find(|migration| migration.version == step.version)
+                .chain(RETAINED_FAILURE_MIGRATIONS.iter())
+                .find(|migration| migration.version == step.version && migration.name == step.name)
                 .ok_or_else(|| {
                     Error::Store(format!(
                         "migration implementation for schema version {} is missing",
@@ -16565,7 +18535,14 @@ fn apply_migrations_with_secret_source(
         }
     }
 
-    verify_schema_history(conn, LATEST_SCHEMA_VERSION)?;
+    storage_formats::verify_history(conn, current_schema_version(conn)?)?;
+    crate::plugin_catalog::verify_with_data(conn)?;
+    verify_plugin_data_schema(conn)?;
+    verify_plugin_service_schema(conn)?;
+    crate::plugin_plan::verify_plan_schema(conn)?;
+    crate::plugin_host::verify_receipt_schema(conn)?;
+    crate::plugin_plan::verify_launch_schema(conn)?;
+    subject_assignment_migration::verify(conn)?;
     verify_workspace_runtime_binding_schema(conn)?;
     verify_workspace_runtime_verification_schema(conn)?;
     verify_workspace_deletion_schema(conn)?;
@@ -16595,18 +18572,86 @@ fn table_columns(conn: &Connection, table_name: &str) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+#[path = "storage_owner_tests.rs"]
+mod storage_owner_tests;
+
+#[cfg(test)]
+#[path = "combined_failure_migration_tests.rs"]
+mod combined_failure_migration_tests;
+
+#[cfg(test)]
+#[path = "worker_create_failure_store_tests.rs"]
+mod worker_create_failure_store_tests;
+
+#[cfg(test)]
 #[path = "store_test_support.rs"]
 mod test_support;
+
+#[cfg(test)]
+pub(crate) fn prepare_retained_test_schema(path: &std::path::Path, version: i64) {
+    tests::prepare_retained_schema(path, version);
+}
 
 #[cfg(test)]
 mod tests {
     include!("assignment_tracking_tests.rs");
     include!("assignment_delivery_tests.rs");
+    include!("subject_assignment_migration_tests.rs");
     include!("notification_routing_tests.rs");
     include!("notification_diagnostics_tests.rs");
     include!("job_notification_tests.rs");
     include!("implementation_result_tests.rs");
     include!("store_workspace_config_tests.rs");
+    include!("plugin_plan/launch_migration_tests.rs");
+
+    #[test]
+    fn reserved_authority_reader_rejects_writes_and_retains_fence_until_last_clone_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let reader = store.subject_authority_reader().unwrap();
+        assert!(
+            reader
+                .with_conn(|connection| {
+                    connection.execute_batch("CREATE TABLE unauthorized_effect(value TEXT)")?;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(reader.with_conn_mut(|_| Ok(())).is_err());
+        assert!(reader.drive_authority(&path).is_err());
+        assert!(reader.subject_authority_reader().is_err());
+        let clone = reader.clone();
+        drop(reader);
+        clone
+            .with_conn(|connection| {
+                assert_eq!(
+                    connection.query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name='unauthorized_effect'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let error = writer.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        drop(clone);
+        writer.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert!(
+            SqliteWorkspaceStore::in_memory_for_test()
+                .unwrap()
+                .subject_authority_reader()
+                .is_err()
+        );
+    }
 
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
         store.with_conn(|c| {
@@ -17332,18 +19377,29 @@ mod tests {
                 .map_err(Error::from)
             })
             .unwrap();
-        assert_eq!(cleanup_after_fence, ("pending".to_string(), None));
+        assert_eq!(cleanup_after_fence.0, "pending");
+        assert!(cleanup_after_fence.1.is_some());
+        let intent = store
+            .external_workdir_cleanup_intent("workspace-a", "grant-a")
+            .unwrap()
+            .unwrap();
+        assert!(intent.failures().is_empty());
         assert!(
             store
-                .update_external_workdir_cleanup_state(
-                    "workspace-a",
-                    "grant-a",
-                    "retry_required",
-                    Some("attachment_release_failed"),
-                    "2026-01-01T00:00:08Z",
-                )
+                .external_workdir_cleanup_operation("workspace-a", "grant-a")
                 .unwrap()
+                .is_none()
         );
+        assert!(matches!(
+            store.update_external_workdir_cleanup_state(
+                "workspace-a",
+                "grant-a",
+                "retry_required",
+                Some("attachment_release_failed"),
+                "2026-01-01T00:00:08Z",
+            ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
         let cleanup_retry = store
             .with_conn(|conn| {
                 conn.query_row(
@@ -17354,13 +19410,7 @@ mod tests {
                 .map_err(Error::from)
             })
             .unwrap();
-        assert_eq!(
-            cleanup_retry,
-            (
-                "retry_required".to_string(),
-                Some("attachment_release_failed".to_string())
-            )
-        );
+        assert_eq!(cleanup_retry, cleanup_after_fence);
         assert!(
             !store
                 .activate_external_workdir_grant(
@@ -17371,6 +19421,642 @@ mod tests {
                     "2026-01-01T00:00:08Z",
                 )
                 .unwrap()
+        );
+    }
+
+    // Store component coverage: real schema, grant fencing, link lifetimes and
+    // transactions. SQL only seeds identity and injects competing writes/faults;
+    // these tests do not claim Runtime or session-close integration coverage.
+    struct CleanupStoreFixture {
+        store: SqliteWorkspaceStore,
+        request: crate::grant_cleanup_operation::CleanupRequest,
+        link: WorkerWorkdirLinkRecord,
+    }
+
+    impl CleanupStoreFixture {
+        fn new() -> Self {
+            let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
+            store.with_conn(|conn| {
+                conn.execute_batch(
+                    "INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
+                     VALUES('cleanup-owner','user','cleanup-owner','Owner','1','1');
+                     INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+                     VALUES('cleanup-ws','cleanup-owner','Cleanup','active','1','1');
+                     INSERT INTO worker_registry(workspace_id,runtime_id,worker_id,display_name,retention_state,created_at,updated_at)
+                     VALUES('cleanup-ws','runtime-a','00000000-0000-7000-8000-000000000001','Worker','normal','1','1');",
+                )?;
+                Ok(())
+            }).unwrap();
+            for (grant_id, workdir_id) in [("grant-a", "external-a"), ("grant-b", "external-b")] {
+                store
+                    .create_external_workdir_grant(
+                        &ExternalWorkdirGrantRecord {
+                            grant_id: grant_id.into(),
+                            workspace_id: "cleanup-ws".into(),
+                            workdir_id: workdir_id.into(),
+                            provider_instance_id: "provider-a".into(),
+                            display_name: "External".into(),
+                            permissions: "read_write".into(),
+                            created_by: "cleanup-owner".into(),
+                            created_at: "1".into(),
+                            expires_at: None,
+                            generation: 1,
+                            status: "pending".into(),
+                            updated_at: "1".into(),
+                        },
+                        &WorkdirRegistryRecord {
+                            workspace_id: "cleanup-ws".into(),
+                            workdir_id: workdir_id.into(),
+                            display_name: None,
+                            source: WorkdirRegistrySource::ExternalGrant {
+                                grant_id: grant_id.into(),
+                            },
+                            creation_selector: None,
+                            creation_ref: None,
+                            creation_tree: None,
+                            current_selector: None,
+                            current_ref: None,
+                            current_tree: None,
+                            observed_at_epoch_seconds: None,
+                            materialization_status: "pending".into(),
+                            cleanliness: "unknown".into(),
+                            created_at: "1".into(),
+                            updated_at: "1".into(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let link = store
+                .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+                    workspace_id: "cleanup-ws".into(),
+                    worker: RuntimeWorkerRef::new(
+                        "runtime-a",
+                        "00000000-0000-7000-8000-000000000001",
+                    ),
+                    workdir_id: "external-a".into(),
+                    alias: "external".into(),
+                    capabilities: workdir::WorkdirSessionCapabilities::READ_WRITE,
+                    linked_at: "2".into(),
+                    unlinked_at: None,
+                    connection_id: String::new(),
+                })
+                .unwrap();
+            assert!(
+                store
+                    .update_external_workdir_grant_state(
+                        "cleanup-ws",
+                        "grant-a",
+                        "provider-a",
+                        1,
+                        "revoked",
+                        "3",
+                    )
+                    .unwrap()
+            );
+            let request = crate::grant_cleanup_operation::CleanupRequest {
+                operation_id: "cleanup-operation".into(),
+                workspace_id: "cleanup-ws".into(),
+                grant_id: "grant-a".into(),
+                provider_instance_id: "provider-a".into(),
+                grant_generation: 1,
+                working_directory_id: "external-a".into(),
+                target: Some(crate::grant_cleanup_operation::CleanupRuntimeTarget {
+                    worker: link.worker.clone(),
+                    connection_id: link.connection_id.clone(),
+                    alias: link.alias.clone(),
+                    expected_generation: "runtime-generation-before".into(),
+                    logical_workdir_attachments: Vec::new(),
+                }),
+            };
+            Self {
+                store,
+                request,
+                link,
+            }
+        }
+
+        fn admit(&self) -> crate::grant_cleanup_operation::LoadedCleanupOperation {
+            match self
+                .store
+                .begin_external_workdir_cleanup_operation(&self.request, &[], "4")
+                .unwrap()
+            {
+                crate::grant_cleanup_operation::CleanupAdmission::Admitted(owner) => owner,
+                crate::grant_cleanup_operation::CleanupAdmission::Existing(_) => {
+                    panic!("already admitted")
+                }
+            }
+        }
+
+        fn snapshot(&self) -> (String, Option<String>, Option<String>) {
+            self.store.with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT cleanup_state,cleanup_error,cleanup_updated_at FROM external_workdir_grants
+                     WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?)
+            }).unwrap()
+        }
+
+        fn detach(&self) {
+            self.store
+                .detach_worker_workdir_connection(
+                    &self.link.workspace_id,
+                    &self.link.worker,
+                    &self.link.alias,
+                    &self.link.connection_id,
+                    "5",
+                )
+                .unwrap();
+        }
+    }
+
+    fn cleanup_store_failure(
+        reason: workdir::management_failure::WorkdirManagementReason,
+    ) -> protocol::background_failure::BackgroundFailure {
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementVisibility,
+        };
+        let facts = error_contract::FailureFacts::new(WorkdirManagementFailure {
+            operation: WorkdirManagementOperation::GrantRevoke,
+            reason,
+        })
+        .unwrap();
+        let projected = error_contract::project_failure::<error_contract::Storage, _>(
+            &facts,
+            &WorkdirManagementVisibility {
+                can_view_cause: true,
+            },
+        )
+        .unwrap();
+        protocol::background_failure::BackgroundFailure::from_projected(&projected).unwrap()
+    }
+
+    #[test]
+    fn external_workdir_cleanup_intent_exact_preimage_rejects_stale_appends() {
+        use protocol::background_failure::StoredFailure;
+        use workdir::management_failure::WorkdirManagementReason as Reason;
+        let fixture = CleanupStoreFixture::new();
+        let intent = fixture
+            .store
+            .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+            .unwrap()
+            .unwrap();
+        let failure = cleanup_store_failure(Reason::GrantAuditFailed);
+        let saved = fixture
+            .store
+            .append_external_workdir_cleanup_intent_failures(
+                &intent,
+                std::slice::from_ref(&failure),
+                "same-time",
+            )
+            .unwrap();
+        let snapshot = fixture.snapshot();
+        assert!(matches!(
+            fixture
+                .store
+                .append_external_workdir_cleanup_intent_failures(
+                    &intent,
+                    std::slice::from_ref(&failure),
+                    "same-time",
+                ),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(fixture.snapshot(), snapshot);
+        assert_eq!(
+            saved.failures(),
+            vec![StoredFailure::from_storage(failure.as_storage_str().into())]
+        );
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+                .unwrap()
+                .unwrap()
+                .failures(),
+            saved.failures()
+        );
+        assert_eq!(snapshot.0, "pending");
+        assert!(
+            fixture
+                .store
+                .external_workdir_cleanup_operation("cleanup-ws", "grant-a")
+                .unwrap()
+                .is_none()
+        );
+        let debug = format!("{saved:?}");
+        assert!(!debug.contains("cleanup-ws"));
+        assert!(!debug.contains(failure.as_storage_str()));
+
+        // Semantic equality is not an exact committed preimage.
+        fixture.store.with_conn(|conn| {
+            conn.execute("UPDATE external_workdir_grants SET cleanup_error=cleanup_error || ' ' WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'", [])?;
+            Ok(())
+        }).unwrap();
+        let reformatted = fixture.snapshot();
+        assert!(matches!(
+            fixture
+                .store
+                .append_external_workdir_cleanup_intent_failures(&saved, &[failure], "same-time",),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(fixture.snapshot(), reformatted);
+        assert!(
+            fixture
+                .store
+                .external_workdir_cleanup_intent("other-workspace", "grant-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn external_workdir_cleanup_intent_failures_survive_begin_without_dispatch_authority() {
+        use protocol::background_failure::StoredFailure;
+        use workdir::management_failure::WorkdirManagementReason as Reason;
+        let fixture = CleanupStoreFixture::new();
+        let intent = fixture
+            .store
+            .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+            .unwrap()
+            .unwrap();
+        let audit = cleanup_store_failure(Reason::GrantAuditFailed);
+        let generation = cleanup_store_failure(Reason::GrantAttachmentReleaseFailed);
+        let intent = fixture
+            .store
+            .append_external_workdir_cleanup_intent_failures(
+                &intent,
+                std::slice::from_ref(&audit),
+                "4",
+            )
+            .unwrap();
+        let owner = match fixture
+            .store
+            .begin_external_workdir_cleanup_operation(
+                &fixture.request,
+                std::slice::from_ref(&generation),
+                "4",
+            )
+            .unwrap()
+        {
+            crate::grant_cleanup_operation::CleanupAdmission::Admitted(owner) => owner,
+            _ => panic!("fresh intent must admit once"),
+        };
+        assert_eq!(
+            owner.operation().failures(),
+            vec![
+                StoredFailure::from_storage(audit.as_storage_str().into()),
+                StoredFailure::from_storage(generation.as_storage_str().into()),
+            ]
+        );
+        assert!(!owner.operation().release_confirmed);
+        assert!(!owner.operation().runtime_dispatched);
+        assert_eq!(owner.operation().runtime_status, None);
+        assert!(!owner.operation().settled);
+        let snapshot = fixture.snapshot();
+        assert!(matches!(
+            fixture
+                .store
+                .append_external_workdir_cleanup_intent_failures(&intent, &[audit], "4",),
+            Err(Error::WorkdirAttachmentConflict(_))
+        ));
+        assert_eq!(fixture.snapshot(), snapshot);
+        assert!(
+            fixture
+                .store
+                .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_observation("cleanup-ws", "grant-a")
+                .unwrap()
+                .1,
+            owner.operation().failures()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_operation("cleanup-ws", "grant-a")
+                .unwrap()
+                .unwrap()
+                .operation(),
+            owner.operation()
+        );
+    }
+
+    #[test]
+    fn external_workdir_cleanup_intent_rejects_changed_grant_binding() {
+        for change in [
+            "provider_instance_id='provider-b'",
+            "generation=2",
+            "status='offline'",
+        ] {
+            let fixture = CleanupStoreFixture::new();
+            let intent = fixture
+                .store
+                .external_workdir_cleanup_intent("cleanup-ws", "grant-a")
+                .unwrap()
+                .unwrap();
+            fixture.store.with_conn(|conn| {
+                conn.execute(&format!("UPDATE external_workdir_grants SET {change} WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'"), [])?;
+                Ok(())
+            }).unwrap();
+            let snapshot = fixture.snapshot();
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .append_external_workdir_cleanup_intent_failures(
+                        &intent,
+                        &[cleanup_store_failure(
+                            workdir::management_failure::WorkdirManagementReason::GrantAuditFailed
+                        )],
+                        "4",
+                    ),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .external_workdir_cleanup_intent("cleanup-ws", "grant-a"),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_release_rejects_detached_alias_and_connection_aba() {
+        for change in ["detached", "reused_alias", "reconnected"] {
+            let fixture = CleanupStoreFixture::new();
+            let owner = fixture.admit();
+            fixture
+                .store
+                .validate_external_workdir_cleanup_release(&owner)
+                .unwrap();
+            fixture.detach();
+            if change != "detached" {
+                let mut replacement = fixture.link.clone();
+                replacement.linked_at = "6".into();
+                if change == "reused_alias" {
+                    replacement.workdir_id = "external-b".into();
+                }
+                let replacement = fixture.store.attach_worker_workdir(&replacement).unwrap();
+                assert_ne!(replacement.connection_id, fixture.link.connection_id);
+            }
+            let snapshot = fixture.snapshot();
+            let links = fixture
+                .store
+                .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                .unwrap();
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .validate_external_workdir_cleanup_release(&owner),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .confirm_external_workdir_cleanup_release(&owner, "7"),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+            assert_eq!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap(),
+                links
+            );
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_release_rejects_stale_preimage_and_grant_binding() {
+        for change in [
+            "provider_instance_id='provider-b'",
+            "generation=2",
+            "status='offline'",
+            "diagnostic_append",
+        ] {
+            let fixture = CleanupStoreFixture::new();
+            let owner = fixture.admit();
+            if change == "diagnostic_append" {
+                fixture
+                    .store
+                    .append_external_workdir_cleanup_failures(
+                        &owner,
+                        &[cleanup_store_failure(
+                            workdir::management_failure::WorkdirManagementReason::GrantAuditFailed,
+                        )],
+                        "5",
+                    )
+                    .unwrap();
+            } else {
+                fixture.store.with_conn(|conn| {
+                    conn.execute(&format!("UPDATE external_workdir_grants SET {change} WHERE workspace_id='cleanup-ws' AND grant_id='grant-a'"), [])?;
+                    Ok(())
+                }).unwrap();
+            }
+            let snapshot = fixture.snapshot();
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .validate_external_workdir_cleanup_release(&owner),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .confirm_external_workdir_cleanup_release(&owner, "6"),
+                    Err(Error::WorkdirAttachmentConflict(_))
+                ),
+                "{change}"
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+            assert_eq!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap(),
+                vec![fixture.link]
+            );
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_release_confirmation_rolls_back_and_rejects_zero_unlinks() {
+        for trigger in [
+            "CREATE TEMP TRIGGER cleanup_fail BEFORE UPDATE OF cleanup_error ON external_workdir_grants BEGIN SELECT RAISE(FAIL,'injected cleanup persistence failure'); END;",
+            "CREATE TEMP TRIGGER cleanup_fail BEFORE UPDATE OF unlinked_at ON worker_workdir_links BEGIN SELECT RAISE(IGNORE); END;",
+        ] {
+            let fixture = CleanupStoreFixture::new();
+            let owner = fixture.admit();
+            fixture
+                .store
+                .validate_external_workdir_cleanup_release(&owner)
+                .unwrap();
+            let snapshot = fixture.snapshot();
+            fixture
+                .store
+                .with_conn(|conn| {
+                    conn.execute_batch(trigger)?;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                fixture
+                    .store
+                    .confirm_external_workdir_cleanup_release(&owner, "5")
+                    .is_err()
+            );
+            assert_eq!(fixture.snapshot(), snapshot);
+            assert_eq!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap(),
+                vec![fixture.link.clone()]
+            );
+            fixture
+                .store
+                .with_conn(|conn| {
+                    conn.execute_batch("DROP TRIGGER cleanup_fail;")?;
+                    Ok(())
+                })
+                .unwrap();
+            let released = fixture
+                .store
+                .confirm_external_workdir_cleanup_release(&owner, "6")
+                .unwrap();
+            assert!(released.operation().release_confirmed);
+            assert!(
+                fixture
+                    .store
+                    .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .external_workdir_cleanup_operation("cleanup-ws", "grant-a")
+                    .unwrap()
+                    .unwrap()
+                    .operation(),
+                released.operation()
+            );
+        }
+    }
+
+    #[test]
+    fn external_workdir_cleanup_released_operation_keeps_diagnostics_replay_and_receipt_settlement()
+    {
+        use crate::hosts::RuntimeOperationStatus;
+        let fixture = CleanupStoreFixture::new();
+        let owner = fixture.admit();
+        let released = fixture
+            .store
+            .confirm_external_workdir_cleanup_release(&owner, "5")
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .validate_external_workdir_cleanup_release(&released)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .list_worker_workdir_links("cleanup-ws", &fixture.link.worker)
+                .unwrap()
+                .is_empty()
+        );
+        let saved = fixture
+            .store
+            .append_external_workdir_cleanup_failures(
+                &released,
+                &[cleanup_store_failure(
+                    workdir::management_failure::WorkdirManagementReason::GrantAuditFailed,
+                )],
+                "6",
+            )
+            .unwrap();
+        let replay = match fixture
+            .store
+            .begin_external_workdir_cleanup_operation(&fixture.request, &[], "7")
+            .unwrap()
+        {
+            crate::grant_cleanup_operation::CleanupAdmission::Existing(owner) => owner,
+            _ => panic!("release replay must not admit a new owner"),
+        };
+        assert_eq!(replay.operation(), saved.operation());
+        assert!(replay.operation().release_confirmed);
+        let dispatched = fixture
+            .store
+            .mark_external_workdir_cleanup_runtime_dispatched(&replay, "8")
+            .unwrap();
+        let observed = fixture
+            .store
+            .record_external_workdir_cleanup_runtime_observation(
+                &dispatched,
+                RuntimeOperationStatus::Unknown,
+                &[],
+                "9",
+            )
+            .unwrap();
+        let worker_ref = runtime_api::WorkerRef {
+            worker_id: fixture.link.worker.worker_id.parse().unwrap(),
+        };
+        let request = fixture.request.runtime_request().unwrap();
+        let proof = runtime_api::WorkerWorkdirAttachmentsOperationObservation {
+            worker_ref: worker_ref.clone(),
+            request: request.clone(),
+            result: runtime_api::WorkerWorkdirAttachmentsOperationOutcome::Receipt {
+                receipt: runtime_api::WorkerWorkdirAttachmentsOperationReceipt {
+                    worker_ref,
+                    request,
+                    resulting_generation: "runtime-generation-after".into(),
+                },
+            },
+            current_generation: Some("runtime-generation-after".into()),
+        };
+        let settled = fixture
+            .store
+            .settle_external_workdir_cleanup_operation(&observed, Some(&proof), "10")
+            .unwrap();
+        assert!(settled.operation().settled);
+        assert_eq!(
+            settled.operation().runtime_status,
+            Some(RuntimeOperationStatus::Unknown)
+        );
+        assert_eq!(settled.operation().failures(), saved.operation().failures());
+        assert_eq!(
+            fixture
+                .store
+                .external_workdir_cleanup_observation("cleanup-ws", "grant-a")
+                .unwrap(),
+            ("completed".into(), saved.operation().failures())
         );
     }
 
@@ -18178,9 +20864,19 @@ mod tests {
 
     #[test]
     fn current_schema_accepts_every_retained_canonical_provenance() {
-        for baseline_version in OLDEST_SCHEMA_VERSION..=LATEST_SCHEMA_VERSION {
+        for baseline_version in
+            (OLDEST_SCHEMA_VERSION..=113).chain(std::iter::once(LATEST_SCHEMA_VERSION))
+        {
             let conn = Connection::open_in_memory().unwrap();
             configure_sqlite(&conn).unwrap();
+            ticket::migrate_sqlite_ticket_schema(&conn).unwrap();
+            merge_request::migrate(&conn).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
+                .unwrap();
+            let transaction =
+                rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Exclusive)
+                    .unwrap();
+            create_latest_workspace_schema(&transaction).unwrap();
             conn.execute(
                 "INSERT INTO __yoi_schema_migrations(version, name) VALUES (?1, ?2)",
                 params![baseline_version, SCHEMA_BASELINE_NAME],
@@ -18196,6 +20892,7 @@ mod tests {
                 )
                 .unwrap();
             }
+            transaction.commit().unwrap();
             verify_schema_history(&conn, LATEST_SCHEMA_VERSION).unwrap();
         }
     }
@@ -18350,7 +21047,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
-            (83..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            (83..=113)
+                .chain([122, 123, 124, 125, 126, 127, 128, 129])
+                .collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let assignment = store
@@ -18846,7 +21545,11 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
     include!("schema_convergence_tests.rs");
     include!("ticket_tag_upgrade_tests.rs");
     include!("ticket_post_upgrade_tests.rs");
+    include!("ticket_plan_retirement_tests.rs");
     include!("migration_entrypoint_tests.rs");
+    include!("plugin_host_migration_tests.rs");
+    include!("plugin_data_migration_tests.rs");
+    include!("plugin_service_migration_tests.rs");
     include!("legacy_evidence_column_tests.rs");
 
     #[test]
@@ -19010,7 +21713,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         fixture.commit().unwrap();
     }
 
-    fn prepare_schema_v50(path: &Path, workspace_id: Option<&str>) {
+    pub(super) fn prepare_schema_v50(path: &Path, workspace_id: Option<&str>) {
         prepare_schema_v52(path);
         let conn = Connection::open(path).unwrap();
         configure_sqlite(&conn).unwrap();
@@ -19068,6 +21771,297 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         fixture.commit().unwrap();
     }
 
+    fn expected_retained_migration_chain() -> Vec<WorkspaceSchemaMigrationStep> {
+        vec![
+            WorkspaceSchemaMigrationStep {
+                version: 51,
+                name: WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 52,
+                name: RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 53,
+                name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 54,
+                name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 55,
+                name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 56,
+                name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 57,
+                name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 58,
+                name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 59,
+                name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 60,
+                name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 61,
+                name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 62,
+                name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 63,
+                name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 64,
+                name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 65,
+                name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 66,
+                name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 67,
+                name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 68,
+                name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 69,
+                name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 70,
+                name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 71,
+                name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 72,
+                name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 73,
+                name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 74,
+                name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 75,
+                name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 76,
+                name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 77,
+                name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 78,
+                name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 79,
+                name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 80,
+                name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 81,
+                name: "Backend Job immutable resource serialization".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 82,
+                name: "Ticket responsibility and unfinished work separation".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 83,
+                name: "Generic Ticket Worker roles and durable claims".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 84,
+                name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 85,
+                name: "content-addressed Flow sources".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 86,
+                name: "content-fenced config, Memory settings and Jobs".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 87,
+                name: "Repository SSH key identities and encrypted operation objects".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 88,
+                name: "Runtime binding identities and retention content contracts".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 89,
+                name: "descriptive legacy evidence columns".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 90,
+                name:
+                    "Runtime binding connection configuration and historical verification archive"
+                        .to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 91,
+                name: "Ticket open/closed cases and retained routing evidence".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 92,
+                name: "Ticket-owned assignment tracking".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 93,
+                name: "Durable assignment deliveries and source-bound startup fences".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 94,
+                name: "Canonical Ticket posts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 95,
+                name: "Common notification routing and durable Worker delivery".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 96,
+                name: "Backend Job common notification routing".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 97,
+                name: "MR notifications and authenticated implementation results".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 98,
+                name: "Assignment-independent implementation reports".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 99,
+                name: "Explicit hosting administrators and self-registration policy".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 100,
+                name: "Provisional users and scoped passkey activation".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 101,
+                name: "Durable explicit Subject body release".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 102,
+                name: "Durable failed Subject creation recovery".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 103,
+                name: "Passkey metadata and atomic addition results".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 104,
+                name: "Converge Passkey results and Job input retention".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 105,
+                name: "Durable Subject deletion snapshots and Job admission fences".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 106,
+                name: crate::plugin_catalog::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 107,
+                name: "Immutable Worker Plugin plans and retained pins".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 108,
+                name: "Subject Ticket responsibility and current-body notification routing".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 109,
+                name: "Durable Plugin Host invocations and HTTPS effect receipts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 110,
+                name: "Worker Plugin launch selection associations".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 111,
+                name: "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 112,
+                name: "Ticket Service outbox and fenced consumers".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 113,
+                name: "Ticket work-decomposition parent links".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 122,
+                name: crate::config_adoption::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 123,
+                name: backend_job_upgrade::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 124,
+                name: WORKER_CREATE_FAILURE_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 125,
+                name: backend_job_recovery_store::CAUSE_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 126,
+                name: SERVICE_OUTCOME_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 127,
+                name: journal_removal_store::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 128,
+                name: TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 129,
+                name: DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into(),
+            },
+        ]
+    }
+
     #[test]
     fn schema_v50_plans_and_applies_the_complete_retained_chain() {
         let temp = tempfile::tempdir().unwrap();
@@ -19077,189 +22071,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 50);
         assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
-        assert_eq!(
-            plan.migrations,
-            vec![
-                WorkspaceSchemaMigrationStep {
-                    version: 51,
-                    name: WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 52,
-                    name: RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 53,
-                    name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 54,
-                    name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 55,
-                    name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 56,
-                    name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 57,
-                    name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 58,
-                    name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 59,
-                    name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 60,
-                    name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 61,
-                    name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 62,
-                    name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 63,
-                    name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 64,
-                    name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 65,
-                    name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 66,
-                    name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 67,
-                    name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 68,
-                    name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 69,
-                    name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 70,
-                    name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 71,
-                    name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 72,
-                    name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 73,
-                    name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 74,
-                    name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 75,
-                    name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 76,
-                    name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 77,
-                    name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 78,
-                    name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 79,
-                    name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 80,
-                    name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 81,
-                    name: "Backend Job immutable resource serialization".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 82,
-                    name: "Ticket responsibility and unfinished work separation".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 83,
-                    name: "Generic Ticket Worker roles and durable claims".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 84,
-                    name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 85,
-                    name: "content-addressed Flow sources".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 86,
-                    name: "content-fenced config, Memory settings and Jobs".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 87,
-                    name: "Repository SSH key identities and encrypted operation objects"
-                        .to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 88,
-                    name: "Runtime binding identities and retention content contracts".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 89,
-                    name: "descriptive legacy evidence columns".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 90,
-                    name: "Runtime binding connection configuration and historical verification archive".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 91,
-                    name: "Ticket open/closed cases and retained routing evidence".to_string()
-                },
-                WorkspaceSchemaMigrationStep {version:92, name:"Ticket-owned assignment tracking".into()},
-                WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
-                WorkspaceSchemaMigrationStep {version:94, name:"Canonical Ticket posts".into()},
-                WorkspaceSchemaMigrationStep {version:95, name:"Common notification routing and durable Worker delivery".into()},
-                WorkspaceSchemaMigrationStep {version:96, name:"Backend Job common notification routing".into()},
-                WorkspaceSchemaMigrationStep {version:97, name:"MR notifications and authenticated implementation results".into()},
-                WorkspaceSchemaMigrationStep {version:98, name:"Assignment-independent implementation reports".into()},
-                WorkspaceSchemaMigrationStep {version:99, name:"Explicit hosting administrators and self-registration policy".into()},
-                WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
-                WorkspaceSchemaMigrationStep {version:101, name:"Durable explicit Subject body release".into()},
-                WorkspaceSchemaMigrationStep {version:102, name:"Durable failed Subject creation recovery".into()},
-                WorkspaceSchemaMigrationStep {version:103, name:"Passkey metadata and atomic addition results".into()},
-                WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
-            ]
-        );
+        assert_eq!(plan.migrations, expected_retained_migration_chain());
 
         let unchanged = Connection::open(&path).unwrap();
         assert_eq!(current_schema_version(&unchanged).unwrap(), 50);
@@ -19372,6 +22184,23 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (102, "Durable failed Subject creation recovery".to_string()),
 (103, "Passkey metadata and atomic addition results".to_string()),
 (104, "Converge Passkey results and Job input retention".to_string()),
+(105, "Durable Subject deletion snapshots and Job admission fences".to_string()),
+(106, crate::plugin_catalog::MIGRATION_NAME.to_string()),
+(107, "Immutable Worker Plugin plans and retained pins".to_string()),
+(108, "Subject Ticket responsibility and current-body notification routing".to_string()),
+(109, "Durable Plugin Host invocations and HTTPS effect receipts".to_string()),
+(110, "Worker Plugin launch selection associations".to_string()),
+(111, "Typed Plugin Ticket extension data and atomic mutation receipts".to_string()),
+(112, "Ticket Service outbox and fenced consumers".to_string()),
+(113, "Ticket work-decomposition parent links".to_string()),
+(122, crate::config_adoption::MIGRATION_NAME.to_string()),
+(123, backend_job_upgrade::MIGRATION_NAME.to_string()),
+(124, WORKER_CREATE_FAILURE_MIGRATION_NAME.to_string()),
+(125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.to_string()),
+(126, SERVICE_OUTCOME_MIGRATION_NAME.to_string()),
+(127, journal_removal_store::MIGRATION_NAME.to_string()),
+(128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.to_string()),
+(129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -19713,16 +22542,17 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
         migrate_workspace_runtime_bindings_v50_to_v51(&conn).unwrap();
+        let history = workspace_schema_migration_history(&conn).unwrap();
         drop(conn);
 
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 51);
         assert_eq!(
-            plan.migrations
-                .iter()
-                .map(|migration| migration.version)
-                .collect::<Vec<_>>(),
-            (52..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            plan.migrations,
+            expected_retained_migration_chain()
+                .into_iter()
+                .filter(|migration| migration.version > 51)
+                .collect::<Vec<_>>()
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -19730,9 +22560,17 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
+        let expected_history: Vec<_> = history
+            .into_iter()
+            .chain(
+                plan.migrations
+                    .iter()
+                    .map(|step| (step.version, step.name.clone())),
+            )
+            .collect();
         assert_eq!(
-            workspace_schema_migration_history(&conn).unwrap().len(),
-            (LATEST_SCHEMA_VERSION - 50 + 1) as usize
+            workspace_schema_migration_history(&conn).unwrap(),
+            expected_history
         );
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
@@ -20784,31 +23622,45 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         .unwrap();
         let error = apply_migrations(&conn).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not start with a retained schema baseline")
+            matches!(&error, Error::Store(message) if message.starts_with("Server storage format: unknown baseline or current version:")),
+            "{error:?}"
         );
     }
 
     #[test]
     fn startup_rejects_noncanonical_history_at_the_baseline_version() {
         let conn = Connection::open_in_memory().unwrap();
-        configure_sqlite(&conn).unwrap();
+        prepare_connection(&conn).unwrap();
         conn.execute(
             "INSERT INTO __yoi_schema_migrations (version, name) VALUES (1, 'legacy')",
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![LATEST_SCHEMA_VERSION, "workspace schema baseline"],
-        )
-        .unwrap();
+        let history = workspace_schema_migration_history(&conn).unwrap();
+        let schema = fixture_query_rows(
+            &conn,
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name",
+        );
+        let writes: i64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
         let error = apply_migrations(&conn).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not start with a retained schema baseline")
+            matches!(&error, Error::Store(message) if message == "Server storage format: missing failure migration predecessor"),
+            "{error:?}"
+        );
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap(), history);
+        assert_eq!(
+            fixture_query_rows(
+                &conn,
+                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name"
+            ),
+            schema
+        );
+        assert_eq!(
+            conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            writes
         );
     }
 
@@ -22631,7 +25483,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            ((version + 1)..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            ((version + 1)..=113)
+                .chain([122, 123, 124, 125, 126, 127, 128, 129])
+                .collect::<Vec<_>>()
         );
         drop(conn);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -22657,7 +25511,24 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (101, "Durable explicit Subject body release".into()),
                          (102, "Durable failed Subject creation recovery".into()),
                          (103, "Passkey metadata and atomic addition results".into()),
-                         (104, "Converge Passkey results and Job input retention".into())]);
+                         (104, "Converge Passkey results and Job input retention".into()),
+                         (105, "Durable Subject deletion snapshots and Job admission fences".into()),
+                         (106, crate::plugin_catalog::MIGRATION_NAME.into()),
+                         (107, "Immutable Worker Plugin plans and retained pins".into()),
+                         (108, "Subject Ticket responsibility and current-body notification routing".into()),
+                         (109, "Durable Plugin Host invocations and HTTPS effect receipts".into()),
+                         (110, "Worker Plugin launch selection associations".into()),
+                         (111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()),
+                         (112, "Ticket Service outbox and fenced consumers".into()),
+                         (113, "Ticket work-decomposition parent links".into()),
+                         (122, crate::config_adoption::MIGRATION_NAME.into()),
+                         (123, backend_job_upgrade::MIGRATION_NAME.into()),
+                         (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
+                         (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
+                         (126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
+                         (127, journal_removal_store::MIGRATION_NAME.into()),
+                         (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into()),
+                         (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -23388,8 +26259,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let first = manual_worker_assignment("first", "first-assignment");
         let orchestrator = TicketRoleAssignmentRecord {
             role: TicketAssignmentRole::Orchestrator,
-            principal: TicketAssignmentPrincipal::WorkspaceAgent {
-                agent_key: "workspace-orchestrator".into(),
+            principal: TicketAssignmentPrincipal::Subject {
+                subject_id: "fixture-subject".into(),
             },
             ..first.clone()
         };
@@ -24473,8 +27344,8 @@ INSERT INTO worker_registry (
             ticket_id: ticket.id.clone(),
             assignment_id: "orchestrator-1".to_string(),
             role: TicketAssignmentRole::Orchestrator,
-            principal: TicketAssignmentPrincipal::WorkspaceAgent {
-                agent_key: "workspace-orchestrator".to_string(),
+            principal: TicketAssignmentPrincipal::Subject {
+                subject_id: "fixture-subject".to_string(),
             },
             assigned_by: "user".to_string(),
             assigned_at: "2026-09-01T00:00:00Z".to_string(),
@@ -24687,12 +27558,27 @@ INSERT INTO worker_registry (
         )
         .unwrap();
 
+        let history = workspace_schema_migration_history(&conn).unwrap();
+        let schema = fixture_query_rows(
+            &conn,
+            "SELECT type,name,sql FROM sqlite_schema ORDER BY type,name",
+        );
         let error = apply_migrations(&conn).unwrap_err().to_string();
         assert!(
-            error.contains(&format!("schema version {future_version} is newer")),
+            error.contains("Server storage format: unknown baseline or current version")
+                && error.contains(&future_version.to_string()),
             "{error}"
         );
-        assert!(error.contains("refusing to serve"), "{error}");
+
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap(), history);
+        assert_eq!(current_schema_version(&conn).unwrap(), future_version);
+        assert_eq!(
+            fixture_query_rows(
+                &conn,
+                "SELECT type,name,sql FROM sqlite_schema ORDER BY type,name",
+            ),
+            schema
+        );
     }
 
     #[test]
@@ -26593,6 +29479,673 @@ INSERT INTO worker_registry (
             .unwrap();
     }
 
+    fn stored_job_cause() -> crate::backend_job::BackgroundFailure {
+        use protocol::session_failure::{
+            SessionPrincipal, SessionRegistrationCause, session_registration_attachment,
+        };
+        let retained = runtime_api::WorkerStartupFailure {
+            primary: session_registration_attachment(SessionRegistrationCause::denied(
+                SessionPrincipal::Subject,
+            ))
+            .unwrap(),
+            secondary: Vec::new(),
+            resources: None,
+            persistence: None,
+            io_kind: None,
+        };
+        crate::backend_job::background_failure_from_startup(&retained).unwrap()
+    }
+
+    #[tokio::test]
+    async fn backend_job_cause_reconciliation_and_terminal_save_rollback_reopen() {
+        use crate::backend_job::StoredFailure;
+        use error_contract::{DecodeFailure, compatibility::StoredFailureRead};
+        use protocol::session_failure::{SessionFailureVisibility, SessionRegistrationCause};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("causes.sqlite");
+        let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        let request = resource_job_request("cause-save", "cause-subject", "candidate");
+        let original = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(matches!(
+            StoredFailure::read_optional::<SessionRegistrationCause>(
+                original.job.failure_cause.as_ref()
+            ),
+            StoredFailureRead::LegacyWithoutFacts
+        ));
+        let cause = stored_job_cause();
+        // Abort the second row update, after reconciliation and attempt writes.
+        // Neither state nor cause may be reported saved when the transaction fails.
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER inject_job_cause_save BEFORE UPDATE ON backend_jobs BEGIN SELECT RAISE(ABORT,'injected cause save failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .record_backend_job_reconciliation_with_cause(
+                    "resource-workspace",
+                    &original.attempt,
+                    "input_observation",
+                    "legacy diagnostic wording is not authority",
+                    "reconcile_same_identity",
+                    Some(&cause),
+                    RESOURCE_JOB_NOW
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_backend_job("resource-workspace", &request.job_id)
+                .unwrap()
+                .unwrap(),
+            original.job
+        );
+        assert_eq!(
+            store
+                .get_backend_job_attempt(
+                    "resource-workspace",
+                    &request.job_id,
+                    &original.attempt.attempt_id
+                )
+                .unwrap()
+                .unwrap(),
+            original.attempt
+        );
+        assert!(
+            store
+                .get_backend_job_reconciliation(
+                    "resource-workspace",
+                    &request.job_id,
+                    &original.attempt.attempt_id
+                )
+                .unwrap()
+                .is_none()
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER inject_job_cause_save")?;
+                Ok(())
+            })
+            .unwrap();
+        let observed = store
+            .record_backend_job_reconciliation_with_cause(
+                "resource-workspace",
+                &original.attempt,
+                "input_observation",
+                "different prose",
+                "reconcile_same_identity",
+                Some(&cause),
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert_eq!(observed.state, original.attempt.state);
+        assert!(matches!(
+            observed
+                .failure_cause
+                .as_ref()
+                .unwrap()
+                .decode::<SessionRegistrationCause>(),
+            DecodeFailure::Known(_)
+        ));
+        assert!(
+            observed
+                .failure_cause
+                .as_ref()
+                .unwrap()
+                .project_for::<error_contract::Browser, SessionRegistrationCause>(
+                    &SessionFailureVisibility {
+                        can_view_cause: false
+                    }
+                )
+                .is_err()
+        );
+        // Terminal state and typed evidence must also commit together.
+        store.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER inject_terminal_save BEFORE UPDATE ON backend_jobs WHEN NEW.state='failed' BEGIN SELECT RAISE(ABORT,'injected terminal save failure'); END;")?; Ok(()) }).unwrap();
+        assert!(
+            store
+                .finish_backend_job_attempt_with_cause(
+                    "resource-workspace",
+                    &request.job_id,
+                    &observed.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "dispatch_refused",
+                    "wording",
+                    Some(&cause),
+                    RESOURCE_JOB_NOW
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_backend_job_attempt(
+                    "resource-workspace",
+                    &request.job_id,
+                    &observed.attempt_id
+                )
+                .unwrap()
+                .unwrap(),
+            observed
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER inject_terminal_save")?;
+                Ok(())
+            })
+            .unwrap();
+        let finished = store
+            .finish_backend_job_attempt_with_cause(
+                "resource-workspace",
+                &request.job_id,
+                &observed.attempt_id,
+                BackendJobAttemptState::Failed,
+                "dispatch_refused",
+                "wording",
+                Some(&cause),
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let saved = reopened
+            .get_backend_job("resource-workspace", &request.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.state, BackendJobState::Failed);
+        assert_eq!(saved.failure_cause, finished.failure_cause);
+        assert_eq!(saved.input_digest, original.job.input_digest);
+        assert_eq!(saved.intent_fingerprint, original.job.intent_fingerprint);
+        assert_eq!(
+            reopened
+                .get_backend_job_attempt(
+                    "resource-workspace",
+                    &request.job_id,
+                    &finished.attempt_id
+                )
+                .unwrap()
+                .unwrap(),
+            finished
+        );
+        // No stored bytes are accidentally serialized by the existing public DTO.
+        assert!(
+            serde_json::to_value(saved)
+                .unwrap()
+                .get("failure_cause")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_cause_success_is_immutable_across_later_cleanup_failure_and_save_error() {
+        use crate::backend_job::BackgroundJobCause;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cleanup-causes.sqlite");
+        let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
+        seed_resource_job_workspace(&store).await;
+        let request = resource_job_request("cause-success", "success-subject", "candidate");
+        let reserved = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        let worker = bind_resource_job_worker(&store, &reserved, "cause-worker");
+        let current = store
+            .get_backend_job_attempt(
+                "resource-workspace",
+                &request.job_id,
+                &reserved.attempt.attempt_id,
+            )
+            .unwrap()
+            .unwrap();
+        let cause = BackgroundJobCause::ReconciliationRequired
+            .storage()
+            .unwrap();
+        store
+            .record_backend_job_reconciliation_with_cause(
+                "resource-workspace",
+                &current,
+                "receipt_observation",
+                "not a final failure",
+                "reconcile_same_run",
+                Some(&cause),
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        let submission = BackendJobResultSubmission {
+            job_id: request.job_id.clone(),
+            attempt_id: current.attempt_id.clone(),
+            input_digest: request.input_digest().unwrap(),
+            result: serde_json::json!({"recorded":true}),
+        };
+        let accepted = store
+            .accept_backend_job_result("resource-workspace", &worker, &submission, RESOURCE_JOB_NOW)
+            .unwrap();
+        assert!(accepted.job.failure_cause.is_none());
+        assert!(accepted.attempt.failure_cause.is_none());
+        let history = store
+            .list_backend_job_attempts("resource-workspace", &request.job_id)
+            .unwrap();
+        let (claimed, owned) = store
+            .claim_backend_job_worker_cleanup_owned(
+                "resource-workspace",
+                &history,
+                &accepted.attempt,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(owned);
+        let history = store
+            .list_backend_job_attempts("resource-workspace", &request.job_id)
+            .unwrap();
+        let cleanup = BackgroundJobCause::CleanupFailed.storage().unwrap();
+        store.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER inject_cleanup_save BEFORE UPDATE OF worker_cleanup_failure_cause ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'injected cleanup save failure'); END;")?; Ok(()) }).unwrap();
+        assert!(
+            store
+                .finish_backend_job_worker_cleanup_owned_with_cause(
+                    "resource-workspace",
+                    &history,
+                    &claimed,
+                    BackendJobWorkerCleanupState::Failed,
+                    Some("cleanup_failed"),
+                    Some("cleanup only"),
+                    Some(&cleanup),
+                    RESOURCE_JOB_NOW
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_backend_job_attempt("resource-workspace", &request.job_id, &current.attempt_id)
+                .unwrap()
+                .unwrap(),
+            claimed
+        );
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER inject_cleanup_save")?;
+                Ok(())
+            })
+            .unwrap();
+        let failed_cleanup = store
+            .finish_backend_job_worker_cleanup_owned_with_cause(
+                "resource-workspace",
+                &history,
+                &claimed,
+                BackendJobWorkerCleanupState::Failed,
+                Some("cleanup_failed"),
+                Some("cleanup only"),
+                Some(&cleanup),
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert_eq!(failed_cleanup.state, BackendJobAttemptState::Completed);
+        assert_eq!(failed_cleanup.result, accepted.attempt.result);
+        assert!(failed_cleanup.failure_cause.is_none());
+        assert!(matches!(
+            failed_cleanup
+                .worker_cleanup_failure_cause
+                .as_ref()
+                .unwrap()
+                .decode::<BackgroundJobCause>(),
+            error_contract::DecodeFailure::Known(_)
+        ));
+        assert!(
+            store
+                .finish_backend_job_attempt_with_cause(
+                    "resource-workspace",
+                    &request.job_id,
+                    &current.attempt_id,
+                    BackendJobAttemptState::Failed,
+                    "late_failure",
+                    "must not replace success",
+                    Some(&cause),
+                    RESOURCE_JOB_NOW
+                )
+                .is_err()
+        );
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert_eq!(
+            reopened
+                .get_backend_job("resource-workspace", &request.job_id)
+                .unwrap()
+                .unwrap(),
+            accepted.job
+        );
+        assert_eq!(
+            reopened
+                .get_backend_job_attempt("resource-workspace", &request.job_id, &current.attempt_id)
+                .unwrap()
+                .unwrap(),
+            failed_cleanup
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_cause_reader_keeps_future_corrupt_and_legacy_rows_readable() {
+        use crate::backend_job::{BackgroundJobCause, StoredFailure};
+        use error_contract::{DecodeFailure, compatibility::StoredFailureRead};
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
+        seed_resource_job_workspace(&store).await;
+        let request = resource_job_request("cause-reader", "reader-subject", "candidate");
+        let original = store
+            .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+            .unwrap();
+        let future = BackgroundJobCause::InputFailed
+            .storage()
+            .unwrap()
+            .as_storage_str()
+            .replace("\"version\":1", "\"version\":999");
+        for raw in [
+            None,
+            Some(future.as_str()),
+            Some("{TEST_ONLY_SECRET /private/path"),
+        ] {
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE backend_jobs SET failure_cause=?1 WHERE job_id=?2",
+                        params![raw, request.job_id],
+                    )?;
+                    conn.execute(
+                        "UPDATE backend_job_attempts SET failure_cause=?1 WHERE job_id=?2",
+                        params![raw, request.job_id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            let job = store
+                .get_backend_job("resource-workspace", &request.job_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.state, original.job.state);
+            let attempt = store
+                .get_backend_job_attempt(
+                    "resource-workspace",
+                    &request.job_id,
+                    &original.attempt.attempt_id,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.failure_cause, attempt.failure_cause);
+            match (
+                raw,
+                StoredFailure::read_optional::<BackgroundJobCause>(job.failure_cause.as_ref()),
+            ) {
+                (None, StoredFailureRead::LegacyWithoutFacts) => {}
+                (Some(value), StoredFailureRead::Structured(DecodeFailure::Unsupported(_)))
+                    if value == future => {}
+                (Some(_), StoredFailureRead::Structured(DecodeFailure::Corrupt(_))) => {}
+                _ => panic!("incorrect retained evidence classification"),
+            }
+        }
+        assert!(
+            store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE backend_jobs SET failure_cause=?1 WHERE job_id=?2",
+                        params!["é".repeat(16385), request.job_id],
+                    )?;
+                    Ok(())
+                })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_job_cause_migration_125_is_additive_atomic_and_reopens_like_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cause-migration.sqlite");
+        prepare_retained_schema(&path, 124);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
+        seed_resource_job_workspace(&store).await;
+        for id in [
+            "cause-old-pending",
+            "cause-old-completed",
+            "cause-old-failed",
+        ] {
+            let request = resource_job_request(id, id, "candidate");
+            let reserved = store
+                .reserve_backend_job("resource-workspace", &request, RESOURCE_JOB_NOW)
+                .unwrap();
+            if id.ends_with("completed") {
+                seed_completed_job_receipts(&store, id, "completed");
+            }
+            if id.ends_with("failed") {
+                store
+                    .finish_backend_job_attempt(
+                        "resource-workspace",
+                        id,
+                        &reserved.attempt.attempt_id,
+                        BackendJobAttemptState::Failed,
+                        "old_failure",
+                        "legacy text must not become typed facts",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+            }
+        }
+        let before: Vec<_> = [
+            "cause-old-pending",
+            "cause-old-completed",
+            "cause-old-failed",
+        ]
+        .into_iter()
+        .map(|id| {
+            (
+                store
+                    .get_backend_job("resource-workspace", id)
+                    .unwrap()
+                    .unwrap(),
+                store
+                    .list_backend_job_attempts("resource-workspace", id)
+                    .unwrap(),
+            )
+        })
+        .collect();
+        // Copy canonical rows into only the columns of the genuine predecessor;
+        // neither its DDL nor its migration receipts are reconstructed from latest.
+        let mut legacy_rows = Vec::new();
+        for table in [
+            "accounts",
+            "workspaces",
+            "backend_jobs",
+            "backend_job_attempts",
+        ] {
+            let columns = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let names = columns.join(",");
+            let query = format!("SELECT {names} FROM {table} ORDER BY rowid");
+            let rows = store
+                .with_conn(|source| Ok(fixture_query_rows(source, &query)))
+                .unwrap();
+            let placeholders = vec!["?"; columns.len()].join(",");
+            for row in &rows {
+                let precluded = (table == "backend_job_attempts")
+                    .then(|| {
+                        columns
+                            .iter()
+                            .position(|name| name == "allocation_precluded_at")
+                            .unwrap()
+                    })
+                    .filter(|index| row[*index] != rusqlite::types::Value::Null);
+                let mut insertion = row.clone();
+                if let Some(index) = precluded {
+                    insertion[index] = rusqlite::types::Value::Null;
+                    let state = columns.iter().position(|name| name == "state").unwrap();
+                    insertion[state] = rusqlite::types::Value::Text("reserved".into());
+                }
+                conn.execute(
+                    &format!("INSERT INTO {table} ({names}) VALUES ({placeholders})"),
+                    rusqlite::params_from_iter(&insertion),
+                )
+                .unwrap();
+                if let Some(index) = precluded {
+                    // Preserve existing negative-allocation proof through the
+                    // predecessor's real Reserved -> Failed transition, not an
+                    // INSERT that bypasses its proof-minting trigger.
+                    let workspace = columns
+                        .iter()
+                        .position(|name| name == "workspace_id")
+                        .unwrap();
+                    let attempt = columns
+                        .iter()
+                        .position(|name| name == "attempt_id")
+                        .unwrap();
+                    assert_eq!(conn.execute(
+                        "UPDATE backend_job_attempts SET state='failed',allocation_precluded_at=?1 WHERE workspace_id=?2 AND attempt_id=?3",
+                        params![&row[index], &row[workspace], &row[attempt]],
+                    ).unwrap(), 1);
+                }
+            }
+            assert_eq!(fixture_query_rows(&conn, &query), rows);
+            legacy_rows.push((query, rows));
+        }
+        drop(store);
+        assert_eq!(current_schema_version(&conn).unwrap(), 124);
+        storage_formats::verify_history(&conn, 124).unwrap();
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            assert!(!column_exists(&conn, table, column).unwrap());
+        }
+        conn.execute_batch("CREATE TRIGGER inject_cause_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=125 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+        let error = migrate_backend_job_causes_v124_to_v125(&conn).unwrap_err();
+        assert!(error.to_string().contains("injected receipt failure"));
+        assert_eq!(current_schema_version(&conn).unwrap(), 124);
+        storage_formats::verify_history(&conn, 124).unwrap();
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            assert!(
+                !column_exists(&conn, table, column).unwrap(),
+                "ALTER TABLE must roll back with receipt failure"
+            );
+        }
+        for (query, rows) in &legacy_rows {
+            assert_eq!(&fixture_query_rows(&conn, query), rows);
+        }
+        conn.execute_batch("DROP TRIGGER inject_cause_migration")
+            .unwrap();
+        migrate_backend_job_causes_v124_to_v125(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 125);
+        storage_formats::verify_history(&conn, 125).unwrap();
+        assert!(
+            migrate_backend_job_causes_v124_to_v125(&conn).is_err(),
+            "not applied twice"
+        );
+        for (query, rows) in &legacy_rows {
+            assert_eq!(&fixture_query_rows(&conn, query), rows);
+        }
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            assert!(column_exists(&conn, table, column).unwrap());
+            let invented: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(invented, 0, "legacy text must not become typed facts");
+        }
+        drop(conn);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
+                storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)
+            })
+            .unwrap();
+        for (job, attempts) in &before {
+            assert_eq!(
+                store
+                    .get_backend_job("resource-workspace", &job.request.job_id)
+                    .unwrap()
+                    .as_ref(),
+                Some(job)
+            );
+            assert_eq!(
+                &store
+                    .list_backend_job_attempts("resource-workspace", &job.request.job_id)
+                    .unwrap(),
+                attempts
+            );
+        }
+        let new_request =
+            resource_job_request("cause-post-migration", "post-migration", "candidate");
+        let new = store
+            .reserve_backend_job("resource-workspace", &new_request, RESOURCE_JOB_NOW)
+            .unwrap();
+        drop(store);
+        let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        assert_eq!(
+            reopened
+                .get_backend_job("resource-workspace", &new_request.job_id)
+                .unwrap()
+                .unwrap(),
+            new.job
+        );
+        assert_eq!(new.job.state, BackendJobState::Pending);
+        for (job, attempts) in before {
+            assert_eq!(
+                reopened
+                    .get_backend_job("resource-workspace", &job.request.job_id)
+                    .unwrap(),
+                Some(job.clone())
+            );
+            assert_eq!(
+                reopened
+                    .list_backend_job_attempts("resource-workspace", &job.request.job_id)
+                    .unwrap(),
+                attempts
+            );
+        }
+        let fresh = SqliteWorkspaceStore::in_memory_fixture().unwrap();
+        let signature = |conn: &Connection| {
+            for (table, column) in [
+                ("backend_jobs", "failure_cause"),
+                ("backend_job_attempts", "failure_cause"),
+                ("backend_job_attempts", "worker_cleanup_failure_cause"),
+            ] {
+                let error = conn
+                    .execute(
+                        &format!(
+                            "UPDATE {table} SET {column}=?1 WHERE job_id='cause-post-migration'"
+                        ),
+                        [&"x".repeat(32769)],
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(error, rusqlite::Error::SqliteFailure(ref failure, _)
+                    if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+                    "oversized cause must fail its CHECK, not an unrelated guard: {error}"
+                );
+            }
+            Ok(combined_failure_migration_tests::failure_signature(conn))
+        };
+        let migrated_signature = reopened.with_conn(signature).unwrap();
+        // Additive histories have different physical column order. Compare the
+        // existing semantic signature and exercise bounds on real mutable rows.
+        let fresh_signature = fresh
+            .with_conn(|conn| Ok(combined_failure_migration_tests::failure_signature(conn)))
+            .unwrap();
+        assert_eq!(migrated_signature, fresh_signature);
+    }
+
     // Storage component tests: seed already-saved result/cleanup receipts, without
     // constructing an execution Worker or claiming a model/dispatch integration.
     fn seed_completed_job_receipts(store: &SqliteWorkspaceStore, id: &str, cleanup: &str) {
@@ -26730,20 +30283,32 @@ INSERT INTO worker_registry (
     }
 
     #[tokio::test]
-    async fn backend_job_input_unknown_retention_and_legacy_invalidation_do_not_reinterpret_outcome()
+    async fn backend_job_input_pending_retention_and_legacy_invalidation_do_not_reinterpret_outcome()
      {
         use crate::backend_job::{JobInputDisposition, JobInputRetirementReason};
         let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         seed_resource_job_workspace(&store).await;
         for (id, state) in [
             ("unfinished", None),
-            ("unknown-input", Some(BackendJobAttemptState::Unknown)),
+            ("reconciling-input", None),
             ("failed-input", Some(BackendJobAttemptState::Failed)),
         ] {
             let original = resource_job_request(id, id, "candidate");
             let reservation = store
                 .reserve_backend_job("resource-workspace", &original, RESOURCE_JOB_NOW)
                 .unwrap();
+            if id == "reconciling-input" {
+                store
+                    .record_backend_job_reconciliation(
+                        "resource-workspace",
+                        &reservation.attempt,
+                        "receipt_missing",
+                        "acceptance lookup temporarily unavailable",
+                        "reconcile_saved_acceptance",
+                        RESOURCE_JOB_NOW,
+                    )
+                    .unwrap();
+            }
             if let Some(state) = state {
                 store
                     .finish_backend_job_attempt(
@@ -26861,24 +30426,54 @@ INSERT INTO worker_registry (
         use crate::backend_job::{JobInputDisposition, JobInputRetirementReason};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("migration.sqlite");
-        let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
+        // Build the actual retained boundary, never latest DDL relabelled as 102.
+        prepare_retained_schema(&path, 102);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        // Obtain a canonical pending Job through the current API, then copy only
+        // columns that existed at the retained boundary into the historical file.
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         seed_resource_job_workspace(&store).await;
         let original = resource_job_request("upgrade", "subject", "candidate");
         let before = store
             .reserve_backend_job("resource-workspace", &original, RESOURCE_JOB_NOW)
             .unwrap();
-        store.with_conn(|conn| {
-            conn.execute_batch("DROP TRIGGER backend_job_input_retirement; DROP TRIGGER backend_job_identity_immutable;
-                ALTER TABLE backend_jobs DROP COLUMN input_disposition;
-                DROP TRIGGER passkey_metadata_insert;
-                DROP TABLE passkey_addition_receipts;
-                DROP TABLE passkey_metadata;
-                UPDATE __yoi_schema_migrations SET version=102 WHERE version=104;
-                CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;")?; Ok(())
-        }).unwrap();
+        for table in [
+            "accounts",
+            "workspaces",
+            "backend_jobs",
+            "backend_job_attempts",
+        ] {
+            let columns = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let names = columns.join(",");
+            let rows = store
+                .with_conn(|source| {
+                    Ok(fixture_query_rows(
+                        source,
+                        &format!("SELECT {names} FROM {table}"),
+                    ))
+                })
+                .unwrap();
+            let placeholders = vec!["?"; columns.len()].join(",");
+            for row in rows {
+                conn.execute(
+                    &format!("INSERT INTO {table} ({names}) VALUES ({placeholders})"),
+                    rusqlite::params_from_iter(row),
+                )
+                .unwrap();
+            }
+        }
         drop(store);
-        let conn = Connection::open(&path).unwrap();
-        configure_sqlite(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 102);
+        verify_schema_history(&conn, 102).unwrap();
+        assert!(!column_exists(&conn, "backend_jobs", "input_disposition").unwrap());
+        conn.execute_batch("CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE ON backend_job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;").unwrap();
         assert!(migrate_job_input_retention_v102_to_v103(&conn).is_err());
         assert_eq!(current_schema_version(&conn).unwrap(), 102);
         assert!(!column_exists(&conn, "backend_jobs", "input_disposition").unwrap());
@@ -26887,12 +30482,24 @@ INSERT INTO worker_registry (
         migrate_job_input_retention_v102_to_v103(&conn).unwrap();
         drop(conn);
         let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let migrated = reopened
+            .get_backend_job("resource-workspace", "upgrade")
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.state, BackendJobState::Failed);
         assert_eq!(
+            migrated.failure_category.as_deref(),
+            Some("version_upgrade_execution_aborted")
+        );
+        let mut preserved = migrated.clone();
+        preserved.state = before.job.state;
+        preserved.failure_category = before.job.failure_category.clone();
+        preserved.failure_detail = before.job.failure_detail.clone();
+        assert_eq!(preserved, before.job);
+        assert!(
             reopened
-                .get_backend_job("resource-workspace", "upgrade")
+                .backend_job_was_migrated("resource-workspace", "upgrade")
                 .unwrap()
-                .unwrap(),
-            before.job
         );
         let erased = reopened
             .reclaim_backend_job_input(
@@ -26903,7 +30510,8 @@ INSERT INTO worker_registry (
             )
             .unwrap();
         assert_eq!(erased.input_disposition, JobInputDisposition::Erased);
-        assert_eq!(erased.state, BackendJobState::Pending);
+        assert_eq!(erased.state, BackendJobState::Failed);
+        assert_eq!(erased.failure_category, migrated.failure_category);
         assert_eq!(
             reopened
                 .reserve_backend_job("resource-workspace", &original, RESOURCE_JOB_NOW)
@@ -27128,18 +30736,50 @@ INSERT INTO worker_registry (
         assert_eq!(second.job.request, request);
         assert_eq!(second.attempt.attempt, 2);
         bind_resource_job_worker(&store, &second, "unknown-worker");
-        store
-            .finish_backend_job_attempt(
+        let expected = store
+            .get_backend_job_attempt(
                 "resource-workspace",
                 &request.job_id,
                 &second.attempt.attempt_id,
-                BackendJobAttemptState::Unknown,
-                "unknown_effects",
-                "domain outcome unknown",
+            )
+            .unwrap()
+            .unwrap();
+        let pending = store
+            .record_backend_job_reconciliation(
+                "resource-workspace",
+                &expected,
+                "receipt_unavailable",
+                "domain completion must be reconciled",
+                "read_saved_domain_completion",
                 RESOURCE_JOB_NOW,
             )
             .unwrap();
-        finish_resource_job_cleanup(&store, &second);
+        let history = store
+            .list_backend_job_attempts("resource-workspace", &request.job_id)
+            .unwrap();
+        let (executing, claimed) = store
+            .claim_backend_job_worker_cleanup_owned(
+                "resource-workspace",
+                &history,
+                &pending,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
+        assert!(claimed);
+        let history = store
+            .list_backend_job_attempts("resource-workspace", &request.job_id)
+            .unwrap();
+        store
+            .finish_backend_job_worker_cleanup_owned(
+                "resource-workspace",
+                &history,
+                &executing,
+                BackendJobWorkerCleanupState::Completed,
+                None,
+                None,
+                RESOURCE_JOB_NOW,
+            )
+            .unwrap();
         drop(store);
         let restarted = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let active = restarted
@@ -27149,7 +30789,7 @@ INSERT INTO worker_registry (
             )
             .unwrap()
             .unwrap();
-        assert_eq!(active.state, BackendJobState::Unknown);
+        assert_eq!(active.state, BackendJobState::Pending);
         assert_eq!(active.request, request);
         assert!(
             restarted
@@ -28148,13 +31788,12 @@ INSERT INTO worker_registry (
             .unwrap();
         assert_eq!(second.attempt.attempt, 2);
         store
-            .finish_backend_job_attempt(
+            .record_backend_job_reconciliation(
                 workspace_id,
-                &retry_request.job_id,
-                &second.attempt.attempt_id,
-                BackendJobAttemptState::Unknown,
-                "worker_unknown",
-                "worker unavailable",
+                &second.attempt,
+                "worker_unavailable",
+                "worker acceptance must be reconciled",
+                "reconcile_saved_acceptance",
                 "2026-09-01T00:01:05Z",
             )
             .unwrap();
@@ -28185,3 +31824,11 @@ mod repository_key_migration_tests;
 #[cfg(test)]
 #[path = "frozen_runtime_binding_tests.rs"]
 mod frozen_runtime_binding_tests;
+
+#[cfg(test)]
+#[path = "plugin_catalog/migration_tests.rs"]
+mod plugin_catalog_migration_tests;
+
+#[cfg(test)]
+#[path = "plugin_plan/migration_tests.rs"]
+mod plugin_plan_migration_tests;

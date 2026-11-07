@@ -5,6 +5,42 @@
 //! runs a real ProfileRuntimeWorkerFactory/Controller and materialized Workdir;
 //! only its external model stream is scripted. Neither fixture claims OS isolation.
 use super::*;
+#[path = "chat_delegation_connected_tests.rs"]
+mod chat_delegation_connected;
+#[path = "chat_tests.rs"]
+mod chat_tests;
+#[path = "journal_native_authority_tests.rs"]
+mod journal_native_authority;
+#[path = "memory_native_authority_tests.rs"]
+mod memory_native_authority;
+#[path = "native_lock_order_tests.rs"]
+mod native_lock_order;
+#[path = "session_registration_connected_tests.rs"]
+mod session_registration_connected;
+#[path = "staging_native_authority_tests.rs"]
+mod staging_native_authority;
+#[path = "subject_body_cleanup_connected_tests.rs"]
+mod subject_body_cleanup_connected;
+#[path = "subject_body_connected_tests.rs"]
+mod subject_body_connected;
+#[path = "subject_body_tests.rs"]
+mod subject_body_tests;
+#[path = "subject_job_model_supply_tests.rs"]
+mod subject_job_model_supply;
+#[path = "subject_mr_completion_admission_tests.rs"]
+mod subject_mr_completion_admission;
+#[path = "subject_permission_management_tests.rs"]
+mod subject_permission_management;
+#[path = "subject_ticket_migration_connected_tests.rs"]
+mod subject_ticket_migration_connected;
+#[path = "ticket_parent_connected_tests.rs"]
+mod ticket_parent_connected;
+#[path = "ticket_worker_messaging_connected_tests.rs"]
+mod ticket_worker_messaging_connected;
+#[path = "worker_messaging_connected_tests.rs"]
+mod worker_messaging_connected;
+#[path = "worker_operation_authorization_tests.rs"]
+mod worker_operation_authorization;
 use agen::tool::{Tool, ToolExecutionContext, ToolOutput};
 use server_api::authorization::{
     PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,
@@ -23,9 +59,26 @@ fn activation(name: &str) -> ScopedPermission {
         resource: PermissionResource::Feature,
     }
 }
+fn subject_permission(subject: &str, operation: &str) -> ScopedPermission {
+    ScopedPermission {
+        operation: operation.into(),
+        resource: PermissionResource::Subject {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            subject_id: subject.into(),
+        },
+    }
+}
 fn create_permission() -> ScopedPermission {
     ScopedPermission {
         operation: "ticket.create".into(),
+        resource: PermissionResource::Workspace {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        },
+    }
+}
+fn query_permission() -> ScopedPermission {
+    ScopedPermission {
+        operation: "ticket.query".into(),
         resource: PermissionResource::Workspace {
             workspace_id: TEST_WORKSPACE_ID.into(),
         },
@@ -106,6 +159,25 @@ impl Fixture {
         let source = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
         let identity = Arc::new(RuntimeIdentityMaterial::generate(&source.runtime_id).unwrap());
         configure_runtime_request_auth(&mut api, &identity, &source.runtime_id);
+        open_subjektiv_store(&api)
+            .unwrap()
+            .set_subject_permissions(
+                &subject,
+                &SubjectPermissionsUpdate {
+                    operation_id: "fixture-session-setup".into(),
+                    expected_change_id: Some(
+                        open_subjektiv_store(&api)
+                            .unwrap()
+                            .current_subject_policy(&subject)
+                            .unwrap()
+                            .unwrap()
+                            .change_id,
+                    ),
+                    execution: vec![subject_permission(&subject, "session.record")],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
         // The execution fixture does not bootstrap a Session. Exercise the real
         // signed startup callback explicitly so the policy store sees the active
         // Journal writer, just as it does after normal Runtime startup.
@@ -113,6 +185,19 @@ impl Fixture {
             &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/sessions"),
             serde_json::to_vec(&json!({"session_id":session_store::new_session_id().to_string(),"create_if_missing":true})).unwrap())).await;
         assert_eq!(status, StatusCode::OK, "source startup callback: {body}");
+        // Reproduce a migrated/unset policy only after authorized setup. Retain
+        // immutable setup history; no protected callback is bypassed by this input.
+        api.feature_storage
+            .open(&api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                connection.execute(
+                    "DELETE FROM subject_permissions WHERE subject_id = ?1",
+                    [&subject],
+                )?;
+                Ok(())
+            })
+            .unwrap();
         let owner =
             seed_test_workspace_owner_token(api.store.as_ref(), "subject-authority-owner").await;
         assert!(
@@ -137,11 +222,113 @@ impl Fixture {
             _dir: dir,
         }
     }
+    async fn adopt_policy(&self, execution: &str, delegation: &str) {
+        let catalog = WorkspaceServerApi::new(self.api.config.clone(), self.api.store.clone());
+        catalog
+            .apis
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), self.api.clone());
+        catalog
+            .routers
+            .lock()
+            .await
+            .insert(TEST_WORKSPACE_ID.into(), build_router(self.api.clone()));
+        let app = workspace_server_router(catalog);
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/config/adoption");
+        let response = app
+            .clone()
+            .oneshot(human_request(&self.owner, "GET", &path, None))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let source: server_api::ConfigurationSourceResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        let policy_file = source
+            .state
+            .snapshot
+            .entries
+            .iter()
+            .find(|(path, _)| path.starts_with("permissions/migrated"))
+            .expect("migration materializes editable permission source");
+        let content = format!(
+            "{{ subjects = [{{ subject_id = {}; execution = {execution}; delegation = {delegation}; }}]; remove_subjects = []; }}",
+            serde_json::to_string(&self.subject).unwrap(),
+        );
+        let request = server_api::ConfigurationAdoptionRequest {
+            operation_id: Uuid::now_v7().to_string(),
+            expected_head: source.history_head,
+            expected_catalog_digest: source.catalog_digest,
+            expected_legacy_export: source.expected_legacy_export,
+            source: server_api::ConfigCommitRequest {
+                base_digest: source.state.snapshot.digest,
+                entrypoints: source.state.contract.entrypoints,
+                changes: vec![server_api::ConfigTreeChange::Update {
+                    path: policy_file.0.clone(),
+                    expected_digest: policy_file.1.content_digest.clone(),
+                    content,
+                }],
+            },
+        };
+        let response = app
+            .oneshot(human_request(
+                &self.owner,
+                "POST",
+                &format!("{path}/commit"),
+                Some(serde_json::to_value(request).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let receipt: server_api::ConfigurationAdoptionReceipt =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(receipt.source_stored && receipt.policy_committed);
+    }
+
     fn policy_path(&self) -> String {
         format!(
             "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
             self.subject
         )
+    }
+    // Seed only intentionally unsupported saved input, never a management save.
+    // This models pre-catalog policies without teaching the HTTP validator to issue them.
+    fn seed_saved_policy(
+        &self,
+        execution: Vec<ScopedPermission>,
+        delegation: Vec<ScopedPermission>,
+    ) -> SubjectPermissions {
+        let store = open_subjektiv_store(&self.api).unwrap();
+        let previous = store.subject_permissions(&self.subject).unwrap();
+        store
+            .set_subject_permissions(
+                &self.subject,
+                &SubjectPermissionsUpdate {
+                    operation_id: Uuid::now_v7().to_string(),
+                    expected_change_id: previous.map(|policy| policy.change_id),
+                    execution,
+                    delegation,
+                },
+            )
+            .unwrap()
     }
     async fn assign(
         &self,
@@ -350,16 +537,543 @@ impl WorkspaceClient for RouterClient {
                 .await
                 .map_err(|e| WorkspaceClientError::Request(e.to_string()))?;
             let status = response.status().as_u16();
+            let content_type = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
             let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
                 .await
                 .map_err(|e| WorkspaceClientError::Request(e.to_string()))?;
             Ok(WorkspaceResponse {
+                content_type,
                 status,
                 body: String::from_utf8(bytes.to_vec())
                     .map_err(|e| WorkspaceClientError::Request(e.to_string()))?,
             })
         })
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_owner_adoption_authorizes_signed_ticket_effects_and_revocation_without_id_grants()
+ {
+    let f = Fixture::new().await;
+    f.adopt_policy(r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.create", "ticket.read", "ticket.query"]; }]; }"#, "{}").await;
+    let policy = f
+        .api
+        .config_store
+        .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+        .unwrap()
+        .unwrap();
+    assert!(
+        policy.legacy_constraints.is_none(),
+        "normal new key policy does not synthesize an all-target legacy grant"
+    );
+    let client = f.client(&f.source);
+    let (installed, tool) =
+        ticket_tool_host(&f._dir.path().join("canonical-ticket"), client.clone()).await;
+    assert!(installed);
+    tool.unwrap()
+        .execute(
+            r#"{"title":"Canonical assigned operation reaches durable Ticket storage"}"#,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ticket_posts(&client), 1);
+    let tickets = browser_ticket_backend(&f.api)
+        .unwrap()
+        .list(Default::default())
+        .unwrap();
+    assert_eq!(tickets.len(), 1);
+    let reference = tickets[0].id.clone();
+    let read = ticket_read_permission(&reference);
+    assert_eq!(f.check(&f.source, &read).await.0, StatusCode::OK);
+    let mut foreign = read.clone();
+    foreign.resource = PermissionResource::Ticket {
+        workspace_id: "foreign-workspace".into(),
+        ticket_id: reference,
+    };
+    assert_eq!(f.check(&f.source, &foreign).await.0, StatusCode::FORBIDDEN);
+    f.adopt_policy("{}", "{}").await;
+    assert_eq!(f.check(&f.source, &read).await.0, StatusCode::FORBIDDEN);
+    let (_, tool) =
+        ticket_tool_host(&f._dir.path().join("canonical-revoked"), client.clone()).await;
+    assert!(
+        tool.unwrap()
+            .execute(
+                r#"{"title":"Revoked policy must not create"}"#,
+                ToolExecutionContext::direct()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        browser_ticket_backend(&f.api)
+            .unwrap()
+            .list(Default::default())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_policy_keeps_migrated_ticket_id_limits_and_explicit_exclusions() {
+    let f = Fixture::new().await;
+    let a = seed_resource_ticket(&f, "Migration exact target A", "canonical-migrate-a");
+    let b = seed_resource_ticket(&f, "Migration denied target B", "canonical-migrate-b");
+    f.assign(vec![ticket_read_permission(&a[0])], vec![]).await;
+    f.adopt_policy(r#"{ sets = ["ticket"]; }"#, "{}").await;
+    let policy = f
+        .api
+        .config_store
+        .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+        .unwrap()
+        .unwrap();
+    assert!(policy.legacy_constraints.is_some());
+    for alias in &a {
+        assert_eq!(
+            f.check(&f.source, &ticket_read_permission(alias)).await.0,
+            StatusCode::OK
+        );
+    }
+    for alias in &b {
+        assert_eq!(
+            f.check(&f.source, &ticket_read_permission(alias)).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        f.check(&f.source, &create_permission()).await.0,
+        StatusCode::FORBIDDEN,
+        "adding a Set cannot discard migrated per-operation domain limits"
+    );
+    f.adopt_policy(r#"{ sets = ["ticket"]; exclude_namespaces = [{ namespace = "ticket"; keys = ["ticket.read"]; }]; }"#, "{}").await;
+    assert_eq!(
+        f.check(&f.source, &ticket_read_permission(&a[0])).await.0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_delegation_freezes_child_operations_and_rechecks_parent_current_ceiling() {
+    let f = Fixture::new().await;
+    let lane = r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.create", "ticket.query"]; }, { namespace = "worker"; keys = ["worker.create"]; }]; }"#;
+    f.adopt_policy(lane, lane).await;
+    let child = f
+        .child("canonical-explicit-child", vec![create_permission()])
+        .await;
+    assert_eq!(
+        f.check(&child, &create_permission()).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.check(&child, &query_permission()).await.0,
+        StatusCode::FORBIDDEN,
+        "parent current keys do not enlarge a frozen child"
+    );
+    let saved = open_subjektiv_store(&f.api)
+        .unwrap()
+        .worker_execution_grant(&child.runtime_id, &child.worker_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.subject_id, f.subject);
+    assert_eq!(saved.permissions, vec![create_permission()]);
+    assert_eq!(
+        saved.source_change_id,
+        f.api
+            .config_store
+            .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+            .unwrap()
+            .unwrap()
+            .change_id
+    );
+    subject_authorization::revalidate_execution_grant(&f.api, &saved).unwrap();
+    let child_client = f.client(&child);
+    let (installed, tool) = ticket_tool_host(
+        &f._dir.path().join("canonical-child-effect"),
+        child_client.clone(),
+    )
+    .await;
+    assert!(installed);
+    tool.unwrap()
+        .execute(
+            r#"{"title":"Persisted canonical child creates only the granted operation"}"#,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ticket_posts(&child_client), 1);
+    assert_eq!(
+        browser_ticket_backend(&f.api)
+            .unwrap()
+            .list(Default::default())
+            .unwrap()
+            .len(),
+        1
+    );
+    f.adopt_policy(lane, "{}").await;
+    assert!(subject_authorization::revalidate_execution_grant(&f.api, &saved).is_err());
+    assert_eq!(
+        f.check(&child, &create_permission()).await.0,
+        StatusCode::FORBIDDEN,
+        "saved child receipt is not current authority after parent reduction"
+    );
+    assert_eq!(
+        f.check(&f.source, &create_permission()).await.0,
+        StatusCode::OK,
+        "execution and delegation remain separate lanes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_exact_keys_observe_current_feature_removal_without_expanding_children_or_losing_mcp()
+ {
+    let f = Fixture::new().await;
+    declared_ticket_children(&f, true);
+    let root = workspace_operation("ticket.hoge");
+    let child = workspace_operation("ticket.hoge.fuga");
+    f.seed_saved_policy(
+        vec![root.clone(), create_permission(), activation("mcp")],
+        vec![],
+    );
+    assert_eq!(f.check(&f.source, &root).await.0, StatusCode::OK);
+    assert_eq!(
+        f.check(&f.source, &child).await.0,
+        StatusCode::FORBIDDEN,
+        "legacy exact keys are not silently reinterpreted as a children assignment"
+    );
+    f.api
+        .permission_registry
+        .write()
+        .unwrap()
+        .set_enabled(&worker::feature::FeatureId::builtin("ticket"), false)
+        .unwrap();
+    assert_eq!(
+        f.check(&f.source, &create_permission()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.check(&f.source, &activation("mcp")).await.0,
+        StatusCode::OK
+    );
+    {
+        let mut registry = f.api.permission_registry.write().unwrap();
+        let namespace = feature_permissions::NamespaceId::parse("ticket").unwrap();
+        let handle = registry
+            .namespace_handle(&worker::feature::FeatureId::builtin("ticket"), &namespace)
+            .unwrap()
+            .clone();
+        let mut declaration = registry
+            .host()
+            .catalog()
+            .namespaces
+            .into_iter()
+            .find(|entry| entry.namespace == namespace)
+            .unwrap()
+            .declaration;
+        declaration
+            .permissions
+            .retain(|definition| definition.key.as_str() != "ticket.hoge");
+        registry.update(&handle, declaration).unwrap();
+        registry
+            .set_enabled(&worker::feature::FeatureId::builtin("ticket"), true)
+            .unwrap();
+    }
+    assert_eq!(
+        f.check(&f.source, &root).await.0,
+        StatusCode::FORBIDDEN,
+        "unchanged legacy storage cannot keep a removed operation alive"
+    );
+    assert_eq!(
+        f.check(&f.source, &create_permission()).await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_subject_scope_and_callee_service_retain_authenticated_original_subject() {
+    let f = Fixture::new().await;
+    let other = open_subjektiv_store(&f.api)
+        .unwrap()
+        .create_subject(crate::subjektiv::SubjectRole::new("other-protected-subject").unwrap())
+        .unwrap()
+        .id;
+    let memory = r#"{ namespaces = [{ namespace = "memory"; keys = ["memory.resident.read"]; }, { namespace = "worker"; keys = ["worker.create"]; }]; }"#;
+    f.adopt_policy(memory, memory).await;
+    assert_eq!(
+        f.check(
+            &f.source,
+            &subject_permission(&f.subject, "memory.resident.read")
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.check(
+            &f.source,
+            &subject_permission(&other, "memory.resident.read")
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, _) = f
+        .spawn(
+            &f.source,
+            f.child_request(
+                "cannot-delegate-other-subject",
+                vec![subject_permission(&other, "memory.resident.read")],
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let client = f.client(&f.source);
+    let (_host, installed, service) =
+        ticket_worker_host_with_service(&f._dir.path().join("callee-service"), client.clone())
+            .await;
+    assert!(installed);
+    let service = service.unwrap();
+    let denied = service.clone();
+    assert!(
+        tokio::task::spawn_blocking(
+            move || denied.create(NewTicket::new("Caller memory rights are not Ticket rights"))
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert_eq!(ticket_posts(&client), 0);
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.create"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let created = tokio::task::spawn_blocking(move || {
+        service.create(NewTicket::new(
+            "Callee checks its own key for original source",
+        ))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ticket_posts(&client), 1);
+    assert_eq!(
+        browser_ticket_backend(&f.api)
+            .unwrap()
+            .show(created.id.into())
+            .unwrap()
+            .meta
+            .title,
+        "Callee checks its own key for original source"
+    );
+}
+
+fn declared_ticket_children(f: &Fixture, include_children: bool) {
+    use feature_permissions::{NamespaceId, PermissionDefinition, PermissionKey};
+    let mut registry = f.api.permission_registry.write().unwrap();
+    let namespace = NamespaceId::parse("ticket").unwrap();
+    let handle = registry
+        .namespace_handle(&worker::feature::FeatureId::builtin("ticket"), &namespace)
+        .unwrap()
+        .clone();
+    let mut declaration = registry
+        .host()
+        .catalog()
+        .namespaces
+        .into_iter()
+        .find(|entry| entry.namespace == namespace)
+        .unwrap()
+        .declaration;
+    declaration
+        .permissions
+        .retain(|definition| !definition.key.as_str().starts_with("ticket.hoge"));
+    for (key, child) in [
+        ("ticket.hoge", Some("ticket.hoge.fuga")),
+        ("ticket.hoge.fuga", Some("ticket.hoge.fuga.leaf")),
+        ("ticket.hoge.fuga.leaf", None),
+        ("ticket.hoge.unrelated", None),
+    ] {
+        declaration.permissions.push(PermissionDefinition {
+            key: PermissionKey::parse(key).unwrap(),
+            description: "Explicit graph fixture".into(),
+            children: child
+                .filter(|_| include_children)
+                .map(|key| PermissionKey::parse(key).unwrap())
+                .into_iter()
+                .collect(),
+        });
+    }
+    registry.update(&handle, declaration).unwrap();
+}
+
+fn workspace_operation(operation: &str) -> ScopedPermission {
+    ScopedPermission {
+        operation: operation.into(),
+        resource: PermissionResource::Workspace {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_signed_multilevel_children_follow_current_edges_but_never_expand_frozen_children()
+ {
+    let f = Fixture::new().await;
+    declared_ticket_children(&f, true);
+    let execution = r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge"]; }, { namespace = "worker"; keys = ["worker.create"]; }]; }"#;
+    let delegation = r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge"]; }]; }"#;
+    f.adopt_policy(execution, delegation).await;
+    let root = workspace_operation("ticket.hoge");
+    let descendant = workspace_operation("ticket.hoge.fuga.leaf");
+    let same_prefix = workspace_operation("ticket.hoge.unrelated");
+    assert_eq!(f.check(&f.source, &descendant).await.0, StatusCode::OK);
+    assert_eq!(
+        f.check(&f.source, &same_prefix).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let root_child = f.child("graph-root-child", vec![root.clone()]).await;
+    let leaf_child = f.child("graph-leaf-child", vec![descendant.clone()]).await;
+    assert_eq!(f.check(&root_child, &root).await.0, StatusCode::OK);
+    assert_eq!(
+        f.check(&root_child, &descendant).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(f.check(&leaf_child, &descendant).await.0, StatusCode::OK);
+    let before = f
+        .api
+        .config_store
+        .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+        .unwrap()
+        .unwrap()
+        .change_id;
+    declared_ticket_children(&f, false);
+    assert_eq!(
+        f.api
+            .config_store
+            .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
+            .unwrap()
+            .unwrap()
+            .change_id,
+        before,
+        "graph changes do not require redistributing Subject assignments"
+    );
+    assert_eq!(f.check(&f.source, &root).await.0, StatusCode::OK);
+    assert_eq!(
+        f.check(&f.source, &descendant).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.check(&leaf_child, &descendant).await.0,
+        StatusCode::FORBIDDEN,
+        "unchanged frozen child is attenuated by the current graph/parent ceiling"
+    );
+}
+
+struct TrustedAuthorizationPlugin;
+impl worker::feature::FeatureModule for TrustedAuthorizationPlugin {
+    fn descriptor(&self) -> worker::feature::FeatureDescriptor {
+        let mut descriptor = worker::feature::FeatureDescriptor::builtin(
+            "authorization-plugin",
+            "Authorization fixture",
+        );
+        descriptor.id = worker::feature::FeatureId::new("plugin:authorization-fixture").unwrap();
+        descriptor.runtime = worker::feature::FeatureRuntimeKind::ExternalPlugin;
+        descriptor
+    }
+    fn install(
+        &self,
+        _: &mut worker::feature::FeatureInstallContext<'_>,
+    ) -> std::result::Result<(), worker::feature::FeatureInstallError> {
+        Ok(())
+    }
+    fn declare_permissions(
+        &self,
+        registrar: &mut worker::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> std::result::Result<(), worker::feature::FeatureInstallError> {
+        use feature_permissions::*;
+        let namespace = NamespaceId::parse("external_fixture").unwrap();
+        let handle = registrar.namespace(namespace.clone())?;
+        let key = PermissionKey::parse("external_fixture.read.deep").unwrap();
+        registrar.declare(
+            &handle,
+            NamespaceDeclaration {
+                permissions: vec![PermissionDefinition {
+                    key: key.clone(),
+                    description: "Trusted test Plugin".into(),
+                    children: vec![],
+                }],
+                sets: vec![SetContribution {
+                    set: PermissionSetId::parse("ticket").unwrap(),
+                    children: vec![PermissionReference::Namespace(NamespacePermissions {
+                        namespace,
+                        keys: vec![key],
+                    })],
+                }],
+            },
+        )
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_existing_set_holder_observes_trusted_plugin_add_disable_remove_without_child_expansion()
+ {
+    let f = Fixture::new().await;
+    f.adopt_policy(r#"{ sets = ["ticket"]; namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }]; }"#, r#"{ sets = ["ticket"]; }"#).await;
+    let child = f
+        .child("before-plugin-child", vec![create_permission()])
+        .await;
+    let operation = workspace_operation("external_fixture.read.deep");
+    assert_eq!(
+        f.check(&f.source, &operation).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let plugin = worker::feature::FeatureId::new("plugin:authorization-fixture").unwrap();
+    f.api
+        .permission_registry
+        .write()
+        .unwrap()
+        .add_module(&TrustedAuthorizationPlugin)
+        .unwrap();
+    assert_eq!(f.check(&f.source, &operation).await.0, StatusCode::OK);
+    assert_eq!(f.check(&child, &operation).await.0, StatusCode::FORBIDDEN);
+    for enabled in [false, true] {
+        f.api
+            .permission_registry
+            .write()
+            .unwrap()
+            .set_enabled(&plugin, enabled)
+            .unwrap();
+        assert_eq!(
+            f.check(&f.source, &operation).await.0,
+            if enabled {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            }
+        );
+        assert_eq!(
+            f.check(&f.source, &create_permission()).await.0,
+            StatusCode::OK
+        );
+    }
+    f.api
+        .permission_registry
+        .write()
+        .unwrap()
+        .remove(&plugin)
+        .unwrap();
+    assert_eq!(
+        f.check(&f.source, &operation).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.check(&child, &create_permission()).await.0,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -376,6 +1090,7 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
         let (status, body) = f.check(&f.source, &permission).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "unset policy: {body}");
     }
+    f.seed_saved_policy(vec![activation("ticket")], vec![]);
     f.assign(vec![activation("ticket"), create_permission()], vec![])
         .await;
     for permission in [activation("ticket"), create_permission()] {
@@ -435,13 +1150,332 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    let legacy_client = f.client(&legacy);
+    let (installed, tool) =
+        ticket_tool_host(&f._dir.path().join("legacy-ticket"), legacy_client.clone()).await;
+    assert!(installed);
+    assert!(legacy_client.requests.lock().unwrap().is_empty());
+    tool.unwrap()
+        .execute(
+            r#"{"title":"Unattached Worker retains provider-authorized create"}"#,
+            ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ticket_posts(&legacy_client), 1);
+    assert_eq!(
+        browser_ticket_backend(&f.api)
+            .unwrap()
+            .list(Default::default())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn concrete_resource_permissions(f: &Fixture) -> Vec<ScopedPermission> {
+    let workspace = TEST_WORKSPACE_ID.to_owned();
+    [
+        (
+            "ticket.read",
+            PermissionResource::Ticket {
+                workspace_id: workspace.clone(),
+                ticket_id: "resource-ticket".into(),
+            },
+        ),
+        (
+            "objective.read",
+            PermissionResource::Objective {
+                workspace_id: workspace.clone(),
+                objective_id: "resource-objective".into(),
+            },
+        ),
+        (
+            "merge_request.read",
+            PermissionResource::MergeRequest {
+                workspace_id: workspace.clone(),
+                merge_request_id: "resource-mr".into(),
+            },
+        ),
+        (
+            "memory.resident.read",
+            PermissionResource::Subject {
+                workspace_id: workspace.clone(),
+                subject_id: f.subject.clone(),
+            },
+        ),
+        (
+            "drive.read_text",
+            PermissionResource::DriveEntry {
+                workspace_id: workspace.clone(),
+                node_id: "resource-entry".into(),
+            },
+        ),
+        (
+            "drive.request_status",
+            PermissionResource::DriveRequest {
+                workspace_id: workspace.clone(),
+                request_id: "resource-request".into(),
+            },
+        ),
+        (
+            "workdir.create",
+            PermissionResource::Repository {
+                workspace_id: workspace.clone(),
+                repository_key: "test-repository".into(),
+            },
+        ),
+        (
+            "workdir.detach",
+            PermissionResource::WorkdirAttachment {
+                workspace_id: workspace.clone(),
+                connection_id: "resource-attachment".into(),
+            },
+        ),
+        (
+            "workspace_config.read",
+            PermissionResource::WorkspaceConfig {
+                workspace_id: workspace,
+                path: "main.dcdl".into(),
+                recursive: false,
+            },
+        ),
+        (
+            "web.fetch",
+            PermissionResource::Network {
+                url: "https://example.invalid/resource".into(),
+            },
+        ),
+        (
+            "subworker.observe",
+            PermissionResource::SubWorker {
+                runtime_id: f.source.runtime_id.clone(),
+                worker_id: f.source.worker_id.clone(),
+                name: "resource-child".into(),
+            },
+        ),
+    ]
+    .into_iter()
+    .map(|(operation, resource)| ScopedPermission {
+        operation: operation.into(),
+        resource,
+    })
+    .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_never_expands_saved_workspace_or_feature_grants_to_new_resource_kinds() {
+    let f = Fixture::new().await;
+    let requested = concrete_resource_permissions(&f);
+    let workspace_grants: Vec<_> = requested
+        .iter()
+        .map(|permission| ScopedPermission {
+            operation: permission.operation.clone(),
+            resource: PermissionResource::Workspace {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            },
+        })
+        .collect();
+    f.seed_saved_policy(workspace_grants.clone(), vec![]);
+    for permission in &requested {
+        let (status, body) = f.check(&f.source, permission).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "Workspace is not a parent resource: {permission:?}: {body}"
+        );
+    }
+    // Same-operation Workspace grants above isolate kind containment from the
+    // separate rule that an old Feature activation name grants no dotted operation.
+    let feature_names: std::collections::BTreeSet<_> = requested
+        .iter()
+        .map(|permission| permission.operation.split('.').next().unwrap())
+        .collect();
+    f.seed_saved_policy(feature_names.into_iter().map(activation).collect(), vec![]);
+    for permission in &requested {
+        assert_eq!(
+            f.check(&f.source, permission).await.0,
+            StatusCode::FORBIDDEN,
+            "{permission:?}"
+        );
+    }
+    f.seed_saved_policy(requested.clone(), vec![]);
+    for permission in &requested {
+        let (status, body) = f.check(&f.source, permission).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "exact resource must be usable: {permission:?}: {body}"
+        );
+        assert_eq!(body, json!({"scope": permission.resource}));
+    }
+    // These are current persisted policies, not mocked authorization answers.
+    assert_eq!(
+        open_subjektiv_store(&f.api)
+            .unwrap()
+            .subject_permissions(&f.subject)
+            .unwrap()
+            .unwrap()
+            .execution,
+        requested
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_rejects_cross_workspace_resource_claims_before_alias_resolution() {
+    let f = Fixture::new().await;
+    let permissions = concrete_resource_permissions(&f);
+    f.seed_saved_policy(permissions.clone(), vec![]);
+    for permission in permissions
+        .iter()
+        .filter(|permission| permission.resource.workspace_id().is_some())
+    {
+        let mut forged = serde_json::to_value(permission).unwrap();
+        forged["resource"]["workspace_id"] = json!("forged-workspace");
+        let forged: ScopedPermission = serde_json::from_value(forged).unwrap();
+        let (status, body) = f.check(&f.source, &forged).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{forged:?}: {body}");
+        assert!(
+            !body.to_string().contains("scope"),
+            "refusal must not return effective scope: {body}"
+        );
+    }
+}
+
+fn seed_resource_ticket(f: &Fixture, title: &str, slug: &str) -> [String; 3] {
+    let backend = browser_ticket_backend(&f.api).unwrap();
+    let mut input = NewTicket::new(title);
+    input.slug = Some(slug.into());
+    input.body = "PRIVATE_AUTHORIZATION_BODY_MUST_NOT_BE_RETURNED".into();
+    let created = backend.create(input).unwrap();
+    let stored = backend.show(created.id.clone().into()).unwrap();
+    let resource_key = created.resource_key.unwrap();
+    assert!(resource_key.starts_with("T-"));
+    assert_eq!(stored.meta.slug, slug);
+    assert_ne!(created.id, resource_key);
+    assert_ne!(created.id, slug);
+    [created.id, resource_key, stored.meta.slug]
+}
+
+fn ticket_read_permission(reference: &str) -> ScopedPermission {
+    ScopedPermission {
+        operation: "ticket.read".into(),
+        resource: PermissionResource::Ticket {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            ticket_id: reference.into(),
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_ticket_grant_accepts_only_same_ticket_internal_id_code_and_slug() {
+    let f = Fixture::new().await;
+    let a = seed_resource_ticket(&f, "Allowed resource A", "resource-a-slug");
+    let b = seed_resource_ticket(&f, "Denied resource B", "resource-b-slug");
+    for granted in &a {
+        f.assign(vec![ticket_read_permission(granted)], vec![])
+            .await;
+        for requested in &a {
+            let permission = ticket_read_permission(requested);
+            let (status, body) = f.check(&f.source, &permission).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "grant {granted}, request {requested}: {body}"
+            );
+            assert_eq!(
+                body,
+                json!({"scope": permission.resource}),
+                "same identity must return the caller's requested spelling, not a broader scope"
+            );
+        }
+        let absent = f
+            .check(
+                &f.source,
+                &ticket_read_permission("resource-does-not-exist"),
+            )
+            .await;
+        assert_eq!(absent.0, StatusCode::FORBIDDEN);
+        for requested in &b {
+            assert_eq!(
+                f.check(&f.source, &ticket_read_permission(requested)).await,
+                absent,
+                "another existing Ticket and a missing Ticket must have the same refusal"
+            );
+        }
+        // Alias lookup cannot cross resource kinds even when identity text matches.
+        for resource in [
+            PermissionResource::Objective {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                objective_id: granted.clone(),
+            },
+            PermissionResource::MergeRequest {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                merge_request_id: granted.clone(),
+            },
+        ] {
+            let permission = ScopedPermission {
+                operation: "ticket.read".into(),
+                resource,
+            };
+            assert_eq!(
+                f.check(&f.source, &permission).await.0,
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+    f.assign(vec![], vec![]).await;
+    let absent = f
+        .check(
+            &f.source,
+            &ticket_read_permission("resource-does-not-exist"),
+        )
+        .await;
+    for reference in a.iter().chain(&b) {
+        assert_eq!(
+            f.check(&f.source, &ticket_read_permission(reference)).await,
+            absent,
+            "revocation must deny all spellings of an existing target just like an absent target"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_host_ungranted_operation_does_not_disclose_ticket_or_subject_existence() {
+    let f = Fixture::new().await;
+    let ticket = seed_resource_ticket(&f, "Private existence fixture", "private-existence-slug");
+    // An unrelated operation on the right Subject is not permission to read it.
+    f.assign(
+        vec![subject_permission(&f.subject, "session.record")],
+        vec![],
+    )
+    .await;
+    for (existing, missing) in [
+        (
+            ticket_read_permission(&ticket[0]),
+            ticket_read_permission("no-such-ticket"),
+        ),
+        (
+            subject_permission(&f.subject, "memory.resident.read"),
+            subject_permission("no-such-subject", "memory.resident.read"),
+        ),
+    ] {
+        let denial = f.check(&f.source, &existing).await;
+        assert_eq!(denial.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            denial,
+            f.check(&f.source, &missing).await,
+            "an ungranted operation must not distinguish existing and absent protected targets"
+        );
+        assert!(!denial.1.to_string().contains("PRIVATE_AUTHORIZATION_BODY"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authorization_rejects_missing_source_unknown_identity_fields_and_tampered_signed_body() {
     let f = Fixture::new().await;
-    f.assign(vec![activation("ticket")], vec![]).await;
-    let body = serde_json::to_value(activation("ticket")).unwrap();
+    f.assign(vec![create_permission()], vec![]).await;
+    let body = serde_json::to_value(create_permission()).unwrap();
     let (status, error) = response(
         &f.api,
         human_request(&f.owner, "POST", &authorization_path(), Some(body.clone())),
@@ -539,7 +1573,7 @@ async fn authorization_rejects_missing_source_unknown_identity_fields_and_tamper
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permissions() {
+async fn only_owner_account_can_assign_shrink_and_revoke_subject_permissions() {
     let f = Fixture::new().await;
     let (status, body) = response(
         &f.api,
@@ -550,8 +1584,8 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
     assert!(body["permissions"].is_null());
     let original = f
         .assign(
-            vec![activation("ticket"), create_permission()],
-            vec![activation("ticket")],
+            vec![create_permission(), query_permission()],
+            vec![create_permission()],
         )
         .await;
     let (status, body) = response(
@@ -603,9 +1637,20 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
         .await;
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
-            "foreign account {method}: {body}"
+            if method == "GET" {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "non-owner account {method}: {body}"
         );
+        if method == "GET" {
+            assert_eq!(body["can_manage"], false);
+            assert_eq!(
+                body["permissions"],
+                serde_json::to_value(&original).unwrap()
+            );
+        }
     }
     assert_eq!(
         open_subjektiv_store(&f.api)
@@ -614,7 +1659,7 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
             .unwrap(),
         Some(original.clone())
     );
-    let shrunk = f.assign(vec![activation("ticket")], vec![]).await;
+    let shrunk = f.assign(vec![query_permission()], vec![]).await;
     assert_ne!(shrunk.change_id, original.change_id);
     assert_eq!(
         f.check(&f.source, &create_permission()).await.0,
@@ -633,7 +1678,7 @@ async fn only_owner_account_can_read_assign_shrink_and_revoke_subject_permission
     let revoked = f.assign(vec![], vec![]).await;
     assert!(revoked.execution.is_empty() && revoked.delegation.is_empty());
     assert_eq!(
-        f.check(&f.source, &activation("ticket")).await.0,
+        f.check(&f.source, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
 }
@@ -655,11 +1700,11 @@ impl agen::llm_client::LlmClient for UnusedModel {
 }
 async fn ticket_worker_host_with_service(
     root: &Path,
-    client: Arc<RouterClient>,
+    client: Arc<dyn WorkspaceClient>,
 ) -> (
     worker::Worker<UnusedModel, session_store::FsStore>,
     bool,
-    Option<Arc<dyn worker::feature::builtin::ticket::TicketService>>,
+    Option<Arc<dyn worker::feature::contracts::TicketService>>,
 ) {
     let manifest = worker::WorkerManifest::from_toml(
         r#"
@@ -704,9 +1749,9 @@ async fn ticket_worker_host_with_service(
         Some(
             report
                 .services
-                .service::<dyn worker::feature::builtin::ticket::TicketService>(
+                .service::<dyn worker::feature::contracts::TicketService>(
                     &worker::feature::ServiceId::builtin(
-                        worker::feature::builtin::ticket::TICKET_SERVICE_ID,
+                        worker::feature::contracts::TICKET_SERVICE_ID,
                     ),
                 )
                 .unwrap(),
@@ -718,12 +1763,15 @@ async fn ticket_worker_host_with_service(
 }
 async fn ticket_worker_host(
     root: &Path,
-    client: Arc<RouterClient>,
+    client: Arc<dyn WorkspaceClient>,
 ) -> (worker::Worker<UnusedModel, session_store::FsStore>, bool) {
     let (host, installed, _) = ticket_worker_host_with_service(root, client).await;
     (host, installed)
 }
-async fn ticket_tool_host(root: &Path, client: Arc<RouterClient>) -> (bool, Option<Arc<dyn Tool>>) {
+async fn ticket_tool_host(
+    root: &Path,
+    client: Arc<dyn WorkspaceClient>,
+) -> (bool, Option<Arc<dyn Tool>>) {
     let (host, installed) = ticket_worker_host(root, client).await;
     let server = host.engine().tool_server_handle();
     server.flush_pending();
@@ -731,7 +1779,7 @@ async fn ticket_tool_host(root: &Path, client: Arc<RouterClient>) -> (bool, Opti
     if !installed {
         assert!(
             tool.is_none(),
-            "denied activation must not partially install TicketCreate"
+            "failed installation must not partially install TicketCreate"
         );
     }
     (installed, tool)
@@ -752,35 +1800,59 @@ fn value(output: ToolOutput) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn worker_feature_activation_is_distinct_from_ticket_create_and_revocation_precedes_backend_call()
- {
+async fn ticket_registration_is_local_and_only_create_permission_allows_backend_effects() {
     let f = Fixture::new().await;
     let client = f.client(&f.source);
-    for (name, permissions, installed) in [
-        ("unset", vec![], false),
-        ("operation-only", vec![create_permission()], false),
-        ("activation-only", vec![activation("ticket")], true),
+    let mut wrong_workspace = create_permission();
+    wrong_workspace.resource = PermissionResource::Ticket {
+        workspace_id: TEST_WORKSPACE_ID.into(),
+        ticket_id: "another-ticket".into(),
+    };
+    let (installed, tool) = ticket_tool_host(&f._dir.path().join("unset"), client.clone()).await;
+    assert!(installed);
+    assert!(
+        client.requests.lock().unwrap().is_empty(),
+        "registration performs no HTTP"
+    );
+    assert!(
+        tool.unwrap()
+            .execute(
+                r#"{"title":"unset must not create"}"#,
+                ToolExecutionContext::direct()
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(ticket_posts(&client), 0);
+    for (name, permissions) in [
+        ("empty", vec![]),
+        ("old-feature-only", vec![activation("ticket")]),
+        ("wrong-resource", vec![wrong_workspace]),
     ] {
+        f.seed_saved_policy(permissions.clone(), vec![]);
         f.assign(permissions, vec![]).await;
-        let (actual, tool) = ticket_tool_host(&f._dir.path().join(name), client.clone()).await;
-        assert_eq!(actual, installed, "{name}");
-        if let Some(tool) = tool {
-            let result = tool
-                .execute(
-                    r#"{"title":"must not reach TicketBackend"}"#,
-                    ToolExecutionContext::direct(),
-                )
-                .await;
-            assert!(result.is_err(), "activation alone cannot create a Ticket");
-            assert_eq!(
-                ticket_posts(&client),
-                0,
-                "denial must precede TicketBackend HTTP call"
-            );
-        }
+        client.requests.lock().unwrap().clear();
+        let (installed, tool) = ticket_tool_host(&f._dir.path().join(name), client.clone()).await;
+        assert!(installed, "{name}");
+        assert!(
+            client.requests.lock().unwrap().is_empty(),
+            "{name}: registration performs no HTTP"
+        );
+        let result = tool
+            .unwrap()
+            .execute(
+                r#"{"title":"must not reach TicketBackend"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await;
+        assert!(result.is_err(), "{name}");
+        assert_eq!(
+            ticket_posts(&client),
+            0,
+            "{name}: deny before downstream create"
+        );
     }
-    f.assign(vec![activation("ticket"), create_permission()], vec![])
-        .await;
+    f.assign(vec![create_permission()], vec![]).await;
     let (installed, tool) = ticket_tool_host(&f._dir.path().join("allowed"), client.clone()).await;
     assert!(installed);
     let tool = tool.unwrap();
@@ -800,7 +1872,7 @@ async fn worker_feature_activation_is_distinct_from_ticket_create_and_revocation
         1,
         "genuine SQLite Ticket backend result: {created}"
     );
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     let result = tool
         .execute(
             r#"{"title":"revoked after install"}"#,
@@ -814,6 +1886,309 @@ async fn worker_feature_activation_is_distinct_from_ticket_create_and_revocation
         "old installed Tool must recheck before backend call"
     );
     assert_eq!(backend.list(Default::default()).unwrap().len(), 1);
+}
+
+fn local_task_manifest() -> worker::WorkerManifest {
+    worker::WorkerManifest::from_toml(
+        r#"
+        [worker]
+        name = "local-authorization-tasks"
+        [model]
+        scheme = "anthropic"
+        model_id = "unused"
+        [engine]
+        [scope]
+        allow = []
+        [feature.workdir_catalog]
+        enabled = false
+        [feature.task]
+        enabled = true
+    "#,
+    )
+    .unwrap()
+}
+
+fn local_bootstrap(
+    root: &Path,
+    manifest: worker::WorkerManifest,
+    client: Arc<dyn WorkspaceClient>,
+) -> worker::WorkerBootstrap<
+    session_store::CombinedStore<session_store::FsStore, session_store::FsWorkerStore>,
+> {
+    worker::WorkerBootstrap::new(
+        manifest,
+        session_store::CombinedStore::new(
+            session_store::FsStore::new(root.join("sessions")).unwrap(),
+            session_store::FsWorkerStore::new(root.join("worker-metadata")).unwrap(),
+        ),
+        worker::PromptCatalogSource::builtins_only(),
+        worker::WorkerWorkspaceContext::with_client(
+            Some(worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap()),
+            client,
+        ),
+        worker::WorkerFilesystemAuthority::None,
+        worker::WorkerBootstrapLayout::Direct {
+            runtime_base: root.join("runtime"),
+        },
+    )
+    .with_model_client(UnusedModel)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unset_subject_local_task_startup_create_update_and_history_replay_make_no_http_calls() {
+    let f = Fixture::new().await;
+    let client = f.client(&f.source);
+    assert!(
+        open_subjektiv_store(&f.api)
+            .unwrap()
+            .subject_permissions(&f.subject)
+            .unwrap()
+            .is_none()
+    );
+    let prepared = local_bootstrap(
+        &f._dir.path().join("task-start"),
+        local_task_manifest(),
+        client.clone(),
+    )
+    .prepare()
+    .await
+    .unwrap();
+    let tools = prepared.worker().engine().tool_server_handle();
+    let boot = prepared.start().await.unwrap();
+    tools.flush_pending();
+    let create_args = r#"{"subject":"Local task","description":"No external operation"}"#;
+    let create = tools.get_tool("TaskCreate").unwrap().1;
+    let created = value(
+        create
+            .execute(create_args, ToolExecutionContext::direct())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(created["taskid"], 1);
+    assert_eq!(created["status"], "pending");
+    let update_args = r#"{"taskid":1,"status":"completed"}"#;
+    let update = tools.get_tool("TaskUpdate").unwrap().1;
+    let updated = value(
+        update
+            .execute(update_args, ToolExecutionContext::direct())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(updated["status"], "completed");
+    boot.handle
+        .send(protocol::Method::Shutdown {
+            command: protocol::WorkerCommandEnvelope::new(1),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), boot.controller_task)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Replay uses the Feature's production history boundary, not a test store.
+    let history = [
+        agen::Item::tool_call("local-create", "TaskCreate", create_args),
+        agen::Item::tool_call("local-update", "TaskUpdate", update_args),
+    ];
+    let replay = worker::feature::builtin::TaskFeature::from_history(&history);
+    let mut prepared = local_bootstrap(
+        &f._dir.path().join("task-replay"),
+        local_task_manifest(),
+        client.clone(),
+    )
+    .prepare()
+    .await
+    .unwrap();
+    let report = prepared
+        .worker_mut()
+        .install_features(worker::feature::FeatureRegistryBuilder::new().with_module(replay));
+    assert!(!report.has_errors(), "{}", report.error_message());
+    let tools = prepared.worker().engine().tool_server_handle();
+    tools.flush_pending();
+    let task = value(
+        tools
+            .get_tool("TaskGet")
+            .unwrap()
+            .1
+            .execute(r#"{"taskid":1}"#, ToolExecutionContext::direct())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(task, updated, "replay preserves local Task state");
+    assert!(
+        client.requests.lock().unwrap().is_empty(),
+        "startup, Tools and replay must make zero activation or operation HTTP calls"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unset_subject_mcp_activation_denies_before_discovery_process_spawn() {
+    let f = Fixture::new().await;
+    let client = f.client(&f.source);
+    let marker = f._dir.path().join("mcp-spawned");
+    let mut manifest = local_task_manifest();
+    manifest
+        .mcp
+        .stdio_servers
+        .push(manifest::McpStdioServerConfig {
+            name: "must-not-discover".into(),
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf spawned > \"$1\"".into(),
+                "mcp-fixture".into(),
+                marker.display().to_string(),
+            ],
+            cwd: None,
+            env: Default::default(),
+        });
+    let error = match local_bootstrap(&f._dir.path().join("mcp-denied"), manifest, client.clone())
+        .start()
+        .await
+    {
+        Ok(boot) => {
+            boot.controller_task.abort();
+            panic!("MCP startup must be denied")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(error.contains("mcp") && error.contains("403"), "{error}");
+    assert!(
+        !marker.exists(),
+        "denial must precede discovery's process effect"
+    );
+    let requests = client.requests.lock().unwrap();
+    assert_eq!(
+        requests.as_slice(),
+        &[("POST".into(), authorization_path())],
+        "only MCP's retained activation check may run"
+    );
+}
+
+#[derive(Debug, Default)]
+struct FailedAuthorizationTransport {
+    requests: Mutex<Vec<String>>,
+}
+impl WorkspaceClient for FailedAuthorizationTransport {
+    fn workspace_id(&self) -> Option<&str> {
+        Some(TEST_WORKSPACE_ID)
+    }
+    fn kind(&self) -> &str {
+        "failed-transport"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn execute(
+        &self,
+        request: WorkspaceRequest,
+    ) -> std::result::Result<WorkspaceResponse, WorkspaceClientError> {
+        self.requests.lock().unwrap().push(request.path);
+        Err(WorkspaceClientError::Request(
+            "injected connection failure".into(),
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ticket_registration_without_host_is_local_but_operations_never_fall_back_to_standalone() {
+    let dir = tempfile::tempdir().unwrap();
+    let failed = Arc::new(FailedAuthorizationTransport::default());
+    let bound_id = worker::WorkspaceId::new(TEST_WORKSPACE_ID).unwrap();
+    for (name, client) in [
+        (
+            "unconnected",
+            worker::WorkerWorkspaceContext::no_workspace().client_handle(),
+        ),
+        (
+            "standalone",
+            worker::WorkerWorkspaceContext::local_filesystem(None).client_handle(),
+        ),
+        (
+            "unavailable-bound",
+            worker::WorkerWorkspaceContext::unavailable(Some(bound_id), "connection unavailable")
+                .client_handle(),
+        ),
+        (
+            "transport-error",
+            failed.clone() as Arc<dyn WorkspaceClient>,
+        ),
+    ] {
+        let (installed, tool) = ticket_tool_host(&dir.path().join(name), client).await;
+        assert!(installed, "{name}: local registration needs no Host");
+        let error = tool
+            .unwrap()
+            .execute(
+                r#"{"title":"must not create"}"#,
+                ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            !error.to_string().contains("403"),
+            "unavailable is not policy denial: {name}: {error}"
+        );
+    }
+    assert_eq!(
+        failed.requests.lock().unwrap().as_slice(),
+        &[authorization_path()],
+        "communication failure must not issue downstream create"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subject_operation_allow_does_not_enlarge_real_provider_write_scope() {
+    let f = Fixture::new().await;
+    let permission = ScopedPermission {
+        operation: "filesystem.write".into(),
+        resource: PermissionResource::Workdir {
+            working_directory_id: "read-only-provider".into(),
+            path: ".".into(),
+            recursive: true,
+        },
+    };
+    f.assign(vec![permission.clone()], vec![]).await;
+    assert_eq!(f.check(&f.source, &permission).await.0, StatusCode::OK);
+    let root = tempfile::tempdir().unwrap();
+    let mut config = manifest::ScopeConfig {
+        allow: manifest::Scope::writable(root.path())
+            .unwrap()
+            .allow_rules(),
+        deny: vec![],
+    };
+    config.allow[0].permission = manifest::Permission::Read;
+    let client = f.client(&f.source);
+    let session = worker::authorized_workdir::authorized_workdir_session(
+        Arc::new(workdir::LocalWorkdirSession::new(
+            manifest::Scope::from_config(&config).unwrap(),
+            root.path().to_path_buf(),
+        )),
+        client.clone(),
+        "read-only-provider".into(),
+    );
+    let result = session
+        .write(workdir::WriteRequest {
+            path: workdir::WorkdirPath::new("denied.txt").unwrap(),
+            content: b"must-not-write".to_vec(),
+            expected_hash: None,
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "Host grant cannot override the provider's read-only scope"
+    );
+    assert!(!root.path().join("denied.txt").exists());
+    assert!(
+        client
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, path)| path == &authorization_path()),
+        "real Host authorization must be connected to provider dispatch"
+    );
 }
 
 fn creation_record_counts(f: &Fixture) -> [i64; 3] {
@@ -837,7 +2212,7 @@ fn creation_record_counts(f: &Fixture) -> [i64; 3] {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn generic_create_routes_refuse_body_and_child_delegation_before_any_creation_effect() {
     let f = Fixture::new().await;
-    let permissions = vec![activation("ticket"), create_permission()];
+    let permissions = vec![query_permission(), create_permission()];
     f.assign(vec![], permissions.clone()).await;
     let mut child_request = f.child_request("redelegating-editor", permissions.clone());
     child_request["execution_grant"]["redelegation"] = json!(permissions);
@@ -954,7 +2329,7 @@ async fn generic_create_routes_preserve_human_and_non_subject_worker_creation() 
 async fn subject_control_creation_recovers_control_grant_failure_and_lost_response_without_duplicates()
  {
     let f = Fixture::new().await;
-    let permissions = vec![activation("ticket"), create_permission()];
+    let permissions = vec![query_permission(), create_permission()];
     f.assign(vec![], permissions.clone()).await;
     let mut missing_id = f.child_request("control-grant-recovery", permissions.clone());
     missing_id
@@ -1032,7 +2407,7 @@ async fn subject_control_creation_recovers_control_grant_failure_and_lost_respon
 async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_one_worker_and_grant()
  {
     let f = Fixture::new().await;
-    let grant_permissions = vec![activation("ticket"), create_permission()];
+    let grant_permissions = vec![create_permission()];
     let policy = f.assign(vec![], grant_permissions.clone()).await;
     assert_eq!(
         f.check(&f.source, &create_permission()).await.0,
@@ -1151,7 +2526,7 @@ async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_o
     let (status, body) = f
         .spawn(
             &child,
-            f.child_request("undelegatable-grandchild", vec![activation("ticket")]),
+            f.child_request("undelegatable-grandchild", vec![query_permission()]),
         )
         .await;
     assert_eq!(
@@ -1164,12 +2539,12 @@ async fn explicit_delegation_creates_workdirless_ticketless_editor_and_replays_o
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn delegated_creation_rejects_excess_permissions_and_body_identity_before_runtime_spawn() {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket")]).await;
-    let mut singleton = f.child_request("singleton-escalation", vec![activation("ticket")]);
+    f.assign(vec![], vec![query_permission()]).await;
+    let mut singleton = f.child_request("singleton-escalation", vec![query_permission()]);
     singleton["singleton_key"] = json!("model-chosen-singleton");
-    let mut body_attachment = f.child_request("subject-escalation", vec![activation("ticket")]);
+    let mut body_attachment = f.child_request("subject-escalation", vec![query_permission()]);
     body_attachment["feature_connections"] = json!({"subjektiv":{"subject_id":f.subject}});
-    let mut spoof = f.child_request("origin-escalation", vec![activation("ticket")]);
+    let mut spoof = f.child_request("origin-escalation", vec![query_permission()]);
     spoof["execution_grant"]["subject_id"] = json!(f.subject);
     for request in [
         singleton,
@@ -1191,12 +2566,9 @@ async fn delegated_creation_rejects_excess_permissions_and_body_identity_before_
 async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_falls_back_to_legacy()
  {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket")]).await;
-    let child = f.child("revocable-child", vec![activation("ticket")]).await;
-    assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
-        StatusCode::OK
-    );
+    f.assign(vec![], vec![query_permission()]).await;
+    let child = f.child("revocable-child", vec![query_permission()]).await;
+    assert_eq!(f.check(&child, &query_permission()).await.0, StatusCode::OK);
     let before = open_subjektiv_store(&f.api)
         .unwrap()
         .worker_execution_grant(&child.runtime_id, &child.worker_id)
@@ -1204,7 +2576,7 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
         .unwrap();
     f.assign(vec![], vec![]).await;
     assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
+        f.check(&child, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
     let observation = f
@@ -1222,7 +2594,7 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
         Some(json!({"expected_observation_token":observation,"request_id":"restore-revoked-child"})))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
+        f.check(&child, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
@@ -1234,33 +2606,33 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
     );
     // Regranting identical permissions changes the assignment identity. Old
     // grants remain revoked rather than refreshing during restore/reconnect.
-    f.assign(vec![], vec![activation("ticket")]).await;
+    f.assign(vec![], vec![query_permission()]).await;
     assert_eq!(
-        f.check(&child, &activation("ticket")).await.0,
+        f.check(&child, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
     let current = f
-        .child("current-before-origin-release", vec![activation("ticket")])
+        .child("current-before-origin-release", vec![query_permission()])
         .await;
     assert_eq!(
-        f.check(&current, &activation("ticket")).await.0,
+        f.check(&current, &query_permission()).await.0,
         StatusCode::OK
     );
     f.release_source_lease();
     assert_eq!(
-        f.check(&current, &activation("ticket")).await.0,
+        f.check(&current, &query_permission()).await.0,
         StatusCode::CONFLICT,
         "the captured source lease is no longer current"
     );
     assert_eq!(
-        f.check(&f.source, &activation("ticket")).await.0,
+        f.check(&f.source, &query_permission()).await.0,
         StatusCode::UNAUTHORIZED,
         "released body fails signed-source authentication instead of falling through to legacy compatibility"
     );
     let (status, _) = f
         .spawn(
             &f.source,
-            f.child_request("released-origin-spawn", vec![activation("ticket")]),
+            f.child_request("released-origin-spawn", vec![query_permission()]),
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -1269,7 +2641,7 @@ async fn restored_child_cannot_refresh_revoked_policy_and_released_origin_never_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_backend() {
     let f = Fixture::new().await;
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     let client = f.client(&f.source);
     let (mut host, installed) =
         ticket_worker_host(&f._dir.path().join("wip-host"), client.clone()).await;
@@ -1312,10 +2684,10 @@ async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_bac
         .as_array()
         .unwrap()
         .iter()
-        .find(|interface| interface["reference"]["name"] == "yoi.ticket/collection/v1")
+        .find(|interface| interface["reference"]["name"] == "yoi.ticket/collection/v2")
         .expect("native Ticket collection interface")["reference"]
         .clone();
-    let args = json!({"path":"/tickets","interface":reference,"operation":"create","arguments":{"title":"Native authorized Ticket"}}).to_string();
+    let args = json!({"path":"/tickets","interface":reference,"operation":"create","arguments":{"content":{"title":"Native authorized Ticket"}}}).to_string();
     assert!(
         invoke
             .execute(&args, ToolExecutionContext::direct())
@@ -1327,8 +2699,7 @@ async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_bac
         0,
         "WIP denial must not call TicketBackend HTTP"
     );
-    f.assign(vec![activation("ticket"), create_permission()], vec![])
-        .await;
+    f.assign(vec![create_permission()], vec![]).await;
     invoke
         .execute(&args, ToolExecutionContext::direct())
         .await
@@ -1337,7 +2708,7 @@ async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_bac
     let backend = browser_ticket_backend(&f.api).unwrap();
     let tickets = backend.list(Default::default()).unwrap();
     assert_eq!(tickets.len(), 1);
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     assert!(
         invoke
             .execute(&args, ToolExecutionContext::direct())
@@ -1357,7 +2728,7 @@ async fn policy_replacement_reports_interruption_evidence_but_exact_replay_does_
  {
     let f = Fixture::new().await;
     let update = json!({"operation_id":"policy-interruption-once","expected_change_id":null,
-        "execution":[activation("ticket")],"delegation":[]});
+        "execution":[create_permission()],"delegation":[]});
     let (status, body) = response(
         &f.api,
         human_request(&f.owner, "POST", &f.policy_path(), Some(update.clone())),
@@ -1411,13 +2782,13 @@ async fn policy_replacement_reports_interruption_evidence_but_exact_replay_does_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling() {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket"), create_permission()])
+    f.assign(vec![], vec![query_permission(), create_permission()])
         .await;
     let mut request = f.child_request(
         "redelegating-parent",
-        vec![activation("ticket"), create_permission()],
+        vec![query_permission(), create_permission()],
     );
-    request["execution_grant"]["redelegation"] = json!([activation("ticket")]);
+    request["execution_grant"]["redelegation"] = json!([query_permission()]);
     let (status, body) = f.spawn(&f.source, request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let parent = RuntimeWorkerRef::new(
@@ -1427,7 +2798,7 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
     let (status, body) = f
         .spawn(
             &parent,
-            f.child_request("allowed-grandchild", vec![activation("ticket")]),
+            f.child_request("allowed-grandchild", vec![query_permission()]),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1445,7 +2816,7 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
         "keep immediate lineage instead of flattening to the body"
     );
     assert_eq!(
-        f.check(&grandchild, &activation("ticket")).await.0,
+        f.check(&grandchild, &query_permission()).await.0,
         StatusCode::OK
     );
     assert_eq!(
@@ -1467,7 +2838,7 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
     assert_eq!(f.runtime.spawn_requests().len(), calls);
     f.assign(vec![], vec![]).await;
     assert_eq!(
-        f.check(&grandchild, &activation("ticket")).await.0,
+        f.check(&grandchild, &query_permission()).await.0,
         StatusCode::FORBIDDEN
     );
 }
@@ -1475,8 +2846,8 @@ async fn grandchild_grant_uses_immediate_parent_subset_not_root_subject_ceiling(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_profile_name_with_wider_resolved_scope_cannot_rebind_existing_operation() {
     let f = Fixture::new().await;
-    f.assign(vec![], vec![activation("ticket")]).await;
-    let mut request = f.child_request("profile-bound-once", vec![activation("ticket")]);
+    f.assign(vec![], vec![query_permission()]).await;
+    let mut request = f.child_request("profile-bound-once", vec![query_permission()]);
     request["profile"] = json!("project:authority-editor");
     let (status, body) = f.spawn(&f.source, request.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1512,7 +2883,7 @@ async fn same_profile_name_with_wider_resolved_scope_cannot_rebind_existing_oper
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source() {
     let f = Fixture::new().await;
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     let client = f.client(&f.source);
     let (_host, installed, service) =
         ticket_worker_host_with_service(&f._dir.path().join("service-host"), client.clone()).await;
@@ -1575,8 +2946,7 @@ async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source(
             .unwrap()
             .is_empty()
     );
-    f.assign(vec![activation("ticket"), create_permission()], vec![])
-        .await;
+    f.assign(vec![create_permission()], vec![]).await;
     let allowed = service.clone();
     let created =
         tokio::task::spawn_blocking(move || allowed.create(NewTicket::new("Service authorized")))
@@ -1589,7 +2959,7 @@ async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source(
         "Service authorized"
     );
     assert_eq!(ticket_posts(&client), 1);
-    f.assign(vec![activation("ticket")], vec![]).await;
+    f.assign(vec![], vec![]).await;
     assert!(
         tokio::task::spawn_blocking(move || service.create(NewTicket::new("Revoked service")))
             .await
@@ -1919,208 +3289,509 @@ impl Drop for ConnectedRuntimeServer {
     }
 }
 
+#[tokio::test]
+async fn delegated_subject_child_cannot_downgrade_ticket_start_to_manual_by_omitting_assignment() {
+    let f = Fixture::new().await;
+    let create = ScopedPermission {
+        operation: "worker.create".into(),
+        resource: PermissionResource::Workspace {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        },
+    };
+    f.assign(vec![create.clone()], vec![create.clone()]).await;
+    let mut request = f.child_request("ticket-initiation-source", vec![create.clone()]);
+    request["execution_grant"]["redelegation"] = json!([create]);
+    let (status, created) = f.spawn(&f.source, request).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let child = RuntimeWorkerRef::new(
+        created["runtime_id"].as_str().unwrap(),
+        created["worker_id"].as_str().unwrap(),
+    );
+    // The child's ordinary redelegation remains valid: body ownership is a
+    // Ticket-initiation condition, not a blanket ban on general Worker creation.
+    let (status, ordinary) = f
+        .spawn(&child, f.child_request("ordinary-grandchild", vec![]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ordinary}");
+
+    let ticket = browser_ticket_backend(&f.api)
+        .unwrap()
+        .create(NewTicket::new("Another Subject's Ticket"))
+        .unwrap();
+    assign_test_orchestrator(&f.api, &ticket.id);
+    let spawns = f.runtime.spawn_requests().len();
+    let mut request = f.child_request("child-ticket-control", vec![]);
+    request["ticket_assignment"] = json!({
+        "ticket_id": ticket.id, "operation_id":"child-ticket-start-without-assignment",
+    });
+    let (status, denied) = f.spawn(&child, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert!(
+        denied["message"].as_str().unwrap().contains("Subject body"),
+        "{denied}"
+    );
+    assert_eq!(f.runtime.spawn_requests().len(), spawns);
+    assert!(
+        f.api
+            .store
+            .get_ticket_assignment_operation(
+                TEST_WORKSPACE_ID,
+                "child-ticket-start-without-assignment",
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+pub(super) const CONNECTED_RUNTIME: &str = "connected-subject-authorization";
+
+/// Shared signed Backend/Runtime connection. Only the supplied model is replaced;
+/// temporary roots, request authentication and Controller/tool dispatch stay real.
+pub(super) struct ConnectedWorkerHarness {
+    pub(super) api: WorkspaceApi,
+    // Expose only the persisted root needed to reopen ordinary Session history.
+    pub(super) runtime_root: PathBuf,
+    runtime: worker_runtime::Runtime,
+    factory: worker_runtime::worker_backend::ProfileRuntimeWorkerFactory,
+    identity: RuntimeIdentityMaterial,
+    backend_url: String,
+    pub(super) owner: String,
+    materializer: worker_runtime::working_directory::RuntimeGitMaterializer,
+    authorizations: Arc<Mutex<Vec<(Value, StatusCode)>>>,
+    runtime_errors: Arc<Mutex<Vec<String>>>,
+    runtime_startup_failures: Arc<Mutex<Vec<runtime_api::WorkerStartupFailure>>>,
+    _backend_server: AuthorizationCallbackServer,
+    _runtime_server: ConnectedRuntimeServer,
+    _dir: tempfile::TempDir,
+}
+impl ConnectedWorkerHarness {
+    /// Exercise the authenticated Browser TCP/HTTP boundary without discarding
+    /// media type or rewriting its body. Bound both elapsed time and streamed bytes;
+    /// redirects/retries must not turn a failed create response into another POST.
+    pub(super) async fn human_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
+        let mut response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .unwrap()
+            .request(method, format!("{}{path}", self.backend_url))
+            .bearer_auth(&self.owner)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        let headers = response.headers().clone();
+        assert!(
+            response
+                .content_length()
+                .is_none_or(|len| len <= RESPONSE_LIMIT as u64)
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            assert!(
+                chunk.len() <= RESPONSE_LIMIT - bytes.len(),
+                "Browser response exceeds test limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        (status, headers, bytes)
+    }
+
+    pub(super) async fn human(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let (status, _, bytes) = self.human_raw(method.clone(), path, body).await;
+        let body = if status == StatusCode::NO_CONTENT {
+            assert!(bytes.is_empty(), "{method} {path}: HTTP204 must be empty");
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                panic!(
+                    "{method} {path}: HTTP{status}, invalid JSON: {error}; body={:?}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })
+        };
+        (status, body)
+    }
+
+    async fn start<M: agen::llm_client::LlmClient + Clone + 'static>(model: M) -> Self {
+        Self::start_with_layer(model, |router| router).await
+    }
+
+    /// Keep the existing signed RuntimeHTTP assembly, adding only the production
+    /// Plugin bridge and a TLS-peer transport on the Server before either router
+    /// can handle a request. No guest, delivery or owner implementation is replaced.
+    pub(super) async fn start_with_plugins<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        transport: Arc<crate::plugin_https::HttpsTransport>,
+    ) -> Self {
+        Self::start_configured(model, Some(transport), |router| router).await
+    }
+
+    async fn start_with_layer<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        app_layer: impl FnOnce(Router) -> Router,
+    ) -> Self {
+        Self::start_configured(model, None, app_layer).await
+    }
+
+    async fn start_with_database<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        prepare: impl FnOnce(&ServerConfig),
+    ) -> Self {
+        Self::start_prepared(model, None, |router| router, prepare).await
+    }
+
+    async fn start_configured<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
+        app_layer: impl FnOnce(Router) -> Router,
+    ) -> Self {
+        Self::start_prepared(model, plugin_https_transport, app_layer, |_| {}).await
+    }
+
+    async fn start_prepared<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
+        app_layer: impl FnOnce(Router) -> Router,
+        prepare: impl FnOnce(&ServerConfig),
+    ) -> Self {
+        const RUNTIME: &str = CONNECTED_RUNTIME;
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", backend_listener.local_addr().unwrap());
+        let runtime_url = format!("http://{}", runtime_listener.local_addr().unwrap());
+        let identity = RuntimeIdentityMaterial::generate(RUNTIME).unwrap();
+        let runtime_root = dir.path().join("connected-runtime");
+        let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
+            dir.path().join("connected-workdirs"),
+        );
+
+        let mut config = test_server_config(dir.path());
+        config.backend_base_url = Some(backend_url.clone());
+        prepare(&config);
+        // The embedded Runtime is unused. Connected Workers execute on the real
+        // Runtime assembled below, not on this Host fixture's embedded backend.
+        let control = Arc::new(test_control_store(&config));
+        seed_test_registered_workspace(control.as_ref(), &config)
+            .await
+            .unwrap();
+        let mut api = WorkspaceApi::new_with_execution_backend(
+            config,
+            control,
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let plugins_enabled = plugin_https_transport.is_some();
+        api.plugin_https_transport = plugin_https_transport;
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_workspace_runtime_binding_record(
+                WorkspaceRuntimeBinding {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                    runtime_id: RUNTIME.into(),
+                    display_name: RUNTIME.into(),
+                    base_url: runtime_url.clone(),
+                    public_key: identity.public_key.clone(),
+                    public_key_fingerprint: String::new(),
+                    binding_id: "connected-authorization-binding".into(),
+                    authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    revoked_at: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let binding = api
+            .store
+            .get_workspace_runtime_binding(TEST_WORKSPACE_ID, RUNTIME)
+            .await
+            .unwrap()
+            .unwrap();
+        // Repository materialization and Worker startup must authenticate as this
+        // Workspace, not the Runtime HTTP local-token fallback's `local` Workspace.
+        let workspace_identity = api
+            .signing_identities
+            .provision_existing(TEST_WORKSPACE_ID, &test_owner_actor().account_id)
+            .unwrap();
+        let registration = worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            backend_url: backend_url.clone(),
+            key_id: workspace_identity.key_id.clone(),
+            algorithm: workspace_identity.algorithm.clone(),
+            public_key: workspace_identity.public_key.clone().unwrap(),
+            public_key_fingerprint: workspace_identity.public_key_fingerprint.clone().unwrap(),
+            trust_id: "connected-authorization-workspace-trust".into(),
+            state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
+            registered_at_unix: 1,
+            updated_at_unix: 1,
+        };
+        let verifier = worker_runtime::workspace_issuer::WorkspaceCapabilityVerifier::new(
+            vec![registration.clone()],
+            Arc::new(
+                worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default(),
+            ),
+        )
+        .unwrap();
+        let workspace_client =
+            worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
+                TEST_WORKSPACE_ID,
+                &backend_url,
+                RUNTIME,
+            )
+            .with_runtime_request_source(&identity, &backend_url);
+        let mut factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
+            dir.path().join("connected-profiles"),
+        )
+        .with_remote_worker_mutation_identity(identity.clone())
+        .with_workspace_request_client(workspace_client.clone())
+        .with_runtime_store_dir(&runtime_root)
+        .with_spawn_model_client_factory(move || Box::new(model.clone()));
+        if plugins_enabled {
+            // This is the Runtime's registered Server, also used by the HTTP
+            // verifier above, not a fabricated Plugin admission response. All
+            // admission/delivery/Host operations still traverse the signed client.
+            let current: Arc<worker_runtime::plugin::remote::CurrentPluginServer> =
+                Arc::new(move |workspace| {
+                    if workspace == registration.workspace_id {
+                        Ok(registration.clone())
+                    } else {
+                        Err(yoi_plugin_runtime::delivery::DeliveryError::Denied)
+                    }
+                });
+            // Remote providers build the standard signed Host client, retaining
+            // PLUGIN_HOST_RESPONSE_BODY_LIMIT (finite 4.5 MiB); do not substitute
+            // an unbounded test client or an in-process owner fallback here.
+            let providers = Arc::new(
+                worker_runtime::plugin::remote::RemotePluginRuntimeProviders::new(
+                    std::collections::HashMap::from([(
+                        TEST_WORKSPACE_ID.to_string(),
+                        workspace_client,
+                    )]),
+                    current,
+                ),
+            );
+            let plugins = worker_runtime::plugin::PinnedPluginToolRuntime::new(
+                providers,
+                &runtime_root.with_extension("plugin-cache"),
+            )
+            .unwrap();
+            factory = factory.with_plugin_runtime(Arc::new(plugins));
+        }
+        // Freeze the fully configured factory only after installing the bridge.
+        let execution =
+            worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory.clone())
+                .unwrap()
+                .with_working_directory_materializer(materializer.clone());
+        let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
+            worker_runtime::fs_store::FsRuntimeStoreOptions {
+                root: runtime_root.clone(),
+                runtime_id: RUNTIME.into(),
+                display_name: None,
+            },
+            Arc::new(execution),
+        )
+        .unwrap();
+        let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_errors = runtime_errors.clone();
+        let runtime_startup_failures = Arc::new(Mutex::new(Vec::new()));
+        let captured_startup_failures = runtime_startup_failures.clone();
+        let runtime_server = ConnectedRuntimeServer::start(
+            runtime_listener,
+            worker_runtime::http_server::runtime_http_router_with_workspace_auth(
+                runtime.clone(),
+                None,
+                worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
+                    verifier,
+                    runtime_id: RUNTIME.into(),
+                },
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let errors = captured_errors.clone();
+                    let startup_failures = captured_startup_failures.clone();
+                    async move {
+                        let response = next.run(request).await;
+                        if !response.status().is_client_error()
+                            && !response.status().is_server_error()
+                        {
+                            return response;
+                        }
+                        let (parts, body) = response.into_parts();
+                        let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                        let content_type = parts
+                            .headers
+                            .get(axum::http::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or("");
+                        let body: Value = serde_json::from_slice(&bytes).unwrap();
+                        let message = if content_type == runtime_api::startup::PROBLEM_CONTENT_TYPE
+                        {
+                            use runtime_api::startup::{
+                                DecodeStartupProblem, StartupBoundary, decode_startup_problem,
+                            };
+                            if let DecodeStartupProblem::Known(failure) = decode_startup_problem(
+                                &bytes,
+                                parts.status.as_u16(),
+                                content_type,
+                                StartupBoundary::Runtime,
+                            ) {
+                                startup_failures
+                                    .lock()
+                                    .unwrap()
+                                    .push(failure.startup().clone());
+                            } else {
+                                // Cleanup probes also use Control and Workdir management
+                                // Problems; validate them without counting another startup failure.
+                                assert!(
+                                    matches!(
+                                        api_macros::http::decode_problem_response::<
+                                            runtime_api::control_failure::RuntimeControlCause,
+                                        >(
+                                            &bytes,
+                                            parts.status.as_u16(),
+                                            content_type,
+                                            &runtime_api::control_failure::ControlBoundary,
+                                            error_contract::Budget::new(16384, 16384),
+                                        ),
+                                        error_contract::DecodeFailure::Known(_)
+                                    ) || matches!(
+                                        api_macros::http::decode_problem_response::<
+                                            workdir::management_failure::WorkdirManagementFailure,
+                                        >(
+                                            &bytes,
+                                            parts.status.as_u16(),
+                                            content_type,
+                                            &runtime_api::management_failure::ManagementBoundary,
+                                            error_contract::Budget::new(16384, 16384),
+                                        ),
+                                        error_contract::DecodeFailure::Known(_)
+                                    ),
+                                    "RuntimeHTTP must emit a valid Startup, Control or Workdir management Problem"
+                                );
+                            }
+                            body["detail"].as_str().expect("Problem detail")
+                        } else {
+                            body["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown fixture error")
+                        };
+                        errors.lock().unwrap().push(message.to_owned());
+                        Response::from_parts(parts, Body::from(bytes))
+                    }
+                },
+            )),
+        );
+        api.runtime.register_or_replace(
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig {
+                    runtime_id: RUNTIME.into(),
+                    workspace_id: Some(TEST_WORKSPACE_ID.into()),
+                    display_name: RUNTIME.into(),
+                    base_url: runtime_url,
+                    bearer_token: None,
+                    workspace_authorization: Some(
+                        crate::hosts::WorkspaceRuntimeAuthorization::new(
+                            api.store.clone(),
+                            api.signing_identities.clone(),
+                            backend_url.clone(),
+                            binding,
+                        ),
+                    ),
+                    strict_public_egress: false,
+                    cached_worker_creation_available: true,
+                    cached_os: "linux".into(),
+                    cached_arch: "x86_64".into(),
+                    cached_status: "active".into(),
+                    timeout: std::time::Duration::from_secs(30),
+                },
+                TEST_WORKSPACE_ID.to_string(),
+                backend_url.clone(),
+            )
+            .unwrap(),
+        );
+        seed_test_delivery_binding(&api);
+
+        let authorizations = Arc::new(Mutex::new(Vec::<(Value, StatusCode)>::new()));
+        let observed = authorizations.clone();
+        let app = build_router(api.clone()).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let observed = observed.clone();
+                async move {
+                    if request.uri().path() != authorization_path() {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
+                    let permission: Value = serde_json::from_slice(&bytes).unwrap();
+                    let response = next
+                        .run(Request::from_parts(parts, Body::from(bytes)))
+                        .await;
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((permission, response.status()));
+                    response
+                }
+            },
+        ));
+        let backend_server = AuthorizationCallbackServer::start(backend_listener, app_layer(app));
+        let owner =
+            seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner")
+                .await;
+
+        Self {
+            api,
+            runtime_root,
+            runtime,
+            factory,
+            identity,
+            backend_url,
+            owner,
+            materializer,
+            authorizations,
+            runtime_errors,
+            runtime_startup_failures,
+            _backend_server: backend_server,
+            _runtime_server: runtime_server,
+            _dir: dir,
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_read_but_not_write()
 {
     use worker_runtime::working_directory::WorkingDirectoryMaterializer;
 
-    const RUNTIME: &str = "connected-subject-authorization";
-    let dir = tempfile::tempdir().unwrap();
-    init_clean_git_workspace(dir.path());
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let backend_url = format!("http://{}", backend_listener.local_addr().unwrap());
-    let runtime_url = format!("http://{}", runtime_listener.local_addr().unwrap());
-    let identity = RuntimeIdentityMaterial::generate(RUNTIME).unwrap();
-    let runtime_root = dir.path().join("connected-runtime");
-    let materializer = worker_runtime::working_directory::RuntimeGitMaterializer::new(
-        dir.path().join("connected-workdirs"),
-    );
+    const RUNTIME: &str = CONNECTED_RUNTIME;
     let (completed, mut completion) = tokio::sync::mpsc::channel(4);
-    let model = ConnectedAuthorizationModel { completed };
-    let factory = worker_runtime::worker_backend::ProfileRuntimeWorkerFactory::new(
-        dir.path().join("connected-profiles"),
-    )
-    .with_remote_worker_mutation_identity(identity.clone())
-    .with_workspace_request_client(
-        worker_runtime::workspace_request::RuntimeWorkspaceRequestClient::new(
-            TEST_WORKSPACE_ID,
-            &backend_url,
-            RUNTIME,
-        )
-        .with_runtime_request_source(&identity, &backend_url),
-    )
-    .with_runtime_store_dir(&runtime_root)
-    .with_spawn_model_client_factory(move || Box::new(model.clone()));
-    let execution = worker_runtime::worker_backend::WorkerRuntimeExecutionBackend::new(factory)
-        .unwrap()
-        .with_working_directory_materializer(materializer.clone());
-    let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
-        worker_runtime::fs_store::FsRuntimeStoreOptions {
-            root: runtime_root,
-            runtime_id: RUNTIME.into(),
-            display_name: None,
-        },
-        Arc::new(execution),
-    )
-    .unwrap();
-
-    let mut config = test_server_config(dir.path());
-    config.backend_base_url = Some(backend_url.clone());
-    // The embedded Runtime is unused. Both source and child below execute on the
-    // connected real Runtime above, not on this existing Host fixture backend.
-    let control = Arc::new(test_control_store(&config));
-    seed_test_registered_workspace(control.as_ref(), &config)
-        .await
-        .unwrap();
-    let api = WorkspaceApi::new_with_execution_backend(
-        config,
-        control,
-        Arc::new(DeterministicExecutionBackend::default()),
-    )
-    .await
-    .unwrap();
-    let now = now_registry_timestamp();
-    api.store
-        .upsert_workspace_runtime_binding_record(
-            WorkspaceRuntimeBinding {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                runtime_id: RUNTIME.into(),
-                display_name: RUNTIME.into(),
-                base_url: runtime_url.clone(),
-                public_key: identity.public_key.clone(),
-                public_key_fingerprint: String::new(),
-                binding_id: "connected-authorization-binding".into(),
-                authentication_mode: StoredRuntimeAuthenticationMode::WorkspaceIdentity,
-                created_at: now.clone(),
-                updated_at: now,
-                revoked_at: None,
-            },
-            false,
-        )
-        .await
-        .unwrap();
-    let binding = api
-        .store
-        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, RUNTIME)
-        .await
-        .unwrap()
-        .unwrap();
-    // Repository materialization and Worker startup must authenticate as this
-    // Workspace, not the Runtime HTTP local-token fallback's `local` Workspace.
-    let workspace_identity = api
-        .signing_identities
-        .provision_existing(TEST_WORKSPACE_ID, &test_owner_actor().account_id)
-        .unwrap();
-    let verifier = worker_runtime::workspace_issuer::WorkspaceCapabilityVerifier::new(
-        vec![
-            worker_runtime::workspace_issuer::WorkspaceIssuerTrustRecord {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                backend_url: backend_url.clone(),
-                key_id: workspace_identity.key_id.clone(),
-                algorithm: workspace_identity.algorithm.clone(),
-                public_key: workspace_identity.public_key.clone().unwrap(),
-                public_key_fingerprint: workspace_identity.public_key_fingerprint.clone().unwrap(),
-                trust_id: "connected-authorization-workspace-trust".into(),
-                state: worker_runtime::workspace_issuer::WorkspaceIssuerTrustState::Active,
-                registered_at_unix: 1,
-                updated_at_unix: 1,
-            },
-        ],
-        Arc::new(
-            worker_runtime::workspace_issuer::InMemoryWorkspaceClaimReplayProtection::default(),
-        ),
-    )
-    .unwrap();
-    let runtime_errors = Arc::new(Mutex::new(Vec::<String>::new()));
-    let captured_errors = runtime_errors.clone();
-    let _runtime_server = ConnectedRuntimeServer::start(
-        runtime_listener,
-        worker_runtime::http_server::runtime_http_router_with_workspace_auth(
-            runtime.clone(),
-            None,
-            worker_runtime::http_server::WorkspaceRuntimeHttpAuth {
-                verifier,
-                runtime_id: RUNTIME.into(),
-            },
-        )
-        .layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let errors = captured_errors.clone();
-                async move {
-                    let response = next.run(request).await;
-                    if response.status().is_success() {
-                        return response;
-                    }
-                    let (parts, body) = response.into_parts();
-                    let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
-                    let body: Value = serde_json::from_slice(&bytes).unwrap();
-                    errors.lock().unwrap().push(
-                        body["error"]["message"]
-                            .as_str()
-                            .unwrap_or("unknown fixture error")
-                            .to_owned(),
-                    );
-                    Response::from_parts(parts, Body::from(bytes))
-                }
-            },
-        )),
-    );
-    api.runtime.register_or_replace(
-        RemoteWorkerRuntime::new(
-            RemoteRuntimeConfig {
-                runtime_id: RUNTIME.into(),
-                workspace_id: Some(TEST_WORKSPACE_ID.into()),
-                display_name: RUNTIME.into(),
-                base_url: runtime_url,
-                bearer_token: None,
-                workspace_authorization: Some(crate::hosts::WorkspaceRuntimeAuthorization::new(
-                    api.store.clone(),
-                    api.signing_identities.clone(),
-                    backend_url.clone(),
-                    binding,
-                )),
-                strict_public_egress: false,
-                cached_worker_creation_available: true,
-                cached_os: "linux".into(),
-                cached_arch: "x86_64".into(),
-                cached_status: "active".into(),
-                timeout: std::time::Duration::from_secs(30),
-            },
-            TEST_WORKSPACE_ID.to_string(),
-            backend_url.clone(),
-        )
-        .unwrap(),
-    );
-    install_subject_profiles(&api, "workspace_write");
-    seed_test_delivery_binding(&api);
-
-    let authorizations = Arc::new(Mutex::new(Vec::<(Value, StatusCode)>::new()));
-    let observed = authorizations.clone();
-    let app = build_router(api.clone()).layer(axum::middleware::from_fn(
-        move |request: axum::extract::Request, next: axum::middleware::Next| {
-            let observed = observed.clone();
-            async move {
-                if request.uri().path() != authorization_path() {
-                    return next.run(request).await;
-                }
-                let (parts, body) = request.into_parts();
-                let bytes = to_bytes(body, 2 * 1024 * 1024).await.unwrap();
-                let permission: Value = serde_json::from_slice(&bytes).unwrap();
-                let response = next
-                    .run(Request::from_parts(parts, Body::from(bytes)))
-                    .await;
-                observed
-                    .lock()
-                    .unwrap()
-                    .push((permission, response.status()));
-                response
-            }
-        },
-    ));
-    let _backend_server = AuthorizationCallbackServer::start(backend_listener, app);
-    let owner =
-        seed_test_workspace_owner_token(api.store.as_ref(), "connected-authorization-owner").await;
+    let harness = ConnectedWorkerHarness::start(ConnectedAuthorizationModel { completed }).await;
+    let api = &harness.api;
+    let identity = &harness.identity;
+    let backend_url = &harness.backend_url;
+    let owner = &harness.owner;
+    let materializer = &harness.materializer;
+    let authorizations = &harness.authorizations;
+    let runtime_errors = &harness.runtime_errors;
+    install_subject_profiles(api, "workspace_write");
     let (status, created_workdir) = response(&api, human_request(&owner, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
         Some(json!({"runtime_id":RUNTIME, "repository_key":"test-repository", "selector":"HEAD", "operation_id":"connected-authorization-workdir"})))).await;
@@ -2148,32 +3819,13 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
             recursive: true,
         },
     };
-    let mut child_permissions: Vec<_> = [
-        "task",
-        "web",
-        "image",
-        "sub_worker",
-        "flow",
-        "worker",
-        "workspace_worker_discovery",
-        "objective",
-        "manage_workdir",
-        "workdir_catalog",
-        "drive",
-        "ticket",
-        "merge_request",
-        "subjektiv",
-    ]
-    .into_iter()
-    .map(activation)
-    .collect();
-    child_permissions.push(read_permission.clone());
+    let child_permissions = vec![read_permission.clone()];
     // Set policy before startup: the actual source Controller sees this policy,
     // not an unset body or a registry/singleton row manufactured by the test.
     let (status, body) = response(&api, human_request(&owner, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
-        Some(json!({"operation_id":"connected-authorization-policy", "expected_change_id":null,
-            "execution":(["task", "subjektiv", "web", "image", "sub_worker", "worker", "workspace_worker_discovery", "objective", "manage_workdir", "workdir_catalog", "drive", "ticket"].into_iter().map(activation).collect::<Vec<_>>()),
+        Some(json!({"operation_id":"connected-authorization-policy", "expected_change_id":subject_store.current_subject_policy(&subject).unwrap().unwrap().change_id,
+            "execution":(["session.record", "memory.resident.read", "memory.resident.supply", "journal.startup.read", "journal.startup.supply"].into_iter().map(|operation| subject_permission(&subject, operation)).collect::<Vec<_>>()),
             "delegation":child_permissions.clone()})))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let Json(source) = create_workspace_worker(
@@ -2357,4 +4009,1183 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
             .is_empty(),
         "generic Profile delegation requires no Ticket"
     );
+}
+
+/// Deterministic external-model substitute, not an LLM evaluation. Each real
+/// Controller reads before joining the barrier, so serialized child execution
+/// cannot pass. File IO and result persistence always use production tools.
+#[derive(Clone)]
+struct ConcurrentTicketAuthorizationModel {
+    overlap: Arc<tokio::sync::Barrier>,
+    completed: tokio::sync::mpsc::Sender<(String, Vec<(String, bool, String)>)>,
+}
+
+#[async_trait::async_trait]
+impl agen::llm_client::LlmClient for ConcurrentTicketAuthorizationModel {
+    async fn stream(
+        &self,
+        request: agen::llm_client::Request,
+    ) -> std::result::Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<
+                        Item = std::result::Result<
+                            agen::llm_client::event::Event,
+                            agen::llm_client::error::ClientError,
+                        >,
+                    > + Send,
+            >,
+        >,
+        agen::llm_client::error::ClientError,
+    > {
+        use agen::llm_client::{
+            event::{Event, StopReason},
+            types::{ContentPart, Item},
+        };
+        let input = request.items.iter().find_map(|item| {
+            let Item::Message { content, .. } = item else {
+                return None;
+            };
+            content.iter().find_map(|part| {
+                let ContentPart::Text { text } = part else {
+                    return None;
+                };
+                text.strip_prefix("connected-ticket-case:")
+                    .map(|json| serde_json::from_str::<Value>(json).unwrap())
+            })
+        });
+        let end = || {
+            vec![
+                Event::text_block_start(0),
+                Event::text_delta(0, "scripted turn finished"),
+                Event::text_block_stop(0, Some(StopReason::EndTurn)),
+            ]
+        };
+        let Some(input) = input else {
+            // Bodies may receive normal lifecycle/notification input. That must
+            // never run the child script or count as a concurrent child turn.
+            return Ok(Box::pin(futures::stream::iter(end().into_iter().map(Ok))));
+        };
+        let ticket = input["ticket"].as_str().unwrap();
+        let expected = input["content"].as_str().unwrap();
+        let results: Vec<_> = request
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::ToolResult {
+                    call_id,
+                    is_error,
+                    content,
+                    summary,
+                    ..
+                } if call_id.starts_with("parallel-") => Some((
+                    call_id.clone(),
+                    *is_error,
+                    format!("{summary}; {content:?}"),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().all(|(_, error, _)| !error),
+            "real child tool failed: {results:?}"
+        );
+        let has = |id: &str| results.iter().any(|(call, _, _)| call == id);
+        let events = if has("parallel-report") {
+            self.completed.try_send((ticket.into(), results)).unwrap();
+            end()
+        } else {
+            let (id, name, arguments) = if has("parallel-reread") {
+                assert!(
+                    results
+                        .iter()
+                        .find(|(id, _, _)| id == "parallel-reread")
+                        .unwrap()
+                        .2
+                        .contains(expected),
+                    "result must follow the real post-write Read: {results:?}"
+                );
+                (
+                    "parallel-report",
+                    "TicketImplementationResult",
+                    json!({"ticket":ticket, "kind":"result",
+                    "body":format!("Verified README.md contains {expected}"), "merge_request":null}),
+                )
+            } else if has("parallel-write") {
+                (
+                    "parallel-reread",
+                    "Read",
+                    json!({"target_workdir":"workdir", "file_path":"README.md"}),
+                )
+            } else if has("parallel-read") {
+                assert!(
+                    results[0].2.contains("clean"),
+                    "actual initial read: {results:?}"
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(30), self.overlap.wait())
+                    .await
+                    .expect("both real child turns must overlap after their initial Read");
+                (
+                    "parallel-write",
+                    "Write",
+                    json!({"target_workdir":"workdir", "file_path":"README.md", "content":expected}),
+                )
+            } else {
+                (
+                    "parallel-read",
+                    "Read",
+                    json!({"target_workdir":"workdir", "file_path":"README.md"}),
+                )
+            };
+            assert!(
+                request.tools.iter().any(|tool| tool.name == name),
+                "Profile must expose {name}"
+            );
+            vec![
+                Event::tool_use_start(0, id, name),
+                Event::tool_input_delta(0, arguments.to_string()),
+                Event::tool_use_stop(0),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+    }
+
+    fn clone_boxed(&self) -> Box<dyn agen::llm_client::LlmClient> {
+        Box::new(self.clone())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separate_branches() {
+    use worker_runtime::working_directory::WorkingDirectoryMaterializer;
+
+    struct Case {
+        subject: String,
+        ticket: String,
+        branch: String,
+        workdir: String,
+        root: PathBuf,
+        source: RuntimeWorkerRef,
+        delegation: String,
+        content: String,
+        permissions: Vec<ScopedPermission>,
+        change: String,
+        request: Value,
+    }
+    let (completed, mut completion) = tokio::sync::mpsc::channel(2);
+    let f = ConnectedWorkerHarness::start(ConcurrentTicketAuthorizationModel {
+        overlap: Arc::new(tokio::sync::Barrier::new(2)),
+        completed,
+    })
+    .await;
+    let api = &f.api;
+    install_subject_profiles(api, "workspace_write");
+    let subjects = open_subjektiv_store(api).unwrap();
+    let mut cases = Vec::new();
+    for label in ["alpha", "beta"] {
+        let branch = format!("subject-{label}-work");
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(f._dir.path())
+                .args(["branch", &branch])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (status, created) = f
+            .human(
+                reqwest::Method::POST,
+                &format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),
+                json!({"runtime_id":CONNECTED_RUNTIME, "repository_key":"test-repository",
+                "selector":branch, "operation_id":format!("parallel-{label}-workdir")}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let workdir = created["item"]["working_directory_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let root = f
+            .materializer
+            .bind_working_directory(&workdir, None)
+            .unwrap()
+            .root()
+            .to_path_buf();
+        // Runtime materialization intentionally checks out detached. Establish
+        // each working branch as fixture setup before either child starts; the
+        // real Controller tools below must mutate these separate checkouts.
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["switch", "-c", &branch])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "clean\n"
+        );
+        let subject = subjects
+            .create_subject(
+                crate::subjektiv::SubjectRole::new(format!("parallel-{label}")).unwrap(),
+            )
+            .unwrap()
+            .id;
+        let mut input = NewTicket::new(format!("Connected {label} work"));
+        set_test_ticket_target(&mut input, "test-repository", &branch);
+        let ticket = browser_ticket_backend(api).unwrap().create(input).unwrap();
+        let ticket_permission = |operation: &str| ScopedPermission {
+            operation: operation.into(),
+            resource: PermissionResource::Ticket {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+                ticket_id: ticket.id.clone(),
+            },
+        };
+        // No workspace-wide delegation grant: exactly this file in this Workdir
+        // and read/result operations on this Ticket. The body stays Workdirless.
+        let permissions: Vec<_> = ["filesystem.read", "filesystem.write"]
+            .into_iter()
+            .map(|operation| ScopedPermission {
+                operation: operation.into(),
+                resource: PermissionResource::Workdir {
+                    working_directory_id: workdir.clone(),
+                    path: "README.md".into(),
+                    recursive: false,
+                },
+            })
+            .chain([
+                ticket_permission("ticket.read"),
+                ticket_permission("ticket.implementation_result.write"),
+            ])
+            .collect();
+        let mut execution: Vec<_> = [
+            "session.record",
+            "memory.resident.read",
+            "memory.resident.supply",
+            "journal.startup.read",
+            "journal.startup.supply",
+        ]
+        .into_iter()
+        .map(|operation| subject_permission(&subject, operation))
+        .collect();
+        execution.push(ticket_permission("ticket.assignment.assign"));
+        execution.push(ScopedPermission {
+            operation: "worker.create".into(),
+            resource: PermissionResource::Workspace {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            },
+        });
+        let (status, policy) = f
+            .human(
+                reqwest::Method::POST,
+                &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),
+                json!({"operation_id":format!("parallel-{label}-policy"), "expected_change_id":subjects.current_subject_policy(&subject).unwrap().unwrap().change_id,
+                "execution":execution, "delegation":permissions}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{policy}");
+        let policy = subjects.subject_permissions(&subject).unwrap().unwrap();
+        assert_eq!(policy.delegation, permissions);
+        let (status, source) = f.human(reqwest::Method::POST,
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            json!({"runtime_id":CONNECTED_RUNTIME, "display_name":format!("{label} read-only body"),
+                "profile":"project:authority-source", "initial_submit":[], "workdir_attachments":[],
+                "feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "connect: {source}; Runtime: {:?}",
+            f.runtime_errors.lock().unwrap()
+        );
+        let source = RuntimeWorkerRef::new(
+            source["runtime_id"].as_str().unwrap(),
+            source["worker_id"].as_str().unwrap(),
+        );
+        assert!(
+            api.store
+                .list_worker_workdir_links(TEST_WORKSPACE_ID, &source)
+                .unwrap()
+                .is_empty()
+        );
+        let lease = api
+            .store
+            .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease.key,
+            crate::subjektiv::subject_worker_singleton_key(&subject).unwrap()
+        );
+        let (status, assigned) = f.human(reqwest::Method::PUT,
+            &format!("/api/w/{TEST_WORKSPACE_ID}/tickets/{}/assignments/orchestrator", ticket.id),
+            json!({"operation_id":format!("parallel-{label}-assign"), "expected_assignment_id":null,
+                "principal":{"kind":"subject", "subject_id":subject}})).await;
+        assert_eq!(status, StatusCode::OK, "{assigned}");
+        assert_eq!(assigned["assignment"]["principal"]["subject_id"], subject);
+        let delegation = assigned["assignment"]["assignment_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let content = format!("connected {label} result");
+        let request = json!({"runtime_id":CONNECTED_RUNTIME,
+            "display_name":format!("{label} delegated Ticket editor"), "profile":"project:authority-editor",
+            "ticket_assignment":{"ticket_id":ticket.id, "operation_id":format!("parallel-{label}-start"),
+                "orchestrator_assignment_id":delegation},
+            "initial_submit":[{"kind":"text", "content":format!("connected-ticket-case:{}", json!({"ticket":ticket.id,"content":content}))}],
+            "workdir_attachments":[{"alias":"workdir", "working_directory_id":workdir}],
+            "feature_connections":{}, "control_operation_id":format!("parallel-{label}-control"),
+            "execution_grant":{"permissions":permissions, "redelegation":[]}});
+        cases.push(Case {
+            subject,
+            ticket: ticket.id,
+            branch,
+            workdir,
+            root,
+            source,
+            delegation,
+            content,
+            permissions,
+            change: policy.change_id,
+            request,
+        });
+    }
+    assert_ne!(cases[0].subject, cases[1].subject);
+    assert_ne!(cases[0].ticket, cases[1].ticket);
+    assert_ne!(cases[0].branch, cases[1].branch);
+    assert_ne!(cases[0].workdir, cases[1].workdir);
+    assert_ne!(cases[0].root, cases[1].root);
+    assert_ne!(cases[0].source, cases[1].source);
+    assert!(
+        api.store
+            .current_worker_singleton_owner(
+                TEST_WORKSPACE_ID,
+                crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY
+            )
+            .unwrap()
+            .is_none()
+    );
+
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
+    let (alpha, beta) = tokio::join!(
+        connected_authorization_post(
+            &f.backend_url,
+            &f.identity,
+            &cases[0].source,
+            &path,
+            &cases[0].request
+        ),
+        connected_authorization_post(
+            &f.backend_url,
+            &f.identity,
+            &cases[1].source,
+            &path,
+            &cases[1].request
+        ),
+    );
+    let mut children = Vec::new();
+    for (case, (status, child)) in cases.iter().zip([alpha, beta]) {
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "signed Ticket spawn: {child}; Runtime: {:?}",
+            f.runtime_errors.lock().unwrap()
+        );
+        let child = RuntimeWorkerRef::new(
+            child["runtime_id"].as_str().unwrap(),
+            child["worker_id"].as_str().unwrap(),
+        );
+        let grant = subjects
+            .worker_execution_grant(&child.runtime_id, &child.worker_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.subject_id, case.subject);
+        assert_eq!(grant.origin_worker_id, case.source.worker_id);
+        assert_eq!(grant.source_change_id, case.change);
+        assert_eq!(grant.permissions, case.permissions);
+        assert!(grant.redelegation.is_empty());
+        assert!(
+            api.store
+                .require_current_worker_singleton_owner(TEST_WORKSPACE_ID, &child)
+                .unwrap()
+                .is_none()
+        );
+        let assigned = api
+            .store
+            .get_current_ticket_worker_assignment(TEST_WORKSPACE_ID, &case.ticket)
+            .unwrap()
+            .unwrap();
+        assert_eq!(assigned.worker, child);
+        let links = api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &child)
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].workdir_id, case.workdir);
+        children.push(child);
+    }
+    assert_ne!(children[0], children[1]);
+    let mut completions = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let (ticket, results) =
+            tokio::time::timeout(std::time::Duration::from_secs(45), completion.recv())
+                .await
+                .expect("both barrier-overlapped Controllers must finish")
+                .expect("model completion");
+        assert_eq!(
+            results.len(),
+            4,
+            "Read, Write, Read, persisted result: {results:?}"
+        );
+        assert!(
+            completions.insert(ticket, results).is_none(),
+            "each Ticket completes once"
+        );
+    }
+    let saved = api.config_store.with_conn(|conn| {
+        let mut statement = conn.prepare("SELECT ticket_id, worker_id, result_id FROM ticket_implementation_results WHERE workspace_id=?1 ORDER BY ticket_id")?;
+        Ok(statement.query_map([TEST_WORKSPACE_ID], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)))?
+            .collect::<std::result::Result<Vec<_>,_>>()?)
+    }).unwrap();
+    assert_eq!(saved.len(), 2);
+    assert_ne!(saved[0].2, saved[1].2);
+    for (i, case) in cases.iter().enumerate() {
+        assert!(completions.contains_key(&case.ticket));
+        assert_eq!(
+            fs::read_to_string(case.root.join("README.md")).unwrap(),
+            case.content
+        );
+        let branch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&case.root)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert!(branch.status.success());
+        assert_eq!(
+            String::from_utf8(branch.stdout).unwrap().trim(),
+            case.branch
+        );
+        let row = saved.iter().find(|row| row.0 == case.ticket).unwrap();
+        assert_eq!(row.1, children[i].worker_id);
+        let receipt = api
+            .config_store
+            .implementation_result(TEST_WORKSPACE_ID, &case.ticket, &row.2)
+            .unwrap();
+        assert_eq!(
+            receipt.request.body,
+            format!("Verified README.md contains {}", case.content)
+        );
+        assert!(
+            api.config_store
+                .implementation_result(TEST_WORKSPACE_ID, &cases[1 - i].ticket, &row.2)
+                .is_err(),
+            "the other Ticket cannot read this result"
+        );
+        let current = api
+            .store
+            .list_current_ticket_assignment_tracking(TEST_WORKSPACE_ID, &case.ticket)
+            .unwrap()
+            .remove(0);
+        assert_eq!(current.assignment_id, case.delegation);
+        assert_eq!(
+            current.principal,
+            ticket::TicketAssignmentPrincipalSnapshot::Subject {
+                subject_id: case.subject.clone()
+            }
+        );
+        assert_eq!(
+            current.tracking.unwrap().status,
+            ticket::TicketAssignmentTrackingStatus::Waiting,
+            "child result is not a Subject self-report"
+        );
+        assert_eq!(
+            api.authority.ticket(&case.ticket).unwrap().state,
+            server_api::BrowserTicketState::Open
+        );
+        // Live Host policy also rejects crossing the other Subject's Workdir.
+        let mut other = case.permissions[0].clone();
+        other.resource = PermissionResource::Workdir {
+            working_directory_id: cases[1 - i].workdir.clone(),
+            path: "README.md".into(),
+            recursive: false,
+        };
+        let (status, body) = connected_authorization_post(
+            &f.backend_url,
+            &f.identity,
+            &children[i],
+            &authorization_path(),
+            &serde_json::to_value(other).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "cross-Subject Workdir: {body}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(f._dir.path().join("README.md")).unwrap(),
+        "clean\n",
+        "distinct runtime Workdirs must not mutate the repository source"
+    );
+}
+
+fn attach_authorization_metadata(
+    f: &Fixture,
+    worker: &RuntimeWorkerRef,
+    id: &str,
+) -> WorkerWorkdirLinkRecord {
+    // Materialization/provider execution is outside this metadata-resolution test.
+    // Connection identities still come from the production attachment ledger.
+    seed_cleanup_workdir_for_runtime(&f.api, id, &worker.runtime_id, "present", "clean");
+    f.api
+        .store
+        .attach_worker_workdir(&WorkerWorkdirLinkRecord {
+            connection_id: String::new(),
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            worker: worker.clone(),
+            workdir_id: id.into(),
+            alias: "checkout".into(),
+            capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            linked_at: now_registry_timestamp(),
+            unlinked_at: None,
+        })
+        .unwrap()
+}
+
+async fn attachment_bound_check(
+    f: &Fixture,
+    worker: &RuntimeWorkerRef,
+    alias: &str,
+    expected: Option<&str>,
+) -> (StatusCode, Value) {
+    response(
+        &f.api,
+        runtime_source_request(
+            &f.identity,
+            Some(&worker.worker_id),
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/authorization/bound-check"),
+            serde_json::to_vec(&json!({"operation":"workdir.detach", "target":{
+                "kind":"workdir_attachment", "alias":alias, "expected_connection_id":expected,
+            }}))
+            .unwrap(),
+        ),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bound_attachment_uses_current_source_metadata_and_policy_not_alias_as_authority() {
+    let f = Fixture::new().await;
+    let link = attach_authorization_metadata(&f, &f.source, "bound-subject-workdir");
+    let permission = ScopedPermission {
+        operation: "workdir.detach".into(),
+        resource: PermissionResource::WorkdirAttachment {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            connection_id: link.connection_id.clone(),
+        },
+    };
+    let (status, denied) = attachment_bound_check(&f, &f.source, "checkout", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "unset: {denied}");
+    assert!(denied.get("scope").is_none());
+    f.assign(vec![permission.clone()], vec![permission.clone()])
+        .await;
+    let (status, allowed) =
+        attachment_bound_check(&f, &f.source, "checkout", Some(&link.connection_id)).await;
+    assert_eq!(status, StatusCode::OK, "{allowed}");
+    assert_eq!(allowed, json!({"scope":permission.resource}));
+    for (alias, expected) in [
+        ("missing", None),
+        ("checkout", Some("different-connection")),
+    ] {
+        let (status, body) = attachment_bound_check(&f, &f.source, alias, expected).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.get("scope").is_none());
+    }
+    let child = f.child("bound-attachment-child", vec![permission]).await;
+    let (status, body) =
+        attachment_bound_check(&f, &child, "checkout", Some(&link.connection_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a delegated operation cannot borrow its source's alias: {body}"
+    );
+    f.assign(vec![], vec![]).await;
+    assert_eq!(
+        attachment_bound_check(&f, &f.source, "checkout", None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let retained = f
+        .api
+        .store
+        .list_worker_workdir_links(TEST_WORKSPACE_ID, &f.source)
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].connection_id, link.connection_id);
+    assert!(
+        retained[0].unlinked_at.is_none(),
+        "authorization alone never detaches the route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_bound_attachment_returns_concrete_resource_and_rejects_replaced_connection() {
+    let f = Fixture::new().await;
+    let Json(created) = create_workspace_worker(
+        State(f.api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: f.source.runtime_id.clone(),
+            display_name: "Legacy attachment owner".into(),
+            singleton_key: None,
+            profile: Some("builtin:coder".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: Default::default(),
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let worker = RuntimeWorkerRef::new(created.runtime_id, created.worker_id);
+    let first = attach_authorization_metadata(&f, &worker, "legacy-bound-workdir");
+    let (status, body) =
+        attachment_bound_check(&f, &worker, "checkout", Some(&first.connection_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"scope":PermissionResource::WorkdirAttachment {
+            workspace_id: TEST_WORKSPACE_ID.into(), connection_id: first.connection_id.clone(),
+        }})
+    );
+    f.api
+        .store
+        .detach_worker_workdir_connection(
+            TEST_WORKSPACE_ID,
+            &worker,
+            "checkout",
+            &first.connection_id,
+            &now_registry_timestamp(),
+        )
+        .unwrap();
+    let second = attach_authorization_metadata(&f, &worker, "legacy-bound-workdir");
+    assert_ne!(second.connection_id, first.connection_id);
+    let (status, body) =
+        attachment_bound_check(&f, &worker, "checkout", Some(&first.connection_id)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "stale connection must not select replacement: {body}"
+    );
+    assert!(body.get("scope").is_none());
+    let (status, body) = attachment_bound_check(&f, &worker, "checkout", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["scope"]["connection_id"], second.connection_id);
+    assert!(
+        f.api
+            .store
+            .list_worker_workdir_links(TEST_WORKSPACE_ID, &worker)
+            .unwrap()
+            .iter()
+            .any(|link| link.connection_id == second.connection_id && link.unlinked_at.is_none())
+    );
+}
+
+/// Job dispatch still uses its real reservation, registry and attempt writes.
+/// Only the embedded Runtime execution is held idle, so an unrelated external
+/// model failure cannot race this suite's policy/attempt assertions.
+struct HeldAuthorizationJobRuntime(WorkdirlessFixtureRuntime, worker_runtime::Runtime);
+impl crate::hosts::WorkspaceWorkerRuntime for HeldAuthorizationJobRuntime {
+    fn sync_config_bundle(
+        &self,
+        bundle: worker_runtime::config_bundle::ConfigBundle,
+    ) -> crate::hosts::ConfigBundleSyncResult {
+        crate::hosts::ConfigBundleSyncResult {
+            state: crate::hosts::InternalWorkerOperationState::Accepted,
+            availability: Some(
+                self.1
+                    .store_config_bundle(bundle)
+                    .expect("valid Host Job configuration"),
+            ),
+            diagnostics: vec![],
+        }
+    }
+    fn replace_worker_workspace_api(
+        &self,
+        worker_id: &str,
+        workspace_api: WorkspaceApiRef,
+    ) -> crate::hosts::WorkerWorkspaceApiResult {
+        self.0
+            .replace_worker_workspace_api(worker_id, workspace_api)
+    }
+    fn runtime_id(&self) -> &str {
+        EMBEDDED_WORKER_RUNTIME_ID
+    }
+    fn runtime_summary(&self, limit: usize) -> crate::hosts::InternalRuntimeSummary {
+        let mut summary = self.0.runtime_summary(limit);
+        summary.runtime_id = EMBEDDED_WORKER_RUNTIME_ID.into();
+        summary
+    }
+    fn list_hosts(&self, limit: usize) -> crate::hosts::RuntimeList<InternalHostSummary> {
+        self.0.list_hosts(limit)
+    }
+    fn list_workers(&self, limit: usize) -> crate::hosts::RuntimeList<InternalWorkerSummary> {
+        self.0.list_workers(limit)
+    }
+    fn worker(&self, worker_id: &str) -> crate::hosts::WorkerLookupResult {
+        self.0.worker(worker_id)
+    }
+    fn spawn_worker(
+        &self,
+        binding: WorkerCreateBinding,
+        request: WorkerSpawnRequest,
+    ) -> WorkerSpawnResult {
+        let mut result = self.0.spawn_worker(binding, request);
+        if let Some(worker) = &mut result.worker {
+            worker.worker.runtime_id = EMBEDDED_WORKER_RUNTIME_ID.into();
+        }
+        for worker in self.0.workers.lock().unwrap().iter_mut() {
+            worker.worker.runtime_id = EMBEDDED_WORKER_RUNTIME_ID.into();
+        }
+        result
+    }
+    fn send_input(
+        &self,
+        worker_id: &str,
+        request: WorkerInputRequest,
+    ) -> crate::hosts::WorkerInputResult {
+        let run_id = request.submission_request_id.clone();
+        let mut result = self.0.send_input(worker_id, request);
+        result.worker.runtime_id = EMBEDDED_WORKER_RUNTIME_ID.into();
+        result.runtime_run_id = run_id;
+        result
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn canonical_job_intersects_current_execution_with_attempt_subject_and_job_kind() {
+    let f = Fixture::new().await;
+    f.api
+        .runtime
+        .register_or_replace(HeldAuthorizationJobRuntime(
+            WorkdirlessFixtureRuntime::default(),
+            worker_runtime::Runtime::new_memory(),
+        ));
+    f.adopt_policy(r#"{ sets = ["memory", "ticket"]; }"#, "{}")
+        .await;
+    let output = subjektiv_job::dispatch(&f.api, &f.subject, Some(f.source.clone()), 0, 0).unwrap();
+    assert_eq!(output.status, "started");
+    let job = f
+        .api
+        .store
+        .find_active_backend_job_for_resource(
+            TEST_WORKSPACE_ID,
+            &crate::backend_job::subjektiv_serialization_key(&f.subject),
+        )
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .api
+        .store
+        .get_backend_job_attempt(
+            TEST_WORKSPACE_ID,
+            &job.request.job_id,
+            &crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt),
+        )
+        .unwrap()
+        .unwrap();
+    let worker = attempt.worker.as_ref().unwrap();
+    let allowed = subject_permission(&f.subject, "memory.surface.prepare");
+    // Dispatch selects the embedded Job Runtime, not the body fixture's signing
+    // Runtime. Exercise the production bound-operation checker with the actual
+    // persisted attempt Worker; do not forge a proof using the body's identity.
+    let check = |permission: &ScopedPermission| {
+        subject_authorization::authorize_scope(
+            &f.api,
+            worker,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: permission.operation.clone(),
+                resource: permission.resource.clone(),
+            },
+        )
+    };
+    assert!(check(&allowed).is_ok());
+    assert!(
+        check(&subject_permission(
+            "another-subject",
+            "memory.surface.prepare"
+        ))
+        .is_err()
+    );
+    assert!(check(&create_permission()).is_err());
+    assert!(check(&subject_permission(&f.subject, "journal.state.read")).is_err());
+    f.adopt_policy(r#"{ sets = ["memory", "ticket"]; exclude_namespaces = [{ namespace = "memory"; keys = ["memory.surface.prepare"]; }]; }"#, "{}").await;
+    assert!(check(&allowed).is_err());
+    assert_eq!(
+        f.api
+            .store
+            .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+            .unwrap()
+            .unwrap()
+            .request,
+        job.request,
+        "current policy checks do not rewrite or reissue a saved attempt request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_request() {
+    let f = Fixture::new().await;
+    f.api
+        .runtime
+        .register_or_replace(HeldAuthorizationJobRuntime(
+            WorkdirlessFixtureRuntime::default(),
+            worker_runtime::Runtime::new_memory(),
+        ));
+    let permission = subject_permission(&f.subject, "memory.surface.prepare");
+    f.assign(
+        vec![
+            permission.clone(),
+            create_permission(),
+            subject_permission(&f.subject, "memory.consolidation.request"),
+            subject_permission(&f.subject, "memory.consolidation.supply"),
+        ],
+        vec![],
+    )
+    .await;
+    let output = subjektiv_job::dispatch(&f.api, &f.subject, Some(f.source.clone()), 0, 0).unwrap();
+    assert_eq!(output.status, "started");
+    let job = f
+        .api
+        .store
+        .find_active_backend_job_for_resource(
+            TEST_WORKSPACE_ID,
+            &crate::backend_job::subjektiv_serialization_key(&f.subject),
+        )
+        .unwrap()
+        .unwrap();
+    let attempt = f
+        .api
+        .store
+        .get_backend_job_attempt(
+            TEST_WORKSPACE_ID,
+            &job.request.job_id,
+            &crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt),
+        )
+        .unwrap()
+        .unwrap();
+    let worker = attempt.worker.as_ref().unwrap();
+    let needed = server_api::authorization::OperationAuthorizationRequest {
+        operation: permission.operation.clone(),
+        resource: permission.resource.clone(),
+    };
+    assert_eq!(
+        subject_authorization::authorize_scope(&f.api, worker, &needed).unwrap(),
+        Some(permission.resource)
+    );
+    let forbidden = server_api::authorization::OperationAuthorizationRequest {
+        operation: "ticket.create".into(),
+        resource: create_permission().resource,
+    };
+    assert!(
+        subject_authorization::authorize_scope(&f.api, worker, &forbidden).is_err(),
+        "Job capabilities must not inherit its body's unrelated Workspace permissions"
+    );
+    assert!(
+        subjektiv_job::active_grant(&f.api, TEST_WORKSPACE_ID, worker).is_ok(),
+        "the held attempt is live before its origin is replaced"
+    );
+    // The signed startup callback created a real, empty writer binding. Release
+    // it through the domain's pending-source/generation checks before applying
+    // historical disconnection input; singleton release is not writer revocation.
+    // This execution fixture has no live Controller and does not prove cancellation.
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let attribution = store
+        .subject_session_attributions(&f.subject)
+        .unwrap()
+        .into_iter()
+        .find(|attr| attr.runtime_id == f.source.runtime_id && attr.worker_id == f.source.worker_id)
+        .unwrap();
+    let host =
+        subjektiv::journal::JournalHostContext::validated_session(&store, attribution).unwrap();
+    store
+        .release_journal_writer(&subjektiv::journal::JournalWriterBinding {
+            subject_id: f.subject.clone(),
+            runtime_id: f.source.runtime_id.clone(),
+            worker_id: f.source.worker_id.clone(),
+            binding_id: host.writer_binding_id().unwrap().into(),
+        })
+        .unwrap();
+    f.release_source_lease();
+    let Json(replacement) = create_workspace_worker(
+        State(f.api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: f.source.runtime_id.clone(),
+            display_name: "Replacement Job origin".into(),
+            singleton_key: None,
+            profile: Some("project:authority-source".into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachments: vec![],
+            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                    subject_id: f.subject.clone(),
+                }),
+            },
+            control_operation_id: None,
+            execution_grant: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let replacement = RuntimeWorkerRef::new(replacement.runtime_id, replacement.worker_id);
+    assert!(subject_authorization::authorize_scope(&f.api, &replacement, &needed).is_ok());
+    assert!(
+        subject_authorization::authorize_job_input(&f.api, &job.request).is_err(),
+        "frozen input supply must reject the old origin independently of attempt cleanup"
+    );
+    assert!(
+        subject_authorization::authorize_scope(&f.api, worker, &needed).is_err(),
+        "a new body cannot refresh an old frozen Job origin"
+    );
+    let saved = f
+        .api
+        .store
+        .get_backend_job(TEST_WORKSPACE_ID, &job.request.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.request, job.request);
+    assert_eq!(saved.request.source_worker.as_ref(), Some(&f.source));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_native_admission_reads_reserved_authority_while_host_writer_owns_shared_connection()
+{
+    // Real native Feature admission and Host writer reservation, canonical policy,
+    // singleton/Job checks and persisted Memory effect. Only Runtime execution is
+    // held. The observer does not authorize or replace any production check.
+    for job_worker in [false, true] {
+        let fixture = Fixture::new().await;
+        fixture
+            .adopt_policy(r#"{ sets = ["memory"]; }"#, "{}")
+            .await;
+        let worker = if job_worker {
+            fixture
+                .api
+                .runtime
+                .register_or_replace(HeldAuthorizationJobRuntime(
+                    WorkdirlessFixtureRuntime::default(),
+                    worker_runtime::Runtime::new_memory(),
+                ));
+            let output = subjektiv_job::dispatch(
+                &fixture.api,
+                &fixture.subject,
+                Some(fixture.source.clone()),
+                0,
+                0,
+            )
+            .unwrap();
+            assert_eq!(output.status, "started");
+            let job = fixture
+                .api
+                .store
+                .find_active_backend_job_for_resource(
+                    TEST_WORKSPACE_ID,
+                    &crate::backend_job::subjektiv_serialization_key(&fixture.subject),
+                )
+                .unwrap()
+                .unwrap();
+            fixture
+                .api
+                .store
+                .get_backend_job_attempt(
+                    TEST_WORKSPACE_ID,
+                    &job.request.job_id,
+                    &crate::backend_job::attempt_id(&job.request.job_id, job.current_attempt),
+                )
+                .unwrap()
+                .unwrap()
+                .worker
+                .unwrap()
+        } else {
+            fixture.source.clone()
+        };
+        let store = open_subjektiv_store(&fixture.api).unwrap();
+        let context = subjektiv::api::HostOperationContext::validated_consolidation(
+            &store,
+            &fixture.subject,
+            Some(vec![]),
+            None,
+        )
+        .unwrap();
+        let (reserve_tx, reserve_rx) = std::sync::mpsc::sync_channel(0);
+        let (owned_tx, owned_rx) = std::sync::mpsc::sync_channel(0);
+        let ordinary = fixture.api.config_store.clone();
+        let writer = std::thread::spawn(move || {
+            reserve_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            ordinary.with_conn(|connection| {
+                // The original connection mutex is held before reauthorization
+                // proceeds. Its real native writer waits behind Memory's fence.
+                owned_tx.send(()).unwrap();
+                connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK")?;
+                Ok(())
+            })
+        });
+        let owned_rx = Mutex::new(owned_rx);
+        let first_admission = std::sync::Once::new();
+        let effect_store = subject_authorization::memory_effect_store_after_reservation(
+            &fixture.api,
+            &store,
+            &worker,
+            &fixture.subject,
+            "memory.surface.prepare",
+            Arc::new(move || {
+                // Force the writer overlap for the mutation only. Its returned
+                // resident surface now performs a separate protected admission.
+                first_admission.call_once(|| {
+                    reserve_tx.send(()).unwrap();
+                    owned_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                });
+            }),
+        );
+        let result = subjektiv::api::execute(
+            &effect_store,
+            &context,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                serde_json::from_value(json!({})).unwrap(),
+            ),
+        );
+        // Join before assertions so the waiting writer is recovered even on an
+        // effect error. An ordinary-connection reentry makes this writer BUSY.
+        let writer_result = writer.join().unwrap();
+        assert!(writer_result.is_ok(), "job={job_worker}: {writer_result:?}");
+        assert!(result.is_ok(), "job={job_worker}: {result:?}");
+        fixture.adopt_policy("{}", "{}").await;
+        let revoked = subject_authorization::subject_effect_store(
+            &fixture.api,
+            &store,
+            &worker,
+            &fixture.subject,
+            "memory.surface.prepare",
+        );
+        let result = subjektiv::api::execute(
+            &revoked,
+            &context,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                serde_json::from_value(json!({})).unwrap(),
+            ),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(subjektiv::api::OperationError::PermissionDenied(_))
+            ),
+            "current revocation must deny another effect: job={job_worker}: {result:?}"
+        );
+        fixture
+            .api
+            .feature_storage
+            .open(&fixture.api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT count(*) FROM surface_generation_runs WHERE subject_id=?1",
+                    [&fixture.subject],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(
+                    count, 1,
+                    "only the admitted effect persists: job={job_worker}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn memory_native_effect_rechecks_prepared_authority_and_preserves_no_write_on_revocation() {
+    // Native admission component: actual owner adoption, Worker singleton,
+    // registered Feature resolver and SQLite effects. Context preparation is
+    // explicit; HTTP role dispatch/Job attempts are covered by the Job suite.
+    for change in ["unchanged", "policy", "body"] {
+        let fixture = Fixture::new().await;
+        fixture.adopt_policy(r#"{ namespaces = [{ namespace = "memory"; keys = ["memory.surface.prepare"]; }]; }"#, "{}").await;
+        let store = open_subjektiv_store(&fixture.api).unwrap();
+        let context = subjektiv::api::HostOperationContext::validated_consolidation(
+            &store,
+            &fixture.subject,
+            Some(vec![]),
+            None,
+        )
+        .unwrap();
+        authorize_subjektiv_operation(
+            &fixture.api,
+            &fixture.source,
+            TEST_WORKSPACE_ID,
+            &fixture.subject,
+            "memory.surface.prepare",
+        )
+        .unwrap();
+        match change {
+            "policy" => fixture.adopt_policy("{}", "{}").await,
+            "body" => fixture.release_source_lease(),
+            _ => {}
+        }
+        let effect_store = subject_authorization::subject_effect_store(
+            &fixture.api,
+            &store,
+            &fixture.source,
+            &fixture.subject,
+            "memory.surface.prepare",
+        );
+        let result = subjektiv::api::execute(
+            &effect_store,
+            &context,
+            server_api::SubjektivMemoryBackendOperation::PrepareSurface(
+                serde_json::from_value(json!({})).unwrap(),
+            ),
+        );
+        if change == "unchanged" {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(subjektiv::api::OperationError::PermissionDenied(_))
+                ),
+                "{change}: {result:?}"
+            );
+        }
+        fixture
+            .api
+            .feature_storage
+            .open(&fixture.api.subjektiv_registration)
+            .unwrap()
+            .with_connection(|connection| {
+                let count: i64 = connection.query_row(
+                    "SELECT count(*) FROM surface_generation_runs WHERE subject_id=?1",
+                    [&fixture.subject],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(count, if change == "unchanged" { 1 } else { 0 });
+                Ok(())
+            })
+            .unwrap();
+    }
 }

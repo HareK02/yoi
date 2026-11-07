@@ -10,6 +10,10 @@
 //! material so fallback can recover information intentionally omitted from an earlier
 //! complementary summary, without accumulating stale references in the next segment.
 
+pub(crate) mod permission_declaration;
+
+mod context_view;
+
 use crate::feature::{
     FeatureDescriptor, FeatureHookPoint, FeatureInstallContext, FeatureInstallError, FeatureModule,
     HookDeclaration, ToolContribution, ToolDeclaration,
@@ -25,7 +29,10 @@ use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use subjektiv::journal::transport::*;
 use subjektiv::journal::{
     JournalAction, JournalOperation, MAX_JOURNAL_PAGE, MAX_JOURNAL_READ_BYTES,
@@ -64,6 +71,7 @@ impl JournalReadStatus {
 // These diagnostics belong to the Feature, not persisted/model-visible input.
 enum JournalCompactionFailure {
     Connection(std::io::ErrorKind),
+    SnapshotPermissionDenied,
     SnapshotConflict,
     SnapshotInvalidArgument,
     SnapshotUnavailable,
@@ -74,18 +82,22 @@ enum JournalCompactionFailure {
 impl JournalCompactionFailure {
     fn snapshot(error: SubjektivHostError) -> Self {
         match error {
+            SubjektivHostError::PermissionDenied(_) => Self::SnapshotPermissionDenied,
             SubjektivHostError::Conflict { .. } => Self::SnapshotConflict,
             SubjektivHostError::InvalidArgument(_) => Self::SnapshotInvalidArgument,
-            SubjektivHostError::Unavailable(_) => Self::SnapshotUnavailable,
+            SubjektivHostError::Unavailable(_) | SubjektivHostError::SessionRegistration { .. } => {
+                Self::SnapshotUnavailable
+            }
         }
     }
 
     fn stage(&self) -> &'static str {
         match self {
             Self::Connection(_) => "connection",
-            Self::SnapshotConflict | Self::SnapshotInvalidArgument | Self::SnapshotUnavailable => {
-                "snapshot"
-            }
+            Self::SnapshotPermissionDenied
+            | Self::SnapshotConflict
+            | Self::SnapshotInvalidArgument
+            | Self::SnapshotUnavailable => "snapshot",
             Self::Serialization => "serialization",
             Self::ByteBudget => "byte_budget",
         }
@@ -97,6 +109,7 @@ impl JournalCompactionFailure {
             Self::Connection(std::io::ErrorKind::InvalidInput) => "invalid_input",
             Self::Connection(std::io::ErrorKind::NotConnected) => "not_connected",
             Self::Connection(_) => "io_error",
+            Self::SnapshotPermissionDenied => "permission_denied",
             Self::SnapshotConflict => "host_conflict",
             Self::SnapshotInvalidArgument => "host_invalid_argument",
             Self::SnapshotUnavailable => "host_unavailable",
@@ -144,29 +157,42 @@ fn journal_input(
 pub(crate) struct JournalContextSource {
     host: SubjektivHostConnection,
     prompts: Arc<arc_swap::ArcSwap<crate::prompt::catalog::PromptCatalog>>,
+    startup_supplied: AtomicBool,
+    compaction_supplied: AtomicBool,
 }
 impl JournalContextSource {
     pub(crate) fn new(
         host: SubjektivHostConnection,
         prompts: Arc<arc_swap::ArcSwap<crate::prompt::catalog::PromptCatalog>>,
     ) -> Self {
-        Self { host, prompts }
+        Self {
+            host,
+            prompts,
+            startup_supplied: AtomicBool::new(false),
+            compaction_supplied: AtomicBool::new(false),
+        }
     }
 }
 #[async_trait]
 impl crate::worker::SessionContextSource for JournalContextSource {
+    fn protected_input_kind(&self) -> Option<&'static str> {
+        Some("journal")
+    }
+
     async fn load(&self) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
         use sha2::{Digest, Sha256};
         if !self.host.host.journal_startup_granted() {
             return Ok(Vec::new());
         }
+        self.host
+            .authorize_operation("journal.startup.read")
+            .map_err(|e| e.to_string())?;
         let snapshot = self
             .host
             .journal_startup_context()
             .map_err(|e| e.to_string())?;
-        // A successful empty read contributes no model context. Keep an omitted
-        // snapshot even when empty: truncation is not evidence of absence.
-        let empty = snapshot.journals.is_empty() && !snapshot.omitted;
+        // Empty journals add no context; omission must still remain visible.
+        let context_yaml = context_view::yaml(&snapshot).map_err(|e| e.to_string())?;
         // Hash the same canonical JSON value retained by SystemItem, so replay
         // can verify provenance without depending on domain struct field order.
         let snapshot_value = serde_json::to_value(&snapshot).map_err(|e| e.to_string())?;
@@ -174,12 +200,12 @@ impl crate::worker::SessionContextSource for JournalContextSource {
         if snapshot_json.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES {
             return Err("Host Journal startup snapshot exceeds independent byte budget".into());
         }
-        if empty {
+        let Some(context_yaml) = context_yaml else {
             return Ok(Vec::new());
-        }
+        };
         let prompts = self.prompts.load();
         let body = prompts
-            .subjektiv_journal_startup(&snapshot_json)
+            .subjektiv_journal_startup(&context_yaml)
             .map_err(|e| e.to_string())?;
         if body.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES + 4096 {
             return Err("Journal startup prompt exceeds rendered byte budget".into());
@@ -203,13 +229,50 @@ impl crate::worker::SessionContextSource for JournalContextSource {
             },
         )
         .map_err(|e| e.to_string())?;
+        self.host
+            .authorize_operation("journal.startup.supply")
+            .map_err(|e| e.to_string())?;
+        let input = journal_input(body, payload, "journal_startup")?;
+        self.startup_supplied.store(true, Ordering::Release);
         Ok(vec![session_store::LoggedSystemHistoryEntry::from_input(
             session_store::LoggedSessionHistoryOrigin::Provided {
                 producer: "subjektiv.journal".into(),
             },
             None,
-            journal_input(body, payload, "journal_startup")?,
+            input,
         )])
+    }
+
+    async fn authorize_supply(&self) -> Result<(), String> {
+        if self.startup_supplied.load(Ordering::Acquire) {
+            self.host
+                .authorize_operation("journal.startup.supply")
+                .map_err(|error| error.to_string())?;
+        }
+        if self.compaction_supplied.load(Ordering::Acquire) {
+            self.host
+                .authorize_operation("journal.compaction.supply")
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn authorize_retained_supply(&self, kind: &str) -> Result<(), String> {
+        let operations: &[&str] = match kind {
+            "journal-startup" => &["journal.startup.supply"],
+            "journal-compaction" => &["journal.compaction.supply"],
+            // Legacy Journal context cannot distinguish its original source.
+            // It may retain both kinds; it never obtains permission from flags
+            // reset by restore or from today's Feature configuration.
+            "journal" => &["journal.startup.supply", "journal.compaction.supply"],
+            _ => return Err("unknown retained Journal input kind".into()),
+        };
+        for operation in operations {
+            self.host
+                .authorize_operation(operation)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     async fn load_compaction_context(
@@ -217,15 +280,24 @@ impl crate::worker::SessionContextSource for JournalContextSource {
         session: session_store::SessionId,
     ) -> Result<Vec<session_store::LoggedSystemHistoryEntry>, String> {
         // A changed Session must never reuse the old source's Host ownership.
-        let connection = if self.host.context.session_id == session.to_string() {
-            Ok(Some(self.host.clone()))
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "context source belongs to a different Session",
-            ))
-        };
-        let input = freeze_compaction_journal(connection, &self.prompts.load_full())?;
+        if self.host.context.session_id != session.to_string() {
+            return Err("Journal context source belongs to a different Session".into());
+        }
+        if !self.host.host.journal_compaction_granted() {
+            return Ok(Vec::new());
+        }
+        self.host
+            .authorize_operation("journal.compaction.read")
+            .map_err(|error| error.to_string())?;
+        self.host
+            .authorize_operation("journal.compaction.supply")
+            .map_err(|error| error.to_string())?;
+        let input =
+            freeze_compaction_journal(Ok(Some(self.host.clone())), &self.prompts.load_full())?;
+        self.host
+            .authorize_operation("journal.compaction.supply")
+            .map_err(|error| error.to_string())?;
+        self.compaction_supplied.store(true, Ordering::Release);
         Ok(vec![session_store::LoggedSystemHistoryEntry::from_input(
             session_store::LoggedSessionHistoryOrigin::Provided {
                 producer: "subjektiv.journal".into(),
@@ -252,7 +324,12 @@ pub(crate) fn freeze_compaction_journal(
     let read = match connection {
         Ok(Some(connection)) if connection.host.journal_compaction_granted() => Some(
             connection
-                .journal_compaction_context()
+                .authorize_operation("journal.compaction.read")
+                .and_then(|_| connection.journal_compaction_context())
+                .and_then(|snapshot| {
+                    connection.authorize_operation("journal.compaction.supply")?;
+                    Ok(snapshot)
+                })
                 .map_err(JournalCompactionFailure::snapshot),
         ),
         Ok(_) => None,
@@ -260,13 +337,8 @@ pub(crate) fn freeze_compaction_journal(
     };
     let snapshot = read.as_ref().and_then(|read| read.as_ref().ok()).cloned();
     let prepared = match read {
-        None => Ok((Disabled, String::new())),
+        None => Ok((Disabled, String::new(), String::new())),
         Some(Ok(snapshot)) => {
-            let status = if snapshot.journals.is_empty() {
-                Absent
-            } else {
-                Available
-            };
             // The current snapshot has only derived, JSON-safe fields (strings,
             // integers, vectors, enums and a UUID). There is no known serialization
             // failure fixture; retain this guard if the domain type changes.
@@ -274,7 +346,14 @@ pub(crate) fn freeze_compaction_journal(
                 .map_err(|_| JournalCompactionFailure::Serialization)
                 .and_then(|json| {
                     if json.len() <= subjektiv::journal::startup::STARTUP_MAX_BYTES {
-                        Ok((status, json))
+                        let yaml = context_view::yaml(&snapshot)
+                            .map_err(|_| JournalCompactionFailure::Serialization)?;
+                        let status = if yaml.is_some() { Available } else { Absent };
+                        let yaml = yaml.unwrap_or_default();
+                        if yaml.len() > subjektiv::journal::startup::STARTUP_MAX_BYTES + 4096 {
+                            return Err(JournalCompactionFailure::ByteBudget);
+                        }
+                        Ok((status, json, yaml))
                     } else {
                         Err(JournalCompactionFailure::ByteBudget)
                     }
@@ -282,13 +361,13 @@ pub(crate) fn freeze_compaction_journal(
         }
         Some(Err(failure)) => Err(failure),
     };
-    let (status, json) = prepared.unwrap_or_else(|failure| {
+    let (status, json, context_yaml) = prepared.unwrap_or_else(|failure| {
         tracing::warn!(
             stage = failure.stage(),
             reason = failure.reason(),
             "Journal compaction snapshot unavailable; continuing without Journal"
         );
-        (Unavailable, String::new())
+        (Unavailable, String::new(), String::new())
     });
     use sha2::{Digest, Sha256};
     let snapshot_sha256: Option<String> = (!json.is_empty()).then(|| {
@@ -298,12 +377,7 @@ pub(crate) fn freeze_compaction_journal(
             .collect()
     });
     let body = prompts
-        .subjektiv_journal_compaction(
-            status.as_str(),
-            &json,
-            snapshot_sha256.as_deref(),
-            workspace_id.as_deref(),
-        )
+        .subjektiv_journal_compaction(status.as_str(), &context_yaml)
         .map_err(|e| e.to_string())?;
     let payload = session_store::FeatureInputPayload::encode(
         "journal:compaction",
@@ -344,18 +418,32 @@ impl JournalRecordingFeature {
     }
     fn request(&self, reason: JournalRecordingReason) -> Result<(), HookError> {
         self.host
-            .host
-            .request_journal_recording(&self.host.context, reason)
+            .authorize_operation("journal.recording.request")
+            .and_then(|_| {
+                self.host
+                    .host
+                    .request_journal_recording(&self.host.context, reason)
+            })
             .map(|_| ())
-            .map_err(|_| {
-                HookError::new(
-                    HookErrorCategory::Dependency,
-                    "Journal admission unconfirmed; Host must reconcile saved public history",
-                )
+            .map_err(|error| {
+                let diagnostic = match error {
+                    SubjektivHostError::PermissionDenied(_) => {
+                        "Journal journal.recording.request permission denied; admission not started"
+                    }
+                    _ => "Journal admission unconfirmed; Host must reconcile saved public history",
+                };
+                HookError::new(HookErrorCategory::Dependency, diagnostic)
             })
     }
 }
 impl FeatureModule for JournalRecordingFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin("journal-recording", "Journal recording admission")
             .with_hook(HookDeclaration::new(
@@ -850,6 +938,244 @@ mod tests {
         });
         assert!(input.body().contains("Journal read status: disabled."));
         assert!(logs.text().is_empty());
+    }
+
+    #[derive(Default)]
+    struct ContextHost {
+        allowed: Mutex<Vec<&'static str>>,
+        reads: std::sync::atomic::AtomicUsize,
+        requests: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::subjektiv::SubjektivHost for ContextHost {
+        fn settings(&self) -> crate::subjektiv::SubjektivHostSettings {
+            crate::subjektiv::SubjektivHostSettings {
+                language: "English".into(),
+            }
+        }
+        fn authorize_operation(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            operation: &str,
+        ) -> Result<(), SubjektivHostError> {
+            if self.allowed.lock().unwrap().contains(&operation) {
+                Ok(())
+            } else {
+                Err(SubjektivHostError::PermissionDenied(operation.into()))
+            }
+        }
+        fn journal_startup_granted(&self) -> bool {
+            true
+        }
+        fn journal_compaction_granted(&self) -> bool {
+            true
+        }
+        fn journal_recording_granted(&self) -> bool {
+            true
+        }
+        fn journal_startup_context(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+        ) -> Result<subjektiv::journal::startup::JournalStartupSnapshot, SubjektivHostError>
+        {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(subjektiv::journal::startup::JournalStartupSnapshot {
+                subject_id: "subject".into(),
+                journals: vec![],
+                omitted: true,
+            })
+        }
+        fn journal_compaction_context(
+            &self,
+            context: &crate::subjektiv::SubjektivHostContext,
+        ) -> Result<subjektiv::journal::startup::JournalStartupSnapshot, SubjektivHostError>
+        {
+            self.journal_startup_context(context)
+        }
+        fn request_journal_recording(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: JournalRecordingReason,
+        ) -> Result<JournalRecordingResponse, SubjektivHostError> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(JournalRecordingResponse::NoNewSources)
+        }
+        fn memory(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: server_api::SubjektivMemoryBackendOperation,
+        ) -> Result<server_api::SubjektivMemoryBackendResponse, SubjektivHostError> {
+            unreachable!()
+        }
+        fn session(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: server_api::SubjektivSessionBackendOperation,
+        ) -> Result<server_api::SubjektivSessionBackendResponse, SubjektivHostError> {
+            unreachable!()
+        }
+        fn stage_candidate(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: memory::backend::MemoryStageCandidateOperation,
+        ) -> Result<server_api::SubjektivStageCandidateResponse, SubjektivHostError> {
+            unreachable!()
+        }
+        fn record_session(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: bool,
+        ) -> Result<server_api::SubjektivRecordSessionResponse, SubjektivHostError> {
+            unreachable!()
+        }
+        fn request_consolidation(
+            &self,
+            _: &crate::subjektiv::SubjektivHostContext,
+            _: memory::backend::MemoryConsolidateStagingOperation,
+        ) -> Result<memory::backend::MemoryConsolidationOutput, SubjektivHostError> {
+            unreachable!()
+        }
+    }
+    fn context_connection(host: Arc<ContextHost>) -> SubjektivHostConnection {
+        SubjektivHostConnection::new(
+            host,
+            crate::subjektiv::SubjektivHostContext {
+                worker_id: "worker".into(),
+                session_id: "session".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn startup_context_denial_never_reads_or_supplies_and_revocation_rechecks_supply() {
+        use crate::worker::SessionContextSource;
+        use std::sync::atomic::Ordering::SeqCst;
+        let host = Arc::new(ContextHost::default());
+        let source = JournalContextSource::new(
+            context_connection(host.clone()),
+            Arc::new(arc_swap::ArcSwap::from(
+                crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
+            )),
+        );
+        source.authorize_supply().await.unwrap();
+        assert!(
+            source
+                .load()
+                .await
+                .unwrap_err()
+                .contains("journal.startup.read")
+        );
+        assert_eq!(host.reads.load(SeqCst), 0);
+        *host.allowed.lock().unwrap() = vec!["journal.startup.read", "journal.startup.supply"];
+        assert_eq!(source.load().await.unwrap().len(), 1);
+        source.authorize_supply().await.unwrap();
+        assert_eq!(host.reads.load(SeqCst), 1);
+        *host.allowed.lock().unwrap() = vec!["journal.startup.read"];
+        assert!(
+            source
+                .authorize_supply()
+                .await
+                .unwrap_err()
+                .contains("journal.startup.supply")
+        );
+        assert_eq!(host.reads.load(SeqCst), 1);
+        assert!(
+            source
+                .load()
+                .await
+                .unwrap_err()
+                .contains("journal.startup.supply")
+        );
+        assert_eq!(host.reads.load(SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_compaction_supply_rechecks_without_reading_or_requiring_startup_grant() {
+        use crate::worker::SessionContextSource;
+        use std::sync::atomic::Ordering::SeqCst;
+        let host = Arc::new(ContextHost::default());
+        let session = session_store::new_session_id();
+        let mut connection = context_connection(host.clone());
+        connection.context.session_id = session.to_string();
+        let source = JournalContextSource::new(
+            connection,
+            Arc::new(arc_swap::ArcSwap::from(
+                crate::prompt::catalog::PromptCatalog::builtins_only().unwrap(),
+            )),
+        );
+        assert!(source.load_compaction_context(session).await.is_err());
+        assert_eq!(host.reads.load(SeqCst), 0);
+        source.authorize_supply().await.unwrap();
+        *host.allowed.lock().unwrap() =
+            vec!["journal.compaction.read", "journal.compaction.supply"];
+        assert_eq!(
+            source.load_compaction_context(session).await.unwrap().len(),
+            1
+        );
+        source.authorize_supply().await.unwrap();
+        assert_eq!(host.reads.load(SeqCst), 1);
+        *host.allowed.lock().unwrap() = vec!["journal.compaction.read"];
+        assert!(
+            source
+                .authorize_supply()
+                .await
+                .unwrap_err()
+                .contains("journal.compaction.supply")
+        );
+        assert_eq!(host.reads.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn compaction_and_recording_denial_has_zero_downstream_calls_and_revocation_is_live() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let host = Arc::new(ContextHost::default());
+        let connection = context_connection(host.clone());
+        let prompts = crate::prompt::catalog::PromptCatalog::builtins_only().unwrap();
+        let denied = freeze_compaction_journal(Ok(Some(connection.clone())), &prompts).unwrap();
+        assert!(denied.body().contains("Journal read status: unavailable."));
+        assert_eq!(host.reads.load(SeqCst), 0);
+        let feature = JournalRecordingFeature::new(connection.clone()).unwrap();
+        assert!(
+            feature
+                .request(JournalRecordingReason::RunCommitted)
+                .is_err()
+        );
+        assert_eq!(host.requests.load(SeqCst), 0);
+        *host.allowed.lock().unwrap() = vec![
+            "journal.compaction.read",
+            "journal.compaction.supply",
+            "journal.recording.request",
+        ];
+        let allowed = freeze_compaction_journal(Ok(Some(connection.clone())), &prompts).unwrap();
+        let payload: JournalCompactionInput = allowed
+            .metadata()
+            .feature_payload()
+            .unwrap()
+            .decode("journal:compaction", 1)
+            .unwrap();
+        assert!(payload.snapshot.is_some());
+        feature
+            .request(JournalRecordingReason::RunCommitted)
+            .unwrap();
+        assert_eq!(host.reads.load(SeqCst), 1);
+        assert_eq!(host.requests.load(SeqCst), 1);
+        *host.allowed.lock().unwrap() = vec!["journal.compaction.read"];
+        let denied = freeze_compaction_journal(Ok(Some(connection)), &prompts).unwrap();
+        let payload: JournalCompactionInput = denied
+            .metadata()
+            .feature_payload()
+            .unwrap()
+            .decode("journal:compaction", 1)
+            .unwrap();
+        assert!(payload.snapshot.is_none());
+        assert_eq!(host.reads.load(SeqCst), 2);
+        assert!(
+            feature
+                .request(JournalRecordingReason::RunCommitted)
+                .is_err()
+        );
+        assert_eq!(host.requests.load(SeqCst), 1);
     }
 
     #[derive(Default)]

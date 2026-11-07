@@ -12,9 +12,10 @@ export const BUILD_TIMEOUT_MS = 1_800_000;
 export const MAX_JOBS = 64;
 
 export function defaultJobs(cpus = availableParallelism()): number {
-  // Leave headroom for internal runners; higher top-level counts can be chosen
-  // explicitly, but are not assumed to improve throughput or timing stability.
-  return Math.min(32, Math.max(1, Math.ceil(cpus * 4 / 3)));
+  // Each suite can spawn its own Runtime, database executors and compiler work.
+  // CPU count alone over-admits these suites and consumes their timeout budgets.
+  // Keep headroom by default; --jobs remains an explicit concurrency override.
+  return Math.min(8, Math.max(1, Math.ceil(cpus * 4 / 3)));
 }
 
 export function parseJobs(args: string[]): number {
@@ -71,7 +72,7 @@ export function shardRustCommand(
   const serial = ["worker", "worker-runtime", "yoi-workspace-server"].includes(
     task.name.split("/")[0],
   );
-  if (names.length <= 72) {
+  if (names.length <= (serial ? 36 : 72)) {
     return [{
       task: serial
         ? { ...task, args: [...task.args, "--test-threads", "1"] }
@@ -79,7 +80,9 @@ export function shardRustCommand(
       selectedNames: [...names],
     }];
   }
-  const count = Math.min(32, Math.ceil(names.length / 36));
+  // Shard size and concurrency are independent: a growing test inventory must
+  // not silently pack more serial cases into the same fixed timeout window.
+  const count = Math.ceil(names.length / 36);
   const shards: string[][] = Array.from({ length: count }, () => []);
   names.forEach((name, index) => shards[index % count].push(name));
   return shards.map((selectedNames, index) => ({

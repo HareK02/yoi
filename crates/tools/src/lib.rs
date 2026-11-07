@@ -2,6 +2,7 @@
 
 pub mod checkout;
 pub mod error;
+pub mod failure;
 pub mod tracker;
 
 mod bash;
@@ -15,6 +16,8 @@ mod routing;
 mod search_target;
 pub mod view_image;
 mod web;
+pub mod workdir_audit;
+mod workdir_error;
 mod write;
 
 pub use bash::{BashResult, BashTool, bash_tool};
@@ -28,7 +31,8 @@ pub use tracker::{ChangeStat, Tracker};
 pub use view_image::{
     detect_image_mime, read_workdir_bytes, routed_view_image_tool, view_image_tool,
 };
-pub use web::{web_fetch_tool, web_search_tool};
+pub use web::{WebOperationAuthorizer, WebTools, web_fetch_tool, web_search_tool};
+pub use workdir_error::WorkdirToolError;
 pub use write::write_tool;
 
 /// Build the filesystem/command tool surface for a single Workdir session.

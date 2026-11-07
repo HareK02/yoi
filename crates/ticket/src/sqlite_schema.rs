@@ -20,7 +20,7 @@ use crate::{Result, TicketError, sqlite_err};
 
 const MIGRATION_TABLE: &str = "ticket_schema_migrations";
 const MAX_SCHEMA_DIAGNOSTICS: usize = 32;
-const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 13;
+const LATEST_SQLITE_TICKET_SCHEMA_VERSION: i64 = 17;
 const BASELINE_MIGRATION_NAME: &str = "ticket schema baseline";
 
 #[derive(Clone, Copy)]
@@ -52,7 +52,8 @@ const OWNED_TABLES: &[&str] = &[
     "typed_ticket_event_references",
     "typed_ticket_event_attributes",
     "typed_ticket_relations",
-    "typed_ticket_orchestration_plans",
+    "typed_ticket_parent_links",
+    "typed_ticket_parent_operations",
     "typed_ticket_artifacts",
     "typed_ticket_case_metadata",
     "typed_ticket_case_history",
@@ -225,6 +226,7 @@ const RELATION_COLUMNS: &[ExpectedColumn] = &[
     column("at", "TEXT", true, 0),
 ];
 
+// Only retained component 7..=16 preimages contain this retired table.
 const ORCHESTRATION_PLAN_COLUMNS: &[ExpectedColumn] = &[
     column("workspace_id", "TEXT", true, 1),
     column("ticket_id", "TEXT", true, 2),
@@ -320,11 +322,69 @@ pub fn migrate_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
     }
 }
 
-/// Appends assignment, post, and content-change fact migrations without replacing applied markers.
-/// The host owns the surrounding transaction.
-/// A savepoint rolls back this component on failure, without committing host work.
-/// Current component 13 is verified only; historical edits are never backfilled.
+/// Startup-only historical composition targets retained by Workspace migrations.
+/// These are frozen component boundaries, not selectable request schemas or a
+/// way to restore legacy execution authority. Current stores must use the latest
+/// composer and request paths must use read-only verification instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoricalTicketSchemaTarget {
+    /// Two-state cases plus tags; no owning assignment tracking yet.
+    Cases10,
+    /// Owning assignment tracking, before canonical posts.
+    Tracking11,
+    /// Canonical posts, before content-change facts.
+    Posts12,
+    /// Content-change facts, before Subject responsibility constraints.
+    Content13,
+    /// Subject responsibility, before Service outbox facts.
+    Subjects14,
+    /// Service outbox, before work-decomposition parent links.
+    Outbox15,
+    /// Work decomposition, before retiring historical orchestration records.
+    ParentLinks16,
+}
+impl HistoricalTicketSchemaTarget {
+    fn shape(self) -> TicketSchemaShape {
+        match self {
+            Self::Cases10 => TicketSchemaShape::Composed10,
+            Self::Tracking11 => TicketSchemaShape::Tracking11,
+            Self::Posts12 => TicketSchemaShape::Posts12,
+            Self::Content13 => TicketSchemaShape::ContentChanges13,
+            Self::Subjects14 => TicketSchemaShape::Subjects14,
+            Self::Outbox15 => TicketSchemaShape::Outbox15,
+            Self::ParentLinks16 => TicketSchemaShape::ParentLinks16,
+        }
+    }
+}
+
+/// Compose one explicit retained host-migration boundary in the host's startup
+/// transaction. This is NOT a request-path API or a downgrade/repair operation.
+///
+/// A recognized older preimage is verified before composition. Applied receipts
+/// are retained; only missing migration receipts are appended. If the stored
+/// version is already at or above the target, its ACTUAL version and complete
+/// shape are verified without downgrading, relabelling, or replaying old steps.
+/// Unknown history and weakened constraints fail closed. The component savepoint
+/// rolls back failure without committing or discarding the caller's other work.
+pub fn migrate_historical_sqlite_ticket_schema_in_transaction(
+    connection: &Connection,
+    target: HistoricalTicketSchemaTarget,
+) -> Result<()> {
+    migrate_ticket_schema_to_in_transaction(connection, target.shape())
+}
+
+/// Appends owning component migrations through the latest contract without
+/// replacing applied receipts. Startup only; the host owns the transaction.
+/// A savepoint rolls back this component on failure without committing host work.
+/// Already-current schemas are verified, never repaired or backfilled.
 pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> Result<()> {
+    migrate_ticket_schema_to_in_transaction(connection, TicketSchemaShape::PlanRetired17)
+}
+
+fn migrate_ticket_schema_to_in_transaction(
+    connection: &Connection,
+    target: TicketSchemaShape,
+) -> Result<()> {
     if connection.is_autocommit() {
         return Err(TicketError::Sqlite(
             "Ticket component migration requires a host transaction".into(),
@@ -344,26 +404,36 @@ pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> R
         verify_table(connection, MIGRATION_TABLE, MIGRATION_COLUMNS, &[], false)?;
         let applied = load_applied_migrations(connection)?;
         if applied.is_empty() {
-            create_latest_ticket_schema(connection)?;
+            connection
+                .execute_batch(include_str!("frozen_schema_v10.sql"))
+                .map_err(sqlite_err)?;
+            for version in 11..=target.version() {
+                apply_component_migration(connection, version)?;
+            }
             connection
                 .execute(
-                    "INSERT INTO ticket_schema_migrations VALUES (13, ?1, ?2)",
-                    params![BASELINE_MIGRATION_NAME, chrono::Utc::now().to_rfc3339()],
+                    "INSERT INTO ticket_schema_migrations VALUES (?1, ?2, ?3)",
+                    params![
+                        target.version(),
+                        BASELINE_MIGRATION_NAME,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
                 )
                 .map_err(sqlite_err)?;
         } else {
-            let version = recognized_schema_version(&applied)?;
+            let mut version = recognized_schema_version(&applied)?;
             if version == 6 {
+                // Retained v6 conversion establishes the verified v7 preimage.
+                // Preserve its original baseline receipt instead of renumbering it.
                 migrate_v6_to_v7(connection)?;
-                connection
-                    .execute(
-                        "UPDATE ticket_schema_migrations SET version = 7 WHERE version = 6",
-                        [],
-                    )
-                    .map_err(sqlite_err)?;
+                append_component_receipt(connection, 7)?;
+                version = 7;
             }
-            let shape = TicketSchemaShape::from_version(if version == 6 { 7 } else { version });
+            let shape = TicketSchemaShape::from_version(version);
             verify_ticket_schema_shape(connection, shape)?;
+            if version >= target.version() {
+                return Ok(());
+            }
             match shape {
                 TicketSchemaShape::Legacy7 => {
                     add_tag_schema(connection)?;
@@ -374,30 +444,22 @@ pub fn migrate_sqlite_ticket_schema_in_transaction(connection: &Connection) -> R
                 TicketSchemaShape::Composed10
                 | TicketSchemaShape::Tracking11
                 | TicketSchemaShape::Posts12
-                | TicketSchemaShape::ContentChanges13 => {}
+                | TicketSchemaShape::ContentChanges13
+                | TicketSchemaShape::Subjects14
+                | TicketSchemaShape::Outbox15
+                | TicketSchemaShape::ParentLinks16
+                | TicketSchemaShape::PlanRetired17 => {}
             }
             if version < 10 {
-                connection
-                    .execute(
-                        "UPDATE ticket_schema_migrations SET version = 10, applied_at = ?1",
-                        params![chrono::Utc::now().to_rfc3339()],
-                    )
-                    .map_err(sqlite_err)?;
+                append_component_receipt(connection, 10)?;
+                version = 10;
             }
-            if version < 11 {
-                crate::assignment_tracking::migrate_assignment_tracking(connection)?;
-                connection.execute("INSERT INTO ticket_schema_migrations VALUES (11, 'Ticket-owned assignment tracking', ?1)", params![chrono::Utc::now().to_rfc3339()]).map_err(sqlite_err)?;
-            }
-            if version < 12 {
-                migrate_posts(connection)?;
-                connection.execute("INSERT INTO ticket_schema_migrations VALUES (12, 'Canonical Ticket posts', ?1)", params![chrono::Utc::now().to_rfc3339()]).map_err(sqlite_err)?;
-            }
-            if version < 13 {
-                migrate_content_changes(connection)?;
-                connection.execute("INSERT INTO ticket_schema_migrations VALUES (13, 'Ticket content change facts', ?1)", params![chrono::Utc::now().to_rfc3339()]).map_err(sqlite_err)?;
+            for next in version + 1..=target.version() {
+                apply_component_migration(connection, next)?;
+                append_component_receipt(connection, next)?;
             }
         }
-        verify_sqlite_ticket_schema(connection)
+        verify_ticket_schema_shape(connection, target)
     })();
     match result {
         Ok(()) => connection
@@ -421,6 +483,10 @@ enum TicketSchemaShape {
     Tracking11,
     Posts12,
     ContentChanges13,
+    Subjects14,
+    Outbox15,
+    ParentLinks16,
+    PlanRetired17,
 }
 impl TicketSchemaShape {
     fn from_version(version: i64) -> Self {
@@ -432,6 +498,10 @@ impl TicketSchemaShape {
             11 => Self::Tracking11,
             12 => Self::Posts12,
             13 => Self::ContentChanges13,
+            14 => Self::Subjects14,
+            15 => Self::Outbox15,
+            16 => Self::ParentLinks16,
+            17 => Self::PlanRetired17,
             _ => unreachable!(),
         }
     }
@@ -444,6 +514,10 @@ impl TicketSchemaShape {
             Self::Tracking11 => 11,
             Self::Posts12 => 12,
             Self::ContentChanges13 => 13,
+            Self::Subjects14 => 14,
+            Self::Outbox15 => 15,
+            Self::ParentLinks16 => 16,
+            Self::PlanRetired17 => 17,
         }
     }
     fn tags(self) -> bool {
@@ -454,6 +528,10 @@ impl TicketSchemaShape {
                 | Self::Tracking11
                 | Self::Posts12
                 | Self::ContentChanges13
+                | Self::Subjects14
+                | Self::Outbox15
+                | Self::ParentLinks16
+                | Self::PlanRetired17
         )
     }
     fn cases(self) -> bool {
@@ -464,13 +542,33 @@ impl TicketSchemaShape {
                 | Self::Tracking11
                 | Self::Posts12
                 | Self::ContentChanges13
+                | Self::Subjects14
+                | Self::Outbox15
+                | Self::ParentLinks16
+                | Self::PlanRetired17
         )
     }
 }
 
+/// Read-only verification for a retained Host composition boundary. The actual
+/// supported shape must be at least the requested boundary; later component
+/// receipts and their complete constraints are verified without relabelling.
+pub fn verify_historical_sqlite_ticket_schema(
+    connection: &Connection,
+    target: HistoricalTicketSchemaTarget,
+) -> Result<()> {
+    let version = recognized_schema_version(&load_applied_migrations(connection)?)?;
+    if version < target.shape().version() {
+        return Err(TicketError::Sqlite(
+            "Ticket schema precedes the required Host composition boundary".into(),
+        ));
+    }
+    verify_ticket_schema_shape(connection, TicketSchemaShape::from_version(version))
+}
+
 /// Verifies the current Ticket-owned SQLite schema without executing DDL.
 pub fn verify_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
-    verify_ticket_schema_shape(connection, TicketSchemaShape::ContentChanges13)
+    verify_ticket_schema_shape(connection, TicketSchemaShape::PlanRetired17)
 }
 
 /// Retained Workspace schema-66 migration produces the pre-classification v7
@@ -484,7 +582,7 @@ pub fn verify_pre_classification_ticket_schema(connection: &Connection) -> Resul
 /// treating historical workflow values as the current two-state case authority.
 pub fn verify_legacy_sqlite_ticket_schema(connection: &Connection) -> Result<()> {
     let applied = load_applied_migrations(connection)?;
-    let version = applied.keys().next().copied().unwrap_or_default();
+    let version = recognized_schema_version(&applied)?;
     if !matches!(version, 7 | 8) {
         return Err(TicketError::Sqlite(
             "legacy Ticket schema requires component 7 or 8".into(),
@@ -575,6 +673,18 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             CHILD_FOREIGN_KEYS,
         ),
     ] {
+        // Retained preimages still require the retired table; current stores reject it.
+        if table == "typed_ticket_orchestration_plans"
+            && matches!(shape, TicketSchemaShape::PlanRetired17)
+        {
+            if table_exists(connection, table)? {
+                push_diagnostic(
+                    &mut diagnostics,
+                    "retired Ticket orchestration storage remains".into(),
+                );
+            }
+            continue;
+        }
         if !shape.tags()
             && matches!(
                 table,
@@ -586,7 +696,12 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
         let mut columns = columns.to_vec();
         if matches!(
             shape,
-            TicketSchemaShape::Posts12 | TicketSchemaShape::ContentChanges13
+            TicketSchemaShape::Posts12
+                | TicketSchemaShape::ContentChanges13
+                | TicketSchemaShape::Subjects14
+                | TicketSchemaShape::Outbox15
+                | TicketSchemaShape::ParentLinks16
+                | TicketSchemaShape::PlanRetired17
         ) {
             if table == "typed_tickets" {
                 columns.retain(|c| c.name != "body");
@@ -804,7 +919,23 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             ),
         );
     }
+    if !matches!(shape, TicketSchemaShape::PlanRetired17) {
+        collect_foreign_key_check_diagnostics(
+            connection,
+            "typed_ticket_orchestration_plans",
+            &mut diagnostics,
+        );
+    }
     for table in OWNED_TABLES {
+        if !matches!(
+            shape,
+            TicketSchemaShape::ParentLinks16 | TicketSchemaShape::PlanRetired17
+        ) && matches!(
+            *table,
+            "typed_ticket_parent_links" | "typed_ticket_parent_operations"
+        ) {
+            continue;
+        }
         if !shape.tags()
             && matches!(
                 *table,
@@ -831,16 +962,32 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
         TicketSchemaShape::Tracking11
             | TicketSchemaShape::Posts12
             | TicketSchemaShape::ContentChanges13
+            | TicketSchemaShape::Subjects14
+            | TicketSchemaShape::Outbox15
+            | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
     ) {
-        if let Err(error) =
-            crate::assignment_tracking::verify_assignment_tracking_schema(connection)
-        {
+        if let Err(error) = crate::assignment_tracking::verify_assignment_tracking_schema(
+            connection,
+            matches!(
+                shape,
+                TicketSchemaShape::Subjects14
+                    | TicketSchemaShape::Outbox15
+                    | TicketSchemaShape::ParentLinks16
+                    | TicketSchemaShape::PlanRetired17
+            ),
+        ) {
             push_diagnostic(&mut diagnostics, error.to_string());
         }
     }
     if matches!(
         shape,
-        TicketSchemaShape::Posts12 | TicketSchemaShape::ContentChanges13
+        TicketSchemaShape::Posts12
+            | TicketSchemaShape::ContentChanges13
+            | TicketSchemaShape::Subjects14
+            | TicketSchemaShape::Outbox15
+            | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
     ) {
         collect_index_diagnostics(
             connection,
@@ -851,8 +998,29 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
             &mut diagnostics,
         );
     }
-    if matches!(shape, TicketSchemaShape::ContentChanges13) {
+    if matches!(
+        shape,
+        TicketSchemaShape::ContentChanges13
+            | TicketSchemaShape::Subjects14
+            | TicketSchemaShape::Outbox15
+            | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
+    ) {
         collect_content_change_diagnostics(connection, &mut diagnostics)?;
+    }
+    if matches!(
+        shape,
+        TicketSchemaShape::Outbox15
+            | TicketSchemaShape::ParentLinks16
+            | TicketSchemaShape::PlanRetired17
+    ) {
+        collect_service_outbox_diagnostics(connection, &mut diagnostics)?;
+    }
+    if matches!(
+        shape,
+        TicketSchemaShape::ParentLinks16 | TicketSchemaShape::PlanRetired17
+    ) {
+        collect_parent_link_diagnostics(connection, &mut diagnostics)?;
     }
     if diagnostics.is_empty() {
         Ok(())
@@ -870,13 +1038,51 @@ fn verify_ticket_schema_shape(connection: &Connection, shape: TicketSchemaShape)
     }
 }
 
-fn create_latest_ticket_schema(connection: &Connection) -> Result<()> {
+// Both fresh and retained composition use this single ordered step dispatcher.
+fn apply_component_migration(connection: &Connection, version: i64) -> Result<()> {
+    match version {
+        11 => crate::assignment_tracking::migrate_assignment_tracking(connection),
+        12 => migrate_posts(connection),
+        13 => migrate_content_changes(connection),
+        14 => crate::subject_assignment::migrate(connection),
+        15 => connection
+            .execute_batch(crate::service_outbox::OUTBOX_SCHEMA_SQL)
+            .map_err(sqlite_err),
+        16 => connection
+            .execute_batch(crate::parent_links::SCHEMA_SQL)
+            .map_err(sqlite_err),
+        17 => crate::retire_orchestration_plans::migrate(connection),
+        _ => unreachable!("bounded component migration"),
+    }
+}
+
+fn component_migration_name(version: i64) -> &'static str {
+    match version {
+        7 => "Ordered Ticket targets",
+        10 => "Ticket case and tag composition",
+        11 => "Ticket-owned assignment tracking",
+        12 => "Canonical Ticket posts",
+        13 => "Ticket content change facts",
+        14 => "Subject Ticket responsibility",
+        15 => "Ticket Service transactional outbox",
+        16 => "Ticket work-decomposition parent links",
+        17 => "Retire Ticket orchestration plans into historical comments",
+        _ => unreachable!("bounded component receipt"),
+    }
+}
+
+fn append_component_receipt(connection: &Connection, version: i64) -> Result<()> {
     connection
-        .execute_batch(include_str!("latest_schema.sql"))
+        .execute(
+            "INSERT INTO ticket_schema_migrations VALUES (?1, ?2, ?3)",
+            params![
+                version,
+                component_migration_name(version),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
         .map_err(sqlite_err)?;
-    crate::assignment_tracking::migrate_assignment_tracking(connection)?;
-    migrate_posts(connection)?;
-    migrate_content_changes(connection)
+    Ok(())
 }
 
 fn migrate_content_changes(connection: &Connection) -> Result<()> {
@@ -958,6 +1164,72 @@ fn collect_content_change_diagnostics(
         }
     }
     collect_foreign_key_check_diagnostics(connection, TABLE, diagnostics);
+    Ok(())
+}
+
+fn collect_parent_link_diagnostics(
+    connection: &Connection,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    // These statements are tables/indexes only. Compare the complete owned DDL,
+    // including the composite Workspace FKs, self-link CHECK and children index.
+    for expected in crate::parent_links::SCHEMA_SQL.split(';') {
+        let expected = expected.trim();
+        if expected.is_empty() {
+            continue;
+        }
+        let words: Vec<_> = expected.split_whitespace().collect();
+        let kind = words[1].to_ascii_lowercase();
+        let name = words[2];
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        let normalize = |sql: &str| sql.split_whitespace().collect::<String>();
+        if actual.as_deref().map(normalize) != Some(normalize(expected)) {
+            push_diagnostic(
+                diagnostics,
+                format!("invalid Ticket parent-link {kind} {name}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn collect_service_outbox_diagnostics(
+    connection: &Connection,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    // Check the complete owned DDL, including AUTOINCREMENT, bounds, uniqueness
+    // and absence of a cascading FK. Host-owned additional triggers are allowed.
+    for expected in crate::service_outbox::OUTBOX_SCHEMA_SQL.split(';') {
+        let expected = expected.trim();
+        if expected.is_empty() {
+            continue;
+        }
+        let words: Vec<_> = expected.split_whitespace().collect();
+        let kind = words[1].to_ascii_lowercase();
+        let name = words[2];
+        let actual: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sqlite_err)?;
+        let normalize = |sql: &str| sql.split_whitespace().collect::<String>();
+        if actual.as_deref().map(normalize) != Some(normalize(expected)) {
+            push_diagnostic(
+                diagnostics,
+                format!("invalid Ticket Service outbox {kind} {name}"),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1046,7 +1318,7 @@ fn migrate_legacy_cases(connection: &Connection) -> Result<()> {
 }
 fn add_tag_schema(connection: &Connection) -> Result<()> {
     // Use the exact canonical DDL rather than duplicating migration definitions.
-    let (_, tag_schema) = include_str!("latest_schema.sql")
+    let (_, tag_schema) = include_str!("frozen_schema_v10.sql")
         .split_once("-- Workspace tag foundation (v8): shared by fresh schema and v7 upgrade.")
         .expect("canonical tag schema marker");
     connection.execute_batch(tag_schema).map_err(sqlite_err)
@@ -1212,26 +1484,24 @@ fn load_applied_migrations(connection: &Connection) -> Result<BTreeMap<i64, Stri
 }
 
 fn recognized_schema_version(applied: &BTreeMap<i64, String>) -> Result<i64> {
-    if applied.len() == 1 {
-        if let Some((&version, name)) = applied.first_key_value() {
-            if (6..=13).contains(&version) && name == BASELINE_MIGRATION_NAME {
-                return Ok(version);
-            }
-        }
-    }
-    for baseline in [10, 11, 12] {
-        let mut expected = BTreeMap::from([(baseline, BASELINE_MIGRATION_NAME.to_owned())]);
-        for (version, name) in [
-            (11, "Ticket-owned assignment tracking"),
-            (12, "Canonical Ticket posts"),
-            (13, "Ticket content change facts"),
-        ] {
-            if version <= baseline {
-                continue;
-            }
-            expected.insert(version, name.to_owned());
+    if let Some((&baseline, name)) = applied.first_key_value() {
+        if (6..=LATEST_SQLITE_TICKET_SCHEMA_VERSION).contains(&baseline)
+            && name == BASELINE_MIGRATION_NAME
+        {
+            let mut expected = BTreeMap::from([(baseline, name.clone())]);
             if applied == &expected {
-                return Ok(version);
+                return Ok(baseline);
+            }
+            // Versions 8 and 9 were independent baseline generations, not
+            // ordered upgrades. Both compose at10; v6 additionally needs v7.
+            for version in [7, 10, 11, 12, 13, 14, 15, 16, 17] {
+                if version <= baseline || (version == 7 && baseline != 6) {
+                    continue;
+                }
+                expected.insert(version, component_migration_name(version).to_owned());
+                if applied == &expected {
+                    return Ok(version);
+                }
             }
         }
     }
@@ -1733,10 +2003,16 @@ mod tests {
         assert_eq!(
             load_applied_migrations(&connection).unwrap(),
             BTreeMap::from([
-                (10, BASELINE_MIGRATION_NAME.to_owned()),
+                (6, BASELINE_MIGRATION_NAME.to_owned()),
+                (7, "Ordered Ticket targets".to_owned()),
+                (10, "Ticket case and tag composition".to_owned()),
                 (11, "Ticket-owned assignment tracking".to_owned()),
                 (12, "Canonical Ticket posts".to_owned()),
-                (13, "Ticket content change facts".to_owned())
+                (13, "Ticket content change facts".to_owned()),
+                (14, "Subject Ticket responsibility".to_owned()),
+                (15, "Ticket Service transactional outbox".to_owned()),
+                (16, "Ticket work-decomposition parent links".to_owned()),
+                (17, component_migration_name(17).to_owned())
             ])
         );
     }
@@ -1879,7 +2155,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain a canonical baseline and ordered migrations through 13"
+            "migration history must contain a canonical baseline and ordered migrations through 17"
         ));
         assert_eq!(load_applied_migrations(&connection).unwrap().len(), 2);
     }
@@ -1901,7 +2177,7 @@ mod tests {
 
         let error = migrate_sqlite_ticket_schema(&connection).unwrap_err();
         assert!(error.to_string().contains(
-            "migration history must contain a canonical baseline and ordered migrations through 13"
+            "migration history must contain a canonical baseline and ordered migrations through 17"
         ));
         assert!(!table_exists(&connection, "typed_tickets").unwrap());
     }

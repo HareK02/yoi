@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct TicketBrowseQueryRequest {
+    #[cfg_attr(feature = "typescript", ts(type = "TicketParentFilter | null"))]
+    pub parent: Option<ticket::TicketParentFilter>,
     pub query: Option<String>,
     #[serde(default)]
     #[cfg_attr(feature = "typescript", ts(type = "Array<BrowserTicketState>"))]

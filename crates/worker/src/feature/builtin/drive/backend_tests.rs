@@ -7,6 +7,9 @@ use crate::worker::{WorkspaceBinaryResponse, WorkspaceClientError, WorkspaceResp
 use std::sync::{Condvar, Mutex};
 use tracing::instrument::WithSubscriber;
 
+#[path = "failure/backend_tests.rs"]
+mod failure_projection;
+
 const SECRET: &str = "secret-token /private/drive credential=unsafe";
 const ID: &str = "host-request-1";
 
@@ -43,6 +46,7 @@ fn mutation() -> DriveMutationRequest {
 }
 fn json(value: impl Serialize) -> WorkspaceResponse {
     WorkspaceResponse {
+        content_type: Some("application/json".into()),
         status: 200,
         body: serde_json::to_string(&value).unwrap(),
     }
@@ -104,14 +108,17 @@ impl Client {
             Fault::InvalidPath => Err(WorkspaceClientError::InvalidPath(SECRET.into())),
             Fault::Panic => panic!("injected adapter task panic"),
             Fault::Decode => Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 200,
                 body: SECRET.into(),
             }),
             Fault::Size => Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 200,
                 body: SECRET.repeat(RESPONSE_LIMIT / SECRET.len() + 1),
             }),
             Fault::Rejected | Fault::Unknown => Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 409,
                 body: serde_json::to_string(&DriveApiError {
                     code: DriveApiErrorCode::Conflict,
@@ -125,6 +132,7 @@ impl Client {
                 .unwrap(),
             }),
             Fault::Unrecognized => Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 503,
                 body: SECRET.into(),
             }),
@@ -170,6 +178,15 @@ impl WorkspaceClient for Client {
         &self,
         request: WorkspaceRequest,
     ) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        if request.path.ends_with("/authorization/check") {
+            let input: server_api::authorization::OperationAuthorizationRequest =
+                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
+            return Ok(WorkspaceResponse {
+                content_type: Some("application/json".into()),
+                status: 200,
+                body: serde_json::json!({"scope": input.resource}).to_string(),
+            });
+        }
         let is_status = request.path.contains("/requests/");
         let fault = if is_status { self.receipt } else { self.fault };
         let mutation = request.method == WorkspaceRequestMethod::Post;
@@ -273,6 +290,7 @@ impl WorkspaceClient for Client {
             })
         } else {
             WorkspaceResponse {
+                content_type: Some("application/json".into()),
                 status: 200,
                 body: if matches!(self.fault, Fault::Length) {
                     "x"
@@ -284,6 +302,7 @@ impl WorkspaceClient for Client {
         };
         self.fail(self.fault, success)
             .map(|r| WorkspaceBinaryResponse {
+                content_type: r.content_type,
                 status: r.status,
                 body: r.body.into_bytes(),
             })
@@ -542,7 +561,7 @@ async fn production_deadline_does_not_cancel_effect_or_infer_uncommitted_from_sn
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_reply_loss_keeps_original_receipt_and_retained_effect_without_reexecution() {
     use axum::{
         Router,
@@ -563,6 +582,7 @@ async fn http_reply_loss_keeps_original_receipt_and_retained_effect_without_reex
     }
     let stored = Arc::new(Mutex::new(Stored::default()));
     let router = Router::new()
+        .route("/api/w/workspace/authorization/check", post(|body: axum::body::Bytes| async move { let input: server_api::authorization::OperationAuthorizationRequest = serde_json::from_slice(&body).unwrap(); axum::Json(serde_json::json!({"scope":input.resource})) }))
         .route("/api/w/workspace/drive/metadata", get(|| async { SECRET }))
         .route(
             "/api/w/workspace/drive/mutate",
@@ -624,7 +644,7 @@ async fn http_reply_loss_keeps_original_receipt_and_retained_effect_without_reex
         .with_subscriber(capture.dispatch())
         .await
         .unwrap_err();
-    assert!(matches!(error, DriveError::Unavailable));
+    assert!(matches!(error, DriveError::Unavailable), "{error:?}");
     safe(&capture, Reason::Decode, &error.to_string());
     let capture = Capture::default();
     let response = backend

@@ -399,3 +399,21 @@ Deno.test("Worker launch request preserves typed Feature invocations and rejects
     ...invocation, extra: true,
   } }] }), Error, "unknown field extra");
 });
+
+Deno.test("Worker catalog preserves typed saved removal observations across reloads", () => {
+  const summary = { ...worker, state: "stopped", resource_key: "W-1", availability: "observed" };
+  for (const [state, cause] of [["held", "recording_disabled"], ["waiting", "job_pending"], ["held", "source_unavailable"], ["held", "ownership_unknown"], ["held", "job_failed"], ["held", "execution_unconfirmed"], ["held", "storage_unavailable"]]) {
+    const removal = { operation_id: "original-operation", state, phase: "recording", cause };
+    assertEquals(parseWorkerSummary(JSON.parse(JSON.stringify({ ...summary, removal }))).removal, removal);
+  }
+  for (const phase of ["awaiting_quiescence", "recording", "awaiting_effects_end", "released", "completed"]) {
+    const removal = { operation_id: "original-operation", state: "waiting", phase };
+    assertEquals(parseWorkerSummary({ ...summary, removal }).removal, removal);
+  }
+  assertEquals(parseWorkerSummary(summary).removal, undefined);
+  for (const invalid of [{ state: "removed" }, { phase: "discarded" }, { cause: "retry" }, { operation_id: "" }, { body: "must not leak" }]) {
+    assertThrows(() => parseWorkerSummary({ ...summary, removal: {
+      state: "held", phase: "recording", operation_id: "original-operation", ...invalid,
+    } }), Error, "removal");
+  }
+});

@@ -3,6 +3,8 @@
 mod public_assignment;
 #[path = "server_residual_execution_tests.rs"]
 mod residual;
+#[path = "server_session_binding_tests.rs"]
+mod signed_binding;
 use super::*;
 use crate::SqliteWorkspaceStore;
 use crate::db_executor::{DbExecutor, DbExecutorLimits, DbOperationLifetime};
@@ -77,6 +79,7 @@ impl Fixture {
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
             backend_base_url: Some("http://localhost:8787".into()),
+            control_plane_endpoints: Default::default(),
         };
         let store = Arc::new(
             SqliteWorkspaceStore::open_for_test(&config.database_path)
@@ -177,7 +180,11 @@ impl Fixture {
         Self::request(
             "POST",
             SUBJECTS,
-            serde_json::json!({ "role": role, "behavior_md": "" }),
+            serde_json::json!({
+                "operation_id": format!("create-{role}"),
+                "role": role,
+                "behavior_md": ""
+            }),
         )
     }
 
@@ -962,6 +969,19 @@ impl HeldRuntimeReply {
         Self::with_held_path(Some(path.to_owned()))
     }
     fn with_held_path(path: Option<String>) -> Self {
+        Self::with_response(path, None)
+    }
+    fn with_response(path: Option<String>, response: Option<serde_json::Value>) -> Self {
+        Self::with_response_count(path, response, 1)
+    }
+    // Hold only the first response; subsequent exact-request controls use the
+    // same endpoint without changing Runtime trust merely to replace the fake.
+    fn with_response_count(
+        path: Option<String>,
+        response: Option<serde_json::Value>,
+        count: usize,
+    ) -> Self {
+        assert!(count > 0);
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -970,11 +990,14 @@ impl HeldRuntimeReply {
         let upstream_released = Arc::new(AtomicBool::new(false));
         let flag = upstream_released.clone();
         let thread = std::thread::spawn(move || {
+            let mut entered = Some(entered);
+            let mut remaining = count;
             loop {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
                 stream.set_read_timeout(Some(WATCHDOG)).unwrap();
+                stream.set_write_timeout(Some(WATCHDOG)).unwrap();
                 let Ok(Some(request)) = read_runtime_fixture_request(&mut stream) else {
                     return;
                 };
@@ -984,11 +1007,26 @@ impl HeldRuntimeReply {
                     let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                     continue;
                 }
-                let _ = entered.send(request);
-                let _ = permit.recv_timeout(WATCHDOG);
-                flag.store(true, Ordering::SeqCst);
-                let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                break;
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(request);
+                    let _ = permit.recv_timeout(WATCHDOG);
+                    flag.store(true, Ordering::SeqCst);
+                }
+                if let Some(response) = response.as_ref() {
+                    let body = serde_json::to_vec(response).unwrap();
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
             }
         });
         Self {
@@ -1097,6 +1135,152 @@ impl Drop for CountJobLease {
     }
 }
 
+async fn session_runtime_subject(
+    fixture: &Fixture,
+    kind: &str,
+) -> (String, RuntimeWorkerRef, server_api::ServerRequestContext) {
+    let Json(subject) = scoped_create_subjektiv_subject(
+        State(fixture.api.clone()),
+        AxumPath(ScopedWorkspacePath {
+            workspace_id: WORKSPACE.into(),
+        }),
+        Extension(RequestActor {
+            user_id: "fixture-user".into(),
+            account_id: format!("account-{WORKSPACE}"),
+            handle: "fixture-user".into(),
+            display_name: "Fixture user".into(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        }),
+        Json(server_api::SubjektivSubjectCreateRequest {
+            operation_id: format!("create-network-subject-{kind}"),
+            role: "network subject".into(),
+            behavior_md: String::new(),
+        }),
+    )
+    .await
+    .unwrap()
+    .1;
+    if let Some(operation) = match kind {
+        "read" => Some("session.read"),
+        "search" => Some("session.search"),
+        "list" => Some("session.list"),
+        _ => None,
+    } {
+        open_subjektiv_store(&fixture.api)
+            .unwrap()
+            .set_subject_permissions(
+                &subject.id,
+                &server_api::authorization::SubjectPermissionsUpdate {
+                    operation_id: format!("session-wait-grant-{kind}"),
+                    expected_change_id: Some(
+                        open_subjektiv_store(&fixture.api)
+                            .unwrap()
+                            .current_subject_policy(&subject.id)
+                            .unwrap()
+                            .unwrap()
+                            .change_id,
+                    ),
+                    execution: vec![server_api::authorization::ScopedPermission {
+                        operation: operation.into(),
+                        resource: server_api::authorization::PermissionResource::Subject {
+                            workspace_id: WORKSPACE.into(),
+                            subject_id: subject.id.clone(),
+                        },
+                    }],
+                    delegation: vec![],
+                },
+            )
+            .unwrap();
+    }
+    let singleton = if kind == "legacy_scope" {
+        format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id)
+    } else {
+        crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap()
+    };
+    let memory = fixture
+        .store
+        .get_workspace_memory_settings(WORKSPACE)
+        .unwrap();
+    let reservation = fixture
+        .store
+        .reserve_worker_create(
+            WORKSPACE,
+            "subject-runtime",
+            "network-fixture",
+            "network-fixture-fingerprint",
+            Some(&singleton),
+            &memory,
+        )
+        .unwrap();
+    let worker = RuntimeWorkerRef::new("subject-runtime", reservation.worker_id.to_string());
+    fixture
+        .store
+        .upsert_worker_registry(&WorkerRegistryRecord {
+            workspace_id: WORKSPACE.into(),
+            worker: worker.clone(),
+            display_name: "network fixture".into(),
+            profile: None,
+            retention_state: "normal".into(),
+            transcript_ref: None,
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    fixture
+        .store
+        .complete_worker_create_reservation(WORKSPACE, reservation.worker_id)
+        .unwrap();
+    open_subjektiv_store(&fixture.api)
+        .unwrap()
+        .record_session_attribution(
+            crate::subjektiv::SubjectSessionAttribution::new(
+                subject.id.clone(),
+                worker.runtime_id.clone(),
+                worker.worker_id.clone(),
+                "session",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    fixture
+        .store
+        .create_worker_control_grant(&WorkerControlGrantRecord {
+            workspace_id: WORKSPACE.into(),
+            grant_id: "session-observe".into(),
+            controller: worker.clone(),
+            subject: worker.clone(),
+            relation: "subject_session".into(),
+            origin: "test".into(),
+            permissions: vec!["observe".into()],
+            operation_id: "session-observe".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            revoked_at: None,
+        })
+        .unwrap();
+    let context = server_api::ServerRequestContext {
+        actor: None,
+        worker_source: None,
+        runtime_source: Some(server_api::ServerRuntimeSource {
+            // Older handler-only tests use a fixture inbound context. Preserve
+            // the original recorded binding at setup, never a post-wait lookup.
+            authentication_binding_id: fixture
+                .store
+                .get_workspace_runtime_binding(WORKSPACE, &worker.runtime_id)
+                .unwrap()
+                .unwrap()
+                .binding_id,
+            runtime_id: worker.runtime_id.clone(),
+            worker_id: Some(worker.worker_id.clone()),
+        }),
+        origin: None,
+        transport_headers: Vec::new(),
+    };
+    (subject.id, worker, context)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_the_actual_host_lease()
  {
@@ -1111,98 +1295,7 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
             &format!("http://{}", reply.address),
             false,
         );
-        let Json(subject) = scoped_create_subjektiv_subject(
-            State(fixture.api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: WORKSPACE.into(),
-            }),
-            Json(server_api::SubjektivSubjectCreateRequest {
-                role: "network subject".into(),
-                behavior_md: String::new(),
-            }),
-        )
-        .await
-        .unwrap()
-        .1;
-        let singleton = if kind == "legacy_scope" {
-            format!("{SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX}{}", subject.id)
-        } else {
-            crate::subjektiv::subject_worker_singleton_key(&subject.id).unwrap()
-        };
-        let memory = fixture
-            .store
-            .get_workspace_memory_settings(WORKSPACE)
-            .unwrap();
-        let reservation = fixture
-            .store
-            .reserve_worker_create(
-                WORKSPACE,
-                "subject-runtime",
-                "network-fixture",
-                "network-fixture-fingerprint",
-                Some(&singleton),
-                &memory,
-            )
-            .unwrap();
-        let worker = RuntimeWorkerRef::new("subject-runtime", reservation.worker_id.to_string());
-        fixture
-            .store
-            .upsert_worker_registry(&WorkerRegistryRecord {
-                workspace_id: WORKSPACE.into(),
-                worker: worker.clone(),
-                display_name: "network fixture".into(),
-                profile: None,
-                retention_state: "normal".into(),
-                transcript_ref: None,
-                session_ref: None,
-                summary_ref: None,
-                diagnostics_ref: None,
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-            })
-            .unwrap();
-        fixture
-            .store
-            .complete_worker_create_reservation(WORKSPACE, reservation.worker_id)
-            .unwrap();
-        open_subjektiv_store(&fixture.api)
-            .unwrap()
-            .record_session_attribution(
-                crate::subjektiv::SubjectSessionAttribution::new(
-                    subject.id.clone(),
-                    worker.runtime_id.clone(),
-                    worker.worker_id.clone(),
-                    "session",
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        fixture
-            .store
-            .create_worker_control_grant(&WorkerControlGrantRecord {
-                workspace_id: WORKSPACE.into(),
-                grant_id: "session-observe".into(),
-                controller: worker.clone(),
-                subject: worker.clone(),
-                relation: "subject_session".into(),
-                origin: "test".into(),
-                permissions: vec!["observe".into()],
-                operation_id: "session-observe".into(),
-                created_at: "2026-01-01T00:00:00Z".into(),
-                revoked_at: None,
-            })
-            .unwrap();
-        let context = server_api::ServerRequestContext {
-            actor: None,
-            worker_source: None,
-            runtime_source: Some(server_api::ServerRuntimeSource {
-                authentication_binding_id: "fixture-binding".into(),
-                runtime_id: worker.runtime_id,
-                worker_id: Some(worker.worker_id),
-            }),
-            origin: None,
-            transport_headers: Vec::new(),
-        };
+        let (subject_id, _worker, context) = session_runtime_subject(&fixture, kind).await;
         let counts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let lifetime = Arc::new(CountJobLifetime(counts.clone()));
         let api = fixture.api.clone();
@@ -1214,7 +1307,7 @@ async fn subjektiv_runtime_waits_leave_db_and_control_free_and_cancel_retains_th
                         State(api),
                         AxumPath(ScopedSubjektivSubjectPath {
                             workspace_id: WORKSPACE.into(),
-                            subject_id: subject.id,
+                            subject_id,
                         }),
                     )
                     .await
@@ -1956,5 +2049,170 @@ async fn worker_discovery_sql_waits_off_tokio_and_keeps_admission_until_actual_c
             "actual discovery cleanup leaked its lease"
         );
         fixture.host_executor.drain().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn session_runtime_reply_rechecks_policy_body_and_observation_before_delivering_data() {
+    // Production Host handler, current policy/domain stores and generated Remote
+    // transport. The authenticated inbound context and Runtime data producer are
+    // fixture boundaries; this does not claim real model execution or HTTP auth.
+    for kind in ["read", "search"] {
+        for change in ["unchanged", "policy", "body", "observe"] {
+            let fixture = Fixture::new().await;
+            let entry = serde_json::json!({"segment_id":"segment","entry_ref":"E1","kind":"user","origin":"human_input","lineage":{"kind":"root"}});
+            let page = if kind == "read" {
+                let mut page = entry;
+                page["session_id"] = "session".into();
+                page["generation"] = "generation".into();
+                page["mode"] = "compact".into();
+                page["content"] = "protected needle".into();
+                page["has_more"] = false.into();
+                page["scanned_bytes"] = 16.into();
+                page["scanned_segments"] = 1.into();
+                page["scanned_entries"] = 1.into();
+                page
+            } else {
+                let mut entry = entry;
+                entry["compact"] = "protected needle".into();
+                entry["compact_truncated"] = false.into();
+                entry["scan_cursor"] = "start".into();
+                serde_json::json!({"session_id":"session","generation":"generation","items":[entry],"has_more":false,"scanned_bytes":16,"scanned_segments":1,"scanned_entries":1})
+            };
+            let response = serde_json::json!({"availability":"page","page":page});
+            if kind == "read" {
+                serde_json::from_value::<runtime_api::SessionPublicReadAvailability>(
+                    response.clone(),
+                )
+                .unwrap();
+            } else {
+                serde_json::from_value::<runtime_api::SessionPublicSearchAvailability>(
+                    response.clone(),
+                )
+                .unwrap();
+            }
+            let mut reply = HeldRuntimeReply::with_response(None, Some(response));
+            install_remote_fixture(
+                &fixture,
+                "subject-runtime",
+                &format!("http://{}", reply.address),
+                false,
+            );
+            let (subject, worker, context) = session_runtime_subject(&fixture, kind).await;
+            let operation = if kind == "read" {
+                server_api::SubjektivSessionBackendOperation::Read(serde_json::from_value(serde_json::json!({"session_id":"session","segment_id":"segment","entry_ref":"E1","mode":"compact"})).unwrap())
+            } else {
+                server_api::SubjektivSessionBackendOperation::Search(
+                    serde_json::from_value(
+                        serde_json::json!({"session_id":"session","query":"needle"}),
+                    )
+                    .unwrap(),
+                )
+            };
+            let api = fixture.api.clone();
+            let call = tokio::spawn(async move {
+                scoped_subjektiv_session_backend(
+                    State(api),
+                    AxumPath(ScopedWorkspacePath {
+                        workspace_id: WORKSPACE.into(),
+                    }),
+                    context,
+                    Json(server_api::SubjektivSessionBackendRequest { operation }),
+                )
+                .await
+            });
+            observed(reply.entered.take().unwrap()).await.unwrap();
+            match change {
+                "policy" => {
+                    let store = open_subjektiv_store(&fixture.api).unwrap();
+                    let current = store.current_subject_policy(&subject).unwrap().unwrap();
+                    store
+                        .set_subject_permissions(
+                            &subject,
+                            &server_api::authorization::SubjectPermissionsUpdate {
+                                operation_id: "revoke-during-runtime-reply".into(),
+                                expected_change_id: Some(current.change_id),
+                                execution: vec![],
+                                delegation: vec![],
+                            },
+                        )
+                        .unwrap();
+                }
+                "observe" => {
+                    assert!(
+                        fixture
+                            .store
+                            .revoke_worker_control_grant(
+                                WORKSPACE,
+                                "session-observe",
+                                &Utc::now().to_rfc3339()
+                            )
+                            .unwrap()
+                    );
+                }
+                "body" => {
+                    // No live Controller exists in this transport fixture. Use the
+                    // real historical release writer; do not fabricate stop proof.
+                    let lease = fixture
+                        .store
+                        .require_current_worker_singleton_owner(WORKSPACE, &worker)
+                        .unwrap()
+                        .unwrap();
+                    fixture
+                        .api
+                        .config_store
+                        .reserve_subject_release(
+                            WORKSPACE,
+                            &lease,
+                            "disconnected-writer",
+                            "replace-body",
+                        )
+                        .unwrap();
+                    fixture
+                        .api
+                        .config_store
+                        .confirm_subject_release_proof(
+                            WORKSPACE,
+                            &lease,
+                            "disconnected-writer",
+                            "replace-body",
+                            false,
+                        )
+                        .unwrap();
+                    fixture
+                        .api
+                        .config_store
+                        .release_subject_singleton(
+                            WORKSPACE,
+                            &lease,
+                            "disconnected-writer",
+                            "replace-body",
+                        )
+                        .unwrap();
+                }
+                _ => {}
+            }
+            reply.release.take().unwrap().send(()).unwrap();
+            let result = observed(call).await.unwrap();
+            if change == "unchanged" {
+                let Json(response) = result.unwrap();
+                let bytes = serde_json::to_string(&response).unwrap();
+                assert!(bytes.contains("protected needle"), "{kind}: {bytes}");
+            } else {
+                let error = result
+                    .err()
+                    .expect("changed authority must withhold Runtime data");
+                assert!(
+                    matches!(error.error, Error::WorkspacePermissionDenied(_))
+                        || (change == "body"
+                            && matches!(&error.error,
+                            Error::RepositoryConflict(message) if message.starts_with("worker_singleton_fenced:"))),
+                    "{kind}/{change}: {:?}",
+                    error.error
+                );
+            }
+            reply.finish();
+            fixture.host_executor.drain().await.unwrap();
+        }
     }
 }

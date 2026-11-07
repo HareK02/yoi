@@ -54,6 +54,14 @@ fn reject_symlink_ancestors(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+pub(crate) enum DriveAuthority {
+    Managed(feature_storage::FeatureDatabase),
+    // Minimal legacy fixtures are not evidence of production catalog ownership.
+    #[cfg(test)]
+    Fixture(PathBuf),
+}
+
 pub(crate) struct WorkspaceDriveHost {
     registration: crate::RegisteredFeature,
     purged: AtomicBool,
@@ -76,11 +84,19 @@ impl WorkspaceDriveHost {
             drive: Mutex::new(None),
         })
     }
+    pub(crate) fn adopt_legacy_storage(
+        &self,
+        storage: &WorkspaceFeatureStorage,
+        catalog: &crate::SqliteWorkspaceStore,
+    ) -> Result<()> {
+        catalog.adopt_workspace_feature_storage(storage, &self.registration, "drive_state")
+    }
+
     pub(crate) async fn open(
         &self,
         storage: &WorkspaceFeatureStorage,
         root: PathBuf,
-        authority_database: PathBuf,
+        authority_database: DriveAuthority,
     ) -> Result<Drive> {
         let mut cached = self.drive.lock().await;
         if let Some(drive) = cached.as_ref() {
@@ -94,12 +110,20 @@ impl WorkspaceDriveHost {
                 // Domain IMMEDIATE transactions lock the attached server authority
                 // as well as Drive metadata. Deletion reservation and cached-handle
                 // operations therefore serialize with other server DB writes.
-                Drive::open_with_workspace_authority(
-                    &storage,
-                    &registration,
-                    &root,
-                    &authority_database,
-                )
+                match authority_database {
+                    DriveAuthority::Managed(catalog) => {
+                        Drive::open_with_managed_workspace_authority(
+                            &storage,
+                            &registration,
+                            &root,
+                            &catalog,
+                        )
+                    }
+                    #[cfg(test)]
+                    DriveAuthority::Fixture(path) => {
+                        Drive::open_with_workspace_authority(&storage, &registration, &root, &path)
+                    }
+                }
                 .map_err(Error::from)
             })
             .await?;
@@ -111,7 +135,7 @@ impl WorkspaceDriveHost {
         &self,
         storage: &WorkspaceFeatureStorage,
         root: PathBuf,
-        authority_database: PathBuf,
+        authority_database: DriveAuthority,
     ) -> Result<()> {
         if self.purged.load(Ordering::Acquire) {
             return Ok(());
@@ -126,7 +150,7 @@ impl WorkspaceDriveHost {
         &self,
         storage: &WorkspaceFeatureStorage,
         root: PathBuf,
-        authority_database: PathBuf,
+        authority_database: DriveAuthority,
     ) -> Result<()> {
         if self.purged.load(Ordering::Acquire) {
             return Ok(());
@@ -154,11 +178,15 @@ impl WorkspaceDriveHost {
 }
 
 #[cfg(test)]
+#[path = "workspace_drive_catalog_tests.rs"]
+mod catalog_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use workspace_drive::Mutation;
 
-    fn seed_authority(data_root: &Path) -> PathBuf {
+    fn seed_authority(data_root: &Path) -> DriveAuthority {
         let path = data_root.join("server.db");
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -166,7 +194,7 @@ mod tests {
             INSERT INTO workspaces VALUES ('workspace-a', 'active');",
         )
         .unwrap();
-        path
+        DriveAuthority::Fixture(path)
     }
 
     #[test]

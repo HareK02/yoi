@@ -6,9 +6,10 @@
 //! Job state is not stored in Memory or interactive Sessions.
 //!
 //! Identical intent under the same ID returns the current snapshot; changes conflict.
-//! Only known failures can create new attempts through explicit retry. Reopening preserves
-//! Reserved and makes unaccepted Dispatched attempts Unknown. Unknown does not prove no effects;
-//! cancellation does not erase that attempt's uncertainty or serialization fence.
+//! Version cutover fails only old unfinished work and permanently forbids old Job continuation.
+//! Ordinary reopen preserves execution bindings: neither a terminal outcome nor process absence
+//! releases serialization/capacity. Retry requires independent owned shutdown evidence; granted
+//! Jobs also require authoritative domain reconciliation of the original input and operations.
 //!
 //! Results commit before releasing the Internal Worker. Replaying the same result is idempotent;
 //! different results and stale attempts are rejected. Later cancellation/execution failure does
@@ -25,7 +26,23 @@ use thiserror::Error;
 #[path = "job_store/legacy_migrations.rs"]
 mod legacy_migrations;
 
-const SCHEMA_VERSION: i64 = 5;
+#[path = "job_store/recovery.rs"]
+mod recovery;
+
+#[cfg(test)]
+#[path = "job_store/start_rejection_tests.rs"]
+mod start_rejection_tests;
+
+#[path = "job_store/failure.rs"]
+mod failure;
+pub(crate) use failure::SettlementFailures;
+use failure::StoredJobFailures;
+pub use failure::{
+    JobFailureCause, JobFailureObservation, JobFailureObservations, JobFailureVisibility,
+};
+use protocol::background_failure::{BackgroundFailure, StoredFailure};
+
+const SCHEMA_VERSION: i64 = 9;
 
 /// Availability of the immutable input body, independent of execution outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,7 +89,6 @@ pub enum JobState {
     Pending,
     Completed,
     Failed,
-    Unknown,
     Cancelled,
 }
 
@@ -83,7 +99,6 @@ pub enum JobAttemptState {
     Dispatched,
     Completed,
     Failed,
-    Unknown,
     Cancelled,
 }
 
@@ -98,7 +113,6 @@ impl JobAttemptState {
             Self::Dispatched => "dispatched",
             Self::Completed => "completed",
             Self::Failed => "failed",
-            Self::Unknown => "unknown",
             Self::Cancelled => "cancelled",
         }
     }
@@ -117,6 +131,45 @@ pub struct JobSnapshot {
     pub attempt: JobAttempt,
     pub result: Option<Value>,
     pub acknowledged: bool,
+    /// A version cutover is final even when input/checkpoint remains incomplete.
+    pub version_stopped: bool,
+    /// The exact current reservation was rejected before dispatch, by this Host.
+    /// This is not a runner shutdown or cleanup receipt.
+    pub start_rejected_by: Option<String>,
+    /// All historical execution owners, independent of Job outcome/checkpoint.
+    pub executions: Vec<JobExecutionOwnership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobExecutionOwnership {
+    pub attempt_id: String,
+    pub owner_id: String,
+    pub run_id: String,
+    pub writes_revoked: bool,
+    pub cleanup_receipt: Option<String>,
+}
+
+impl JobSnapshot {
+    /// Terminal failure/completion without the attempt's admission binding is not
+    /// an empty set of successfully joined executions. Only an explicit rejection
+    /// saved while Reserved can preclude that binding; it proves no runner cleanup.
+    /// All historical admitted executions still require their own cleanup proof.
+    pub fn executions_released(&self) -> bool {
+        let needs_binding = matches!(
+            self.attempt.state,
+            JobAttemptState::Dispatched | JobAttemptState::Completed | JobAttemptState::Failed
+        );
+        (!needs_binding
+            || (self.attempt.state == JobAttemptState::Failed && self.start_rejected_by.is_some())
+            || self
+                .executions
+                .iter()
+                .any(|execution| execution.attempt_id == self.attempt.attempt_id))
+            && self
+                .executions
+                .iter()
+                .all(|e| e.writes_revoked && e.cleanup_receipt.is_some())
+    }
 }
 
 impl JobSnapshot {
@@ -147,7 +200,6 @@ impl JobSnapshot {
                 JobState::Pending => job::JobState::Pending,
                 JobState::Completed => job::JobState::Completed,
                 JobState::Failed => job::JobState::Failed,
-                JobState::Unknown => job::JobState::Unknown,
                 JobState::Cancelled => job::JobState::Cancelled,
             },
             attempt_state: match self.attempt.state {
@@ -155,19 +207,29 @@ impl JobSnapshot {
                 JobAttemptState::Dispatched => job::JobAttemptState::Dispatched,
                 JobAttemptState::Completed => job::JobAttemptState::Completed,
                 JobAttemptState::Failed => job::JobAttemptState::Failed,
-                JobAttemptState::Unknown => job::JobAttemptState::Unknown,
                 JobAttemptState::Cancelled => job::JobAttemptState::Cancelled,
             },
             result: self.result.clone(),
-            failure_category: self.attempt.failure.as_ref().map(|_| {
-                match self.attempt.state {
-                    JobAttemptState::Cancelled => "cancelled",
-                    JobAttemptState::Unknown => "unknown_outcome",
-                    _ => "execution_failed",
-                }
-                .to_string()
-            }),
-            failure_detail: self.attempt.failure.clone(),
+            failure_category: self
+                .attempt
+                .failure
+                .as_ref()
+                .filter(|_| matches!(self.state, JobState::Failed | JobState::Cancelled))
+                .map(|_| {
+                    match self.attempt.state {
+                        JobAttemptState::Cancelled => "cancelled",
+                        _ => "execution_failed",
+                    }
+                    .to_string()
+                }),
+            // Legacy prose is retained for the owner, never endorsed or redisclosed.
+            // Typed consumers use JobAttempt::failure_observations with current visibility.
+            failure_detail: self
+                .attempt
+                .failure
+                .as_ref()
+                .filter(|_| matches!(self.state, JobState::Failed | JobState::Cancelled))
+                .map(|_| "Failure details unavailable.".into()),
         }
     }
 }
@@ -177,7 +239,28 @@ pub struct JobAttempt {
     pub attempt_id: String,
     pub number: u8,
     pub state: JobAttemptState,
+    /// Owner-local legacy diagnostics. Untrusted text is not a query attachment.
+    #[serde(skip)]
     pub failure: Option<String>,
+    #[serde(skip)]
+    failures: StoredJobFailures,
+}
+
+impl JobAttempt {
+    /// Reproject stored facts using the query boundary's current authorization.
+    pub fn failure_observations<A: error_contract::Audience>(
+        &self,
+        current: &JobFailureVisibility,
+    ) -> JobFailureObservations<A>
+    where
+        JobFailureCause: error_contract::ProjectFor<
+                A,
+                Authorization = JobFailureVisibility,
+                Details = JobFailureCause,
+            >,
+    {
+        self.failures.project(current)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -192,6 +275,8 @@ pub enum JobStoreError {
     Job(#[from] job::JobError),
     #[error("Job directory: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Job failure contract: {0}")]
+    FailureContract(#[from] error_contract::ContractError),
     #[error("unsupported Job schema version {0}")]
     UnsupportedSchema(i64),
     #[error("corrupt Job database: {0}")]
@@ -216,6 +301,7 @@ pub enum JobStoreError {
 
 pub(crate) struct JobStore {
     conn: Connection,
+    owner_id: String,
 }
 
 impl JobStore {
@@ -239,61 +325,12 @@ impl JobStore {
         }
         let mut conn = Connection::open(path)?;
         feature_storage::configure_connection(&conn)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            0 => {
-                tx.execute_batch(SCHEMA)?;
-                tx.execute_batch(GRANT_SCHEMA)?;
-                tx.execute_batch(RECONCILIATION_SCHEMA)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            1 | 2 => {
-                if version == 1 {
-                    tx.execute_batch(GRANT_SCHEMA)?;
-                }
-                legacy_migrations::migrate_legacy_jobs(&tx)?;
-                tx.execute_batch(RECONCILIATION_SCHEMA)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            3 => {
-                tx.execute_batch(RECONCILIATION_SCHEMA)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            4 | SCHEMA_VERSION => {}
-            other => return Err(JobStoreError::UnsupportedSchema(other)),
-        }
-        if version < 5 {
-            tx.execute_batch(INPUT_RETENTION_SCHEMA)?;
-            let has_legacy_archive: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='legacy_job_archive')", [], |r| r.get(0))?;
-            if has_legacy_archive {
-                tx.execute_batch("DROP TRIGGER legacy_job_archive_immutable;
-                    CREATE TRIGGER legacy_job_archive_immutable BEFORE UPDATE OF job_id,fingerprint,attempts_json ON legacy_job_archive
-                    BEGIN SELECT RAISE(ABORT, 'immutable legacy Job archive'); END;
-                    CREATE TRIGGER legacy_job_archive_input_retirement BEFORE UPDATE OF request_json ON legacy_job_archive
-                    WHEN NOT EXISTS (SELECT 1 FROM job_intents WHERE job_id=OLD.job_id AND input_disposition<>'available')
-                      OR (json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input') AND json_type(NEW.request_json,'$.input')='null') IS NOT TRUE
-                    BEGIN SELECT RAISE(ABORT, 'immutable legacy Job input'); END;")?;
-            }
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
-        // An accepted result is the only evidence of success. Reserved attempts
-        // were never started and remain pending; cancelled attempts never resume.
-        tx.execute_batch(
-            "UPDATE job_attempts SET state = 'completed', failure = NULL
-               WHERE state = 'dispatched' AND result_json IS NOT NULL;
-             UPDATE job_attempts SET state = 'unknown',
-                 failure = 'Host interrupted before an accepted result'
-               WHERE state = 'dispatched' AND result_json IS NULL;
-             UPDATE job_intents SET state = (
-                 SELECT state FROM job_attempts
-                 WHERE job_id = job_intents.job_id AND number = current_attempt)
-               WHERE state = 'pending' AND EXISTS (
-                 SELECT 1 FROM job_attempts WHERE job_id = job_intents.job_id
-                 AND number = current_attempt AND state IN ('completed', 'unknown'));",
-        )?;
-        tx.commit()?;
-        Ok(Self { conn })
+        recovery::initialize(&mut conn)?;
+        // Opening never infers shutdown from a missing task or a process exit.
+        Ok(Self {
+            conn,
+            owner_id: uuid::Uuid::now_v7().to_string(),
+        })
     }
 
     pub(crate) fn reserve(&mut self, request: JobRequest) -> Result<JobSnapshot, JobStoreError> {
@@ -351,9 +388,9 @@ impl JobStore {
         Ok(snapshot)
     }
 
-    /// Domain Host attests that this fenced attempt's only effects are reconciled in its
-    /// authoritative durable consumer. This releases serialization, not the original Unknown
-    /// history, and cannot authorize retry or change its result. The service checks cleanup.
+    /// Domain Host attests that this fenced attempt's effects are reconciled in its
+    /// authoritative durable consumer. Preserve the original attempt/cause; this receipt
+    /// neither proves execution shutdown nor permits an old-version Job to continue.
     pub(crate) fn reconcile_granted_attempt(
         &mut self,
         job_id: &str,
@@ -373,12 +410,24 @@ impl JobStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot = require_snapshot(&tx, job_id)?;
         check_attempt(&snapshot, attempt_id)?;
-        if snapshot.domain_grant.is_none()
-            || snapshot.attempt.state != JobAttemptState::Unknown
-            || !matches!(snapshot.state, JobState::Unknown | JobState::Cancelled)
+        if snapshot.version_stopped || snapshot.input_disposition != JobInputDisposition::Available
         {
             return Err(JobStoreError::InvalidTransition(
-                "domain reconciliation requires a fenced unknown granted attempt",
+                "stopped or retired input forbids domain reconciliation",
+            ));
+        }
+        snapshot.load_executable_request()?;
+        if snapshot.domain_grant.is_none()
+            || snapshot.attempt.state != JobAttemptState::Failed
+            || !matches!(snapshot.state, JobState::Failed | JobState::Cancelled)
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "domain reconciliation requires a failed granted attempt",
+            ));
+        }
+        if !snapshot.executions_released() {
+            return Err(JobStoreError::InvalidTransition(
+                "execution cleanup is not proven",
             ));
         }
         let old: Option<String> = tx.query_row("SELECT domain_receipt FROM job_domain_reconciliations WHERE job_id=?1 AND attempt_id=?2",
@@ -394,14 +443,24 @@ impl JobStore {
         Ok(())
     }
 
-    /// Only definitive failure can create a new immutable attempt. Unknown
-    /// outcomes require caller reconciliation, never an automatic replay.
+    /// Only result-only work with independent shutdown proof can use generic retry.
+    /// Side-effecting domain work must reconcile its authoritative operation receipts.
     pub(crate) fn retry(&mut self, job_id: &str) -> Result<JobSnapshot, JobStoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous = require_snapshot(&tx, job_id)?;
         previous.load_executable_request()?;
+        if previous.version_stopped || !previous.executions_released() {
+            return Err(JobStoreError::InvalidTransition(
+                "version stop or unreleased execution forbids retry",
+            ));
+        }
+        if previous.domain_grant.is_some() {
+            return Err(JobStoreError::InvalidTransition(
+                "domain Jobs require same-Job reconciliation, not generic retry",
+            ));
+        }
         if previous.state != JobState::Failed || previous.attempt.state != JobAttemptState::Failed {
             return Err(JobStoreError::InvalidTransition(
                 "retry requires known failure",
@@ -463,7 +522,8 @@ impl JobStore {
             return Ok(snapshot);
         }
         if reason == JobInputRetirementReason::Completed
-            && (snapshot.state != JobState::Completed
+            && (!snapshot.executions_released()
+                || snapshot.state != JobState::Completed
                 || snapshot.attempt.state != JobAttemptState::Completed
                 || snapshot.result.is_none())
         {
@@ -497,6 +557,165 @@ impl JobStore {
         Ok(snapshot)
     }
 
+    /// Settlement belongs to the current attempt and the exact Host connection
+    /// that dispatched it. Reopen/map absence cannot transfer that authority.
+    pub(crate) fn check_execution_binding(
+        &self,
+        job_id: &str,
+        attempt_id: &str,
+        input_digest: &str,
+        execution: &JobExecutionOwnership,
+    ) -> Result<(), JobStoreError> {
+        let saved = self.get(job_id)?;
+        check_attempt(&saved, attempt_id)?;
+        if saved.input_digest != input_digest {
+            return Err(JobStoreError::DigestMismatch);
+        }
+        if saved.version_stopped
+            || execution.attempt_id != attempt_id
+            || execution.owner_id != self.owner_id
+            || !saved.executions.iter().any(|bound| {
+                bound.attempt_id == attempt_id
+                    && bound.owner_id == execution.owner_id
+                    && bound.run_id == execution.run_id
+            })
+        {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        Ok(())
+    }
+
+    /// Only a bound runner proof can discharge ownership. Terminal state, process
+    /// absence, or a successful result do not call this method implicitly.
+    pub(crate) fn confirm_execution_cleanup(
+        &mut self,
+        job_id: &str,
+        execution: &JobExecutionOwnership,
+        receipt: &str,
+    ) -> Result<(), JobStoreError> {
+        if execution.owner_id != self.owner_id
+            || receipt.is_empty()
+            || receipt.len() > 256
+            || receipt.chars().any(char::is_control)
+        {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        let changed = self.conn.execute("UPDATE job_execution_ownership SET writes_revoked=1,cleanup_receipt=?5 WHERE job_id=?1 AND attempt_id=?2 AND owner_id=?3 AND run_id=?4",
+            params![job_id,execution.attempt_id,execution.owner_id,execution.run_id,receipt])?;
+        if changed != 1 {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execution_obligations(
+        &self,
+    ) -> Result<Vec<JobExecutionOwnership>, JobStoreError> {
+        // A failed/dispatched row without its admission binding cannot disappear
+        // from the shutdown barrier merely because there is no ownership row.
+        let missing: Option<String> = self.conn.query_row(
+            "SELECT a.attempt_id FROM job_intents i JOIN job_attempts a
+             ON a.job_id=i.job_id AND a.number=i.current_attempt
+             WHERE a.state IN ('dispatched','failed','completed')
+               AND NOT EXISTS(SELECT 1 FROM job_execution_ownership e WHERE e.attempt_id=a.attempt_id)
+               AND NOT EXISTS(SELECT 1 FROM job_version_stops s WHERE s.job_id=i.job_id)
+               AND NOT (a.state='failed' AND EXISTS(SELECT 1 FROM job_start_rejections r WHERE r.job_id=i.job_id AND r.attempt_id=a.attempt_id))
+             LIMIT 1", [], |row|row.get(0)).optional()?;
+        if let Some(attempt) = missing {
+            return Err(JobStoreError::Corrupt(format!(
+                "execution admission/cleanup evidence missing for attempt {attempt}"
+            )));
+        }
+        let mut stmt = self.conn.prepare("SELECT attempt_id,owner_id,run_id,writes_revoked,cleanup_receipt FROM job_execution_ownership WHERE cleanup_receipt IS NULL OR writes_revoked=0 ORDER BY rowid")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(JobExecutionOwnership {
+                    attempt_id: r.get(0)?,
+                    owner_id: r.get(1)?,
+                    run_id: r.get(2)?,
+                    writes_revoked: r.get(3)?,
+                    cleanup_receipt: r.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Same immutable Journal input, bounded new attempt, never a replacement Job.
+    /// The caller has reconciled/closed the old generation's saved operations.
+    pub(crate) fn resume_granted(
+        &mut self,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<JobSnapshot, JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = require_snapshot(&tx, job_id)?;
+        check_attempt(&saved, attempt_id)?;
+        saved.load_executable_request()?;
+        let reconciled: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM job_domain_reconciliations WHERE job_id=?1 AND attempt_id=?2)", params![job_id,attempt_id], |row|row.get(0))?;
+        if saved.version_stopped
+            || saved.domain_grant.is_none()
+            || !saved.executions_released()
+            || !reconciled
+            || saved.state != JobState::Failed
+            || saved.attempt.state != JobAttemptState::Failed
+            || saved.attempt.number >= saved.request.limits.max_attempts
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "same-Job recovery requires reconciled execution and available attempt budget",
+            ));
+        }
+        let next = saved.attempt.number + 1;
+        insert_attempt(&tx, &saved.request, next)?;
+        tx.execute(
+            "UPDATE job_intents SET state='pending',current_attempt=?2 WHERE job_id=?1",
+            params![job_id, next],
+        )?;
+        let snapshot = require_snapshot(&tx, job_id)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    /// A domain's saved complete checkpoint may settle the current interrupted
+    /// attempt without invoking the model or claiming that execution has ended.
+    pub(crate) fn accept_reconciled(
+        &mut self,
+        submission: &JobResultSubmission,
+    ) -> Result<JobSnapshot, JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = require_snapshot(&tx, &submission.job_id)?;
+        check_attempt(&saved, &submission.attempt_id)?;
+        if saved.version_stopped
+            || saved.domain_grant.is_none()
+            || saved.state == JobState::Cancelled
+        {
+            return Err(JobStoreError::InvalidTransition(
+                "domain completion is unavailable for this Job",
+            ));
+        }
+        if saved.input_digest != submission.input_digest {
+            return Err(JobStoreError::DigestMismatch);
+        }
+        if saved.state == JobState::Completed {
+            drop(tx);
+            return self.accept(submission);
+        }
+        saved.load_executable_request()?;
+        let (digest, encoded) =
+            job::result_digest(&submission.result, saved.request.limits.max_result_bytes)?;
+        tx.execute("UPDATE job_attempts SET state='completed',result_json=?3,result_digest=?4 WHERE job_id=?1 AND attempt_id=?2",params![submission.job_id,submission.attempt_id,encoded,digest])?;
+        tx.execute(
+            "UPDATE job_intents SET state='completed' WHERE job_id=?1",
+            [&submission.job_id],
+        )?;
+        let snapshot = require_snapshot(&tx, &submission.job_id)?;
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
     pub(crate) fn get(&self, job_id: &str) -> Result<JobSnapshot, JobStoreError> {
         require_snapshot(&self.conn, job_id)
     }
@@ -511,8 +730,8 @@ impl JobStore {
             .collect()
     }
 
-    pub(crate) fn unknown_granted(&self) -> Result<Vec<JobSnapshot>, JobStoreError> {
-        let mut statement = self.conn.prepare("SELECT i.job_id FROM job_intents i JOIN job_attempts a ON a.job_id=i.job_id AND a.number=i.current_attempt JOIN job_domain_grants g ON g.job_id=i.job_id WHERE a.state='unknown' AND NOT EXISTS (SELECT 1 FROM job_domain_reconciliations r WHERE r.job_id=a.job_id AND r.attempt_id=a.attempt_id) ORDER BY i.rowid")?;
+    pub(crate) fn unreleased_granted(&self) -> Result<Vec<JobSnapshot>, JobStoreError> {
+        let mut statement = self.conn.prepare("SELECT i.job_id FROM job_intents i JOIN job_attempts a ON a.job_id=i.job_id AND a.number=i.current_attempt JOIN job_domain_grants g ON g.job_id=i.job_id WHERE (EXISTS(SELECT 1 FROM job_execution_ownership e WHERE e.job_id=i.job_id AND e.cleanup_receipt IS NULL) OR (a.state='failed' AND NOT EXISTS (SELECT 1 FROM job_domain_reconciliations r WHERE r.job_id=a.job_id AND r.attempt_id=a.attempt_id))) ORDER BY i.rowid")?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -526,7 +745,7 @@ impl JobStore {
         let mut statement = self.conn.prepare(
             "SELECT i.job_id FROM job_intents i JOIN job_attempts a
              ON a.job_id = i.job_id AND a.number = i.current_attempt
-             WHERE i.state = 'pending' AND i.input_disposition='available' AND a.state = 'reserved' ORDER BY i.rowid",
+             WHERE i.state = 'pending' AND NOT EXISTS (SELECT 1 FROM job_version_stops s WHERE s.job_id=i.job_id) AND i.input_disposition='available' AND a.state = 'reserved' ORDER BY i.rowid",
         )?;
         let ids = statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -550,7 +769,9 @@ impl JobStore {
         let snapshot = require_snapshot(&tx, job_id)?;
         check_attempt(&snapshot, attempt_id)?;
         snapshot.load_executable_request()?;
-        if snapshot.state != JobState::Pending
+        if snapshot.version_stopped
+            || !snapshot.executions_released()
+            || snapshot.state != JobState::Pending
             || snapshot.attempt.state != JobAttemptState::Reserved
         {
             return Err(JobStoreError::InvalidTransition(
@@ -559,9 +780,9 @@ impl JobStore {
         }
         check_serialization(&tx, snapshot.request.serialization_key.as_deref(), job_id)?;
         let (active, active_limit): (i64, Option<u16>) = tx.query_row(
-            "SELECT COUNT(*), MIN(i.max_concurrent) FROM job_attempts a JOIN job_intents i
-             ON i.job_id = a.job_id AND i.current_attempt = a.number
-             WHERE a.state = 'dispatched'",
+            "SELECT COUNT(*), MIN(i.max_concurrent) FROM job_execution_ownership e JOIN job_intents i
+             ON i.job_id = e.job_id
+             WHERE e.writes_revoked=0 OR e.cleanup_receipt IS NULL",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -577,6 +798,8 @@ impl JobStore {
             "UPDATE job_attempts SET state = 'dispatched' WHERE job_id = ?1 AND attempt_id = ?2",
             params![job_id, attempt_id],
         )?;
+        tx.execute("INSERT INTO job_execution_ownership(job_id,attempt_id,owner_id,run_id) VALUES(?1,?2,?3,?4)",
+            params![job_id,attempt_id,self.owner_id,worker::job::execution_run_id(&snapshot.request, attempt_id)?.to_string()])?;
         let snapshot = require_snapshot(&tx, job_id)?;
         tx.commit()?;
         Ok(snapshot)
@@ -613,9 +836,14 @@ impl JobStore {
         snapshot.load_executable_request()?;
         if snapshot.state != JobState::Pending
             || snapshot.attempt.state != JobAttemptState::Dispatched
+            || !snapshot.executions.iter().any(|execution| {
+                execution.attempt_id == bound.attempt_id
+                    && execution.owner_id == self.owner_id
+                    && !execution.writes_revoked
+            })
         {
             return Err(JobStoreError::InvalidTransition(
-                "result requires the active dispatched attempt",
+                "result requires the active dispatched attempt owned by this Host",
             ));
         }
         tx.execute(
@@ -630,6 +858,78 @@ impl JobStore {
         let snapshot = require_snapshot(&tx, &bound.job_id)?;
         tx.commit()?;
         Ok(snapshot)
+    }
+
+    /// Persist attempt evidence with its terminal transition. Exact settlement retries
+    /// retain first observations; accepted results and cleanup ownership are independent.
+    pub(crate) fn record_settlement_failures(
+        &mut self,
+        job_id: &str,
+        attempt_id: &str,
+        failures: SettlementFailures,
+    ) -> Result<(), JobStoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let saved = require_snapshot(&tx, job_id)?;
+        check_attempt(&saved, attempt_id)?;
+        if saved.version_stopped
+            || !saved
+                .executions
+                .iter()
+                .any(|bound| bound.attempt_id == attempt_id && bound.owner_id == self.owner_id)
+        {
+            return Err(JobStoreError::AttemptMismatch);
+        }
+        let completed = saved.state == JobState::Completed;
+        let primary = (!completed).then_some(failures.primary).flatten();
+        let post_result = completed.then_some(failures.post_result).flatten();
+        let encode =
+            |cause: Option<JobFailureCause>| cause.map(JobFailureCause::attachment).transpose();
+        let primary_attachment = encode(primary)?;
+        let post_attachment = encode(post_result)?;
+        let receipt_attachment = encode(failures.result_receipt)?;
+        let cleanup_attachment = encode(failures.cleanup)?;
+        if saved.state == JobState::Pending {
+            let cause = primary
+                .or(failures.result_receipt)
+                .unwrap_or(JobFailureCause::MissingResult);
+            let detail = match cause {
+                // Preserve the existing owner-local stop diagnostic, not its classification.
+                JobFailureCause::DeadlineExceeded => "timeout",
+                JobFailureCause::HostStopped => "Host cancellation/shutdown",
+                _ => cause.explanation(),
+            };
+            set_terminal(&tx, &saved, JobAttemptState::Failed, Some(detail))?;
+        }
+        // Nullable additions allow historical rows with no typed facts. Never infer
+        // a cause from those rows' prose or overwrite unknown retained evidence.
+        tx.execute(
+            "UPDATE job_attempts SET
+                primary_failure_json=COALESCE(primary_failure_json,?3),
+                post_result_failure_json=COALESCE(post_result_failure_json,?4),
+                result_receipt_failure_json=COALESCE(result_receipt_failure_json,?5),
+                cleanup_failure_json=COALESCE(cleanup_failure_json,?6)
+             WHERE job_id=?1 AND attempt_id=?2",
+            params![
+                job_id,
+                attempt_id,
+                primary_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str),
+                post_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str),
+                receipt_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str),
+                cleanup_attachment
+                    .as_ref()
+                    .map(BackgroundFailure::as_storage_str)
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub(crate) fn finish(
@@ -670,20 +970,17 @@ impl JobStore {
         Ok(snapshot)
     }
 
-    /// Cancellation is durable. Cancelling unknown intent must not erase the
-    /// attempt's uncertain execution evidence or release its serialization fence.
-    /// A previously accepted result wins and remains success.
+    /// Cancellation preserves execution ownership and the serialization fence until
+    /// independent cleanup proof exists. A previously accepted result remains success.
     pub(crate) fn cancel(&mut self, job_id: &str) -> Result<JobSnapshot, JobStoreError> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let snapshot = require_snapshot(&tx, job_id)?;
-        if snapshot.state == JobState::Unknown {
-            tx.execute(
-                "UPDATE job_intents SET state = 'cancelled' WHERE job_id = ?1",
-                [job_id],
-            )?;
-        } else if !matches!(snapshot.state, JobState::Completed | JobState::Cancelled) {
+        if !matches!(
+            snapshot.state,
+            JobState::Completed | JobState::Cancelled | JobState::Failed
+        ) {
             set_terminal(
                 &tx,
                 &snapshot,
@@ -732,9 +1029,11 @@ fn check_serialization(
         let conflicting: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM job_intents i WHERE serialization_key = ?1
              AND job_id <> ?2 AND (state = 'pending' OR EXISTS
-                 (SELECT 1 FROM job_attempts a WHERE a.job_id = i.job_id AND a.state = 'unknown'
-                  AND NOT EXISTS (SELECT 1 FROM job_domain_reconciliations r
-                    WHERE r.job_id=a.job_id AND r.attempt_id=a.attempt_id))))",
+                 (SELECT 1 FROM job_execution_ownership e WHERE e.job_id=i.job_id
+                    AND (e.writes_revoked=0 OR e.cleanup_receipt IS NULL))
+                 OR (state='failed' AND EXISTS(SELECT 1 FROM job_domain_grants g WHERE g.job_id=i.job_id)
+                     AND NOT EXISTS(SELECT 1 FROM job_domain_reconciliations r JOIN job_attempts a ON a.attempt_id=r.attempt_id
+                                    WHERE r.job_id=i.job_id AND a.number=i.current_attempt))))",
             params![key, job_id],
             |row| row.get(0),
         )?;
@@ -790,6 +1089,31 @@ fn require_snapshot(conn: &Connection, job_id: &str) -> Result<JobSnapshot, JobS
     read_snapshot(conn, job_id)?.ok_or_else(|| JobStoreError::NotFound(job_id.to_owned()))
 }
 
+fn read_attempt_failures(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<StoredJobFailures, JobStoreError> {
+    // The reader can precede the additive writer/schema rollout. A genuine
+    // storage error or partially installed schema must not become absent facts.
+    let has_attachments: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('job_attempts') WHERE name='primary_failure_json')",
+        [], |row| row.get(0),
+    )?;
+    if !has_attachments {
+        return Ok(StoredJobFailures::default());
+    }
+    Ok(conn.query_row(
+        "SELECT primary_failure_json, post_result_failure_json, result_receipt_failure_json, cleanup_failure_json FROM job_attempts WHERE attempt_id=?1",
+        [attempt_id],
+        |r| Ok(StoredJobFailures {
+            primary: r.get::<_, Option<String>>(0)?.map(StoredFailure::from_storage),
+            post_result: r.get::<_, Option<String>>(1)?.map(StoredFailure::from_storage),
+            result_receipt: r.get::<_, Option<String>>(2)?.map(StoredFailure::from_storage),
+            cleanup: r.get::<_, Option<String>>(3)?.map(StoredFailure::from_storage),
+        }),
+    )?)
+}
+
 fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>, JobStoreError> {
     let row = conn
         .query_row(
@@ -832,7 +1156,6 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
                 "pending" => JobState::Pending,
                 "completed" => JobState::Completed,
                 "failed" => JobState::Failed,
-                "unknown" => JobState::Unknown,
                 "cancelled" => JobState::Cancelled,
                 _ => {
                     return Err(JobStoreError::Corrupt(format!(
@@ -845,7 +1168,6 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
                 "dispatched" => JobAttemptState::Dispatched,
                 "completed" => JobAttemptState::Completed,
                 "failed" => JobAttemptState::Failed,
-                "unknown" => JobAttemptState::Unknown,
                 "cancelled" => JobAttemptState::Cancelled,
                 _ => {
                     return Err(JobStoreError::Corrupt(format!(
@@ -875,7 +1197,14 @@ fn read_snapshot(conn: &Connection, job_id: &str) -> Result<Option<JobSnapshot>,
                     .transpose()?,
                 state,
                 acknowledged,
+                version_stopped: conn.query_row("SELECT EXISTS(SELECT 1 FROM job_version_stops WHERE job_id=?1)", [job_id], |r|r.get(0))?,
+                start_rejected_by: conn.query_row("SELECT owner_id FROM job_start_rejections WHERE job_id=?1 AND attempt_id=?2", params![job_id,attempt_id], |r|r.get(0)).optional()?,
+                executions: {
+                    let mut stmt = conn.prepare("SELECT attempt_id,owner_id,run_id,writes_revoked,cleanup_receipt FROM job_execution_ownership WHERE job_id=?1 ORDER BY rowid")?;
+                    stmt.query_map([job_id], |r| Ok(JobExecutionOwnership { attempt_id:r.get(0)?,owner_id:r.get(1)?,run_id:r.get(2)?,writes_revoked:r.get(3)?,cleanup_receipt:r.get(4)? }))?.collect::<Result<Vec<_>,_>>()?
+                },
                 attempt: JobAttempt {
+                    failures: read_attempt_failures(conn, &attempt_id)?,
                     attempt_id,
                     number,
                     state: attempt_state,
@@ -953,8 +1282,10 @@ CREATE TABLE job_intents (
     fingerprint TEXT NOT NULL,
     serialization_key TEXT,
     max_concurrent INTEGER NOT NULL CHECK (max_concurrent BETWEEN 1 AND 65535),
-    state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown', 'cancelled')),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'cancelled')),
     current_attempt INTEGER NOT NULL CHECK (current_attempt BETWEEN 1 AND 255),
+    input_disposition TEXT NOT NULL DEFAULT 'available'
+        CHECK (input_disposition IN ('available','reclaimed','erased','invalidated')),
     acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
     CHECK (acknowledged = 0 OR state = 'completed'),
     FOREIGN KEY (job_id, current_attempt) REFERENCES job_attempts(job_id, number)
@@ -965,7 +1296,7 @@ CREATE TABLE job_attempts (
     number INTEGER NOT NULL CHECK (number BETWEEN 1 AND 255),
     attempt_id TEXT NOT NULL UNIQUE,
     input_digest TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'unknown', 'cancelled')),
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'cancelled')),
     result_json TEXT,
     result_digest TEXT,
     failure TEXT,
@@ -974,10 +1305,10 @@ CREATE TABLE job_attempts (
     CHECK (state <> 'completed' OR result_json IS NOT NULL)
 );
 CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key)
-    WHERE serialization_key IS NOT NULL AND state IN ('pending', 'unknown');
+    WHERE serialization_key IS NOT NULL AND state = 'pending';
 CREATE INDEX job_attempt_state ON job_attempts(state);
 CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF
-    job_id, request_json, fingerprint, serialization_key, max_concurrent ON job_intents
+    job_id, fingerprint, serialization_key, max_concurrent ON job_intents
 BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
 CREATE TRIGGER job_attempt_immutable BEFORE UPDATE OF
     job_id, number, attempt_id, input_digest ON job_attempts
@@ -986,6 +1317,14 @@ CREATE TRIGGER job_result_immutable BEFORE UPDATE OF result_json, result_digest 
 WHEN OLD.result_json IS NOT NULL AND
     (NEW.result_json IS NOT OLD.result_json OR NEW.result_digest IS NOT OLD.result_digest)
 BEGIN SELECT RAISE(ABORT, 'immutable accepted Job result'); END;
+CREATE TRIGGER job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON job_intents
+WHEN (
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
+      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
+    AND json_type(NEW.request_json,'$.input') = 'null'
+) IS NOT TRUE
+BEGIN SELECT RAISE(ABORT, 'immutable Job input retirement'); END;
 ";
 
 #[cfg(test)]
@@ -996,7 +1335,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
-    fn request(id: &str) -> JobRequest {
+    pub(super) fn request(id: &str) -> JobRequest {
         JobRequest {
             job_id: id.into(),
             purpose: "fixture".into(),
@@ -1007,6 +1346,252 @@ mod tests {
             serialization_key: None,
             limits: JobLimits::default(),
         }
+    }
+
+    #[test]
+    fn failure_reader_reprojects_and_quarantines_legacy_unknown_and_corrupt_bytes() {
+        let (dir, mut store) = fixture();
+        let saved = dispatched(&mut store, request("failure-reader"));
+        store
+            .finish(
+                "failure-reader",
+                &saved.attempt.attempt_id,
+                JobAttemptState::Failed,
+                Some("TEST_ONLY_SECRET /private/legacy/path"),
+            )
+            .unwrap();
+        let known = JobFailureCause::Worker.attachment().unwrap();
+        let forged_explanation = known.as_storage_str().replace(
+            JobFailureCause::Worker.explanation(),
+            "TEST_ONLY_SECRET /private/retained/path",
+        );
+        let future = known
+            .as_storage_str()
+            .replace("\"version\":1", "\"version\":999");
+        store
+            .conn
+            .execute(
+                "UPDATE job_attempts SET primary_failure_json=?1,post_result_failure_json=?2,
+            result_receipt_failure_json=?3 WHERE attempt_id=?4",
+                params![
+                    forged_explanation,
+                    future,
+                    "{ TEST_ONLY_SECRET /private/corrupt",
+                    saved.attempt.attempt_id
+                ],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        let saved = reopened.get("failure-reader").unwrap();
+        let observed =
+            saved
+                .attempt
+                .failure_observations::<error_contract::Tool>(&JobFailureVisibility {
+                    can_view_cause: true,
+                });
+        let JobFailureObservation::Known(projected) = observed.primary else {
+            panic!("known cause lost")
+        };
+        assert_eq!(*projected.details(), JobFailureCause::Worker);
+        assert_eq!(
+            projected.explanation(),
+            JobFailureCause::Worker.explanation()
+        );
+        let encoded = error_contract::encode_projected_failure(
+            &projected,
+            error_contract::Budget::new(8192, 8192),
+        )
+        .unwrap();
+        let encoded = std::str::from_utf8(encoded.as_bytes()).unwrap();
+        assert!(!encoded.contains("TEST_ONLY_SECRET"));
+        assert!(!encoded.contains("/private/"));
+        assert!(matches!(
+            observed.post_result,
+            JobFailureObservation::Unsupported
+        ));
+        assert!(matches!(
+            observed.result_receipt,
+            JobFailureObservation::Corrupt
+        ));
+        assert!(matches!(
+            observed.cleanup,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        let hidden =
+            saved
+                .attempt
+                .failure_observations::<error_contract::Tool>(&JobFailureVisibility {
+                    can_view_cause: false,
+                });
+        assert!(matches!(hidden.primary, JobFailureObservation::NotVisible));
+        assert!(matches!(
+            hidden.post_result,
+            JobFailureObservation::NotVisible
+        ));
+        assert!(matches!(
+            hidden.result_receipt,
+            JobFailureObservation::NotVisible
+        ));
+        for json in [
+            serde_json::to_string(&saved).unwrap(),
+            serde_json::to_string(&saved.outcome()).unwrap(),
+        ] {
+            assert!(!json.contains("TEST_ONLY_SECRET"));
+            assert!(!json.contains("/private/"));
+            assert!(!json.contains("primary_failure_json"));
+        }
+        assert!(
+            saved
+                .attempt
+                .failure
+                .as_ref()
+                .unwrap()
+                .contains("TEST_ONLY_SECRET"),
+            "legacy bytes remain owner-local, not reclassified"
+        );
+        assert!(!saved.executions_released());
+    }
+
+    #[test]
+    fn failure_attachment_and_terminal_state_commit_together_or_not_at_all() {
+        let (dir, mut store) = fixture();
+        let saved = dispatched(&mut store, request("atomic-failure"));
+        store.conn.execute_batch("CREATE TRIGGER fail_attachment BEFORE UPDATE OF primary_failure_json ON job_attempts
+            BEGIN SELECT RAISE(ABORT,'injected attachment failure'); END;").unwrap();
+        let failures = || SettlementFailures {
+            primary: Some(JobFailureCause::Worker),
+            cleanup: Some(JobFailureCause::CleanupUnconfirmed),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .record_settlement_failures("atomic-failure", &saved.attempt.attempt_id, failures())
+                .is_err()
+        );
+        assert_eq!(store.get("atomic-failure").unwrap(), saved);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("atomic-failure").unwrap(), saved);
+        drop(reopened);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_attachment")
+            .unwrap();
+        store
+            .record_settlement_failures("atomic-failure", &saved.attempt.attempt_id, failures())
+            .unwrap();
+        let failed = store.get("atomic-failure").unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert!(!failed.executions_released());
+        store
+            .record_settlement_failures("atomic-failure", &saved.attempt.attempt_id, failures())
+            .unwrap();
+        assert_eq!(
+            store.get("atomic-failure").unwrap(),
+            failed,
+            "same settlement is idempotent"
+        );
+        drop(store);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("atomic-failure").unwrap(), failed);
+    }
+
+    #[test]
+    fn v9_failure_migration_is_additive_atomic_reader_first_and_does_not_cut_over_jobs() {
+        let (dir, mut store) = fixture();
+        let pending = store.reserve(request("legacy-pending")).unwrap();
+        let running = dispatched(&mut store, request("legacy-running"));
+        let failed = store
+            .finish(
+                "legacy-running",
+                &running.attempt.attempt_id,
+                JobAttemptState::Failed,
+                Some("old explanation says timeout; not typed evidence"),
+            )
+            .unwrap();
+        let complete = dispatched(&mut store, request("legacy-complete"));
+        let complete = store
+            .accept(&JobResultSubmission {
+                job_id: "legacy-complete".into(),
+                attempt_id: complete.attempt.attempt_id.clone(),
+                input_digest: complete.input_digest.clone(),
+                result: json!({"saved":true}),
+            })
+            .unwrap();
+        // Reconstruct the actual v8 schema, with unchanged legacy rows and receipts.
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE job_attempts DROP COLUMN primary_failure_json;
+            ALTER TABLE job_attempts DROP COLUMN post_result_failure_json;
+            ALTER TABLE job_attempts DROP COLUMN result_receipt_failure_json;
+            ALTER TABLE job_attempts DROP COLUMN cleanup_failure_json;
+            PRAGMA user_version=8;",
+            )
+            .unwrap();
+        let before = require_snapshot(&store.conn, "legacy-running").unwrap();
+        assert_eq!(before, failed);
+        assert!(matches!(
+            before
+                .attempt
+                .failure_observations::<error_contract::Tool>(&JobFailureVisibility {
+                    can_view_cause: true
+                })
+                .primary,
+            JobFailureObservation::LegacyWithoutFacts
+        ));
+        // Fault after DDL: initialize must roll the columns/version back together.
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TABLE migration_fault(id TEXT REFERENCES job_intents(job_id));
+            INSERT INTO migration_fault VALUES('missing');",
+            )
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        assert!(recovery::initialize(&mut store.conn).is_err());
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            require_snapshot(&store.conn, "legacy-running").unwrap(),
+            failed
+        );
+        let column_exists: bool = store.conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('job_attempts') WHERE name='primary_failure_json')",
+            [], |r| r.get(0)).unwrap();
+        assert!(!column_exists);
+        store
+            .conn
+            .execute_batch("DROP TABLE migration_fault")
+            .unwrap();
+        drop(store);
+        let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        for original in [pending, failed, complete] {
+            assert_eq!(reopened.get(&original.request.job_id).unwrap(), original);
+            assert!(!original.version_stopped);
+        }
+        let fresh = reopened.reserve(request("after-v9")).unwrap();
+        drop(reopened);
+        let reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+        assert_eq!(reopened.get("after-v9").unwrap(), fresh);
+        assert_eq!(
+            reopened
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
     }
 
     #[test]
@@ -1024,7 +1609,7 @@ mod tests {
             .finish(
                 "first",
                 &reserved.attempt.attempt_id,
-                JobAttemptState::Unknown,
+                JobAttemptState::Failed,
                 Some("response lost"),
             )
             .unwrap();
@@ -1039,6 +1624,13 @@ mod tests {
                 .reconcile_granted_attempt("first", "foreign-attempt", "domain-fenced")
                 .is_err()
         );
+        assert!(
+            store
+                .reconcile_granted_attempt("first", &unknown.attempt.attempt_id, "domain-fenced")
+                .is_err()
+        );
+        record_runner_cleanup(&mut store, "first");
+        let unknown = store.get("first").unwrap();
         store
             .reconcile_granted_attempt("first", &unknown.attempt.attempt_id, "domain-fenced")
             .unwrap();
@@ -1056,7 +1648,7 @@ mod tests {
         drop(store);
         let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
         assert_eq!(reopened.get("first").unwrap(), unknown);
-        assert!(reopened.unknown_granted().unwrap().is_empty());
+        assert!(reopened.unreleased_granted().unwrap().is_empty());
         assert!(
             reopened
                 .conn
@@ -1067,42 +1659,101 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_migration_preserves_unknown_grant_and_its_serialization_fence() {
+    fn granted_reconciliation_rechecks_retired_input_in_its_own_transaction() {
         let (dir, mut store) = fixture();
+        for (id, erase) in [("live-input", false), ("erased-input", true)] {
+            let reserved = store
+                .reserve_granted(request(id), Some(json!({"domain":"consolidation"})))
+                .unwrap();
+            store.dispatch(id, &reserved.attempt.attempt_id, 8).unwrap();
+            store
+                .finish(
+                    id,
+                    &reserved.attempt.attempt_id,
+                    JobAttemptState::Failed,
+                    Some("provider failure"),
+                )
+                .unwrap();
+            record_runner_cleanup(&mut store, id);
+            let observed = store.get(id).unwrap();
+            assert!(observed.executions_released());
+            if erase {
+                let mut other = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
+                other
+                    .reclaim_input(
+                        id,
+                        &observed.input_digest,
+                        JobInputRetirementReason::ExplicitErasure,
+                    )
+                    .unwrap();
+            }
+            let result = store.reconcile_granted_attempt(
+                id,
+                &observed.attempt.attempt_id,
+                "inspected-original-effects",
+            );
+            assert_eq!(result.is_ok(), !erase);
+            let receipts: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM job_domain_reconciliations WHERE job_id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(receipts, i64::from(!erase));
+            assert_eq!(store.get(id).unwrap().state, JobState::Failed);
+        }
+    }
+
+    #[test]
+    fn schema_three_cutover_preserves_grant_history_and_execution_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jobs.sqlite3");
+        let mut conn = Connection::open(&path).unwrap();
+        feature_storage::configure_connection(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(legacy_migrations::SCHEMA).unwrap();
+        tx.execute_batch(GRANT_SCHEMA).unwrap();
         let mut first = request("first");
         first.serialization_key = Some("journal".into());
-        let reserved = store
-            .reserve_granted(first, Some(json!({"domain":"journal"})))
-            .unwrap();
-        store
-            .dispatch("first", &reserved.attempt.attempt_id, 8)
-            .unwrap();
-        let unknown = store
-            .finish(
-                "first",
-                &reserved.attempt.attempt_id,
-                JobAttemptState::Unknown,
-                Some("unconfirmed"),
-            )
-            .unwrap();
-        store.conn.execute_batch("DROP TRIGGER job_input_retirement; DROP TRIGGER job_intent_immutable;
-            ALTER TABLE job_intents DROP COLUMN input_disposition;
-            CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF job_id,request_json,fingerprint,serialization_key,max_concurrent ON job_intents
-            BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
-            DROP TRIGGER job_reconciliation_immutable; DROP TRIGGER job_reconciliation_retained; DROP TABLE job_domain_reconciliations; DROP INDEX job_serialization_singleflight; CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key) WHERE serialization_key IS NOT NULL AND state IN ('pending','unknown'); PRAGMA user_version=3;").unwrap();
-        drop(store);
-        let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
-        assert_eq!(reopened.get("first").unwrap(), unknown);
+        tx.execute("INSERT INTO job_intents(job_id,request_json,fingerprint,serialization_key,max_concurrent,state,current_attempt) VALUES('first',?1,?2,'journal',8,'unknown',1)", params![serde_json::to_string(&first).unwrap(),first.fingerprint().unwrap()]).unwrap();
+        tx.execute("INSERT INTO job_attempts(job_id,number,attempt_id,input_digest,state,failure) VALUES('first',1,?1,?2,'unknown','unconfirmed')", params![job::attempt_id("first",1),first.input_digest().unwrap()]).unwrap();
+        tx.execute(
+            "INSERT INTO job_domain_grants VALUES('first',?1)",
+            [serde_json::to_string(&json!({"domain":"journal"})).unwrap()],
+        )
+        .unwrap();
+        tx.pragma_update(None, "user_version", 3).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+        let mut reopened = JobStore::open(&path).unwrap();
+        let saved = reopened.get("first").unwrap();
+        assert_eq!(saved.state, JobState::Failed);
+        assert_eq!(
+            saved.attempt.failure.as_deref(),
+            Some(recovery::UPDATE_INTERRUPTION)
+        );
+        assert_eq!(saved.domain_grant, Some(json!({"domain":"journal"})));
+        assert!(saved.version_stopped);
+        assert!(!saved.executions_released());
         let mut next = request("next");
         next.serialization_key = Some("journal".into());
         assert!(matches!(
-            reopened.reserve(next.clone()),
+            reopened.reserve(next),
             Err(JobStoreError::SerializationConflict(_))
         ));
-        reopened
-            .reconcile_granted_attempt("first", &unknown.attempt.attempt_id, "domain-fenced")
-            .unwrap();
-        reopened.reserve(next).unwrap();
+        assert!(
+            reopened
+                .reconcile_granted_attempt("first", &saved.attempt.attempt_id, "not-a-stop-proof")
+                .is_err()
+        );
+        assert!(
+            reopened
+                .resume_granted("first", &saved.attempt.attempt_id)
+                .is_err()
+        );
+        assert!(reopened.retry("first").is_err());
     }
 
     fn fixture() -> (TempDir, JobStore) {
@@ -1117,6 +1768,15 @@ mod tests {
             attempt_id: snapshot.attempt.attempt_id.clone(),
             input_digest: snapshot.input_digest.clone(),
             result,
+        }
+    }
+
+    // Store-level fixture only: the runner/gate proof is exercised by Jobs tests.
+    fn record_runner_cleanup(store: &mut JobStore, id: &str) {
+        for execution in store.get(id).unwrap().executions {
+            store
+                .confirm_execution_cleanup(id, &execution, "fixture-owned-run-joined")
+                .unwrap();
         }
     }
 
@@ -1139,7 +1799,9 @@ mod tests {
             .dispatch("retained", &reserved.attempt.attempt_id, 8)
             .unwrap();
         let result = submission(&running, json!({"saved":true}));
-        let completed = store.accept(&result).unwrap();
+        store.accept(&result).unwrap();
+        record_runner_cleanup(&mut store, "retained");
+        let completed = store.get("retained").unwrap();
         store.ack("retained").unwrap();
         let retired = store
             .reclaim_input(
@@ -1219,7 +1881,7 @@ mod tests {
         let (_dir, mut store) = fixture();
         for (id, state) in [
             ("pending", None),
-            ("unknown", Some(JobAttemptState::Unknown)),
+            ("unknown", Some(JobAttemptState::Failed)),
             ("failed", Some(JobAttemptState::Failed)),
         ] {
             let original = request(id);
@@ -1285,7 +1947,8 @@ mod tests {
         drop(store);
         let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
         let recovered = reopened.get("erase-running").unwrap();
-        assert_eq!(recovered.state, JobState::Unknown);
+        assert_eq!(recovered, erased);
+        assert!(!recovered.executions_released());
         assert_eq!(recovered.input_disposition, JobInputDisposition::Erased);
         assert_eq!(recovered.input_digest, running.input_digest);
         assert!(reopened.accept(&result).is_err());
@@ -1388,17 +2051,95 @@ mod tests {
 
     #[test]
     fn input_retirement_migration_preserves_receipts_and_rolls_back_failed_ddl() {
-        let (dir, mut store) = fixture();
-        let original = store.reserve(request("upgrade")).unwrap();
-        store.conn.execute_batch("DROP TRIGGER job_input_retirement; DROP TRIGGER job_intent_immutable;
-            ALTER TABLE job_intents DROP COLUMN input_disposition;
-            CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF job_id,request_json,fingerprint,serialization_key,max_concurrent ON job_intents
-            BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
-            PRAGMA user_version=4;
-            CREATE TRIGGER job_input_retirement BEFORE UPDATE ON job_attempts BEGIN SELECT RAISE(ABORT,'collision'); END;").unwrap();
-        drop(store);
+        // The version/state matrix and FK rebuild belong to recovery::tests.
+        // Exercise the input-retirement DDL collision from the retained v4 schema,
+        // then prove that explicit erasure preserves the migrated receipts.
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("jobs.sqlite3");
-        assert!(JobStore::open(&path).is_err());
+        let mut conn = Connection::open(&path).unwrap();
+        feature_storage::configure_connection(&conn).unwrap();
+        let result = json!({"accepted":true});
+        let (result_digest, result_json) = job::result_digest(&result, 1024).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(legacy_migrations::SCHEMA).unwrap();
+        tx.execute_batch(GRANT_SCHEMA).unwrap();
+        tx.execute_batch(RECONCILIATION_SCHEMA).unwrap();
+        for (id, state, attempt_state) in [
+            ("upgrade", "pending", "reserved"),
+            ("receipt", "completed", "completed"),
+        ] {
+            let req = request(id);
+            tx.execute(
+                "INSERT INTO job_intents
+                 (job_id,request_json,fingerprint,max_concurrent,state,current_attempt,acknowledged)
+                 VALUES(?1,?2,?3,?4,?5,1,?6)",
+                params![
+                    id,
+                    serde_json::to_string(&req).unwrap(),
+                    req.fingerprint().unwrap(),
+                    req.limits.max_concurrent_jobs,
+                    state,
+                    id == "receipt"
+                ],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO job_attempts
+                 (job_id,number,attempt_id,input_digest,state,result_json,result_digest)
+                 VALUES(?1,1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    job::attempt_id(id, 1),
+                    req.input_digest().unwrap(),
+                    attempt_state,
+                    (id == "receipt").then_some(&result_json),
+                    (id == "receipt").then_some(&result_digest)
+                ],
+            )
+            .unwrap();
+        }
+        tx.execute_batch(
+            "INSERT INTO job_domain_grants VALUES('receipt','{\"domain\":\"fixture\"}');
+             INSERT INTO job_domain_reconciliations
+             VALUES('receipt','receipt:attempt:1','retained-domain-receipt');",
+        )
+        .unwrap();
+        tx.pragma_update(None, "user_version", 4).unwrap();
+        tx.commit().unwrap();
+        let read_receipts = |conn: &Connection| {
+            conn.query_row(
+                "SELECT a.result_json,a.result_digest,r.domain_receipt
+                 FROM job_attempts a JOIN job_domain_reconciliations r
+                 ON r.job_id=a.job_id AND r.attempt_id=a.attempt_id
+                 WHERE a.job_id='receipt'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let receipts = read_receipts(&conn);
+        conn.execute_batch(
+            "CREATE TRIGGER job_input_retirement BEFORE UPDATE ON job_attempts
+             BEGIN SELECT RAISE(ABORT,'collision'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = JobStore::open(&path)
+            .err()
+            .expect("DDL collision must fail");
+        assert!(matches!(&error, JobStoreError::Sqlite(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("trigger job_input_retirement already exists")
+        );
         let conn = Connection::open(&path).unwrap();
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1406,33 +2147,119 @@ mod tests {
         assert_eq!(version, 4);
         let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('job_intents') WHERE name='input_disposition')",[],|r|r.get(0)).unwrap();
         assert!(!present);
+        assert!(conn.prepare("SELECT * FROM job_version_history").is_err());
+        assert_eq!(read_receipts(&conn), receipts);
+        let original: (String, String, String) = conn
+            .query_row(
+                "SELECT i.request_json,i.state,a.state FROM job_intents i
+                 JOIN job_attempts a ON a.job_id=i.job_id WHERE i.job_id='upgrade'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            original,
+            (
+                serde_json::to_string(&request("upgrade")).unwrap(),
+                "pending".into(),
+                "reserved".into()
+            )
+        );
+        // Rollback must restore the v4 input immutability trigger, not only the column.
+        assert!(
+            conn.execute_batch("UPDATE job_intents SET request_json='{}' WHERE job_id='upgrade'")
+                .is_err()
+        );
         conn.execute_batch("DROP TRIGGER job_input_retirement")
             .unwrap();
         drop(conn);
+
         let mut reopened = JobStore::open(&path).unwrap();
-        assert_eq!(reopened.get("upgrade").unwrap(), original);
+        let stopped = reopened.get("upgrade").unwrap();
+        assert_eq!(stopped.request, request("upgrade"));
+        assert_eq!(stopped.state, JobState::Failed);
+        assert_eq!(stopped.attempt.state, JobAttemptState::Failed);
         assert_eq!(
-            reopened
-                .get("upgrade")
-                .unwrap()
-                .load_executable_request()
-                .unwrap(),
-            &request("upgrade")
+            stopped.attempt.failure.as_deref(),
+            Some(recovery::UPDATE_INTERRUPTION)
         );
-        let retired = reopened
-            .reclaim_input(
-                "upgrade",
-                &original.input_digest,
-                JobInputRetirementReason::ExplicitErasure,
-            )
-            .unwrap();
-        assert_eq!(retired.state, JobState::Pending);
+        assert!(stopped.version_stopped);
+        assert!(!stopped.executions_released());
+        assert!(stopped.start_rejected_by.is_none());
+        assert!(reopened.retry("upgrade").is_err());
         assert!(
             reopened
-                .conn
-                .execute_batch("UPDATE job_intents SET input_disposition='available'")
+                .dispatch("upgrade", &stopped.attempt.attempt_id, 8)
                 .is_err()
         );
+        assert!(reopened.pending().unwrap().is_empty());
+        let completed = reopened.get("receipt").unwrap();
+        assert_eq!(completed.request, request("receipt"));
+        assert_eq!(completed.state, JobState::Completed);
+        assert_eq!(completed.result, Some(result));
+        assert!(completed.acknowledged);
+        assert_eq!(read_receipts(&reopened.conn), receipts);
+        let history: (String, String) = reopened
+            .conn
+            .query_row(
+                "SELECT job_state,attempt_state FROM job_version_history WHERE job_id='upgrade'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(history, ("pending".into(), "reserved".into()));
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM job_attempts WHERE job_id='upgrade'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+
+        let mut retired_receipts = Vec::new();
+        for before in [stopped, completed] {
+            let id = &before.request.job_id;
+            let retired = reopened
+                .reclaim_input(
+                    id,
+                    &before.input_digest,
+                    JobInputRetirementReason::ExplicitErasure,
+                )
+                .unwrap();
+            assert_eq!(retired.state, before.state);
+            assert_eq!(retired.attempt, before.attempt);
+            assert_eq!(retired.result, before.result);
+            assert_eq!(retired.input_digest, before.input_digest);
+            assert_eq!(retired.intent_fingerprint, before.intent_fingerprint);
+            assert_eq!(retired.input_disposition, JobInputDisposition::Erased);
+            assert!(retired.request.input.is_null());
+            assert!(retired.load_executable_request().is_err());
+            assert!(
+                reopened
+                    .conn
+                    .execute(
+                        "UPDATE job_intents SET input_disposition='available' WHERE job_id=?1",
+                        [id]
+                    )
+                    .is_err()
+            );
+            retired_receipts.push(retired);
+        }
+        assert_eq!(read_receipts(&reopened.conn), receipts);
+        let fresh = reopened.reserve(request("after-upgrade")).unwrap();
+        assert!(!fresh.version_stopped);
+        drop(reopened);
+        let reopened = JobStore::open(&path).unwrap();
+        for retired in retired_receipts {
+            assert_eq!(reopened.get(&retired.request.job_id).unwrap(), retired);
+        }
+        assert_eq!(read_receipts(&reopened.conn), receipts);
+        assert_eq!(reopened.get("after-upgrade").unwrap(), fresh);
+        assert_eq!(reopened.pending().unwrap(), vec![fresh]);
     }
 
     #[test]
@@ -1588,6 +2415,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.reserve(original.clone()).unwrap(), failed);
+        assert!(store.retry("retry").is_err());
+        record_runner_cleanup(&mut store, "retry");
         let second = store.retry("retry").unwrap();
         assert_eq!(second.request, original);
         assert_eq!(second.attempt.number, 2);
@@ -1624,6 +2453,9 @@ mod tests {
             )
         );
         store
+            .dispatch("retry", &second.attempt.attempt_id, 8)
+            .unwrap();
+        store
             .finish(
                 "retry",
                 &second.attempt.attempt_id,
@@ -1631,6 +2463,15 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!store.get("retry").unwrap().executions_released());
+        assert!(matches!(
+            store.retry("retry"),
+            Err(JobStoreError::InvalidTransition(
+                "version stop or unreleased execution forbids retry"
+            ))
+        ));
+        record_runner_cleanup(&mut store, "retry");
+        assert!(store.get("retry").unwrap().executions_released());
         assert!(matches!(
             store.retry("retry"),
             Err(JobStoreError::InvalidTransition("attempt limit reached"))
@@ -1736,7 +2577,6 @@ mod tests {
             .unwrap();
         for state in [
             JobAttemptState::Failed,
-            JobAttemptState::Unknown,
             JobAttemptState::Cancelled,
             JobAttemptState::Completed,
         ] {
@@ -1803,10 +2643,11 @@ mod tests {
         assert_eq!(reopened.pending().unwrap(), vec![pending.clone()]);
         assert_eq!(reopened.get("pending").unwrap(), pending);
         let unknown = reopened.get("interrupted").unwrap();
-        assert_eq!(unknown.state, JobState::Unknown);
-        assert_eq!(unknown.attempt.state, JobAttemptState::Unknown);
+        assert_eq!(unknown, active);
+        assert_eq!(unknown.state, JobState::Pending);
+        assert_eq!(unknown.attempt.state, JobAttemptState::Dispatched);
         assert_eq!(unknown.result, None);
-        assert!(unknown.attempt.failure.is_some());
+        assert!(!unknown.executions_released());
         assert_eq!(reopened.reserve(request("interrupted")).unwrap(), unknown);
         assert!(reopened.retry("interrupted").is_err());
         assert!(
@@ -1840,10 +2681,11 @@ mod tests {
         drop(store);
         let mut reopened = JobStore::open(&dir.path().join("jobs.sqlite3")).unwrap();
         let retained = reopened.get("accepted-fixture").unwrap();
-        assert_eq!(retained.state, JobState::Completed);
-        assert_eq!(retained.attempt.state, JobAttemptState::Completed);
+        assert_eq!(retained.state, JobState::Pending);
+        assert_eq!(retained.attempt.state, JobAttemptState::Dispatched);
         assert_eq!(retained.result, Some(bound.result.clone()));
-        assert_eq!(reopened.accept(&bound).unwrap(), retained);
+        assert!(!retained.executions_released());
+        assert!(reopened.accept(&bound).is_err());
         assert!(reopened.pending().unwrap().is_empty());
     }
 
@@ -1888,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn serialization_fences_pending_unknown_and_conflicting_retry() {
+    fn serialization_fences_unreleased_execution_and_conflicting_retry() {
         let (dir, mut store) = fixture();
         let mut first = request("first");
         first.serialization_key = Some("resource".into());
@@ -1909,9 +2751,13 @@ mod tests {
             reopened.reserve(second.clone()),
             Err(JobStoreError::SerializationConflict(_))
         ));
-        let cancelled_unknown = reopened.cancel("first").unwrap();
-        assert_eq!(cancelled_unknown.state, JobState::Cancelled);
-        assert_eq!(cancelled_unknown.attempt.state, JobAttemptState::Unknown);
+        let cancelled_unreleased = reopened.cancel("first").unwrap();
+        assert_eq!(cancelled_unreleased.state, JobState::Cancelled);
+        assert_eq!(
+            cancelled_unreleased.attempt.state,
+            JobAttemptState::Cancelled
+        );
+        assert!(!cancelled_unreleased.executions_released());
         assert!(matches!(
             reopened.reserve(second.clone()),
             Err(JobStoreError::SerializationConflict(_))
@@ -1921,6 +2767,9 @@ mod tests {
         second.serialization_key = Some("independent-resource".into());
         let second_snapshot = reopened.reserve(second.clone()).unwrap();
         reopened
+            .dispatch("second", &second_snapshot.attempt.attempt_id, 8)
+            .unwrap();
+        reopened
             .finish(
                 "second",
                 &second_snapshot.attempt.attempt_id,
@@ -1928,6 +2777,15 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!reopened.get("second").unwrap().executions_released());
+        assert!(matches!(
+            reopened.retry("second"),
+            Err(JobStoreError::InvalidTransition(
+                "version stop or unreleased execution forbids retry"
+            ))
+        ));
+        record_runner_cleanup(&mut reopened, "second");
+        assert!(reopened.get("second").unwrap().executions_released());
         let mut third = request("third");
         third.serialization_key = Some("independent-resource".into());
         reopened.reserve(third).unwrap();
@@ -1971,6 +2829,11 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(matches!(
+            store.dispatch("other", &other.attempt.attempt_id, 8),
+            Err(JobStoreError::ConcurrentLimit)
+        ));
+        record_runner_cleanup(&mut store, "strict");
         store
             .dispatch("other", &other.attempt.attempt_id, 8)
             .unwrap();
@@ -1989,6 +2852,11 @@ mod tests {
             JobAttemptState::Reserved
         );
         store.accept(&submission(&other, json!({}))).unwrap();
+        assert!(matches!(
+            store.dispatch("host-bound", &host_bound.attempt.attempt_id, 1),
+            Err(JobStoreError::ConcurrentLimit)
+        ));
+        record_runner_cleanup(&mut store, "other");
         store
             .dispatch("host-bound", &host_bound.attempt.attempt_id, 1)
             .unwrap();
@@ -2077,11 +2945,11 @@ mod tests {
     #[test]
     fn failure_detail_is_utf8_bounded_and_terminal_classification_is_stable() {
         let (_dir, mut store) = fixture();
-        let reserved = store.reserve(request("failure")).unwrap();
+        let active = dispatched(&mut store, request("failure"));
         let failed = store
             .finish(
                 "failure",
-                &reserved.attempt.attempt_id,
+                &active.attempt.attempt_id,
                 JobAttemptState::Failed,
                 Some(&"猫".repeat(1024)),
             )
@@ -2093,7 +2961,7 @@ mod tests {
             store
                 .finish(
                     "failure",
-                    &reserved.attempt.attempt_id,
+                    &active.attempt.attempt_id,
                     JobAttemptState::Failed,
                     Some("different detail")
                 )
@@ -2104,8 +2972,8 @@ mod tests {
             store
                 .finish(
                     "failure",
-                    &reserved.attempt.attempt_id,
-                    JobAttemptState::Unknown,
+                    &active.attempt.attempt_id,
+                    JobAttemptState::Cancelled,
                     None
                 )
                 .is_err()
@@ -2114,16 +2982,27 @@ mod tests {
             store
                 .finish(
                     "failure",
-                    &reserved.attempt.attempt_id,
+                    &active.attempt.attempt_id,
                     JobAttemptState::Completed,
                     None
                 )
                 .is_err()
         );
-        assert!(store.accept(&submission(&reserved, json!({}))).is_err());
+        assert!(store.accept(&submission(&active, json!({}))).is_err());
         assert!(store.ack("failure").is_err());
-        assert_eq!(store.cancel("failure").unwrap().state, JobState::Cancelled);
-        assert!(store.retry("failure").is_err());
+        assert_eq!(store.cancel("failure").unwrap(), failed);
+        assert!(!failed.executions_released());
+        assert!(matches!(
+            store.retry("failure"),
+            Err(JobStoreError::InvalidTransition(
+                "version stop or unreleased execution forbids retry"
+            ))
+        ));
+        record_runner_cleanup(&mut store, "failure");
+        let released = store.get("failure").unwrap();
+        assert!(released.executions_released());
+        assert_eq!(released.attempt, failed.attempt);
+        assert_eq!(store.retry("failure").unwrap().attempt.number, 2);
     }
 
     #[test]
@@ -2176,6 +3055,9 @@ mod tests {
                 Some("known failure"),
             )
             .unwrap();
+        assert!(!failed.executions_released());
+        record_runner_cleanup(&mut store, "atomic");
+        let failed = store.get("atomic").unwrap();
         store
             .conn
             .execute_batch(

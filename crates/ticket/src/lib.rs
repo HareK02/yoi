@@ -30,7 +30,15 @@ pub use assignment_answer::*;
 mod assignment_tracking;
 pub mod config;
 mod content_changes;
+mod parent_links;
+mod retire_orchestration_plans;
+pub use parent_links::{
+    TicketChildrenPage, TicketChildrenRequest, TicketLinkSummary, TicketParentFilter,
+    TicketParentLink, TicketParentObservation, TicketParentSetRequest,
+};
+pub mod service_outbox;
 mod sqlite_schema;
+mod subject_assignment;
 mod tags;
 pub use assignment_tracking::*;
 pub use tags::{
@@ -39,14 +47,13 @@ pub use tags::{
 pub mod tool;
 
 pub use sqlite_schema::{
+    HistoricalTicketSchemaTarget, migrate_historical_sqlite_ticket_schema_in_transaction,
     migrate_sqlite_ticket_schema, migrate_sqlite_ticket_schema_in_transaction,
-    verify_legacy_sqlite_ticket_schema, verify_pre_classification_ticket_schema,
-    verify_sqlite_ticket_schema,
+    verify_historical_sqlite_ticket_schema, verify_legacy_sqlite_ticket_schema,
+    verify_pre_classification_ticket_schema, verify_sqlite_ticket_schema,
 };
 
 const MAX_INTAKE_SUMMARY_BODY_BYTES: usize = 16 * 1024;
-const MAX_ORCHESTRATION_PLAN_TEXT_BYTES: usize = 16 * 1024;
-const MAX_ORCHESTRATION_PLAN_FIELD_BYTES: usize = 1024;
 const DEFAULT_TICKET_BODY: &str = "## Background\n\n## Acceptance criteria\n\n- TBD\n";
 
 fn normalized_record_language(language: &str) -> Option<String> {
@@ -369,6 +376,7 @@ pub enum TicketEventKind {
     ImplementationReport,
     StateChanged,
     TagsChanged,
+    ParentChanged,
     IntakeSummary,
     StatusChanged,
     Close,
@@ -385,6 +393,7 @@ impl TicketEventKind {
             Self::ImplementationReport => "implementation_report",
             Self::StateChanged => "state_changed",
             Self::TagsChanged => "tags_changed",
+            Self::ParentChanged => "parent_changed",
             Self::IntakeSummary => "intake_summary",
             Self::StatusChanged => "status_changed",
             Self::Close => "close",
@@ -401,6 +410,7 @@ impl TicketEventKind {
             Self::ImplementationReport => "Implementation report".to_string(),
             Self::StateChanged => "State changed".to_string(),
             Self::TagsChanged => "Tags changed".to_string(),
+            Self::ParentChanged => "Parent changed".to_string(),
             Self::IntakeSummary => "Intake summary".to_string(),
             Self::StatusChanged => "Status changed".to_string(),
             Self::Close => "Closed".to_string(),
@@ -420,6 +430,7 @@ impl From<&str> for TicketEventKind {
             "review" => Self::Comment,
             "state_changed" => Self::StateChanged,
             "tags_changed" => Self::TagsChanged,
+            "parent_changed" => Self::ParentChanged,
             "intake_summary" => Self::IntakeSummary,
             "status_changed" => Self::StatusChanged,
             "close" | "closed" => Self::Close,
@@ -1468,115 +1479,6 @@ fn compact_ticket_state_label(state: TicketState) -> &'static str {
     state.as_str()
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Serialize,
-    Deserialize,
-    schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum OrchestrationPlanKind {
-    Before,
-    After,
-    BlockedBy,
-    Blocks,
-    ConflictsWith,
-    DoNotParallelize,
-    WaitingCapacityNote,
-    AcceptedPlan,
-}
-
-impl OrchestrationPlanKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Before => "before",
-            Self::After => "after",
-            Self::BlockedBy => "blocked_by",
-            Self::Blocks => "blocks",
-            Self::ConflictsWith => "conflicts_with",
-            Self::DoNotParallelize => "do_not_parallelize",
-            Self::WaitingCapacityNote => "waiting_capacity_note",
-            Self::AcceptedPlan => "accepted_plan",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "before" => Some(Self::Before),
-            "after" => Some(Self::After),
-            "blocked_by" => Some(Self::BlockedBy),
-            "blocks" => Some(Self::Blocks),
-            "conflicts_with" => Some(Self::ConflictsWith),
-            "do_not_parallelize" => Some(Self::DoNotParallelize),
-            "waiting_capacity_note" => Some(Self::WaitingCapacityNote),
-            "accepted_plan" => Some(Self::AcceptedPlan),
-            _ => None,
-        }
-    }
-
-    fn requires_related_ticket(self) -> bool {
-        matches!(
-            self,
-            Self::Before
-                | Self::After
-                | Self::BlockedBy
-                | Self::Blocks
-                | Self::ConflictsWith
-                | Self::DoNotParallelize
-        )
-    }
-}
-
-impl fmt::Display for OrchestrationPlanKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AcceptedOrchestrationPlan {
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role_plan: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct NewOrchestrationPlanRecord {
-    pub kind: OrchestrationPlanKind,
-    pub related_ticket: Option<String>,
-    pub note: Option<String>,
-    pub accepted_plan: Option<AcceptedOrchestrationPlan>,
-    pub author: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct OrchestrationPlanRecord {
-    pub id: String,
-    pub ticket_id: String,
-    pub kind: OrchestrationPlanKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub related_ticket: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accepted_plan: Option<AcceptedOrchestrationPlan>,
-    pub author: String,
-    pub at: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TicketMeta {
     pub id: String,
@@ -1774,6 +1676,17 @@ pub struct TicketPostEdit {
 }
 
 pub trait TicketBackend {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> Result<TicketParentLink>;
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketParentSetRequest,
+    ) -> Result<TicketParentLink>;
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketChildrenRequest,
+    ) -> Result<TicketChildrenPage>;
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,
@@ -1843,22 +1756,23 @@ pub trait TicketBackend {
         kind: Option<TicketRelationKind>,
     ) -> Result<Vec<TicketRelation>>;
     fn relation_view(&self, id: TicketIdOrSlug) -> Result<TicketRelationView>;
-    fn add_orchestration_plan_record(
-        &self,
-        id: TicketIdOrSlug,
-        record: NewOrchestrationPlanRecord,
-    ) -> Result<OrchestrationPlanRecord>;
-    fn query_orchestration_plan_records(
-        &self,
-        ticket: Option<TicketIdOrSlug>,
-        kind: Option<OrchestrationPlanKind>,
-    ) -> Result<Vec<OrchestrationPlanRecord>>;
     fn doctor(&self) -> Result<TicketDoctorReport>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum TicketBackendOperation {
+    ParentLink {
+        id: TicketIdOrSlug,
+    },
+    SetParentLink {
+        id: TicketIdOrSlug,
+        request: TicketParentSetRequest,
+    },
+    ChildrenPage {
+        id: TicketIdOrSlug,
+        request: TicketChildrenRequest,
+    },
     ListWorkspaceTags {
         request: TagListRequest,
     },
@@ -1934,20 +1848,14 @@ pub enum TicketBackendOperation {
     RelationView {
         id: TicketIdOrSlug,
     },
-    AddOrchestrationPlanRecord {
-        id: TicketIdOrSlug,
-        record: NewOrchestrationPlanRecord,
-    },
-    QueryOrchestrationPlanRecords {
-        ticket: Option<TicketIdOrSlug>,
-        kind: Option<OrchestrationPlanKind>,
-    },
     Doctor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 pub enum TicketBackendOperationResult {
+    ParentLink(TicketParentLink),
+    ChildrenPage(TicketChildrenPage),
     WorkspaceTags(Vec<WorkspaceTag>),
     WorkspaceTag(WorkspaceTag),
     Text(String),
@@ -1961,8 +1869,6 @@ pub enum TicketBackendOperationResult {
     Relation(TicketRelation),
     Relations(Vec<TicketRelation>),
     RelationView(TicketRelationView),
-    OrchestrationPlanRecord(OrchestrationPlanRecord),
-    OrchestrationPlanRecords(Vec<OrchestrationPlanRecord>),
     DoctorReport(TicketDoctorReport),
 }
 
@@ -1974,6 +1880,15 @@ where
     B: TicketBackend + ?Sized,
 {
     Ok(match operation {
+        TicketBackendOperation::ParentLink { id } => {
+            TicketBackendOperationResult::ParentLink(backend.get_ticket_parent(id)?)
+        }
+        TicketBackendOperation::SetParentLink { id, request } => {
+            TicketBackendOperationResult::ParentLink(backend.set_ticket_parent(id, request)?)
+        }
+        TicketBackendOperation::ChildrenPage { id, request } => {
+            TicketBackendOperationResult::ChildrenPage(backend.query_ticket_children(id, request)?)
+        }
         TicketBackendOperation::ListWorkspaceTags { request } => {
             TicketBackendOperationResult::WorkspaceTags(backend.list_workspace_tags(request)?)
         }
@@ -2043,16 +1958,6 @@ where
         }
         TicketBackendOperation::RelationView { id } => {
             TicketBackendOperationResult::RelationView(backend.relation_view(id)?)
-        }
-        TicketBackendOperation::AddOrchestrationPlanRecord { id, record } => {
-            TicketBackendOperationResult::OrchestrationPlanRecord(
-                backend.add_orchestration_plan_record(id, record)?,
-            )
-        }
-        TicketBackendOperation::QueryOrchestrationPlanRecords { ticket, kind } => {
-            TicketBackendOperationResult::OrchestrationPlanRecords(
-                backend.query_orchestration_plan_records(ticket, kind)?,
-            )
         }
         TicketBackendOperation::Doctor => {
             TicketBackendOperationResult::DoctorReport(backend.doctor()?)
@@ -2615,6 +2520,14 @@ impl SqliteTicketBackend {
             conn.execute("INSERT INTO typed_ticket_event_attributes (workspace_id, ticket_id, event_index, key, value) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![self.workspace_id, ticket_id, next_index, key, value]).map_err(sqlite_err)?;
         }
+        service_outbox::insert(
+            conn,
+            &self.workspace_id,
+            ticket_id,
+            service_outbox::EventType::Changed,
+            event.at.as_deref().unwrap_or(&now_utc()),
+            &event_ref,
+        )?;
         if let Some(hook) = &self.mutation_hook {
             hook(
                 conn,
@@ -3099,6 +3012,23 @@ fn finish_sqlite_transaction<R>(conn: &Connection, result: Result<R>) -> Result<
 }
 
 impl TicketBackend for SqliteTicketBackend {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> Result<TicketParentLink> {
+        self.parent_link(id)
+    }
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketParentSetRequest,
+    ) -> Result<TicketParentLink> {
+        self.set_parent_link(id, request)
+    }
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: TicketChildrenRequest,
+    ) -> Result<TicketChildrenPage> {
+        self.children_page(id, request)
+    }
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,
@@ -3788,43 +3718,6 @@ impl TicketBackend for SqliteTicketBackend {
         })
     }
 
-    fn add_orchestration_plan_record(
-        &self,
-        id: TicketIdOrSlug,
-        record: NewOrchestrationPlanRecord,
-    ) -> Result<OrchestrationPlanRecord> {
-        self.with_write(|conn| {
-            let ticket_id = self.resolve_ticket_id(conn, id)?;
-            let meta = self.load_ticket(conn, &ticket_id)?.meta;
-            let output = OrchestrationPlanRecord { id: allocate_record_id(unix_epoch_millis_now().unwrap_or(0), |_| false).map_err(|err| TicketError::Conflict(format!("failed to allocate orchestration plan id: {err}")))?, ticket_id, kind: record.kind, related_ticket: record.related_ticket, note: record.note, accepted_plan: record.accepted_plan, author: record.author.unwrap_or_else(default_author), at: now_utc() };
-            validate_orchestration_plan_record(&output, Some(&meta))?;
-            conn.execute(r#"INSERT INTO typed_ticket_orchestration_plans (workspace_id, ticket_id, record_id, kind, related_ticket, note, accepted_summary, accepted_branch, accepted_worktree, accepted_role_plan, author, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
-                params![self.workspace_id, output.ticket_id, output.id, output.kind.as_str(), output.related_ticket, output.note, output.accepted_plan.as_ref().map(|plan| plan.summary.as_str()), output.accepted_plan.as_ref().and_then(|plan| plan.branch.as_deref()), output.accepted_plan.as_ref().and_then(|plan| plan.worktree.as_deref()), output.accepted_plan.as_ref().and_then(|plan| plan.role_plan.as_deref()), output.author, output.at]).map_err(sqlite_err)?;
-            Ok(output)
-        })
-    }
-
-    fn query_orchestration_plan_records(
-        &self,
-        ticket: Option<TicketIdOrSlug>,
-        kind: Option<OrchestrationPlanKind>,
-    ) -> Result<Vec<OrchestrationPlanRecord>> {
-        self.with_read(|conn| {
-            let ticket_id = ticket.map(|id| self.resolve_ticket_id(conn, id)).transpose()?;
-            let mut stmt = conn.prepare("SELECT ticket_id, record_id, kind, related_ticket, note, accepted_summary, accepted_branch, accepted_worktree, accepted_role_plan, author, at FROM typed_ticket_orchestration_plans WHERE workspace_id = ?1 ORDER BY at ASC, record_id ASC").map_err(sqlite_err)?;
-            let rows = stmt.query_map(params![self.workspace_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, String>(9)?, row.get::<_, String>(10)?))).map_err(sqlite_err)?;
-            let mut records = Vec::new();
-            for row in rows {
-                let (record_ticket, id, kind_raw, related_ticket, note, summary, branch, worktree, role_plan, author, at) = row.map_err(sqlite_err)?;
-                if ticket_id.as_ref().is_some_and(|ticket_id| ticket_id != &record_ticket) { continue; }
-                let Some(record_kind) = OrchestrationPlanKind::parse(&kind_raw) else { continue; };
-                if kind.is_some_and(|expected| expected != record_kind) { continue; }
-                records.push(OrchestrationPlanRecord { ticket_id: record_ticket, id, kind: record_kind, related_ticket, note, accepted_plan: summary.map(|summary| AcceptedOrchestrationPlan { summary, branch, worktree, role_plan }), author, at });
-            }
-            Ok(records)
-        })
-    }
-
     fn doctor(&self) -> Result<TicketDoctorReport> {
         self.with_read(|conn| {
             let _ = self.list_summaries(conn, TicketListQuery::all())?;
@@ -4135,170 +4028,6 @@ fn format_relation_blockers(blockers: &[TicketRelationBlocker]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn validate_plan_required_text(label: &str, value: &str, max_bytes: usize) -> Result<()> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(TicketError::Conflict(format!(
-            "orchestration plan {label} must not be empty"
-        )));
-    }
-    validate_plan_optional_text(label, Some(trimmed), max_bytes)
-}
-
-fn validate_plan_optional_text(label: &str, value: Option<&str>, max_bytes: usize) -> Result<()> {
-    if let Some(value) = value {
-        if value.as_bytes().len() > max_bytes {
-            return Err(TicketError::Conflict(format!(
-                "orchestration plan {label} exceeds {max_bytes} bytes"
-            )));
-        }
-        if value.contains('\0') {
-            return Err(TicketError::Conflict(format!(
-                "orchestration plan {label} must not contain NUL bytes"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_plan_optional_single_line(
-    label: &str,
-    value: Option<&str>,
-    max_bytes: usize,
-) -> Result<()> {
-    validate_plan_optional_text(label, value, max_bytes)?;
-    if let Some(value) = value {
-        if value.contains('\n') || value.contains('\r') {
-            return Err(TicketError::Conflict(format!(
-                "orchestration plan {label} must be a single line"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_accepted_orchestration_plan(plan: &AcceptedOrchestrationPlan) -> Result<()> {
-    validate_plan_required_text(
-        "accepted_plan.summary",
-        &plan.summary,
-        MAX_ORCHESTRATION_PLAN_TEXT_BYTES,
-    )?;
-    validate_plan_optional_single_line(
-        "accepted_plan.branch",
-        plan.branch.as_deref(),
-        MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-    )?;
-    validate_plan_optional_single_line(
-        "accepted_plan.worktree",
-        plan.worktree.as_deref(),
-        MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-    )?;
-    validate_plan_optional_text(
-        "accepted_plan.role_plan",
-        plan.role_plan.as_deref(),
-        MAX_ORCHESTRATION_PLAN_TEXT_BYTES,
-    )
-}
-
-fn validate_new_orchestration_plan_record(record: &NewOrchestrationPlanRecord) -> Result<()> {
-    if record.kind.requires_related_ticket() {
-        let related = record.related_ticket.as_deref().ok_or_else(|| {
-            TicketError::Conflict(format!(
-                "orchestration plan kind `{}` requires related_ticket",
-                record.kind
-            ))
-        })?;
-        validate_plan_required_text(
-            "related_ticket",
-            related,
-            MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-        )?;
-        validate_plan_optional_single_line(
-            "related_ticket",
-            Some(related),
-            MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-        )?;
-    } else if let Some(related) = record.related_ticket.as_deref() {
-        validate_plan_optional_single_line(
-            "related_ticket",
-            Some(related),
-            MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-        )?;
-    }
-
-    if matches!(record.kind, OrchestrationPlanKind::AcceptedPlan) {
-        let plan = record.accepted_plan.as_ref().ok_or_else(|| {
-            TicketError::Conflict("accepted_plan record requires accepted_plan fields".to_string())
-        })?;
-        validate_accepted_orchestration_plan(plan)?;
-    } else if record.accepted_plan.is_some() {
-        return Err(TicketError::Conflict(
-            "accepted_plan fields are only valid for accepted_plan records".to_string(),
-        ));
-    }
-
-    if matches!(record.kind, OrchestrationPlanKind::WaitingCapacityNote) {
-        let note = record.note.as_deref().ok_or_else(|| {
-            TicketError::Conflict("waiting_capacity_note records require note".to_string())
-        })?;
-        validate_plan_required_text("note", note, MAX_ORCHESTRATION_PLAN_TEXT_BYTES)?;
-    } else {
-        validate_plan_optional_text(
-            "note",
-            record.note.as_deref(),
-            MAX_ORCHESTRATION_PLAN_TEXT_BYTES,
-        )?;
-    }
-    validate_plan_optional_single_line(
-        "author",
-        record.author.as_deref(),
-        MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-    )
-}
-
-fn validate_orchestration_plan_record(
-    record: &OrchestrationPlanRecord,
-    meta: Option<&TicketMeta>,
-) -> Result<()> {
-    validate_plan_required_text("id", &record.id, MAX_ORCHESTRATION_PLAN_FIELD_BYTES)?;
-    validate_plan_optional_single_line("id", Some(&record.id), MAX_ORCHESTRATION_PLAN_FIELD_BYTES)?;
-    validate_plan_required_text(
-        "ticket_id",
-        &record.ticket_id,
-        MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-    )?;
-    validate_plan_optional_single_line(
-        "ticket_id",
-        Some(&record.ticket_id),
-        MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-    )?;
-    validate_plan_required_text("author", &record.author, MAX_ORCHESTRATION_PLAN_FIELD_BYTES)?;
-    validate_plan_optional_single_line(
-        "author",
-        Some(&record.author),
-        MAX_ORCHESTRATION_PLAN_FIELD_BYTES,
-    )?;
-    validate_plan_required_text("at", &record.at, MAX_ORCHESTRATION_PLAN_FIELD_BYTES)?;
-    validate_plan_optional_single_line("at", Some(&record.at), MAX_ORCHESTRATION_PLAN_FIELD_BYTES)?;
-    let new_record = NewOrchestrationPlanRecord {
-        kind: record.kind,
-        related_ticket: record.related_ticket.clone(),
-        note: record.note.clone(),
-        accepted_plan: record.accepted_plan.clone(),
-        author: Some(record.author.clone()),
-    };
-    validate_new_orchestration_plan_record(&new_record)?;
-    if let Some(meta) = meta {
-        if record.ticket_id != meta.id {
-            return Err(TicketError::Conflict(format!(
-                "orchestration plan record {} targets {} but artifact belongs to {}",
-                record.id, record.ticket_id, meta.id
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn validate_event_attr(key: &str, value: &str) -> Result<()> {
@@ -6006,94 +5735,5 @@ mod tests {
             unchanged_incoming.relations.blockers[0].blocking_ticket,
             blocker.id
         );
-    }
-
-    #[test]
-    fn orchestration_plan_records_persist_and_query_by_ticket_and_kind() {
-        let temp = TempDir::new().unwrap();
-        let backend = backend(&temp);
-        let first = backend.create(NewTicket::new("First ticket")).unwrap();
-        let second = backend.create(NewTicket::new("Second ticket")).unwrap();
-
-        let before = backend
-            .add_orchestration_plan_record(
-                TicketIdOrSlug::Id(first.id.clone()),
-                NewOrchestrationPlanRecord {
-                    kind: OrchestrationPlanKind::Before,
-                    related_ticket: Some(second.id.clone()),
-                    note: Some(
-                        "First must land before second because both touch routing.".to_string(),
-                    ),
-                    accepted_plan: None,
-                    author: Some("orchestrator".to_string()),
-                },
-            )
-            .unwrap();
-        assert_eq!(before.ticket_id, first.id);
-        assert_eq!(before.kind, OrchestrationPlanKind::Before);
-
-        backend
-            .add_orchestration_plan_record(
-                TicketIdOrSlug::Id(first.id.clone()),
-                NewOrchestrationPlanRecord {
-                    kind: OrchestrationPlanKind::AcceptedPlan,
-                    related_ticket: None,
-                    note: Some("Accepted during routing.".to_string()),
-                    accepted_plan: Some(AcceptedOrchestrationPlan {
-                        summary: "Implement in a sibling coder worktree, then review before merge."
-                            .to_string(),
-                        branch: Some("ticket-orchestration-plan-tool".to_string()),
-                        worktree: Some(".worktree/ticket-orchestration-plan-tool".to_string()),
-                        role_plan: Some(
-                            "Coder implements; Reviewer checks capability boundaries.".to_string(),
-                        ),
-                    }),
-                    author: Some("orchestrator".to_string()),
-                },
-            )
-            .unwrap();
-
-        let ticket_records = backend
-            .query_orchestration_plan_records(Some(TicketIdOrSlug::Query(first.id.clone())), None)
-            .unwrap();
-        assert_eq!(ticket_records.len(), 2);
-        assert!(
-            ticket_records
-                .iter()
-                .any(|record| record.kind == OrchestrationPlanKind::AcceptedPlan)
-        );
-
-        let before_records = backend
-            .query_orchestration_plan_records(None, Some(OrchestrationPlanKind::Before))
-            .unwrap();
-        assert_eq!(before_records.len(), 1);
-        assert_eq!(
-            before_records[0].related_ticket.as_deref(),
-            Some(second.id.as_str())
-        );
-        assert_eq!(backend.doctor().unwrap().error_count(), 0);
-    }
-
-    #[test]
-    fn orchestration_plan_validation_rejects_missing_related_ticket() {
-        let temp = TempDir::new().unwrap();
-        let backend = backend(&temp);
-        let ticket = backend
-            .create(NewTicket::new("Needs plan validation"))
-            .unwrap();
-
-        let err = backend
-            .add_orchestration_plan_record(
-                TicketIdOrSlug::Id(ticket.id.clone()),
-                NewOrchestrationPlanRecord {
-                    kind: OrchestrationPlanKind::BlockedBy,
-                    related_ticket: None,
-                    note: Some("Missing related ticket should fail.".to_string()),
-                    accepted_plan: None,
-                    author: None,
-                },
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("requires related_ticket"));
     }
 }

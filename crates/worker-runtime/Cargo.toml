@@ -23,10 +23,12 @@ fs-store = ["dep:fs4"]
 test-support = ["fs-store", "ws-server"]
 # Explicit process-test synchronization; independent of offline fixture tooling.
 restore-checkpoints = ["fs-store"]
-http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
+http-server = ["dep:api-macros", "dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "tokio/sync"]
 
 [dependencies]
+api-macros = { workspace = true, optional = true }
+error-contract.workspace = true
 agen.workspace = true
 async-trait.workspace = true
 base64.workspace = true
@@ -36,6 +38,8 @@ decodal.workspace = true
 flow = { path = "../flow" }
 fs4 = { workspace = true, optional = true }
 manifest.workspace = true
+yoi-plugin-runtime = { path = "../plugin-runtime" }
+plugin-plan = { path = "../plugin-plan" }
 libc.workspace = true
 protocol.workspace = true
 runtime-api.workspace = true
@@ -43,11 +47,12 @@ serde = { workspace = true, features = ["derive"] }
 session-store.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
-reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls", "stream"] }
 ring.workspace = true
 tar.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "process", "rt", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 toml.workspace = true

@@ -257,6 +257,7 @@ mod tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: serde_json::to_string(&*self.response.lock().unwrap()).unwrap(),
             })

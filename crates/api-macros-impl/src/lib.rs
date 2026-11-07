@@ -53,6 +53,7 @@ enum Method {
 #[derive(Clone, Copy, Default)]
 struct AdapterConfig {
     reqwest: bool,
+    client_error_hook: bool,
     axum: bool,
     openapi: bool,
 }
@@ -64,9 +65,10 @@ impl Parse for AdapterConfig {
         for adapter in adapters {
             match adapter.to_string().as_str() {
                 "reqwest" if !config.reqwest => config.reqwest = true,
+                "client_error_hook" if !config.client_error_hook => config.client_error_hook = true,
                 "axum" if !config.axum => config.axum = true,
                 "openapi" if !config.openapi => config.openapi = true,
-                "reqwest" | "axum" | "openapi" => {
+                "reqwest" | "axum" | "openapi" | "client_error_hook" => {
                     return Err(syn::Error::new(adapter.span(), "duplicate API adapter"));
                 }
                 _ => {
@@ -76,6 +78,12 @@ impl Parse for AdapterConfig {
                     ));
                 }
             }
+        }
+        if config.client_error_hook && !config.reqwest {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "`client_error_hook` requires the `reqwest` adapter",
+            ));
         }
         Ok(config)
     }
@@ -121,6 +129,8 @@ struct RouteArgs {
     responses: Vec<DeclaredResponse>,
     error_status: Option<LitInt>,
     additional_error_statuses: Vec<LitInt>,
+    additional_error_content_types: Option<Vec<LitStr>>,
+    client_error_hook: Option<syn::LitBool>,
     bearer_auth: Option<syn::LitBool>,
     browser_auth: Option<syn::LitBool>,
     normalize_body_errors: Option<syn::LitBool>,
@@ -310,6 +320,8 @@ impl Parse for RouteArgs {
             responses: Vec::new(),
             error_status: None,
             additional_error_statuses: Vec::new(),
+            additional_error_content_types: None,
+            client_error_hook: None,
             bearer_auth: None,
             browser_auth: None,
             normalize_body_errors: None,
@@ -379,6 +391,25 @@ impl Parse for RouteArgs {
                         }
                     }
                 }
+                "additional_error_content_types" => {
+                    let content;
+                    syn::bracketed!(content in input);
+                    let values = Punctuated::<LitStr, Token![,]>::parse_terminated(&content)?
+                        .into_iter()
+                        .collect();
+                    set_once(
+                        &mut result.additional_error_content_types,
+                        values,
+                        &key,
+                        "additional_error_content_types",
+                    )?;
+                }
+                "client_error_hook" => set_once(
+                    &mut result.client_error_hook,
+                    input.parse::<syn::LitBool>()?,
+                    &key,
+                    "client_error_hook",
+                )?,
                 "bearer_auth" => set_once(
                     &mut result.bearer_auth,
                     input.parse::<syn::LitBool>()?,
@@ -406,7 +437,7 @@ impl Parse for RouteArgs {
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "unsupported route option; expected operation_id, status, alternate_status, responses, error_status, additional_error_statuses, bearer_auth, browser_auth, normalize_body_errors, or openapi",
+                        "unsupported route option; expected operation_id, status, alternate_status, responses, error_status, additional_error_statuses, additional_error_content_types, client_error_hook, bearer_auth, browser_auth, normalize_body_errors, or openapi",
                     ));
                 }
             }
@@ -502,6 +533,8 @@ struct Operation {
     alternate_status: Option<u16>,
     error_status: Option<u16>,
     additional_error_statuses: Vec<u16>,
+    additional_error_content_types: Vec<String>,
+    client_error_hook: bool,
     bearer_auth: bool,
     browser_auth: bool,
     normalize_body_errors: bool,
@@ -546,7 +579,7 @@ fn normalize_api(
     for mut trait_item in std::mem::take(&mut item.items) {
         let operation = match &mut trait_item {
             TraitItem::Fn(method) => {
-                let operation = normalize_operation(method)?;
+                let operation = normalize_operation(method, adapters)?;
                 retained_items.push(trait_item);
                 operation
             }
@@ -778,6 +811,8 @@ fn normalize_websocket_operation(declaration: &mut syn::TraitItemType) -> syn::R
         alternate_status: None,
         error_status: None,
         additional_error_statuses: Vec::new(),
+        additional_error_content_types: Vec::new(),
+        client_error_hook: false,
         bearer_auth: false,
         browser_auth: false,
         normalize_body_errors: false,
@@ -796,7 +831,10 @@ fn validate_frame_type(ty: &Type) -> syn::Result<()> {
     }
 }
 
-fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
+fn normalize_operation(
+    method: &mut TraitItemFn,
+    adapters: AdapterConfig,
+) -> syn::Result<Operation> {
     validate_signature(method)?;
 
     let mut route = None;
@@ -843,6 +881,53 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
     }
     if let Some(ty) = error_body.as_ref() {
         validate_named_body_type(ty, "error response")?;
+    }
+
+    let client_error_hook = route
+        .client_error_hook
+        .as_ref()
+        .is_some_and(|value| value.value);
+    if client_error_hook {
+        let option = route.client_error_hook.as_ref().expect("enabled hook");
+        if !adapters.reqwest {
+            return Err(syn::Error::new_spanned(
+                option,
+                "client_error_hook requires the `reqwest` adapter",
+            ));
+        }
+        if error_body.is_none() {
+            return Err(syn::Error::new_spanned(
+                option,
+                "client_error_hook requires a public error response type",
+            ));
+        }
+    }
+
+    let mut additional_error_content_types = Vec::new();
+    if let Some(content_types) = &route.additional_error_content_types {
+        if error_body.is_none() {
+            return Err(syn::Error::new_spanned(
+                &route.path,
+                "additional_error_content_types require a public error response type",
+            ));
+        }
+        if content_types.is_empty() {
+            return Err(syn::Error::new_spanned(
+                &route.path,
+                "additional_error_content_types must not be empty",
+            ));
+        }
+        for content_type in content_types {
+            let value = validate_error_content_type(content_type)?;
+            if value == "application/json" || additional_error_content_types.contains(&value) {
+                return Err(syn::Error::new_spanned(
+                    content_type,
+                    "additional error content types must be distinct from each other and application/json",
+                ));
+            }
+            additional_error_content_types.push(value);
+        }
+        additional_error_content_types.sort();
     }
 
     let declared_responses = !route.responses.is_empty();
@@ -1196,6 +1281,8 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
         alternate_status,
         error_status,
         additional_error_statuses,
+        additional_error_content_types,
+        client_error_hook,
         bearer_auth: route.bearer_auth.as_ref().is_some_and(|value| value.value),
         browser_auth: route.browser_auth.as_ref().is_some_and(|value| value.value),
         normalize_body_errors: route
@@ -1204,6 +1291,43 @@ fn normalize_operation(method: &mut TraitItemFn) -> syn::Result<Operation> {
             .is_some_and(|value| value.value),
         openapi_skip: route.openapi.as_ref().is_some_and(|value| !value.value),
     })
+}
+
+// Route media declarations are concrete type/subtype tokens, not media ranges or parameters.
+fn validate_error_content_type(literal: &LitStr) -> syn::Result<String> {
+    let value = literal.value().to_ascii_lowercase();
+    let valid_token = |token: &str| {
+        !token.is_empty()
+            && token.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    };
+    if !value
+        .split_once('/')
+        .is_some_and(|(kind, subtype)| valid_token(kind) && valid_token(subtype))
+    {
+        return Err(syn::Error::new_spanned(
+            literal,
+            "error content type must be a concrete type/subtype without parameters",
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_signature(method: &TraitItemFn) -> syn::Result<()> {
@@ -1815,17 +1939,27 @@ fn reqwest_adapter_tokens(
                 }
             }
         };
+        let public_error_decode = if api.adapters.client_error_hook || operation.client_error_hook {
+            quote! {
+                <#error_type as #api_crate::reqwest::HttpClientError>::decode_error(&__response)
+                    .map_err(#api_crate::reqwest::ClientError::failure)?
+            }
+        } else {
+            quote! {
+                __response
+                    .decode_json::<#error_type>(#api_crate::reqwest::DecodeKind::PublicError)
+                    .map_err(|_| #api_crate::reqwest::ClientError::failure(
+                        #api_crate::reqwest::ClientFailure::ErrorResponseDecode {
+                            status: __status.as_u16(),
+                        },
+                    ))?
+            }
+        };
         let public_error = match operation.error_body.as_ref() {
-            Some(error) => quote! {
+            Some(_) => quote! {
                 if (400..=599).contains(&__actual) {
                     let __status = __response.status();
-                    let __error = __response
-                        .decode_json::<#error>(#api_crate::reqwest::DecodeKind::PublicError)
-                        .map_err(|_| #api_crate::reqwest::ClientError::failure(
-                            #api_crate::reqwest::ClientFailure::ErrorResponseDecode {
-                                status: __status.as_u16(),
-                            },
-                        ))?;
+                    let __error = #public_error_decode;
                     return ::core::result::Result::Err(
                         #api_crate::reqwest::ClientError::public(__status, __error),
                     );
@@ -2098,7 +2232,7 @@ fn axum_adapter_tokens(
                                             status,
                                             rejection.body_text(),
                                         );
-                                        return #api_crate::axum::error_response(
+                                        return #api_crate::axum::http_error_response(
                                             #api_crate::axum::status(status),
                                             error,
                                         );
@@ -2132,7 +2266,7 @@ fn axum_adapter_tokens(
                                             status,
                                             rejection.body_text(),
                                         );
-                                        return #api_crate::axum::error_response(
+                                        return #api_crate::axum::http_error_response(
                                             #api_crate::axum::status(status),
                                             error,
                                         );
@@ -2218,7 +2352,7 @@ fn axum_adapter_tokens(
             let error = match operation.error_status {
                 Some(_) => quote!({
                     let status = #api_crate::HttpError::status_code(&error);
-                    #api_crate::axum::error_response(#api_crate::axum::status(status), error)
+                    #api_crate::axum::http_error_response(#api_crate::axum::status(status), error)
                 }),
                 None => quote!({ let _ = error; #api_crate::axum::empty_response(#api_crate::axum::framework::StatusCode::INTERNAL_SERVER_ERROR) }),
             };
@@ -2315,110 +2449,115 @@ fn openapi_adapter_tokens(
             matches!(operation.transport, Transport::Http) && !operation.openapi_skip
         })
         .map(|operation| {
-        let method = method_name(operation.method);
-        let path = &operation.path;
-        let operation_id = &operation.operation_id;
-        let parameters = operation.parameters.iter().filter_map(|parameter| {
-            if matches!(parameter.location, Location::Body | Location::Binary | Location::Extension) {
-                return None;
-            }
-            let ty = &parameter.ty;
-            let name = &parameter.wire_name;
-            let location = match parameter.location {
-                Location::Path => "path",
-                Location::Query => "query",
-                Location::Header => "header",
-                Location::Body | Location::Binary | Location::Extension => unreachable!(),
-            };
-            Some(quote! {
-                operation.parameter::<#ty>(#name, #location)?;
-            })
-        });
-        let request = operation.request_body.as_ref().map(|body| match body.wire_kind {
-            RequestWireKind::Json => {
-                let ty = &body.ty;
-                quote! {
-                    operation.request_body::<#ty>("application/json")?;
+            let method = method_name(operation.method);
+            let path = &operation.path;
+            let operation_id = &operation.operation_id;
+            let parameters = operation.parameters.iter().filter_map(|parameter| {
+                if matches!(
+                    parameter.location,
+                    Location::Body | Location::Binary | Location::Extension
+                ) {
+                    return None;
                 }
-            }
-            RequestWireKind::Binary => quote! {
-                operation.binary_request_body()?;
-            },
-        });
-        let success_responses = operation.success_responses.iter().enumerate().map(|(index, response)| {
-            let status = response.status;
-            let description = if index == 0 {
-                "Successful response"
-            } else {
-                "Alternate successful response"
-            };
-            let body = match response.body.as_ref() {
-                Some(ty) if is_binary_body_type(ty) => quote! {
-                    operation.binary_response(#status, #description)?;
-                },
-                Some(ty) => quote! {
-                    operation.response::<#ty>(#status, "application/json", #description)?;
-                },
-                None => quote! {
-                    operation.empty_response(#status, #description)?;
-                },
-            };
-            let headers = response.headers.iter().map(|header| {
-                let ty = &header.ty;
-                let name = &header.wire_name;
-                quote! {
-                    operation.response_header::<#ty>(#status, #name)?;
-                }
+                let ty = &parameter.ty;
+                let name = &parameter.wire_name;
+                let location = match parameter.location {
+                    Location::Path => "path",
+                    Location::Query => "query",
+                    Location::Header => "header",
+                    Location::Body | Location::Binary | Location::Extension => unreachable!(),
+                };
+                Some(quote! {
+                    operation.parameter::<#ty>(#name, #location)?;
+                })
             });
-            quote! {
-                #body
-                #(#headers)*
-            }
-        });
-        let error = operation
-            .error_status
-            .zip(operation.error_body.as_ref())
-            .map(|(status, ty)| {
-                quote! {
-                    operation.response::<#ty>(#status, "application/json", "Error response")?;
-                }
-            });
-        let additional_errors = operation
-            .error_body
-            .as_ref()
-            .map(|ty| {
-                operation
-                    .additional_error_statuses
-                    .iter()
-                    .map(|status| {
+            let request = operation
+                .request_body
+                .as_ref()
+                .map(|body| match body.wire_kind {
+                    RequestWireKind::Json => {
+                        let ty = &body.ty;
                         quote! {
-                            operation.response::<#ty>(#status, "application/json", "Error response")?;
+                            operation.request_body::<#ty>("application/json")?;
                         }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let bearer_auth = operation.bearer_auth.then(|| {
-            quote! { operation.bearer_authentication(); }
-        });
-        let browser_auth = operation.browser_auth.then(|| {
-            quote! { operation.browser_authentication(); }
-        });
+                    }
+                    RequestWireKind::Binary => quote! {
+                        operation.binary_request_body()?;
+                    },
+                });
+            let success_responses = operation.success_responses.iter().enumerate().map(
+                |(index, response)| {
+                    let status = response.status;
+                    let description = if index == 0 {
+                        "Successful response"
+                    } else {
+                        "Alternate successful response"
+                    };
+                    let body = match response.body.as_ref() {
+                        Some(ty) if is_binary_body_type(ty) => quote! {
+                            operation.binary_response(#status, #description)?;
+                        },
+                        Some(ty) => quote! {
+                            operation.response::<#ty>(#status, "application/json", #description)?;
+                        },
+                        None => quote! {
+                            operation.empty_response(#status, #description)?;
+                        },
+                    };
+                    let headers = response.headers.iter().map(|header| {
+                        let ty = &header.ty;
+                        let name = &header.wire_name;
+                        quote! {
+                            operation.response_header::<#ty>(#status, #name)?;
+                        }
+                    });
+                    quote! {
+                        #body
+                        #(#headers)*
+                    }
+                },
+            );
+            let errors = operation
+                .error_body
+                .as_ref()
+                .map(|ty| {
+                    let additional_content_types = &operation.additional_error_content_types;
+                    operation
+                        .error_status
+                        .into_iter()
+                        .chain(operation.additional_error_statuses.iter().copied())
+                        .map(|status| {
+                            quote! {
+                                operation.response_content_types::<#ty>(
+                                    #status,
+                                    &["application/json", #(#additional_content_types),*],
+                                    "Error response",
+                                )?;
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let bearer_auth = operation.bearer_auth.then(|| {
+                quote! { operation.bearer_authentication(); }
+            });
+            let browser_auth = operation.browser_auth.then(|| {
+                quote! { operation.browser_authentication(); }
+            });
 
-        quote! {
-            {
-                let mut operation = builder.operation(#method, #path, #operation_id)?;
-                #(#parameters)*
-                #bearer_auth
-                #browser_auth
-                #request
-                #(#success_responses)*
-                #error
-                #(#additional_errors)*
-                operation.finish()?;
+            quote! {
+                {
+                    let mut operation = builder.operation(#method, #path, #operation_id)?;
+                    #(#parameters)*
+                    #bearer_auth
+                    #browser_auth
+                    #request
+                    #(#success_responses)*
+                    #(#errors)*
+                    operation.finish()?;
+                }
             }
-        }
-    });
+        });
 
     quote! {
         #[doc = "Build this trait's deterministic, deployment-independent OpenAPI 3.1 document."]
@@ -2660,6 +2799,13 @@ fn metadata_tokens(
         } else {
             quote!(#api_crate::WireKind::Empty)
         };
+        let content_types = if response.body.as_ref().is_some_and(is_binary_body_type) {
+            quote!(&["application/octet-stream"])
+        } else if response.body.is_some() {
+            quote!(&["application/json"])
+        } else {
+            quote!(&[])
+        };
         let headers = response.headers.iter().map(|header| {
             let wire_name = &header.wire_name;
             let ty = &header.ty;
@@ -2674,6 +2820,7 @@ fn metadata_tokens(
             #api_crate::ResponseMetadata {
                 status: #status,
                 body: #api_crate::BodyMetadata { wire_kind: #wire_kind },
+                content_types: #content_types,
                 headers: &[#(#headers),*],
             }
         }
@@ -2683,10 +2830,12 @@ fn metadata_tokens(
         .into_iter()
         .chain(operation.additional_error_statuses.iter().copied());
     let error_responses = error_statuses.map(|status| {
+        let additional_content_types = &operation.additional_error_content_types;
         quote! {
             #api_crate::ResponseMetadata {
                 status: #status,
                 body: #api_crate::BodyMetadata { wire_kind: #api_crate::WireKind::Json },
+                content_types: &["application/json", #(#additional_content_types),*],
                 headers: &[],
             }
         }

@@ -10,6 +10,7 @@ http-client = ["dep:reqwest"]
 
 [dependencies]
 async-trait.workspace = true
+error-contract.workspace = true
 fs-operation.workspace = true
 libc.workspace = true
 manifest.workspace = true
@@ -20,6 +21,8 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+uuid = { workspace = true, features = ["v7"] }
+tracing.workspace = true
 tokio = { workspace = true, features = ["io-util", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]

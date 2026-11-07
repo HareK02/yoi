@@ -349,7 +349,7 @@ mod input_delivery {
             open_action("must not save"),
             f.ranges.clone(),
         );
-        f.store().retire_subject(&f.host.subject_id).unwrap();
+        crate::tests::legacy_retired_fixture(f.store(), &f.host.subject_id).unwrap();
         f.reopen();
         assert!(matches!(
             service::attest_input_delivery(f.store(), &ctx, &digest(), &f.ranges),
@@ -429,12 +429,16 @@ mod input_delivery {
                 ))
                 .unwrap();
             let store = SubjektivStore::open(&scope, &registration).unwrap();
-            let subject = store
-                .create_subject_with_behavior(
-                    SubjectRole::new("preserved").unwrap(),
-                    "Existing behavior".into(),
-                )
-                .unwrap();
+            let subject = if baseline.last().unwrap().version() < 12 {
+                pre_permissions_subject_fixture(&store, "preserved", "Existing behavior")
+            } else {
+                store
+                    .create_subject_with_behavior(
+                        SubjectRole::new("preserved").unwrap(),
+                        "Existing behavior".into(),
+                    )
+                    .unwrap()
+            };
             drop(store);
             drop(scope);
             manager.shutdown().unwrap();
@@ -494,8 +498,8 @@ mod input_delivery {
     }
 
     #[test]
-    fn input_delivery_migration_failure_rolls_back_table_creation_and_retries() {
-        // A colliding trigger is created before migration so failure occurs after its new table DDL.
+    fn input_delivery_migration_collision_is_rejected_before_ddl_and_retries() {
+        // A colliding trigger must be diagnosed before pending migration DDL.
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("rollback");
         let manager = FeatureStorage::new(&root);
@@ -525,12 +529,16 @@ mod input_delivery {
         let manager = FeatureStorage::new(&root);
         let scope = manager.scope("input-delivery-rollback").unwrap();
         let registration = SubjektivStore::register(&scope).unwrap();
-        assert!(matches!(
-            SubjektivStore::open(&scope, &registration),
+        match SubjektivStore::open(&scope, &registration) {
             Err(crate::SubjektivError::Storage(
-                feature_storage::FeatureStorageError::MigrationFailed { .. }
-            ))
-        ));
+                feature_storage::FeatureStorageError::MigrationHistory { detail, .. },
+            )) => assert!(
+                detail.contains("journal_generation_input_delivery_no_update"),
+                "{detail}"
+            ),
+            Err(error) => panic!("expected pre-DDL shape refusal, got {error:?}"),
+            Ok(_) => panic!("colliding schema was accepted"),
+        }
         drop(scope);
         manager.shutdown().unwrap();
         drop(manager);
@@ -547,6 +555,11 @@ mod input_delivery {
         assert_eq!(store.subject(&subject.id).unwrap(), Some(subject.clone()));
         store.database.try_transaction(|tx| {
             assert!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='journal_generation_input_deliveries')", [], |r| r.get::<_, bool>(0))?);
+            let receipts = tx.prepare("SELECT version,name FROM __yoi_feature_schema_migrations ORDER BY version")?
+                .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let expected: Vec<_> = (&crate::MIGRATIONS[..12]).iter().map(|m| (m.version(), m.name().to_string())).collect();
+            assert_eq!(receipts, expected);
             tx.execute_batch("DROP TRIGGER journal_generation_input_delivery_no_update")?;
             Ok::<_, JournalError>(())
         }).unwrap();
@@ -685,8 +698,16 @@ mod snapshot_inputs {
         f: &Fixture,
         bodies: &[String],
     ) -> (JournalHostContext, String, CaptureDto) {
-        let host = session_host(f.store(), &f.host.subject_id, "canonical-input-session");
-        let capture = canonical_capture("canonical-input-session", bodies);
+        admitted_capture_in_session(f, "canonical-input-session", bodies)
+    }
+
+    fn admitted_capture_in_session(
+        f: &Fixture,
+        session: &str,
+        bodies: &[String],
+    ) -> (JournalHostContext, String, CaptureDto) {
+        let host = session_host(f.store(), &f.host.subject_id, session);
+        let capture = canonical_capture(session, bodies);
         let mut journal_id = None;
         for ranges in recording::capture_ranges(&capture)
             .unwrap()
@@ -792,6 +813,137 @@ mod snapshot_inputs {
         service::execute_snapshot(f.store(), ctx, &request.input_digest().unwrap(), action)
     }
 
+    fn human_metadata(capture: &mut CaptureDto, account_id: &str) {
+        for entry in &mut capture.entries {
+            let origin = session_store::LoggedSessionHistoryOrigin::HumanInput {
+                account_id: account_id.into(),
+            };
+            entry.source.history_origin = Some(origin.clone());
+            let CaptureBody::CanonicalPublic { descriptor, .. } = &mut entry.body else {
+                unreachable!();
+            };
+            descriptor.origin = PublicMaterialOrigin::History { origin };
+        }
+    }
+
+    #[test]
+    fn admission_and_job_capture_keep_a_complete_body_larger_than_48_kib() {
+        let f = Fixture::new();
+        let body = "界".repeat(24_000);
+        let (host, id, capture) = admitted_capture(&f, std::slice::from_ref(&body));
+        let admitted = capture
+            .recording_slice(
+                RecordingPosition::default(),
+                MAX_JOURNAL_RANGES,
+                JournalInput::capture_budget(),
+            )
+            .unwrap();
+        assert!(admitted.next.is_none());
+        assert_eq!(admitted.capture.recording_text(0).unwrap().2, body);
+        let input = JournalInput::build(f.store(), &host, &id, |order, byte, budget| {
+            assert!(budget > 48 * 1024);
+            Ok(capture
+                .recording_slice(
+                    RecordingPosition {
+                        canonical_order: order,
+                        byte_offset: byte,
+                    },
+                    MAX_JOURNAL_RANGES,
+                    budget,
+                )
+                .unwrap()
+                .capture)
+        })
+        .unwrap();
+        assert_eq!(input.selected_ranges[0].bytes.end, body.len() as u64);
+        job_request("above-old-cutoff", &input);
+    }
+
+    #[test]
+    fn journal_job_limit_fits_the_maximal_prefix_with_escaped_utf8_metadata_and_body() {
+        for body in ["x".repeat(200_000), "🦀\u{1}\\\"界\n".repeat(30_000)] {
+            let f = Fixture::new();
+            let session = "資料\"\\🦀".repeat(10);
+            let (host, id, mut capture) =
+                admitted_capture_in_session(&f, &session, std::slice::from_ref(&body));
+            human_metadata(&mut capture, &"利用者\"\\\u{1}".repeat(2_000));
+            capture.validate(CaptureLimits::default()).unwrap();
+            let input = JournalInput::build(f.store(), &host, &id, |order, byte, budget| {
+                let slice = capture
+                    .recording_slice(
+                        RecordingPosition {
+                            canonical_order: order,
+                            byte_offset: byte,
+                        },
+                        MAX_JOURNAL_RANGES,
+                        budget,
+                    )
+                    .unwrap();
+                assert!(serde_json::to_vec(&slice).unwrap().len() <= budget);
+                Ok(slice.capture)
+            })
+            .unwrap();
+            let request = job_request("exact-job-boundary", &input);
+            let size = serde_json::to_vec(&request.input).unwrap().len();
+            if body.starts_with('x') {
+                assert_eq!(size, ::job::MAX_JOB_INPUT_BYTES);
+            }
+            assert!(size <= ::job::MAX_JOB_INPUT_BYTES);
+            let end = input.selected_ranges[0].bytes.end as usize;
+            assert!(end < body.len());
+            assert_eq!(input.capture.recording_text(0).unwrap().2, &body[..end]);
+            let mut one_more = input.clone();
+            let next = body[end..].chars().next().unwrap();
+            let CaptureBody::CanonicalPublic { text, .. } = &mut one_more.capture.entries[0].body
+            else {
+                unreachable!()
+            };
+            text.push(next);
+            one_more.selected_ranges[0].bytes.end += next.len_utf8() as u64;
+            let oversized = serde_json::to_value(&one_more).unwrap();
+            assert!(serde_json::to_vec(&oversized).unwrap().len() > ::job::MAX_JOB_INPUT_BYTES);
+            assert!(JournalInput::decode(&oversized).is_err());
+            assert!(
+                ::job::JobRequest {
+                    input: oversized,
+                    ..request
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn unfit_next_entry_metadata_preserves_the_earlier_complete_prefix() {
+        let f = Fixture::new();
+        let (host, id, mut capture) = admitted_capture(&f, &["first".into(), "🦀".into()]);
+        let mut next_only = capture.clone();
+        next_only.entries.remove(0);
+        human_metadata(&mut next_only, &"\\\"\u{1}界".repeat(8_000));
+        capture.entries[1] = next_only.entries.remove(0);
+        let input = JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture)).unwrap();
+        assert_eq!(input.selected_ranges.len(), 1);
+        assert_eq!(input.capture.recording_text(0).unwrap().2, "first");
+        job_request("metadata-does-not-drop-earlier-entry", &input);
+        let journal = f.store().read_journal(&host, &id).unwrap();
+        assert_eq!((journal.process_order, journal.process_byte), (0, 0));
+    }
+
+    #[test]
+    fn unfit_first_entry_metadata_errors_without_advancing_the_checkpoint() {
+        let f = Fixture::new();
+        let (host, id, mut capture) = admitted_capture(&f, &["🦀".into()]);
+        human_metadata(&mut capture, &"\\\"\u{1}界".repeat(8_000));
+        assert!(matches!(
+            JournalInput::build(f.store(), &host, &id, |_, _, _| Ok(capture)),
+            Err(JournalError::InvalidInput(_))
+        ));
+        let journal = f.store().read_journal(&host, &id).unwrap();
+        assert_eq!((journal.process_order, journal.process_byte), (0, 0));
+        assert!(f.store().journal_retention_required(&host).unwrap());
+    }
+
     #[test]
     fn complete_input_budget_and_successive_canonical_prefixes_preserve_all_escaped_utf8_bytes() {
         let f = Fixture::new();
@@ -799,7 +951,8 @@ mod snapshot_inputs {
             .map(|i| format!("[user {i}] 公開原文\n\"\\\u{1}\t").repeat(8))
             .collect();
         bodies[60] = "[long public result] 日本語🦀\n\"\\\u{1}\t".repeat(14_000);
-        let (host, id, capture) = admitted_capture(&f, &bodies);
+        let (host, id, mut capture) = admitted_capture(&f, &bodies);
+        human_metadata(&mut capture, &"利用者\"\\\u{1}".repeat(80));
         let all_ranges = recording::capture_ranges(&capture).unwrap();
         seed_initial_state(&f, &host, &id, all_ranges[..1].to_vec());
         let mut reconstructed = vec![String::new(); bodies.len()];
@@ -1210,6 +1363,21 @@ mod snapshot_inputs {
             service::finish(f.store(), &recovery).unwrap(),
             saved_completion
         );
+        // Deletion, unlike writer release, invalidates even exact saved input/completion replay.
+        f.store()
+            .begin_subject_deletion(&host.subject_id, "delete")
+            .unwrap();
+        subject_deleted(
+            f.store()
+                .prepare_journal_input(&host, &input, generation.job.clone()),
+        );
+        subject_deleted(service::finish(f.store(), &recovery));
+        subject_deleted(JournalJobContext::validated_recovery(
+            f.store(),
+            &host,
+            &generation.id,
+            generation.job.clone(),
+        ));
     }
 
     #[test]
@@ -1575,6 +1743,42 @@ use feature_storage::{FeatureStorage, ScopedFeatureStorage};
 use sha2::{Digest, Sha256};
 use std::sync::{Arc, Barrier};
 use std::thread;
+
+pub(super) fn pre_permissions_subject_fixture(
+    store: &SubjektivStore,
+    role: &str,
+    behavior: &str,
+) -> crate::SubjectRecord {
+    // Freeze the schema 7–11 row/record shape; today's create API also writes policy tables.
+    assert!((7..=11).contains(&store.database.schema_version().unwrap()));
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "id": "legacy-subject",
+        "role": role,
+        "behavior_md": behavior,
+        "state": "active",
+        "created_at": "2026-09-28T10:00:00.000Z",
+        "updated_at": "2026-09-28T10:00:00.000Z"
+    });
+    store
+        .database
+        .try_transaction::<_, crate::SubjektivError>(|tx| {
+            tx.execute(
+                "INSERT INTO subjects(subject_id,role,behavior_md,state,record_json,created_at,updated_at)
+                 VALUES(?1,?2,?3,'active',?4,?5,?5)",
+                rusqlite::params![
+                    "legacy-subject",
+                    role,
+                    behavior,
+                    record.to_string(),
+                    "2026-09-28T10:00:00.000Z",
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    serde_json::from_value(record).unwrap()
+}
 
 #[test]
 fn explicit_erasure_releases_only_after_all_body_sessions_including_unadmitted_history_are_erased()
@@ -2833,7 +3037,7 @@ fn job_service_source_reads_are_generation_bound_and_stop_at_supplied_byte_end()
 #[test]
 fn explicit_erasure_remains_available_for_retired_subject_without_reopening_recording() {
     let f = Fixture::new();
-    f.store().retire_subject(&f.host.subject_id).unwrap();
+    crate::tests::legacy_retired_fixture(f.store(), &f.host.subject_id).unwrap();
     assert!(f.store().journal_retention_required(&f.host).unwrap());
     f.store()
         .erase_journal_session(&f.host, "erase-retired")
@@ -3118,16 +3322,17 @@ impl Fixture {
             SubjektivStore::register(&workspace).unwrap()
         };
         let store = SubjektivStore::open(&workspace, &registration).unwrap();
-        let subject = store
-            .create_subject_with_behavior(
-                SubjectRole::new("companion").unwrap(),
-                if upgrade {
-                    "Preserve existing Subject behavior".into()
-                } else {
-                    String::new()
-                },
+        let subject = if upgrade {
+            pre_permissions_subject_fixture(
+                &store,
+                "companion",
+                "Preserve existing Subject behavior",
             )
-            .unwrap();
+        } else {
+            store
+                .create_subject(SubjectRole::new("companion").unwrap())
+                .unwrap()
+        };
         let attribution =
             SubjectSessionAttribution::new(&subject.id, "runtime", "worker", "source-session")
                 .unwrap();
@@ -4086,10 +4291,7 @@ fn retired_subject_keeps_reader_access_but_rejects_existing_write_context() {
         },
         vec![],
     );
-    fixture
-        .store()
-        .retire_subject(&fixture.host.subject_id)
-        .unwrap();
+    crate::tests::legacy_retired_fixture(fixture.store(), &fixture.host.subject_id).unwrap();
     assert!(matches!(
         fixture.store().execute_journal(&ctx, late),
         Err(JournalError::PermissionDenied(_))
@@ -5030,10 +5232,12 @@ fn backup_restore_preserves_generation_records_corrections_sources_position_and_
         vec![],
     );
     fixture.close(&generation);
-    fixture.workspace.as_ref().unwrap().delete().unwrap();
     fixture.store.take();
     fixture.workspace.take();
     fixture.manager.take().unwrap().shutdown().unwrap();
+    // Data-file loss is recoverable while the durable source owner remains intact.
+    // Explicit delete is a separate irreversible fence, covered by storage-owner tests.
+    std::fs::remove_dir_all(fixture.temp.path().join("storage/journal-tests")).unwrap();
     let manager = FeatureStorage::new(fixture.temp.path().join("storage"));
     let workspace = manager.workspace("journal-tests").unwrap();
     workspace.restore(&snapshot).unwrap();
@@ -5169,16 +5373,20 @@ fn failure_before_receipt_rolls_back_record_and_checkpoint_then_exact_retry_succ
     );
     let before = fixture.state();
     let sources = fixture.sources();
-    assert!(matches!(
-        fixture.store().execute_journal(&ctx, record.clone()),
-        Err(JournalError::Storage(_))
-    ));
+    let error = fixture
+        .store()
+        .execute_journal(&ctx, record.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected before receipt"),
+        "{error}"
+    );
+    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     fixture.reopen();
     assert_eq!(fixture.state(), before);
     assert_eq!(fixture.sources(), sources);
     assert!(fixture.entries().is_empty());
     assert!(fixture.receipt("fault-record").is_none());
-    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     let saved = fixture
         .store()
         .execute_journal(&ctx, record.clone())
@@ -5195,16 +5403,20 @@ fn failure_before_receipt_rolls_back_record_and_checkpoint_then_exact_retry_succ
     );
     fixture.sql("CREATE TRIGGER fail_test_receipt BEFORE INSERT ON journal_operations WHEN NEW.request_id='fault-checkpoint' BEGIN SELECT RAISE(ABORT, 'injected before receipt'); END;").unwrap();
     let before_checkpoint = fixture.state();
-    assert!(matches!(
-        fixture.store().execute_journal(&ctx, cp.clone()),
-        Err(JournalError::Storage(_))
-    ));
+    let error = fixture
+        .store()
+        .execute_journal(&ctx, cp.clone())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected before receipt"),
+        "{error}"
+    );
+    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     fixture.reopen();
     assert_eq!(fixture.state(), before_checkpoint);
     assert_eq!(fixture.sources(), sources);
     assert_eq!(fixture.receipt("fault-record"), Some(saved));
     assert!(fixture.receipt("fault-checkpoint").is_none());
-    fixture.sql("DROP TRIGGER fail_test_receipt;").unwrap();
     let reflected = fixture.store().execute_journal(&ctx, cp.clone()).unwrap();
     assert_eq!((reflected.process_order, reflected.process_byte), (2, 0));
     fixture.reopen();
@@ -5476,7 +5688,8 @@ fn serialized_metadata_and_text_budgets_preserve_continuation_and_availability_r
 }
 
 #[test]
-fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existing_subject() {
+fn journal_migration_collision_is_rejected_before_ddl_and_retries_without_changing_existing_subject()
+ {
     for (baseline, collision, rolled_back) in [
         (&crate::MIGRATIONS[..7], "journal_entries", "journals"),
         (
@@ -5496,12 +5709,7 @@ fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existin
             ))
             .unwrap();
         let store = SubjektivStore::open(&scope, &registration).unwrap();
-        let subject = store
-            .create_subject_with_behavior(
-                SubjectRole::new("preserved").unwrap(),
-                "Original behavior".into(),
-            )
-            .unwrap();
+        let subject = pre_permissions_subject_fixture(&store, "preserved", "Original behavior");
         store
             .database
             .try_transaction::<_, JournalError>(|tx| {
@@ -5516,12 +5724,13 @@ fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existin
         let manager = FeatureStorage::new(&root);
         let scope = manager.scope("migration-rollback").unwrap();
         let registration = SubjektivStore::register(&scope).unwrap();
-        assert!(matches!(
-            SubjektivStore::open(&scope, &registration),
+        match SubjektivStore::open(&scope, &registration) {
             Err(crate::SubjektivError::Storage(
-                feature_storage::FeatureStorageError::MigrationFailed { .. }
-            ))
-        ));
+                feature_storage::FeatureStorageError::MigrationHistory { detail, .. },
+            )) => assert!(detail.contains(collision), "{detail}"),
+            Err(error) => panic!("expected pre-DDL shape refusal, got {error:?}"),
+            Ok(_) => panic!("colliding schema was accepted"),
+        }
         drop(scope);
         manager.shutdown().unwrap();
         drop(manager);
@@ -5543,6 +5752,17 @@ fn journal_migration_failure_rolls_back_ddl_and_retries_without_changing_existin
                     [rolled_back],
                     |r| r.get::<_, bool>(0)
                 )?);
+                let receipts = tx
+                    .prepare(
+                        "SELECT version,name FROM __yoi_feature_schema_migrations ORDER BY version",
+                    )?
+                    .query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let expected: Vec<_> = (baseline)
+                    .iter()
+                    .map(|m| (m.version(), m.name().to_string()))
+                    .collect();
+                assert_eq!(receipts, expected);
                 tx.execute_batch(&format!("DROP TABLE {collision}"))?;
                 Ok(())
             })
@@ -5744,4 +5964,315 @@ fn late_gap_admission_and_partial_updates_reject_stale_source_page_cursors() {
             .list_journal_sources(&host, &id, Some(&cursor.to_string()), 1),
         Err(JournalError::InvalidInput(_))
     ));
+}
+
+fn subject_deleted<T: std::fmt::Debug>(result: JournalResult<T>) {
+    assert!(
+        matches!(
+            result,
+            Err(JournalError::Subject(
+                crate::SubjektivError::SubjectNotFound(_)
+            ))
+        ),
+        "unexpected result: {result:?}"
+    );
+}
+
+#[test]
+fn subject_deletion_fence_denies_all_journal_read_write_binding_and_recovery_paths() {
+    use transport::{
+        JournalJobRequest as Request, JournalSnapshot, JournalTextRead, JournalTextTarget,
+    };
+    let mut f = Fixture::new();
+    let (generation, ctx) = f.generation("delete-job", f.ranges.clone());
+    let operation = f.operation(
+        "saved",
+        open_action("private body"),
+        vec![f.ranges[0].clone()],
+    );
+    let receipt = f.store().execute_journal(&ctx, operation.clone()).unwrap();
+    let entry = receipt.entry_id.unwrap();
+    let reader = JournalHostContext::validated_reader(f.store(), &f.host.subject_id).unwrap();
+    let writer = f
+        .store()
+        .claim_journal_writer(&f.host.subject_id, "runtime", "worker")
+        .unwrap();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    service::attest_input_delivery(f.store(), &ctx, &digest, &f.ranges).unwrap();
+    f.store().database.try_transaction::<_, JournalError>(|tx| {
+        tx.execute("INSERT INTO journal_generation_deliveries(generation_id,source_order,ranges_json) VALUES(?1,0,'[]')", [&generation.id])?;
+        Ok(())
+    }).unwrap();
+    f.store().database.try_transaction::<_, JournalError>(|tx| {
+        tx.execute("INSERT INTO legacy_record_archive(source_table,row_position,row_json) VALUES('subjects',0,?1)", [serde_json::json!({"subject_id":f.host.subject_id,"record_json":"archived private body"}).to_string()])?;
+        Ok(())
+    }).unwrap();
+    f.store()
+        .begin_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap();
+    // Exercise actual SQL owner resolution for *every* indirect content table,
+    // not only table-name inventory. Fence errors must precede PK/immutable/FK errors.
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|tx| {
+            for (table, field, new_owner) in [
+                ("journal_sources", "journal_id", "other-journal"),
+                ("journal_operations", "journal_id", "other-journal"),
+                ("journal_generations", "journal_id", "other-journal"),
+                ("journal_session_bindings", "binding_id", "other-binding"),
+                (
+                    "journal_generation_deliveries",
+                    "generation_id",
+                    "other-generation",
+                ),
+                (
+                    "journal_generation_input_deliveries",
+                    "generation_id",
+                    "other-generation",
+                ),
+                (
+                    "legacy_record_archive",
+                    "row_json",
+                    "{\"subject_id\":\"other-subject\"}",
+                ),
+            ] {
+                assert!(
+                    tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))?
+                        > 0,
+                    "{table}"
+                );
+                let insert = tx
+                    .execute(&format!("INSERT INTO {table} SELECT * FROM {table}"), [])
+                    .unwrap_err();
+                assert!(
+                    insert.to_string().contains("Subject deletion has begun"),
+                    "{table}: {insert}"
+                );
+                let update = tx
+                    .execute(&format!("UPDATE {table} SET {field}=?1"), [new_owner])
+                    .unwrap_err();
+                assert!(
+                    update.to_string().contains("Subject deletion has begun"),
+                    "{table}: {update}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    macro_rules! denied { ($($result:expr),+ $(,)?) => { $(subject_deleted($result);)+ }; }
+    for host in [&f.host, &reader] {
+        denied!(
+            f.store().list_journals(host, None, 1),
+            f.store().read_journal(host, &f.journal_id),
+            f.store().list_journal_entries(host, &f.journal_id, None, 1),
+            f.store().read_journal_text(
+                host,
+                &f.journal_id,
+                Some(&entry),
+                JournalTextField::Body,
+                None,
+                0,
+                8
+            ),
+            f.store().read_journal_source(host, &f.journal_id, 0),
+            f.store().list_journal_sources(host, &f.journal_id, None, 1),
+            f.store()
+                .query_journal_operation(host, &f.journal_id, "saved"),
+            f.store()
+                .read_journal_operation_status(host, &f.journal_id, "saved"),
+            f.store()
+                .read_journal_operation_coverage(host, &f.journal_id, "saved", 0, 1),
+            f.store()
+                .list_journal_operations(host, &f.journal_id, None, 1),
+            f.store().journal_entry_summary(host, &f.journal_id, &entry),
+            f.store()
+                .journal_correction_targets(host, &f.journal_id, &entry),
+            f.store()
+                .browse_journal_entries(host, None, None, None, None, 1),
+            f.store()
+                .journal_has_unreflected_sources(host, &f.journal_id),
+            f.store().journal_startup_snapshot(host, None),
+        );
+    }
+    denied!(
+        f.store().journal_compaction_snapshot(&f.host),
+        f.store().journal_session_erased(&f.host),
+        f.store().journal_for_session(&f.host),
+        f.store().journal_retention_required(&f.host),
+        f.store().erase_journal_session(&f.host, "erase"),
+        f.store().release_erased_journal_body(&f.host),
+        f.store().journal_predecessor_session(&writer),
+        f.store()
+            .journal_body_is_unpublished(&f.host.subject_id, "runtime", "worker"),
+        f.store()
+            .journal_worker_was_released(&f.host.subject_id, "runtime", "worker"),
+        f.store().journal_writer_active(&writer),
+        f.store()
+            .journal_session_writer_matches(&writer, "source-session"),
+        f.store()
+            .claim_journal_writer(&f.host.subject_id, "runtime", "worker"),
+        f.store()
+            .bind_journal_session(&writer, f.host.attribution.clone().unwrap()),
+        f.store().release_journal_writer(&writer),
+        f.store().accept_journal_sources(&f.host, "late", &f.ranges),
+        f.store()
+            .mark_journal_sources_unavailable(&f.host, &f.journal_id, &f.ranges),
+        f.store()
+            .mark_journal_sources_available(&f.host, &f.journal_id, &f.ranges),
+        f.store().active_journal_generation(&f.host, &f.journal_id),
+        f.store().prepare_journal_generation(
+            &f.host,
+            &f.journal_id,
+            generation.job.clone(),
+            f.ranges.clone()
+        ),
+        f.store()
+            .close_journal_generation(&f.host, &generation.id, &generation.job),
+        f.store().read_journal_generation(&f.host, &generation.id),
+        f.store().journal_resume_state(&f.host, &f.journal_id),
+        f.store().execute_journal(&ctx, operation.clone()),
+        JournalJobContext::validated_recovery(
+            f.store(),
+            &f.host,
+            &generation.id,
+            generation.job.clone()
+        ),
+        service::attest_input_delivery(f.store(), &ctx, &digest, &f.ranges),
+        service::finish(f.store(), &ctx),
+        service::execute_snapshot(f.store(), &ctx, &digest, Request::ReadState),
+        service::execute_snapshot(
+            f.store(),
+            &ctx,
+            &digest,
+            Request::QueryOperation {
+                request_id: "saved".into()
+            }
+        ),
+        service::execute_snapshot(
+            f.store(),
+            &ctx,
+            &digest,
+            Request::ReadText {
+                read: JournalTextRead {
+                    target: JournalTextTarget::Position {
+                        snapshot: JournalSnapshot::Initial
+                    },
+                    offset: 0,
+                    limit: 8,
+                    content_token: None
+                }
+            }
+        ),
+    );
+    // Failed purge and restart must not revive any cached context or exact receipt.
+    f.sql("CREATE TRIGGER injected_subject_purge_failure BEFORE DELETE ON subjects BEGIN SELECT RAISE(ABORT,'injected subject purge'); END;").unwrap();
+    let error = f
+        .store()
+        .finish_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("injected subject purge"),
+        "{error}"
+    );
+    f.sql("DROP TRIGGER injected_subject_purge_failure;")
+        .unwrap();
+    f.reopen();
+    subject_deleted(f.store().execute_journal(&ctx, operation));
+    f.store()
+        .finish_subject_deletion(&f.host.subject_id, "delete")
+        .unwrap();
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|tx| {
+            for table in [
+                "journals",
+                "journal_entries",
+                "journal_corrections",
+                "journal_sources",
+                "journal_generations",
+                "journal_operations",
+                "journal_generation_deliveries",
+                "journal_generation_input_deliveries",
+                "journal_writer_bindings",
+                "journal_session_bindings",
+            ] {
+                assert_eq!(
+                    tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                        .get::<_, i64>(0))?,
+                    0,
+                    "{table}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn subject_deletion_during_capture_rejects_even_empty_delayed_input() {
+    use session_store::capture::CaptureDto;
+    let f = Fixture::new();
+    let result = recording::JournalInput::build(f.store(), &f.host, &f.journal_id, |_, _, _| {
+        f.store()
+            .begin_subject_deletion(&f.host.subject_id, "delete")?;
+        Ok(CaptureDto {
+            version: 1,
+            session_id: "source-session".into(),
+            segment_id: "segment".into(),
+            view_entry_count: 0,
+            entries: vec![],
+        })
+    });
+    subject_deleted(result);
+}
+
+#[test]
+fn subject_deletion_during_source_callback_cannot_return_or_attest_cached_material() {
+    use transport::{JournalJobRequest as Request, JournalTextRead, JournalTextTarget};
+    let f = Fixture::new();
+    let (_, ctx) = f.generation("delayed-source", f.ranges.clone());
+    let result = service::execute_bounded(
+        f.store(),
+        &ctx,
+        Request::ReadText {
+            read: JournalTextRead {
+                target: JournalTextTarget::Source {
+                    pointer: f.ranges[0].source.pointer.clone(),
+                },
+                offset: 0,
+                limit: 8,
+                content_token: None,
+            },
+        },
+        |source, start, _| {
+            f.store()
+                .begin_subject_deletion(&f.host.subject_id, "delete")?;
+            Ok(recording::JournalMaterial {
+                range: JournalSourceRange {
+                    source: source.clone(),
+                    bytes: JournalByteRange {
+                        start,
+                        end: start + 8,
+                    },
+                },
+                text: "private!".into(),
+            })
+        },
+    );
+    subject_deleted(result);
+    f.store()
+        .database
+        .try_with_connection::<_, JournalError>(|tx| {
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM journal_generation_deliveries",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
 }

@@ -1,16 +1,28 @@
 import type {
-  Diagnostic,
+  DomainFailureDetails,
+  WorkdirManagementOperation,
+} from "#lib/generated/domain-failures.ts";
+import { decodeDomainFailureDetails } from "#lib/workspace/failure/domains.ts";
+import { failureNotice } from "#lib/workspace/failure/model.ts";
+import {
+  decodeFailure,
+  type FailureReceipt,
+  receiveProblem,
+} from "#lib/workspace/failure/receive.ts";
+import { type ApiResult, readBoundedJson } from "./http.ts";
+import type {
   ExternalWorkdirPermissions,
   WorkingDirectoryCleanupTarget,
   WorkingDirectoryCreateRequest,
   WorkingDirectoryCreateResponse,
   WorkingDirectoryDetailResponse,
   WorkingDirectoryListResponse,
+  WorkingDirectoryManagementDiagnostic,
   WorkingDirectoryOccupancy,
   WorkingDirectoryRemovalResponse,
   WorkingDirectorySource,
   WorkingDirectorySummary,
-} from "../../generated/workdir-api";
+} from "../../generated/workdir-api.ts";
 
 const SUMMARY_KEYS = new Set([
   "working_directory_id",
@@ -36,7 +48,7 @@ const CREATE_REQUEST_KEYS = new Set([
   "selector",
   "operation_id",
 ]);
-const DIAGNOSTIC_KEYS = new Set(["code", "severity", "message"]);
+const DIAGNOSTIC_KEYS = new Set(["code", "severity", "message", "failure"]);
 const CLEANUP_TARGET_KEYS = new Set([
   "kind",
   "working_directory_id",
@@ -342,12 +354,22 @@ function parseOccupancy(value: unknown): WorkingDirectoryOccupancy {
   };
 }
 
-function parseDiagnostic(value: unknown): Diagnostic {
+function parseDiagnostic(value: unknown): WorkingDirectoryManagementDiagnostic {
   const record = exactRecord(value, DIAGNOSTIC_KEYS, "Workdir diagnostic");
+  // Optional evidence cannot invalidate the inventory/status or invent a cause
+  // for historical diagnostics. Only the shared receiver interprets its bytes.
+  const evidence = typeof record.failure === "string"
+    ? decodeFailure(record.failure, decodeDomainFailureDetails)
+    : null;
+  const known = evidence?.kind === "known" &&
+    evidence.failure.domain === "workdir_management";
   return {
     code: stringField(record, "code"),
     severity: enumField(record, "severity", ["info", "warning", "error"]),
-    message: stringField(record, "message"),
+    message: known
+      ? evidence.failure.explanation
+      : stringField(record, "message"),
+    ...(known ? { failure: record.failure as string } : {}),
   };
 }
 
@@ -421,4 +443,53 @@ function assignOptionalString<T extends object>(
     throw new Error(`${key} must be a non-empty string or null`);
   }
   (target as Record<string, unknown>)[key] = value;
+}
+
+export class WorkdirManagementHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly receipt: FailureReceipt<DomainFailureDetails>,
+  ) {
+    super(failureNotice(receipt).explanation);
+    this.name = "WorkdirManagementHttpError";
+  }
+}
+
+export async function workdirManagementResponseError(
+  response: Response,
+  operation: WorkdirManagementOperation,
+): Promise<WorkdirManagementHttpError> {
+  let receipt = await receiveProblem(response, decodeDomainFailureDetails);
+  if (receipt.kind === "problem") {
+    const failure = receipt.problem.yoi_failure;
+    if (
+      failure.domain !== "workdir_management" ||
+      !("operation" in failure.details) ||
+      failure.details.operation !== operation
+    ) {
+      receipt = { kind: "unsupported" };
+    }
+  }
+  return new WorkdirManagementHttpError(response.status, receipt);
+}
+
+export async function loadWorkdirJson<T>(
+  fetchFn: typeof fetch,
+  path: string,
+  parse: (value: unknown) => T,
+  init?: RequestInit,
+): Promise<ApiResult<T>> {
+  try {
+    const response = await fetchFn(path, init);
+    if (!response.ok) {
+      const error = await workdirManagementResponseError(response, "list");
+      return { data: null, status: response.status, error: error.message };
+    }
+    return {
+      data: parse(await readBoundedJson(response, 512 * 1024)),
+      error: null,
+    };
+  } catch {
+    return { data: null, error: "Workdir inventory could not be loaded" };
+  }
 }

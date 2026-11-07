@@ -105,6 +105,7 @@ pub(super) fn check_session_host(
             "different storage scope".into(),
         ));
     }
+    crate::require_subject_in_connection(tx, &host.subject_id)?;
     let attr = host
         .attribution
         .as_ref()
@@ -134,6 +135,7 @@ pub(super) fn check_host(
             "different storage scope".into(),
         ));
     }
+    crate::require_subject_in_connection(tx, &host.subject_id)?;
     if write {
         let state: String = tx.query_row(
             "SELECT state FROM subjects WHERE subject_id=?1",
@@ -466,7 +468,7 @@ impl SubjektivStore {
         ranges: &[JournalSourceRange],
     ) -> JournalResult<JournalId> {
         text(title, 1024)?;
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             check_host(self,tx,host,true)?;
             super::lifecycle::reject_erased(tx, host)?;
             let session=&host.attribution.as_ref().expect("checked").session_id;
@@ -501,7 +503,7 @@ impl SubjektivStore {
         id: &str,
         ranges: &[JournalSourceRange],
     ) -> JournalResult<()> {
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             check_host(self,tx,host,true)?;let j=journal(tx,host,id,true)?;check_ranges(tx,&j,ranges,false)?;
             for r in ranges {let s=source(tx,id,r.source.order)?;let mut u=s.unavailable;u.push(r.bytes);tx.execute("UPDATE journal_sources SET unavailable_json=?3 WHERE journal_id=?1 AND source_order=?2",params![id,r.source.order,serde_json::to_string(&merge(u)?)?])?;}
             Ok(())
@@ -515,7 +517,7 @@ impl SubjektivStore {
         id: &str,
         ranges: &[JournalSourceRange],
     ) -> JournalResult<()> {
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             check_host(self,tx,host,true)?;let j=journal(tx,host,id,true)?;check_ranges(tx,&j,ranges,false)?;
             for r in ranges {
                 let s=source(tx,id,r.source.order)?;let mut remaining=Vec::new();
@@ -533,7 +535,7 @@ impl SubjektivStore {
         host: &JournalHostContext,
         id: &str,
     ) -> JournalResult<Option<JournalGeneration>> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, true)?;
             journal(tx, host, id, true)?;
             let generation_id: Option<String> = tx
@@ -557,7 +559,7 @@ impl SubjektivStore {
     ) -> JournalResult<JournalGeneration> {
         label(&binding.job_id)?;
         label(&binding.attempt_id)?;
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             check_host(self,tx,host,true)?;let j=journal(tx,host,id,true)?;
             let request=serde_json::to_string(&selected_ranges)?;
             let existing:Option<(String,String)>=tx.query_row("SELECT request_json,snapshot_json FROM journal_generations WHERE journal_id=?1 AND job_id=?2 AND attempt_id=?3",params![id,binding.job_id,binding.attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
@@ -580,7 +582,7 @@ impl SubjektivStore {
     ) -> JournalResult<JournalGeneration> {
         label(&binding.job_id)?;
         label(&binding.attempt_id)?;
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             check_host(self, tx, host, false)?;
             check_session_host(self, tx, host)?;
             let current = journal(tx, host, &input.journal_id, true)?;
@@ -624,7 +626,7 @@ impl SubjektivStore {
     }
 
     pub(super) fn validate_journal_job(&self, ctx: &JournalJobContext) -> JournalResult<()> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             job(self, tx, ctx, true)?;
             Ok(())
         })
@@ -636,7 +638,7 @@ impl SubjektivStore {
         generation_id: &str,
         binding: &JobAttemptBinding,
     ) -> JournalResult<()> {
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             check_host(self, tx, host, true)?;
             let (g, _) = generation(tx, host, generation_id)?;
             if &g.job != binding {
@@ -659,7 +661,7 @@ impl SubjektivStore {
         id: &str,
         binding: &JobAttemptBinding,
     ) -> JournalResult<Option<JournalGeneration>> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             check_session_host(self, tx, host)?;
             journal(tx, host, id, true)?;
@@ -682,7 +684,7 @@ impl SubjektivStore {
         host: &JournalHostContext,
         generation_id: &str,
     ) -> JournalResult<JournalGeneration> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, true)?;
             Ok(generation(tx, host, generation_id)?.0)
         })
@@ -694,7 +696,7 @@ impl SubjektivStore {
         host: &JournalHostContext,
         id: &str,
     ) -> JournalResult<(Journal, Option<JournalEntry>)> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, true)?;
             Ok((journal(tx, host, id, true)?, open(tx, id)?))
         })
@@ -705,7 +707,7 @@ impl SubjektivStore {
         operation: JournalOperation,
     ) -> JournalResult<JournalReceipt> {
         label(&operation.request_id)?;
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             let g=job(self,tx,ctx,false)?;
             if let Some(old)=saved(tx,&g.journal_id,&operation.request_id)? {
                 if old.receipt.generation_id!=g.id || old.operation!=operation {return Err(conflict("operation identifier already used with different input or generation"));}
@@ -805,7 +807,7 @@ impl SubjektivStore {
         journal_id: &str,
         id: &str,
     ) -> JournalResult<JournalOperationStatus> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             journal(tx, host, journal_id, false)?;
             let saved =
@@ -834,7 +836,7 @@ impl SubjektivStore {
         limit: usize,
     ) -> JournalResult<JournalPage<JournalSourceRange>> {
         let limit = page_limit(limit)?;
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             journal(tx, host, journal_id, false)?;
             let saved =
@@ -862,7 +864,7 @@ impl SubjektivStore {
         journal_id: &str,
         id: &str,
     ) -> JournalResult<Option<JournalReceipt>> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             journal(tx, host, journal_id, false)?;
             Ok(saved(tx, journal_id, id)?.map(|s| s.receipt))
@@ -876,7 +878,7 @@ impl SubjektivStore {
         limit: usize,
     ) -> JournalResult<JournalPage<JournalReceipt>> {
         let limit = page_limit(limit)?;
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self,tx,host,false)?;journal(tx,host,journal_id,false)?;
             // Immutable request IDs are not chronological; the durable SQLite rowid provides keyset order.
             let after=after.map(str::parse::<i64>).transpose().map_err(|_|invalid("invalid operation cursor"))?.unwrap_or(0);
@@ -897,7 +899,7 @@ impl SubjektivStore {
         limit: usize,
     ) -> JournalResult<JournalPage<JournalSourceStatus>> {
         let limit = page_limit(limit)?;
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             check_host(self,tx,host,false)?;journal(tx,host,journal_id,false)?;
             let fingerprint=source_fingerprint(tx,journal_id)?;
             let after=if let Some(cursor)=cursor {
@@ -924,7 +926,7 @@ impl SubjektivStore {
         journal_id: &str,
         order: u64,
     ) -> JournalResult<JournalSourceStatus> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             journal(tx, host, journal_id, false)?;
             source(tx, journal_id, order)
@@ -938,7 +940,7 @@ impl SubjektivStore {
         limit: usize,
     ) -> JournalResult<JournalPage<JournalMetadata>> {
         let limit = page_limit(limit)?;
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             let mut stmt = tx.prepare(
                 "SELECT id FROM journals WHERE subject_id=?1 AND id>?2 ORDER BY id LIMIT ?3",
@@ -962,7 +964,7 @@ impl SubjektivStore {
         host: &JournalHostContext,
         id: &str,
     ) -> JournalResult<JournalMetadata> {
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             metadata(tx, host, id)
         })
@@ -975,7 +977,7 @@ impl SubjektivStore {
         limit: usize,
     ) -> JournalResult<JournalPage<JournalEntrySummary>> {
         let limit = page_limit(limit)?;
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self,tx,host,false)?;journal(tx,host,journal_id,false)?;
             let mut stmt=tx.prepare("SELECT id FROM journal_entries WHERE journal_id=?1 AND (?2 IS NULL OR position>?2) ORDER BY position LIMIT ?3")?;
             let ids=stmt.query_map(params![journal_id,after,limit+1],|r|r.get::<_,String>(0))?.collect::<Result<Vec<_>,_>>()?;
@@ -998,7 +1000,7 @@ impl SubjektivStore {
         if !(4..=MAX_JOURNAL_READ_BYTES).contains(&max_bytes) {
             return Err(invalid("text page must be 4..16384 bytes"));
         }
-        self.database.try_with_connection(|tx| {
+        self.journal_connection(|tx| {
             check_host(self, tx, host, false)?;
             let j = journal(tx, host, journal_id, false)?;
             let (body, token) = match (field, entry_id) {

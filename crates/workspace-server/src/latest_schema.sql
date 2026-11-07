@@ -1,10 +1,10 @@
 -- Canonical composed Workspace Server schema. New databases are created directly at this generation.
+-- Plugin catalog schema is composed by store.rs.
 -- Ticket creates its standalone schema first; replace those empty tables with the composed authority.
 DROP TABLE typed_ticket_event_attributes;
 DROP TABLE typed_ticket_event_references;
 DROP TABLE typed_ticket_artifacts;
 DROP TABLE typed_ticket_labels;
-DROP TABLE typed_ticket_orchestration_plans;
 DROP TABLE typed_ticket_raw_frontmatter;
 DROP TABLE typed_ticket_relations;
 DROP TABLE typed_ticket_risk_flags;
@@ -458,22 +458,6 @@ CREATE TABLE typed_ticket_labels (
     PRIMARY KEY (workspace_id, ticket_id, ordinal),
     FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
 );
-CREATE TABLE typed_ticket_orchestration_plans (
-    workspace_id TEXT NOT NULL,
-    ticket_id TEXT NOT NULL,
-    record_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    related_ticket TEXT,
-    note TEXT,
-    accepted_summary TEXT,
-    accepted_branch TEXT,
-    accepted_worktree TEXT,
-    accepted_role_plan TEXT,
-    author TEXT NOT NULL,
-    at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, ticket_id, record_id),
-    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
-);
 CREATE TABLE typed_ticket_raw_frontmatter (
     workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
     PRIMARY KEY (workspace_id, ticket_id, key),
@@ -694,6 +678,8 @@ CREATE TABLE worker_create_reservations (
             updated_at TEXT NOT NULL, request_fingerprint TEXT, memory_language TEXT,
             singleton_key TEXT,
             singleton_generation INTEGER CHECK (singleton_generation IS NULL OR singleton_generation > 0),
+            startup_failure_json TEXT CHECK (startup_failure_json IS NULL OR
+                (typeof(startup_failure_json) = 'text' AND length(CAST(startup_failure_json AS BLOB)) <= 32768)),
             PRIMARY KEY (workspace_id, allocation_key),
             UNIQUE (workspace_id, worker_id),
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
@@ -798,7 +784,7 @@ CREATE TABLE backend_jobs (
             resource_key TEXT,
             request_json TEXT NOT NULL,
             intent_fingerprint TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'unknown')),
+            state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed')),
             current_attempt INTEGER NOT NULL CHECK (current_attempt > 0 AND current_attempt <= 3),
             result_json TEXT,
             result_digest TEXT,
@@ -822,7 +808,7 @@ CREATE TABLE backend_job_attempts (
             attempt_id TEXT NOT NULL,
             attempt INTEGER NOT NULL CHECK (attempt > 0 AND attempt <= 3),
             input_digest TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatching', 'dispatched', 'completed', 'failed', 'unknown')),
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatching', 'dispatched', 'completed', 'failed')),
             runtime_id TEXT,
             worker_id TEXT,
             runtime_run_id TEXT,
@@ -842,6 +828,7 @@ CREATE TABLE backend_job_attempts (
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             completed_at TEXT,
+            allocation_precluded_at TEXT,
             PRIMARY KEY (workspace_id, job_id, attempt_id),
             UNIQUE (workspace_id, job_id, attempt),
             UNIQUE (workspace_id, runtime_id, worker_id),
@@ -1757,3 +1744,5 @@ WHEN (OLD.runtime_id != NEW.runtime_id OR OLD.worker_id != NEW.worker_id OR OLD.
     WHERE workspace_id = OLD.workspace_id AND runtime_id = OLD.runtime_id
       AND worker_id = OLD.worker_id)
 BEGIN SELECT RAISE(ABORT, 'Worker has unfinished Ticket work'); END;
+
+-- Subject deletion schema is composed by store.rs.

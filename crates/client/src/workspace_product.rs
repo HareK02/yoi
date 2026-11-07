@@ -10,10 +10,9 @@ use server_api::{
     WorkspaceRuntimeDetail, WorkspaceRuntimeResource,
 };
 use ticket::{
-    MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent, NewTicketRelation,
-    OrchestrationPlanKind, OrchestrationPlanRecord, Ticket, TicketBackend, TicketDependencyCheck,
-    TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary, TicketItemEdit,
-    TicketListQuery, TicketListState, TicketMarkReady, TicketRef, TicketRelation,
+    MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, Ticket, TicketBackend,
+    TicketDependencyCheck, TicketDoctorReport, TicketError, TicketIdOrSlug, TicketIntakeSummary,
+    TicketItemEdit, TicketListQuery, TicketListState, TicketMarkReady, TicketRef, TicketRelation,
     TicketRelationKind, TicketRelationView, TicketStateChange, TicketStateSelector, TicketSummary,
 };
 
@@ -82,6 +81,23 @@ impl BackendWorkspaceProductClient {
                 >,
             >,
     {
+        self.generated_normalized(operation, crate::backend_workspace::server_client_error)
+    }
+
+    fn generated_normalized<T, E, F, Fut>(
+        &self,
+        operation: F,
+        normalize: impl FnOnce(
+            &BackendApiClient,
+            server_api::client_support::ClientError<E>,
+        ) -> BackendWorkspaceClientError,
+    ) -> Result<T, BackendWorkspaceClientError>
+    where
+        F: FnOnce(
+            server_api::ServerApiClient<crate::backend_workspace::ServerBearerAuthorizer>,
+        ) -> Fut,
+        Fut: std::future::Future<Output = Result<T, server_api::client_support::ClientError<E>>>,
+    {
         let client = crate::backend_workspace::server_api_client(&self.api)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -89,7 +105,21 @@ impl BackendWorkspaceProductClient {
             .map_err(|error| BackendWorkspaceClientError::InvalidTarget(error.to_string()))?;
         runtime
             .block_on(operation(client))
-            .map_err(|error| crate::backend_workspace::server_client_error(&self.api, error))
+            .map_err(|error| normalize(&self.api, error))
+    }
+
+    pub fn read_ticket_link_summary(
+        &self,
+        reference: &str,
+    ) -> Result<ticket::TicketLinkSummary, BackendWorkspaceClientError> {
+        let workspace_id = self.workspace_id.clone();
+        let reference = reference.to_owned();
+        self.generated(move |client| async move {
+            client
+                .ticket_link_summary_get(workspace_id, reference)
+                .await
+                .map(|response| response.0)
+        })
     }
 
     pub fn list_workspace_tags(
@@ -570,9 +600,9 @@ impl BackendWorkspaceProductClient {
             execution_grant: None,
         };
         let workspace_id = self.workspace_id.clone();
-        let response: BrowserCreateWorkerResponse = self.generated(move |client| async move {
+        let response: BrowserCreateWorkerResponse = self.generated_normalized(move |client| async move {
             client.workspace_worker_create(workspace_id, request).await
-        })?;
+        }, crate::backend_workspace::worker_create_client_error)?;
         Ok(format!(
             "Started Intake Worker {}/{} for Ticket {ticket_id}",
             response.runtime_id, response.worker_id
@@ -602,6 +632,47 @@ impl BackendWorkspaceProductClient {
 }
 
 impl TicketBackend for BackendWorkspaceProductClient {
+    fn get_ticket_parent(&self, id: TicketIdOrSlug) -> ticket::Result<ticket::TicketParentLink> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(&id);
+        self.generated(move |client| async move {
+            client
+                .ticket_parent_get(workspace_id, id)
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
+    }
+    fn set_ticket_parent(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketParentSetRequest,
+    ) -> ticket::Result<ticket::TicketParentLink> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(&id);
+        self.generated(move |client| async move {
+            client
+                .ticket_parent_set(workspace_id, id, server_api::TicketParentRequest(request))
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
+    }
+    fn query_ticket_children(
+        &self,
+        id: TicketIdOrSlug,
+        request: ticket::TicketChildrenRequest,
+    ) -> ticket::Result<ticket::TicketChildrenPage> {
+        let workspace_id = self.workspace_id.clone();
+        let id = ticket_reference(&id);
+        self.generated(move |client| async move {
+            client
+                .ticket_children_query(workspace_id, id, server_api::TicketChildrenQuery(request))
+                .await
+                .map(|response| response.0)
+        })
+        .map_err(ticket_client_error)
+    }
     fn edit_post_with_snapshots(
         &self,
         id: TicketIdOrSlug,
@@ -842,44 +913,6 @@ impl TicketBackend for BackendWorkspaceProductClient {
         self.generated(move |client| async move {
             client
                 .ticket_relation_view(workspace_id, id)
-                .await
-                .map(|response| response.0)
-        })
-        .map_err(ticket_client_error)
-    }
-
-    fn add_orchestration_plan_record(
-        &self,
-        id: TicketIdOrSlug,
-        record: NewOrchestrationPlanRecord,
-    ) -> ticket::Result<OrchestrationPlanRecord> {
-        let workspace_id = self.workspace_id.clone();
-        let id = ticket_reference(&id);
-        self.generated(move |client| async move {
-            client
-                .ticket_orchestration_plan_record(
-                    workspace_id,
-                    id,
-                    server_api::CreateTicketOrchestrationPlanRequest(record),
-                )
-                .await
-                .map(|response| response.0)
-        })
-        .map_err(ticket_client_error)
-    }
-
-    fn query_orchestration_plan_records(
-        &self,
-        ticket: Option<TicketIdOrSlug>,
-        kind: Option<OrchestrationPlanKind>,
-    ) -> ticket::Result<Vec<OrchestrationPlanRecord>> {
-        let workspace_id = self.workspace_id.clone();
-        self.generated(move |client| async move {
-            client
-                .ticket_orchestration_plan_query(
-                    workspace_id,
-                    server_api::TicketOrchestrationPlanSearchRequest { ticket, kind },
-                )
                 .await
                 .map(|response| response.0)
         })
@@ -1607,28 +1640,6 @@ mod tests {
         let request = request.recv().unwrap();
         assert!(request.starts_with("POST /api/w/workspace-a/tickets/relations/search "));
         assert!(request.contains("\"ticket\":{\"Query\":\"T-1\"}"));
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn orchestration_plan_query_uses_workspace_scoped_backend_route() {
-        let (base_url, request, handle) = one_response_server("200 OK", "[]");
-        let client = BackendWorkspaceProductClient::new_with_access_token(
-            base_url,
-            "workspace-a",
-            "test-backend-token",
-        )
-        .unwrap();
-
-        let records = TicketBackend::query_orchestration_plan_records(&client, None, None).unwrap();
-
-        assert!(records.is_empty());
-        assert!(
-            request
-                .recv()
-                .unwrap()
-                .starts_with("POST /api/w/workspace-a/tickets/orchestration-plans/search ")
-        );
         handle.join().unwrap();
     }
 

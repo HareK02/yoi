@@ -341,6 +341,8 @@ async fn post_restore_projection_waits_off_tokio_and_preserves_historical_result
     historical.label = "historical label".into();
     historical.state = "paused".into();
     let result = || crate::hosts::InternalWorkerRestoreResult {
+        control: None,
+        startup: None,
         state: server_api::WorkerRestoreState::Rejected,
         worker: Some(historical.clone()),
         diagnostics: Vec::new(),
@@ -392,6 +394,8 @@ async fn post_restore_projection_waits_off_tokio_and_preserves_historical_result
         record.worker.runtime_id.clone(),
         record.worker.worker_id.clone(),
         crate::hosts::InternalWorkerRestoreResult {
+            control: None,
+            startup: None,
             state: server_api::WorkerRestoreState::Rejected,
             worker: None,
             diagnostics: Vec::new(),
@@ -658,6 +662,7 @@ async fn worker_control_source_lookup_waits_off_tokio_and_retains_finite_host_ow
     let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let request = || {
         Json(server_api::RuntimeWorkerLifecycleRequest {
+            stop_intent: None,
             reason: None,
             ticket_assignment: None,
         })
@@ -715,7 +720,7 @@ async fn worker_control_source_lookup_waits_off_tokio_and_retains_finite_host_ow
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free() {
+async fn ticket_tracking_authority_and_case_audit_use_local_state_without_runtime_lookup() {
     for operation in ["tracking", "case"] {
         let fixture = fixture().await;
         let ticket = browser_ticket_backend(&fixture.api)
@@ -767,6 +772,9 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
         };
         let backend = browser_ticket_backend(&fixture.api).unwrap();
         let before = backend.show(TicketIdOrSlug::Id(ticket.id.clone())).unwrap();
+        // Tracking authority and case attribution are now local Subject/assignment
+        // reads, not observations of a singleton Runtime Worker. Keep a held
+        // Runtime endpoint to detect an accidental return to network authority.
         let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let api = fixture.api.clone();
         let ticket_id = ticket.id.clone();
@@ -819,8 +827,24 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
             },
         ));
         assert!(futures::poll!(&mut decision).is_pending());
-        let request = observed(reply.entered.take().unwrap()).await.unwrap();
-        assert!(request.contains("/v1/workers/"), "{operation}: {request}");
+        let outcome = observed(decision.as_mut()).await;
+        if operation == "tracking" {
+            let error = outcome.unwrap_err();
+            assert!(
+                error.error.to_string().contains("Subject body"),
+                "{error:?}"
+            );
+        } else {
+            outcome.unwrap();
+        }
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(
+                reply.entered.as_mut().unwrap().try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "local assignment authority/audit must not observe Runtime"
+        );
         let store = fixture.store.clone();
         observed(
             fixture
@@ -836,7 +860,6 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
         observed(tokio::time::sleep(StdDuration::from_millis(1))).await;
         assert!(!reply.upstream_released.load(Ordering::SeqCst));
         drop(decision);
-        assert_eq!(leases.load(Ordering::SeqCst), 1);
         reply.finish();
         observed(fixture.host_executor.drain()).await.unwrap();
         observed(fixture.executor.drain()).await.unwrap();
@@ -848,8 +871,8 @@ async fn ticket_tracking_authority_and_case_audit_lookup_leave_db_and_tokio_free
                 "tracking still requires live assignment authority"
             );
         } else {
-            // Profile-authorized case changes do not depend on a live
-            // Orchestrator lookup. Its failure only affects audit role context.
+            // Case changes do not depend on a remote singleton lookup.
+            // The local assignment-only audit falls back to an ordinary Worker.
             assert_eq!(after.meta.workflow_state, ticket::TicketState::Closed);
             assert_eq!(
                 after.events.last().unwrap().attributes["source_actor_role"],
@@ -890,6 +913,18 @@ async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_contr
         released,
     };
     observed(waiting).await.unwrap(); // actual SQL transaction owns the Feature connection
+    // Force close to be queued before the sole DB worker can start it. Pending
+    // admission alone must not be mistaken for an available second queue slot.
+    let (started, running) = oneshot::channel();
+    let (start_close, held) = mpsc::channel();
+    fixture
+        .executor
+        .dispatch(move || {
+            let _ = started.send(());
+            let _ = held.recv_timeout(WATCHDOG);
+        })
+        .unwrap();
+    observed(running).await.unwrap();
     let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut close = Box::pin(crate::db_executor::with_operation_lifetime(
         Arc::new(CountJobLifetime(leases.clone())),
@@ -899,6 +934,30 @@ async fn cancelled_feature_shutdown_keeps_sql_close_owned_without_blocking_contr
         futures::poll!(&mut close).is_pending(),
         "Feature connection close must not wait on Tokio"
     );
+    assert!(matches!(
+        fixture.executor.dispatch(|| {}),
+        Err(Error::DbCapacityExceeded)
+    ));
+    start_close.send(()).unwrap();
+    let fenced = observed(async {
+        loop {
+            match fixture
+                .api
+                .feature_storage
+                .open(&fixture.api.subjektiv_registration)
+            {
+                Err(crate::FeatureStorageError::ShuttingDown) => break,
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => panic!("unexpected Feature admission failure: {error}"),
+            }
+        }
+    });
+    tokio::select! {
+        _ = fenced => {},
+        result = &mut close => panic!("close completed while its connection is held: {result:?}"),
+    }
+    // Observing the real shutdown fence proves close was dequeued and started;
+    // only now can the one waiting slot be filled deterministically.
     runtime_progress_while_locked(&lock).await;
     assert_eq!(
         observed(fixture.host_executor.run(|| Ok::<_, Error>("control")))
@@ -1261,13 +1320,28 @@ async fn drive_and_config_preflight_keep_live_authority_owned_and_report_overloa
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() {
+async fn owner_adoption_publishes_after_commit_without_holding_the_sql_lane() {
+    use server_api::ConfigurationAdoptionApi;
     let fixture = fixture().await;
+    // This executor fixture supplies an authenticated owner context; full cookie
+    // admission belongs to configuration_adoption_http_integration.
+    let context = server_api::ServerRequestContext {
+        actor: Some(RequestActor {
+            user_id: "fixture-user".into(),
+            account_id: format!("account-{WORKSPACE}"),
+            handle: "fixture-user".into(),
+            display_name: "Fixture user".into(),
+            auth_method: ActorAuthMethod::BrowserSession,
+        }),
+        worker_source: None,
+        runtime_source: None,
+        origin: Some("http://localhost:5173".into()),
+        transport_headers: Vec::new(),
+    };
     let current = fixture
-        .api
-        .config_store
-        .load_workspace_config(WORKSPACE)
-        .unwrap()
+        .server
+        .configuration_source(context.clone(), WORKSPACE.into())
+        .await
         .unwrap();
     let mut reply = HeldRuntimeReply::new();
     install_remote_fixture(
@@ -1276,31 +1350,29 @@ async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() 
         &format!("http://{}", reply.address),
         false,
     );
-    let leases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut commit = Box::pin(crate::db_executor::with_operation_lifetime(
-        Arc::new(CountJobLifetime(leases.clone())),
-        scoped_commit_workspace_config_tree(
-            State(fixture.api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: WORKSPACE.into(),
-            }),
-            Json(server_api::ConfigCommitRequest {
-                base_digest: current.snapshot.digest.clone(),
-                entrypoints: current
-                    .contract
-                    .entrypoints
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                changes: vec![server_api::ConfigTreeChange::Create {
-                    path: "notes/owned-publication.txt".into(),
-                    content_type: server_api::ConfigContentType::Text,
-                    content: "committed before prompt publication".into(),
-                }],
-            }),
-        ),
-    ));
-    assert!(futures::poll!(&mut commit).is_pending());
+    let server = fixture.server.clone();
+    let request = server_api::ConfigurationAdoptionRequest {
+        operation_id: "owned-publication".into(),
+        expected_head: current.history_head.clone(),
+        expected_catalog_digest: current.catalog_digest.clone(),
+        expected_legacy_export: current.expected_legacy_export.clone(),
+        source: server_api::ConfigCommitRequest {
+            base_digest: current.state.snapshot.digest.clone(),
+            entrypoints: current.state.contract.entrypoints.clone(),
+            changes: vec![server_api::ConfigTreeChange::Create {
+                path: "notes/owned-publication.txt".into(),
+                content_type: server_api::ConfigContentType::Text,
+                content: "committed before prompt publication".into(),
+            }],
+        },
+    };
+    let commit = tokio::spawn(async move {
+        server
+            .configuration_adopt(context, WORKSPACE.into(), request)
+            .await
+    });
+    let receipt = observed(commit).await.unwrap().unwrap();
+    assert!(receipt.source_stored && receipt.policy_committed);
     let request = observed(reply.entered.take().unwrap()).await.unwrap();
     assert!(
         request.starts_with("POST "),
@@ -1316,7 +1388,7 @@ async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() 
     .unwrap()
     .unwrap();
     assert_ne!(
-        state.snapshot.digest, current.snapshot.digest,
+        state.snapshot.digest, current.state.snapshot.digest,
         "publication must observe the committed tree"
     );
     assert!(
@@ -1332,12 +1404,16 @@ async fn ui_config_commit_publishes_after_commit_without_holding_the_sql_lane() 
         "control"
     );
     assert!(!reply.upstream_released.load(Ordering::SeqCst));
-    drop(commit);
-    assert_eq!(leases.load(Ordering::SeqCst), 1);
+    let admission = fixture.server.admission_for_workspace(WORKSPACE).await;
+    let mut deletion = Box::pin(admission.lock_deletion());
+    assert!(
+        futures::poll!(&mut deletion).is_pending(),
+        "publication must retain its admitted Workspace lifetime after the receipt returns"
+    );
     reply.finish();
     observed(fixture.host_executor.drain()).await.unwrap();
     observed(fixture.executor.drain()).await.unwrap();
-    assert_eq!(leases.load(Ordering::SeqCst), 0);
+    let _deletion = observed(deletion).await;
     assert_eq!(
         fixture
             .api

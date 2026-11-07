@@ -57,7 +57,23 @@ mod schema_convergence {
         }
         let mut rows: Vec<_> = tables
             .into_iter()
-            .map(|table| stored_fixture_rows(conn, table))
+            .map(|table| {
+                let mut rows = stored_fixture_rows(conn, table);
+                if table == "backend_job_attempts" {
+                    // The retained tail appends proof and typed cause columns.
+                    // Upgrade must not invent either for historical attempts.
+                    for column in [
+                        "allocation_precluded_at", "failure_cause", "worker_cleanup_failure_cause",
+                    ] {
+                        if !column_exists(conn, table, column).unwrap() {
+                            for row in &mut rows {
+                                row.push(rusqlite::types::Value::Null);
+                            }
+                        }
+                    }
+                }
+                rows
+            })
             .collect();
         // A Passkey-branch Job gains only input_disposition; all old columns must
         // remain byte-for-byte equal, including body, digest and result receipts.
@@ -91,10 +107,10 @@ mod schema_convergence {
                 assert_eq!(plan.current_schema_version, 103);
                 assert_eq!(
                     plan.migrations,
-                    vec![WorkspaceSchemaMigrationStep {
-                        version: 104,
-                        name: "Converge Passkey results and Job input retention".into(),
-                    }]
+                    expected_retained_migration_chain()
+                        .into_iter()
+                        .filter(|migration| migration.version > 103)
+                        .collect::<Vec<_>>()
                 );
                 assert_eq!(
                     schema_rows(&conn),
@@ -108,8 +124,9 @@ mod schema_convergence {
                 upgraded.with_conn(|conn| {
                     assert_eq!(feature_rows(conn, job_variant), rows);
                     let mut expected = history.clone();
-                    expected.push((104, "Converge Passkey results and Job input retention".into()));
+                    expected.extend(plan.migrations.iter().map(|step| (step.version, step.name.clone())));
                     assert_eq!(workspace_schema_migration_history(conn)?, expected);
+                    assert_eq!(conn.query_row("SELECT count(*) FROM backend_jobs WHERE failure_cause IS NOT NULL", [], |r| r.get::<_, i64>(0))?, 0);
                     for table in ["passkey_credentials", "passkey_metadata", "passkey_addition_receipts", "backend_jobs", "backend_job_attempts"] {
                         assert_eq!(state_contract_schema_signature(conn, table), fresh.with_conn(|c| Ok(state_contract_schema_signature(c, table)))?, "{table}");
                     }
@@ -138,7 +155,7 @@ mod schema_convergence {
                         assert_eq!(feature_rows(conn, job_variant), rows);
                         assert_eq!(
                             workspace_schema_migration_history(conn)?.len(),
-                            history.len() + 1
+                            history.len() + plan.migrations.len()
                         );
                         Ok(())
                     })
@@ -176,7 +193,7 @@ mod schema_convergence {
                 upgraded
                     .with_conn(|conn| {
                         assert_eq!(feature_rows(conn, job_variant), rows);
-                        assert_eq!(current_schema_version(conn)?, 104);
+                        assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                         Ok(())
                     })
                     .unwrap();

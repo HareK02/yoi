@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 mod backend_diagnostic;
+pub(crate) mod backend_job_input;
 pub mod backend_job_result;
 pub(crate) mod bash;
 
@@ -29,14 +30,21 @@ pub mod memory_staging_output;
 pub(crate) mod memory_surface_lifecycle;
 pub(crate) mod memory_surface_output;
 pub mod merge_request;
+mod native_contract;
+pub(crate) mod notification_permissions;
 pub mod objective;
 pub mod orchestration;
+pub(crate) mod plugin_host_permissions;
+pub(crate) mod repository_permissions;
 mod resource_projection;
 pub mod session_explore;
+pub(crate) mod sub_worker;
+pub(crate) mod subjektiv_chat;
 pub(crate) mod subjektiv_memory;
 pub(crate) mod subjektiv_session;
 pub mod task;
 pub mod ticket;
+pub(crate) mod web;
 pub mod worker_observation;
 pub mod workspace_config;
 pub mod workspace_worker_discovery;
@@ -44,7 +52,6 @@ pub mod workspace_worker_discovery;
 pub use task::{TaskFeature, task_tools_feature};
 pub use ticket::{TicketFeature, TicketFeatureAccess, ticket_tools_feature};
 pub use worker_observation::{
-    CompositeWorkerObservationProvider, WorkerObservationError, WorkerObservationFeature,
-    WorkerObservationProvider, WorkerObservationSubject, WorkerObservationSubjectRef,
-    WorkerSessionCapture, WorkspaceClientWorkerObservationProvider,
+    CompositeWorkerObservationProvider, WorkerObservationFeature,
+    WorkspaceClientWorkerObservationProvider,
 };

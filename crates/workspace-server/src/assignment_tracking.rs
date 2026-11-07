@@ -29,6 +29,7 @@ pub enum TicketOrchestratorAssignmentSourceContext {
     Runtime {
         runtime_id: String,
         worker_id: String,
+        #[serde(rename = "subject_id")]
         agent_key: String,
         authentication_binding_id: String,
     },
@@ -46,9 +47,25 @@ pub(super) fn require_runtime_source(
     agent_key: &str,
     binding_id: &str,
 ) -> Result<()> {
-    let current_source:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM worker_singleton_owners singleton JOIN workspace_runtime_bindings binding ON binding.workspace_id=singleton.workspace_id AND binding.runtime_id=singleton.runtime_id WHERE singleton.workspace_id=?1 AND singleton.singleton_key=?2 AND singleton.runtime_id=?3 AND singleton.worker_id=?4 AND binding.binding_id=?5 AND binding.revoked_at IS NULL)",params![workspace_id,crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY,runtime_id,worker_id,binding_id],|row|row.get(0))?;
-    if agent_key != "workspace-orchestrator" || binding_id.trim().is_empty() || !current_source {
-        return Err(Error::WorkspacePermissionDenied("Assignment source is not the current registered Orchestrator with its authenticated Runtime binding".into()));
+    // The legacy field name is retained in immutable source receipts, but only a
+    // Subject identity can authenticate this self-report/delivery boundary.
+    // In particular, never reinterpret the old workspace-agent identity.
+    if agent_key == "workspace-orchestrator" || agent_key.trim().is_empty() {
+        return Err(Error::WorkspacePermissionDenied(
+            "Legacy assignment sources are audit-only".into(),
+        ));
+    }
+    let key = crate::subjektiv::subject_worker_singleton_key(agent_key)
+        .map_err(|error| Error::WorkspacePermissionDenied(error.to_string()))?;
+    let current_source: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM worker_singleton_owners s
+         JOIN worker_create_reservations r ON r.workspace_id=s.workspace_id AND r.runtime_id=s.runtime_id AND r.worker_id=s.worker_id AND r.singleton_key=s.singleton_key AND r.singleton_generation=s.generation AND r.state!='removed'
+         JOIN workspace_runtime_bindings b ON b.workspace_id=s.workspace_id AND b.runtime_id=s.runtime_id
+         WHERE s.workspace_id=?1 AND s.singleton_key=?2 AND s.runtime_id=?3 AND s.worker_id=?4 AND b.binding_id=?5 AND b.revoked_at IS NULL
+         AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.workspace_id=s.workspace_id AND d.subject_id=?6))",
+        params![workspace_id, key, runtime_id, worker_id, binding_id, agent_key], |row| row.get(0))?;
+    if binding_id.trim().is_empty() || !current_source {
+        return Err(Error::WorkspacePermissionDenied("Assignment source is not the current Subject body with its authenticated Runtime binding and generation".into()));
     }
     Ok(())
 }
@@ -64,14 +81,25 @@ pub(super) fn require_assignment_source(
             worker_id,
             agent_key,
             authentication_binding_id,
-        } => require_runtime_source(
-            conn,
-            workspace_id,
-            runtime_id,
-            worker_id,
-            agent_key,
-            authentication_binding_id,
-        ),
+        } => {
+            let live: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings b JOIN worker_registry w ON w.workspace_id=b.workspace_id AND w.runtime_id=b.runtime_id WHERE b.workspace_id=?1 AND b.runtime_id=?2 AND b.binding_id=?3 AND b.revoked_at IS NULL AND w.worker_id=?4)",params![workspace_id,runtime_id,authentication_binding_id,worker_id], |r|r.get(0))?;
+            if !live || agent_key == "workspace-orchestrator" {
+                return Err(Error::WorkspacePermissionDenied(
+                    "Assignment source binding is no longer live".into(),
+                ));
+            }
+            if !agent_key.is_empty() {
+                require_runtime_source(
+                    conn,
+                    workspace_id,
+                    runtime_id,
+                    worker_id,
+                    agent_key,
+                    authentication_binding_id,
+                )?;
+            }
+            Ok(())
+        }
         TicketOrchestratorAssignmentSourceContext::Account {
             account_id,
             user_id,
@@ -110,7 +138,7 @@ pub(super) fn update(
             workspace_id,
             &source.runtime_id,
             &source.worker_id,
-            &source.agent_key,
+            &source.subject_id,
             &source.authentication_binding_id,
         )?;
         let result = ticket::sqlite_update_ticket_assignment_tracking_in_transaction(

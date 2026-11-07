@@ -1,0 +1,539 @@
+//! Storage component tests: real retained migration functions and published SQL
+//! on isolated SQLite databases; no authority, Runtime or domain recovery fakes.
+//! The normal workspace-server lib test target runs this module. These fixtures
+//! attest physical acceptance/data retention, not policy transfer or Job recovery.
+use super::*;
+use rusqlite::{backup::Backup, params};
+
+#[test]
+fn table_declaration_normalization_is_idempotent_after_extension() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch("CREATE TABLE sample(z TEXT CHECK (z IN ('x','y')), a INTEGER PRIMARY KEY);")
+        .unwrap();
+    let mut shape = snapshot(&connection).unwrap();
+    let tokens = &mut shape.get_mut("sample").unwrap().2;
+    assert_eq!(declarations(tokens.clone()).unwrap(), *tokens);
+    let start = tokens.iter().position(|token| token == "(").unwrap();
+    tokens.splice(
+        start + 1..start + 1,
+        ["word:middle".into(), "word:text".into(), ",".into()],
+    );
+    let extended = declarations(tokens.clone()).unwrap();
+    assert_eq!(declarations(extended.clone()).unwrap(), extended);
+    connection
+        .execute_batch("ALTER TABLE sample ADD COLUMN middle TEXT;")
+        .unwrap();
+    assert_eq!(snapshot(&connection).unwrap()["sample"].2, extended);
+}
+
+fn save_history(
+    conn: &Connection,
+    stage: Stage,
+    baseline: i64,
+    predecessor: Option<(Family, usize)>,
+) {
+    conn.execute("DELETE FROM __yoi_schema_migrations", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+        params![baseline, super::super::SCHEMA_BASELINE_NAME],
+    )
+    .unwrap();
+    let published = match stage {
+        Stage::Published(family, count) => Some((family, count)),
+        _ => predecessor,
+    };
+    if let Some((family, count)) = published {
+        for (index, name) in family.names().iter().take(count).enumerate() {
+            let version = 114 + index as i64;
+            if version > baseline {
+                conn.execute(
+                    "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+                    params![version, name],
+                )
+                .unwrap();
+            }
+        }
+    }
+    if let Stage::Converged(current) = stage {
+        for (version, name) in [
+            (119, CONVERGED),
+            (120, PRIOR_RELEASE),
+            (121, CLEANUP_COVERAGE),
+        ] {
+            if version > baseline && version <= current {
+                conn.execute(
+                    "INSERT INTO __yoi_schema_migrations(version,name) VALUES(?1,?2)",
+                    params![version, name],
+                )
+                .unwrap();
+            }
+        }
+    }
+}
+
+fn fixture(stage: Stage, baseline: i64, predecessor: Option<(Family, usize)>) -> Connection {
+    let conn = reference_base().unwrap();
+    install_reference(&conn, stage).unwrap();
+    save_history(&conn, stage, baseline, predecessor);
+    conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
+        VALUES('owner','user','owner','Owner','1','1');
+        INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
+        VALUES('workspace-a','owner','Saved workspace','active','1','1');
+        INSERT INTO backend_jobs(workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,state,current_attempt,created_at,updated_at,input_disposition)
+        VALUES('workspace-a','saved-job','journal','digest','input','{}','fingerprint','pending',1,'1','1','erased');
+        INSERT INTO backend_job_attempts(workspace_id,job_id,attempt_id,attempt,input_digest,state,deadline_at,created_at,updated_at)
+        VALUES('workspace-a','saved-job','saved-attempt',1,'digest','reserved','2','1','1');
+        INSERT INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at)
+        VALUES('saved-removal','saved-plan','saved-fingerprint','workspace-a','runtime','worker','1','policy','digest','erase','erase','none','erase','[]','succeeded','saved','1','1');").unwrap();
+    if super::super::table_exists(&conn, "permission_policy_receipts").unwrap() {
+        conn.execute_batch("INSERT INTO permission_policy_receipts(workspace_id,operation_id,fingerprint,result_json)
+            VALUES('workspace-a','saved-permission','saved-fingerprint','{\"saved\":true}');").unwrap();
+    }
+    if super::super::table_exists(&conn, "server_feature_root").unwrap() {
+        conn.execute_batch("INSERT INTO server_feature_root(root_slot,reservation_id,request_fingerprint,state,accepted_receipt)
+            VALUES(1,'saved-reservation','saved-fingerprint','accepted','saved-root-receipt');
+            INSERT INTO content_history_targets(workspace,target,head,erased)
+            VALUES('workspace-a','workspace-config',NULL,1);").unwrap();
+    }
+    conn
+}
+
+fn saved_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
+    let names = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").unwrap()
+        .query_map([], |row| row.get::<_, String>(0)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut statement = conn
+                .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
+                .unwrap();
+            let count = statement.column_count();
+            let mut rows = statement
+                .query_map([], |row| {
+                    (0..count)
+                        .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .map(|row| format!("{:?}", row.unwrap()))
+                .collect::<Vec<_>>();
+            rows.sort();
+            (name, rows)
+        })
+        .collect()
+}
+
+fn assert_accepted_without_domain_changes(conn: &Connection, current: i64) {
+    let rows = saved_rows(conn);
+    let shape = snapshot(conn).unwrap();
+    verify_history(conn, current).unwrap();
+    if current >= 114 {
+        let plan = published_plan(conn, current).unwrap().unwrap();
+        assert_eq!(plan.migrations.len(), 8);
+        assert_eq!(plan.migrations[0].version, 122);
+        assert_eq!(
+            plan.migrations[0].name,
+            crate::config_adoption::MIGRATION_NAME
+        );
+        assert_eq!(plan.migrations[1].version, 123);
+        assert_eq!(
+            plan.migrations[1].name,
+            super::super::backend_job_upgrade::MIGRATION_NAME
+        );
+        assert_eq!(
+            plan.target_schema_version,
+            super::super::LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            plan.migrations[6].name,
+            super::super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME
+        );
+        assert_eq!(plan.migrations[7].version, 129);
+        assert_eq!(
+            plan.migrations[7].name,
+            super::super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME
+        );
+    }
+    assert_eq!(rows, saved_rows(conn));
+    assert_eq!(shape, snapshot(conn).unwrap());
+}
+
+#[test]
+fn each_published_receipt_prefix_and_fresh_branch_baseline_requires_its_real_shape() {
+    for family in FAMILIES {
+        for count in 1..=family.names().len() {
+            let stage = Stage::Published(family, count);
+            let current = 113 + count as i64;
+            // A baseline can start at any retained branch stage, not just 113.
+            for baseline in 113..=current {
+                let conn = fixture(stage, baseline, None);
+                assert_accepted_without_domain_changes(&conn, current);
+            }
+        }
+    }
+}
+
+#[test]
+fn converged_shapes_keep_all_real_predecessor_receipts_and_erasure_fences() {
+    let origins = std::iter::once(None).chain(
+        FAMILIES
+            .into_iter()
+            .flat_map(|family| (1..=family.names().len()).map(move |count| Some((family, count)))),
+    );
+    for origin in origins {
+        for current in 119..=121 {
+            let conn = fixture(Stage::Converged(current), 113, origin);
+            assert_accepted_without_domain_changes(&conn, current);
+            let erased: i64 = conn
+                .query_row("SELECT erased FROM content_history_targets", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(erased, 1);
+            // A physical check must not act as the Job owner's new Failed migration.
+            let state: String = conn
+                .query_row("SELECT state FROM backend_jobs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(state, "pending");
+        }
+    }
+    for current in 119..=121 {
+        for baseline in 119..=current {
+            assert_accepted_without_domain_changes(
+                &fixture(Stage::Converged(current), baseline, None),
+                current,
+            );
+        }
+    }
+}
+
+// Snapshot retained values, excluding the execution conversion fields and new nullable columns.
+// Existing published-family history tables remain byte-for-byte in this check.
+fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
+    let mut result = Vec::new();
+    for (name, _) in saved_rows(conn) {
+        if name == "__yoi_schema_migrations" {
+            continue;
+        }
+        if name == "typed_ticket_orchestration_plans" {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM typed_ticket_orchestration_plans",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            continue; // Ticket17 retires this empty fixture table.
+        }
+        let columns = super::super::table_columns(conn, &name)
+            .unwrap()
+            .into_iter()
+            .filter(|column| {
+                !["backend_jobs", "backend_job_attempts"].contains(&name.as_str())
+                    || ![
+                        "state",
+                        "failure_category",
+                        "failure_detail",
+                        "allocation_precluded_at",
+                        "failure_cause",
+                        "worker_cleanup_failure_cause",
+                    ]
+                    .contains(&column.as_str())
+            })
+            .filter(|column| name != "plugin_service_consumers" || column != "last_outcome_json")
+            .filter(|column| {
+                name != "worker_removal_operations" || column != "journal_removal_json"
+            })
+            .filter(|column| {
+                name != "worker_create_reservations" || column != "startup_failure_json"
+            })
+            .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+            .collect::<Vec<_>>();
+        let columns = columns.join(",");
+        let predicate = if name == "ticket_schema_migrations" {
+            " WHERE version<=16"
+        } else {
+            ""
+        };
+        let mut statement = conn
+            .prepare(&format!("SELECT {columns} FROM \"{name}\"{predicate}"))
+            .unwrap();
+        let count = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..count)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .map(|row| format!("{:?}", row.unwrap()))
+            .collect::<Vec<_>>();
+        rows.sort();
+        result.push((name, rows));
+    }
+    result
+}
+
+fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(Family, usize)>) {
+    let source = fixture(stage, baseline, predecessor);
+    let expected = immutable_rows(&source);
+    let original_receipts = super::super::workspace_schema_migration_history(&source).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("catalog.db");
+    let mut destination = Connection::open(&path).unwrap();
+    Backup::new(&source, &mut destination)
+        .unwrap()
+        .run_to_completion(128, std::time::Duration::ZERO, None)
+        .unwrap();
+    drop(destination);
+    let mut committed_history = None;
+    for _ in 0..2 {
+        let conn = Connection::open(&path).unwrap();
+        // Actual production open/ordered runner, including the new migration.
+        super::super::prepare_connection(&conn).unwrap();
+        assert_eq!(
+            super::super::current_schema_version(&conn).unwrap(),
+            super::super::LATEST_SCHEMA_VERSION
+        );
+        let allocation_precluded: Option<String> = conn
+            .query_row(
+                "SELECT allocation_precluded_at FROM backend_job_attempts WHERE attempt_id='saved-attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            allocation_precluded.is_none(),
+            "migration must not invent allocation proof"
+        );
+        let actual = immutable_rows(&conn);
+        for (table, rows) in &expected {
+            assert_eq!(
+                &actual.iter().find(|(name, _)| name == table).unwrap().1,
+                rows,
+                "{table}, from {stage:?}, baseline {baseline}"
+            );
+        }
+        let outcome:(String,String,Option<String>)=conn.query_row("SELECT state,failure_category,completed_at FROM backend_jobs WHERE job_id='saved-job'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(
+            outcome,
+            (
+                "failed".into(),
+                super::super::backend_job_upgrade::FAILURE_CATEGORY.into(),
+                None
+            )
+        );
+        let mut history = super::super::workspace_schema_migration_history(&conn).unwrap();
+        for version in [129, 128, 127, 126, 125, 124] {
+            assert_eq!(
+                history.pop(),
+                Some((version, tail_migration_name(version).unwrap().into()))
+            );
+        }
+        assert_eq!(
+            history.pop(),
+            Some((
+                123,
+                super::super::backend_job_upgrade::MIGRATION_NAME.into()
+            ))
+        );
+        assert_eq!(
+            history.pop(),
+            Some((122, crate::config_adoption::MIGRATION_NAME.into()))
+        );
+        assert_eq!(history, original_receipts);
+        verify_history(&conn, super::super::LATEST_SCHEMA_VERSION).unwrap();
+        let saved = saved_rows(&conn);
+        if let Some(previous) = &committed_history {
+            assert_eq!(previous, &saved);
+        } else {
+            committed_history = Some(saved);
+        }
+    }
+}
+
+#[test]
+fn published_database_runs_normal_store_preparation_and_reopens_without_downgrade() {
+    for family in FAMILIES {
+        for count in 1..=family.names().len() {
+            let stage = Stage::Published(family, count);
+            for baseline in 113..=113 + count as i64 {
+                exercise_published_runner(stage, baseline, None);
+            }
+        }
+    }
+    for current in 119..=121 {
+        for baseline in 119..=current {
+            exercise_published_runner(Stage::Converged(current), baseline, None);
+        }
+        for origin in
+            std::iter::once(None).chain(FAMILIES.into_iter().flat_map(|family| {
+                (1..=family.names().len()).map(move |count| Some((family, count)))
+            }))
+        {
+            exercise_published_runner(Stage::Converged(current), 113, origin);
+        }
+    }
+}
+
+#[test]
+fn unknown_mixed_missing_receipts_and_shapes_are_diagnosed_without_writes() {
+    for (sql, current) in [
+        (
+            "UPDATE __yoi_schema_migrations SET name='unknown receipt' WHERE version=115",
+            118,
+        ),
+        ("DELETE FROM __yoi_schema_migrations WHERE version=116", 118),
+        (
+            "UPDATE __yoi_schema_migrations SET name='Worker removal expected Feature database identity' WHERE version=115",
+            118,
+        ),
+        ("DROP TRIGGER backend_job_cleanup_owner_immutable", 118),
+        (
+            "CREATE INDEX unreceipted_job_index ON backend_jobs(job_id)",
+            118,
+        ),
+        (
+            "INSERT INTO __yoi_schema_migrations(version,name) VALUES(122,'unknown future')",
+            122,
+        ),
+    ] {
+        let conn = fixture(Stage::Published(Family::Jobs, 5), 113, None);
+        conn.execute_batch(sql).unwrap();
+        let rows = saved_rows(&conn);
+        let shape = snapshot(&conn).unwrap();
+        assert!(verify_history(&conn, current).is_err(), "{sql}");
+        assert_eq!(saved_rows(&conn), rows);
+        assert_eq!(snapshot(&conn).unwrap(), shape);
+    }
+    let conn = fixture(Stage::Published(Family::Permissions, 2), 113, None);
+    conn.execute_batch(COLLECTION_SQL).unwrap();
+    assert!(
+        verify_history(&conn, 115)
+            .unwrap_err()
+            .to_string()
+            .contains("mismatch")
+    );
+    let conn = fixture(Stage::Converged(121), 113, None);
+    conn.execute_batch("DROP TRIGGER backend_job_cleanup_origin_immutable")
+        .unwrap();
+    assert!(verify_history(&conn, 121).is_err());
+}
+
+#[test]
+fn missing_or_weakened_constraints_and_literal_changes_are_not_shape_equivalent() {
+    let conn = fixture(Stage::Published(Family::Permissions, 1), 113, None);
+    conn.execute_batch("DROP TABLE permission_policy_receipts;
+        CREATE TABLE permission_policy_receipts(workspace_id TEXT NOT NULL,operation_id TEXT NOT NULL,fingerprint TEXT NOT NULL,result_json TEXT NOT NULL,PRIMARY KEY(workspace_id,operation_id));").unwrap();
+    assert!(verify_history(&conn, 114).is_err());
+    let conn = fixture(Stage::Published(Family::Jobs, 5), 113, None);
+    conn.execute_batch("DROP TRIGGER backend_job_cleanup_owner_immutable;
+        CREATE TRIGGER backend_job_cleanup_owner_immutable BEFORE UPDATE ON backend_job_cleanup_invocation_owners
+        BEGIN SELECT RAISE(ABORT,'Cleanup invocation ownership is immutable'); END;").unwrap();
+    assert!(verify_history(&conn, 118).is_err());
+}
+
+fn retained_to(target: i64, alternate_103: bool) -> (tempfile::TempDir, Connection) {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("retained.db");
+    super::super::tests::prepare_schema_v50(&path, Some("workspace-a"));
+    let conn = Connection::open(&path).unwrap();
+    super::super::configure_sqlite(&conn).unwrap();
+    for migration in super::super::MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= target)
+    {
+        let current = super::super::current_schema_version(&conn).unwrap();
+        verify_history(&conn, current).unwrap();
+        let migration = if migration.version == 103 && alternate_103 {
+            &super::super::JOB_INPUT_RETENTION_SCHEMA_103
+        } else {
+            migration
+        };
+        (migration.apply)(&conn).unwrap();
+    }
+    verify_history(&conn, target).unwrap();
+    (temp, conn)
+}
+
+#[test]
+fn oldest_data_bearing_schema_and_both_real_103_histories_migrate_without_relabeling() {
+    for alternate in [false, true] {
+        let (_temp, conn) = retained_to(103, alternate);
+        let original = super::super::workspace_schema_migration_history(&conn).unwrap();
+        super::super::prepare_connection(&conn).unwrap();
+        verify_history(&conn, super::super::LATEST_SCHEMA_VERSION).unwrap();
+        let updated = super::super::workspace_schema_migration_history(&conn).unwrap();
+        assert_eq!(&updated[..original.len()], &original);
+        let name: String = conn
+            .query_row(
+                "SELECT display_name FROM workspaces WHERE workspace_id='workspace-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Workspace A");
+    }
+}
+
+#[test]
+fn fresh_103_baselines_use_shape_and_never_repair_missing_receipts_or_guards() {
+    for alternate in [false, true] {
+        let (_temp, conn) = retained_to(103, alternate);
+        conn.execute_batch("DELETE FROM __yoi_schema_migrations;
+            INSERT INTO __yoi_schema_migrations(version,name) VALUES(103,'workspace schema baseline');").unwrap();
+        assert_accepted_without_domain_changes(&conn, 103);
+        if alternate {
+            conn.execute_batch("DROP TRIGGER backend_job_input_retirement")
+                .unwrap();
+        } else {
+            conn.execute_batch("DROP TABLE passkey_addition_receipts")
+                .unwrap();
+        }
+        let rows = saved_rows(&conn);
+        assert!(verify_history(&conn, 103).is_err());
+        assert_eq!(saved_rows(&conn), rows);
+    }
+    let (_temp, conn) = retained_to(102, false);
+    conn.execute_batch(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(103,'workspace schema baseline')",
+    )
+    .unwrap();
+    assert!(verify_history(&conn, 103).is_err());
+}
+
+#[test]
+fn later_family_objects_without_receipts_and_half_converged_103_are_rejected() {
+    let conn = fixture(Stage::Base, 113, None);
+    conn.execute_batch(CLAIMS_SQL).unwrap();
+    assert!(verify_history(&conn, 113).is_err());
+    let (_temp, conn) = retained_to(103, false);
+    conn.execute_batch("ALTER TABLE backend_jobs ADD COLUMN input_disposition TEXT NOT NULL DEFAULT 'available' CHECK(input_disposition IN ('available','reclaimed','erased','invalidated'))").unwrap();
+    assert!(verify_history(&conn, 103).is_err());
+}
+
+#[test]
+fn schema_comparison_preserves_literals_programs_and_composite_key_order() {
+    let left = declarations(
+        tokens("CREATE TABLE item(a TEXT, b TEXT, PRIMARY KEY(a,b), CHECK(a='Sensitive'))")
+            .unwrap(),
+    )
+    .unwrap();
+    let reordered = declarations(
+        tokens("CREATE TABLE \"item\"(b TEXT, CHECK(a='Sensitive'), a TEXT, PRIMARY KEY(a,b))")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(left, reordered);
+    for sql in [
+        "CREATE TABLE item(a TEXT, b TEXT, PRIMARY KEY(b,a), CHECK(a='Sensitive'))",
+        "CREATE TABLE item(a TEXT, b TEXT, PRIMARY KEY(a,b), CHECK(a='sensitive'))",
+    ] {
+        assert_ne!(left, declarations(tokens(sql).unwrap()).unwrap());
+    }
+}

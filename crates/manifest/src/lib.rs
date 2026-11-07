@@ -7,6 +7,7 @@ mod model;
 pub mod model_catalog;
 pub mod paths;
 pub mod plugin;
+mod plugin_profile;
 mod profile;
 mod scope;
 
@@ -24,6 +25,7 @@ pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
 };
 pub use paths::user_profiles_path;
+pub use plugin_profile::{PluginProfileConfig, PluginProfileSelection, PluginTicketDataGrant};
 pub use profile::{
     ProfileDiscovery, ProfileError, ProfileExecutionTarget, ProfileManifestSnapshot,
     ProfileMetadata, ProfileRegistry, ProfileRegistryEntry, ProfileRegistrySource,
@@ -80,6 +82,11 @@ pub struct WorkerManifest {
     /// consumer boundary.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Narrowing-only Workspace Plugin selections, not enablement or execution pins.
+    /// Empty selections are omitted to preserve existing no-Plugin snapshots and
+    /// their serialized fingerprint inputs.
+    #[serde(default, skip_serializing_if = "PluginProfileConfig::is_empty")]
+    pub plugins: PluginProfileConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
     /// First-class web tools configuration. Network access remains fail-closed
@@ -412,6 +419,8 @@ pub struct SubjektivFeatureProfileConfig {
     pub enabled: bool,
     /// Explicit consolidation tool policy; never grants Job or subject authority.
     pub consolidation_tools: bool,
+    /// Opt-in conversation tools; the Host must bind an explicit Subject connection.
+    pub chat: FeatureFlagConfig,
     pub extraction: MemoryExtractionProfileConfig,
 }
 
@@ -420,6 +429,7 @@ impl Default for SubjektivFeatureProfileConfig {
         Self {
             enabled: false,
             consolidation_tools: false,
+            chat: FeatureFlagConfig::disabled(),
             extraction: MemoryExtractionProfileConfig::default(),
         }
     }
@@ -1116,6 +1126,7 @@ impl Default for CompactionConfig {
 impl WorkerManifest {
     pub fn requires_persisted_execution_snapshot(&self) -> bool {
         self.profile.is_some()
+            || !self.plugins.is_empty()
             || self.feature.memory.workspace_settings.is_some()
             || self.feature.subjektiv.workspace_settings.is_some()
     }
@@ -1595,9 +1606,7 @@ model_id = "claude-sonnet-4-20250514"
         );
         let error = WorkerManifest::from_toml(&toml).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("dynamic Plugins are not supported"),
+            error.to_string().contains("unknown field `enabled`"),
             "unexpected error: {error}"
         );
     }
@@ -1617,7 +1626,7 @@ model_id = "claude-sonnet-4-20250514"
             }),
         );
         let error = serde_json::from_value::<WorkerManifest>(top_level).unwrap_err();
-        assert!(error.to_string().contains("unknown field `plugins`"));
+        assert!(error.to_string().contains("unknown field `resolved`"));
 
         let mut nested = base;
         nested

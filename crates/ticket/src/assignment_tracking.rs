@@ -8,7 +8,7 @@
 //! Close/reopen does not change handling; current responsibility can report after close
 //! without restoring execution grants. Retained unknown handling is not inferred waiting/done.
 //!
-//! The host authenticates the current workspace-agent Worker and its actual Runtime
+//! The host authenticates the current Subject body Worker and its actual Runtime
 //! binding, including retries, inside the same write transaction as receipt comparison,
 //! current-assignment/event CAS, audit, and result. Never split that transaction around
 //! awaits. A replayed receipt is not a fresh event observation: reread before a new update,
@@ -48,7 +48,7 @@ pub struct TicketAssignmentTrackingUpdate {
     pub tracking: TicketAssignmentTracking,
 }
 
-/// Backend-owned authenticated context, never decoded from model input. Agent
+/// Backend-owned authenticated context, never decoded from model input. Subject
 /// principal remains stable across Worker exchange; exact replay binds to the
 /// authenticated concrete sender and its binding, not merely a claimed role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -56,7 +56,7 @@ pub struct TicketAssignmentTrackingSourceContext {
     pub actor: String,
     pub runtime_id: String,
     pub worker_id: String,
-    pub agent_key: String,
+    pub subject_id: String,
     pub authentication_binding_id: String,
 }
 
@@ -87,6 +87,9 @@ pub struct TicketAssignmentTrackingProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TicketAssignmentPrincipalSnapshot {
+    Subject {
+        subject_id: String,
+    },
     User {
         account_id: String,
     },
@@ -156,11 +159,11 @@ fn validate_update(
     ]
     .into_iter()
     .any(|value| !valid_identity(value))
-        || source.agent_key != "workspace-orchestrator"
+        || !valid_identity(&source.subject_id)
+        || source.subject_id == "workspace-orchestrator"
     {
         return Err(TicketError::Conflict(
-            "tracking requires bounded identities and authenticated workspace-orchestrator source"
-                .into(),
+            "tracking requires bounded identities and authenticated Subject source".into(),
         ));
     }
     for text in [
@@ -216,7 +219,8 @@ pub fn sqlite_ticket_assignment_tracking(
         .transpose()?;
     // Legacy migration may retain current responsibility without evidence of
     // handling status. Its real Assign audit is still an immutable observation
-    // against which the first explicit self-report can CAS, even after close.
+    // for a later explicitly authorized operation, even after close. This does
+    // not authorize a legacy agent relationship to report as a Subject.
     // Never manufacture a tracking event/status or repair a missing audit. Once
     // tracking exists, only its event identity is a valid observation.
     let last_event_id = if current && tracking.is_none() && last_event_id.is_none() {
@@ -238,6 +242,9 @@ pub fn sqlite_ticket_assignment_tracking(
     let missing =
         || TicketError::Conflict("stored assignment principal identity is incomplete".into());
     let principal = match kind.as_str() {
+        "subject" => TicketAssignmentPrincipalSnapshot::Subject {
+            subject_id: principal_id.ok_or_else(missing)?,
+        },
         "workspace_agent" => TicketAssignmentPrincipalSnapshot::WorkspaceAgent {
             agent_key: principal_id.ok_or_else(missing)?,
         },
@@ -441,10 +448,10 @@ pub fn sqlite_update_ticket_assignment_tracking_in_transaction(
             "tracking assignment is removed/replaced or last event changed".into(),
         ));
     }
-    let principal_matches:bool=conn.query_row("SELECT principal_kind='workspace_agent' AND principal_id=?3 FROM ticket_worker_assignments WHERE workspace_id=?1 AND assignment_id=?2",params![workspace_id,update.assignment_id,source.agent_key],|r|r.get(0)).map_err(sqlite_err)?;
+    let principal_matches:bool=conn.query_row("SELECT principal_kind='subject' AND principal_id=?3 FROM ticket_worker_assignments WHERE workspace_id=?1 AND assignment_id=?2",params![workspace_id,update.assignment_id,source.subject_id],|r|r.get(0)).map_err(sqlite_err)?;
     if !principal_matches {
         return Err(TicketError::Conflict(
-            "authenticated agent does not own this assignment".into(),
+            "authenticated Subject does not own this assignment".into(),
         ));
     }
     let event_id=format!("tracking-{}",allocate_record_id(unix_epoch_millis_now().unwrap_or(0), |candidate| conn.query_row("SELECT EXISTS(SELECT 1 FROM typed_ticket_assignment_tracking_history WHERE workspace_id=?1 AND event_id=?2)",params![workspace_id,format!("tracking-{candidate}")],|r|r.get::<_,bool>(0)).unwrap_or(true)).map_err(sqlite_err)?);
@@ -572,7 +579,10 @@ fn reconcile_legacy_tracking(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn verify_assignment_tracking_schema(conn: &Connection) -> Result<()> {
+pub(crate) fn verify_assignment_tracking_schema(
+    conn: &Connection,
+    subject_contract: bool,
+) -> Result<()> {
     // Object names alone would accept same-named no-op triggers after drift.
     let canonical = Connection::open_in_memory().map_err(sqlite_err)?;
     canonical
@@ -603,6 +613,13 @@ pub(crate) fn verify_assignment_tracking_schema(conn: &Connection) -> Result<()>
         }
         result.replace("ifnotexists", "")
     };
+    // Generation is selected by the owning migration ledger, never by a trigger name.
+    if subject_contract {
+        canonical
+            .execute_batch(crate::subject_assignment::SUBJECT_GUARDS)
+            .map_err(sqlite_err)?;
+        crate::subject_assignment::verify(conn)?;
+    }
     for name in [
         "typed_ticket_assignment_tracking_history",
         "typed_ticket_assignment_tracking_operations",
@@ -811,6 +828,14 @@ pub(crate) fn verify_assignment_tracking_schema(conn: &Connection) -> Result<()>
                 |r| r.get(0),
             )
             .map_err(sqlite_err)?;
+        let expected_sql = if subject_contract {
+            expected_sql.replace(
+                "CHECK(principal_kind IN ('user', 'worker', 'workspace_agent'))",
+                "CHECK(principal_kind IN ('user', 'worker', 'workspace_agent', 'subject'))",
+            )
+        } else {
+            expected_sql
+        };
         let expected_sql = normalize(expected_sql);
         let actual_sql = normalize(actual_sql);
         let mut remainder = expected_sql.as_str();

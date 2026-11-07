@@ -35,7 +35,7 @@
     {
       "id": "sessions",
       "label": "Session journals",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?view=sessions",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?view=sessions",
       "goal": "Choose among saved Session journals and distinguish pending work from source presence.",
       "dataState": "Two Sessions, one with unreflected sources; deleted versus unavailable originals; bounded next page.",
       "ready": {
@@ -62,7 +62,7 @@
     {
       "id": "list",
       "label": "Literal search results",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?q=release%20%5Ba%2Bb%5D%20%25_",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?q=release%20%5Ba%2Bb%5D%20%25_",
       "goal": "Find literal text across Sessions and continue a bounded search.",
       "dataState": "Sixteen matching events across two Sessions with fixed/open states and a continuation.",
       "ready": {
@@ -79,7 +79,7 @@
     {
       "id": "detail-missing",
       "label": "Saved Journal with deleted original",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?journal=journal-release&entry=entry-00",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?journal=journal-release&entry=entry-00",
       "goal": "Read narrative, correction and related Memory without restoring a Worker or original Session.",
       "dataState": "Open event, three of eight related Memories, correcting entry; original conversation is deleted.",
       "ready": {
@@ -116,7 +116,7 @@
     {
       "id": "detail-unavailable",
       "label": "Journal with unavailable original",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?journal=journal-review&entry=entry-01",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?journal=journal-review&entry=entry-01",
       "goal": "Distinguish inability to check the original from confirmed deletion.",
       "dataState": "Fixed event remains readable, but original presence/permission is unavailable.",
       "ready": {
@@ -139,7 +139,7 @@
     {
       "id": "memory",
       "label": "Memory links back to exact Journal events",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001?change_id=change-current",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memories/memory-decision-with-a-deliberately-long-stable-identity-for-overflow-review-0000000001?change_id=change-current",
       "goal": "Identify Journal targets by title and date, with bounded continuation and separate original-source status.",
       "dataState": "Three of eight persisted candidate links, including missing/unavailable originals and reconsideration.",
       "ready": {
@@ -172,7 +172,7 @@
     {
       "id": "memory-unconnected",
       "label": "Unconnected Memory",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memory-resolved-0002?change_id=change-earlier",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/memories/memory-resolved-0002?change_id=change-earlier",
       "goal": "Recognize a missing persisted connection without fabricating a target or pending reason.",
       "dataState": "Immutable historical change with insufficient_source; no Journal anchors.",
       "ready": {
@@ -195,7 +195,7 @@
     {
       "id": "no-journal",
       "label": "No saved Journal",
-      "path": "/w/memory-review/memory/empty-subject/journal?view=sessions",
+      "path": "/w/memory-review/subjektiv/empty-subject/journal?view=sessions",
       "goal": "Distinguish no saved Journal from pending, no search results and read failure.",
       "dataState": "Successful empty Session-journal page.",
       "ready": {
@@ -212,7 +212,7 @@
     {
       "id": "no-search-result",
       "label": "No literal search matches",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?q=definitely-no-such-literal",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?q=definitely-no-such-literal",
       "goal": "Keep the query visible when search succeeds with zero results.",
       "dataState": "Successful empty search, not an unavailable Journal.",
       "ready": {
@@ -229,7 +229,7 @@
     {
       "id": "denied",
       "label": "Journal read denied",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?journal=journal-denied&entry=entry-00",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?journal=journal-denied&entry=entry-00",
       "goal": "Show a read failure rather than inventing an empty or deleted Journal.",
       "dataState": "Intentional fixture HTTP 403; verifies error presentation only, not backend authorization.",
       "ready": {
@@ -246,7 +246,7 @@
     {
       "id": "request-failure",
       "label": "Journal list unavailable",
-      "path": "/w/memory-review/memory/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?q=fixture-failure",
+      "path": "/w/memory-review/subjektiv/release-coordination-subject-with-a-deliberately-long-stable-identity-for-responsive-review/journal?q=fixture-failure",
       "goal": "Keep request failure distinct from zero matching entries.",
       "dataState": "Intentional fixture HTTP 503 with the search query retained.",
       "ready": {

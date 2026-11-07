@@ -3,20 +3,44 @@
 pub mod auth;
 pub mod authority;
 pub mod backend_job;
+mod backend_job_host_effects;
 pub mod companion;
 pub mod config;
+pub mod config_adoption;
+mod config_publication;
 pub mod config_source;
+pub mod configuration_failure;
+mod configuration_migration;
+#[cfg(test)]
+mod configuration_transfer_tests;
+#[cfg(test)]
+mod content_history_tests;
 pub mod db_executor;
+pub mod external_workdir_connection_observations;
 pub mod feature_storage;
+pub mod grant_cleanup_operation;
 pub mod hosts;
 pub mod memory_backend;
 pub mod memory_staging;
 pub mod observation;
+pub mod plugin_binding;
+pub mod plugin_catalog;
+pub mod plugin_data;
+pub mod plugin_delivery;
+pub mod plugin_host;
+pub mod plugin_https;
+pub mod plugin_plan;
+pub mod plugin_receipt;
+pub mod plugin_service;
+pub mod plugin_settings;
+pub mod policy_config;
 pub mod profile_settings;
 pub mod prompt_settings;
 pub mod records;
 pub mod repositories;
 pub mod repository_access;
+pub mod repository_access_failure;
+pub mod repository_failure;
 pub mod repository_source;
 pub mod resource_broker;
 #[cfg(test)]
@@ -34,8 +58,11 @@ pub mod subjektiv;
 #[cfg(test)]
 mod ticket_browse_performance_tests;
 mod ticket_item_checker;
+pub mod workdir_cleanup_failure;
 pub mod workdir_create_operations;
+mod workdir_inventory_failure;
 mod workdir_removal;
+mod worker_create_failure_store;
 mod worker_projection;
 pub mod worker_source;
 pub mod workspace_catalog;
@@ -80,6 +107,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("Subjektiv storage error: {0}")]
+    SubjektivStorage(#[source] FeatureStorageError),
     #[error("ticket error: {0}")]
     Ticket(#[from] ticket::TicketError),
     #[error("merge request error: {0}")]
@@ -90,8 +119,12 @@ pub enum Error {
     InvalidInput(String),
     #[error("invalid project record id `{0}`")]
     InvalidRecordId(String),
+    #[error("{0}")]
+    Configuration(#[from] configuration_failure::ConfigurationFailure),
     #[error("workspace backend config error: {0}")]
     Config(String),
+    #[error("Workspace prompt projection is unavailable")]
+    PromptProjection(#[source] std::sync::Arc<Error>),
     #[error("record `{0}` is missing frontmatter")]
     MissingFrontmatter(String),
     #[error("unknown local host `{0}`")]
@@ -104,11 +137,63 @@ pub enum Error {
     InvalidRuntimeIdentifier { kind: String, value: String },
     #[error("worker name is reserved for a dedicated Workspace service: {0}")]
     ReservedWorkerName(String),
+    #[error("{}", cause.explanation())]
+    RuntimeControlFailed {
+        runtime_id: String,
+        cause: protocol::control_failure::RuntimeControlCause,
+    },
+    /// Typed startup result; HTTP and other callers project this without parsing Display.
+    #[error(
+        "Worker creation failed; the typed result retains its cause and operation observations"
+    )]
+    WorkerCreateFailed {
+        failure: Box<runtime_api::startup::WorkerCreateFailure>,
+        #[source]
+        source: Option<Box<Error>>,
+    },
     #[error("runtime `{runtime_id}` operation failed ({code}): {message}")]
     RuntimeOperationFailed {
         runtime_id: String,
         code: String,
         message: String,
+    },
+    #[error("Runtime Workdir attachment synchronization could not be confirmed")]
+    WorkdirAttachmentSyncFailed {
+        runtime_id: String,
+        observation: Box<hosts::RuntimeOperationResponse>,
+    },
+    #[error("External Workdir connection stage source")]
+    ExternalWorkdirConnectionSource(#[source] std::sync::Arc<Error>),
+    #[error("External Workdir provider frame encoding failed")]
+    ExternalWorkdirFrameEncoding(#[source] serde_json::Error),
+    #[error("External Workdir provider frame decoding failed")]
+    ExternalWorkdirFrameDecoding(#[source] serde_json::Error),
+    #[error("External Workdir provider transport failed")]
+    ExternalWorkdirTransport(#[source] axum::Error),
+    #[error("External Workdir provider transport timed out")]
+    ExternalWorkdirTransportTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("External Workdir connection ended ({reason})")]
+    ExternalWorkdirConnectionClosed {
+        reason: workdir::management_failure::WorkdirManagementReason,
+    },
+    #[error("External Workdir observation failed")]
+    ExternalWorkdirObservationFailed {
+        operation: workdir::management_failure::WorkdirManagementOperation,
+        reason: workdir::management_failure::WorkdirManagementReason,
+        #[source]
+        source: Box<Error>,
+    },
+    #[error("External Workdir cleanup has additional failures; the primary result is unchanged")]
+    ExternalWorkdirCleanupFailed {
+        #[source]
+        primary: Box<Error>,
+        supplementary: Vec<Error>,
+    },
+    #[error("Workdir session closing could not be confirmed")]
+    WorkdirSessionCloseFailed {
+        runtime_id: String,
+        #[source]
+        failure: workdir_cleanup_failure::WorkdirCleanupFailure,
     },
     #[error("runtime `{runtime_id}` operation failed (workdir_session_open_failed): {}", transport.message)]
     WorkdirSessionOpenFailed {
@@ -120,6 +205,10 @@ pub enum Error {
         runtime_id: String,
         capability: String,
     },
+    #[error("{0}")]
+    RepositoryLookup(#[from] repository_failure::RepositoryFailure),
+    #[error("{0}")]
+    RepositoryAccess(#[from] repository_access_failure::RepositoryAccessFailure),
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
     #[error("subjektiv subject `{0}` was not found in this Workspace")]
@@ -159,6 +248,12 @@ pub enum Error {
         "restore_observation_conflict: Restore observation changed; refresh before a new intent"
     )]
     RestoreObservationConflict,
+    #[error("Subject body changed; reload before a new lifecycle intent")]
+    SubjectBodySuperseded,
+    #[error("Worker lifecycle observation is stale; this request was not accepted")]
+    WorkerLifecycleObservationStale,
+    #[error("Repository key {repository_key} already exists with different registration intent")]
+    RepositoryRegistrationConflict { repository_key: String },
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]
@@ -167,6 +262,10 @@ pub enum Error {
     WorkerSourceIdentity(String),
     #[error("Workspace signing identity error ({code}): {message}")]
     WorkspaceSigningIdentity { code: String, message: String },
+    #[error("Plugin catalog error: {0}")]
+    PluginCatalog(#[from] plugin_catalog::PluginCatalogError),
+    #[error("Plugin Host operation rejected: {0}")]
+    PluginHost(#[from] server_api::PluginHostError),
     #[error("Workspace Drive error: {0}")]
     Drive(#[from] workspace_drive::Error),
     #[error("DB execution capacity exceeded")]
@@ -175,6 +274,18 @@ pub enum Error {
     DbExecutorUnavailable,
     #[error("DB operation outcome unknown; do not automatically retry")]
     DbOperationOutcomeUnknown,
+    /// Observed operation failure and independent projection/save failures. Neither
+    /// recording failure nor this wrapper is proof of a durable Job transition.
+    /// Display is deliberately static; authenticated consumers inspect typed fields.
+    #[error("Backend Job operation failed; recording evidence is separate")]
+    BackendJobFailure {
+        #[source]
+        primary: std::sync::Arc<Error>,
+        failure_cause: Option<backend_job::BackgroundFailure>,
+        recording: Vec<Error>,
+    },
+    #[error("Backend Job cause projection failed")]
+    BackendJobCauseProjection(#[source] error_contract::ContractError),
     #[error("store error: {0}")]
     Store(String),
 }

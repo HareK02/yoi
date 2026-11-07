@@ -4,6 +4,35 @@ use std::future::Future;
 
 const MANAGEMENT_BODY_LIMIT: usize = 8 * 1024 * 1024;
 
+#[cfg(test)]
+mod attachment_control_tests {
+    use super::*;
+
+    #[test]
+    fn attachment_control_dto_does_not_retain_raw_storage_or_provider_text() {
+        for error in [
+            RuntimeError::StoreCommitOutcomeUnknown {
+                operation: "write Worker aggregate",
+                path: std::path::PathBuf::from("/private/runtime/worker.json"),
+                source: std::io::Error::other("private-provider-token"),
+            },
+            RuntimeError::InvalidRequest(
+                "private-provider-token /private/runtime/worker.json".into(),
+            ),
+        ] {
+            let cause = error.control_cause();
+            let dto = api_error(RuntimeHttpRestError::runtime_control(error));
+            assert_eq!(dto.error.code, cause.reason());
+            assert_eq!(dto.error.message, cause.explanation());
+            assert_eq!(dto.control_cause(), Some(cause));
+            assert!(dto.error.startup.is_none());
+            let serialized = serde_json::to_string(&dto).unwrap();
+            assert!(!serialized.contains("/private/runtime"));
+            assert!(!serialized.contains("private-provider-token"));
+        }
+    }
+}
+
 // Axum request extensions remain the authorization authority. The generated adapter deliberately
 // has no authentication model, so the verified extension is scoped across its service call.
 tokio::task_local! {
@@ -172,6 +201,10 @@ async fn runtime_api_wire_compatibility(
         response.status(),
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
     ) && !is_json_error
+        && response
+            .extensions()
+            .get::<Arc<runtime_api::RuntimeApiError>>()
+            .is_none()
     {
         return RuntimeHttpRestError::new(
             StatusCode::BAD_REQUEST,
@@ -224,7 +257,21 @@ where
 }
 
 fn api_error(error: RuntimeHttpRestError) -> runtime_api::RuntimeApiError {
-    runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message)
+    let mut response =
+        runtime_api::RuntimeApiError::new(error.status.as_u16(), error.code, error.message);
+    if error.startup.is_none() {
+        if let Some(cause) = error.control {
+            response = response.with_control(cause);
+        }
+    }
+    response.error.startup = error.startup;
+    if let Some(cause) = error.management {
+        response = response.with_management(cause);
+    }
+    if let Some(failure) = error.create_failure {
+        return response.with_create_failure(failure);
+    }
+    response
 }
 
 impl runtime_api::RuntimeApi for RuntimeManagementApi {
@@ -404,6 +451,30 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 "Session erasure requires filesystem storage",
             ))
         }
+    }
+
+    async fn purge_subject_job_removal(
+        &self,
+        request: runtime_api::SubjectJobRemovalPurgeRequest,
+    ) -> Result<runtime_api::SubjectJobRemovalPurgeResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.deletion.workspace_id)?;
+        self.state
+            .runtime
+            .purge_subject_job_removal_scoped(&scope, request)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)
+    }
+
+    async fn subject_delete_worker(
+        &self,
+        request: runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<runtime_api::SubjectDeleteWorkerResponse, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        self.state
+            .runtime
+            .subject_delete_worker_scoped(&scope, request)
+            .map_err(RuntimeHttpRestError::runtime)
+            .map_err(api_error)
     }
 
     async fn recover_subject_create(
@@ -654,11 +725,12 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         let ack = match auth_workspace_scope(&self.state, auth_extension().as_ref())
             .map_err(api_error)?
         {
-            Some(scope) => self
-                .state
-                .runtime
-                .stop_worker_scoped(&scope, &worker_ref, value.reason),
-            None => self.state.runtime.stop_worker(&worker_ref, value.reason),
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .stop_worker_request_scoped(&scope, &worker_ref, value)
+            }
+            None => self.state.runtime.stop_worker_request(&worker_ref, value),
         }
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
@@ -666,11 +738,57 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         Ok(runtime_api::WorkerLifecycleResponse { ack })
     }
 
+    async fn coordinate_worker_stop(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, runtime_api::RuntimeApiError> {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let outcome = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .coordinate_worker_stop_scoped(&scope, &worker_ref, value)
+            }
+            None => self
+                .state
+                .runtime
+                .coordinate_worker_stop(&worker_ref, value),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        response(outcome)
+    }
+
+    async fn worker_stop_outcome(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerLifecycleRequest,
+    ) -> Result<runtime_api::WorkerStopOutcome, runtime_api::RuntimeApiError> {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let outcome = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => {
+                self.state
+                    .runtime
+                    .worker_stop_outcome_scoped(&scope, &worker_ref, value)
+            }
+            None => self.state.runtime.worker_stop_outcome(&worker_ref, value),
+        }
+        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(api_error)?;
+        response(outcome)
+    }
+
     async fn cancel_worker(
         &self,
         worker_id: String,
         value: runtime_api::WorkerLifecycleRequest,
     ) -> Result<runtime_api::WorkerLifecycleResponse, runtime_api::RuntimeApiError> {
+        validate_cancel_request(&value).map_err(api_error)?;
         let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
         let ack = match auth_workspace_scope(&self.state, auth_extension().as_ref())
             .map_err(api_error)?
@@ -709,6 +827,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         let result = result
             .map(|result| -> Result<_, runtime_api::RuntimeApiError> {
                 Ok(runtime_api::WorkerRestoreResponse {
+                    control: result.control,
+                    startup: result.startup,
                     state: match result.state {
                         server_api::WorkerRestoreState::Accepted => {
                             runtime_api::WorkerRestoreState::Accepted
@@ -762,6 +882,8 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
         .map_err(RuntimeHttpRestError::runtime)
         .map_err(api_error)?;
         Ok(runtime_api::WorkerRestoreResponse {
+            control: result.control,
+            startup: result.startup,
             state: match result.state {
                 server_api::WorkerRestoreState::Accepted => {
                     runtime_api::WorkerRestoreState::Accepted
@@ -830,10 +952,83 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 .runtime
                 .replace_worker_workdir_attachments(&worker_ref, attachments),
         }
-        .map_err(RuntimeHttpRestError::runtime)
+        .map_err(RuntimeHttpRestError::runtime_control)
         .map_err(api_error)?;
         let worker = response(worker)?;
         Ok(runtime_api::WorkerResponse { worker })
+    }
+
+    async fn observe_worker_workdir_attachments(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerWorkdirAttachmentsRequest,
+    ) -> Result<runtime_api::WorkerWorkdirAttachmentsObservation, runtime_api::RuntimeApiError>
+    {
+        let attachments = request(value.logical_workdir_attachments.clone())?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        let result = match auth_workspace_scope(&self.state, auth_extension().as_ref())
+            .map_err(api_error)?
+        {
+            Some(scope) => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_state_scoped(&scope, &worker_ref, attachments),
+            None => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_state(&worker_ref, attachments),
+        }
+        .map_err(RuntimeHttpRestError::runtime_control)
+        .map_err(api_error)?;
+        // Preserve the caller's exact set ordering in the observation echo.
+        Ok(runtime_api::WorkerWorkdirAttachmentsObservation {
+            request: value,
+            ..result
+        })
+    }
+
+    async fn apply_worker_workdir_attachments_operation(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<runtime_api::WorkerWorkdirAttachmentsOperationReceipt, runtime_api::RuntimeApiError>
+    {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        match auth_workspace_scope(&self.state, auth_extension().as_ref()).map_err(api_error)? {
+            Some(scope) => self
+                .state
+                .runtime
+                .apply_worker_workdir_attachments_operation_scoped(&scope, &worker_ref, request),
+            None => self
+                .state
+                .runtime
+                .apply_worker_workdir_attachments_operation(&worker_ref, request),
+        }
+        .map_err(RuntimeHttpRestError::runtime_control)
+        .map_err(api_error)
+    }
+
+    async fn observe_worker_workdir_attachments_operation(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerWorkdirAttachmentsOperationRequest,
+    ) -> Result<
+        runtime_api::WorkerWorkdirAttachmentsOperationObservation,
+        runtime_api::RuntimeApiError,
+    > {
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        match auth_workspace_scope(&self.state, auth_extension().as_ref()).map_err(api_error)? {
+            Some(scope) => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_operation_scoped(&scope, &worker_ref, request),
+            None => self
+                .state
+                .runtime
+                .observe_worker_workdir_attachments_operation(&worker_ref, request),
+        }
+        .map_err(RuntimeHttpRestError::runtime_control)
+        .map_err(api_error)
     }
 
     async fn complete_worker_arguments(
@@ -904,6 +1099,75 @@ impl runtime_api::RuntimeApi for RuntimeManagementApi {
                 503,
                 "worker_retention_unavailable",
                 "Worker retention requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn freeze_worker_removal(
+        &self,
+        worker_id: String,
+        value: runtime_api::WorkerRetentionExecutionRequest,
+    ) -> Result<runtime_api::WorkerRemovalFreeze, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &value.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        if value.worker_id != worker_ref.worker_id {
+            return Err(runtime_api::RuntimeApiError::new(
+                400,
+                "worker_id_mismatch",
+                "Worker removal route identity mismatch",
+            ));
+        }
+        #[cfg(feature = "fs-store")]
+        {
+            let request: WorkerRetentionExecutionRequest = request(value)?;
+            self.state
+                .runtime
+                .freeze_worker_removal_scoped(&scope, &request)
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, value);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Worker removal requires filesystem storage",
+            ))
+        }
+    }
+
+    async fn capture_worker_removal_session(
+        &self,
+        worker_id: String,
+        request: runtime_api::WorkerRemovalSessionCaptureRequest,
+    ) -> Result<session_store::capture::RecordingCaptureSlice, runtime_api::RuntimeApiError> {
+        let scope = material_scope(&self.state, &request.workspace_id)?;
+        let worker_ref = worker_ref_for(&self.state.runtime, worker_id).map_err(api_error)?;
+        #[cfg(feature = "fs-store")]
+        {
+            self.state
+                .runtime
+                .capture_worker_removal_session_scoped(
+                    &scope,
+                    &request.operation_id,
+                    worker_ref.worker_id,
+                    request.session_id,
+                    request.active_segment_id,
+                    request.start,
+                    request.max_entries,
+                    request.max_serialized_bytes,
+                )
+                .map_err(RuntimeHttpRestError::runtime)
+                .map_err(api_error)
+        }
+        #[cfg(not(feature = "fs-store"))]
+        {
+            let _ = (scope, worker_ref, request);
+            Err(runtime_api::RuntimeApiError::new(
+                503,
+                "worker_retention_unavailable",
+                "Worker removal requires filesystem storage",
             ))
         }
     }

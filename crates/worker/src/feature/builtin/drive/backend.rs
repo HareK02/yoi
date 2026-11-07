@@ -17,6 +17,7 @@ use crate::worker::{
     WorkspaceBinaryRequest, WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod,
 };
 use serde::{Serialize, de::DeserializeOwned};
+use server_api::authorization::PermissionResource;
 use server_api::*;
 
 pub(super) const DEADLINE: Duration = Duration::from_secs(30);
@@ -30,6 +31,14 @@ pub struct DriveBackend {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DriveError {
+    #[error(
+        "Drive operation authorization failed before dispatch: {operation}; resource={resource:?}; denied={denied}"
+    )]
+    Authorization {
+        operation: String,
+        resource: PermissionResource,
+        denied: bool,
+    },
     #[error("Drive access denied")]
     Denied,
     #[error("Drive resource not found")]
@@ -48,6 +57,29 @@ pub enum DriveError {
         "Drive mutation outcome unknown; request_id={0}; query request_status; do not blindly repeat"
     )]
     OutcomeUnknown(String),
+    /// The caller result remains independent of the received, closed-enum cause.
+    /// No received explanation, context or request identity is retained here.
+    #[error("{result}")]
+    Remote {
+        result: Box<DriveError>,
+        details: DriveHttpFailureDetails,
+    },
+}
+
+impl DriveError {
+    pub(super) fn classification_source(&self) -> &Self {
+        match self {
+            Self::Remote { result, .. } => result.classification_source(),
+            source => source,
+        }
+    }
+
+    pub(super) fn remote_details(&self) -> Option<DriveHttpFailureDetails> {
+        match self {
+            Self::Remote { details, .. } => Some(*details),
+            _ => None,
+        }
+    }
 }
 
 impl DriveBackend {
@@ -62,6 +94,30 @@ impl DriveBackend {
             .workspace_id()
             .filter(|id| !id.is_empty() && self.client.is_available())
             .ok_or(DriveError::Denied)
+    }
+    fn authorize(&self, operation: &str, resource: PermissionResource) -> Result<(), DriveError> {
+        self.client
+            .authorize_operation(operation, &resource)
+            .map_err(|error| {
+                let denied = error.is_authorization_denial();
+                DriveError::Authorization {
+                    operation: operation.into(),
+                    resource,
+                    denied,
+                }
+            })
+    }
+    fn workspace_resource(&self) -> Result<PermissionResource, DriveError> {
+        Ok(PermissionResource::Workspace {
+            workspace_id: self.workspace()?.into(),
+        })
+    }
+    fn entry_resource(&self, entry: &DriveEntryRef) -> Result<PermissionResource, DriveError> {
+        self.validate_ref(entry)?;
+        Ok(PermissionResource::DriveEntry {
+            workspace_id: entry.workspace_id.clone(),
+            node_id: entry.node_id.clone(),
+        })
     }
     fn base(&self) -> Result<String, DriveError> {
         Ok(format!("/api/w/{}/drive", encode(self.workspace()?)))
@@ -149,6 +205,7 @@ impl DriveBackend {
         if !response.is_success() {
             return Err(classify(
                 response.status,
+                response.content_type.as_deref(),
                 response.body.as_bytes(),
                 mutation,
                 request_id,
@@ -176,6 +233,7 @@ impl DriveBackend {
         .await
     }
     pub async fn capabilities(&self) -> Result<DriveCapabilities, DriveError> {
+        self.authorize("drive.capabilities", self.workspace_resource()?)?;
         self.get(
             "/capabilities",
             &serde_json::json!({}),
@@ -184,6 +242,7 @@ impl DriveBackend {
         .await
     }
     pub async fn root(&self) -> Result<DriveEntry, DriveError> {
+        self.authorize("drive.root", self.workspace_resource()?)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "root", false, None);
         let entry: DriveEntry = self
             .json(
@@ -201,6 +260,7 @@ impl DriveBackend {
         Ok(entry)
     }
     pub async fn metadata(&self, entry: &DriveEntryRef) -> Result<DriveEntry, DriveError> {
+        self.authorize("drive.metadata", self.entry_resource(entry)?)?;
         self.validate_ref(entry)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "metadata", false, None);
         let result: DriveEntry = self
@@ -226,6 +286,7 @@ impl DriveBackend {
         limit: Option<u32>,
         after: Option<String>,
     ) -> Result<DriveListResponse, DriveError> {
+        self.authorize("drive.list", self.entry_resource(parent)?)?;
         self.validate_ref(parent)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "list", false, None);
         let result: DriveListResponse = self
@@ -258,6 +319,7 @@ impl DriveBackend {
         Ok(result)
     }
     pub async fn search(&self, query: DriveSearchQuery) -> Result<DriveListResponse, DriveError> {
+        self.authorize("drive.search", self.workspace_resource()?)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "search", false, None);
         let result: DriveListResponse = self.get("/search", &query, &diagnostic).await?;
         self.validate_page(
@@ -290,6 +352,7 @@ impl DriveBackend {
         entry: &DriveEntryRef,
         max_bytes: u32,
     ) -> Result<DriveReadTextResponse, DriveError> {
+        self.authorize("drive.read_text", self.entry_resource(entry)?)?;
         self.validate_ref(entry)?;
         let diagnostic = Diagnostic::new(Adapter::Drive, "read_text", false, None);
         let result: DriveReadTextResponse = self
@@ -341,6 +404,7 @@ impl DriveBackend {
                 body: None,
                 max_response_bytes: DRIVE_CHUNK_MAX_BYTES as usize,
             };
+            self.authorize("drive.read_chunk", self.entry_resource(&entry.entry)?)?;
             let client = self.client.clone();
             let deadline = self.deadline;
             let response = tokio::time::timeout(
@@ -369,6 +433,7 @@ impl DriveBackend {
             if !(200..300).contains(&response.status) {
                 return Err(classify(
                     response.status,
+                    response.content_type.as_deref(),
                     &response.body,
                     false,
                     "",
@@ -400,31 +465,35 @@ impl DriveBackend {
             Ok(response)
         });
         match result {
-            Err(DriveError::OutcomeUnknown(_)) => match self
-                .status_with_diagnostic(id, &diagnostic.at_stage(Stage::Reconcile))
-                .await
+            Err(error)
+                if matches!(error.classification_source(), DriveError::OutcomeUnknown(_)) =>
             {
-                Ok(DriveRequestStatusResponse {
-                    state: DriveRequestState::Committed,
-                    response: Some(response),
-                    ..
-                }) => {
-                    diagnostic.record(Stage::Reconcile, Reason::Reconciled, None);
-                    Ok(response) // status validates both IDs and entry metadata
+                match self
+                    .status_with_diagnostic(id, &diagnostic.at_stage(Stage::Reconcile))
+                    .await
+                {
+                    Ok(DriveRequestStatusResponse {
+                        state: DriveRequestState::Committed,
+                        response: Some(response),
+                        ..
+                    }) => {
+                        diagnostic.record(Stage::Reconcile, Reason::Reconciled, None);
+                        Ok(response) // status validates both IDs and entry metadata
+                    }
+                    Ok(status) => {
+                        diagnostic.record(
+                            Stage::Reconcile,
+                            match status.state {
+                                DriveRequestState::Uncommitted => Reason::NotCommittedSnapshot,
+                                DriveRequestState::Committed => Reason::IncompleteReceipt,
+                            },
+                            None,
+                        );
+                        Err(error)
+                    }
+                    Err(_) => Err(error),
                 }
-                Ok(status) => {
-                    diagnostic.record(
-                        Stage::Reconcile,
-                        match status.state {
-                            DriveRequestState::Uncommitted => Reason::NotCommittedSnapshot,
-                            DriveRequestState::Committed => Reason::IncompleteReceipt,
-                        },
-                        None,
-                    );
-                    Err(DriveError::OutcomeUnknown(id.into()))
-                }
-                Err(_) => Err(DriveError::OutcomeUnknown(id.into())),
-            },
+            }
             other => other,
         }
     }
@@ -454,6 +523,24 @@ impl DriveBackend {
             diagnostic.record(Stage::Request, Reason::RequestSize, None);
             return Err(DriveError::Limit);
         }
+        match &request.mutation {
+            DriveMutation::CreateFolder { parent, .. } => {
+                self.authorize("drive.create_folder", self.entry_resource(parent)?)?
+            }
+            DriveMutation::CreateText { parent, .. } => {
+                self.authorize("drive.create_text", self.entry_resource(parent)?)?
+            }
+            DriveMutation::UpdateText { id, .. } => {
+                self.authorize("drive.update_text", self.entry_resource(id)?)?
+            }
+            DriveMutation::Delete { id, .. } => {
+                self.authorize("drive.delete", self.entry_resource(id)?)?
+            }
+            DriveMutation::Relocate { id, parent, .. } => {
+                self.authorize("drive.relocate", self.entry_resource(id)?)?;
+                self.authorize("drive.relocate", self.entry_resource(parent)?)?;
+            }
+        }
         let result = self
             .json(
                 WorkspaceRequest::json(
@@ -479,6 +566,18 @@ impl DriveBackend {
             diagnostic.record(Stage::Request, Reason::RequestSize, None);
             return Err(DriveError::Limit);
         }
+        let node_id = match query.operation {
+            DriveUploadOperation::Create => query.parent_id.as_ref(),
+            DriveUploadOperation::Update => query.id.as_ref(),
+        }
+        .ok_or_else(|| DriveError::Invalid("upload target required".into()))?;
+        self.authorize(
+            "drive.upload",
+            self.entry_resource(&DriveEntryRef {
+                workspace_id: query.entry_workspace_id.clone(),
+                node_id: node_id.clone(),
+            })?,
+        )?;
         let path = format!("{}/upload{}", self.base()?, query_string(&query)?);
         let request = WorkspaceBinaryRequest {
             method: WorkspaceRequestMethod::Put,
@@ -508,6 +607,7 @@ impl DriveBackend {
             }
             Ok(Ok(Ok(response))) => Err(classify(
                 response.status,
+                response.content_type.as_deref(),
                 &response.body,
                 true,
                 &query.request_id,
@@ -540,6 +640,13 @@ impl DriveBackend {
         if request_id.is_empty() || request_id.len() > 256 {
             return Err(DriveError::Invalid("invalid request ID".into()));
         }
+        self.authorize(
+            "drive.request_status",
+            PermissionResource::DriveRequest {
+                workspace_id: self.workspace()?.into(),
+                request_id: request_id.into(),
+            },
+        )?;
         let response: DriveRequestStatusResponse = self
             .json(
                 WorkspaceRequest::get(format!("{}/requests/{}", self.base()?, encode(request_id))),
@@ -609,27 +716,41 @@ fn query_string<T: Serialize>(value: &T) -> Result<String, DriveError> {
 }
 fn classify(
     status: u16,
+    content_type: Option<&str>,
     body: &[u8],
     mutation: bool,
     id: &str,
     diagnostic: &Diagnostic,
 ) -> DriveError {
-    if let Ok(error) = serde_json::from_slice::<DriveApiError>(body) {
-        if error.classification == DriveFailureClassification::Unknown
+    if let Ok(received) =
+        DriveHttpApiError::decode_received(status, content_type.unwrap_or(""), body)
+    {
+        let error = received.legacy();
+        let result = if error.classification == DriveFailureClassification::Unknown
             || error.code == DriveApiErrorCode::OutcomeUnknown
         {
             diagnostic.record(Stage::Response, Reason::BackendUnknown, Some(status));
-            return DriveError::OutcomeUnknown(id.into());
-        }
-        diagnostic.record(Stage::Response, Reason::BackendRejected, Some(status));
-        return match error.code {
-            DriveApiErrorCode::Denied => DriveError::Denied,
-            DriveApiErrorCode::NotFound => DriveError::NotFound,
-            DriveApiErrorCode::Conflict => DriveError::Conflict,
-            DriveApiErrorCode::Invalid => DriveError::Invalid("Backend rejected arguments".into()),
-            DriveApiErrorCode::Limit => DriveError::Limit,
-            DriveApiErrorCode::StorageUnavailable => DriveError::Unavailable,
-            DriveApiErrorCode::OutcomeUnknown => DriveError::OutcomeUnknown(id.into()),
+            DriveError::OutcomeUnknown(id.into())
+        } else {
+            diagnostic.record(Stage::Response, Reason::BackendRejected, Some(status));
+            match error.code {
+                DriveApiErrorCode::Denied => DriveError::Denied,
+                DriveApiErrorCode::NotFound => DriveError::NotFound,
+                DriveApiErrorCode::Conflict => DriveError::Conflict,
+                DriveApiErrorCode::Invalid => {
+                    DriveError::Invalid("Backend rejected arguments".into())
+                }
+                DriveApiErrorCode::Limit => DriveError::Limit,
+                DriveApiErrorCode::StorageUnavailable => DriveError::Unavailable,
+                DriveApiErrorCode::OutcomeUnknown => DriveError::OutcomeUnknown(id.into()),
+            }
+        };
+        return match received.details() {
+            Some(details) => DriveError::Remote {
+                result: Box::new(result),
+                details: *details,
+            },
+            None => result,
         };
     }
     diagnostic.record(Stage::Response, Reason::UnrecognizedResponse, Some(status));

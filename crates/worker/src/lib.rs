@@ -17,6 +17,7 @@ pub mod job;
 mod metadata_lifecycle;
 pub mod model_client;
 mod paste_artifact_tool;
+pub mod plugin;
 pub mod profile_manifest;
 pub mod prompt;
 #[cfg(test)]
@@ -30,9 +31,12 @@ pub mod shared_state;
 mod shutdown_after_idle;
 mod subject_release;
 mod subjektiv_metadata;
+#[cfg(test)]
+mod test_support;
 pub use subject_release::SubjectReleaseReservation;
 pub mod skill;
 pub mod spawn;
+pub mod startup_failure;
 pub mod subjektiv;
 pub mod wip;
 

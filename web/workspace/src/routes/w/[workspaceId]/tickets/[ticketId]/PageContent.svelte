@@ -4,6 +4,7 @@
   import TicketTags from "#lib/workspace/tickets/TicketTags.svelte";
   import TicketWorkerObservation from "#lib/workspace/tickets/TicketWorkerObservation.svelte";
   import TicketHandling from "#lib/workspace/tickets/TicketHandling.svelte";
+  import TicketHierarchy from "#lib/workspace/tickets/TicketHierarchy.svelte";
   import { observeOperation, type ObservedOperation } from "#lib/workspace/api/ticket-operations.ts";
   import RichMarkdown from "#lib/workspace/console/RichMarkdown.svelte";
   import BevelLine from "#lib/workspace/ui/BevelLine.svelte";
@@ -24,6 +25,7 @@
   import { currentRequirementApprovalStatus, summarySourceReviewStatus } from "#lib/workspace/merge-request-status.ts";
   import {
     relationLabel,
+    assignmentPrincipalLabel,
     ticketWorkerLaunchHref,
   } from "#lib/workspace/tickets/ticket-panel.ts";
   import type {
@@ -582,11 +584,17 @@
       <BevelLine decorative />
       {#each ticket.action_eligibility.blockers as blocker}<p class="workspace-callout">{blocker}</p>{/each}
       {#key JSON.stringify([data.workspaceId, ticket.id])}
-        <TicketHandling workspaceId={data.workspaceId} {ticket} orchestrator={data.orchestrator.data} refresh={refreshOperationTicket} />
+        <TicketHandling workspaceId={data.workspaceId} {ticket} refresh={refreshOperationTicket} />
         <BevelLine decorative />
         <TicketTags workspaceId={data.workspaceId} {ticket} refresh={refreshOperationTicket} />
       {/key}
 
+      <BevelLine decorative />
+      <TicketHierarchy
+        workspaceId={data.workspaceId}
+        routeTicketId={data.ticketId}
+        {ticket}
+      />
       <BevelLine decorative />
       <section class="ticket-detail-section ticket-relations">
         <div class="ticket-section-heading">
@@ -696,15 +704,7 @@
             {#each ticket.assignments as assignment}
               <li>
                 <strong>{assignment.role}</strong>
-                <span>
-                  {#if assignment.principal.kind === "worker"}
-                    {assignment.principal.runtime_id}/{assignment.principal.worker_id}
-                  {:else if assignment.principal.kind === "user"}
-                    {assignment.principal.account_id}
-                  {:else}
-                    {assignment.principal.agent_key}
-                  {/if}
-                </span>
+                <span>{assignmentPrincipalLabel(assignment.principal)}</span>
               </li>
             {/each}
           </ul>

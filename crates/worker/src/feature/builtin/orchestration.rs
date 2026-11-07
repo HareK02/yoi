@@ -9,19 +9,19 @@ use protocol::Segment;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::manage_worker::{
-    WORKER_LIFECYCLE_SERVICE_ID, WorkerLifecycleService, WorkerLifecycleSpawnRequest,
+use crate::feature::contracts::{
+    TICKET_SERVICE_ID, TICKET_SERVICE_VERSION, TicketService, WORKER_LIFECYCLE_SERVICE_ID,
+    WORKER_LIFECYCLE_SERVICE_VERSION, WorkerLifecycleService, WorkerLifecycleSpawnRequest,
     WorkerLifecycleWorkdirAttachment,
 };
-use super::ticket::{TICKET_SERVICE_ID, TicketService};
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureModule, ServiceId,
-    ServiceRequirement, ToolContribution, ToolDeclaration,
+    ServiceRequirement, ServiceVersionReq, ToolContribution, ToolDeclaration,
 };
 
 const FEATURE_ID: &str = "orchestration";
 const TOOL_NAME: &str = "SpawnTicketWorker";
-const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); repository/Workdir attachments are optional. For builtin:coder (or coder), omitted flow defaults to builtin:coder-review so the Coder owns the Reviewer SubWorker cycle and MR verdict. Explicit flow: null disables Flow; a string selects another Flow. Other profiles get no default Flow. Results and return choices follow user intent, not a universal approval or MR gate. Orchestrator starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
+const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); repository/Workdir attachments are optional. For builtin:coder (or coder), omitted flow defaults to builtin:coder-review so the Coder owns the Reviewer SubWorker cycle and MR verdict. Explicit flow: null disables Flow; a string selects another Flow. Other profiles get no default Flow. Results and return choices follow user intent, not a universal approval or MR gate. Assigned Subject starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -34,14 +34,20 @@ impl FeatureModule for OrchestrationFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin(FEATURE_ID, "Orchestration")
             .with_description("Semantic Ticket orchestration operations.")
-            .with_service_requirement(ServiceRequirement::required(
-                ServiceId::builtin(TICKET_SERVICE_ID),
-                "SpawnTicketWorker requires current typed Ticket authority",
-            ))
-            .with_service_requirement(ServiceRequirement::required(
-                ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
-                "SpawnTicketWorker requires Workspace Worker lifecycle authority",
-            ))
+            .with_service_requirement(
+                ServiceRequirement::required(
+                    ServiceId::builtin(TICKET_SERVICE_ID),
+                    "SpawnTicketWorker requires current typed Ticket authority",
+                )
+                .with_version(ServiceVersionReq::exact(TICKET_SERVICE_VERSION)),
+            )
+            .with_service_requirement(
+                ServiceRequirement::required(
+                    ServiceId::builtin(WORKER_LIFECYCLE_SERVICE_ID),
+                    "SpawnTicketWorker requires Workspace Worker lifecycle authority",
+                )
+                .with_version(ServiceVersionReq::exact(WORKER_LIFECYCLE_SERVICE_VERSION)),
+            )
             .with_tool(ToolDeclaration::new(TOOL_NAME, TOOL_DESCRIPTION))
     }
 
@@ -78,7 +84,7 @@ struct SpawnTicketWorkerWorkdirInput {
 #[serde(deny_unknown_fields)]
 struct SpawnTicketWorkerInput {
     ticket_id: String,
-    /// Observed current delegation identity. Required by Backend for an Orchestrator start; manual callers omit it.
+    /// Observed current delegation identity. Required by Backend for an assigned Subject start; manual callers omit it.
     #[serde(default)]
     orchestrator_assignment_id: Option<String>,
     runtime_id: String,
@@ -97,6 +103,10 @@ struct SpawnTicketWorkerInput {
     /// Workdirs. Backend derives effective capabilities; callers cannot request them.
     #[serde(default)]
     workdir_attachments: Vec<SpawnTicketWorkerWorkdirInput>,
+    /// Existing general delegation contract. Backend validates the live Subject
+    /// ceiling and requested Profile; Ticket assignment grants no capabilities.
+    #[serde(default)]
+    execution_grant: Option<server_api::authorization::WorkerDelegationRequest>,
 }
 
 // Serde's ordinary Option would collapse explicit null and an absent field.
@@ -164,7 +174,7 @@ impl Tool for SpawnTicketWorkerTool {
                 operation_id: Some(format!("spawn-ticket-worker:{}:{call_id}", ticket.id)),
                 display_name: format!("Worker · {}", ticket.resource_key),
                 initial_submit,
-                execution_grant: None,
+                execution_grant: input.execution_grant,
             })
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -275,7 +285,7 @@ mod tests {
     use ticket::{TicketError, TicketState};
 
     use super::*;
-    use crate::feature::builtin::ticket::TicketHandoff;
+    use crate::feature::contracts::TicketHandoff;
     use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 
     struct FixedTicketService(TicketState);
@@ -305,6 +315,7 @@ mod tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
             Ok(self.response.clone().unwrap_or_else(|| WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: r#"{"worker_id":"42"}"#.to_string(),
             }))
@@ -333,6 +344,12 @@ mod tests {
         let mut input = input();
         input["flow"] = serde_json::json!("project:investigation");
         input["orchestrator_assignment_id"] = serde_json::json!("delegation-742");
+        input["execution_grant"] = serde_json::json!({
+            "permissions": [{"operation":"ticket.read","resource":{"kind":"ticket","workspace_id":"workspace-1","ticket_id":"T-719"}}],
+            "redelegation": []
+        });
+        let expected_grant: server_api::authorization::WorkerDelegationRequest =
+            serde_json::from_value(input["execution_grant"].clone()).unwrap();
         input["workdir_attachments"] = serde_json::json!([
             {
                 "alias": "checkout",
@@ -353,6 +370,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.runtime_id, "runtime-1");
+        assert_eq!(request.execution_grant.as_ref(), Some(&expected_grant));
         assert_eq!(
             request.orchestrator_assignment_id.as_deref(),
             Some("delegation-742")
@@ -569,6 +587,7 @@ mod tests {
         for state in [TicketState::Open, TicketState::Closed] {
             let service = Arc::new(RecordingService {
                 response: Some(WorkspaceResponse {
+                    content_type: None,
                     status: 409,
                     body: "Backend rejected Ticket claim".into(),
                 }),

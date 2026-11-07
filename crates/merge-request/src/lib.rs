@@ -718,7 +718,10 @@ impl MergeRequestStore {
         let merge_request_id = i.merge_request_id.clone();
         self.assigned(&i.auth, &i.ticket_id, &i.repository_id)?;
         let mut c = self.lock()?;
-        let t = c.transaction()?;
+        // Acquire the writer before reading the open-MR conflict snapshot. A
+        // deferred read-to-write upgrade can fail immediately with SQLITE_BUSY
+        // while normal Subject history/Job writers use the same database.
+        let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let conflict:bool=t.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 AND mr.repository_id=?3 AND mr.state='open')",params![i.auth.workspace_id,i.ticket_id,i.repository_id],|r|r.get(0))?;
         if conflict {
             return Err(MergeRequestError::Conflict(
@@ -1186,9 +1189,26 @@ impl MergeRequestStore {
     /// Rechecks assignments, Ticket content/state, and valid approval before commit.
     /// Replay with the same operation ID and all inputs returns the same result; reuse with different inputs is rejected.
     pub fn complete(&self, i: CompleteMergeRequest) -> Result<MergeEvent, MergeRequestError> {
+        self.complete_with_admission(i, |_| Ok(()))
+    }
+
+    /// Host authority is checked before receipt validation and again under the
+    /// IMMEDIATE commit transaction, including exact replay. Admission must use
+    /// the supplied connection and must not reenter this store or call providers.
+    pub fn complete_with_admission(
+        &self,
+        i: CompleteMergeRequest,
+        admit: impl Fn(&Connection) -> Result<(), MergeRequestError>,
+    ) -> Result<MergeEvent, MergeRequestError> {
+        {
+            let connection = self.lock()?;
+            admit(&connection)?;
+        }
         self.validate_completion(&i)?;
         let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        admit(&transaction)?;
         let mr = load_mr(&transaction, &i.auth.workspace_id, &i.merge_request_id)?
             .filter(|mr| mr.ticket_ids.iter().any(|id| id == &i.ticket_id))
             .ok_or(MergeRequestError::NotFound)?;

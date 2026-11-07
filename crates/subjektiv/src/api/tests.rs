@@ -452,3 +452,45 @@ fn query_content_condition_ignores_behavior_and_detects_aba_memory_writes() {
         Err(OperationError::Conflict(_))
     ));
 }
+
+#[test]
+fn subject_deletion_revalidates_cached_body_empty_batch_and_receipt_contexts() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, store) = open(temp.path(), "scope");
+    let subject = store
+        .create_subject(SubjectRole::new("companion").unwrap())
+        .unwrap();
+    let body = HostOperationContext::validated_body(&store, &subject.id, None).unwrap();
+    let empty =
+        HostOperationContext::validated_consolidation(&store, &subject.id, Some(vec![]), None)
+            .unwrap();
+    store.begin_subject_deletion(&subject.id, "delete").unwrap();
+    for context in [&body, &empty] {
+        for operation in [
+            query(None),
+            Op::ListCandidates(server_api::SubjektivMemoryCandidateListRequest { limit: None }),
+            Op::ReceiptStatus(server_api::SubjektivMemoryReceiptStatusRequest {
+                receipt_id: "receipt".into(),
+            }),
+            Op::ReadCandidate(server_api::SubjektivMemoryCandidateReadRequest {
+                candidate_id: "candidate".into(),
+            }),
+        ] {
+            assert!(matches!(
+                execute(&store, context, operation),
+                Err(OperationError::SubjectNotFound(_))
+            ));
+        }
+    }
+    store
+        .finish_subject_deletion(&subject.id, "delete")
+        .unwrap();
+    assert!(
+        execute(
+            &store,
+            &empty,
+            Op::ListCandidates(server_api::SubjektivMemoryCandidateListRequest { limit: None })
+        )
+        .is_err()
+    );
+}

@@ -41,12 +41,51 @@ impl WorkdirSessionId {
 }
 
 /// Open a fresh session for a persisted Workdir identity.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct OpenWorkdirSessionRequest {
+    /// Chosen before dispatch so an unknown open outcome can still be closed.
+    pub session_id: WorkdirSessionId,
     /// Optional Runtime Worker whose persisted binding establishes workspace
     /// ownership of the Workdir. Runtime servers reject cross-workspace owners.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_worker_id: Option<String>,
+}
+
+// Admission deadlines bound close-before-open receipts without expiring live sessions.
+const SESSION_OPEN_WINDOW_MS: u64 = 5 * 60 * 1_000;
+
+impl Default for OpenWorkdirSessionRequest {
+    fn default() -> Self {
+        let deadline = session_clock_ms().saturating_add(SESSION_OPEN_WINDOW_MS);
+        Self {
+            session_id: WorkdirSessionId(format!("{deadline}.{}", uuid::Uuid::now_v7())),
+            owner_worker_id: None,
+        }
+    }
+}
+
+fn session_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+impl WorkdirSessionId {
+    /// Latest admission time, not a lifetime limit on an already open session.
+    fn open_deadline_ms(&self) -> Option<u64> {
+        let (deadline, nonce) = self.0.split_once('.')?;
+        uuid::Uuid::parse_str(nonce).ok()?;
+        deadline.parse().ok()
+    }
+
+    /// Validate against the Runtime's serialized, nondecreasing admission clock.
+    pub fn admitted_deadline_ms(&self, now_ms: u64) -> Option<u64> {
+        self.open_deadline_ms().filter(|deadline| {
+            *deadline >= now_ms
+                && *deadline <= now_ms.saturating_add(SESSION_OPEN_WINDOW_MS + 30_000)
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -492,13 +531,16 @@ impl WorkdirTransportError {
 
 #[cfg(feature = "http-client")]
 mod client {
+    mod retention;
+    use retention::{RemoteSessionClose, RemoteSessionLifetime};
+    pub use retention::{RemoteWorkdirSessionOwner, RemoteWorkdirSessionRegistry};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
 
     use async_trait::async_trait;
-    use reqwest::{Client, StatusCode, Url};
+    use reqwest::{Client, Url};
 
     use super::*;
     use crate::{Workdir, WorkdirSession};
@@ -555,7 +597,8 @@ mod client {
         session_id: WorkdirSessionId,
         capabilities: WorkdirSessionCapabilities,
         environment: crate::WorkdirSessionEnvironment,
-        closed: AtomicBool,
+        close_state: Arc<RemoteSessionClose>,
+        _lifetime: Arc<RemoteSessionLifetime>,
     }
 
     impl RemoteWorkdirSession {
@@ -576,12 +619,36 @@ mod client {
             .await
         }
 
+        /// Convenience open with best-effort last-user teardown. Connections that
+        /// must retry failed Drop teardown retain a RemoteWorkdirSessionRegistry.
         pub async fn open_with_authorization(
             client: Client,
             base_url: Url,
             authorization: Arc<dyn WorkdirHttpAuthorization>,
             workdir_id: WorkdirId,
             request: OpenWorkdirSessionRequest,
+        ) -> Result<Self, WorkdirError> {
+            RemoteWorkdirSessionRegistry::default()
+                .open_with_authorization(
+                    client,
+                    base_url,
+                    authorization,
+                    workdir_id,
+                    request,
+                    std::time::Duration::from_secs(30),
+                    None,
+                )
+                .await
+        }
+
+        async fn open_retained(
+            client: Client,
+            base_url: Url,
+            authorization: Arc<dyn WorkdirHttpAuthorization>,
+            workdir_id: WorkdirId,
+            request: OpenWorkdirSessionRequest,
+            close_state: Arc<RemoteSessionClose>,
+            lifetime: Arc<RemoteSessionLifetime>,
         ) -> Result<Self, WorkdirError> {
             let url = endpoint(
                 &base_url,
@@ -592,6 +659,7 @@ mod client {
             let token = authorization
                 .bearer_token("POST".to_string(), url.path().to_string(), body.clone())
                 .await?;
+            close_state.dispatched.store(true, Ordering::Release);
             let response = client
                 .post(url)
                 .bearer_auth(token)
@@ -601,9 +669,9 @@ mod client {
                 .await
                 .map_err(http_unavailable)?;
             let opened: OpenWorkdirSessionResponse = decode_response(response).await?;
-            if opened.workdir_id.as_str() != workdir_id.as_str() {
+            if opened.workdir_id != workdir_id || opened.session_id != request.session_id {
                 return Err(WorkdirError::Unavailable(
-                    "Runtime opened a session for a different Workdir".to_string(),
+                    "Runtime opened a session with a different identity".to_string(),
                 )
                 .with_failure_reason(crate::WorkdirFailureReason::SessionIdentityMismatch));
             }
@@ -615,7 +683,8 @@ mod client {
                 session_id: opened.session_id,
                 capabilities: opened.capabilities,
                 environment: opened.environment,
-                closed: AtomicBool::new(false),
+                close_state,
+                _lifetime: lifetime,
             })
         }
 
@@ -627,7 +696,7 @@ mod client {
             &self,
             operation: WorkdirSessionOperation,
         ) -> Result<WorkdirSessionOperationResult, WorkdirError> {
-            if self.closed.load(Ordering::Acquire) {
+            if self.close_state.closed.load(Ordering::Acquire) {
                 return Err(
                     WorkdirError::Unavailable("Workdir session is closed".to_string())
                         .with_failure_reason(crate::WorkdirFailureReason::SessionClosed),
@@ -1014,29 +1083,7 @@ mod client {
         }
 
         async fn close(&self) -> Result<(), WorkdirError> {
-            if self.closed.swap(true, Ordering::AcqRel) {
-                return Ok(());
-            }
-            let url = endpoint(
-                &self.base_url,
-                &["v1", "workdir-sessions", self.session_id.as_str()],
-            )?;
-            let token = self
-                .authorization
-                .bearer_token("DELETE".to_string(), url.path().to_string(), Vec::new())
-                .await?;
-            let response = self
-                .client
-                .delete(url)
-                .bearer_auth(token)
-                .send()
-                .await
-                .map_err(http_unavailable)?;
-            if response.status() == StatusCode::NO_CONTENT || response.status().is_success() {
-                Ok(())
-            } else {
-                Err(decode_error(response).await)
-            }
+            self.close_state.close().await
         }
     }
 
@@ -1194,26 +1241,51 @@ mod client {
             let workdir = Workdir::new("w");
             let open_request = OpenWorkdirSessionRequest {
                 owner_worker_id: Some("worker".to_string()),
+                ..Default::default()
             };
-            let error = RemoteWorkdirSession::open_with_authorization(
-                client.clone(),
-                base_url.clone(),
-                authorization.clone(),
-                workdir.id().clone(),
-                open_request.clone(),
-            )
-            .await
-            .unwrap_err();
+            let registry = RemoteWorkdirSessionRegistry::default();
+            let error = registry
+                .open_with_authorization(
+                    client.clone(),
+                    base_url.clone(),
+                    authorization.clone(),
+                    workdir.id().clone(),
+                    open_request.clone(),
+                    std::time::Duration::from_secs(30),
+                    None,
+                )
+                .await
+                .unwrap_err();
             assert!(matches!(
                 error,
                 WorkdirError::Unavailable(message) if message == "authorization rejected request 1"
             ));
 
-            // Seed an already-open session to exercise the public operation and
-            // close boundaries independently of the rejected open request.
+            // Rejected authorization never dispatched an open, so neither Drop
+            // nor ordinary cleanup may mint a DELETE authorization or send HTTP.
+            registry.close_abandoned("w").await.unwrap();
+            assert_eq!(authorization.requests.lock().unwrap().len(), 1);
+
+            // Seed an already-open session through the production retention helper
+            // to exercise operation/close independently of rejected open.
+            let seeded_request = OpenWorkdirSessionRequest {
+                session_id: WorkdirSessionId::new("s").unwrap(),
+                ..Default::default()
+            };
+            let (close_state, lifetime) = registry
+                .retain(
+                    client.clone(),
+                    base_url.clone(),
+                    authorization.clone(),
+                    workdir.id().clone(),
+                    &seeded_request,
+                    None,
+                )
+                .unwrap();
+            close_state.dispatched.store(true, Ordering::Release);
             let remote = RemoteWorkdirSession {
-                client,
-                base_url,
+                client: client.clone(),
+                base_url: base_url.clone(),
                 authorization: authorization.clone(),
                 workdir,
                 session_id: WorkdirSessionId::new("s").unwrap(),
@@ -1221,7 +1293,8 @@ mod client {
                 environment: crate::WorkdirSessionEnvironment::root(
                     WorkdirSessionCapabilities::EMPTY,
                 ),
-                closed: AtomicBool::new(false),
+                close_state,
+                _lifetime: lifetime,
             };
             let stat = StatRequest {
                 path: crate::WorkdirPath::new("file").unwrap(),
@@ -1263,6 +1336,26 @@ mod client {
                 listener.accept().unwrap_err().kind(),
                 std::io::ErrorKind::WouldBlock
             );
+            // An invalid endpoint cannot be produced by a successful open, but
+            // must not turn a pre-dispatch error into a confirmed close either.
+            let (invalid_close, _lifetime) = registry
+                .retain(
+                    client,
+                    Url::parse("data:invalid-base").unwrap(),
+                    authorization,
+                    Workdir::new("w").id().clone(),
+                    &OpenWorkdirSessionRequest::default(),
+                    None,
+                )
+                .unwrap();
+            invalid_close.dispatched.store(true, Ordering::Release);
+            for _ in 0..2 {
+                assert!(matches!(
+                    invalid_close.close().await,
+                    Err(WorkdirError::InvalidArgument(_))
+                ));
+                assert!(!invalid_close.closed.load(Ordering::Acquire));
+            }
         }
     }
 
@@ -1271,7 +1364,8 @@ mod client {
 
 #[cfg(feature = "http-client")]
 pub use client::{
-    ClientSession as RemoteWorkdirSession, WorkdirHttpAuthorization, WorkdirHttpAuthorizationFuture,
+    ClientSession as RemoteWorkdirSession, RemoteWorkdirSessionOwner, RemoteWorkdirSessionRegistry,
+    WorkdirHttpAuthorization, WorkdirHttpAuthorizationFuture,
 };
 
 #[cfg(test)]

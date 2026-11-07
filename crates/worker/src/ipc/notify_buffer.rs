@@ -264,9 +264,7 @@ mod tests {
         match item {
             SystemItem::Notification { message, body, .. } => {
                 assert_eq!(message, "hello");
-                assert!(body.contains("[Notification]"));
-                assert!(body.contains("hello"));
-                assert!(body.contains("not a blocking request"));
+                assert_eq!(body.trim(), "[Notification]\nhello");
             }
             other => panic!("unexpected: {other:?}"),
         }

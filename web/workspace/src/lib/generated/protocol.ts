@@ -2,6 +2,34 @@
 // Do not edit by hand. Rust DTO authority lives in `crates/protocol`.
 // Large integer fields are JSON numbers on the wire and are emitted as TypeScript `number`.
 
+export type RuntimeControlCause = "runtime_missing" | "worker_missing" | "invalid_worker_identifier" | "runtime_stopped" | "execution_unavailable" | "execution_failed" | "execution_rejected" | "restore_observation_stale" | "restore_observation_conflict" | "restore_admission_busy" | "stop_observation_conflict" | "stop_request_conflict" | "stop_admission_busy" | "create_request_conflict" | "invalid_request" | "workspace_binding_mismatch" | "configuration_unavailable" | "working_directory_failed" | "persistence_failed" | "persistence_outcome_unknown" | "store_unavailable" | "recording_source_unavailable" | "recording_ownership_unknown" | "recording_execution_unconfirmed" | "state_unavailable" | "authorization_failed" | "connection_failed" | "transport_failed" | "timed_out" | "request_encoding_failed" | "client_setup_failed" | "response_too_large" | "invalid_response" | "result_unavailable" | "unsupported_operation" | "remote_rejected";
+
+export type StartupFailureAttachment = string;
+
+export type StoredStartupFailureAttachment = StartupFailureAttachment;
+
+export type StartupStage = "preflight" | "metadata" | "reconstruction" | "recovery" | "binding" | "feature" | "activation_effects" | "controller";
+
+export type RuntimeStartupReason = "startup_failed" | "segment_empty" | "system_prompt_missing" | "metadata_pending" | "metadata_missing" | "metadata_inactive" | "manifest_missing" | "allocation_failed" | "session_read_failed" | "metadata_read_failed" | "provider_failed" | "attribution_failed" | "feature_failed";
+
+export type RuntimeStartupCause = { stage: StartupStage, reason: RuntimeStartupReason, };
+
+export type StartupFailurePhase = "cleanup" | "runtime_record_delete" | "runtime_snapshot_save" | "runtime_removal_publish" | "runtime_reconciliation_record_save" | "runtime_reconciliation_publish" | "metadata_save";
+
+export type StartupCleanupFailure = "ownership" | "workdir" | "artifacts" | "allocation" | "feature" | "unsupported";
+
+export type StartupPersistenceOutcome = "persisted" | "not_saved" | "conflict" | "outcome_unknown";
+
+export type StartupSecondaryFailure = { "kind": "projection_unavailable", phase: StartupFailurePhase, } | { "kind": "cleanup", failure: StartupCleanupFailure, } | { "kind": "persistence", phase: StartupFailurePhase, outcome: StartupPersistenceOutcome, };
+
+export type StartupResources = "none" | "worker_startup" | "unproven";
+
+export type StartupCleanup = "not_needed" | "required" | "confirmed" | { "failed": StartupCleanupFailure };
+
+export type StartupResourceFacts = { resources: StartupResources, cleanup: StartupCleanup, durable_effects_possible: boolean, };
+
+export type StartupIoKind = "not_found" | "permission_denied" | "already_exists" | "invalid_input" | "invalid_data" | "interrupted" | "timed_out" | "would_block" | "unexpected_eof" | "other";
+
 export type AlertLevel = "warn" | "error";
 
 export type AlertPosition = { "kind": "start" } | { "kind": "after_entry", entry_id: string, } | { "kind": "after_tool_call", call_id: string, } | { "kind": "after_in_flight", block_id: number, };
@@ -49,6 +77,11 @@ name: string, arguments: Array<InvocationArgumentValue>, };
 export type FeatureInvocationStatus = "succeeded" | "failed" | "outcome_unknown";
 
 export type FeatureInvocationResult = { invocation_id: string, identity: FeatureInvocationIdentity, status: FeatureInvocationStatus, message: string,
+/**
+ * Optional projected cause, separate from successful preparation context and
+ * the operation outcome. Redisclosure requires current domain authority.
+ */
+failure?: StartupFailureAttachment | null,
 /**
  * Bounded model-visible context produced by the handler. Credentials and
  * executable implementation details must not be included.

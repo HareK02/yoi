@@ -1,13 +1,5 @@
 <script lang="ts">
-  import DeferredPage from '#lib/workspace/navigation/DeferredPage.svelte';
-  import PageContent from './PageContent.svelte';
-  import type { PageProps } from './$types';
-
-  let { data }: PageProps = $props();
+  import LegacySubjectRoute from '#lib/workspace/subjektiv/LegacySubjectRoute.svelte';
 </script>
 
-<DeferredPage {data} title="Subjects">
-  {#snippet children(resolved)}
-    <PageContent data={resolved} />
-  {/snippet}
-</DeferredPage>
+<LegacySubjectRoute />

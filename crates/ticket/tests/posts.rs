@@ -168,7 +168,7 @@ fn editing_rejects_system_judgments_other_tickets_and_missing_identity() {
 
 fn schema11(conn: &Connection) {
     // Build the actual retained component shape, not a current schema with its marker changed.
-    conn.execute_batch(include_str!("../src/latest_schema.sql"))
+    conn.execute_batch(include_str!("../src/frozen_schema_v10.sql"))
         .unwrap();
     conn.execute_batch(include_str!("../src/assignment_schema.sql"))
         .unwrap();
@@ -270,7 +270,7 @@ fn schema12_migrates_body_authors_archived_history_and_stable_references_then_re
             |r| r.get::<_, i64>(0)
         )
         .unwrap(),
-        13
+        17
     );
     backend
         .add_event("known".into(), comment("Next", "author"))

@@ -43,7 +43,10 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[path = "test_support.rs"]
 pub mod test_support;
 
-pub(crate) const SCHEMA_VERSION: u32 = 14;
+pub(crate) const SCHEMA_VERSION: u32 = 17;
+const ATTACHMENT_SET_SCHEMA_VERSION: u32 = 16;
+const SESSION_ARCHIVE_SCHEMA_VERSION: u32 = 15;
+const RESTORE_REPAIR_SCHEMA_VERSION: u32 = 14;
 const RESTORE_DECISION_SCHEMA_VERSION: u32 = 13;
 const RESTORE_ADMISSION_SCHEMA_VERSION: u32 = 12;
 // Frozen source schemas: do not move their meaning when adding a migration.
@@ -277,11 +280,27 @@ impl FsRuntimeStore {
         atomic_write_json(&self.runtime_path(), &snapshot, "write runtime snapshot")
     }
 
+    /// Use the canonical pretty-JSON representation, including its final newline,
+    /// to refuse writes that our bounded canonical reader could not reopen.
+    pub(crate) fn validate_worker_record_size(
+        &self,
+        worker: &PersistedWorkerRecord,
+    ) -> Result<(), RuntimeError> {
+        let bytes = worker_record_serialized_size(worker)?;
+        if bytes > MAX_WORKER_RECORD_BYTES {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "Worker aggregate requires {bytes} bytes, exceeding canonical reader limit {MAX_WORKER_RECORD_BYTES}; retained lifecycle owners cannot be evicted"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn write_worker_record(
         &self,
         worker: &PersistedWorkerRecord,
     ) -> Result<(), RuntimeError> {
         self.ensure_worker_ref(&worker.worker_ref)?;
+        self.validate_worker_record_size(worker)?;
         let worker_dir = self.worker_dir(&worker.worker_id);
         fs::create_dir_all(&worker_dir).map_err(|source| RuntimeError::StoreIo {
             operation: "create Worker store",
@@ -560,6 +579,22 @@ impl FsRuntimeStore {
         self.root.join(RUNTIME_FILE)
     }
 
+    pub(crate) fn worker_originals_absent(
+        &self,
+        worker_id: WorkerId,
+    ) -> Result<bool, RuntimeError> {
+        let path = self.worker_dir(&worker_id);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(source) => Err(RuntimeError::StoreIo {
+                operation: "confirm Subject Worker original absence",
+                path,
+                source,
+            }),
+        }
+    }
+
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
         self.root.join(WORKERS_DIR).join(worker_id.to_string())
     }
@@ -659,6 +694,8 @@ pub(crate) struct OpenedFsRuntimeStore {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedRuntimeState {
+    pub(crate) subject_delete_worker_fences:
+        BTreeMap<WorkerId, crate::runtime::SubjectDeleteWorkerFence>,
     pub(crate) subject_create_recovery_fences:
         BTreeMap<WorkerId, crate::runtime::SubjectCreateRecoveryFence>,
     pub(crate) subject_releases: Vec<(
@@ -735,6 +772,7 @@ pub(crate) enum PersistedWorkerExecutionState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedWorkerRecord {
+    pub(crate) workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard,
     pub(crate) restore_guard: crate::runtime::RestoreGuard,
     pub(crate) worker_ref: WorkerRef,
     pub(crate) worker_id: WorkerId,
@@ -876,11 +914,14 @@ fn plan_runtime_store_migration(
             | SOURCE_SCHEMA_VERSION
             | RESTORE_ADMISSION_SCHEMA_VERSION
             | RESTORE_DECISION_SCHEMA_VERSION
+            | RESTORE_REPAIR_SCHEMA_VERSION
+            | SESSION_ARCHIVE_SCHEMA_VERSION
+            | ATTACHMENT_SET_SCHEMA_VERSION
     ) {
         return Err(runtime_store_corrupt(
             &runtime_path,
             format!(
-                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
+                "unsupported Runtime store schema version {schema_version}; expected {OLDEST_SCHEMA_VERSION}, {LEGACY_SCHEMA_VERSION}, {PREVIOUS_SCHEMA_VERSION}, {AGGREGATE_SCHEMA_VERSION}, {EXECUTION_SCHEMA_VERSION}, {SOURCE_SCHEMA_VERSION}, {RESTORE_ADMISSION_SCHEMA_VERSION}, {RESTORE_DECISION_SCHEMA_VERSION}, {RESTORE_REPAIR_SCHEMA_VERSION}, {SESSION_ARCHIVE_SCHEMA_VERSION}, {ATTACHMENT_SET_SCHEMA_VERSION}, or {SCHEMA_VERSION}"
             ),
         ));
     }
@@ -1216,6 +1257,9 @@ fn migrate_worker_record(
             | SOURCE_SCHEMA_VERSION
             | RESTORE_ADMISSION_SCHEMA_VERSION
             | RESTORE_DECISION_SCHEMA_VERSION
+            | RESTORE_REPAIR_SCHEMA_VERSION
+            | SESSION_ARCHIVE_SCHEMA_VERSION
+            | ATTACHMENT_SET_SCHEMA_VERSION
     ) {
         // Admission identity survives migration. Older pending records did not
         // distinguish a committed decision from preparation or failed cleanup.
@@ -1229,13 +1273,17 @@ fn migrate_worker_record(
                 "Worker schema does not match Runtime migration source".into(),
             ));
         }
-        if source_schema_version != RESTORE_DECISION_SCHEMA_VERSION {
+        if source_schema_version < RESTORE_DECISION_SCHEMA_VERSION {
             migrate_restore_commit_fact(&mut identity_document, identity_path)?;
         }
-        migrate_restore_repair_fact(&mut identity_document, identity_path)?;
+        if source_schema_version < RESTORE_REPAIR_SCHEMA_VERSION {
+            migrate_restore_repair_fact(&mut identity_document, identity_path)?;
+        }
+        migrate_v17_attachment_authority(&mut identity_document, identity_path)?;
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
-        let aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
+        let mut aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
             .map_err(|error| runtime_store_corrupt(identity_path, error.to_string()))?;
+        aggregate.canonicalize_legacy_logical_attachments();
         aggregate.clone().validate(identity_path)?;
         return Ok(aggregate);
     }
@@ -1246,14 +1294,16 @@ fn migrate_worker_record(
             .map_err(|message| runtime_store_corrupt(identity_path, message.into()))?;
         migrate_restore_commit_fact(&mut identity_document, identity_path)?;
         migrate_restore_repair_fact(&mut identity_document, identity_path)?;
+        migrate_v17_attachment_authority(&mut identity_document, identity_path)?;
         identity_document["schema_version"] = serde_json::Value::from(SCHEMA_VERSION);
-        let aggregate: WorkerAggregateRecord =
-            serde_json::from_value(identity_document).map_err(|error| {
+        let mut aggregate: WorkerAggregateRecord = serde_json::from_value(identity_document)
+            .map_err(|error| {
                 runtime_store_corrupt(
                     identity_path,
                     format!("decode migrated schema-v9 Worker aggregate: {error}"),
                 )
             })?;
+        aggregate.canonicalize_legacy_logical_attachments();
         aggregate.clone().validate(identity_path)?;
         return Ok(aggregate);
     }
@@ -1310,6 +1360,29 @@ fn migrate_worker_record(
     identity.validate_for_schema(identity_path, PREVIOUS_SCHEMA_VERSION)?;
     execution.validate_for_schema(&identity, &execution_path, PREVIOUS_SCHEMA_VERSION)?;
     Ok(WorkerAggregateRecord::from_v8(identity, execution))
+}
+
+// Versioned initialization only: legacy set observations cannot prove a public
+// operation was ever fulfilled. Preserve every existing value and mint no receipt.
+fn migrate_v17_attachment_authority(
+    document: &mut serde_json::Value,
+    path: &Path,
+) -> Result<(), RuntimeError> {
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| runtime_store_corrupt(path, "Worker aggregate must be an object".into()))?;
+    if object.contains_key("workdir_attachments_guard") {
+        return Err(runtime_store_corrupt(
+            path,
+            "legacy Worker contains attachment operation authority".into(),
+        ));
+    }
+    object.insert(
+        "workdir_attachments_guard".into(),
+        serde_json::to_value(crate::runtime::WorkdirAttachmentsGuard::default())
+            .map_err(|error| runtime_store_corrupt(path, error.to_string()))?,
+    );
+    Ok(())
 }
 
 // Missing commit evidence is not proof of rollback. This conversion applies
@@ -1691,6 +1764,9 @@ fn migrate_runtime_document(
         "schema_version".to_string(),
         serde_json::Value::from(SCHEMA_VERSION),
     );
+    object
+        .entry("subject_delete_worker_fences")
+        .or_insert_with(|| serde_json::json!({}));
     // Intermediate schema-11 writers may already have saved irreversible fences.
     // Default only a missing field; malformed or existing fences must not be erased.
     object
@@ -1698,7 +1774,12 @@ fn migrate_runtime_document(
         .or_insert_with(|| serde_json::json!({}));
     if !matches!(
         source_schema_version,
-        SOURCE_SCHEMA_VERSION | RESTORE_ADMISSION_SCHEMA_VERSION | RESTORE_DECISION_SCHEMA_VERSION
+        SOURCE_SCHEMA_VERSION
+            | RESTORE_ADMISSION_SCHEMA_VERSION
+            | RESTORE_DECISION_SCHEMA_VERSION
+            | RESTORE_REPAIR_SCHEMA_VERSION
+            | SESSION_ARCHIVE_SCHEMA_VERSION
+            | ATTACHMENT_SET_SCHEMA_VERSION
     ) {
         object.remove("workers");
         // This legacy cache is not Runtime lifecycle or restore authority. Bundles
@@ -2201,6 +2282,16 @@ fn migrate_runtime_store_in_place(
             planned_worker.legacy_mapping.as_ref(),
             &source_snapshot_path,
         )?;
+        let migrated = aggregate.clone().validate(&source_snapshot_path)?;
+        let bytes = worker_record_serialized_size(&migrated)?;
+        if bytes > MAX_WORKER_RECORD_BYTES {
+            return Err(runtime_store_corrupt(
+                &source_snapshot_path,
+                format!(
+                    "migrated Worker aggregate exceeds canonical reader limit {MAX_WORKER_RECORD_BYTES}; retained owners cannot be evicted"
+                ),
+            ));
+        }
         let metadata_path = source_dir.join(WORKER_METADATA_FILE);
         let metadata = if metadata_path.is_file() {
             let metadata: serde_json::Value =
@@ -2249,6 +2340,9 @@ fn migrate_runtime_store_in_place(
                 SOURCE_SCHEMA_VERSION
                     | RESTORE_ADMISSION_SCHEMA_VERSION
                     | RESTORE_DECISION_SCHEMA_VERSION
+                    | RESTORE_REPAIR_SCHEMA_VERSION
+                    | SESSION_ARCHIVE_SCHEMA_VERSION
+                    | ATTACHMENT_SET_SCHEMA_VERSION
             )
         {
             atomic_write_json(
@@ -2288,6 +2382,7 @@ fn migrate_runtime_store_in_place(
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RuntimeSnapshot {
+    subject_delete_worker_fences: BTreeMap<WorkerId, crate::runtime::SubjectDeleteWorkerFence>,
     #[serde(default)]
     subject_create_recovery_fences: BTreeMap<WorkerId, crate::runtime::SubjectCreateRecoveryFence>,
     #[serde(default)]
@@ -2326,6 +2421,7 @@ fn record_worker_load_diagnostic(
 impl RuntimeSnapshot {
     fn from_persisted(state: &PersistedRuntimeState) -> Self {
         Self {
+            subject_delete_worker_fences: state.subject_delete_worker_fences.clone(),
             subject_create_recovery_fences: state.subject_create_recovery_fences.clone(),
             subject_releases: state.subject_releases.clone(),
             schema_version: SCHEMA_VERSION,
@@ -2349,6 +2445,33 @@ impl RuntimeSnapshot {
                     self.schema_version, SCHEMA_VERSION
                 ),
             });
+        }
+        for (worker_id, fence) in &self.subject_delete_worker_fences {
+            let request = &fence.request;
+            let response_matches = fence.response.as_ref().is_none_or(|response| {
+                response.worker_id == request.worker_id
+                    && response.workspace_id == request.workspace_id
+                    && response.create_fingerprint == request.create_fingerprint
+                    && response.operation_id == request.operation_id
+            });
+            if *worker_id != request.worker_id
+                || request.workspace_id.trim().is_empty()
+                || request.create_fingerprint.trim().is_empty()
+                || request.create_fingerprint.len() > 512
+                || request.operation_id.trim().is_empty()
+                || request.operation_id.len() > 512
+                || self
+                    .workspace_owners
+                    .get(&request.workspace_id)
+                    .is_none_or(|owner| owner.trim().is_empty())
+                || !response_matches
+            {
+                return Err(RuntimeError::StoreCorrupt {
+                    operation: "read Subject delete Worker fence",
+                    path: path.to_path_buf(),
+                    message: "invalid deletion identity, receipt or Workspace owner".into(),
+                });
+            }
         }
         for (worker_id, fence) in &self.subject_create_recovery_fences {
             let request = &fence.request;
@@ -2392,6 +2515,7 @@ impl RuntimeSnapshot {
         workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
+            subject_delete_worker_fences: self.subject_delete_worker_fences,
             subject_create_recovery_fences: self.subject_create_recovery_fences,
             subject_releases: self.subject_releases,
             display_name: self.display_name,
@@ -2407,6 +2531,7 @@ impl RuntimeSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerAggregateRecord {
+    workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard,
     #[serde(default)]
     restore_guard: crate::runtime::RestoreGuard,
     schema_version: u32,
@@ -2448,6 +2573,33 @@ struct WorkerExecutionData {
 }
 
 impl WorkerAggregateRecord {
+    // Before schema 17, reopening an empty/missing logical set derived authority
+    // from local statuses and saved claims. Preserve that effective legacy set
+    // once, beside the fresh migration generation, instead of changing authority
+    // silently on every read of the current aggregate. No operation receipt can
+    // be inferred from this compatibility projection.
+    fn canonicalize_legacy_logical_attachments(&mut self) {
+        if !self.logical_workdir_attachments.is_empty() {
+            return;
+        }
+        let request = match &self.execution_state {
+            WorkerExecutionStateRecord::Available(execution) => Some(&execution.request),
+            WorkerExecutionStateRecord::ReconciliationRequired(operation) => match operation {
+                PersistedWorkerLifecycleOperation::Restore(restore) => Some(&restore.request),
+                PersistedWorkerLifecycleOperation::Stop(stop) => stop.request.as_ref(),
+            },
+            WorkerExecutionStateRecord::Unavailable => None,
+        };
+        let claims = request
+            .map(|request| request.workdir_attachments.as_slice())
+            .unwrap_or_default();
+        self.logical_workdir_attachments =
+            crate::runtime::logical_workdir_attachments_from_statuses(
+                &self.workdir_attachments,
+                claims,
+            );
+    }
+
     fn from_persisted(worker: &PersistedWorkerRecord) -> Self {
         let execution_state = match &worker.execution_state {
             PersistedWorkerExecutionState::Available(execution) => {
@@ -2464,6 +2616,7 @@ impl WorkerAggregateRecord {
         };
         Self {
             schema_version: SCHEMA_VERSION,
+            workdir_attachments_guard: worker.workdir_attachments_guard.clone(),
             restore_guard: worker.restore_guard.clone(),
             worker_ref: worker.worker_ref.clone(),
             worker_id: worker.worker_id,
@@ -2489,10 +2642,16 @@ impl WorkerAggregateRecord {
                 restore_intent: execution.restore_intent,
             },
         ));
-        Self::from_persisted(&persisted)
+        let mut aggregate = Self::from_persisted(&persisted);
+        aggregate.canonicalize_legacy_logical_attachments();
+        aggregate
     }
 
     fn validate(self, path: &Path) -> Result<PersistedWorkerRecord, RuntimeError> {
+        self.workdir_attachments_guard
+            .validate(&self.worker_ref, &self.workspace_id)
+            .map_err(|error| runtime_store_corrupt(path, error.to_string()))?;
+        let workdir_attachments_guard = self.workdir_attachments_guard;
         let restore_guard = self.restore_guard;
         let last_finished_submission_request_id = self.last_finished_submission_request_id;
         let identity = WorkerIdentityRecord {
@@ -2618,6 +2777,7 @@ impl WorkerAggregateRecord {
             WorkerExecutionStateRecord::Unavailable => PersistedWorkerExecutionState::Unavailable,
         };
         let mut persisted = identity.into_persisted(execution_state);
+        persisted.workdir_attachments_guard = workdir_attachments_guard;
         persisted.restore_guard = restore_guard;
         persisted.last_finished_submission_request_id = last_finished_submission_request_id;
         Ok(persisted)
@@ -2792,6 +2952,7 @@ impl WorkerIdentityRecord {
             self.workdir_attachments
         };
         PersistedWorkerRecord {
+            workdir_attachments_guard: crate::runtime::WorkdirAttachmentsGuard::default(),
             restore_guard: crate::runtime::RestoreGuard::default(),
             worker_ref: self.worker_ref,
             worker_id: self.worker_id,
@@ -2971,6 +3132,33 @@ where
         path: path.to_path_buf(),
         message: source.to_string(),
     })
+}
+
+// Count rather than allocate a second aggregate-sized buffer during admission.
+// This is the same serializer and trailing newline as atomic_write_json_with_fault.
+fn worker_record_serialized_size(worker: &PersistedWorkerRecord) -> Result<u64, RuntimeError> {
+    struct ByteCount(u64);
+    impl Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("Worker aggregate size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = ByteCount(0);
+    serde_json::to_writer_pretty(&mut count, &WorkerAggregateRecord::from_persisted(worker))
+        .map_err(|error| {
+            RuntimeError::InvalidRequest(format!("serialize Worker aggregate: {error}"))
+        })?;
+    count
+        .write_all(b"\n")
+        .map_err(|error| RuntimeError::InvalidRequest(error.to_string()))?;
+    Ok(count.0)
 }
 
 fn atomic_write_json<T>(path: &Path, value: &T, operation: &'static str) -> Result<(), RuntimeError>
@@ -3183,7 +3371,7 @@ mod tests {
             // Serialize defaults as a schema-11 writer would, without running
             // a migration or generating a fresh Restore guard for the fixture.
             let request: CreateWorkerRequest = serde_json::from_value(request).unwrap();
-            let worker: WorkerAggregateRecord = serde_json::from_value(serde_json::json!({
+            let worker = serde_json::json!({
                 "schema_version": 11,
                 "restore_guard": {
                     "observation_token": "retained-restore-token",
@@ -3201,9 +3389,8 @@ mod tests {
                 "execution_state": {"state": "available", "execution": {
                     "request": request, "binding": {}, "restore_intent": "automatic"
                 }}
-            }))
-            .unwrap();
-            let mut expected_worker = serde_json::to_value(&worker).unwrap();
+            });
+            let mut expected_worker = worker.clone();
             atomic_write_json(&worker_path, &worker, "write schema-11 Worker").unwrap();
             let worker_before = fs::read(&worker_path).unwrap();
             let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("runtime-test");
@@ -3218,19 +3405,21 @@ mod tests {
             assert_eq!(fs::read(&worker_path).unwrap(), worker_before);
             // The direct reader still rejects a previous schema: migration is
             // explicit, not permissive deserialization of a newer format.
-            let snapshot: RuntimeSnapshot = serde_json::from_value(runtime.clone()).unwrap();
-            assert!(snapshot.validate(&runtime_path).is_err());
+            assert!(serde_json::from_value::<RuntimeSnapshot>(runtime.clone()).is_err());
 
             let opened = FsRuntimeStore::open_or_create(root.clone(), "runtime-test").unwrap();
             let state = opened.state.as_ref().unwrap();
             let persisted_worker = state.workers.get(&worker_id).unwrap();
             expected_worker["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+            expected_worker["workdir_attachments_guard"] =
+                serde_json::to_value(&persisted_worker.workdir_attachments_guard).unwrap();
             assert_eq!(
                 serde_json::to_value(WorkerAggregateRecord::from_persisted(persisted_worker))
                     .unwrap(),
                 expected_worker
             );
             runtime["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+            runtime["subject_delete_worker_fences"] = serde_json::json!({});
             if fence_state == "absent" {
                 runtime["subject_create_recovery_fences"] = serde_json::json!({});
             }
@@ -3332,6 +3521,10 @@ mod tests {
             .unwrap();
             let mut record = serde_json::to_value(record).unwrap();
             record["schema_version"] = serde_json::json!(10);
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("workdir_attachments_guard");
             atomic_write_json(&aggregate.join(WORKER_FILE), &record, "test").unwrap();
             let session = aggregate.join("session");
             fs::create_dir_all(session.join("segments")).unwrap();
@@ -3883,6 +4076,168 @@ mod tests {
     }
 
     #[test]
+    fn schema_v16_attachment_migration_preserves_values_without_synthesizing_receipts() {
+        let (_temp, store, worker, path) = canonical_worker_store();
+        let root = store.root.clone();
+        let mut legacy =
+            serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
+        let previous_guard = legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard")
+            .unwrap();
+        legacy["schema_version"] = serde_json::json!(ATTACHMENT_SET_SCHEMA_VERSION);
+        legacy["logical_workdir_attachments"] = serde_json::json!([{
+            "alias": "checkout", "working_directory_id": "retained-remote-workdir",
+            "capabilities": workdir::WorkdirSessionCapabilities::READ_ONLY
+        }]);
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        write_empty_schema_v8_store(&root);
+        let runtime_path = root.join(RUNTIME_FILE);
+        let mut runtime: serde_json::Value = read_json(&runtime_path, "read fixture").unwrap();
+        runtime["schema_version"] = serde_json::json!(ATTACHMENT_SET_SCHEMA_VERSION);
+        fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+        drop(store);
+        let options = FsRuntimeStoreOptions::new(&root).with_runtime_id("test-runtime");
+        let before = fs::read(&path).unwrap();
+        assert!(
+            FsRuntimeStore::migration_plan(&options)
+                .unwrap()
+                .migration_required
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+        let saved = opened.store.read_worker_record(&worker.worker_ref).unwrap();
+        let mut migrated: serde_json::Value = read_json(&path, "read migrated Worker").unwrap();
+        let guard = migrated
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard")
+            .unwrap();
+        assert_ne!(guard["generation"], previous_guard["generation"]);
+        assert!(
+            guard["generation"]
+                .as_str()
+                .is_some_and(|generation| !generation.is_empty())
+        );
+        assert_eq!(guard["owners"], serde_json::json!({}));
+        legacy["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+        assert_eq!(migrated, legacy);
+        opened.store.write_worker_record(&saved).unwrap();
+        let committed = fs::read(&path).unwrap();
+        drop(opened);
+        let reopened = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
+        reopened
+            .store
+            .read_worker_record(&worker.worker_ref)
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), committed);
+    }
+
+    #[test]
+    fn schema_v16_attachment_migration_canonicalizes_legacy_local_authority_once() {
+        let (_temp, store, worker, path) = canonical_worker_store();
+        let root = store.root.clone();
+        let mut legacy =
+            serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("logical_workdir_attachments");
+        legacy["schema_version"] = serde_json::json!(ATTACHMENT_SET_SCHEMA_VERSION);
+        legacy["workdir_attachments"] = serde_json::json!([{
+            "alias": "checkout", "working_directory": {"summary": {
+                "working_directory_id": "retained-local-workdir", "repository_id": "repo",
+                "materializer_kind": "runtime_git_clone", "status": "active"
+            }}
+        }]);
+        legacy["execution_state"]["execution"]["request"]["workdir_attachments"] = serde_json::json!([{
+            "alias": "checkout", "working_directory_id": "retained-local-workdir",
+            "capabilities": workdir::WorkdirSessionCapabilities::READ_ONLY
+        }]);
+        let statuses: Vec<WorkingDirectoryAttachmentStatus> =
+            serde_json::from_value(legacy["workdir_attachments"].clone()).unwrap();
+        legacy["workdir_attachments"] = serde_json::to_value(statuses).unwrap();
+        let request: CreateWorkerRequest =
+            serde_json::from_value(legacy["execution_state"]["execution"]["request"].clone())
+                .unwrap();
+        legacy["execution_state"]["execution"]["request"] = serde_json::to_value(request).unwrap();
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        write_empty_schema_v8_store(&root);
+        let runtime_path = root.join(RUNTIME_FILE);
+        let mut runtime: serde_json::Value = read_json(&runtime_path, "read fixture").unwrap();
+        runtime["schema_version"] = serde_json::json!(ATTACHMENT_SET_SCHEMA_VERSION);
+        fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+        drop(store);
+        let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
+        let saved = opened.store.read_worker_record(&worker.worker_ref).unwrap();
+        assert_eq!(
+            saved.logical_workdir_attachments,
+            vec![LogicalWorkdirAttachment {
+                alias: workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+                working_directory_id: "retained-local-workdir".into(),
+                capabilities: workdir::WorkdirSessionCapabilities::READ_ONLY,
+            }]
+        );
+        let migrated: serde_json::Value = read_json(&path, "read migrated Worker").unwrap();
+        assert_eq!(
+            migrated["workdir_attachments_guard"]["owners"],
+            serde_json::json!({})
+        );
+        legacy["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+        legacy["workdir_attachments_guard"] = migrated["workdir_attachments_guard"].clone();
+        legacy["logical_workdir_attachments"] = migrated["logical_workdir_attachments"].clone();
+        assert_eq!(migrated, legacy);
+        let committed = fs::read(&path).unwrap();
+        drop(opened);
+        let reopened = FsRuntimeStore::open_or_create(root, "test-runtime").unwrap();
+        let reread = reopened
+            .store
+            .read_worker_record(&worker.worker_ref)
+            .unwrap();
+        assert_eq!(
+            reread.logical_workdir_attachments,
+            saved.logical_workdir_attachments
+        );
+        assert_eq!(
+            serde_json::to_value(&reread.workdir_attachments_guard).unwrap(),
+            migrated["workdir_attachments_guard"]
+        );
+        assert_eq!(fs::read(&path).unwrap(), committed);
+    }
+
+    #[test]
+    fn schema_v16_attachment_migration_failure_preserves_original_tree() {
+        let (_temp, store, worker, path) = canonical_worker_store();
+        let root = store.root.clone();
+        let mut legacy =
+            serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard");
+        legacy["schema_version"] = serde_json::json!(ATTACHMENT_SET_SCHEMA_VERSION);
+        legacy["execution_state"]["execution"]["request"]["worker_id"] =
+            serde_json::json!(WorkerId::now_v7());
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        write_empty_schema_v8_store(&root);
+        let runtime_path = root.join(RUNTIME_FILE);
+        let mut runtime: serde_json::Value = read_json(&runtime_path, "read fixture").unwrap();
+        runtime["schema_version"] = serde_json::json!(ATTACHMENT_SET_SCHEMA_VERSION);
+        fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+        drop(store);
+        let before = fs::read(&path).unwrap();
+        let runtime_before = fs::read(&runtime_path).unwrap();
+        assert!(FsRuntimeStore::open_or_create(root, "test-runtime").is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&runtime_path).unwrap(), runtime_before);
+    }
+
+    #[test]
     fn schema_v9_restore_token_migrates_durably_without_rotating_admission_identity() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime-store");
@@ -3912,6 +4267,10 @@ mod tests {
             .remove("observation_token");
         legacy["restore_guard"]["generation"] = token.clone();
         legacy["schema_version"] = serde_json::json!(AGGREGATE_SCHEMA_VERSION);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard");
         fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         let store = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
         store.store.load_runtime_state().unwrap();
@@ -3962,6 +4321,42 @@ mod tests {
 
         assert!(matches!(error, RuntimeError::StoreCorrupt { .. }));
         assert!(error.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn canonical_worker_writer_enforces_reader_byte_limit_including_final_newline() {
+        let (_temp, store, mut worker, path) = canonical_worker_store();
+        worker.execution_state = PersistedWorkerExecutionState::Unavailable;
+        worker.status = WorkerStatus::Stopped;
+        worker.display_name = Some(String::new());
+        let base = worker_record_serialized_size(&worker).unwrap();
+        worker.display_name = Some("x".repeat((MAX_WORKER_RECORD_BYTES - base) as usize));
+        store.write_worker_record(&worker).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_WORKER_RECORD_BYTES);
+        assert_eq!(
+            worker_record_serialized_size(&worker).unwrap(),
+            MAX_WORKER_RECORD_BYTES
+        );
+        store.read_worker_record(&worker.worker_ref).unwrap();
+        let before = fs::read(&path).unwrap();
+        worker.display_name.as_mut().unwrap().push('x');
+        assert_eq!(
+            worker_record_serialized_size(&worker).unwrap(),
+            MAX_WORKER_RECORD_BYTES + 1
+        );
+        assert!(
+            matches!(store.write_worker_record(&worker), Err(RuntimeError::InvalidRequest(message)) if message.contains("canonical reader limit"))
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            store
+                .read_worker_record(&worker.worker_ref)
+                .unwrap()
+                .display_name
+                .unwrap()
+                .len(),
+            (MAX_WORKER_RECORD_BYTES - base) as usize
+        );
     }
 
     #[test]
@@ -4072,6 +4467,8 @@ mod tests {
         );
     }
 
+    include!("subject_delete_store_tests.rs");
+
     fn canonical_worker_store() -> (
         tempfile::TempDir,
         FsRuntimeStore,
@@ -4161,6 +4558,10 @@ mod tests {
             }
         });
         legacy["schema_version"] = serde_json::json!(AGGREGATE_SCHEMA_VERSION);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("workdir_attachments_guard");
         fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         write_empty_schema_v8_store(&root);
         let runtime_path = root.join(RUNTIME_FILE);
@@ -4196,6 +4597,8 @@ mod tests {
 
         let opened = FsRuntimeStore::open_or_create(root.clone(), "test-runtime").unwrap();
         let persisted = opened.store.read_worker_record(&worker.worker_ref).unwrap();
+        expected["workdir_attachments_guard"] =
+            serde_json::to_value(&persisted.workdir_attachments_guard).unwrap();
         // Compare the persisted aggregate, including both operation IDs, full
         // request/source references, token, pending owner and terminal receipt.
         assert_eq!(
@@ -4271,6 +4674,10 @@ mod tests {
             let mut legacy =
                 serde_json::to_value(WorkerAggregateRecord::from_persisted(&worker)).unwrap();
             legacy["schema_version"] = serde_json::json!(source_schema);
+            legacy
+                .as_object_mut()
+                .unwrap()
+                .remove("workdir_attachments_guard");
             let intent = &mut legacy["execution_state"]["execution"]["intent"];
             let restore = if under_stop {
                 &mut intent["pending_restore"]

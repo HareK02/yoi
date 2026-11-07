@@ -7,10 +7,11 @@ license.workspace = true
 [features]
 default = ["stream"]
 stream = ["dep:tokio"]
-typescript = ["dep:ts-rs", "json-schema"]
-json-schema = ["dep:schemars"]
+typescript = ["dep:ts-rs", "json-schema", "error-contract/typescript"]
+json-schema = ["dep:schemars", "error-contract/json-schema"]
 
 [dependencies]
+error-contract.workspace = true
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

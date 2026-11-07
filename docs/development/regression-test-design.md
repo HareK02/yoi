@@ -53,7 +53,7 @@
 
 ### runner：選択の帳簿と実行引数を照合する
 
-`tools/test.test.ts` の `round-robin shards retain every listed name exactly once at thresholds and the 32-shard cap` は本番parser/sharderへ実形式のlistingを入力し、全名の一意分配と `task.args.slice(3) === selectedNames`、exact/thread/ignore flagsをassertする。`runtime listing persists complete name inventory for large and small binaries` はDeno子でlibtest listingを代替し、本番discovery/executeの保存inventoryを再読取りする。実Rust libtest全体の実行結果照合ではない。
+`tools/test.test.ts` の `round-robin shards retain every listed name without exceeding the case budget` は本番parser/sharderへ実形式のlistingを入力し、全名の一意分配、分割後のケース数上限と `task.args.slice(3) === selectedNames`、exact/thread/ignore flagsをassertする。`runtime listing persists complete name inventory for large and small binaries` はDeno子でlibtest listingを代替し、本番discovery/executeの保存inventoryを再読取りする。実Rust libtest全体の実行結果照合ではない。
 
 `execute preserves live stdout/stderr and times out a group containing a grandchild`、`execute escalates SIGTERM to SIGKILL and reaps a stubborn direct child`、`parent SIGINT/SIGTERM cleans up active groups, reaps children and does not spawn queued commands` は実隔離子プロセスを起動し、PID消滅・保存result・非起動のqueued PIDを観測する。fixtureに独立watchdogがあり、finallyでも回収する。同process group外へ自ら離脱した子孫は対象外。局所入力表を重いrunner全体起動へ移さない。
 

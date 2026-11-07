@@ -94,7 +94,7 @@ pub fn validate_result(
     for candidate_id in batch {
         if store
             .staging_resolution(subject_id, candidate_id)
-            .map_err(|e| OperationError::Store(e.to_string()))?
+            .map_err(crate::api::subjektiv_store_error)?
             .is_none()
         {
             return Err(OperationError::InvalidInput(format!(
@@ -113,9 +113,193 @@ pub fn validate_result(
             job_id,
             attempt_id,
         )
-        .map_err(|e| {
-            OperationError::InvalidInput(format!("consolidation surface result mismatch: {e}"))
+        .map_err(|error| match error {
+            crate::SubjektivError::Storage(error) => OperationError::Storage(error),
+            other => OperationError::InvalidInput(format!(
+                "consolidation surface result mismatch: {other}"
+            )),
         })
+}
+
+/// Reconstructs only a stored terminal outcome for this exact Job/attempt.
+/// Missing work returns `None`; stale, erased, retired or inconsistent evidence is
+/// an error. No candidate decision, generation, model call or finalizer is rerun.
+/// Hosts still fence current grants and independently retain execution cleanup.
+pub fn lookup_result(
+    store: &SubjektivStore,
+    subject_id: &str,
+    batch: &[String],
+    job_id: &str,
+    attempt_id: &str,
+) -> OperationResult<Option<serde_json::Value>> {
+    use crate::SubjektivError;
+    use rusqlite::{OptionalExtension, params};
+
+    if batch.len() > CANDIDATE_BATCH_LIMIT {
+        return Err(OperationError::InvalidInput(
+            "consolidation batch exceeds limit".into(),
+        ));
+    }
+    let result = store.database.try_transaction(|tx| {
+        crate::require_active_subject(tx, subject_id)?;
+        crate::validate_label("Job id", job_id)?;
+        crate::validate_label("attempt id", attempt_id)?;
+        let mut complete = true;
+        for id in batch {
+            let candidate: Option<String> = tx.query_row(
+                "SELECT record_json FROM staging_records WHERE subject_id=?1 AND candidate_id=?2",
+                params![subject_id, id], |row| row.get(0)
+            ).optional()?;
+            let candidate = candidate.ok_or_else(|| SubjektivError::CandidateNotFound(id.clone()))?;
+            crate::parse_staging(store.workspace_id(), &candidate)?;
+            let resolution: Option<String> = tx.query_row(
+                "SELECT resolution_json FROM staging_resolutions WHERE subject_id=?1 AND candidate_id=?2",
+                params![subject_id, id], |row| row.get(0)
+            ).optional()?;
+            match resolution {
+                Some(raw) => {
+                    let saved = crate::parse_resolution(&raw)?;
+                    if saved.subject_id != subject_id || saved.candidate_id != *id {
+                        return Err(SubjektivError::InvalidRecord("consolidation disposition identity mismatch".into()));
+                    }
+                }
+                None => complete = false,
+            }
+        }
+        // Use the existing immutable generation binding and terminal fingerprint
+        // contract, not arrival time or a newly prepared generation. Several
+        // preparations for the same input may share a stored outcome.
+        let fingerprint = crate::memory_fingerprint_in_connection(tx, subject_id)?;
+        let generation: Option<String> = tx.query_row(
+            "SELECT generation_id FROM surface_generation_runs
+             WHERE subject_id=?1 AND job_id=?2 AND attempt_id=?3 AND memory_fingerprint=?4
+             ORDER BY generation_id LIMIT 1",
+            params![subject_id, job_id, attempt_id, fingerprint], |row| row.get(0)
+        ).optional()?;
+        let Some(generation_id) = generation else {
+            let prior = tx.prepare(
+                "SELECT 1 FROM surface_generation_runs WHERE subject_id=?1 AND job_id=?2 AND attempt_id=?3"
+            )?.exists(params![subject_id, job_id, attempt_id])?;
+            if prior {
+                return Err(SubjektivError::InvalidRecord("consolidation generation input is stale".into()));
+            }
+            return Ok(None);
+        };
+        let state: Option<(String, String, Option<String>, Option<String>)> = tx.query_row(
+            "SELECT memory_fingerprint,status,snapshot_id,reason_code FROM surface_generation_state WHERE subject_id=?1",
+            [subject_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))
+        ).optional()?;
+        let Some((saved_fingerprint, status, snapshot_id, reason_code)) = state else { return Ok(None) };
+        // Memory writes mark this exact input dirty before the producer can
+        // publish its terminal receipt. That is unfinished work, not failure.
+        if saved_fingerprint == fingerprint && status == "dirty"
+            && snapshot_id.is_none() && reason_code.is_none()
+        {
+            return Ok(None);
+        }
+        if saved_fingerprint != fingerprint || !matches!(status.as_str(), "ready" | "failed") {
+            return Err(SubjektivError::InvalidRecord("consolidation terminal outcome is stale or inconsistent".into()));
+        }
+        if !complete { return Ok(None) }
+        let mut surface = serde_json::json!({
+            "availability": status, "generation_id": generation_id, "memory_fingerprint": fingerprint
+        });
+        if let Some(id) = snapshot_id { surface["snapshot_id"] = id.into(); }
+        if let Some(reason) = reason_code { surface["reason_code"] = reason.into(); }
+        Ok(Some(serde_json::json!({"subject_id":subject_id, "candidate_ids":batch,"surface":surface})))
+    }).map_err(crate::api::subjektiv_store_error)?;
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    validate_result(store, subject_id, batch, job_id, attempt_id, &result)?;
+    with_dispositions(store, subject_id, batch, &result).map(Some)
+}
+
+/// A read-only view of work retained by an abandoned attempt, NOT a successful
+/// consolidation result. Receipt IDs point to immutable dispositions; unresolved
+/// IDs remain in the original input/staging store for later explicit work.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AbandonedAttempt {
+    pub disposition_ids: Vec<String>,
+    pub unresolved_candidate_ids: Vec<String>,
+    pub prepared_generation_id: Option<String>,
+}
+
+/// Inspect the original batch and preparation without deciding candidates,
+/// preparing/failing a surface, or calling a model/finalizer. The Host must first
+/// prove the exact failed attempt's execution release and current grant/input.
+/// No preparation is a valid pre-effects cut; an existing but stale preparation
+/// is not. A ready surface (possibly shared by another preparation) is untouched.
+pub fn inspect_abandoned_attempt(
+    store: &SubjektivStore,
+    subject_id: &str,
+    batch: &[String],
+    job_id: &str,
+    attempt_id: &str,
+) -> OperationResult<AbandonedAttempt> {
+    use crate::SubjektivError;
+    use rusqlite::{OptionalExtension, params};
+
+    if batch.len() > CANDIDATE_BATCH_LIMIT
+        || batch
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != batch.len()
+    {
+        return Err(OperationError::InvalidInput(
+            "invalid consolidation batch".into(),
+        ));
+    }
+    store.database.try_transaction(|tx| {
+        crate::require_active_subject(tx, subject_id)?;
+        crate::validate_label("Job id", job_id)?;
+        crate::validate_label("attempt id", attempt_id)?;
+        let mut retained = AbandonedAttempt {
+            disposition_ids: Vec::new(),
+            unresolved_candidate_ids: Vec::new(),
+            prepared_generation_id: None,
+        };
+        for id in batch {
+            let raw: Option<String> = tx.query_row(
+                "SELECT record_json FROM staging_records WHERE subject_id=?1 AND candidate_id=?2",
+                params![subject_id, id], |row| row.get(0)
+            ).optional()?;
+            let raw_candidate = raw.ok_or_else(|| SubjektivError::CandidateNotFound(id.clone()))?;
+            let candidate = crate::parse_staging(store.workspace_id(), &raw_candidate)?;
+            if candidate.subject_id != subject_id || candidate.id != *id {
+                return Err(SubjektivError::InvalidRecord("consolidation candidate identity mismatch".into()));
+            }
+            let resolution: Option<String> = tx.query_row(
+                "SELECT resolution_json FROM staging_resolutions WHERE subject_id=?1 AND candidate_id=?2",
+                params![subject_id, id], |row| row.get(0)
+            ).optional()?;
+            if let Some(raw) = resolution {
+                let saved = crate::parse_resolution(&raw)?;
+                if saved.subject_id != subject_id || saved.candidate_id != *id
+                    || !crate::equivalent_staging_payload(&serde_json::to_string(&saved.candidate)?, &raw_candidate)?
+                {
+                    return Err(SubjektivError::InvalidRecord("consolidation disposition identity mismatch".into()));
+                }
+                retained.disposition_ids.push(saved.id);
+            } else {
+                retained.unresolved_candidate_ids.push(id.clone());
+            }
+        }
+        let fingerprint = crate::memory_fingerprint_in_connection(tx, subject_id)?;
+        retained.prepared_generation_id = tx.query_row(
+            "SELECT generation_id FROM surface_generation_runs
+             WHERE subject_id=?1 AND job_id=?2 AND attempt_id=?3 AND memory_fingerprint=?4
+             ORDER BY generation_id LIMIT 1",
+            params![subject_id, job_id, attempt_id, fingerprint], |row| row.get(0)
+        ).optional()?;
+        if retained.prepared_generation_id.is_none() && tx.prepare(
+            "SELECT 1 FROM surface_generation_runs WHERE subject_id=?1 AND job_id=?2 AND attempt_id=?3"
+        )?.exists(params![subject_id, job_id, attempt_id])? {
+            return Err(SubjektivError::InvalidRecord("abandoned consolidation generation input is stale".into()));
+        }
+        Ok(retained)
+    }).map_err(crate::api::subjektiv_store_error)
 }
 
 /// Adds a compact projection of stored dispositions to a validated result.
@@ -131,7 +315,7 @@ pub fn with_dispositions(
     for id in batch {
         let resolution = store
             .staging_resolution(subject_id, id)
-            .map_err(|e| OperationError::Store(e.to_string()))?
+            .map_err(crate::api::subjektiv_store_error)?
             .ok_or_else(|| {
                 OperationError::InvalidInput(format!("candidate `{id}` has no durable disposition"))
             })?;

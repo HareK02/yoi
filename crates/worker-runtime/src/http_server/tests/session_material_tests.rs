@@ -3,6 +3,8 @@
 //! verifier are connected. Only controller execution is replaced by AcceptingBackend;
 //! no model, external server, user credentials or running Runtime is used.
 use super::*;
+#[path = "subject_job_removal_purge_tests.rs"]
+mod subject_job_removal_purge_tests;
 use crate::retention::{DiagnosticsDisposition, SessionDisposition, runtime_session_retention};
 use runtime_api::{
     SessionMaterialCatalogAvailability as Catalog, SessionMaterialReadAvailability as Read,
@@ -56,6 +58,10 @@ impl Fixture {
         let mut request = task_request("canonical Session fixture");
         request.config_bundle = None;
         request.memory_settings.as_mut().unwrap().workspace_id = scope.workspace_id.clone();
+        request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
+            workspace_id: scope.workspace_id.clone(),
+            base_url: "https://backend.test".into(),
+        });
         let worker = runtime
             .create_worker_scoped(&scope, request)
             .unwrap()
@@ -1219,6 +1225,58 @@ async fn subject_create_recovery_signed_http_requires_delete_and_matching_worksp
         assert_eq!(receipt.workspace_id, request.workspace_id);
         assert_eq!(receipt.create_fingerprint, request.create_fingerprint);
         assert_eq!(receipt.operation_id, request.operation_id);
+    }
+}
+
+#[tokio::test]
+async fn subject_delete_worker_signed_http_requires_delete_scope_without_inventing_missing_originals()
+ {
+    let f = Fixture::new();
+    let identity = RuntimeIdentityMaterial::generate("recovery-key").unwrap();
+    let trust = workspace_trust(&identity);
+    let app = runtime_http_router_with_workspace_auth(
+        f.runtime.clone(),
+        None,
+        workspace_test_auth(vec![trust.clone()]),
+    );
+    let path = "/v1/subject-delete-worker";
+    let mut request = runtime_api::SubjectDeleteWorkerRequest {
+        workspace_id: f.scope.workspace_id.clone(),
+        worker_id: WorkerId::now_v7(),
+        create_fingerprint: "unpublished-create".into(),
+        operation_id: "recovery-1".into(),
+    };
+    for operation in ["workers:read", "workers:stop", "workers:create"] {
+        let body = serde_json::to_vec(&request).unwrap();
+        let mut claims = signed_claims(&trust, "POST", path, &body);
+        claims.operation = operation.into();
+        let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    request.workspace_id = "other-workspace".into();
+    let body = serde_json::to_vec(&request).unwrap();
+    let claims = signed_claims(&trust, "POST", path, &body);
+    let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    request.workspace_id = f.scope.workspace_id.clone();
+    for _ in 0..2 {
+        let body = serde_json::to_vec(&request).unwrap();
+        let claims = signed_claims(&trust, "POST", path, &body);
+        assert_eq!(claims.operation, "workers:delete");
+        let response = signed_request(app.clone(), &identity, &claims, body, "workspace-a").await;
+        // Valid authorization reaches domain validation, but the arbitrary ID
+        // has neither an original Stop nor a confirmed historical fence.
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            read_control_cause(response).await,
+            protocol::control_failure::RuntimeControlCause::InvalidRequest
+        );
+        assert!(f.runtime.worker_detail(&f.worker).is_ok());
+        assert!(
+            f.runtime
+                .worker_detail(&WorkerRef::new(request.worker_id))
+                .is_err()
+        );
     }
 }
 

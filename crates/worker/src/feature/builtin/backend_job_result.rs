@@ -370,6 +370,7 @@ mod tests {
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
             self.requests.lock().unwrap().push(request);
             Ok(WorkspaceResponse {
+                content_type: None,
                 status: 200,
                 body: "{\"replayed\":false}".to_string(),
             })

@@ -29,6 +29,8 @@ import type {
   SubjektivResidentSurfaceAvailability,
   SubjektivResidentSurfaceResponse,
   SubjektivResidentSurfaceSnapshot,
+  SubjektivSubjectDeleteRequest,
+  SubjektivSubjectDeleteResponse,
   SubjektivSubjectBehaviorUpdateRequest,
   SubjektivSubjectCreateRequest,
   SubjektivSubjectListResponse,
@@ -115,6 +117,18 @@ export class SubjektivSubjectCreateError extends Error {
 export function validateSubjektivSubjectCreateRequest(
   request: SubjektivSubjectCreateRequest,
 ): SubjektivSubjectCreateRequest {
+  if (
+    typeof request.operation_id !== "string" ||
+    request.operation_id.length === 0 ||
+    new TextEncoder().encode(request.operation_id).byteLength > 256 ||
+    request.operation_id.trim() !== request.operation_id ||
+    /[\p{Cc}*]/u.test(request.operation_id)
+  ) {
+    throw new SubjektivSubjectCreateError(
+      "validation",
+      "Subject operation_id must be nonempty, at most 256 bytes, and contain no surrounding whitespace, control characters, or '*'.",
+    );
+  }
   if (request.role.trim().length === 0) {
     throw new SubjektivSubjectCreateError(
       "validation",
@@ -133,7 +147,11 @@ export function validateSubjektivSubjectCreateRequest(
   }
   const behaviorMd = request.behavior_md ?? "";
   validateSubjectBehavior(behaviorMd);
-  return { role: request.role, behavior_md: behaviorMd };
+  return {
+    operation_id: request.operation_id,
+    role: request.role,
+    behavior_md: behaviorMd,
+  };
 }
 
 function validateSubjectBehavior(behaviorMd: string): void {
@@ -158,6 +176,76 @@ function validateSubjectBehavior(behaviorMd: string): void {
   }
 }
 
+export class SubjektivSubjectDeleteError extends Error {
+  constructor(
+    readonly kind: "rejected" | "unknown_outcome",
+    message: string,
+    readonly status: number | null = null,
+  ) {
+    super(message);
+    this.name = "SubjektivSubjectDeleteError";
+  }
+}
+
+export function parseSubjektivSubjectDeleteResponse(
+  value: unknown,
+  subjectId: string,
+  operationId: string,
+): SubjektivSubjectDeleteResponse {
+  const record = strictRecord(value, ["subject_id", "operation_id", "completed"], "Subject deletion");
+  const response = {
+    subject_id: requiredIdentifier(record, "subject_id"),
+    operation_id: requiredIdentifier(record, "operation_id"),
+    completed: requiredBoolean(record, "completed"),
+  };
+  if (response.subject_id !== subjectId || response.operation_id !== operationId) {
+    invalid("Subject deletion response does not match the request");
+  }
+  return response;
+}
+
+/** HTTP success can confirm only the deletion fence. Every retry retains this request. */
+export async function deleteSubjektivSubject(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+  subjectId: string,
+  request: SubjektivSubjectDeleteRequest,
+): Promise<SubjektivSubjectDeleteResponse> {
+  identifier(request.operation_id, "operation_id");
+  let response: Response;
+  try {
+    response = await fetchFn(workspaceApiPath(workspaceId, `/subjektiv/subjects/${encodeURIComponent(subjectId)}`), {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation_id: request.operation_id }),
+    });
+  } catch {
+    throw new SubjektivSubjectDeleteError("unknown_outcome", "The deletion outcome is unknown. Retry the same request.");
+  }
+  if (!response.ok) {
+    throw new SubjektivSubjectDeleteError(
+      response.status >= 500 ? "unknown_outcome" : "rejected",
+      await subjektivSubjectCreateErrorMessage(response),
+      response.status,
+    );
+  }
+  try {
+    return parseSubjektivSubjectDeleteResponse(
+      await readBoundedJson(response, MEMORY_API_LIMITS.maxResponseBytes),
+      subjectId,
+      request.operation_id,
+    );
+  } catch {
+    throw new SubjektivSubjectDeleteError("unknown_outcome", "The deletion response could not be confirmed. Retry the same request.");
+  }
+}
+
+/**
+ * 呼出元は意図した作成ごとにoperation_idを一度だけ採番し、結果不明なら
+ * 同じID・role・behavior_mdの要求全体を保持する。この関数は自動再試行しない。
+ * 厳密な再送は同じSubjectを返し、同じIDで入力を変えると409になる。
+ * 再送は権限の再付与や削除済みSubjectの復活ではない。
+ */
 export async function createSubjektivSubject(
   fetchFn: typeof fetch,
   workspaceId: string,
@@ -175,7 +263,7 @@ export async function createSubjektivSubject(
   } catch {
     throw new SubjektivSubjectCreateError(
       "unknown_outcome",
-      "The request outcome is unknown. A Subject may have been created.",
+      "The request outcome is unknown. A Subject may have been created. Retry only the same operation_id and full request.",
     );
   }
 
@@ -190,7 +278,7 @@ export async function createSubjektivSubject(
     }
     throw new SubjektivSubjectCreateError(
       "unknown_outcome",
-      "The request outcome is unknown. A Subject may have been created.",
+      "The request outcome is unknown. A Subject may have been created. Retry only the same operation_id and full request.",
       response.status,
     );
   }
@@ -209,7 +297,7 @@ export async function createSubjektivSubject(
   } catch {
     throw new SubjektivSubjectCreateError(
       "unknown_outcome",
-      "The Subject may have been created, but the response could not be confirmed.",
+      "The Subject may have been created, but the response could not be confirmed. Retry only the same operation_id and full request.",
     );
   }
 }
@@ -541,9 +629,11 @@ export function parseSubjektivSubjectResponse(
       "created_at",
       "updated_at",
       "current_worker",
+      "current_body",
+      "current_worker_diagnostics",
     ],
     "Subject response",
-    ["current_worker"],
+    ["current_worker", "current_body", "current_worker_diagnostics"],
   );
   const id = requiredIdentifier(record, "id");
   if (expectedSubjectId !== undefined && id !== expectedSubjectId) {
@@ -571,6 +661,33 @@ export function parseSubjektivSubjectResponse(
         record.current_worker,
         "Subject current worker",
       );
+  }
+  if ("current_body" in record) {
+    if (record.current_body === null) result.current_body = null;
+    else {
+      const body = strictRecord(record.current_body, [
+        "runtime_id",
+        "worker_id",
+        "generation",
+      ], "Subject body owner");
+      const generation = requiredString(body, "generation", 20);
+      if (
+        !/^[1-9][0-9]{0,19}$/.test(generation) ||
+        BigInt(generation) > 18446744073709551615n
+      ) invalid("invalid Subject body generation");
+      result.current_body = {
+        runtime_id: requiredIdentifier(body, "runtime_id"),
+        worker_id: requiredIdentifier(body, "worker_id"),
+        generation,
+      };
+    }
+  }
+  if ("current_worker_diagnostics" in record) {
+    result.current_worker_diagnostics = boundedArray(
+      record.current_worker_diagnostics,
+      100,
+      "current worker diagnostics",
+    ).map(parseDiagnostic);
   }
   return result;
 }

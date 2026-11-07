@@ -80,20 +80,97 @@ pub struct WorkerNotificationAck {
     pub notification_request_id: String,
 }
 
+/// Actual execution-owner termination, not Backend Host drain, writer revocation,
+/// disposable-resource cleanup, or completion of the owning domain operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerExecutionTermination {
+    pub scope: WorkerExecutionTerminationScope,
+    pub worker_ref: WorkerRef,
+    pub stop_operation_id: WorkerLifecycleOperationId,
+    pub execution_id: uuid::Uuid,
+    pub shutdown_command_id: Option<u64>,
+    /// Matching durable acknowledgements observed by this execution owner;
+    /// absence does not establish that another submission was unaccepted.
+    pub submissions: Vec<WorkerSubmissionAck>,
+    /// Nonempty failures leave Feature scope termination/cleanup unconfirmed,
+    /// even though the Controller and adapter-owned tasks have joined.
+    pub feature_failures: Vec<WorkerFeatureShutdownFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerExecutionTerminationScope {
+    Controller,
+    UnpublishedStartupCandidate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerFeatureShutdownFailure {
+    pub category: worker::hook::HookErrorCategory,
+    pub diagnostic: String,
+}
+
+impl WorkerExecutionTermination {
+    pub(crate) fn joined_startup_candidate(
+        worker_ref: WorkerRef,
+        stop_operation_id: WorkerLifecycleOperationId,
+        execution_id: uuid::Uuid,
+    ) -> Self {
+        Self {
+            scope: WorkerExecutionTerminationScope::UnpublishedStartupCandidate,
+            worker_ref,
+            stop_operation_id,
+            execution_id,
+            shutdown_command_id: None,
+            submissions: Vec::new(),
+            feature_failures: Vec::new(),
+        }
+    }
+
+    pub fn confirms_scope_shutdown(
+        &self,
+        worker_ref: &WorkerRef,
+        operation_id: WorkerLifecycleOperationId,
+    ) -> bool {
+        &self.worker_ref == worker_ref
+            && self.stop_operation_id == operation_id
+            && self.feature_failures.is_empty()
+    }
+}
+
 /// Typed execution result class. Results are transient operation outcomes and
 /// are not persisted as Worker lifecycle authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerExecutionResult {
     pub operation: WorkerExecutionOperation,
     pub outcome: WorkerExecutionOutcome,
+    /// Actual Controller targeted or observed by this operation. Receipt lookup
+    /// does not identify the originating run of a receipt retained across restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_state: Option<protocol::WorkerStateSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Durable acceptance, independent of a later operation failure. Receipt
+    /// reconciliation can retain this on an Errored result; it is not run completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<WorkerSubmissionAck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<WorkerNotificationAck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<WorkerExecutionTermination>,
+    /// Projected primary facts. Never stop, cleanup, or retry evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_failure: Option<protocol::startup_failure::StartupFailureAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_failures: Vec<protocol::startup_failure::StartupSecondaryFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_resources: Option<protocol::startup_failure::StartupResourceFacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_failure_persistence: Option<protocol::startup_failure::StartupPersistenceOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_io_kind: Option<protocol::startup_failure::StartupIoKind>,
 }
 
 /// Backend result class for a Worker execution operation.
@@ -112,10 +189,17 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
+            execution_id: None,
             worker_state: None,
             message: None,
             submission: None,
             notification: None,
+            termination: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -133,6 +217,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
+            execution_id: None,
             worker_state: None,
             message: None,
             submission: Some(WorkerSubmissionAck {
@@ -141,6 +226,12 @@ impl WorkerExecutionResult {
                 disposition,
             }),
             notification: None,
+            termination: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -151,12 +242,19 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Accepted,
+            execution_id: None,
             worker_state: None,
             message: None,
             submission: None,
             notification: Some(WorkerNotificationAck {
                 notification_request_id: notification_request_id.into(),
             }),
+            termination: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -164,10 +262,17 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Busy,
+            execution_id: None,
             worker_state: None,
             message: Some(message.into()),
             submission: None,
             notification: None,
+            termination: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -175,10 +280,17 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Rejected,
+            execution_id: None,
             worker_state: None,
             message: Some(message.into()),
             submission: None,
             notification: None,
+            termination: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -186,10 +298,17 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Errored,
+            execution_id: None,
             worker_state: None,
             message: Some(message.into()),
             submission: None,
             notification: None,
+            termination: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
     }
 
@@ -197,11 +316,41 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Unsupported,
+            execution_id: None,
             worker_state: None,
             message: Some(message.into()),
             submission: None,
             notification: None,
+            termination: None,
+            startup_failure: None,
+            secondary_failures: Vec::new(),
+            startup_resources: None,
+            startup_failure_persistence: None,
+            startup_io_kind: None,
         }
+    }
+
+    pub fn with_startup_failure(
+        mut self,
+        failure: protocol::startup_failure::StartupFailureAttachment,
+    ) -> Self {
+        self.startup_failure = Some(failure);
+        self
+    }
+
+    pub fn startup_failure<D: error_contract::WireDetails>(
+        &self,
+    ) -> Option<error_contract::DecodeFailure<D>> {
+        self.startup_failure
+            .as_ref()
+            .map(|failure| failure.decode())
+    }
+
+    pub fn push_secondary_failure(
+        &mut self,
+        failure: protocol::startup_failure::StartupSecondaryFailure,
+    ) {
+        self.secondary_failures.push(failure);
     }
 
     pub fn is_accepted(&self) -> bool {
@@ -661,6 +810,7 @@ pub struct WorkerProtocolTransport {
     dispatch:
         Arc<dyn Fn(Method) -> Result<Vec<protocol::Event>, WorkerExecutionResult> + Send + Sync>,
     validate: Arc<dyn Fn() -> Result<(), WorkerExecutionResult> + Send + Sync>,
+    stop: Option<Arc<dyn Fn(WorkerExecutionStopRequest) -> WorkerExecutionResult + Send + Sync>>,
 }
 
 #[cfg(feature = "ws-server")]
@@ -680,6 +830,25 @@ impl WorkerProtocolTransport {
             events,
             dispatch,
             validate,
+            stop: None,
+        }
+    }
+
+    pub fn with_stop_dispatch(
+        mut self,
+        stop: Arc<dyn Fn(WorkerExecutionStopRequest) -> WorkerExecutionResult + Send + Sync>,
+    ) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    pub fn stop(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
+        match &self.stop {
+            Some(stop) => stop(request),
+            None => WorkerExecutionResult::unsupported(
+                WorkerExecutionOperation::Stop,
+                "bound protocol transport cannot confirm scope shutdown",
+            ),
         }
     }
 
@@ -725,6 +894,55 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         _request: &runtime_api::SubjectCreateRecoveryRequest,
     ) -> Result<(), String> {
         Err("execution backend cannot confirm Subject create execution absence".into())
+    }
+
+    /// Read-only exact execution identity check before Runtime persists exclusion.
+    fn preflight_subject_delete_worker(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot validate Subject Worker identity".into())
+    }
+
+    /// Runtime has durably fenced admission. Confirm shutdown and discard all
+    /// execution candidates under the backend Worker lock; uncertainty must fail.
+    fn subject_delete_worker(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot confirm Subject Worker shutdown".into())
+    }
+
+    /// Retain the durable Runtime exclusion in the adapter even when no Stop
+    /// can yet be admitted (for example an unresolved failed create).
+    fn fence_subject_delete_worker(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot fence Subject Worker admission".into())
+    }
+
+    /// Check current resources after a previously confirmed Subject deletion.
+    /// Runtime separately verifies its durable fence and physical originals;
+    /// this does not issue a Stop or establish historical termination.
+    fn confirm_subject_delete_worker_absent(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        Err("execution backend cannot confirm Subject Worker resource absence".into())
+    }
+
+    /// Internal Runtime consumer: the durable fence and original Stop child are
+    /// owned by Runtime. A saved canonical receipt (settled or pending cleanup)
+    /// is read-only execution evidence, not permission to stop a replacement or
+    /// mint another operation. Runtime alone settles a still-pending Stop.
+    fn subject_delete_worker_stop(
+        &self,
+        _request: &runtime_api::SubjectDeleteWorkerRequest,
+        _stop: WorkerExecutionStopRequest,
+        _canonical: Option<&WorkerExecutionTermination>,
+    ) -> Result<WorkerExecutionResult, String> {
+        Err("execution backend cannot reconcile Subject Worker Stop evidence".into())
     }
 
     /// Must reserve the actual Controller, not infer Idle from a catalog snapshot.
@@ -894,8 +1112,8 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         &self,
         _request: &RepositoryRefObservationRequest,
     ) -> Result<RepositoryRefObservation, WorkingDirectoryDiagnostic> {
-        Err(WorkingDirectoryDiagnostic::rejected(
-            "repository_ref_provider_unavailable",
+        Err(WorkingDirectoryDiagnostic::for_reason(
+            workdir::management_failure::WorkdirManagementReason::RefProviderUnavailable,
             "Worker execution backend does not support Repository ref observation",
         ))
     }
@@ -948,6 +1166,41 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Look up only the receipt for this exact input (request ID, source namespace
+    /// and payload digest). Missing or inaccessible receipts remain unknown; this
+    /// operation must not submit new work.
+    fn reconcile_submission(
+        &self,
+        _worker_ref: &WorkerRef,
+        _input: WorkerInput,
+    ) -> WorkerExecutionResult {
+        WorkerExecutionResult::errored(
+            WorkerExecutionOperation::Input,
+            "submission acceptance is unknown; exact receipt lookup is unavailable",
+        )
+    }
+
+    /// Read an actual retained scope-termination receipt. A backend must reject
+    /// receipts belonging to a replaced execution; absence is not shutdown proof.
+    fn termination_receipt(
+        &self,
+        _worker_ref: &WorkerRef,
+    ) -> Result<Option<WorkerExecutionTermination>, String> {
+        Err("execution backend has no scope-termination receipt reader".into())
+    }
+
+    /// Reconcile canonical execution-owner evidence against current backend
+    /// ownership. The default cannot certify a receipt lost by this backend.
+    fn reconcile_termination_receipt(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: &WorkerExecutionTermination,
+    ) -> Result<Option<WorkerExecutionTermination>, String> {
+        Ok(self
+            .termination_receipt(worker_ref)?
+            .filter(|current| current == saved))
+    }
+
     fn dispatch_input(&self, worker_ref: &WorkerRef, input: WorkerInput) -> WorkerExecutionResult;
 
     fn upload_file(
@@ -994,6 +1247,22 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     ) -> Vec<protocol::CompletionEntry> {
         let _ = worker_ref;
         Vec::new()
+    }
+
+    /// Internal pending-Stop recovery. Saved scope termination does not prove
+    /// factory cleanup; backends must reconcile both under their Worker lock.
+    fn reconcile_stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+        saved: Option<&WorkerExecutionTermination>,
+    ) -> WorkerExecutionResult {
+        if saved.is_some() {
+            return WorkerExecutionResult::errored(
+                WorkerExecutionOperation::Stop,
+                "execution backend cannot reconcile saved Stop termination and cleanup",
+            );
+        }
+        self.stop_worker_operation(request)
     }
 
     fn stop_worker_operation(&self, request: WorkerExecutionStopRequest) -> WorkerExecutionResult {
@@ -1067,6 +1336,37 @@ impl WorkerExecutionBackendRef {
         request: &runtime_api::SubjectCreateRecoveryRequest,
     ) -> Result<(), String> {
         self.backend.recover_subject_create(request)
+    }
+
+    pub(crate) fn preflight_subject_delete_worker(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        self.backend.preflight_subject_delete_worker(request)
+    }
+
+    pub(crate) fn fence_subject_delete_worker(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        self.backend.fence_subject_delete_worker(request)
+    }
+
+    pub(crate) fn confirm_subject_delete_worker_absent(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+    ) -> Result<(), String> {
+        self.backend.confirm_subject_delete_worker_absent(request)
+    }
+
+    pub(crate) fn subject_delete_worker_stop(
+        &self,
+        request: &runtime_api::SubjectDeleteWorkerRequest,
+        stop: WorkerExecutionStopRequest,
+        canonical: Option<&WorkerExecutionTermination>,
+    ) -> Result<WorkerExecutionResult, String> {
+        self.backend
+            .subject_delete_worker_stop(request, stop, canonical)
     }
 
     pub(crate) fn subject_release(
@@ -1227,6 +1527,23 @@ impl WorkerExecutionBackendRef {
         self.backend.observe_workspace_prompt_projection(projection)
     }
 
+    pub(crate) fn reconcile_submission(
+        &self,
+        worker_ref: &WorkerRef,
+        input: WorkerInput,
+    ) -> WorkerExecutionResult {
+        self.backend.reconcile_submission(worker_ref, input)
+    }
+
+    pub(crate) fn reconcile_termination_receipt(
+        &self,
+        worker_ref: &WorkerRef,
+        saved: &WorkerExecutionTermination,
+    ) -> Result<Option<WorkerExecutionTermination>, String> {
+        self.backend
+            .reconcile_termination_receipt(worker_ref, saved)
+    }
+
     pub(crate) fn dispatch_input(
         &self,
         worker_ref: &WorkerRef,
@@ -1285,6 +1602,14 @@ impl WorkerExecutionBackendRef {
     ) -> Vec<protocol::CompletionEntry> {
         self.backend
             .worker_completions(worker_ref, kind, prefix, context)
+    }
+
+    pub(crate) fn reconcile_stop_worker_operation(
+        &self,
+        request: WorkerExecutionStopRequest,
+        saved: Option<&WorkerExecutionTermination>,
+    ) -> WorkerExecutionResult {
+        self.backend.reconcile_stop_worker_operation(request, saved)
     }
 
     pub(crate) fn stop_worker_operation(
@@ -1364,4 +1689,60 @@ impl fmt::Debug for WorkerExecutionBackendRef {
             .field("backend_id", &self.backend_id)
             .finish_non_exhaustive()
     }
+}
+
+/// Transfer a spawn result without deriving operation acceptance from its error text,
+/// HTTP status, cleanup disposition, or persistence outcome. Other operation kinds
+/// keep their existing result contracts and are not reclassified as creation.
+pub fn startup_create_failure(
+    result: &WorkerExecutionResult,
+) -> Result<Option<runtime_api::startup::WorkerCreateFailure>, error_contract::ContractError> {
+    use runtime_api::startup::{
+        CreationAcceptance, ExecutionOutcome, StartupOperationFacts, WorkerCreateFailure,
+    };
+    if result.operation != WorkerExecutionOperation::Spawn {
+        return Ok(None);
+    }
+    let execution = match result.outcome {
+        WorkerExecutionOutcome::Accepted => ExecutionOutcome::Accepted,
+        WorkerExecutionOutcome::Busy => ExecutionOutcome::Busy,
+        WorkerExecutionOutcome::Rejected => ExecutionOutcome::Rejected,
+        WorkerExecutionOutcome::Errored => ExecutionOutcome::Errored,
+        WorkerExecutionOutcome::Unsupported => ExecutionOutcome::Unsupported,
+    };
+    let acceptance = match result.outcome {
+        WorkerExecutionOutcome::Accepted => CreationAcceptance::Accepted,
+        WorkerExecutionOutcome::Rejected | WorkerExecutionOutcome::Unsupported => {
+            CreationAcceptance::Rejected
+        }
+        WorkerExecutionOutcome::Busy | WorkerExecutionOutcome::Errored => {
+            CreationAcceptance::Unknown
+        }
+    };
+    let primary = match result.startup_failure.as_ref() {
+        Some(primary) => primary.clone(),
+        None => worker::startup_failure::runtime_startup_attachment(
+            protocol::startup_failure::RuntimeStartupCause {
+                stage: protocol::startup_failure::StartupStage::Controller,
+                reason: protocol::startup_failure::RuntimeStartupReason::StartupFailed,
+            },
+        )?,
+    };
+    WorkerCreateFailure::new(
+        runtime_api::WorkerStartupFailure {
+            primary,
+            secondary: result.secondary_failures.clone(),
+            resources: result.startup_resources,
+            persistence: result.startup_failure_persistence,
+            io_kind: result.startup_io_kind,
+        },
+        StartupOperationFacts {
+            acceptance,
+            execution,
+            finalize: None,
+            correlation: None,
+            backend_compensation: None,
+        },
+    )
+    .map(Some)
 }

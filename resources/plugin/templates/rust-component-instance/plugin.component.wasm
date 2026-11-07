@@ -1,3 +1,0 @@
-# Build with:
-# cargo component build --release
-# cp target/wasm32-wasip1/release/example_yoi_instance_plugin.wasm plugin.component.wasm

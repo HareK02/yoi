@@ -59,23 +59,25 @@ fn stopped_worker(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId) 
         }}
     }))
     .unwrap();
-    write_json(
-        &aggregate.join("worker.json"),
-        &json!({
-            "schema_version": schema,
-            "worker_ref": {"worker_id": worker}, "worker_id": worker,
-            "profile": request.profile,
-            "profile_source": request.profile_source.reference(),
-            "display_name": null, "config_bundle": null,
-            "created_at_ms": 1234, "status": "stopped", "workspace_id": "workspace-a",
-            "last_finished_submission_request_id": "retained-submission",
-            "restore_guard": {"observation_token": "retained-token",
-                "active_request_id": null, "owners": {}},
-            "execution_state": {"state": "available", "execution": {
-                "request": request, "binding": {}, "restore_intent": "explicit"
-            }}
-        }),
-    );
+    let mut worker_document = json!({
+        "schema_version": schema,
+        "worker_ref": {"worker_id": worker}, "worker_id": worker,
+        "profile": request.profile,
+        "profile_source": request.profile_source.reference(),
+        "display_name": null, "config_bundle": null,
+        "created_at_ms": 1234, "status": "stopped", "workspace_id": "workspace-a",
+        "last_finished_submission_request_id": "retained-submission",
+        "restore_guard": {"observation_token": "retained-token",
+            "active_request_id": null, "owners": {}},
+        "execution_state": {"state": "available", "execution": {
+            "request": request, "binding": {}, "restore_intent": "explicit"
+        }}
+    });
+    if schema == SCHEMA_VERSION {
+        worker_document["workdir_attachments_guard"] =
+            serde_json::to_value(crate::runtime::WorkdirAttachmentsGuard::default()).unwrap();
+    }
+    write_json(&aggregate.join("worker.json"), &worker_document);
     let (session, segment) = write_v4_session(&aggregate);
     let mut metadata = session_store::WorkerMetadata::new(
         format!("worker-runtime-{worker}"),
@@ -97,7 +99,7 @@ fn runtime_fixture(root: &Path, schema: u32) -> (WorkerId, SessionId, SegmentId)
             "schema_version": schema, "display_name": "retained Runtime",
             "backend": "fs_store", "status": "running", "next_diagnostic_id": 1,
             "config_bundles": {}, "workspace_owners": {"workspace-a": "owner-a"},
-            "diagnostics": [], "subject_releases": [],
+            "diagnostics": [], "subject_releases": [], "subject_delete_worker_fences": {},
             "subject_create_recovery_fences": {fenced_worker.to_string(): {
                 "request": {"workspace_id": "workspace-a", "worker_id": fenced_worker,
                     "create_fingerprint": "retained-create", "operation_id": "retained-recovery"},
@@ -218,6 +220,7 @@ fn completed_v4_archive(
             schema_version: OPERATION_SCHEMA_VERSION,
             request: request.clone(),
             result: completed.clone(),
+            shutdown: None,
         },
     );
     fs::remove_dir_all(provider.worker_dir(worker)).unwrap();

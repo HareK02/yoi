@@ -119,6 +119,16 @@ impl SessionRetentionStore {
         Ok(guard)
     }
 
+    /// Hold publication/erasure exclusion only when no durable consumer still
+    /// requires the original source. Used by removal after consumer release.
+    pub fn lock_unpinned(&self, session: SessionId) -> Result<SessionRetentionGuard, StoreError> {
+        let guard = self.lock_live(session)?;
+        if !self.read(session)?.pins.is_empty() {
+            return Err(StoreError::SessionPinned(session));
+        }
+        Ok(guard)
+    }
+
     /// Protect a Host-owned Session before its first source publication. This is
     /// retention intent, not proof that any original material exists. The owner must
     /// establish it before accepting input and use the same control store for writes

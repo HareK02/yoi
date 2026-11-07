@@ -1,0 +1,426 @@
+//! Human catalog management is separate from Runtime artifact delivery and execution grants.
+//! The outer dispatcher authenticates each request. Mutations additionally require the
+//! Workspace owner account; authenticated readers follow the existing Workspace read policy.
+//! Neither model text nor a Runtime workspace.request proof can manufacture a human actor.
+use super::*;
+use server_api::*;
+
+type CatalogResult<T> = std::result::Result<T, RepositoryApiError>;
+
+impl WorkspaceApi {
+    /// Refresh before policy resolution, never from inside a config-store
+    /// transaction. Owner-adopted config pins are the source, not a guest claim.
+    pub(crate) fn refresh_plugin_permission_registry(&self) -> crate::Result<()> {
+        let mut registry = self
+            .permission_registry
+            .write()
+            .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?;
+        let root = ServerConfig::server_data_root_for_data_dir(&self.config.data_root)
+            .join("plugin-artifacts");
+        self.config_store
+            .sync_plugin_permission_registry(&root, self.workspace_id(), &mut registry)
+    }
+
+    /// Gate the exact immutable entry, using its registered Plugin namespace and
+    /// the original authenticated Worker. A guest key never becomes a Host key.
+    pub(super) fn authorize_plugin_entry(
+        &self,
+        worker: &RuntimeWorkerRef,
+        admitted: &crate::plugin_host::AdmittedPluginOperation,
+        tools: &[String],
+        service: Option<&str>,
+    ) -> crate::Result<()> {
+        let root = ServerConfig::server_data_root_for_data_dir(&self.config.data_root)
+            .join("plugin-artifacts");
+        let manifest = self.config_store.plugin_artifact_manifest(
+            &root,
+            self.workspace_id(),
+            admitted.pin.installation_id(),
+            admitted.pin.artifact_digest(),
+        )?;
+        let keys: Vec<_> = if let Some(name) = service {
+            manifest
+                .services
+                .iter()
+                .filter(|entry| entry.name == name)
+                .filter_map(|entry| entry.permission.clone())
+                .collect()
+        } else {
+            manifest
+                .tools
+                .iter()
+                .filter(|entry| tools.contains(&entry.name))
+                .filter_map(|entry| entry.permission.clone())
+                .collect()
+        };
+        if !keys.is_empty() {
+            self.refresh_plugin_permission_registry()?;
+        }
+        let feature = crate::plugin_catalog::permissions::plugin_feature_id(
+            admitted.pin.installation_id(),
+            admitted.pin.artifact_digest(),
+        )?;
+        for key in keys {
+            {
+                let registry = self.permission_registry.read().map_err(|_| {
+                    Error::Config("current Feature declarations unavailable".into())
+                })?;
+                if registry
+                    .namespace_handle(&feature, &key.namespace())
+                    .is_none()
+                {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Plugin entry Feature is no longer registered".into(),
+                    ));
+                }
+            }
+            subject_authorization::authorize_scope(
+                self,
+                worker,
+                &server_api::authorization::OperationAuthorizationRequest {
+                    operation: key.to_string(),
+                    resource: server_api::authorization::PermissionResource::PluginInstallation {
+                        workspace_id: self.workspace_id().into(),
+                        installation_id: admitted.pin.installation_id().into(),
+                    },
+                },
+            )
+            .map_err(|error| error.error)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
+    Router::new()
+        .merge(
+            server_api_axum::plugin_upload(service.clone()).layer(DefaultBodyLimit::max(
+                manifest::plugin::PluginPackageLimits::default().max_package_size_bytes as usize,
+            )),
+        )
+        .merge(server_api_axum::plugin_install(service.clone()))
+        .merge(server_api_axum::plugin_list(service.clone()))
+        .merge(server_api_axum::plugin_worker_diagnostics(service.clone()))
+        .merge(server_api_axum::plugin_service_diagnostics(service.clone()))
+        .merge(server_api_axum::plugin_service_recover(service.clone()))
+        .merge(server_api_axum::plugin_show(service.clone()))
+        .merge(server_api_axum::plugin_artifact_add(service.clone()))
+        .merge(server_api_axum::plugin_revoke(service.clone()))
+        .merge(server_api_axum::plugin_uninstall(service.clone()))
+        .merge(server_api_axum::plugin_data_observe(service.clone()))
+        .merge(server_api_axum::plugin_data_purge(service.clone()))
+        .merge(server_api_axum::plugin_operation(service))
+        .layer(middleware::from_fn(normalize_rejections))
+}
+
+pub(super) async fn normalize_rejections(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    // The management contract classifies malformed DTOs/queries as invalid=400,
+    // including Axum's JSON data/media rejections. Preserve the common envelope
+    // without reflecting attacker-supplied JSON values or transport diagnostics.
+    if matches!(
+        response.status(),
+        StatusCode::BAD_REQUEST
+            | StatusCode::UNPROCESSABLE_ENTITY
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE
+    ) {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(RepositoryApiError::new(
+                400,
+                "plugin_invalid",
+                "Invalid Plugin request",
+                vec![],
+            )),
+        )
+            .into_response()
+    } else {
+        response
+    }
+}
+
+pub(super) fn is_catalog_path(path: &str) -> bool {
+    path.strip_prefix("/api/w/")
+        .and_then(|p| p.split_once('/'))
+        .is_some_and(|(_, resource)| {
+            matches!(resource, "plugins" | "plugin-uploads")
+                || resource.starts_with("plugins/")
+                || resource.starts_with("plugin-operations/")
+        })
+}
+
+pub(super) fn failure(error: Error) -> RepositoryApiError {
+    let (status, code) = match error {
+        Error::PluginCatalog(error) => (error.status(), error.code()),
+        Error::WorkspacePermissionDenied(_) => (403, "access_denied"),
+        Error::WorkspaceIdMismatch => (404, "not_found"),
+        Error::DbCapacityExceeded => (503, "busy"),
+        // A storage failure may be a lost acknowledgement. Do not assert rollback
+        // or encourage a fresh operation key; the caller can reconcile its receipt.
+        _ => (503, "catalog_outcome_unknown"),
+    };
+    RepositoryApiError::new(status, code, format!("Plugin catalog: {code}"), vec![])
+}
+
+pub(super) async fn authorize(
+    api: &WorkspaceApi,
+    workspace: &str,
+    actor: &RequestActor,
+    manage: bool,
+) -> CatalogResult<()> {
+    validate_workspace_scope(api, workspace).map_err(|e| failure(e.error))?;
+    if manage {
+        require_workspace_owner(api, workspace, actor, "Plugin management")
+            .await
+            .map_err(|e| failure(e.error))?;
+    }
+    Ok(())
+}
+
+fn actor_identity(actor: &RequestActor) -> String {
+    // Account alone is not a caller: two users of the same management account
+    // must not consume one another's temporary uploads or operation keys.
+    serde_json::to_string(&(&actor.account_id, &actor.user_id))
+        .expect("string tuple is serializable")
+}
+
+pub(super) async fn upload(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    body: BinaryBody,
+) -> CatalogResult<PluginUploadResponse> {
+    authorize(api, &workspace, &actor, true).await?;
+    let root =
+        ServerConfig::server_data_root_for_data_dir(&api.config.data_root).join("plugin-artifacts");
+    let store = api.config_store.clone();
+    let actor = actor_identity(&actor);
+    let executor = store.db_executor();
+    executor
+        .run(move || store.plugin_upload(&root, &workspace, &actor, body.as_ref()))
+        .await
+        .map_err(failure)
+}
+
+pub(super) async fn install(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    request: PluginInstallRequest,
+) -> CatalogResult<PluginOperationResponse> {
+    authorize(api, &workspace, &actor, true).await?;
+    let store = api.config_store.clone();
+    let actor = actor_identity(&actor);
+    let executor = store.db_executor();
+    let stage_api = api.clone();
+    executor
+        .run(move || {
+            let result = store.plugin_install(&workspace, &actor, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
+        .await
+        .map_err(failure)
+}
+
+pub(super) async fn list(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    query: PluginListRequest,
+) -> CatalogResult<PluginListResponse> {
+    authorize(api, &workspace, &actor, false).await?;
+    let store = api.config_store.clone();
+    let executor = store.db_executor();
+    executor
+        .run(move || store.plugin_list(&workspace, &query))
+        .await
+        .map_err(failure)
+}
+
+pub(super) async fn show(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation_id: String,
+) -> CatalogResult<PluginInstallation> {
+    authorize(api, &workspace, &actor, false).await?;
+    let store = api.config_store.clone();
+    let executor = store.db_executor();
+    executor
+        .run(move || store.plugin_show(&workspace, &installation_id))
+        .await
+        .map_err(failure)
+}
+
+pub(super) async fn artifact_add(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation_id: String,
+    request: PluginAddArtifactRequest,
+) -> CatalogResult<PluginOperationResponse> {
+    authorize(api, &workspace, &actor, true).await?;
+    let store = api.config_store.clone();
+    let actor = actor_identity(&actor);
+    let executor = store.db_executor();
+    let stage_api = api.clone();
+    executor
+        .run(move || {
+            let result =
+                store.plugin_add_artifact(&workspace, &actor, &installation_id, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
+        .await
+        .map_err(failure)
+}
+
+pub(super) async fn revoke(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation_id: String,
+    request: PluginRevokeRequest,
+) -> CatalogResult<PluginOperationResponse> {
+    authorize(api, &workspace, &actor, true).await?;
+    let store = api.config_store.clone();
+    let actor = actor_identity(&actor);
+    let executor = store.db_executor();
+    let stage_api = api.clone();
+    executor
+        .run(move || {
+            let result = store.plugin_revoke(&workspace, &actor, &installation_id, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
+        .await
+        .map_err(failure)
+}
+
+pub(super) async fn uninstall(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation_id: String,
+    request: PluginUninstallRequest,
+) -> CatalogResult<PluginOperationResponse> {
+    authorize(api, &workspace, &actor, true).await?;
+    let store = api.config_store.clone();
+    let actor = actor_identity(&actor);
+    let executor = store.db_executor();
+    let stage_api = api.clone();
+    executor
+        .run(move || {
+            let result = store.plugin_uninstall(&workspace, &actor, &installation_id, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
+        .await
+        .map_err(failure)
+}
+
+pub(super) async fn operation(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    operation_id: String,
+) -> CatalogResult<PluginOperationResponse> {
+    authorize(api, &workspace, &actor, false).await?;
+    let store = api.config_store.clone();
+    let executor = store.db_executor();
+    executor
+        .run(move || store.plugin_operation(&workspace, &operation_id))
+        .await
+        .map_err(failure)
+}
+
+fn data_failure(error: Error) -> RepositoryApiError {
+    if let Error::PluginHost(error) = error {
+        let (status, code) = match error.code {
+            PluginHostErrorCode::NotFound => (404, "not_found"),
+            PluginHostErrorCode::Denied => (403, "access_denied"),
+            PluginHostErrorCode::Conflict => (409, "plugin_data_conflict"),
+            PluginHostErrorCode::InvalidInput => (400, "plugin_invalid"),
+            _ => (503, "plugin_data_outcome_unknown"),
+        };
+        RepositoryApiError::new(status, code, "Plugin data operation", vec![])
+    } else {
+        failure(error)
+    }
+}
+fn purge_state(state: crate::plugin_data::PurgeSnapshot) -> PluginDataPurgeState {
+    PluginDataPurgeState {
+        installation_last_operation: state.installation_last_operation,
+        cells_digest: state.cells_digest,
+        cell_count: state.cell_count,
+    }
+}
+
+pub(super) async fn data_observe(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation: String,
+) -> CatalogResult<PluginDataPurgeState> {
+    // Observing a purge confirmation is an administrator operation. It is only
+    // available after all execution artifacts have been irrevocably revoked.
+    authorize(api, &workspace, &actor, true).await?;
+    let store = api.config_store.clone();
+    store
+        .db_executor()
+        .run(move || {
+            store.with_immediate_transaction(|tx| {
+                crate::plugin_data::purge_snapshot(tx, &workspace, &installation)
+            })
+        })
+        .await
+        .map(purge_state)
+        .map_err(data_failure)
+}
+
+pub(super) async fn data_purge(
+    api: &WorkspaceApi,
+    actor: RequestActor,
+    workspace: String,
+    installation: String,
+    request: PluginDataPurgeRequest,
+) -> CatalogResult<PluginDataPurgeResponse> {
+    // Authenticate again even when this will be a receipt replay. Management
+    // credentials are never borrowed by guest invocations or used to run them.
+    authorize(api, &workspace, &actor, true).await?;
+    let actor = actor_identity(&actor);
+    let store = api.config_store.clone();
+    store
+        .db_executor()
+        .run(move || {
+            store.with_immediate_transaction(|tx| {
+                crate::plugin_data::purge(
+                    tx,
+                    &workspace,
+                    &installation,
+                    &actor,
+                    &request.operation_key,
+                    &crate::plugin_data::PurgeSnapshot {
+                        installation_last_operation: request.expected.installation_last_operation,
+                        cells_digest: request.expected.cells_digest,
+                        cell_count: request.expected.cell_count,
+                    },
+                )
+            })
+        })
+        .await
+        .map(|receipt| PluginDataPurgeResponse {
+            purge_id: receipt.purge_id,
+            observed: purge_state(receipt.observed),
+        })
+        .map_err(data_failure)
+}

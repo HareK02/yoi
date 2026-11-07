@@ -4,11 +4,11 @@
  */
 import type {
   DriveAccess,
-  DriveApiError,
   DriveGrantCreateRequest,
   DriveGrantListResponse,
   DriveGrantResponse,
 } from "#lib/generated/drive-api.ts";
+import { receiveDriveApiError } from "#lib/workspace/drive/api.ts";
 import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
 
 export type { DriveAccess, DriveGrantCreateRequest, DriveGrantResponse };
@@ -88,25 +88,6 @@ export function parseDriveGrantListResponse(
     next_after: v.next_after === null ? null : decimal(v.next_after),
   };
 }
-export function parseDriveGrantError(value: unknown): DriveApiError {
-  const v = object(value, ["code", "classification", "message"]);
-  const codes = [
-    "denied",
-    "not_found",
-    "conflict",
-    "invalid",
-    "limit",
-    "storage_unavailable",
-    "outcome_unknown",
-  ] as const;
-  const code = codes.find((code) => code === v.code);
-  if (
-    !code ||
-    (v.classification !== "not_committed" && v.classification !== "unknown") ||
-    (code === "outcome_unknown" && v.classification !== "unknown")
-  ) throw new Error("Invalid Drive error");
-  return { code, classification: v.classification, message: text(v.message) };
-}
 async function request<T>(
   workspaceId: string,
   path: string,
@@ -122,12 +103,11 @@ async function request<T>(
       cache: "no-store",
       redirect: "error",
     });
-    const payload = await readBoundedJson(response, 1024 * 1024);
     if (!response.ok) {
-      const error = parseDriveGrantError(payload);
+      const { error } = await receiveDriveApiError(response);
       throw new DriveGrantError(error.message, error.classification);
     }
-    return parse(payload);
+    return parse(await readBoundedJson(response, 1024 * 1024));
   } catch (error) {
     if (error instanceof DriveGrantError) throw error;
     throw new DriveGrantError(

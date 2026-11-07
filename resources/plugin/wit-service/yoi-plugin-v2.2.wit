@@ -1,0 +1,41 @@
+package yoi:plugin@2.2.0;
+
+interface service {
+    enum ticket-event-type { ticket-changed, ticket-deleted }
+    record envelope {
+        event-id: string,
+        event-type: ticket-event-type,
+        event-version: u32,
+        occurred-at: string,
+        ticket-ref: string,
+        domain-event-id: string,
+        content-digest: option<string>,
+        correlation-id: option<string>,
+        causation-id: option<string>,
+        invocation-id: string,
+        service-name: string,
+        config-json: string,
+        attempt: u32,
+        remaining-ms: u32,
+    }
+    variant event-result {
+        ack,
+        retry-after(u32),
+        reject(string),
+    }
+    record service-error { code: string, message: string }
+    on-start: func(config: string) -> result<_, service-error>;
+    on-event: func(input: envelope) -> event-result;
+    on-stop: func(reason: string) -> result<_, service-error>;
+}
+
+world ticket-service-plugin {
+    import yoi:host/errors@2.0.0;
+    import yoi:host/connections@2.0.0;
+    import yoi:host/http@2.0.0;
+    import yoi:host/logging@2.0.0;
+    import yoi:host/objects@2.1.0;
+    import yoi:host/ticket-read@2.1.0;
+    import yoi:host/extension-data@2.1.0;
+    export service;
+}

@@ -18,18 +18,25 @@ use agen::{Item, ToolResultDisposition};
 /// Build synthetic `Item::ToolResult` items for every unanswered
 /// `Item::ToolCall` in `history`, preserving order.
 pub(crate) fn orphan_tool_result_closures(history: &[Item], summary: &str) -> Vec<Item> {
-    let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut pending: Vec<Option<&str>> = Vec::new();
     for item in history {
-        if let Item::ToolResult { call_id, .. } = item {
-            answered.insert(call_id.as_str());
+        match item {
+            Item::ToolCall { call_id, .. } => pending.push(Some(call_id)),
+            Item::ToolResult { call_id, .. } => {
+                if let Some(index) = pending
+                    .iter()
+                    .position(|entry| *entry == Some(call_id.as_str()))
+                {
+                    pending[index] = None;
+                }
+            }
+            _ => {}
         }
     }
     let mut out = Vec::new();
-    for item in history {
-        if let Item::ToolCall { call_id, .. } = item {
-            if !answered.contains(call_id.as_str()) {
-                out.push(Item::tool_result_item_with_disposition_and_attachments(
-                    call_id.clone(),
+    for call_id in pending.into_iter().flatten() {
+        out.push(Item::tool_result_item_with_disposition_and_attachments(
+                    call_id,
                     summary,
                     Some(
                         "Execution ended before completion could be confirmed. Completion and side effects are unknown."
@@ -38,8 +45,6 @@ pub(crate) fn orphan_tool_result_closures(history: &[Item], summary: &str) -> Ve
                     ToolResultDisposition::OutcomeUnknown,
                     Vec::new(),
                 ));
-            }
-        }
     }
     out
 }
@@ -58,6 +63,20 @@ fn interrupt_tool_result_summary() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answered_provider_id_does_not_hide_later_unanswered_logical_call() {
+        let history = vec![
+            Item::tool_call("reused", "plugin", "{}"),
+            Item::tool_result("reused", "first finished"),
+            Item::tool_call("reused", "plugin", "{}"),
+        ];
+        let closed = orphan_tool_result_closures(&history, "Interrupted");
+        assert_eq!(closed.len(), 1);
+        assert!(
+            matches!(&closed[0], Item::ToolResult { call_id, disposition: ToolResultDisposition::OutcomeUnknown, .. } if call_id == "reused")
+        );
+    }
 
     #[test]
     fn no_orphans_returns_empty() {

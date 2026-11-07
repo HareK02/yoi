@@ -25,7 +25,11 @@ async fn result_signed_http(
     serde_json::from_slice(&bytes).unwrap()
 }
 
-async fn assert_result_diagnostics(api: &WorkspaceApi, recipient: &RuntimeWorkerRef, result_id: &str) {
+async fn assert_result_diagnostics(
+    api: &WorkspaceApi,
+    recipient: &RuntimeWorkerRef,
+    result_id: &str,
+) {
     let page = delivery_http(api, "GET", &format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?source_event_id=implementation-result:{result_id}"), None, StatusCode::OK).await;
     let rows = page["items"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
@@ -43,7 +47,113 @@ async fn assert_result_diagnostics(api: &WorkspaceApi, recipient: &RuntimeWorker
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn implementation_result_signed_http_reaches_persistent_orchestrator_without_assignment_or_mr() {
+async fn implementation_result_receipt_and_replay_do_not_wait_for_notification_acceptance() {
+    use std::time::Duration;
+
+    struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution, orchestrator, identity) = delivery_recording_fixture(dir.path()).await;
+    let ticket = delivery_ticket(&api, "Receipt is independent of notification acceptance");
+    delivery_assign(&api, &ticket.id, "blocked-result-delegation").await;
+    let coder = spawn_ticket_check_source(&api, "blocked-result-coder");
+    seed_worker_source_member(&api, &coder.runtime_id, &coder.worker_id);
+    let input = json!({"operation_key":"blocked-result", "kind":"result", "body":"Committed facts survive a blocked notification"});
+
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let release = ReleaseOnDrop(Some(release));
+    let recipient = orchestrator.worker_id.clone();
+    execution.before_input_returns(move |worker| {
+        assert_eq!(worker.worker_id.to_string(), recipient);
+        let _ = entered.send(());
+        release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    });
+    let mut report = tokio::spawn({
+        let api = api.clone();
+        let identity = identity.clone();
+        let coder = coder.clone();
+        let ticket = ticket.id.clone();
+        let input = input.clone();
+        async move { result_signed_http(&api, &identity, &coder, &ticket, &input, StatusCode::OK).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .expect("notification reached the gated Runtime acceptance boundary")
+        .unwrap();
+    let receipt = tokio::time::timeout(Duration::from_secs(2), &mut report).await;
+    let replay = if receipt.is_ok() {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    api.config_store
+        .with_conn(|conn| {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM ticket_implementation_results",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM notification_sources WHERE kind='implementation_result'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    // Release before asserting the response result, including when testing the old coupled handler.
+    drop(release);
+    let cleanup = if receipt.is_err() {
+        Some(tokio::time::timeout(Duration::from_secs(5), report).await)
+    } else {
+        None
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        api.host_executors.host().unwrap().drain(),
+    )
+    .await
+    .expect("owned recovery drained after release")
+    .unwrap();
+    let receipt = receipt
+        .expect("committed receipt must not wait for Runtime acceptance")
+        .unwrap();
+    assert_eq!(
+        replay
+            .unwrap()
+            .expect("replay must not wait for Runtime acceptance"),
+        receipt
+    );
+    assert!(cleanup.is_none());
+    assert_result_diagnostics(&api, &orchestrator, receipt["result_id"].as_str().unwrap()).await;
+    delivery_stop(&api, &coder);
+    delivery_stop(&api, &orchestrator);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn implementation_result_signed_http_reaches_persistent_orchestrator_without_assignment_or_mr()
+ {
     let dir = tempfile::tempdir().unwrap();
     let (mut api, execution, _) = delivery_real_fixture(dir.path(), false).await;
     let identity = RuntimeIdentityMaterial::generate(EMBEDDED_WORKER_RUNTIME_ID).unwrap();
@@ -73,7 +183,15 @@ async fn implementation_result_signed_http_reaches_persistent_orchestrator_witho
     let receipt =
         result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK).await;
     // Another authenticated Worker may report, but cannot replay this Workers receipt.
-    result_signed_http(&api, &identity, &orchestrator, &ticket.id, &input, StatusCode::CONFLICT).await;
+    result_signed_http(
+        &api,
+        &identity,
+        &orchestrator,
+        &ticket.id,
+        &input,
+        StatusCode::CONFLICT,
+    )
+    .await;
     delivery_wait_idle(&api, &orchestrator, 2).await;
     assert_eq!(
         result_signed_http(&api, &identity, &coder, &ticket.id, &input, StatusCode::OK).await,
@@ -224,9 +342,22 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
         })
         .unwrap();
     // No mutation callback: a diagnostic read must expose, but not route, saved MR sources.
-    let pending = delivery_http(&api, "GET", &format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?merge_request_id=result-mr"), None, StatusCode::OK).await;
+    let pending = delivery_http(
+        &api,
+        "GET",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?merge_request_id=result-mr"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
     assert_eq!(pending["items"].as_array().unwrap().len(), 4);
-    assert!(pending["items"].as_array().unwrap().iter().all(|row| row["stage"] == "awaiting_routing"));
+    assert!(
+        pending["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["stage"] == "awaiting_routing")
+    );
     assert_eq!(pending["source_checks"][0]["origin_present"], true);
     assert_eq!(pending["source_checks"][0]["captured"], true);
     recover_ticket_notifications(&api);
@@ -325,10 +456,26 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
     assert_eq!(execution.attempts.lock().unwrap().len(), attempts);
     assert_eq!(delivery_receipts(&api, &orchestrator).len(), 10);
     assert_result_diagnostics(&api, &orchestrator, receipt["result_id"].as_str().unwrap()).await;
-    let diagnostics = delivery_http(&api, "GET", &format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?merge_request_id=result-mr"), None, StatusCode::OK).await;
+    let diagnostics = delivery_http(
+        &api,
+        "GET",
+        &format!("/api/w/{TEST_WORKSPACE_ID}/notification-diagnostics?merge_request_id=result-mr"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
     let rows = diagnostics["items"].as_array().unwrap();
-    for kind in ["mr_review_requested", "mr_review", "mr_review_revoked", "mr_review_cancelled", "mr_source_changed"] {
-        let matching: Vec<_> = rows.iter().filter(|r| r["event_kind"] == kind && r["recipient_role"] == "orchestrator").collect();
+    for kind in [
+        "mr_review_requested",
+        "mr_review",
+        "mr_review_revoked",
+        "mr_review_cancelled",
+        "mr_source_changed",
+    ] {
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|r| r["event_kind"] == kind && r["recipient_role"] == "orchestrator")
+            .collect();
         assert!(!matching.is_empty(), "missing diagnostic for {kind}");
         for row in matching {
             assert_eq!(row["stage"], "runtime_accepted");
@@ -337,9 +484,16 @@ async fn mr_result_recovery_and_handoff_are_distinct_persistent_inputs() {
         }
     }
     for kind in ["mr_review_requested", "mr_review_revoked"] {
-        assert!(rows.iter().any(|r| r["event_kind"] == kind && r["recipient_role"] == "worker" && r["stage"] == "suppressed" && r["reason"] == "self_notification"));
+        assert!(rows.iter().any(|r| r["event_kind"] == kind
+            && r["recipient_role"] == "worker"
+            && r["stage"] == "suppressed"
+            && r["reason"] == "self_notification"));
     }
-    assert_eq!(execution.attempts.lock().unwrap().len(), attempts, "diagnostic reads must not dispatch");
+    assert_eq!(
+        execution.attempts.lock().unwrap().len(),
+        attempts,
+        "diagnostic reads must not dispatch"
+    );
     assert_eq!(
         api.authority.ticket(&ticket.id).unwrap().state,
         server_api::BrowserTicketState::Open

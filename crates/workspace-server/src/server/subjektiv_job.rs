@@ -113,6 +113,7 @@ pub(super) async fn retire_legacy_worker(api: &WorkspaceApi, subject_id: &str) -
                     .stop_worker(
                         &owner.worker,
                         WorkerLifecycleRequest {
+                            stop_intent: None,
                             reason: Some(
                                 "Retire legacy subjektiv consolidator after foreground completion"
                                     .into(),
@@ -179,6 +180,7 @@ fn bounded_candidate_batch(
 pub(super) fn dispatch(
     api: &WorkspaceApi,
     subject_id: &str,
+    source_worker: Option<RuntimeWorkerRef>,
     candidate_count: usize,
     total_bytes: u64,
 ) -> ApiResult<MemoryConsolidationOutput> {
@@ -206,7 +208,7 @@ pub(super) fn dispatch(
         profile: format!("builtin:{SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE}"),
         grants: BackendJobGrants { subjektiv_consolidation: Some(SubjektivConsolidationGrant { subject_id: subject_id.into(), candidate_ids }), ..Default::default() },
         serialization_key: None,
-        source_worker: None,
+        source_worker,
         notification_target: None,
         limits: crate::backend_job::BackendJobLimits { timeout_seconds: 600, ..Default::default() },
     };
@@ -239,6 +241,47 @@ pub(super) fn dispatch(
     })
 }
 
+/// Read the existing candidate dispositions and terminal surface outcome for this
+/// exact consolidation attempt. Recovery does not rerun candidate decisions or
+/// surface generation, and migration-retired Jobs never reach the domain lookup.
+pub(super) fn lookup_result(
+    api: &WorkspaceApi,
+    job: &crate::backend_job::BackendJobRecord,
+    attempt: &BackendJobAttemptRecord,
+) -> Result<Option<serde_json::Value>> {
+    if api
+        .store
+        .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
+    {
+        return Ok(None);
+    }
+    let Some(grant) = &job.request.grants.subjektiv_consolidation else {
+        return Ok(None);
+    };
+    if job.workspace_id != api.workspace_id()
+        || attempt.workspace_id != job.workspace_id
+        || attempt.job_id != job.request.job_id
+        || attempt.attempt != job.current_attempt
+        || attempt.attempt_id != crate::backend_job::attempt_id(&attempt.job_id, attempt.attempt)
+        || attempt.input_digest != job.input_digest
+    {
+        return Err(Error::WorkspacePermissionDenied(
+            "Consolidation recovery owner mismatch".into(),
+        ));
+    }
+    job.load_executable_request()?;
+    subject_authorization::authorize_job_input(api, &job.request).map_err(|error| error.error)?;
+    let store = open_subjektiv_store(api).map_err(|error| error.error)?;
+    subjektiv::job::lookup_result(
+        &store,
+        &grant.subject_id,
+        &grant.candidate_ids,
+        &job.request.job_id,
+        &attempt.attempt_id,
+    )
+    .map_err(Error::from)
+}
+
 pub(super) fn validate_result(
     api: &WorkspaceApi,
     request: &BackendJobRequest,
@@ -250,7 +293,7 @@ pub(super) fn validate_result(
     };
     let store =
         crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
-            .map_err(|e| Error::Store(e.to_string()))?;
+            .map_err(subjektiv_store_error)?;
     subjektiv::job::validate_result(
         &store,
         &grant.subject_id,
@@ -277,7 +320,7 @@ pub(super) fn with_dispositions(
         .ok_or_else(|| Error::InvalidInput("missing consolidation grant".into()))?;
     let store =
         crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
-            .map_err(|e| Error::Store(e.to_string()))?;
+            .map_err(subjektiv_store_error)?;
     subjektiv::job::with_dispositions(&store, &grant.subject_id, &grant.candidate_ids, value)
         .map_err(Error::from)
 }

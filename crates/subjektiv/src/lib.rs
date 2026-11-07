@@ -1,11 +1,20 @@
 #![doc = include_str!("../README.md")]
 
 pub mod api;
+pub mod chat;
+pub mod deletion;
+pub mod effect_admission;
 pub mod job;
+pub use deletion::{DeletionSubjectJob, SubjectDeletion};
 pub mod journal;
 mod legacy_migrations;
 pub mod permissions;
+pub use permissions::{
+    CanonicalPermissionSource, DatabaseIdentity, PermissionSourceExport, PermissionTransferReceipt,
+    PermissionTransferSnapshot,
+};
 mod schema;
+mod subject_creation;
 use legacy_migrations::{
     add_candidate_decision_receipts, add_subject_behavior, add_subject_session_attribution,
     add_surface_generation_state, add_surface_job_provenance, create_schema,
@@ -51,7 +60,11 @@ pub enum SubjektivError {
     InvalidRecord(String),
     #[error("subject `{0}` was not found in this Workspace")]
     SubjectNotFound(String),
-    #[error("subject `{0}` is retired")]
+    #[error("Subject creation request `{0}` was reused with different input")]
+    SubjectCreationConflict(String),
+    #[error("Subject deletion request `{0}` conflicts with a saved deletion")]
+    SubjectDeletionConflict(String),
+    #[error("subject `{0}` is legacy-retired")]
     SubjectRetired(String),
     #[error("the selected Worker Profile does not enable subjektiv")]
     ProfileDisabled,
@@ -87,6 +100,10 @@ pub enum SubjektivError {
     SubjectPermissionsConflict(String),
     #[error("permission operation `{0}` was reused with different input")]
     PermissionOperationConflict(String),
+    #[error("legacy permission authority is permanently sealed")]
+    PermissionAuthoritySealed,
+    #[error("permission transfer conflicts with identity, export or retained receipt")]
+    PermissionTransferConflict,
     #[error("authorization denied: {0}")]
     AuthorizationDenied(String),
     #[error("Worker execution grant binding conflicts for `{0}`")]
@@ -146,7 +163,10 @@ impl<'de> Deserialize<'de> for SubjectRole {
 #[serde(rename_all = "snake_case")]
 pub enum SubjectState {
     Active,
-    Retired,
+    /// Saved pre-deletion lifecycle state. The old `retired` spelling remains readable
+    /// and serializable solely to preserve existing data; no retirement operation exists.
+    #[serde(rename = "retired")]
+    LegacyRetired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,10 +664,29 @@ static MIGRATIONS: &[FeatureMigration] = &[
         "bind Journal generation delivery to immutable Job input digest",
         journal::service::migrate_input_delivery,
     ),
+    FeatureMigration::new(
+        14,
+        "add permanent Subject deletion fences and explicit erasure",
+        deletion::migrate,
+    ),
+    FeatureMigration::new(15, "add retained text-only conversations", chat::migrate),
+    FeatureMigration::new(
+        16,
+        "retain replayable Subject creation receipts",
+        subject_creation::migrate,
+    ),
+    FeatureMigration::new(
+        17,
+        "add stable conversation presentation references",
+        chat::migrate_references,
+    ),
 ];
 
+mod storage_formats;
+
 pub const REGISTRATION: FeatureRegistration =
-    FeatureRegistration::new(SUBJEKTIV_FEATURE_ID, MIGRATIONS);
+    FeatureRegistration::new(SUBJEKTIV_FEATURE_ID, MIGRATIONS)
+        .with_history_validation(storage_formats::validate);
 
 /// Subject Memory repository restricted to a Host storage scope.
 /// Owns schemas, validation, queries, and domain transactions; delegates physical layout
@@ -659,6 +698,8 @@ pub const REGISTRATION: FeatureRegistration =
 #[derive(Clone)]
 pub struct SubjektivStore {
     database: FeatureDatabase,
+    canonical_permission_source: Option<std::sync::Arc<dyn permissions::CanonicalPermissionSource>>,
+    effect_authority: Option<std::sync::Arc<dyn effect_admission::SubjectEffectAuthority>>,
 }
 
 impl SubjektivStore {
@@ -716,7 +757,11 @@ impl SubjektivStore {
                 }
             }
         })?;
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            canonical_permission_source: None,
+            effect_authority: None,
+        })
     }
 
     pub fn scope_id(&self) -> &str {
@@ -740,38 +785,28 @@ impl SubjektivStore {
         role: SubjectRole,
         behavior_md: String,
     ) -> Result<SubjectRecord> {
-        validate_subject_behavior(&behavior_md)?;
-        let timestamp = now();
-        let record = SubjectRecord {
-            schema_version: SUBJEKTIV_SCHEMA_VERSION,
-            id: issued_id("subject"),
-            role,
-            behavior_md,
-            state: SubjectState::Active,
-            created_at: timestamp.clone(),
-            updated_at: timestamp,
-        };
-        let raw = serde_json::to_string(&record)?;
-        self.database.try_transaction(|transaction| {
-            transaction.execute(
-                "INSERT INTO subjects (
-                    subject_id, role, behavior_md, state, record_json, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
-                params![
-                    record.id,
-                    record.role.as_str(),
-                    record.behavior_md,
-                    raw,
-                    record.created_at,
-                    record.updated_at
-                ],
-            )?;
-            Ok(record)
-        })
+        self.create_subject_request(role, behavior_md, None)
+    }
+
+    /// Replays the original creation without reissuing permissions or changing the Subject.
+    /// The Host authenticates the administrator before calling. Keep the same operation ID
+    /// and full input after an unknown outcome; different input is a conflict.
+    pub fn create_subject_idempotent(
+        &self,
+        role: SubjectRole,
+        behavior_md: String,
+        operation_id: &str,
+    ) -> Result<SubjectRecord> {
+        server_api::authorization::validate_authorization_identifier(operation_id)
+            .map_err(SubjektivError::InvalidRecord)?;
+        self.create_subject_request(role, behavior_md, Some(operation_id))
     }
 
     pub fn subject(&self, subject_id: &str) -> Result<Option<SubjectRecord>> {
         self.database.try_with_connection(|connection| {
+            if deletion::is_deleting(connection, subject_id)? {
+                return Ok(None);
+            }
             let raw = connection
                 .query_row(
                     "SELECT record_json FROM subjects WHERE subject_id = ?1",
@@ -810,7 +845,7 @@ impl SubjektivStore {
     /// Content/state/provenance changes issue new change IDs, preventing equality even in ABA returns to prior content.
     /// Saves no redundant Subject counter; staging alone does not change this fingerprint.
     pub fn memory_fingerprint(&self, subject_id: &str) -> Result<String> {
-        self.database.try_transaction(|tx| {
+        self.memory_transaction(|tx| {
             require_subject(tx, subject_id)?;
             memory_fingerprint_in_connection(tx, subject_id)
         })
@@ -862,11 +897,13 @@ impl SubjektivStore {
         self.database.try_with_connection(|connection| {
             let sql = if after.is_some() {
                 "SELECT record_json FROM subjects
-                 WHERE created_at > ?1 OR (created_at = ?1 AND subject_id > ?2)
+                 WHERE NOT EXISTS (SELECT 1 FROM subject_deletions d WHERE d.subject_id=subjects.subject_id)
+                   AND (created_at > ?1 OR (created_at = ?1 AND subject_id > ?2))
                  ORDER BY created_at ASC, subject_id ASC
                  LIMIT ?3"
             } else {
                 "SELECT record_json FROM subjects
+                 WHERE NOT EXISTS (SELECT 1 FROM subject_deletions d WHERE d.subject_id=subjects.subject_id)
                  ORDER BY created_at ASC, subject_id ASC
                  LIMIT ?1"
             };
@@ -895,27 +932,6 @@ impl SubjektivStore {
         })
     }
 
-    /// Retires a Subject independently of stopping Workers. Memory/history remain unedited, undeleted, and readable.
-    /// Retirement is irreversible; new candidates and Memory changes require an active Subject.
-    pub fn retire_subject(&self, subject_id: &str) -> Result<SubjectRecord> {
-        self.database.try_transaction(|transaction| {
-            let mut subject = require_subject(transaction, subject_id)?;
-            if subject.state == SubjectState::Retired {
-                return Ok(subject);
-            }
-            subject.state = SubjectState::Retired;
-            subject.updated_at = now();
-            let raw = serde_json::to_string(&subject)?;
-            transaction.execute(
-                "UPDATE subjects
-                 SET state = 'retired', record_json = ?2, updated_at = ?3
-                 WHERE subject_id = ?1",
-                params![subject_id, raw, subject.updated_at],
-            )?;
-            Ok(subject)
-        })
-    }
-
     /// Saves an immutable candidate without changing committed Memory.
     /// Replay with the same candidate identity and payload returns the original record; different content conflicts.
     /// Extraction failure after saving never revokes the candidate. The Host commits the extraction pointer separately.
@@ -923,7 +939,7 @@ impl SubjektivStore {
         validate_staging_record(self.workspace_id(), &record)?;
         validate_staging_admission(&record)?;
         let raw = serde_json::to_string(&record)?;
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             require_active_subject(transaction, &record.subject_id)?;
             write_staging_candidate(transaction, self.workspace_id(), record, raw)
         })
@@ -951,7 +967,7 @@ impl SubjektivStore {
         validate_staging_admission(&record)?;
         let candidate_raw = serde_json::to_string(&record)?;
 
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             require_active_subject(transaction, &record.subject_id)?;
             let existing_raw = transaction
                 .query_row(
@@ -991,7 +1007,7 @@ impl SubjektivStore {
     ) -> Result<SubjectSessionAttribution> {
         validate_session_attribution(&attribution)?;
         let raw = serde_json::to_string(&attribution)?;
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             require_active_subject(transaction, &attribution.subject_id)?;
             write_session_attribution(transaction, attribution, raw)
         })
@@ -1003,6 +1019,10 @@ impl SubjektivStore {
     ) -> Result<Option<SubjectSessionAttribution>> {
         validate_label("session id", session_id)?;
         self.database.try_with_connection(|connection| {
+            if let Some(subject) = deletion::deleted_session_subject(connection, session_id)? {
+                return Err(SubjektivError::SubjectNotFound(subject));
+            }
+
             let raw = connection
                 .query_row(
                     "SELECT record_json FROM subject_session_attributions
@@ -1011,7 +1031,12 @@ impl SubjektivStore {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?;
-            raw.map(|raw| parse_session_attribution(&raw)).transpose()
+            raw.map(|raw| {
+                let record = parse_session_attribution(&raw)?;
+                deletion::require_not_deleting(connection, &record.subject_id)?;
+                Ok(record)
+            })
+            .transpose()
         })
     }
 
@@ -1021,6 +1046,7 @@ impl SubjektivStore {
     ) -> Result<Vec<SubjectSessionAttribution>> {
         validate_label("subject id", subject_id)?;
         self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
             let mut statement = connection.prepare(
                 "SELECT record_json FROM subject_session_attributions
                  WHERE subject_id = ?1
@@ -1062,6 +1088,7 @@ impl SubjektivStore {
         }
         let query_limit = limit.saturating_add(1);
         self.database.try_with_connection(|connection| {
+            require_subject_in_connection(connection, subject_id)?;
             let raw = match (session_id, after) {
                 (Some(session_id), _) => {
                     let mut statement = connection.prepare(
@@ -1127,7 +1154,8 @@ impl SubjektivStore {
         subject_id: &str,
         candidate_id: &str,
     ) -> Result<Option<SubjectStagingRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
+            deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
                     "SELECT record_json FROM staging_records
@@ -1146,7 +1174,7 @@ impl SubjektivStore {
         subject_id: &str,
         limit: usize,
     ) -> Result<Vec<SubjectStagingRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let mut statement = connection.prepare(
                 "SELECT s.record_json
@@ -1169,7 +1197,7 @@ impl SubjektivStore {
     }
 
     pub fn pending_staging_backlog(&self, subject_id: &str) -> Result<(usize, u64)> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let (count, bytes) = connection.query_row(
                 "SELECT COUNT(*), COALESCE(SUM(LENGTH(s.record_json)), 0)
@@ -1291,7 +1319,8 @@ impl SubjektivStore {
         validate_label("candidate id", &request.candidate_id)?;
         validate_nonempty("resolution reason", &request.reason)?;
         let request_raw = serde_json::to_string(&request)?;
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
+            deletion::require_not_deleting(transaction, subject_id)?;
             if let Some((stored_request, stored_receipt)) = transaction
                 .query_row(
                     "SELECT request_json, receipt_json
@@ -1425,7 +1454,8 @@ impl SubjektivStore {
         subject_id: &str,
         candidate_id: &str,
     ) -> Result<Option<StagingResolution>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
+            deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
                     "SELECT resolution_json FROM staging_resolutions
@@ -1439,7 +1469,8 @@ impl SubjektivStore {
     }
 
     pub fn memory(&self, subject_id: &str, memory_id: &str) -> Result<Option<MemoryRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
+            deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
                     "SELECT record_json FROM memory_records
@@ -1458,7 +1489,8 @@ impl SubjektivStore {
         memory_id: &str,
         change_id: String,
     ) -> Result<Option<MemoryRecord>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
+            deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
                     "SELECT record_json FROM memory_changes
@@ -1476,7 +1508,7 @@ impl SubjektivStore {
     pub fn scoped_memory(&self, subject_id: &str, memory_id: &str) -> Result<MemoryRecord> {
         validate_label("subject id", subject_id)?;
         validate_label("Memory id", memory_id)?;
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             scoped_memory_in_connection(connection, subject_id, memory_id)
         })
@@ -1498,7 +1530,7 @@ impl SubjektivStore {
                 "Memory change must be a nonempty change identity".into(),
             ));
         }
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             scoped_memory_in_connection(connection, subject_id, memory_id)?;
             let raw = connection
@@ -1517,7 +1549,7 @@ impl SubjektivStore {
     /// most-recently-updated order.
     pub fn list_memories(&self, subject_id: &str) -> Result<Vec<MemoryRecord>> {
         validate_label("subject id", subject_id)?;
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let mut statement = connection.prepare(
                 "SELECT record_json FROM memory_records
@@ -1540,7 +1572,7 @@ impl SubjektivStore {
         subject_id: &str,
         memory_id: &str,
     ) -> Result<Vec<MemoryRecord>> {
-        self.database.try_transaction(|tx| {
+        self.memory_transaction(|tx| {
             require_subject(tx, subject_id)?;
             let mut record = scoped_memory_in_connection(tx, subject_id, memory_id)?;
             let mut seen = HashSet::new();
@@ -1575,7 +1607,7 @@ impl SubjektivStore {
         subject_id: &str,
         job_attempt: Option<(&str, &str)>,
     ) -> Result<SurfaceGeneration> {
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             require_active_subject(transaction, subject_id)?;
             let memory_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
             let (active_memory_count, materials) =
@@ -1623,7 +1655,7 @@ impl SubjektivStore {
         job_id: &str,
         attempt_id: &str,
     ) -> Result<()> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
             let current_fingerprint = memory_fingerprint_in_connection(connection, subject_id)?;
             let generation_change = require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
@@ -1651,7 +1683,7 @@ impl SubjektivStore {
         job_id: &str,
         attempt_id: &str,
     ) -> Result<()> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             require_job_generation(connection, subject_id, generation_id, job_id, attempt_id)?;
             Ok(())
         })
@@ -1668,7 +1700,7 @@ impl SubjektivStore {
         points: Vec<SurfacePoint>,
     ) -> Result<SurfaceSnapshot> {
         validate_label("surface generation id", generation_id)?;
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             require_active_subject(transaction, subject_id)?;
             let current_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
             let (memory_fingerprint, active_memory_count, materials_json) = transaction
@@ -1739,7 +1771,7 @@ impl SubjektivStore {
     ) -> Result<String> {
         validate_label("surface generation id", generation_id)?;
         validate_label("surface failure reason", reason_code)?;
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             require_active_subject(transaction, subject_id)?;
             let memory_fingerprint = memory_fingerprint_in_connection(transaction, subject_id)?;
             let generation_change = transaction
@@ -1786,7 +1818,7 @@ impl SubjektivStore {
     /// Ready with an empty body is a normal empty result, distinct from ungenerated/stale/failed.
     /// Returns availability separately so an absent injected body implies neither absent committed Memory nor successful generation.
     pub fn resident_surface(&self, subject_id: &str) -> Result<ResidentSurface> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
             let subject = require_subject_in_connection(connection, subject_id)?;
             resident_surface_in_connection(connection, &subject)
         })
@@ -1794,7 +1826,7 @@ impl SubjektivStore {
 
     /// Returns independent behavior and the generated Memory surface as observations from the same SQLite transaction.
     pub fn resident_context(&self, subject_id: &str) -> Result<SubjectResidentContext> {
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             let subject = require_subject(transaction, subject_id)?;
             let surface = resident_surface_in_connection(transaction, &subject)?;
             Ok(SubjectResidentContext { subject, surface })
@@ -1853,7 +1885,8 @@ impl SubjektivStore {
         subject_id: &str,
         snapshot_id: &str,
     ) -> Result<Option<SurfaceSnapshot>> {
-        self.database.try_with_connection(|connection| {
+        self.memory_connection(|connection| {
+            deletion::require_not_deleting(connection, subject_id)?;
             let raw = connection
                 .query_row(
                     "SELECT snapshot_json FROM surface_snapshots
@@ -2427,6 +2460,11 @@ fn write_session_attribution(
     record: SubjectSessionAttribution,
     raw: String,
 ) -> Result<SubjectSessionAttribution> {
+    deletion::require_live_worker(transaction, &record.runtime_id, &record.worker_id)?;
+    if let Some(subject) = deletion::deleted_session_subject(transaction, &record.session_id)? {
+        return Err(SubjektivError::SubjectNotFound(subject));
+    }
+
     let existing = transaction
         .query_row(
             "SELECT record_json FROM subject_session_attributions WHERE session_id = ?1",
@@ -2621,6 +2659,7 @@ fn require_subject_in_connection(
     connection: &rusqlite::Connection,
     subject_id: &str,
 ) -> Result<SubjectRecord> {
+    deletion::require_not_deleting(connection, subject_id)?;
     let raw = connection
         .query_row(
             "SELECT record_json FROM subjects WHERE subject_id = ?1",
@@ -2632,12 +2671,9 @@ fn require_subject_in_connection(
     parse_subject(&raw)
 }
 
-fn require_active_subject(
-    transaction: &Transaction<'_>,
-    subject_id: &str,
-) -> Result<SubjectRecord> {
-    let subject = require_subject(transaction, subject_id)?;
-    if subject.state == SubjectState::Retired {
+fn require_active_subject(transaction: &Connection, subject_id: &str) -> Result<SubjectRecord> {
+    let subject = require_subject_in_connection(transaction, subject_id)?;
+    if subject.state == SubjectState::LegacyRetired {
         return Err(SubjektivError::SubjectRetired(subject_id.to_string()));
     }
     Ok(subject)
@@ -3278,6 +3314,7 @@ fn require_job_generation(
     job_id: &str,
     attempt_id: &str,
 ) -> Result<String> {
+    deletion::require_not_deleting(connection, subject_id)?;
     let change_id: Option<String> = connection.query_row(
         "SELECT memory_fingerprint FROM surface_generation_runs WHERE subject_id = ?1 AND generation_id = ?2 AND job_id = ?3 AND attempt_id = ?4",
         params![subject_id, generation_id, job_id, attempt_id], |row| row.get(0),
@@ -3369,6 +3406,21 @@ mod tests {
 
     use super::*;
     use feature_storage::FeatureStorage;
+
+    /// Builds saved pre-deletion lifecycle data; not a current product operation.
+    pub(crate) fn legacy_retired_fixture(
+        store: &SubjektivStore,
+        subject_id: &str,
+    ) -> Result<SubjectRecord> {
+        store.database.try_transaction(|tx| {
+            let mut subject = require_subject(tx, subject_id)?;
+            subject.state = SubjectState::LegacyRetired;
+            subject.updated_at = now();
+            tx.execute("UPDATE subjects SET state='retired',record_json=?2,updated_at=?3 WHERE subject_id=?1",
+                params![subject_id,serde_json::to_string(&subject)?,subject.updated_at])?;
+            Ok(subject)
+        })
+    }
 
     pub(super) fn role() -> SubjectRole {
         SubjectRole::new("workspace_companion").unwrap()
@@ -5047,8 +5099,8 @@ mod tests {
             Err(SubjektivError::InvalidStateTransition { .. })
         ));
 
-        let retired = store.retire_subject(&subject.id).unwrap();
-        assert_eq!(retired.state, SubjectState::Retired);
+        let retired = crate::tests::legacy_retired_fixture(&store, &subject.id).unwrap();
+        assert_eq!(retired.state, SubjectState::LegacyRetired);
         assert!(matches!(
             store.create_memory(&subject.id, draft("after retirement", "invalid")),
             Err(SubjektivError::SubjectRetired(_))
@@ -5586,10 +5638,11 @@ mod tests {
             )
             .unwrap();
         assert!(second.previous_change_id.is_some());
-        workspace.delete().unwrap();
         drop(reopened);
         drop(workspace);
         drop(manager);
+        // Simulated physical loss retains owner receipts, unlike explicit erasure.
+        std::fs::remove_dir_all(root.join("workspace-a")).unwrap();
 
         let manager = FeatureStorage::new(&root);
         let workspace = manager.workspace("workspace-a").unwrap();

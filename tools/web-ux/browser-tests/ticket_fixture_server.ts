@@ -371,6 +371,7 @@ function projectedTicket(key: string, workspaceId: string) {
     value.events = value.events.map((post) => ({ ...post, editable: false }));
     value.action_eligibility = {
       blockers: ["Read-only fixture"],
+      can_set_parent: false,
       can_assign_orchestrator: false,
       can_unassign_orchestrator: false,
       can_start_manual_worker: false,
@@ -427,6 +428,12 @@ function workerSummary(workerId: string, state: string) {
 Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
   const url = new URL(request.url);
   if (url.pathname === "/health") return new Response("ok");
+  if (url.pathname === "/api/auth/whoami") return Response.json({
+    authentication_reference: "fixture-authentication",
+    session: { kind: "authenticated", expires_at: "2099-01-01T00:00:00Z" },
+    actor: { user_id: "fixture-user", account_id: "fixture-owner", handle: "alice", display_name: "Alice", auth_method: "browser_session" },
+  });
+  if (url.pathname === "/api/hosting/access") return Response.json({ is_admin: false });
   if (url.pathname === "/fixture-state") return Response.json(bodies);
   if (url.pathname === "/fixture-snapshot") {
     return Response.json({
@@ -482,6 +489,7 @@ Deno.serve({ hostname: "127.0.0.1", port }, async (request) => {
           manage_secrets: false,
           manage_runtimes: false,
           delete_workspace: false,
+          delete_subjects: false,
         },
         extension_points: {
           store: "fixture",

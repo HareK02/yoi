@@ -7,6 +7,7 @@
   import { workspaceRoute } from '#lib/workspace/api/http.ts';
   import { ownsRoutePath } from './route-ownership';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
+  import SubjectsNavSection from './SubjectsNavSection.svelte';
   import MemoryNavSection from './MemoryNavSection.svelte';
   import MergeRequestsNavSection from './MergeRequestsNavSection.svelte';
   import TicketsNavSection from './TicketsNavSection.svelte';
@@ -85,6 +86,7 @@
       <ObjectivesNavSection {currentPath} {workspaceId} />
       <MergeRequestsNavSection {currentPath} {workspaceId} />
       <DriveNavSection {currentPath} {workspaceId} />
+      <SubjectsNavSection {currentPath} {workspaceId} />
       <MemoryNavSection {currentPath} {workspaceId} />
       <WorkersNavSection {currentPath} {workspaceId} />
     </nav>

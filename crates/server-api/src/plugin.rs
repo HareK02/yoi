@@ -1,0 +1,477 @@
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginInstallRequest {
+    pub upload_id: String,
+    pub alias: String,
+    pub operation_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginAddArtifactRequest {
+    pub upload_id: String,
+    pub expected_last_operation: String,
+    pub operation_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginRevokeRequest {
+    pub artifact_digest: String,
+    pub expected_last_operation: String,
+    pub reason: String,
+    pub operation_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginUninstallRequest {
+    pub expected_last_operation: String,
+    pub operation_key: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginListRequest {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginSchemaContribution {
+    pub identity: String,
+    pub version: String,
+    pub digest: String,
+    pub namespace: String,
+    pub dcdl: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginToolMetadata {
+    pub name: String,
+    pub description: String,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub input_schema: serde_json::Value,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub output_schema: serde_json::Value,
+    pub error_codes: Vec<String>,
+    pub external_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PluginHttpMethod {
+    Get,
+    Head,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Options,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginConnectionMetadata {
+    pub name: String,
+    pub methods: Vec<PluginHttpMethod>,
+    pub path_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginGrantMetadata {
+    Logging,
+    Https {
+        slot: String,
+    },
+    TicketRead,
+    TicketEvents,
+    TicketDataRead {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
+    TicketDataWrite {
+        collection: String,
+        schema_id: String,
+        schema_version: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataSchemaMetadata {
+    pub collection: String,
+    pub schema_id: String,
+    pub schema_version: String,
+    #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
+    pub schema: serde_json::Value,
+}
+
+/// Exact artifact subscription declarations; selection and current permission are separate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceMetadata {
+    pub name: String,
+    pub subscriptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginArtifact {
+    pub package_id: String,
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub package_digest: String,
+    pub artifact_digest: String,
+    pub artifact_size: u32,
+    pub schema_version: u32,
+    pub world: String,
+    pub required_imports: Vec<String>,
+    pub tools: Vec<PluginToolMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<PluginServiceMetadata>,
+    pub connections: Vec<PluginConnectionMetadata>,
+    pub requested_grants: Vec<PluginGrantMetadata>,
+    #[serde(default)]
+    pub data_collections: Vec<PluginDataSchemaMetadata>,
+    pub config_schema: PluginSchemaContribution,
+    pub revoked: bool,
+    pub revocation_reason: Option<String>,
+}
+
+impl plugin_plan::ArtifactDescriptor for PluginArtifact {
+    fn artifact_identity(&self) -> plugin_plan::ArtifactIdentityProjection {
+        plugin_plan::ArtifactIdentityProjection {
+            package_id: self.package_id.clone(),
+            version: self.version.clone(),
+            package_digest: self.package_digest.clone(),
+            artifact_digest: self.artifact_digest.clone(),
+            artifact_size: self.artifact_size,
+            schema_version: self.schema_version,
+            world: self.world.clone(),
+            required_imports: self.required_imports.clone(),
+            tools: self.tools.iter().map(|tool| tool.name.clone()).collect(),
+            services: self
+                .services
+                .iter()
+                .map(|service| service.name.clone())
+                .collect(),
+            connections: self
+                .connections
+                .iter()
+                .map(|slot| slot.name.clone())
+                .collect(),
+            requested_grants: self
+                .requested_grants
+                .iter()
+                .map(|grant| match grant {
+                    PluginGrantMetadata::Logging => plugin_plan::PluginGrant::Logging,
+                    PluginGrantMetadata::Https { slot } => {
+                        plugin_plan::PluginGrant::Https { slot: slot.clone() }
+                    }
+                    PluginGrantMetadata::TicketRead => plugin_plan::PluginGrant::TicketRead,
+                    PluginGrantMetadata::TicketEvents => plugin_plan::PluginGrant::TicketEvents,
+                    PluginGrantMetadata::TicketDataRead {
+                        collection,
+                        schema_id,
+                        schema_version,
+                    } => plugin_plan::PluginGrant::TicketDataRead {
+                        collection: collection.clone(),
+                        schema_id: schema_id.clone(),
+                        schema_version: schema_version.clone(),
+                    },
+                    PluginGrantMetadata::TicketDataWrite {
+                        collection,
+                        schema_id,
+                        schema_version,
+                    } => plugin_plan::PluginGrant::TicketDataWrite {
+                        collection: collection.clone(),
+                        schema_id: schema_id.clone(),
+                        schema_version: schema_version.clone(),
+                    },
+                })
+                .collect(),
+            config_schema: plugin_plan::PluginSchemaIdentity {
+                identity: self.config_schema.identity.clone(),
+                version: self.config_schema.version.clone(),
+                digest: self.config_schema.digest.clone(),
+                namespace: self.config_schema.namespace.clone(),
+            },
+            revoked: self.revoked,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataPurgeState {
+    pub installation_last_operation: String,
+    pub cells_digest: String,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    #[cfg_attr(feature = "typescript", ts(type = "number"))]
+    pub cell_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataPurgeRequest {
+    pub operation_key: String,
+    pub expected: PluginDataPurgeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDataPurgeResponse {
+    pub purge_id: String,
+    pub observed: PluginDataPurgeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginUploadResponse {
+    pub upload_id: String,
+    pub expires_at: String,
+    pub artifact: PluginArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginInstallation {
+    pub installation_id: String,
+    pub alias: String,
+    pub package_id: String,
+    pub last_operation: String,
+    pub uninstalled: bool,
+    pub artifacts: Vec<PluginArtifact>,
+}
+
+/// Catalog pages omit artifact/schema payloads so the item bound also bounds
+/// response work. Exact immutable metadata is available from installation show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginInstallationSummary {
+    pub installation_id: String,
+    pub alias: String,
+    pub package_id: String,
+    pub last_operation: String,
+    pub uninstalled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginListResponse {
+    pub installations: Vec<PluginInstallationSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PluginOperationKind {
+    Install,
+    AddArtifact,
+    Revoke,
+    Uninstall,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginOperationResponse {
+    pub operation_id: String,
+    pub kind: PluginOperationKind,
+    pub installation: PluginInstallation,
+}
+
+/// Point-in-time owner observation only, never a permission or execution lease.
+/// Deliberately excludes configuration, credentials and artifact locations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkerDiagnostics {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub runtime_limits: PluginRuntimeLimits,
+    pub selection: PluginWorkerDiagnosticSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginWorkerDiagnosticSelection {
+    /// No sealed launch selection exists; do not infer current Profile selection.
+    Unrecorded,
+    /// The owner sealed an explicitly empty selection (a NULL plan).
+    Empty,
+    Plan {
+        plan_id: String,
+        fingerprint: String,
+        pin_state: PluginDiagnosticPinState,
+        plugins: Vec<PluginWorkerDiagnostic>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PluginDiagnosticPinState {
+    Pending,
+    Active,
+    Restorable,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum PluginDiagnosticSurface {
+    Tool,
+    Service,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginWorkerDiagnostic {
+    pub installation_id: String,
+    pub package_id: String,
+    pub package_version: String,
+    pub package_digest: String,
+    pub artifact_digest: String,
+    pub artifact_size: u32,
+    pub surfaces: Vec<PluginDiagnosticSurface>,
+    pub selected_tools: Vec<String>,
+    pub selected_services: Vec<String>,
+    pub service_consumers: Vec<PluginServiceConsumerDiagnostics>,
+    pub admission: PluginDiagnosticAdmission,
+    pub connections: Vec<PluginDiagnosticConnection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceConsumerDiagnostics {
+    pub service_name: String,
+    pub diagnostics: crate::PluginServiceDiagnostics,
+}
+
+/// A successful observation is not retained admission authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginDiagnosticAdmission {
+    Admissible,
+    Refused {
+        reason_code: crate::PluginHostErrorCode,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginDiagnosticConnection {
+    pub slot: String,
+    pub effective_limits: PluginDiagnosticConnectionLimits,
+}
+
+/// Limits are absent when the current binding cannot be admitted; never fall
+/// back to a launch-time policy or a permissive default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginDiagnosticConnectionLimits {
+    Available {
+        timeout_ms: u32,
+        max_request_bytes: u32,
+        max_response_bytes: u32,
+        max_header_bytes: u32,
+    },
+    Unavailable {
+        reason_code: crate::PluginHostErrorCode,
+    },
+}
+
+/// Fixed Tool Runtime budgets, not usage counters or caller-selectable limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginRuntimeLimits {
+    pub payload_bytes: u32,
+    pub config_bytes: u32,
+    pub memory_bytes: u32,
+    pub table_elements: u32,
+    pub instances: u32,
+    pub memories: u32,
+    pub tables: u32,
+    pub resources: u32,
+    pub fuel: u32,
+    pub wall_time_ms: u32,
+    pub host_operations: u32,
+    pub http_body_bytes: u32,
+    pub http_header_bytes: u32,
+    pub http_header_pairs: u32,
+    pub log_bytes: u32,
+}
+
+/// Namespace a byte cache by the authenticated Server origin and signing key.
+/// This is not a package hash or an authorization decision. Hosts derive the
+/// bundle from their current registered authority, never from a delivery reply.
+pub fn plugin_server_authority_identity(bundle: &crate::WorkspacePublicIdentityBundle) -> String {
+    serde_json::to_string(&(
+        bundle.backend_url.trim_end_matches('/'),
+        &bundle.public_key_fingerprint,
+    ))
+    .expect("string tuple is serializable")
+}
+
+/// A selection within a persisted plan, never digest-only retrieval authority.
+/// Workspace and Worker identities come from authenticated Host context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginArtifactDeliveryRequest {
+    pub plan_id: String,
+    pub plan_fingerprint: String,
+    pub installation_id: String,
+    pub artifact_digest: String,
+}
+
+/// Fresh owner observation for one exact selection. Cache only bytes, not this
+/// observation or the Workspace's configuration, grants or installation state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct PluginArtifactDeliveryMetadata {
+    pub workspace_id: String,
+    pub request: PluginArtifactDeliveryRequest,
+    pub artifact: PluginArtifact,
+}

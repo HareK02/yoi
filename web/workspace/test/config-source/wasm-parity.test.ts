@@ -985,3 +985,61 @@ Deno.test("generated WASM rejects forged content identity at the snapshot bounda
     assertThrows(() => set_snapshot(forged));
   }
 });
+
+Deno.test("Plugin closed preflight shares native projection and diagnostic fixture without catalog authority", async () => {
+  const fixture = JSON.parse(
+    await Deno.readTextFile(
+      new URL(
+        "../../../../resources/config-schema/fixtures/plugin-preflight.json",
+        import.meta.url,
+      ),
+    ),
+  ) as {
+    schema: string;
+    cases: Array<{ source: string; mode?: string; diagnostic?: string }>;
+  };
+  const bundle = compose_schema_bundle([{
+    provider_id: "plugin-preflight",
+    namespace: "plugins",
+    version: "1",
+    source: fixture.schema,
+    source_digest: await digestText(fixture.schema),
+  }]) as WorkspaceConfigSchemaBundle;
+  const contract: ToolchainContract = {
+    contract_version: 2,
+    decodal_version: "0.4.0",
+    schema_version: 1,
+    entrypoints: ["main.dcdl"],
+    import_policy_version: 1,
+    schema_bundle: bundle,
+    fingerprint: await toolchainFingerprint(["main.dcdl"], bundle),
+  };
+  for (const testCase of fixture.cases) {
+    const candidate = fixtureSnapshot(schemaSnapshot(testCase.source));
+    if (testCase.diagnostic) {
+      let failure: ProjectedDiagnostic[] = [];
+      try {
+        evaluate_snapshot(candidate, contract);
+      } catch (error) {
+        failure = error as ProjectedDiagnostic[];
+      }
+      assertEquals(Array.isArray(failure), true);
+      assertEquals(failure[0].kind, testCase.diagnostic);
+      assertEquals(failure[0].path, "main.dcdl");
+    } else {
+      const result = evaluate_snapshot(candidate, contract) as {
+        projections: Array<
+          {
+            data_json: {
+              plugins: { enabled: { echo: { config: { mode: string } } } };
+            };
+          }
+        >;
+      };
+      assertEquals(
+        result.projections[0].data_json.plugins.enabled.echo.config.mode,
+        testCase.mode,
+      );
+    }
+  }
+});
