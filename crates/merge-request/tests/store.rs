@@ -65,6 +65,77 @@ fn fixture() -> (tempfile::TempDir, MergeRequestStore) {
     let s = MergeRequestStore::open(&p, Arc::new(a), Arc::new(Repositories)).unwrap();
     (d, s)
 }
+#[test]
+fn concurrent_open_serializes_the_conflict_snapshot_instead_of_upgrading_read_locks() {
+    struct SynchronizedAssignments(Arc<std::sync::Barrier>);
+    impl AssignmentSource for SynchronizedAssignments {
+        fn current_assignment(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<CurrentAssignment>, String> {
+            self.0.wait();
+            Ok(Some(CurrentAssignment {
+                assignment_id: "A".into(),
+                ticket_id: "T".into(),
+                runtime_id: "runtime".into(),
+                worker_id: "coder".into(),
+            }))
+        }
+    }
+    // Independent connections share a file, like MR and Subject history writers.
+    // Admission synchronizes the callers before either acquires the transaction.
+    for _ in 0..20 {
+        let (dir, _fixture) = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let stores: Vec<_> = (0..2)
+            .map(|_| {
+                MergeRequestStore::open(
+                    dir.path().join("db"),
+                    Arc::new(SynchronizedAssignments(barrier.clone())),
+                    Arc::new(Repositories),
+                )
+                .unwrap()
+            })
+            .collect();
+        let threads: Vec<_> = stores
+            .into_iter()
+            .enumerate()
+            .map(|(index, store)| {
+                std::thread::spawn(move || {
+                    store.open_merge_request(OpenMergeRequest {
+                        merge_request_id: format!("MR-{index}"),
+                        ticket_id: "T".into(),
+                        repository_id: "R".into(),
+                        selector_from: format!("work/{index}"),
+                        selector_to: "main".into(),
+                        summary: String::new(),
+                        auth: auth(),
+                        now: at(0),
+                    })
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(MergeRequestError::Conflict(_))))
+                .count(),
+            1,
+            "{results:?}"
+        );
+    }
+}
+
 /// Frozen v12 fixture: counters must never be promoted to content attestations.
 fn freeze_v12_review_payloads(connection: &Connection) {
     let rows = {

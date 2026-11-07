@@ -718,7 +718,10 @@ impl MergeRequestStore {
         let merge_request_id = i.merge_request_id.clone();
         self.assigned(&i.auth, &i.ticket_id, &i.repository_id)?;
         let mut c = self.lock()?;
-        let t = c.transaction()?;
+        // Acquire the writer before reading the open-MR conflict snapshot. A
+        // deferred read-to-write upgrade can fail immediately with SQLITE_BUSY
+        // while normal Subject history/Job writers use the same database.
+        let t = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let conflict:bool=t.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations rel JOIN merge_requests mr ON mr.workspace_id=rel.workspace_id AND mr.merge_request_id=rel.merge_request_id WHERE rel.workspace_id=?1 AND rel.ticket_id=?2 AND mr.repository_id=?3 AND mr.state='open')",params![i.auth.workspace_id,i.ticket_id,i.repository_id],|r|r.get(0))?;
         if conflict {
             return Err(MergeRequestError::Conflict(
