@@ -27,10 +27,19 @@ enum Change {
     AbaSameTrust,
 }
 
-async fn bounded<T>(future: impl Future<Output = T>) -> T {
-    tokio::time::timeout(WAIT, future)
-        .await
-        .expect("signed Embedded Session event/request deadline")
+#[track_caller]
+fn bounded<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
+    let caller = std::panic::Location::caller();
+    async move {
+        eprintln!("signed Embedded Session waiting at {caller}");
+        let value = tokio::time::timeout(WAIT, future)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("signed Embedded Session event/request deadline at {caller}")
+            });
+        eprintln!("signed Embedded Session completed at {caller}");
+        value
+    }
 }
 
 struct HeldReturn {
