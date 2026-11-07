@@ -1186,9 +1186,26 @@ impl MergeRequestStore {
     /// Rechecks assignments, Ticket content/state, and valid approval before commit.
     /// Replay with the same operation ID and all inputs returns the same result; reuse with different inputs is rejected.
     pub fn complete(&self, i: CompleteMergeRequest) -> Result<MergeEvent, MergeRequestError> {
+        self.complete_with_admission(i, |_| Ok(()))
+    }
+
+    /// Host authority is checked before receipt validation and again under the
+    /// IMMEDIATE commit transaction, including exact replay. Admission must use
+    /// the supplied connection and must not reenter this store or call providers.
+    pub fn complete_with_admission(
+        &self,
+        i: CompleteMergeRequest,
+        admit: impl Fn(&Connection) -> Result<(), MergeRequestError>,
+    ) -> Result<MergeEvent, MergeRequestError> {
+        {
+            let connection = self.lock()?;
+            admit(&connection)?;
+        }
         self.validate_completion(&i)?;
         let mut connection = self.lock()?;
-        let transaction = connection.transaction()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        admit(&transaction)?;
         let mr = load_mr(&transaction, &i.auth.workspace_id, &i.merge_request_id)?
             .filter(|mr| mr.ticket_ids.iter().any(|id| id == &i.ticket_id))
             .ok_or(MergeRequestError::NotFound)?;

@@ -86,14 +86,29 @@ where
         }
     }
 
-    /// Inject a process-owned model client. This is primarily useful for
-    /// embedded hosts and deterministic tests that must not start an external
-    /// model server.
+    /// Inject a process-owned model client for this Worker only. This is primarily
+    /// useful for embedded hosts and deterministic tests that must not start an
+    /// external model server. Internal descendants remain Profile-selected unless
+    /// `with_internal_model_client` is also supplied.
     pub fn with_model_client<C>(mut self, model_client: C) -> Self
     where
         C: LlmClient + 'static,
     {
         self.model_client = Some(Box::new(model_client));
+        self
+    }
+
+    /// Explicitly supply the model boundary for Internal descendants. Unlike
+    /// `with_model_client`, this does not select the root Worker's model. Without
+    /// this supply each child builds its own client from its selected Profile.
+    /// This process-local value carries no Workspace authority or reviewer grants.
+    pub fn with_internal_model_client<C>(mut self, model_client: C) -> Self
+    where
+        C: LlmClient + 'static,
+    {
+        self.workspace_context = self
+            .workspace_context
+            .with_internal_model_client(Box::new(model_client));
         self
     }
 
@@ -528,5 +543,79 @@ where
         self.streams = None;
         self.initialized = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::internal_worker::EphemeralSessionStore;
+    use agen::llm_client::client::ResponseStream;
+    use agen::llm_client::{ClientError, Request};
+    use async_trait::async_trait;
+
+    #[derive(Clone)]
+    struct UnusedModelClient;
+
+    #[async_trait]
+    impl LlmClient for UnusedModelClient {
+        async fn stream(&self, _: Request) -> Result<ResponseStream, ClientError> {
+            panic!("model selection tests must not send requests")
+        }
+
+        fn clone_boxed(&self) -> Box<dyn LlmClient> {
+            Box::new(self.clone())
+        }
+    }
+
+    fn bootstrap() -> WorkerBootstrap<EphemeralSessionStore> {
+        let mut config = manifest::WorkerManifestConfig::resolution_defaults();
+        config.worker.name = Some("model-supply-test".into());
+        config.model.model_id = Some("profile-model".into());
+        WorkerBootstrap::new(
+            config.try_into().unwrap(),
+            EphemeralSessionStore::default(),
+            PromptCatalogSource::builtins_only(),
+            WorkerWorkspaceContext::no_workspace(),
+            WorkerFilesystemAuthority::None,
+            WorkerBootstrapLayout::Direct {
+                runtime_base: PathBuf::from("unused-runtime"),
+            },
+        )
+    }
+
+    #[test]
+    fn root_model_injection_does_not_implicitly_override_internal_profiles() {
+        let bootstrap = bootstrap();
+        assert!(
+            bootstrap
+                .workspace_context
+                .internal_model_client()
+                .is_none()
+        );
+        let bootstrap = bootstrap.with_model_client(UnusedModelClient);
+        assert!(bootstrap.model_client.is_some());
+        assert!(
+            bootstrap
+                .workspace_context
+                .internal_model_client()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_internal_model_supply_is_cloned_without_changing_workspace_authority() {
+        let bootstrap = bootstrap();
+        let workspace_client = bootstrap.workspace_context.client_handle();
+        let bootstrap = bootstrap.with_internal_model_client(UnusedModelClient);
+        assert!(bootstrap.model_client.is_none());
+        let context = bootstrap.workspace_context.clone();
+        assert!(context.internal_model_client().is_some());
+        assert!(std::sync::Arc::ptr_eq(
+            &workspace_client,
+            &context.client_handle(),
+        ));
+        assert!(context.workspace_id().is_none());
+        assert!(!context.client().is_available());
     }
 }

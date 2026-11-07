@@ -27,6 +27,8 @@ mod subject_body_connected;
 mod subject_body_tests;
 #[path = "subject_job_model_supply_tests.rs"]
 mod subject_job_model_supply;
+#[path = "subject_mr_completion_admission_tests.rs"]
+mod subject_mr_completion_admission;
 #[path = "subject_permission_management_tests.rs"]
 mod subject_permission_management;
 #[path = "subject_ticket_migration_connected_tests.rs"]

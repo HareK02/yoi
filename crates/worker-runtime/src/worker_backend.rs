@@ -158,6 +158,7 @@ use workdir::{
     WorkdirSessionHandle, WorkdirSessionRouter,
 };
 
+use worker::Worker;
 use worker::feature::builtin::manage_workdir::WorkspaceAttachedWorkdirSession;
 use worker::feature::contracts::{
     WorkerObservationError, WorkerObservationProvider, WorkerObservationSubject,
@@ -166,10 +167,9 @@ use worker::feature::contracts::{
 #[cfg(feature = "ws-server")]
 use worker::ipc::protocol_session::{WorkerProtocolSessionStreams, live_log_entry_event};
 use worker::{
-    PromptCatalogSource, SegmentLogSink, SubjektivSessionAttributionLifecycle, Worker,
-    WorkerBootstrap, WorkerBootstrapError, WorkerBootstrapLayout, WorkerError,
-    WorkerFilesystemAuthority, WorkerHandle, WorkerSharedState, WorkerWorkspaceContext,
-    WorkspaceClient, WorkspaceId,
+    PromptCatalogSource, SegmentLogSink, SubjektivSessionAttributionLifecycle, WorkerBootstrap,
+    WorkerBootstrapError, WorkerBootstrapLayout, WorkerError, WorkerFilesystemAuthority,
+    WorkerHandle, WorkerSharedState, WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 #[cfg(feature = "ws-server")]
@@ -1184,9 +1184,10 @@ impl ProfileRuntimeWorkerFactory {
         }
     }
 
-    /// Supply the external model boundary for newly spawned Controllers. The factory is
-    /// process-owned, never persisted into a Profile or restored as execution authority.
-    /// Restores continue to use their saved model configuration.
+    /// Supply the model boundary for spawned and restored Controllers and their
+    /// Internal descendants. The process-owned supply is never persisted into a
+    /// Profile and carries no Workspace authority. Without it, roots and children
+    /// continue building clients from their respective model configurations.
     pub fn with_spawn_model_client_factory(
         mut self,
         factory: impl Fn() -> Box<dyn agen::llm_client::client::LlmClient> + Send + Sync + 'static,
@@ -2399,7 +2400,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             },
         );
         let bootstrap = match &self.spawn_model_client_factory {
-            Some(factory) => bootstrap.with_model_client(factory()),
+            Some(factory) => {
+                let client = factory();
+                bootstrap
+                    .with_internal_model_client(client.clone_boxed())
+                    .with_model_client(client)
+            }
             None => bootstrap,
         };
         {
@@ -2776,22 +2782,35 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             #[cfg(test)]
             self.restore_checkpoint(stage)
                 .map_err(|_| "injected restore boundary failure")?;
-            let candidate =
-                Worker::prepare_restored_from_worker_metadata_with_context_and_model_client(
-                    &worker_name,
-                    manifest,
-                    store,
-                    loader,
-                    workspace_context,
-                    filesystem_authority,
-                    self.spawn_model_client_factory
-                        .as_ref()
-                        .map(|factory| factory()),
-                )
+            let bootstrap = WorkerBootstrap::new(
+                manifest,
+                store,
+                loader,
+                workspace_context,
+                filesystem_authority,
+                WorkerBootstrapLayout::RuntimeManagedRun {
+                    run_dir: self
+                        .worker_restore_run_dir(&request.worker_ref, request.operation_id)
+                        .map_err(|_| "Worker restore run directory unavailable")?,
+                },
+            );
+            let bootstrap = match &self.spawn_model_client_factory {
+                Some(factory) => {
+                    let client = factory();
+                    bootstrap
+                        .with_internal_model_client(client.clone_boxed())
+                        .with_model_client(client)
+                }
+                None => bootstrap,
+            };
+            let candidate = bootstrap
+                .prepare_restored_candidate(&worker_name)
                 .await
                 .map_err(|error| {
-                    self.retain_construction_failure(&request, &error);
-                    let failure = RuntimeRestoreFailure::from_worker(stage, error);
+                    if let WorkerBootstrapError::Worker(source) = &error {
+                        self.retain_construction_failure(&request, source);
+                    }
+                    let failure = RuntimeRestoreFailure::from_bootstrap(stage, error);
                     let cause = failure.cause;
                     preparation_failure = Some(failure);
                     cause

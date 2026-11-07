@@ -13144,7 +13144,8 @@ impl server_api::ServerApi for ServerApiContractService {
     ) -> std::result::Result<server_api::MergeEvent, server_api::RepositoryApiError> {
         let Json(response) = scoped_complete_merge_request(
             State(self.workspace_api()?.clone()),
-            contract_request_headers(&context)?,
+            current_worker_contract_headers(&context)?,
+            context,
             AxumPath((workspace_id, id)),
             Json(request),
         )
@@ -21189,6 +21190,7 @@ async fn scoped_revoke_merge_request_review(
 async fn scoped_complete_merge_request(
     State(api): State<WorkspaceApi>,
     headers: HeaderMap,
+    context: server_api::ServerRequestContext,
     AxumPath((workspace_id, merge_request_id)): AxumPath<(String, String)>,
     Json(input): Json<server_api::CompleteMergeRequestRequest>,
 ) -> ApiResult<Json<server_api::MergeEvent>> {
@@ -21202,6 +21204,13 @@ async fn scoped_complete_merge_request(
             let store = merge_request_store(&api, &workspace_id)?;
             let mr = store.get_by_id(&workspace_id, &merge_request_id)?;
             let ticket_id = merge_request_ticket_id(&mr)?;
+            let request_source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "MR completion requires a signed Runtime source".into(),
+                )
+            })?;
+            let admission =
+                subject_authorization::merge_completion_subject(&api, &source, &ticket_id)?;
             if let Some(existing) = recorded_merge_completion(&mr.thread, &input.operation_id) {
                 let replay = merge_request::CompleteMergeRequest {
                     merge_request_id,
@@ -21222,11 +21231,10 @@ async fn scoped_complete_merge_request(
                     },
                     now: Utc::now(),
                 };
-                return store
-                    .complete(replay)
+                return admission
+                    .complete(&api, request_source, &store, replay)
                     .map(public_merge_event)
-                    .map(Json)
-                    .map_err(Into::into);
+                    .map(Json);
             }
             let assignment = api
                 .store
@@ -21279,12 +21287,10 @@ async fn scoped_complete_merge_request(
                 },
                 now: Utc::now(),
             };
-            store.validate_completion(&completion)?;
-            store
-                .complete(completion)
+            admission
+                .complete(&api, request_source, &store, completion)
                 .map(public_merge_event)
                 .map(Json)
-                .map_err(Into::into)
         })
         .await
 }

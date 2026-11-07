@@ -439,6 +439,72 @@ fn review_submission_authorization_rejects_invalid_grants_before_side_effects() 
 }
 
 #[test]
+fn completion_admission_fences_commit_and_receipt_replay_without_duplicate_events() {
+    let (_dir, store) = fixture();
+    open(&store);
+    let review = approve(&store, "source", "admission-review");
+    let completion = CompleteMergeRequest {
+        merge_request_id: "MR".into(),
+        ticket_id: "T".into(),
+        operation_id: "admitted-completion".into(),
+        approval_event_id: review.event_id,
+        current_subject_ref: "source".into(),
+        target_ref_before: "before".into(),
+        target_ref_after: "after".into(),
+        strategy: MergeStrategy::FastForward,
+        resolution: ConflictResolution::None,
+        auth: auth(),
+        now: at(5),
+    };
+    let calls = std::cell::Cell::new(0);
+    let rejected = store.complete_with_admission(completion.clone(), |connection| {
+        calls.set(calls.get() + 1);
+        if !connection.is_autocommit() {
+            return Err(MergeRequestError::Unauthorized(
+                "authority changed before commit".into(),
+            ));
+        }
+        Ok(())
+    });
+    assert!(matches!(rejected, Err(MergeRequestError::Unauthorized(_))));
+    assert_eq!(calls.get(), 2);
+    assert_eq!(store.get("W", "T").unwrap().state, MergeRequestState::Open);
+    assert!(
+        !store
+            .get("W", "T")
+            .unwrap()
+            .thread
+            .iter()
+            .any(|event| matches!(event, MergeRequestThreadEvent::Merge(_)))
+    );
+    let merged = store
+        .complete_with_admission(completion.clone(), |_| Ok(()))
+        .unwrap();
+    assert!(matches!(
+        store.complete_with_admission(completion.clone(), |_| Err(
+            MergeRequestError::Unauthorized("revoked replay".into())
+        )),
+        Err(MergeRequestError::Unauthorized(_))
+    ));
+    assert_eq!(
+        store
+            .complete_with_admission(completion, |_| Ok(()))
+            .unwrap(),
+        merged
+    );
+    assert_eq!(
+        store
+            .get("W", "T")
+            .unwrap()
+            .thread
+            .iter()
+            .filter(|event| matches!(event, MergeRequestThreadEvent::Merge(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn integration_preserves_selectors_ticket_state_and_assignment_and_replays_its_merge() {
     let (d, s) = fixture();
     open(&s);

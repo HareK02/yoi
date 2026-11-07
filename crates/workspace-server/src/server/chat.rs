@@ -27,7 +27,7 @@ pub(super) fn observe_next_admission(subject: &str) -> std::sync::mpsc::Receiver
     receive
 }
 
-fn domain(error: crate::subjektiv::chat::ChatError) -> ApiError {
+pub(super) fn domain(error: crate::subjektiv::chat::ChatError) -> ApiError {
     use crate::subjektiv::chat::ChatError;
     match error {
         ChatError::AuthorizationChanged => Error::WorkspacePermissionDenied(error.to_string()),

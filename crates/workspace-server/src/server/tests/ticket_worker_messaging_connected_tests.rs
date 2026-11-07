@@ -6,6 +6,8 @@
 use super::*;
 #[path = "subject_ticket_normal_connected_tests.rs"]
 mod ordinary_subject;
+#[path = "subject_ticket_mr_connected_tests.rs"]
+mod ordinary_subject_mr;
 use agen::llm_client::{
     event::{Event, StopReason},
     types::{ContentPart, Item},

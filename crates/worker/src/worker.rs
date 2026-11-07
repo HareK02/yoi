@@ -2273,6 +2273,9 @@ pub fn marker_workspace_client(
 pub struct WorkerWorkspaceContext {
     workspace_id: Option<WorkspaceId>,
     client: Arc<dyn WorkspaceClient>,
+    // Process-local model supply only, never Workspace authority or persisted config.
+    // Absence preserves model construction from each Internal child's Profile.
+    internal_model_client: Option<Box<dyn LlmClient>>,
 }
 
 impl std::fmt::Debug for WorkerWorkspaceContext {
@@ -2291,6 +2294,7 @@ impl WorkerWorkspaceContext {
         Self {
             workspace_id: None,
             client: unavailable_workspace_client(None, "no workspace configured"),
+            internal_model_client: None,
         }
     }
 
@@ -2299,6 +2303,7 @@ impl WorkerWorkspaceContext {
         Self {
             workspace_id,
             client,
+            internal_model_client: None,
         }
     }
 
@@ -2309,6 +2314,7 @@ impl WorkerWorkspaceContext {
         Self {
             workspace_id,
             client,
+            internal_model_client: None,
         }
     }
 
@@ -2325,6 +2331,7 @@ impl WorkerWorkspaceContext {
         Self {
             workspace_id,
             client,
+            internal_model_client: None,
         }
     }
 
@@ -2338,6 +2345,17 @@ impl WorkerWorkspaceContext {
 
     pub fn client_handle(&self) -> Arc<dyn WorkspaceClient> {
         self.client.clone()
+    }
+
+    pub(crate) fn with_internal_model_client(mut self, client: Box<dyn LlmClient>) -> Self {
+        self.internal_model_client = Some(client);
+        self
+    }
+
+    pub(crate) fn internal_model_client(&self) -> Option<Box<dyn LlmClient>> {
+        self.internal_model_client
+            .as_ref()
+            .map(|client| client.clone_boxed())
     }
 }
 

@@ -941,6 +941,137 @@ fn resources_cover_store(
     Ok(granted_id.is_some() && granted_id == requested_id)
 }
 
+// A frozen Ticket grant can name resources that do not exist until its Coder
+// runs. Derive only that currently assigned implementation's own children and
+// linked MRs, for the exact granted operation. This is not Workspace coverage,
+// a new grant, or permission for a former assignee to continue executing.
+fn ticket_execution_resource(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    granted: &ScopedPermission,
+    needed: &ScopedPermission,
+) -> ApiResult<bool> {
+    let PermissionResource::Ticket {
+        workspace_id,
+        ticket_id,
+    } = &granted.resource
+    else {
+        return Ok(false);
+    };
+    if workspace_id != api.workspace_id() || granted.operation != needed.operation {
+        return Ok(false);
+    }
+    let Some(ticket) = api.store.resolve_resource_reference(
+        workspace_id,
+        WorkspaceResourceKind::Ticket,
+        ticket_id,
+    )?
+    else {
+        return Ok(false);
+    };
+    if api
+        .store
+        .get_current_ticket_worker_assignment(workspace_id, &ticket)?
+        .is_none_or(|assignment| assignment.worker != *worker)
+    {
+        return Ok(false);
+    }
+    let Some(grant) = open_subjektiv_store(api)?
+        .worker_execution_grant(&worker.runtime_id, &worker.worker_id)
+        .map_err(subjektiv_store_error)?
+    else {
+        return Ok(false);
+    };
+    let owns_ticket = api.store.list_current_ticket_assignment_tracking(workspace_id, &ticket)?.into_iter().any(|assignment| matches!(assignment.principal, ticket::TicketAssignmentPrincipalSnapshot::Subject { subject_id } if subject_id == grant.subject_id));
+    if !owns_ticket {
+        return Ok(false);
+    }
+    match (&needed.resource, needed.operation.as_str()) {
+        (PermissionResource::SubWorker { runtime_id, worker_id, .. }, "subworker.spawn" | "subworker.observe" | "subworker.send_input" | "subworker.stop") => Ok(runtime_id == &worker.runtime_id && worker_id == &worker.worker_id),
+        (PermissionResource::MergeRequest { workspace_id: requested, merge_request_id }, "merge_request.read" | "merge_request.readiness" | "merge_request.review") if requested == workspace_id => {
+            api.config_store.with_conn(|connection| {
+                Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations WHERE workspace_id=?1 AND ticket_id=?2 AND merge_request_id=?3)", rusqlite::params![workspace_id, ticket, merge_request_id], |row| row.get(0))?)
+            }).map_err(Into::into)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(super) struct MergeCompletionSubject {
+    subject: String,
+    lease: crate::store::WorkerSingletonLease,
+    assignment_id: String,
+}
+
+pub(super) fn merge_completion_subject(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    ticket: &str,
+) -> ApiResult<MergeCompletionSubject> {
+    let subject = current_assignment_subject_source(api, worker)?;
+    let lease = api
+        .store
+        .require_current_worker_singleton_owner(api.workspace_id(), worker)?
+        .ok_or_else(|| denied("MR completion requires the current Subject body"))?;
+    let assignment = api.store.list_current_ticket_assignment_tracking(api.workspace_id(), ticket)?
+        .into_iter().find(|row| matches!(&row.principal, ticket::TicketAssignmentPrincipalSnapshot::Subject { subject_id } if subject_id == &subject))
+        .ok_or_else(|| denied("MR completion requires the Ticket assigned Subject"))?;
+    Ok(MergeCompletionSubject {
+        subject,
+        lease,
+        assignment_id: assignment.assignment_id,
+    })
+}
+
+impl MergeCompletionSubject {
+    pub(super) fn complete(
+        &self,
+        api: &WorkspaceApi,
+        source: &server_api::ServerRuntimeSource,
+        store: &merge_request::MergeRequestStore,
+        completion: merge_request::CompleteMergeRequest,
+    ) -> ApiResult<merge_request::MergeEvent> {
+        let gate = subjektiv_journal::lifecycle_lock(api, &self.subject)?;
+        let _gate = gate
+            .lock()
+            .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
+        let authority = WorkerAuthorityView::from(api);
+        authority.refresh_permission_registry()?;
+        let feature = open_subjektiv_store(api)?;
+        feature.with_chat_transaction(&self.subject, |native| {
+            Ok((|| -> ApiResult<_> {
+                let registry = api.permission_registry.read().map_err(|_| Error::Config("current Feature registry unavailable".into()))?;
+                let needed = ScopedPermission {
+                    operation: "merge_request.complete".into(),
+                    resource: PermissionResource::MergeRequest { workspace_id: api.workspace_id().into(), merge_request_id: completion.merge_request_id.clone() },
+                };
+                let admit = |connection: &rusqlite::Connection| -> std::result::Result<(), merge_request::MergeRequestError> {
+                    let check = || -> ApiResult<()> {
+                        let policy = crate::SqliteWorkspaceStore::subject_body_policy_on_connection(
+                            connection, api.workspace_id(), &self.subject, &self.lease, native.policy_source(), source,
+                        )?;
+                        let current: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM ticket_current_worker_assignments WHERE workspace_id=?1 AND ticket_id=?2 AND role='orchestrator' AND assignment_id=?3 AND principal_kind='subject' AND principal_id=?4)",
+                            rusqlite::params![api.workspace_id(), completion.ticket_id, self.assignment_id, self.subject], |row| row.get(0),
+                        ).map_err(Error::from)?;
+                        if !current { return Err(denied("Ticket assigned Subject changed before MR completion")); }
+                        let policy = match policy {
+                            server_api::authorization::SubjectPolicySource::Legacy(value) => CurrentSubjectPolicy::Legacy(value),
+                            server_api::authorization::SubjectPolicySource::Feature(value) => CurrentSubjectPolicy::Canonical(value),
+                        };
+                        if !policy.allows_in_registry(&authority, &needed, false, &self.subject, &registry)? {
+                            return Err(denied("Current Subject policy denies MR completion"));
+                        }
+                        Ok(())
+                    };
+                    check().map_err(|error| merge_request::MergeRequestError::Unauthorized(error.error.to_string()))
+                };
+                store.complete_with_admission(completion.clone(), admit).map_err(Error::from).map_err(Into::into)
+            })())
+        }).map_err(chat::domain)?
+    }
+}
+
 pub(super) fn authorize_scope(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
@@ -1012,7 +1143,8 @@ pub(super) fn authorize_scope(
     }
     for permission in &permissions {
         if permission.operation == needed.operation
-            && resources_cover(api, &permission.resource, &needed.resource)?
+            && (resources_cover(api, &permission.resource, &needed.resource)?
+                || ticket_execution_resource(api, worker, permission, &needed)?)
         {
             return Ok(Some(if permission.resource.covers(&needed.resource) {
                 permission.resource.clone()

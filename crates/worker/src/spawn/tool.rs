@@ -355,6 +355,7 @@ impl SubWorkerSpawnTool {
         prompt_loader: PromptCatalogSource,
         available_profiles: AvailableProfiles,
     ) -> Self {
+        let internal_client_override = workspace_context.internal_model_client();
         Self {
             spawner_name,
             workspace_context,
@@ -367,7 +368,7 @@ impl SubWorkerSpawnTool {
             spawner_manifest,
             prompt_loader,
             available_profiles,
-            internal_client_override: None,
+            internal_client_override,
             #[cfg(test)]
             installed_child_workspace_client: std::sync::Mutex::new(None),
         }
@@ -531,6 +532,15 @@ impl Tool for SubWorkerSpawnTool {
                 self.workspace_context.clone()
             };
         let child_workspace_context = restrict_internal_child_drive(child_workspace_context);
+        // Reviewer and Drive wrappers replace Workspace authority independently.
+        // Reattach only an explicit model supply for this child's descendants;
+        // never inherit the parent's actual engine client or Workspace grants.
+        let child_workspace_context = match &self.internal_client_override {
+            Some(client) => {
+                child_workspace_context.with_internal_model_client(client.clone_boxed())
+            }
+            None => child_workspace_context,
+        };
         #[cfg(test)]
         {
             *self.installed_child_workspace_client.lock().unwrap() =
@@ -1318,6 +1328,117 @@ enabled = false
                 ..
             }) if session_id == "child-session" && message == "completed"
         ));
+    }
+
+    #[tokio::test]
+    async fn explicit_context_model_supply_drives_internal_child_without_default_override() {
+        let runtime = TempDir::new().unwrap();
+        let workspace_root = runtime.path().join("project");
+        let available_profiles = write_project_profile_registry(
+            &workspace_root,
+            Some("reviewer"),
+            &[("reviewer", "reviewer.toml", INTERNAL_REVIEWER_PROFILE)],
+        );
+        let mut manifest = parent_manifest(&workspace_root, None);
+        manifest.delegation_scope = ScopeConfig {
+            allow: vec![abs_rule(&workspace_root, Permission::Write)],
+            deny: Vec::new(),
+        };
+        let scope = SharedScope::new(Scope::from_config(&manifest.scope).unwrap());
+        let registry = SpawnedWorkerRegistry::new_internal("parent".into(), scope.clone());
+        let broker = workdir::WorkdirToolBrokerRouter::from_single(
+            workdir::WorkdirAttachmentAlias::new("workdir").unwrap(),
+            Arc::new(workdir::LocalWorkdirSession::materialized_bound(
+                workdir::Workdir::new("test-workdir"),
+                workspace_root.clone(),
+                workspace_root.clone(),
+                scope.clone(),
+                workdir::WorkdirSessionCapabilities::ALL,
+            )),
+        )
+        .unwrap();
+        let workspace_context = crate::worker::WorkerWorkspaceContext::with_client(
+            Some(WorkspaceId::new("workspace-test").unwrap()),
+            Arc::new(AvailableWorkspaceClient {
+                child_names: &["supplied-model-child"],
+            }),
+        );
+        let make_tool = |context| {
+            SubWorkerSpawnTool::new(
+                "parent".into(),
+                context,
+                ParentNotificationTarget::Durable(Arc::new(|_| {})),
+                runtime.path().to_path_buf(),
+                workspace_root.clone(),
+                Some(broker.clone()),
+                registry.clone(),
+                manifest.clone(),
+                PromptCatalogSource::builtins_only(),
+                available_profiles.clone(),
+            )
+        };
+        let default_tool = make_tool(workspace_context.clone());
+        assert!(default_tool.internal_client_override.is_none());
+        let child_config: WorkerManifestConfig = serde_json::from_str(
+            &default_tool
+                .build_spawn_config_json(
+                    "profile-model-child",
+                    None,
+                    &[],
+                    parse_spawn_profile_selector(Some("builtin:reviewer")).unwrap(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = manifest::ProfileResolver::new()
+            .with_workspace_base(&workspace_root)
+            .resolve(
+                &manifest::ProfileSelector::source_named(
+                    manifest::ProfileRegistrySource::Builtin,
+                    "reviewer",
+                ),
+                manifest::ProfileResolveOptions::with_worker_name("expected-reviewer"),
+            )
+            .unwrap()
+            .manifest
+            .model;
+        assert_eq!(child_config.model, expected);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let supplied_context =
+            workspace_context.with_internal_model_client(Box::new(ScriptedInternalClient {
+                calls: calls.clone(),
+                parent_scope: scope,
+                delegated_path: workspace_root.clone(),
+                observed_parent_write_revoked: Arc::new(AtomicBool::new(false)),
+                observed_instruction_override: Arc::new(AtomicBool::new(false)),
+                fail_requests: Arc::new(AtomicBool::new(false)),
+            }));
+        let tool = make_tool(supplied_context.clone());
+        assert!(tool.internal_client_override.is_some());
+        let output = tool
+            .execute(
+                &serde_json::json!({
+                    "name": "supplied-model-child",
+                    "profile": "builtin:reviewer",
+                    "task": "review using the explicitly supplied model",
+                    "scope": [{"target": ".", "permission": "read"}]
+                })
+                .to_string(),
+                agen::tool::ToolExecutionContext::direct(),
+            )
+            .await
+            .unwrap();
+        assert!(output.summary.contains("supplied-model-child"));
+        let record = registry.get_internal("supplied-model-child").unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), record.session.wait_until_idle())
+                .await
+                .expect("supplied model child must finish without a live provider"),
+            crate::internal_worker::InternalWorkerSessionStatus::Idle
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        record.session.stop().await.unwrap();
     }
 
     #[tokio::test]
