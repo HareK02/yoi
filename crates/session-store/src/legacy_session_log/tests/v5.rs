@@ -245,10 +245,59 @@ fn v1_through_v4_worker_migration_reopen_and_mixed_file_retry() {
 }
 
 #[test]
+fn large_legacy_inputs_migrate_and_reopen_without_losing_content() {
+    let body = "x".repeat(4 * 1024 * 1024 + 1);
+    let snapshot = json!({
+        "large": "x".repeat(128 * 1024 + 1),
+        "many": vec![Value::Null; 8193],
+        "deep": (0..20).fold(Value::Null, |inner, _| json!([inner])),
+    });
+    let mut old: Value = serde_json::from_str(V4.lines().next().unwrap()).unwrap();
+    old["entry"]["item"]["body"] = json!(body);
+    old["entry"]["item"]["snapshot"] = snapshot.clone();
+    let source = format!("{old}\n");
+    let root = tempfile::tempdir().unwrap();
+    let (session, segment) = write_worker(root.path(), 4, source.as_bytes());
+    let path = root
+        .path()
+        .join("segments")
+        .join(format!("{segment}.jsonl"));
+    WorkerSessionStore::validate_migration(root.path()).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), source.as_bytes());
+    let store = WorkerSessionStore::new(root.path()).unwrap();
+    let entries = store.read_all(session, segment).unwrap();
+    let LogEntry::AnnotatedSystemItem { entry, .. } = &entries[0] else {
+        panic!()
+    };
+    assert_eq!(entry.item.history_text(), body);
+    let metadata = entry.metadata.input_metadata.as_ref().unwrap();
+    assert_eq!(metadata.public_item().unwrap().body, body);
+    assert_eq!(
+        metadata.usage(),
+        migration_policy(InputCompactionUse::ReferenceInput)
+    );
+    let payload: JournalStartupPayload = metadata
+        .feature_payload()
+        .unwrap()
+        .decode("journal:startup", 1)
+        .unwrap();
+    assert_eq!(payload.snapshot, snapshot);
+    assert_eq!(
+        serde_json::to_value(&entry.metadata.entry_id).unwrap(),
+        old["entry"]["metadata"]["entry_id"]
+    );
+    let migrated = fs::read(&path).unwrap();
+    drop(store);
+    let reopened = WorkerSessionStore::new(root.path()).unwrap();
+    assert_eq!(
+        encode(&reopened.read_all(session, segment).unwrap()),
+        encode(&entries)
+    );
+    assert_eq!(fs::read(&path).unwrap(), migrated);
+}
+
+#[test]
 fn all_segments_preflight_keeps_old_bytes_on_decode_or_conversion_failure() {
-    let mut oversized: Value = serde_json::from_str(V4.lines().next().unwrap()).unwrap();
-    oversized["entry"]["item"]["snapshot"] =
-        json!({"large": "x".repeat(crate::input_metadata::MAX_FEATURE_PAYLOAD_BYTES + 1)});
     let mut unknown: Value = serde_json::from_str(V4.lines().next().unwrap()).unwrap();
     unknown["entry"]["item"]["kind"] = json!("unsupported_future_feature");
     let mut malformed = unknown.clone();
@@ -270,7 +319,6 @@ fn all_segments_preflight_keeps_old_bytes_on_decode_or_conversion_failure() {
         json!({"kind":"provided", "producer":"owner"});
     for bad in [
         "{broken-json}\n".to_owned(),
-        format!("{}\n", oversized),
         format!("{}\n", unknown),
         format!("{}\n", malformed),
         format!("{}\n", missing_metadata),

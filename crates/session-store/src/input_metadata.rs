@@ -5,8 +5,9 @@
 //! policies, private Feature data and an explicit public projection travel as one
 //! value. Restoring this value does not load a Feature or invoke domain behavior.
 //!
-//! Payload validation bounds the decoded value; enclosing log readers must also
-//! enforce their record allocation limit before decoding untrusted persisted input.
+//! Validation checks the input contract, not content size or JSON complexity.
+//! Read/allocation budgets belong at the reader boundary; applying content caps
+//! after decoding would reject otherwise valid persisted history during migration.
 
 use agen::Item;
 use serde::de::DeserializeOwned;
@@ -15,12 +16,7 @@ use serde_json::Value;
 
 use crate::PublicSystemItem;
 
-pub const MAX_FEATURE_PAYLOAD_BYTES: usize = 128 * 1024;
-pub const MAX_SYSTEM_INPUT_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_SYSTEM_PUBLIC_BYTES: usize = 256 * 1024;
 const MAX_SCHEMA_BYTES: usize = 128;
-const MAX_JSON_DEPTH: usize = 16;
-const MAX_JSON_NODES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum InputMetadataError {
@@ -28,8 +24,6 @@ pub enum InputMetadataError {
     InvalidSchema,
     #[error("history input payload version must be nonzero")]
     InvalidVersion,
-    #[error("system input resource limit exceeded")]
-    ResourceLimit,
     #[error("history input payload could not be serialized")]
     Serialization,
     #[error("history input payload schema or version is unsupported by this consumer")]
@@ -85,7 +79,6 @@ impl TryFrom<PayloadWire> for FeatureInputPayload {
         if wire.version == 0 {
             return Err(InputMetadataError::InvalidVersion);
         }
-        validate_json(&wire.value, MAX_FEATURE_PAYLOAD_BYTES)?;
         Ok(Self {
             schema: wire.schema,
             version: wire.version,
@@ -199,9 +192,6 @@ impl TryFrom<MetadataWire> for HistoryInputMetadata {
             {
                 return Err(InputMetadataError::InvalidSchema);
             }
-            let value =
-                serde_json::to_value(public).map_err(|_| InputMetadataError::Serialization)?;
-            validate_json(&value, MAX_SYSTEM_PUBLIC_BYTES)?;
         }
         Ok(Self {
             usage: wire.usage,
@@ -284,9 +274,6 @@ impl TryFrom<InputWire> for SystemInputEnvelope {
     type Error = InputMetadataError;
 
     fn try_from(wire: InputWire) -> Result<Self, Self::Error> {
-        if wire.body.len() > MAX_SYSTEM_INPUT_BYTES {
-            return Err(InputMetadataError::ResourceLimit);
-        }
         Ok(Self {
             body: wire.body,
             metadata: wire.metadata,
@@ -321,36 +308,6 @@ impl SystemInputEnvelope {
     pub fn into_parts(self) -> (String, HistoryInputMetadata) {
         (self.body, self.metadata)
     }
-}
-
-fn validate_json(value: &Value, max_bytes: usize) -> Result<(), InputMetadataError> {
-    fn walk(value: &Value, depth: usize, remaining: &mut usize) -> Result<(), InputMetadataError> {
-        if depth > MAX_JSON_DEPTH || *remaining == 0 {
-            return Err(InputMetadataError::ResourceLimit);
-        }
-        *remaining -= 1;
-        match value {
-            Value::Array(values) => {
-                for value in values {
-                    walk(value, depth + 1, remaining)?;
-                }
-            }
-            Value::Object(values) => {
-                for value in values.values() {
-                    walk(value, depth + 1, remaining)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    let mut remaining = MAX_JSON_NODES;
-    walk(value, 0, &mut remaining)?;
-    let bytes = serde_json::to_vec(value).map_err(|_| InputMetadataError::Serialization)?;
-    if bytes.len() > max_bytes {
-        return Err(InputMetadataError::ResourceLimit);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -432,26 +389,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_oversized_payload_is_rejected_at_construction_and_restore() {
+    fn malformed_payload_is_rejected_at_construction_and_restore() {
         for (schema, version, value) in [
             ("", 1, Value::Null),
             ("invalid schema", 1, Value::Null),
             ("owner:context", 0, Value::Null),
-            (
-                "owner:context",
-                1,
-                Value::String("x".repeat(MAX_FEATURE_PAYLOAD_BYTES)),
-            ),
-            (
-                "owner:context",
-                1,
-                Value::Array(vec![Value::Null; MAX_JSON_NODES]),
-            ),
-            (
-                "owner:context",
-                1,
-                (0..=MAX_JSON_DEPTH).fold(Value::Null, |inner, _| Value::Array(vec![inner])),
-            ),
         ] {
             assert!(FeatureInputPayload::encode(schema, version, &value).is_err());
             assert!(
@@ -546,17 +488,34 @@ mod tests {
     }
 
     #[test]
-    fn model_body_and_public_projection_have_independent_resource_limits() {
-        let metadata = HistoryInputMetadata::new(reference_policy(), None, None).unwrap();
-        assert!(
-            SystemInputEnvelope::new("x".repeat(MAX_SYSTEM_INPUT_BYTES + 1), metadata).is_err()
-        );
+    fn payloads_beyond_former_size_and_complexity_caps_round_trip() {
+        for value in [
+            Value::String("x".repeat(128 * 1024 + 1)),
+            Value::Array(vec![Value::Null; 8193]),
+            (0..20).fold(Value::Null, |inner, _| Value::Array(vec![inner])),
+        ] {
+            let payload = FeatureInputPayload::encode("owner:context", 1, &value).unwrap();
+            let restored: FeatureInputPayload =
+                serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert_eq!(restored, payload);
+            assert_eq!(restored.decode::<Value>("owner:context", 1).unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn large_model_body_and_public_projection_round_trip_without_truncation() {
+        let body = "x".repeat(4 * 1024 * 1024 + 1);
         let public = PublicSystemItem {
             kind: "context".into(),
-            body: "x".repeat(MAX_SYSTEM_PUBLIC_BYTES),
+            body: "公開履歴".repeat(32 * 1024),
             presentation: PublicSystemPresentation::Context,
         };
-        assert!(HistoryInputMetadata::new(reference_policy(), None, Some(public)).is_err());
+        assert!(public.body.len() > 256 * 1024);
+        let metadata = HistoryInputMetadata::new(reference_policy(), None, Some(public)).unwrap();
+        let input = SystemInputEnvelope::new(body, metadata).unwrap();
+        let restored: SystemInputEnvelope =
+            serde_json::from_slice(&serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(restored, input);
         let invalid = serde_json::json!({ "body": "small", "metadata": { "public": null, "feature_payload": null } });
         assert!(serde_json::from_value::<SystemInputEnvelope>(invalid).is_err());
     }

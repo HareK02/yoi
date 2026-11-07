@@ -1814,20 +1814,7 @@ impl ArchiveMigrationFailure {
             {
                 "unsupported_session_schema"
             }
-            // The legacy decoder wraps InputMetadataError in a path-bearing Corrupt
-            // message. Recognize only its fixed cause; never publish that wrapper.
-            StoreError::Corrupt { message, .. }
-                if message.ends_with(&format!(
-                    ": {}",
-                    session_store::InputMetadataError::ResourceLimit
-                )) =>
-            {
-                "input_resource_limit_exceeded"
-            }
             StoreError::Corrupt { .. } => "invalid_session_log",
-            StoreError::InvalidInputMetadata(session_store::InputMetadataError::ResourceLimit) => {
-                "input_resource_limit_exceeded"
-            }
             StoreError::InvalidInputMetadata(_) => "invalid_input_metadata",
             StoreError::ReadLimitExceeded => "read_limit_exceeded",
             _ => "session_conversion_failed",
@@ -2817,11 +2804,6 @@ mod tests {
             ("checksum", "archive_integrity", "archive_checksum_mismatch"),
             ("schema", "session_conversion", "unsupported_session_schema"),
             ("log", "session_conversion", "invalid_session_log"),
-            (
-                "resource_limit",
-                "session_conversion",
-                "input_resource_limit_exceeded",
-            ),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("private-runtime-root");
@@ -2845,21 +2827,6 @@ mod tests {
                 let mut manifest: serde_json::Value = read_json(&path, "test").unwrap();
                 manifest["schema_version"] = serde_json::json!(999);
                 write_json(&path, &manifest);
-            } else if case == "resource_limit" {
-                let mut bytes = fs::read_to_string(&log).unwrap();
-                for line in include_str!("retention/fixtures/system-input-v4.jsonl").lines() {
-                    let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
-                    if let Some(item) = entry.pointer_mut("/entry/item")
-                        && item.get("snapshot").is_some()
-                    {
-                        item["snapshot"] = serde_json::json!({
-                            "private": PRIVATE.repeat(128 * 1024 / PRIVATE.len() + 1)
-                        });
-                    }
-                    bytes.push_str(&serde_json::to_string(&entry).unwrap());
-                    bytes.push('\n');
-                }
-                fs::write(&log, bytes).unwrap();
             }
             commit_session_archive(
                 &provider,
@@ -2970,6 +2937,71 @@ mod tests {
             retention.ensure_live(id),
             Err(session_store::StoreError::SessionErased(_))
         ));
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn startup_migrates_large_archive_inputs_and_preserves_ingestion_receipt() {
+        use session_store::Store;
+
+        let temp = tempfile::tempdir().unwrap();
+        let options =
+            crate::fs_store::FsRuntimeStoreOptions::new(temp.path()).with_runtime_id("runtime-a");
+        drop(crate::Runtime::with_fs_store(options.clone()).unwrap());
+        let worker = WorkerId::now_v7();
+        let segment = old_compacted_source(temp.path(), worker);
+        let provider = FsWorkerRetentionProvider::new(temp.path());
+        let worker_dir = provider.worker_dir(worker);
+        let log = worker_dir
+            .join("session/segments")
+            .join(format!("{segment}.jsonl"));
+        let body = "retained summary ".repeat(32 * 1024);
+        let mut legacy: serde_json::Value = serde_json::from_str(
+            include_str!("retention/fixtures/system-input-v4.jsonl")
+                .lines()
+                .nth(1)
+                .unwrap(),
+        )
+        .unwrap();
+        legacy["entry"]["item"] = serde_json::json!({
+            "kind": "resident_summary_refresh", "body": body
+        });
+        let mut bytes = fs::read_to_string(&log).unwrap();
+        bytes.push_str(&format!("{legacy}\n"));
+        fs::write(&log, bytes).unwrap();
+        let manifest = commit_session_archive(
+            &provider,
+            &request(worker, SessionDisposition::Archive),
+            &worker_dir,
+        )
+        .unwrap();
+        fs::remove_dir_all(worker_dir).unwrap();
+        for _ in 0..2 {
+            drop(crate::Runtime::with_fs_store(options.clone()).unwrap());
+            let (retained, session_root) = provider.session_archive("archive-a").unwrap();
+            assert_eq!(retained, manifest);
+            let store = session_store::WorkerSessionStore::open_read_only(&session_root).unwrap();
+            let entries = store
+                .read_all(manifest.source_session_id.parse().unwrap(), segment)
+                .unwrap();
+            let session_store::LogEntry::AnnotatedSystemItem { entry, .. } =
+                entries.last().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(entry.item.history_text(), body);
+            assert_eq!(
+                entry
+                    .metadata
+                    .input_metadata
+                    .as_ref()
+                    .unwrap()
+                    .public_item()
+                    .unwrap()
+                    .body,
+                body
+            );
+        }
     }
 
     #[test]

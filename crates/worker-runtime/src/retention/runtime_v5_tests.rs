@@ -435,12 +435,7 @@ fn corrupt_archive_does_not_block_startup_or_healthy_session_migration_and_repai
 
 #[test]
 fn unmigratable_archive_preserves_evidence_across_startup_and_reopen() {
-    for (field, value) in [
-        ("snapshot_sha256", json!(42)),
-        ("behavior_md", json!([])),
-        ("snapshot", json!({"large": "x".repeat(128 * 1024 + 1)})),
-        ("body", json!("x".repeat(256 * 1024 + 1))),
-    ] {
+    for (field, value) in [("snapshot_sha256", json!(42)), ("behavior_md", json!([]))] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("runtime");
         let (live_worker, live_session, live_segment) = runtime_fixture(&root, SCHEMA_VERSION);

@@ -153,12 +153,9 @@ impl LoggedHistoryEntry {
                     role: crate::LoggedRole::System,
                     content,
                 } => {
-                    let [crate::LoggedContentPart::Text { text }] = content.as_slice() else {
+                    let [crate::LoggedContentPart::Text { .. }] = content.as_slice() else {
                         return Err(crate::InputMetadataError::InconsistentRecord);
                     };
-                    if text.len() > crate::input_metadata::MAX_SYSTEM_INPUT_BYTES {
-                        return Err(crate::InputMetadataError::ResourceLimit);
-                    }
                 }
                 // Other logical roles may carry use policy, but cannot masquerade
                 // as the System-only public/payload extension contract.
@@ -223,11 +220,7 @@ impl LoggedSystemHistoryEntry {
     pub fn validate_input_metadata(&self) -> Result<(), crate::InputMetadataError> {
         self.metadata.validate_input_metadata()?;
         match (&self.item, &self.metadata.input_metadata) {
-            (crate::SystemItem::Input { body }, Some(_)) => {
-                if body.len() > crate::input_metadata::MAX_SYSTEM_INPUT_BYTES {
-                    return Err(crate::InputMetadataError::ResourceLimit);
-                }
-            }
+            (crate::SystemItem::Input { .. }, Some(_)) => {}
             (crate::SystemItem::Input { .. }, None) => {
                 return Err(crate::InputMetadataError::MissingMetadata);
             }
@@ -295,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn external_system_records_reject_missing_policy_role_mismatch_and_overlimit_body() {
+    fn external_system_records_validate_contract_without_rejecting_large_body() {
         let valid = serde_json::json!({
             "item": { "kind": "input", "body": "context" },
             "metadata": {
@@ -306,7 +299,8 @@ mod tests {
                 } }
             }
         });
-        let restored: LoggedSystemHistoryEntry = serde_json::from_value(valid.clone()).unwrap();
+        let restored: LoggedSystemHistoryEntry = serde_json::from_value(valid).unwrap();
+        let valid = serde_json::to_value(&restored).unwrap();
         let flat = serde_json::to_value(restored.to_history_entry()).unwrap();
         assert!(serde_json::from_value::<LoggedHistoryEntry>(flat.clone()).is_ok());
         for generic in [true, false] {
@@ -340,15 +334,19 @@ mod tests {
             assert!(decode(invalid_role));
             let mut oversized = wire.clone();
             if generic {
-                oversized["item"]["body"] = "x"
-                    .repeat(crate::input_metadata::MAX_SYSTEM_INPUT_BYTES + 1)
-                    .into();
+                oversized["item"]["body"] = "x".repeat(4 * 1024 * 1024 + 1).into();
             } else {
-                oversized["item"]["content"][0]["text"] = "x"
-                    .repeat(crate::input_metadata::MAX_SYSTEM_INPUT_BYTES + 1)
-                    .into();
+                oversized["item"]["content"][0]["text"] = "x".repeat(4 * 1024 * 1024 + 1).into();
             }
-            assert!(decode(oversized));
+            if generic {
+                let restored: LoggedSystemHistoryEntry =
+                    serde_json::from_value(oversized.clone()).unwrap();
+                assert_eq!(serde_json::to_value(restored).unwrap(), oversized);
+            } else {
+                let restored: LoggedHistoryEntry =
+                    serde_json::from_value(oversized.clone()).unwrap();
+                assert_eq!(serde_json::to_value(restored).unwrap(), oversized);
+            }
         }
     }
 

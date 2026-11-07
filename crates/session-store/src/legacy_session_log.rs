@@ -412,8 +412,8 @@ pub(crate) fn migrate_compaction_origins(
 }
 
 /// Explicit legacy-to-current boundary. No Feature inference belongs in ordinary
-/// readers/restoration. Invalid or oversized payloads fail migration; the generic
-/// payload/body/public limits are deliberately not relaxed for legacy data.
+/// readers/restoration. Invalid input contracts fail migration; valid content is
+/// preserved without applying content-size or JSON-complexity caps.
 pub(crate) fn migrate_system_inputs(entry: &mut LogEntry) -> Result<(), crate::InputMetadataError> {
     entry.validate_input_metadata()?;
     match entry {
