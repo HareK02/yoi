@@ -586,7 +586,10 @@ mod tests {
             "preflight must not change source"
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
-        assert_eq!(current_schema_version(&conn).unwrap(), 128);
+        assert_eq!(
+            current_schema_version(&conn).unwrap(),
+            super::LATEST_SCHEMA_VERSION
+        );
         let saved = conn.query_row(
             "SELECT plan_id,input_fingerprint,state,failure_category,journal_removal_json FROM worker_removal_operations WHERE operation_id='op'", [],
             |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?)),

@@ -27521,7 +27521,8 @@ INSERT INTO worker_registry (
         );
         let error = apply_migrations(&conn).unwrap_err().to_string();
         assert!(
-            error.contains("Server storage format: unsupported future failure history"),
+            error.contains("Server storage format: unknown baseline or current version")
+                && error.contains(&future_version.to_string()),
             "{error}"
         );
 

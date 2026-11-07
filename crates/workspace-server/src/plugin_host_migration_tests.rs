@@ -12,7 +12,7 @@ fn plugin_receipt_tail_migrates_true_predecessor_reopens_and_matches_fresh_schem
     assert!(!table_exists(&conn, "plugin_invocations").unwrap());
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 108);
-    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110, 111, 112, 113, 122, 123, 124, 125, 126, 127, 128]);
+    assert_eq!(plan.migrations.iter().map(|step| step.version).collect::<Vec<_>>(), [109, 110, 111, 112, 113, 122, 123, 124, 125, 126, 127, 128, 129]);
     let expected_history: Vec<_> = history.iter().cloned()
         .chain(plan.migrations.iter().map(|step| (step.version, step.name.clone())))
         .collect();

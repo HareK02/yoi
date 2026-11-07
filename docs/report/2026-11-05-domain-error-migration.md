@@ -89,4 +89,34 @@ T-845通常合成時の `t845-composition-build-1` / `t845-composition-migration
 - `composition-server-shards-1` は通常Serverの一部。外側Bash600秒timeoutと内側shardのexit/timeoutは別事実で、全Server成功ではない。未完ケース、migrationの古いtail期待、既存termination/Embedded/Feature storage fixture等の失敗は個別にtriageし、baseline未確認をbaseline扱いしない。
 - `composition-visual-review.json` は実Web＋合成HTTP/WS/WASMの4scenario限定目視。変更後38画像と変更前代表画像を実装者が開き、1440/768/390、light/dark、owner/non-owner、原因の即時可視性と既存狭幅overflow等を確認した。実Backend永続効果や新retained-close失敗画面の証明とは区別する。
 
-通常Server残scope、失敗/timeoutの分類と必要な修正、最終root check・生成整合・format/diff/命名、新sourceでの証拠再利用条件、公開provider exact、同MRの直属fresh全要件review/verdictは引き続き必要。この記録はその完了・採用・配備を主張しない。
+### T-845合成後の通常suiteと再利用条件
+
+`target/t815-evidence/t845-composition-server-unique-ledger-2.json` は通常Server登録2,208件・62 shardの各結果を原ログ/binary hashへ結ぶ。初回は2,153成功・14失敗・41 ignored、未回収0、内側test-command timeout 0。外側Bash group 2/8の600秒timeoutは別に保持する。内側の有限runnerが保存した全終端結果を後から回収したことで、外側timeoutを成功へ読み替えたものではない。
+
+通常再build `t845-composition-build-3` のartifact21（Server lib SHA `f70aa2b9dc1a295ce5335c71f808022cf208e0dd3a8da1264e737cdbf4ddd1e6`）では、6件の旧期待を適応した。migration tailの2件は129を明記、Journalは現行versionを参照、future generationは既存preflight拒否と実versionを要求、Journal保存比較はT-845の空Plan table廃止とTicket 17の一段append以外の全旧列・値・receipt・applied_atを保持、assignment通知はPlan文言廃止後の現在Ticket/assignment/event再読指示を確認する。製品writer・権限・元結果・履歴は変更しない。`t845-migration-notice-recovery-1` はこの6件とServiceを含む7成功、60.48秒、exit 0。
+
+Serviceのfactory leaseが初回に存在しなかった失敗は、隔離same-sourceで成功しただけでは原因確定としない。さらにartifact21の同じ36ケース・同一順のshardを `t845-service-identical-shard-recovery-1` で再実行し、36成功・104.65秒・exit 0を確認したが、初回失敗は原因未確定のflaky残余として残す。最新の非重複通常Server台帳は2,160成功・7失敗・41 ignoredであり、全greenではない。
+
+artifact20から21までの差は上記6 test bodyのみで、production、共有harness/初期化、migration実装、Cargo.lock、feature、依存、登録case集合は不変である。変更試験とServiceの再実行以外はartifact20の結果を再利用し、artifact21で全62 shardを再実行したとは主張しない。`t845-normal-consumers-2` はartifact21の通常Workdir/Worker/Runtime/tools/CLI/config-source/API/client/Ticket全3,386件、`t845-drive-protocol-normal-1` はartifact22の通常Drive/protocol全162件がそれぞれ成功、ignored/失敗/timeout 0。`t845-drive-real-web-2` は別途opt-inの実SQLite/FeatureStorage/loopback Server→production Web Drive adapterで1成功（5.36秒）。通常suiteでignoredだったこの1件を通常集計から除去せず、追加選択として扱う。Runtime spawnはfixtureであり、画面E2Eではない。
+
+### 7件の残余と受入条件の到達範囲
+
+baseline一致だけを理由に免除せず、失敗点から確認できる範囲を分ける。
+
+| 残余 | 到達した境界と本件との関係 | 未確認のまま残すもの |
+| --- | --- | --- |
+| private chat 2件・public messaging 1件 | wrong-assigneeのRuntime control probeが403となり、共通control観測のUnknownを保持した。Repository/Workdir/Drive/configのdomain callerではない | 文言assertがadapter内でpanicし、その後のchat/assignmentの実往復はtimeout。本件のdomain非再送テストで、この3件の後段を代替したとはしない |
+| rejected orchestrator spawn | 起動拒否後diagnosticの旧provider断片文言assert。T-840/T-843/T-814起動/control境界であり、新domain理由の発生点ではない | この試験後半のretry/offline確認。本件を通すためprovider本文の再公開を戻さない |
+| restored parent control | 列挙・input後の取消済みWorker照会が現在の具体的不存在説明を返し、旧文言assertが失敗 | 当該assert以降。Repository/Workdir生成型のconsumer確認を親子control全体の成功とはしない |
+| unset Subject MCP activation | discovery開始前にFeatureLifecycleの403認可拒否 | 意図したMCP理由への到達。この認可拒否を回避してdomain試験へ進めない |
+| failed Subject spawn occupancy | string-only startup fixtureがUnknownで、旧Rejected期待に不一致 | このfixtureでの後続occupancy/proof検証。UnknownをRejectedへ変えることは本件の受入条件に反する |
+
+本件のHTTP/consumer/保存と復旧条件は、別の成功した登録試験で確認する。例として `configuration_http_problem_preserves_catalog_conflict_owner_visibility_and_durable_state`、`publication_http_connects_adoption_dispatch_projection_runtime_and_read_only_lookup`、`publication_registry_failure_preserves_committed_receipt_and_never_resends_on_lookup_or_replay`、`workdir_operation_errors_preserve_typed_public_status_and_code`、`accepted_stop_http_keeps_cleanup_failure_separate_and_does_not_retry_stop_or_close`、`abandoned_close_failure_preserves_session_cause_and_never_dispatches_directory_removal`、`external_grant_owned_unknown_survives_reopen_without_get_or_restart_redispatch`、`detach_compensation_preserves_recreated_same_alias_connection_and_original_session_cause` が全Server台帳で成功している。Web adapter/strict parser・表示は下記のWeb証拠と組み合わせ、上表の7件自体を成功とは扱わない。
+
+`t845-composition-web-validation-1` は現合成sourceでWeb check 0 errors/warnings、864 unit・823 component成功、build成功、28.224秒、exit 0/sourceSame。目視は `t837-composition-visual-review.json` の38画像・6 sheetを実装者自身が再閲覧した。以後render/fixture/CSS/依存は不変、generated差分は6 TSの型宣言のみであり、この範囲で再利用する。実Backend永続効果、7件の後段、全domainのBrowser操作E2Eの証拠とはしない。`t845-composition-doc-doctest-1` は関連13 packageのdoc生成と、libraryを持つ12 packageのdoctest選択がexit 0/sourceSame。登録doctestは各0件であり、実行例の追加成功件数には含めない。
+
+### 容量整理と残る判断
+
+利用者の容量整理指示に対し、自Workdirの旧incrementalだけを実削除した。`cache-cleanup-20261107T0833Z/{plan,retained-before,result}.json` に全1,132対象（旧unit 1,043・旧session 89）と保持inventory/証拠hash照合を保存。targetは238,319,665,152→81,070,227,456 B、回収157,249,437,696 B、filesystem空き46,600,257,536→203,800,150,016 B。最新123 unitと全binary/依存/fingerprint/ログ/画像、source/未commit差分は保持・不変。全clean・他Workdir・共有環境・稼働processは操作していない。
+
+`t845-composition-final-root-static-1` は最終6 test bodyと本記録を含むsnapshotでroot `cargo check --offline --locked -j2`、`cargo fmt --all -- --check`、`git diff --check HEAD`、状態契約命名検査が13.610秒・exit 0/sourceSame（596 matching、0 unapproved、0 stale）。既存dead-code/ts-rs warningは残る。公開provider exact、同MRの直属fresh全要件review/verdictは別の証拠として確認する。この記録は残余の免除、全要件合格、採用・配備・Ticket完了を主張しない。

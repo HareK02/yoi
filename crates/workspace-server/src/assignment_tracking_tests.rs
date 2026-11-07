@@ -454,7 +454,7 @@ fn tracking_store_real_schema91_to92_retains_queue_cases_principals_audit_receip
             .iter()
             .map(|m| m.version)
             .collect::<Vec<_>>(),
-        (92..=113).chain([122, 123, 124, 125, 126, 127, 128]).collect::<Vec<_>>()
+        (92..=113).chain([122, 123, 124, 125, 126, 127, 128, 129]).collect::<Vec<_>>()
     );
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store

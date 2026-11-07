@@ -1787,12 +1787,31 @@ mod tests {
         }
         fn assert_preserved(conn: &Connection, saved: &[SavedTable]) -> crate::Result<()> {
             for (table, columns, before) in saved {
+                if table == "typed_ticket_orchestration_plans"
+                    && !conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                        [table],
+                        |row| row.get::<_, bool>(0),
+                    )?
+                {
+                    assert!(
+                        before.is_empty(),
+                        "this Journal fixture has no Plan memos to retire"
+                    );
+                    ticket::verify_sqlite_ticket_schema(conn)?;
+                    continue;
+                }
                 let after = rows(conn, table, columns)?;
-                if table == "__yoi_schema_migrations" {
+                if table == "__yoi_schema_migrations" || table == "ticket_schema_migrations" {
                     assert!(
                         after.starts_with(before),
-                        "the complete old ledger, including applied_at, must remain a prefix"
+                        "the complete old {table} ledger, including applied_at, must remain a prefix"
                     );
+                    if table == "ticket_schema_migrations" && after.len() != before.len() {
+                        assert_eq!(after.len(), before.len() + 1);
+                        assert_eq!(after.last().unwrap()[0], Value::Integer(17));
+                        ticket::verify_sqlite_ticket_schema(conn)?;
+                    }
                 } else {
                     assert_eq!(&after, before, "old columns and values changed in {table}");
                 }
