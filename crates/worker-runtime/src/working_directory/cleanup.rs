@@ -7,7 +7,8 @@
 //! identity only and report CleanupPending/unknown, not current cleanliness or removal permission.
 //!
 //! The cleanup walker never reads ordinary file bodies or computes content digests. It records
-//! device/inode, type, regular-file executable bits, and size/nanosecond mtime for files and symlinks.
+//! device/inode, type, regular-file executable bits, and size/nanosecond mtime for non-directory
+//! entries, including FIFOs and Unix sockets. IPC endpoints are never opened for I/O or connected.
 //! Directories retain identity/type only because child unlink changes their timestamps. Symlink
 //! targets are neither read nor followed. This is metadata protection, not byte equality:
 //! same-size writes restoring mtime are not guaranteed to be detected. Normal Git inspection may
@@ -735,7 +736,7 @@ mod linux {
     use std::ffi::{CString, OsStr};
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     #[repr(C)]
     struct OpenHow {
@@ -916,7 +917,16 @@ mod linux {
         io_observation::record(io_observation::Event::EntryInspection);
         let file = open(dir, name, libc::O_PATH)?;
         let metadata = file.metadata()?;
-        if !metadata.is_file() && !metadata.is_dir() && !metadata.file_type().is_symlink() {
+        let kind = metadata.file_type();
+        // O_PATH inspects IPC entries without opening a FIFO stream or connecting
+        // to a socket. They are unlinked, never traversed, under the same identity
+        // and mount checks as regular entries; their type alone is not occupancy.
+        if !kind.is_file()
+            && !kind.is_dir()
+            && !kind.is_symlink()
+            && !kind.is_fifo()
+            && !kind.is_socket()
+        {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         Ok(Entry {
@@ -1161,6 +1171,91 @@ pub(super) mod tests {
         let materializer = RuntimeGitMaterializer::new(runtime.path());
         let binding = materializer.create(&request(repo.path())).unwrap();
         (runtime, materializer, binding)
+    }
+
+    fn create_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-terminated path inside the isolated test directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn cleanup_unlinks_fifo_and_socket_without_opening_or_connecting() {
+        use std::os::unix::net::UnixListener;
+        for retry in [false, true] {
+            let (runtime, materializer, binding) = fixture();
+            fs::write(binding.root.join(".git/info/exclude"), "target/\n").unwrap();
+            let output = binding.root.join("target");
+            fs::create_dir(&output).unwrap();
+            let fifo = output.join("ready.fifo");
+            let socket = output.join("service.sock");
+            create_fifo(&fifo);
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut watch = BodyWatch::new(&[fifo, socket]);
+            let id = &binding.working_directory.id;
+            if retry {
+                let (result, audit) =
+                    io_observation::observe(Some(1), || materializer.cleanup_working_directory(id));
+                assert_eq!(
+                    result.unwrap_err().code,
+                    "working_directory_cleanup_permission_denied"
+                );
+                assert_eq!(audit.unlinks, 1);
+                assert_eq!(audit.entry_readable_opens, 0);
+            }
+            drop(materializer);
+            let materializer = RuntimeGitMaterializer::new(runtime.path());
+            let (result, audit) =
+                io_observation::observe(None, || materializer.cleanup_working_directory(id));
+            assert_eq!(
+                result.unwrap().summary.status,
+                WorkingDirectoryStatusKind::NotFound
+            );
+            assert!(!binding.working_directory_root.exists());
+            assert_eq!(audit.entry_readable_opens, 0);
+            watch.assert_no_body_access();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_preserves_replaced_fifo_and_socket_before_unlink() {
+        use std::os::unix::net::UnixListener;
+        for socket in [false, true] {
+            let (runtime, materializer, binding) = fixture();
+            fs::write(binding.root.join(".git/info/exclude"), "target/\n").unwrap();
+            let output = binding.root.join("target");
+            fs::create_dir(&output).unwrap();
+            let path = output.join("endpoint");
+            let _original = if socket {
+                Some(UnixListener::bind(&path).unwrap())
+            } else {
+                create_fifo(&path);
+                None
+            };
+            let error = remove_with_eraser(
+                &materializer,
+                &binding.working_directory.id,
+                |tree, relative, entries| {
+                    fs::rename(&path, runtime.path().join("original-endpoint")).unwrap();
+                    let _replacement = if socket {
+                        Some(UnixListener::bind(&path).unwrap())
+                    } else {
+                        create_fifo(&path);
+                        None
+                    };
+                    erase(tree, relative, entries)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "working_directory_cleanup_changes_present");
+            assert!(path.symlink_metadata().is_ok());
+        }
     }
 
     pub(crate) fn fail_once(materializer: &RuntimeGitMaterializer, id: &str) {
