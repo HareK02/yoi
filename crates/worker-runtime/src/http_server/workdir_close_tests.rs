@@ -12,7 +12,7 @@ use crate::execution::{
 use crate::working_directory::WorkingDirectoryDiagnostic;
 use axum::body::to_bytes;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use tokio::sync::{Notify, Semaphore};
 use tower::ServiceExt;
@@ -27,6 +27,9 @@ struct CloseProvider {
     fail_first: bool,
     entered: Notify,
     release: Semaphore,
+    hold_stat: AtomicBool,
+    stat_entered: Notify,
+    stat_release: Semaphore,
 }
 
 struct AttemptGuard<'a> {
@@ -58,6 +61,10 @@ impl WorkdirSession for CloseProvider {
         &self,
         request: workdir::StatRequest,
     ) -> Result<workdir::StatResult, WorkdirError> {
+        if self.hold_stat.swap(false, Ordering::SeqCst) {
+            self.stat_entered.notify_one();
+            self.stat_release.acquire().await.unwrap().forget();
+        }
         self.local.stat(request).await
     }
     async fn read(
@@ -230,6 +237,9 @@ impl Fixture {
             fail_first,
             entered: Notify::new(),
             release: Semaphore::new(0),
+            hold_stat: AtomicBool::new(false),
+            stat_entered: Notify::new(),
+            stat_release: Semaphore::new(0),
         });
         let runtime = Runtime::with_execution_backend(
             RuntimeOptions::default(),
@@ -241,7 +251,11 @@ impl Fixture {
         let router = runtime_http_router(runtime.clone(), "probe-token".into());
         let opened = router
             .clone()
-            .oneshot(request("POST", "/v1/working-directories/w/sessions", "{}"))
+            .oneshot(request(
+                "POST",
+                "/v1/working-directories/w/sessions",
+                &serde_json::to_string(&OpenWorkdirSessionRequest::default()).unwrap(),
+            ))
             .await
             .unwrap();
         assert_eq!(opened.status(), StatusCode::OK);
@@ -294,6 +308,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         // Let a detached close finish even if a test assertion unwinds.
         self.provider.release.add_permits(1);
+        self.provider.stat_release.add_permits(1);
     }
 }
 
@@ -412,4 +427,135 @@ async fn provider_close_error_retains_session_and_runtime_guard_for_retry() {
         StatusCode::NO_CONTENT
     );
     assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_before_delayed_open_fences_only_the_exact_session_identity() {
+    let fixture = Fixture::new(false, false).await;
+    let delayed = OpenWorkdirSessionRequest::default();
+    let delayed_path = format!("/v1/workdir-sessions/{}", delayed.session_id.as_str());
+    let close = fixture
+        .router
+        .clone()
+        .oneshot(request("DELETE", &delayed_path, ""))
+        .await
+        .unwrap();
+    assert_eq!(close.status(), StatusCode::NO_CONTENT);
+    let opened = fixture
+        .router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/working-directories/w/sessions",
+            &serde_json::to_string(&delayed).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    // A close for an unknown/later ID did not touch the already-live session.
+    fixture.assert_busy();
+    assert_eq!(fixture.close().await.status(), StatusCode::NO_CONTENT);
+    fixture.runtime.cleanup_working_directory("w").unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_open_reuses_one_session_and_closed_open_cannot_resurrect_use() {
+    let fixture = Fixture::new(false, false).await;
+    let session_id = WorkdirSessionId::new(fixture.path.rsplit('/').next().unwrap()).unwrap();
+    let open = OpenWorkdirSessionRequest {
+        session_id,
+        owner_worker_id: None,
+    };
+    for _ in 0..2 {
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/working-directories/w/sessions",
+                &serde_json::to_string(&open).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(fixture.close().await.status(), StatusCode::NO_CONTENT);
+    let response = fixture
+        .router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/working-directories/w/sessions",
+            &serde_json::to_string(&open).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 1);
+    fixture.runtime.cleanup_working_directory("w").unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_operation_waiter_keeps_admitted_use_until_provider_completion() {
+    let fixture = Fixture::new(false, false).await;
+    fixture.provider.hold_stat.store(true, Ordering::SeqCst);
+    let request = request(
+        "POST",
+        &format!("{}/operations", fixture.path),
+        r#"{"operation":{"operation":"stat","request":{"path":"hello.txt"}}}"#,
+    );
+    let operation = tokio::spawn(fixture.router.clone().oneshot(request));
+    bounded(fixture.provider.stat_entered.notified()).await;
+    operation.abort();
+    assert!(operation.await.unwrap_err().is_cancelled());
+    let mut close = Box::pin(fixture.close());
+    assert_pending(close.as_mut()).await;
+    fixture.assert_busy();
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 0);
+    fixture.assert_operations_unavailable().await;
+    fixture.provider.stat_release.add_permits(1);
+    assert_eq!(bounded(close).await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 1);
+    fixture.runtime.cleanup_working_directory("w").unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn admission_capacity_never_evicts_close_receipts_or_prevents_live_close() {
+    let fixture = Fixture::new(false, false).await;
+    let mut first = None;
+    for _ in 1..WorkdirSessionAdmission::CAPACITY {
+        let open = OpenWorkdirSessionRequest::default();
+        let path = format!("/v1/workdir-sessions/{}", open.session_id.as_str());
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(request("DELETE", &path, ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        first.get_or_insert(open);
+    }
+    let overflow = OpenWorkdirSessionRequest::default();
+    let path = format!("/v1/workdir-sessions/{}", overflow.session_id.as_str());
+    let response = fixture
+        .router
+        .clone()
+        .oneshot(request("DELETE", &path, ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response = fixture
+        .router
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/working-directories/w/sessions",
+            &serde_json::to_string(&first.unwrap()).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fixture.close().await.status(), StatusCode::NO_CONTENT);
+    fixture.runtime.cleanup_working_directory("w").unwrap();
 }

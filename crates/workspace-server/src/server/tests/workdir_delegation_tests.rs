@@ -180,7 +180,7 @@ async fn backend_delegation_reaches_external_provider_resolution() {
 #[tokio::test]
 async fn backend_delegation_reaches_remote_repository_resolution() {
     use workdir::http::{
-        OpenWorkdirSessionResponse, RemoteWorkdirSession, WorkdirSessionId,
+        OpenWorkdirSessionRequest, OpenWorkdirSessionResponse, RemoteWorkdirSession,
         WorkdirSessionOperationRequest,
     };
     let root = fixture();
@@ -193,11 +193,11 @@ async fn backend_delegation_reaches_remote_repository_resolution() {
     let app = Router::new()
         .route(
             "/v1/working-directories/{id}/sessions",
-            axum::routing::post(move || {
+            axum::routing::post(move |Json(request): Json<OpenWorkdirSessionRequest>| {
                 let workdir_id = response_id.clone();
                 async move {
                     Json(OpenWorkdirSessionResponse {
-                        session_id: WorkdirSessionId::new("delegation-session").unwrap(),
+                        session_id: request.session_id,
                         workdir_id,
                         capabilities: Caps::ALL,
                         environment: workdir::WorkdirSessionEnvironment::root(Caps::ALL),

@@ -94,11 +94,14 @@ impl Harness {
             runtime: Runtime::new_memory(),
             local_token: None,
             workspace_auth: Some(Arc::new(workspace_test_auth(vec![trust.clone()]))),
+            closed_workdir_sessions: Default::default(),
             workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
                 "session-transport".into(),
                 RuntimeHttpWorkdirSession {
                     owner: RuntimeWorkspaceScope::new("workspace-a", "https://backend.test"),
                     session: session.clone(),
+                    owner_worker_id: None,
+                    operations: Default::default(),
                     close_attempt: None,
                 },
             )]))),
@@ -154,7 +157,10 @@ impl Harness {
             base,
             authorization.clone(),
             Workdir::new("wd-transport").id().clone(),
-            OpenWorkdirSessionRequest::default(),
+            OpenWorkdirSessionRequest {
+                session_id: WorkdirSessionId::new("session-transport").unwrap(),
+                owner_worker_id: None,
+            },
         )
         .await
         .unwrap();
@@ -378,7 +384,10 @@ async fn real_http_spawn_failure_preserves_safe_cause_counts_and_terminal_replay
                 harness.operation_url.join("/").unwrap(),
                 harness.authorization.clone(),
                 Workdir::new("wd-transport").id().clone(),
-                OpenWorkdirSessionRequest::default(),
+                OpenWorkdirSessionRequest {
+                    session_id: WorkdirSessionId::new("session-transport").unwrap(),
+                    owner_worker_id: None,
+                },
             )
             .await
             .unwrap(),

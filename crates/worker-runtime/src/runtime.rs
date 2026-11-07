@@ -137,7 +137,7 @@ fn workdir_operation_busy(id: &str, action: &str, blocking: &WorkdirOperation) -
 }
 
 /// Workspace-scoped Runtime authorization context supplied by a trusted backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct RuntimeWorkspaceScope {
     pub workspace_id: String,
     pub server_id: String,
@@ -1086,10 +1086,12 @@ impl Runtime {
                     .get(&worker_ref.worker_id)
                     .is_some_and(|worker| {
                         worker.belongs_to_workspace(&scope.workspace_id)
-                            && worker.workdir_attachments.iter().any(|attachment| {
+                            && (worker.workdir_attachments.iter().any(|attachment| {
                                 attachment.working_directory.summary.working_directory_id
                                     == working_directory_id
-                            })
+                            }) || worker.logical_workdir_attachments.iter().any(|attachment| {
+                                attachment.working_directory_id == working_directory_id
+                            }))
                     });
                 if !owns_workdir {
                     return Err(RuntimeError::WorkingDirectory(

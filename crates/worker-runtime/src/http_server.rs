@@ -16,7 +16,7 @@ mod runtime_management_api;
 #[cfg(test)]
 mod workdir_close_tests;
 
-use crate::auth::{RuntimeAuthContext, new_token_id, unix_now_seconds};
+use crate::auth::{RuntimeAuthContext, unix_now_seconds};
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, RepositoryRefObservationRequest, WorkerDetail,
     WorkerLifecycleAck, WorkerSummary, WorkingDirectoryRepositoryAccessRequest,
@@ -257,6 +257,7 @@ fn runtime_http_router_with_auth_and_ssh_keyscan_program(
         local_token: local_token.map(Arc::<str>::from),
         workspace_auth: workspace_auth.map(Arc::new),
         workdir_sessions: Arc::new(Mutex::new(HashMap::new())),
+        closed_workdir_sessions: Default::default(),
         ssh_keyscan_program: Arc::new(ssh_keyscan_program),
     };
 
@@ -368,6 +369,7 @@ struct RuntimeHttpState {
     local_token: Option<Arc<str>>,
     workspace_auth: Option<Arc<WorkspaceRuntimeHttpAuth>>,
     workdir_sessions: Arc<Mutex<HashMap<String, RuntimeHttpWorkdirSession>>>,
+    closed_workdir_sessions: Arc<Mutex<WorkdirSessionAdmission>>,
     ssh_keyscan_program: Arc<PathBuf>,
 }
 
@@ -382,7 +384,68 @@ type RuntimeHttpWorkdirCloseResult = Result<(), RuntimeHttpWorkdirError>;
 struct RuntimeHttpWorkdirSession {
     owner: RuntimeWorkspaceScope,
     session: WorkdirSessionHandle,
+    owner_worker_id: Option<String>,
+    operations: Arc<tokio::sync::RwLock<()>>,
     close_attempt: Option<tokio::sync::watch::Receiver<Option<RuntimeHttpWorkdirCloseResult>>>,
+}
+
+// Closed IDs protect unknown opens only within their admission window. A
+// nondecreasing clock prevents a wall-clock rollback from reviving pruned IDs.
+// Reserve receipt capacity at admission: closing a live session cannot fail just
+// because unknown DELETEs consumed the budget in the meantime.
+#[derive(Default)]
+struct WorkdirSessionAdmission {
+    clock_ms: u64,
+    receipts: HashMap<(RuntimeWorkspaceScope, String), (u64, bool)>,
+}
+
+impl WorkdirSessionAdmission {
+    const CAPACITY: usize = 16_384;
+
+    fn now(&mut self) -> u64 {
+        self.clock_ms = self.clock_ms.max(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        );
+        self.receipts
+            .retain(|_, (deadline, _)| *deadline >= self.clock_ms);
+        self.clock_ms
+    }
+
+    fn deadline(&mut self, id: &WorkdirSessionId) -> Option<u64> {
+        let now = self.now();
+        id.admitted_deadline_ms(now)
+    }
+
+    fn reserve(
+        &mut self,
+        owner: RuntimeWorkspaceScope,
+        id: &WorkdirSessionId,
+        closed: bool,
+    ) -> Result<(), RuntimeHttpWorkdirError> {
+        let Some(deadline) = self.deadline(id) else {
+            return if closed {
+                Ok(())
+            } else {
+                Err(RuntimeHttpWorkdirError::invalid_request())
+            };
+        };
+        let key = (owner, id.as_str().to_owned());
+        if !self.receipts.contains_key(&key) && self.receipts.len() >= Self::CAPACITY {
+            return Err(RuntimeHttpWorkdirError::from(
+                workdir::WorkdirError::Unavailable(
+                    "Workdir session admission is at capacity".into(),
+                ),
+            ));
+        }
+        self.receipts
+            .entry(key)
+            .and_modify(|(_, was_closed)| *was_closed |= closed)
+            .or_insert((deadline, closed));
+        Ok(())
+    }
 }
 
 /// `GET /v1/runtime` response.
@@ -889,31 +952,63 @@ async fn open_workdir_session(
                 .ok_or_else(RuntimeHttpWorkdirError::invalid_request)
         })
         .transpose()?;
+    // Deadline validation and pruning share the admission fence with DELETE.
+    let mut closed = state
+        .closed_workdir_sessions
+        .lock()
+        .map_err(|_| RuntimeHttpWorkdirError::internal())?;
+    closed.now();
+    if closed
+        .receipts
+        .get(&(owner.clone(), request.session_id.as_str().to_owned()))
+        .is_some_and(|(_, closed)| *closed)
+    {
+        return Err(RuntimeHttpWorkdirError::not_found());
+    }
+    let mut sessions = state
+        .workdir_sessions
+        .lock()
+        .map_err(|_| RuntimeHttpWorkdirError::internal())?;
+    let session_id = request.session_id;
+    if let Some(record) = sessions.get(session_id.as_str()) {
+        if record.owner != owner
+            || record.session.workdir().id().as_str() != working_directory_id
+            || record.owner_worker_id != request.owner_worker_id
+            || record.close_attempt.is_some()
+        {
+            return Err(RuntimeHttpWorkdirError::not_found());
+        }
+        return Ok(Json(OpenWorkdirSessionResponse {
+            session_id,
+            workdir_id: record.session.workdir().id().clone(),
+            capabilities: record.session.capabilities(),
+            environment: record.session.environment(),
+        }));
+    }
+    closed.reserve(owner.clone(), &session_id, false)?;
     let session = state
         .runtime
         .open_workdir_session_scoped(&owner, &working_directory_id, owner_worker_ref.as_ref())
         .map_err(RuntimeHttpWorkdirError::runtime)?;
-    let session_id =
-        WorkdirSessionId::new(new_token_id().map_err(|_| RuntimeHttpWorkdirError::internal())?)
-            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
     let response = OpenWorkdirSessionResponse {
         session_id: session_id.clone(),
         workdir_id: session.workdir().id().clone(),
         capabilities: session.capabilities(),
         environment: session.environment(),
     };
-    state
-        .workdir_sessions
-        .lock()
-        .map_err(|_| RuntimeHttpWorkdirError::internal())?
-        .insert(
-            session_id.as_str().to_string(),
-            RuntimeHttpWorkdirSession {
-                owner,
-                session,
-                close_attempt: None,
-            },
-        );
+    tracing::debug!(session_id = session_id.as_str(), workdir_id = %working_directory_id,
+        owner_worker_id = ?request.owner_worker_id, workspace_id = %owner.workspace_id,
+        "Runtime Workdir session retained");
+    sessions.insert(
+        session_id.as_str().to_owned(),
+        RuntimeHttpWorkdirSession {
+            owner,
+            session,
+            owner_worker_id: request.owner_worker_id,
+            operations: Default::default(),
+            close_attempt: None,
+        },
+    );
     Ok(Json(response))
 }
 
@@ -925,7 +1020,7 @@ async fn run_workdir_session_operation(
 ) -> Result<Json<WorkdirSessionOperationResult>, RuntimeHttpWorkdirError> {
     let Json(request) = body.map_err(|_| RuntimeHttpWorkdirError::invalid_request())?;
     let owner = required_workdir_owner(auth)?;
-    let source = {
+    let (source, _operation) = {
         let sessions = state
             .workdir_sessions
             .lock()
@@ -934,31 +1029,42 @@ async fn run_workdir_session_operation(
             .get(&session_id)
             .filter(|record| record.owner == owner && record.close_attempt.is_none())
             .ok_or_else(RuntimeHttpWorkdirError::not_found)?;
-        record.session.clone()
+        let operation = record
+            .operations
+            .clone()
+            .try_read_owned()
+            .map_err(|_| RuntimeHttpWorkdirError::not_found())?;
+        (record.session.clone(), operation)
     };
-    let session = source.as_ref();
-    let operation = request.operation;
+    let result = tokio::spawn(async move {
+        let session = source.as_ref();
+        let _operation = _operation;
+        let operation = request.operation;
 
-    let result = match operation {
-        WorkdirSessionOperation::CommandOutput(request) if request.wait => {
-            let cursor = request.cursor;
-            let output = match tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                session.command_output(request),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_) => CommandOutput {
-                    chunks: Vec::new(),
-                    next_cursor: cursor,
-                    terminal: None,
-                },
-            };
-            WorkdirSessionOperationResult::CommandOutput(output)
-        }
-        operation => dispatch_workdir_session_operation(session, operation).await?,
-    };
+        let result = match operation {
+            WorkdirSessionOperation::CommandOutput(request) if request.wait => {
+                let cursor = request.cursor;
+                let output = match tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    session.command_output(request),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => CommandOutput {
+                        chunks: Vec::new(),
+                        next_cursor: cursor,
+                        terminal: None,
+                    },
+                };
+                WorkdirSessionOperationResult::CommandOutput(output)
+            }
+            operation => dispatch_workdir_session_operation(session, operation).await?,
+        };
+        Ok::<_, RuntimeHttpWorkdirError>(result)
+    })
+    .await
+    .map_err(|_| RuntimeHttpWorkdirError::internal())??;
     Ok(Json(result))
 }
 
@@ -969,6 +1075,10 @@ async fn close_workdir_session(
 ) -> Result<StatusCode, RuntimeHttpWorkdirError> {
     let owner = required_workdir_owner(auth)?;
     let mut completion = {
+        let mut closed = state
+            .closed_workdir_sessions
+            .lock()
+            .map_err(|_| RuntimeHttpWorkdirError::internal())?;
         let mut sessions = state
             .workdir_sessions
             .lock()
@@ -977,6 +1087,9 @@ async fn close_workdir_session(
             .get_mut(&session_id)
             .filter(|record| record.owner == owner)
         else {
+            if let Ok(id) = WorkdirSessionId::new(session_id.clone()) {
+                closed.reserve(owner, &id, true)?;
+            }
             return Ok(StatusCode::NO_CONTENT);
         };
         if let Some(completion) = &record.close_attempt {
@@ -986,15 +1099,27 @@ async fn close_workdir_session(
             record.close_attempt = Some(completion.clone());
             let session = record.session.clone();
             let registry = state.workdir_sessions.clone();
+            let receipts = state.closed_workdir_sessions.clone();
+            let operations = record.operations.clone();
+            let owner = record.owner.clone();
             // The task, not an HTTP waiter, owns provider teardown. In particular,
             // Local close marks itself closed before awaiting command teardown;
             // cancelling that future would make a later provider close a false ack.
             tokio::spawn(async move {
+                let _operations = operations.write().await;
                 let result = session.close().await.map_err(RuntimeHttpWorkdirError::from);
+                let mut receipts = receipts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let result = match registry.lock() {
                     Ok(mut sessions) => {
                         if result.is_ok() {
                             sessions.remove(&session_id);
+                            // Capacity was reserved at open. Expired IDs need no receipt.
+                            if let Ok(id) = WorkdirSessionId::new(session_id.clone()) {
+                                let _ = receipts.reserve(owner, &id, true);
+                            }
+                            tracing::debug!(session_id = %session_id, "Runtime Workdir provider close and use release confirmed");
                         } else if let Some(record) = sessions.get_mut(&session_id) {
                             record.close_attempt = None;
                         }
@@ -3144,11 +3269,14 @@ mod tests {
             runtime: Runtime::new_memory(),
             local_token: None,
             workspace_auth: Some(Arc::new(workspace_test_auth(vec![trust.clone()]))),
+            closed_workdir_sessions: Default::default(),
             workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
                 "session-1".into(),
                 RuntimeHttpWorkdirSession {
                     owner: RuntimeWorkspaceScope::new("workspace-a", "https://backend.test"),
                     session,
+                    owner_worker_id: None,
+                    operations: Default::default(),
                     close_attempt: None,
                 },
             )]))),
@@ -3458,11 +3586,14 @@ mod tests {
             .expect("runtime"),
             local_token: Some(Arc::from("token")),
             workspace_auth: None,
+            closed_workdir_sessions: Default::default(),
             workdir_sessions: Arc::new(Mutex::new(HashMap::from([(
                 "session-1".to_string(),
                 RuntimeHttpWorkdirSession {
                     owner: owner.clone(),
                     session: session.clone(),
+                    owner_worker_id: None,
+                    operations: Default::default(),
                     close_attempt: None,
                 },
             )]))),
