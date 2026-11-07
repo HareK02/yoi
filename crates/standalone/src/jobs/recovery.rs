@@ -191,10 +191,7 @@ impl StandaloneJobs {
         attempt: &str,
     ) -> Result<(), JobServiceError> {
         let saved = self.get(id)?;
-        if saved.attempt.attempt_id != attempt
-            || saved.domain_grant.is_some()
-            || saved.version_stopped
-        {
+        if saved.attempt.attempt_id != attempt || saved.domain_grant.is_some() {
             return Err(JobStoreError::AttemptMismatch.into());
         }
         // A client may have cancelled or started this exact attempt since capture.

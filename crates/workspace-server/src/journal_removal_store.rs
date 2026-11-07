@@ -578,7 +578,7 @@ mod tests {
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![124, 125, 126, 127, 128, 129]
+            vec![124, 125, 126, 127, 128, 129, 130]
         );
         assert_eq!(
             current_schema_version(&conn).unwrap(),

@@ -433,8 +433,8 @@ async fn consolidation_admission_duplicate_notifications_preserve_deadline_and_n
 }
 
 #[tokio::test]
-async fn consolidation_admission_capacity_wait_rechecks_retirement_binding_and_version_stop() {
-    for case in ["erased", "version_stopped", "inactive", "released_writer"] {
+async fn consolidation_admission_capacity_wait_rechecks_retirement_and_binding() {
+    for case in ["erased", "inactive", "released_writer"] {
         let fixture = AdmissionFixture::new();
         fixture.hold_capacity().await;
         let before = fixture.reserve();
@@ -448,15 +448,6 @@ async fn consolidation_admission_capacity_wait_rechecks_retirement_binding_and_v
                         &before.request.job_id,
                         &before.input_digest,
                         crate::jobs::JobInputRetirementReason::ExplicitErasure,
-                    )
-                    .unwrap();
-            }
-            "version_stopped" => {
-                rusqlite::Connection::open(&fixture.body.jobs_path)
-                    .unwrap()
-                    .execute(
-                        "INSERT INTO job_version_stops(job_id) VALUES(?1)",
-                        [&before.request.job_id],
                     )
                     .unwrap();
             }

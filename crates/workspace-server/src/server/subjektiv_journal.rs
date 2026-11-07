@@ -40,7 +40,7 @@ pub(super) fn host(
             Error::WorkspacePermissionDenied("Journal Session attribution mismatch".into())
         })?;
     let host = JournalHostContext::validated_session(store, attribution).map_err(domain)?;
-    // Legacy bindings are retained history, not authority to renew a writer on recovery.
+    // The exact frozen writer binding is required even when the Session still exists.
     if grant.binding_id.is_empty() || host.writer_binding_id() != Some(grant.binding_id.as_str()) {
         return Err(Error::WorkspacePermissionDenied(
             "Journal Job writer generation does not match its frozen grant".into(),
@@ -55,7 +55,7 @@ pub(super) fn prepare(api: &WorkspaceApi, reservation: &BackendJobReservation) -
     let Some(grant) = &reservation.job.request.grants.subjektiv_journal else {
         return Ok(());
     };
-    require_current_job(api, &reservation.job)?;
+    require_job_workspace(api, &reservation.job)?;
     let store = store(api)?;
     let attribution = store
         .session_attribution(&grant.session_id)
@@ -96,43 +96,6 @@ pub(super) fn prepare(api: &WorkspaceApi, reservation: &BackendJobReservation) -
     Ok(())
 }
 
-fn legacy_descriptor(request: &BackendJobRequest) -> bool {
-    let Some(grant) = request.grants.subjektiv_journal.as_ref() else {
-        return false;
-    };
-    let Some(object) = request.input.as_object() else {
-        return false;
-    };
-    object.len() == 2
-        && object.get("journal_id").and_then(|v| v.as_str()) == Some(&grant.journal_id)
-        && object.get("selected_ranges")
-            == serde_json::to_value(&grant.selected_ranges).ok().as_ref()
-}
-
-/// Reject descriptor-only current admission without fetching its body or retiring evidence.
-/// Historical migration is owned by the schema transaction, never by ordinary dispatch.
-pub(super) fn migrate_reserved_legacy(
-    api: &WorkspaceApi,
-    reservation: &BackendJobReservation,
-) -> Result<bool> {
-    require_current_job(api, &reservation.job)?;
-    if !legacy_descriptor(&reservation.job.request) {
-        return Ok(false);
-    }
-    // Descriptor input is never materialized from a live Session. Historical migration
-    // owns old rows; a malformed current admission fails without retiring its evidence.
-    api.store.finish_backend_job_attempt(
-        api.workspace_id(),
-        &reservation.job.request.job_id,
-        &reservation.attempt.attempt_id,
-        BackendJobAttemptState::Failed,
-        "journal_descriptor_invalidated",
-        "Descriptor-only Journal input cannot execute; saved input and checkpoints retained",
-        &Utc::now().to_rfc3339(),
-    )?;
-    Ok(true)
-}
-
 fn saved_input(request: &BackendJobRequest, grant: &SubjektivJournalGrant) -> Result<JournalInput> {
     let input = JournalInput::decode(&request.input).map_err(domain)?;
     if input.subject_id != grant.subject_id
@@ -166,7 +129,7 @@ fn live(
         .store
         .get_backend_job(api.workspace_id(), &binding.job_id)?
         .ok_or_else(|| Error::WorkspacePermissionDenied("Journal Job missing".into()))?;
-    require_current_job(api, &job)?;
+    require_job_workspace(api, &job)?;
     job.load_executable_request()?;
     let attempt = api
         .store
@@ -837,12 +800,6 @@ fn dispatch_with_capture(
         if job.state == BackendJobState::Pending {
             return Ok(());
         }
-        if api
-            .store
-            .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
-        {
-            return Ok(());
-        }
         require_job_effects_ended(api, &job)?;
         // Terminal outcome, execution shutdown and coverage are independent evidence.
         store
@@ -866,13 +823,6 @@ fn dispatch_with_capture(
                 .is_none_or(|g| g.journal_id != journal_id)
             {
                 continue;
-            }
-            if api
-                .store
-                .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
-            {
-                // A migrated prefix must not be reselected into an implicitly new Job.
-                return Ok(());
             }
             if job.state == BackendJobState::Pending {
                 return Ok(());
@@ -2610,17 +2560,11 @@ pub(super) fn session_erased(api: &WorkspaceApi, request: &BackendJobRequest) ->
         .map_err(domain)
 }
 
-/// A historical migration receipt permanently excludes this Job from normal execution.
-/// The saved cause alone is insufficient: callers cannot erase the migration boundary by
-/// changing a failure string or by submitting a retained, pre-migration snapshot.
-fn require_current_job(api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()> {
-    if job.workspace_id != api.workspace_id()
-        || api
-            .store
-            .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
-    {
-        return Err(Error::InvalidInput(
-            "Migrated Journal Jobs cannot resume or acquire another attempt".into(),
+/// Journal authority is confined to the authenticated Workspace.
+fn require_job_workspace(api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()> {
+    if job.workspace_id != api.workspace_id() {
+        return Err(Error::WorkspacePermissionDenied(
+            "Journal Job Workspace mismatch".into(),
         ));
     }
     Ok(())
@@ -2634,7 +2578,13 @@ fn can_resume_partial(job: &BackendJobRecord) -> bool {
         )
         && job.input_disposition == crate::backend_job::JobInputDisposition::Available
         && job.current_attempt < job.request.limits.max_attempts
-        && !legacy_descriptor(&job.request)
+        && job.load_executable_request().is_ok()
+        && job
+            .request
+            .grants
+            .subjektiv_journal
+            .as_ref()
+            .is_some_and(|grant| saved_input(&job.request, grant).is_ok())
 }
 
 /// Continue only the frozen partial Job whose actual termination initiated cleanup.
@@ -2794,12 +2744,6 @@ fn reconcile_attempt_under_gate(
         .store
         .get_backend_job(api.workspace_id(), &job.request.job_id)?
         .ok_or_else(|| Error::Store("Journal recovery Job missing".into()))?;
-    if api
-        .store
-        .backend_job_was_migrated(api.workspace_id(), &current_job.request.job_id)?
-    {
-        return Ok(());
-    }
     let current_attempt = api
         .store
         .get_backend_job_attempt(api.workspace_id(), &job.request.job_id, &attempt.attempt_id)?
@@ -3040,12 +2984,7 @@ pub(super) fn resume_recording_after_cleanup(
     else {
         return Ok(());
     };
-    if job.current_attempt != ended.attempt
-        || !can_resume_partial(&job)
-        || api
-            .store
-            .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
-    {
+    if job.current_attempt != ended.attempt || !can_resume_partial(&job) {
         return Ok(());
     }
     let Some(grant) = job.request.grants.subjektiv_journal.as_ref() else {
@@ -3086,9 +3025,6 @@ fn reconcile_session_jobs(
                 .store
                 .get_backend_job_attempt(api.workspace_id(), &job.request.job_id, &id)?
                 .ok_or_else(|| Error::Store("Journal current attempt missing".into()))?;
-            let migrated = api
-                .store
-                .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?;
             if (erased || released) && !attempt.state.terminal() {
                 let (category, detail) = if erased {
                     (
@@ -3110,7 +3046,7 @@ fn reconcile_session_jobs(
                     detail,
                     &Utc::now().to_rfc3339(),
                 )?;
-            } else if !erased && !released && !migrated && job.state == BackendJobState::Pending {
+            } else if !erased && !released && job.state == BackendJobState::Pending {
                 if let Err(error) = reconcile_attempt(api, job, &attempt) {
                     api.retain_backend_job_recovery(
                         &attempt, "journal_receipt_reconciliation", &error.to_string(),
@@ -3236,12 +3172,6 @@ pub(super) fn recover_attempts(api: &WorkspaceApi) -> Result<()> {
                 .store
                 .get_backend_job(api.workspace_id(), &attempt.job_id)?
                 .ok_or_else(|| Error::Store("Retained Journal recovery Job missing".into()))?;
-            if api
-                .store
-                .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
-            {
-                continue;
-            }
             if let Err(error) = reconcile_attempt(api, &job, attempt) {
                 api.retain_backend_job_recovery(
                     attempt, "journal_receipt_reconciliation", &error.to_string(),
@@ -3352,6 +3282,28 @@ mod recovery_input_tests {
     }
 
     #[test]
+    fn journal_request_requires_frozen_writer_binding() {
+        let request = snapshot_request();
+        request.validate().unwrap();
+        let mut wire = serde_json::to_value(&request).unwrap();
+        wire["grants"]["subjektiv_journal"]
+            .as_object_mut()
+            .unwrap()
+            .remove("binding_id");
+        assert!(serde_json::from_value::<BackendJobRequest>(wire).is_err());
+        for binding in ["", " ", "writer\nother"] {
+            let mut invalid = request.clone();
+            invalid
+                .grants
+                .subjektiv_journal
+                .as_mut()
+                .unwrap()
+                .binding_id = binding.into();
+            assert!(invalid.validate().is_err(), "{binding:?}");
+        }
+    }
+
+    #[test]
     fn saved_body_rejects_reselection_descriptor_and_corruption() {
         let request = snapshot_request();
         let grant = request.grants.subjektiv_journal.as_ref().unwrap();
@@ -3372,7 +3324,6 @@ mod recovery_input_tests {
             "journal_id": grant.journal_id,
             "selected_ranges": grant.selected_ranges,
         });
-        assert!(legacy_descriptor(&descriptor));
         assert!(saved_input(&descriptor, grant).is_err());
         let mut corrupt = request.clone();
         let mut input: JournalInput = serde_json::from_value(corrupt.input.clone()).unwrap();
@@ -3382,7 +3333,6 @@ mod recovery_input_tests {
         *text = "substituted new input".into();
         corrupt.input = serde_json::to_value(input).unwrap();
         assert!(saved_input(&corrupt, grant).is_err());
-        assert!(!legacy_descriptor(&corrupt));
     }
 
     #[test]
@@ -3408,7 +3358,7 @@ mod recovery_input_tests {
         };
         assert!(can_resume_partial(&job));
         for cause in [
-            "version_upgrade_execution_aborted",
+            "unrecognized_failure",
             "journal_body_released",
             "journal_session_erased",
             "execution_failed",
@@ -3420,12 +3370,30 @@ mod recovery_input_tests {
         for disposition in [
             crate::backend_job::JobInputDisposition::Reclaimed,
             crate::backend_job::JobInputDisposition::Erased,
-            crate::backend_job::JobInputDisposition::Invalidated,
         ] {
             let mut retired = job.clone();
             retired.input_disposition = disposition;
             assert!(!can_resume_partial(&retired));
         }
+        let mut corrupt = job.clone();
+        corrupt.request.input["capture"]["entries"][0]["body"]["text"] =
+            serde_json::json!("changed body");
+        assert!(!can_resume_partial(&corrupt));
+        // A consistent generic fingerprint cannot make a descriptor into executable Journal input.
+        let mut descriptor = job.clone();
+        let grant = descriptor
+            .request
+            .grants
+            .subjektiv_journal
+            .as_ref()
+            .unwrap();
+        descriptor.request.input = serde_json::json!({
+            "journal_id": grant.journal_id,
+            "selected_ranges": grant.selected_ranges,
+        });
+        descriptor.input_digest = descriptor.request.input_digest().unwrap();
+        descriptor.intent_fingerprint = descriptor.request.fingerprint().unwrap();
+        assert!(!can_resume_partial(&descriptor));
         let mut exhausted = job;
         exhausted.current_attempt = exhausted.request.limits.max_attempts;
         assert!(!can_resume_partial(&exhausted));

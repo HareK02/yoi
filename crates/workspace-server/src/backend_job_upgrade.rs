@@ -1,4 +1,8 @@
-//! One-shot retirement of Jobs that predate the current execution contract.
+//! Frozen schema-123 retirement boundary, never the current fresh/runtime schema.
+//! Schema 130 removes these records and guards through `backend_job_current`.
+//! This module remains only for recognized historical migration prefixes.
+//!
+//! One-shot retirement of Jobs that predate the schema-123 execution contract.
 //!
 //! The Workspace ordered migration owner must validate the retained storage
 //! family first, disable foreign keys BEFORE its exclusive transaction, call
@@ -17,10 +21,93 @@
 //! IDs and same-ID acceptance reconciliation are deliberately outside this cutover.
 use super::{Connection, Error, Result};
 
-/// Final history/guards. Fresh composition calls `install_fresh`, which also
-/// installs EMPTY raw evidence; this SQL alone is not the full fresh schema.
+/// Frozen schema-123 history/guards; old fresh-baseline fixtures also include
+/// EMPTY raw evidence. Neither program is part of current fresh composition.
 pub(super) const MIGRATION_NAME: &str = "Backend Job execution retirement and owned reconciliation";
 pub(super) const SCHEMA: &str = include_str!("backend_job_upgrade.sql");
+
+/// Exact schema-123 recovery extension. Do not derive a historical reference from
+/// evolving runtime DDL: schema 130 no longer has the legacy reconciliation guard.
+pub(super) const RECOVERY_SCHEMA: &str = r#"
+CREATE TRIGGER backend_job_allocation_precluded_no_insert
+BEFORE INSERT ON backend_job_attempts
+WHEN NEW.allocation_precluded_at IS NOT NULL
+BEGIN SELECT RAISE(ABORT,'allocation preclusion requires the Reserved transition'); END;
+CREATE TRIGGER backend_job_allocation_precluded_transition
+BEFORE UPDATE ON backend_job_attempts
+WHEN NEW.allocation_precluded_at IS NOT OLD.allocation_precluded_at AND (
+    OLD.allocation_precluded_at IS NOT NULL
+    OR OLD.state != 'reserved' OR NEW.state != 'failed'
+    OR OLD.runtime_id IS NOT NULL OR OLD.worker_id IS NOT NULL
+    OR OLD.runtime_run_id IS NOT NULL OR OLD.dispatched_at IS NOT NULL
+    OR NEW.runtime_id IS NOT NULL OR NEW.worker_id IS NOT NULL
+    OR NEW.runtime_run_id IS NOT NULL OR NEW.dispatched_at IS NOT NULL
+    OR NEW.allocation_precluded_at IS NOT NEW.completed_at
+    OR NEW.failure_category IS NULL OR length(trim(NEW.failure_category))=0
+)
+BEGIN SELECT RAISE(ABORT,'immutable pre-allocation rejection proof'); END;
+CREATE TRIGGER backend_job_allocation_precluded_no_rebind
+BEFORE UPDATE ON backend_job_attempts
+WHEN OLD.allocation_precluded_at IS NOT NULL AND (
+    NEW.state != 'failed' OR NEW.runtime_id IS NOT NULL OR NEW.worker_id IS NOT NULL
+    OR NEW.runtime_run_id IS NOT NULL OR NEW.dispatched_at IS NOT NULL
+    OR NEW.completed_at IS NOT OLD.completed_at
+)
+BEGIN SELECT RAISE(ABORT,'allocation was conclusively precluded'); END;
+CREATE TABLE backend_job_reconciliation (
+    workspace_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    cause TEXT NOT NULL CHECK(length(cause)>0),
+    detail TEXT NOT NULL,
+    next_action TEXT NOT NULL CHECK(length(next_action)>0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,job_id,attempt_id),
+    FOREIGN KEY(workspace_id,job_id,attempt_id) REFERENCES backend_job_attempts(workspace_id,job_id,attempt_id) ON DELETE CASCADE
+);
+CREATE TRIGGER backend_job_reconciliation_no_legacy
+BEFORE INSERT ON backend_job_reconciliation
+WHEN EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=NEW.workspace_id AND h.job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'pre-upgrade Backend Job cannot reconcile'); END;
+CREATE TABLE backend_job_execution_fences (
+    workspace_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    owner_json TEXT NOT NULL CHECK(json_valid(owner_json)),
+    history_json TEXT NOT NULL CHECK(json_valid(history_json)),
+    controller_json TEXT NOT NULL CHECK(json_valid(controller_json)),
+    host_json TEXT NOT NULL CHECK(json_valid(host_json)),
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,job_id,attempt_id),
+    FOREIGN KEY(workspace_id,job_id,attempt_id) REFERENCES backend_job_attempts(workspace_id,job_id,attempt_id) ON DELETE CASCADE
+);
+CREATE TRIGGER backend_job_execution_fence_immutable
+BEFORE UPDATE ON backend_job_execution_fences
+BEGIN SELECT RAISE(ABORT,'immutable exact execution fence'); END;
+CREATE TABLE backend_job_recovery_probes (
+    workspace_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    successful_writes INTEGER NOT NULL CHECK(successful_writes>0),
+    PRIMARY KEY(workspace_id,job_id,attempt_id),
+    FOREIGN KEY(workspace_id,job_id,attempt_id) REFERENCES backend_job_attempts(workspace_id,job_id,attempt_id) ON DELETE CASCADE
+);
+"#;
+/// Frozen schema-103 input rules used only by retained migration builders.
+pub(super) const INPUT_RETENTION_TRIGGERS: &str = r#"
+CREATE TRIGGER backend_job_identity_immutable BEFORE UPDATE OF
+    workspace_id, job_id, purpose, input_digest, input_ref, resource_key, intent_fingerprint ON backend_jobs
+BEGIN SELECT RAISE(ABORT, 'immutable Backend Job identity'); END;
+CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON backend_jobs
+WHEN (
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
+      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
+    AND json_type(NEW.request_json,'$.input') = 'null'
+) IS NOT TRUE
+BEGIN SELECT RAISE(ABORT, 'immutable Backend Job input retirement'); END;
+"#;
+
 pub(super) const FAILURE_CATEGORY: &str = "version_upgrade_execution_aborted";
 pub(super) const FAILURE_DETAIL: &str = "バージョン更新による実行打切り。旧Jobの再開・再試行は行わない。このFailedは実行停止・書込み失効・Journal完了・rollback・資源解放の証明ではない。";
 
@@ -228,8 +315,9 @@ fn require_transaction(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Fresh creation installs empty evidence and final guards, never captures or
-/// fails Jobs. The fresh canonical state CHECKs are supplied by the owner DDL.
+/// Historical fresh-baseline fixture only. Current creation never installs old
+/// evidence/guards, even empty ones; it composes the current recovery DDL directly.
+#[cfg(test)]
 pub(super) fn install_fresh(conn: &Connection) -> Result<()> {
     require_transaction(conn)?;
     conn.execute_batch(RAW_SCHEMA)?;
@@ -238,10 +326,11 @@ pub(super) fn install_fresh(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "ALTER TABLE backend_job_attempts ADD COLUMN allocation_precluded_at TEXT;",
     )?;
-    conn.execute_batch(super::backend_job_recovery_store::SCHEMA)?;
+    conn.execute_batch(RECOVERY_SCHEMA)?;
     verify(conn)
 }
 
+#[cfg(test)]
 pub(super) fn install_live_checks(conn: &Connection) -> Result<()> {
     for (table, old, new) in STATE_CHECKS {
         replace_state_check(conn, table, old, new)?;
@@ -383,7 +472,7 @@ pub(super) fn install(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "ALTER TABLE backend_job_attempts ADD COLUMN allocation_precluded_at TEXT;",
     )?;
-    conn.execute_batch(super::backend_job_recovery_store::SCHEMA)?;
+    conn.execute_batch(RECOVERY_SCHEMA)?;
     verify(conn)
 }
 

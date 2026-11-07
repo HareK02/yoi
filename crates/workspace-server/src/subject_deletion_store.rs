@@ -194,7 +194,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     }
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(include_str!("subject_deletion_schema.sql"))?;
-    install_notification_erasure(&tx)?;
+    install_notification_erasure(&tx, false)?;
     tx.execute(
         "INSERT INTO __yoi_schema_migrations(version,name) VALUES(105,?1)",
         [MIGRATION_NAME],
@@ -207,7 +207,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
 // Immutable notification evidence normally forbids deletion. The only exception
 // is a saved Subject deletion snapshot; erasure below still requires physical
 // Job Session Purge receipts. Updates remain forbidden, including payload edits.
-pub(super) fn install_notification_erasure(conn: &Connection) -> Result<()> {
+pub(super) fn install_notification_erasure(conn: &Connection, current_jobs: bool) -> Result<()> {
     for (trigger, table, predicate) in [
         (
             "notification_sources_no_delete",
@@ -250,6 +250,9 @@ pub(super) fn install_notification_erasure(conn: &Connection) -> Result<()> {
             "s.sequence=OLD.source_sequence",
         ),
     ] {
+        if current_jobs && table == "notification_job_legacy_receipts" {
+            continue;
+        }
         conn.execute_batch(&format!("DROP TRIGGER {trigger};
             CREATE TRIGGER {trigger} BEFORE DELETE ON {table}
             WHEN NOT EXISTS(SELECT 1 FROM notification_sources s JOIN subject_deletion_jobs j
@@ -656,7 +659,7 @@ impl SqliteWorkspaceStore {
             // scoped to the content-free saved Job identities throughout.
             let source = "SELECT s.sequence FROM notification_sources s JOIN subject_deletion_jobs j ON j.workspace_id=s.workspace_id AND j.job_id=json_extract(s.facts_json,'$.backend_job.job_id') WHERE s.role='backend_job' AND j.workspace_id=?1 AND j.subject_id=?2";
             let delivery = format!("SELECT input_event_id FROM notification_sources WHERE sequence IN ({source})");
-            for table in ["notification_acknowledgements","notification_job_targets","notification_job_legacy_receipts","notification_failures","notification_requests"] {
+            for table in ["notification_acknowledgements","notification_job_targets","notification_failures","notification_requests"] {
                 tx.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1 AND delivery_id IN ({delivery})"),params![workspace,subject])?;
             }
             for table in ["notification_source_preparation_failures","notification_source_offers","notification_decisions"] {

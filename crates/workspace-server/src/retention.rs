@@ -1785,8 +1785,35 @@ mod tests {
                 })
                 .collect()
         }
-        fn assert_preserved(conn: &Connection, saved: &[SavedTable]) -> crate::Result<()> {
+        fn assert_preserved(
+            conn: &Connection,
+            saved: &[SavedTable],
+            migrated: bool,
+        ) -> crate::Result<()> {
             for (table, columns, before) in saved {
+                // Schema130 removes obsolete execution history, not Journal intents.
+                // Preflight must still leave every original table and row untouched.
+                if migrated
+                    && matches!(
+                        table.as_str(),
+                        "backend_job_deliveries"
+                            | "notification_job_legacy_receipts"
+                            | "backend_job_delivery_pre_content_history"
+                            | "backend_job_attempt_pre_content_history"
+                            | "backend_job_pre_content_history"
+                            | "backend_job_attempt_upgrade_history"
+                            | "backend_job_upgrade_history"
+                            | "backend_job_attempt_legacy_state_history"
+                            | "backend_job_legacy_state_history"
+                    )
+                {
+                    assert!(!conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+                        [table],
+                        |row| row.get::<_, bool>(0),
+                    )?, "obsolete Job table remains: {table}");
+                    continue;
+                }
                 if table == "typed_ticket_orchestration_plans"
                     && !conn.query_row(
                         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
@@ -1812,6 +1839,27 @@ mod tests {
                         assert_eq!(after.last().unwrap()[0], Value::Integer(17));
                         ticket::verify_sqlite_ticket_schema(conn)?;
                     }
+                } else if migrated
+                    && matches!(table.as_str(), "backend_jobs" | "backend_job_attempts")
+                {
+                    let job_id = columns
+                        .iter()
+                        .position(|column| column == "job_id")
+                        .unwrap();
+                    let obsolete = Value::Text("obsolete-journal-job".into());
+                    assert_eq!(
+                        before.iter().filter(|row| row[job_id] == obsolete).count(),
+                        1
+                    );
+                    let retained: Vec<_> = before
+                        .iter()
+                        .filter(|row| row[job_id] != obsolete)
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        after, retained,
+                        "only obsolete Job execution may be removed from {table}"
+                    );
                 } else {
                     assert_eq!(&after, before, "old columns and values changed in {table}");
                 }
@@ -1832,6 +1880,25 @@ mod tests {
             conn.execute_batch(frozen).unwrap();
             conn.execute_batch(include_str!("fixtures/published_journal124_values.sql"))
                 .unwrap();
+            // Keep the published current Pending Job, and add a synthetic obsolete
+            // Journal Job whose grant predates binding_id. Removing its execution
+            // rows must neither complete nor discard the independent removal intent.
+            conn.execute_batch(r#"
+                INSERT INTO backend_jobs (
+                    workspace_id,job_id,purpose,input_digest,input_ref,request_json,
+                    intent_fingerprint,state,current_attempt,created_at,updated_at
+                ) SELECT workspace_id,'obsolete-journal-job',purpose,input_digest,input_ref,
+                    json_set(request_json,'$.job_id','obsolete-journal-job',
+                        '$.grants.subjektiv_journal',json('{"subject_id":"subject","session_id":"session","journal_id":"journal","selected_ranges":[]}')),
+                    intent_fingerprint,state,current_attempt,created_at,updated_at
+                FROM backend_jobs WHERE job_id='after-retirement';
+                INSERT INTO backend_job_attempts (
+                    workspace_id,job_id,attempt_id,attempt,input_digest,state,
+                    deadline_at,created_at,updated_at
+                ) SELECT workspace_id,'obsolete-journal-job','obsolete-journal-job:attempt:1',
+                    attempt,input_digest,state,deadline_at,created_at,updated_at
+                FROM backend_job_attempts WHERE job_id='after-retirement';
+            "#).unwrap();
             let (operation_id, metadata): (String, String) = conn
                 .query_row(
                     "SELECT operation_id,journal_removal_json FROM worker_removal_operations",
@@ -1849,14 +1916,14 @@ mod tests {
             // Dry-run executes the owning migration path on its private copy.
             SqliteWorkspaceStore::migration_plan(&path).unwrap();
             let conn = Connection::open(&path).unwrap();
-            assert_preserved(&conn, &before).unwrap();
+            assert_preserved(&conn, &before, false).unwrap();
             assert_eq!(journal_ddl(&conn).unwrap(), ddl);
             drop(conn);
             SqliteWorkspaceStore::migrate_database(&path).unwrap();
             for _ in 0..2 {
                 let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
                 reopened.with_conn(|conn| {
-                    assert_preserved(conn, &before)?;
+                    assert_preserved(conn, &before, true)?;
                     assert_eq!(journal_ddl(conn)?, ddl);
                     assert!(conn.execute("UPDATE worker_removal_operations SET journal_removal_json=json_set(journal_removal_json,'$.binding.writer_binding_id','replacement') WHERE operation_id=?1", [&operation_id]).is_err());
                     assert!(conn.execute("UPDATE worker_removal_operations SET journal_removal_json=json_set(journal_removal_json,'$.phase','invalid') WHERE operation_id=?1", [&operation_id]).is_err());
@@ -1870,6 +1937,12 @@ mod tests {
                 let progress = reopened.get_journal_removal(&prepared).unwrap().unwrap();
                 assert_eq!(progress.operation_id, operation_id);
                 assert_eq!(progress.metadata, expected);
+                assert!(
+                    reopened
+                        .get_backend_job("w", "obsolete-journal-job")
+                        .unwrap()
+                        .is_none()
+                );
                 assert!(
                     reopened
                         .freeze_journal_removal(&prepared, &progress, &[])

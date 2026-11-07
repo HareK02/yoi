@@ -63,7 +63,9 @@ mod schema_convergence {
                     // The retained tail appends proof and typed cause columns.
                     // Upgrade must not invent either for historical attempts.
                     for column in [
-                        "allocation_precluded_at", "failure_cause", "worker_cleanup_failure_cause",
+                        "allocation_precluded_at",
+                        "failure_cause",
+                        "worker_cleanup_failure_cause",
                     ] {
                         if !column_exists(conn, table, column).unwrap() {
                             for row in &mut rows {
@@ -87,6 +89,57 @@ mod schema_convergence {
         rows
     }
 
+    fn passkey_rows(conn: &Connection, job_variant: bool) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let mut tables = vec!["passkey_credentials"];
+        if !job_variant {
+            tables.extend(["passkey_metadata", "passkey_addition_receipts"]);
+        }
+        tables
+            .into_iter()
+            .map(|table| stored_fixture_rows(conn, table))
+            .collect()
+    }
+
+    fn assert_obsolete_jobs_discarded(conn: &Connection) {
+        assert_eq!(current_schema_version(conn).unwrap(), 130);
+        backend_job_current::verify(conn).unwrap();
+        for table in ["backend_jobs", "backend_job_attempts"] {
+            assert!(stored_fixture_rows(conn, table).is_empty(), "{table}");
+        }
+    }
+
+    fn assert_current_job_constraints(conn: &Connection) {
+        // Exercise actual rows, not vacuous UPDATEs after old Jobs were discarded.
+        // Roll back the probe so reopen still checks the migrated empty Job set.
+        let tx = conn.unchecked_transaction().unwrap();
+        let request = resource_job_request("current", "current", "candidate");
+        assert_eq!(tx.execute("INSERT INTO backend_jobs(workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,state,current_attempt,created_at,updated_at)
+            VALUES('workspace',?1,?2,?3,?4,?5,?6,'pending',1,'1','2')",
+            params![request.job_id, request.purpose, request.input_digest().unwrap(), request.input_ref, serde_json::to_string(&request).unwrap(), request.fingerprint().unwrap()]).unwrap(), 1);
+        assert!(
+            tx.execute("UPDATE backend_jobs SET input_digest='changed'", [])
+                .is_err()
+        );
+        assert!(
+            tx.execute(
+                "UPDATE backend_jobs SET input_disposition='unsupported'",
+                []
+            )
+            .is_err()
+        );
+        assert!(tx.execute("UPDATE backend_jobs SET input_disposition='invalidated',request_json=json_set(request_json,'$.input',json('null'))", []).is_err());
+        assert!(tx.execute("UPDATE backend_jobs SET request_json=json_set(request_json,'$.input','replacement')", []).is_err());
+        assert_eq!(tx.execute("UPDATE backend_jobs SET input_disposition='erased',request_json=json_set(request_json,'$.input',json('null'))", []).unwrap(), 1);
+        assert!(
+            tx.execute(
+                "UPDATE backend_jobs SET input_disposition='available',request_json=?1",
+                [serde_json::to_string(&request).unwrap()]
+            )
+            .is_err()
+        );
+        tx.rollback().unwrap();
+    }
+
     fn schema_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
         fixture_query_rows(
             conn,
@@ -95,21 +148,28 @@ mod schema_convergence {
     }
 
     #[test]
-    fn schema_103_variants_converge_preserving_history_values_and_constraints() {
+    fn schema_103_variants_converge_to_current_schema_preserving_passkeys_and_discarding_old_jobs()
+    {
         for job_variant in [false, true] {
             for baseline_only in [false, true] {
                 let (_dir, path) = variant_fixture(job_variant, baseline_only);
                 let conn = Connection::open(&path).unwrap();
                 let history = workspace_schema_migration_history(&conn).unwrap();
                 let rows = feature_rows(&conn, job_variant);
+                let passkeys = passkey_rows(&conn, job_variant);
                 let schema = schema_rows(&conn);
                 let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
                 assert_eq!(plan.current_schema_version, 103);
+                assert_eq!(plan.target_schema_version, 130);
                 assert_eq!(
                     plan.migrations,
                     expected_retained_migration_chain()
                         .into_iter()
-                        .filter(|migration| migration.version > 103)
+                        .filter(|migration| migration.version > 103 && migration.version < 130)
+                        .chain(std::iter::once(WorkspaceSchemaMigrationStep {
+                            version: 130,
+                            name: backend_job_current::MIGRATION_NAME.to_owned(),
+                        }))
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(
@@ -122,7 +182,13 @@ mod schema_convergence {
                 let upgraded = SqliteWorkspaceStore::open_for_test(&path).unwrap();
                 let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
                 upgraded.with_conn(|conn| {
-                    assert_eq!(feature_rows(conn, job_variant), rows);
+                    assert_eq!(passkey_rows(conn, job_variant), passkeys);
+                    assert_obsolete_jobs_discarded(conn);
+                    assert_current_job_constraints(conn);
+                    fresh.with_conn(|c| {
+                        assert_eq!(current_schema_version(c)?, 130);
+                        backend_job_current::verify(c)
+                    })?;
                     let mut expected = history.clone();
                     expected.extend(plan.migrations.iter().map(|step| (step.version, step.name.clone())));
                     assert_eq!(workspace_schema_migration_history(conn)?, expected);
@@ -131,9 +197,6 @@ mod schema_convergence {
                         assert_eq!(state_contract_schema_signature(conn, table), fresh.with_conn(|c| Ok(state_contract_schema_signature(c, table)))?, "{table}");
                     }
                     assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0))?, 0);
-                    assert!(conn.execute("UPDATE backend_jobs SET input_digest='changed'", []).is_err());
-                    assert!(conn.execute("UPDATE backend_jobs SET input_disposition='unsupported'", []).is_err());
-                    assert!(conn.execute("UPDATE backend_jobs SET request_json=json_set(request_json,'$.input','replacement')", []).is_err());
                     assert!(conn.execute("INSERT INTO passkey_metadata(credential_id,key_reference) VALUES('missing','new')", []).is_err());
                     assert!(conn.execute("INSERT INTO passkey_addition_receipts VALUES('other','missing','user','reference')", []).is_err());
                     let reference: (String, Option<String>) = conn.query_row("SELECT key_reference,normal_login_verified_at FROM passkey_metadata WHERE credential_id='key'", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
@@ -142,7 +205,6 @@ mod schema_convergence {
                         assert_eq!(reference.1, None);
                     } else {
                         assert_eq!(reference, ("stable-reference".into(), Some("verified".into())));
-                        assert_eq!(conn.query_row("SELECT count(*) FROM backend_jobs WHERE input_disposition='available'", [], |r| r.get::<_, i64>(0))?, 4);
                     }
                     Ok(())
                 }).unwrap();
@@ -152,7 +214,8 @@ mod schema_convergence {
                 assert_eq!(reopened.list_passkey_summaries("user").unwrap(), summaries);
                 reopened
                     .with_conn(|conn| {
-                        assert_eq!(feature_rows(conn, job_variant), rows);
+                        assert_eq!(passkey_rows(conn, job_variant), passkeys);
+                        assert_obsolete_jobs_discarded(conn);
                         assert_eq!(
                             workspace_schema_migration_history(conn)?.len(),
                             history.len() + plan.migrations.len()
@@ -174,6 +237,7 @@ mod schema_convergence {
                 let schema = schema_rows(&conn);
                 let history = workspace_schema_migration_history(&conn).unwrap();
                 let rows = feature_rows(&conn, job_variant);
+                let passkeys = passkey_rows(&conn, job_variant);
                 drop(conn);
                 let error = SqliteWorkspaceStore::open_for_test(&path)
                     .err()
@@ -192,8 +256,9 @@ mod schema_convergence {
                 let upgraded = SqliteWorkspaceStore::open_for_test(&path).unwrap();
                 upgraded
                     .with_conn(|conn| {
-                        assert_eq!(feature_rows(conn, job_variant), rows);
-                        assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
+                        assert_eq!(passkey_rows(conn, job_variant), passkeys);
+                        assert_obsolete_jobs_discarded(conn);
+                        assert_current_job_constraints(conn);
                         Ok(())
                     })
                     .unwrap();

@@ -1029,12 +1029,7 @@ impl WorkspaceApi {
             .store
             .get_backend_job(self.workspace_id(), &owner.job_id)?
             .ok_or_else(|| Error::Store("Failed recovery Job disappeared".into()))?;
-        if job.current_attempt != owner.attempt
-            || job.input_digest != owner.input_digest
-            || self
-                .store
-                .backend_job_was_migrated(self.workspace_id(), &owner.job_id)?
-        {
+        if job.current_attempt != owner.attempt || job.input_digest != owner.input_digest {
             return Ok(true);
         }
         if !current.state.terminal() {
@@ -1176,12 +1171,6 @@ impl WorkspaceApi {
         if attempt.state.terminal() {
             self.schedule_backend_job_worker_cleanup(&attempt);
             self.drain_reserved_backend_jobs();
-            return Ok(true);
-        }
-        if self
-            .store
-            .backend_job_was_migrated(self.workspace_id(), &attempt.job_id)?
-        {
             return Ok(true);
         }
         if attempt.state == BackendJobAttemptState::Reserved {
@@ -1544,11 +1533,7 @@ impl WorkspaceApi {
             && job.state == BackendJobState::Completed
             && job.current_attempt == current.attempt
             && current.state == BackendJobAttemptState::Completed
-            && !matches!(
-                job.input_disposition,
-                crate::backend_job::JobInputDisposition::Erased
-                    | crate::backend_job::JobInputDisposition::Invalidated
-            )
+            && job.input_disposition != crate::backend_job::JobInputDisposition::Erased
         {
             // Input retirement is later than execution termination and cleanup.
             // Check every historical owner, not just the latest terminal result.

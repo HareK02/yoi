@@ -21,7 +21,7 @@
 mod admission;
 mod authority;
 use admission::{ConsolidationAdmission, schedule_job};
-mod journal;
+pub(crate) mod journal;
 pub(crate) use journal::prepare_worker_deletion;
 
 use std::fs::{self, File, OpenOptions};
@@ -61,6 +61,8 @@ pub enum SubjectError {
     Storage(#[from] feature_storage::FeatureStorageError),
     #[error("local Subject Job shutdown: {0}")]
     JobShutdown(#[from] crate::jobs::JobServiceError),
+    #[error("local Subject Job migration: {0}")]
+    JobMigration(#[from] crate::jobs::JobStoreError),
     #[error("local Subject storage metadata: {0}")]
     Json(#[from] serde_json::Error),
     #[error("local Subject storage permission or identity is invalid: {0}")]
@@ -279,6 +281,28 @@ impl StandaloneSubjects {
                 return Err(SubjectError::InvalidScope("saved Subject body has no explicit release; restore it and complete the Idle/Journal handoff, rather than treating inactive storage as unoccupied".into()));
             }
         }
+        // The exclusive Subject lease is already held. Finish cross-database
+        // migration before publishing a Host, claiming a new writer, or allowing
+        // Job restart recovery. Pin the physical target before any Feature effect;
+        // a failed Feature transaction or queue acknowledgement is retried on open.
+        let jobs_path = jobs_dir.join("jobs.sqlite3");
+        {
+            let mut jobs = crate::job_store::JobStore::open(&jobs_path)?;
+            let identity = self.store.database_identity()?;
+            let ids = jobs.pin_reference_retirement(
+                subject_id,
+                &feature_storage::DatabaseIdentity {
+                    scope: identity.scope_id,
+                    feature: identity.feature_id,
+                    physical: identity.physical_id,
+                },
+            )?;
+            if !ids.is_empty() {
+                self.store
+                    .retire_migrated_subject_job_references(subject_id, &ids)?;
+                jobs.complete_reference_retirement(&ids)?;
+            }
+        }
         let writer =
             self.store
                 .claim_journal_writer(subject_id, &self.scope_id, &worker_id.to_string())?;
@@ -302,7 +326,7 @@ impl StandaloneSubjects {
             host,
             binding,
             lease: Some(lease),
-            jobs_path: jobs_dir.join("jobs.sqlite3"),
+            jobs_path,
             armed: false,
         })
     }
@@ -958,8 +982,7 @@ impl LocalSubjectHost {
             )
             .into());
         }
-        if current.version_stopped
-            || current.input_disposition != crate::jobs::JobInputDisposition::Available
+        if current.input_disposition != crate::jobs::JobInputDisposition::Available
             || current.state == crate::jobs::JobState::Cancelled
         {
             return Err(SubjektivHostError::InvalidArgument(

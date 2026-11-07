@@ -58,10 +58,8 @@
 //! A store error is not durable success: preserve the observed primary separately
 //! from the save error and use existing recovery, not a new Job or second write.
 //!
-//! Schema124 adds nullable bounded evidence only; schema123 and older migration
-//! receipts/results are unchanged. Writer rollback must retain the new reader
-//! while any structured records remain. It must not infer facts from old text or
-//! rerun the schema123 upgrade termination policy on new Jobs.
+//! Nullable failure attachments do not change the current Job structure. Missing facts
+//! never authorize inference from retained prose or replacement execution.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -590,41 +588,6 @@ impl BackendJobAttemptState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendJobDeliveryState {
-    Pending,
-    Sending,
-    Completed,
-    Failed,
-    Unknown,
-}
-
-impl BackendJobDeliveryState {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Sending => "sending",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Result<Self> {
-        match value {
-            "pending" => Ok(Self::Pending),
-            "sending" => Ok(Self::Sending),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            "unknown" => Ok(Self::Unknown),
-            other => Err(Error::Store(format!(
-                "unknown Backend Job delivery state `{other}`"
-            ))),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendJobLimits {
@@ -719,9 +682,7 @@ pub struct SubjektivConsolidationGrant {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubjektivJournalGrant {
-    /// Frozen writer generation. Legacy absence preserves its original canonical wire/digest
-    /// at the read/migration boundary only; it never authorizes a fresh Session read or selection.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Required frozen writer generation; never inferred from the current Session writer.
     pub binding_id: String,
     pub subject_id: String,
     pub session_id: String,
@@ -824,6 +785,7 @@ impl BackendJobRequest {
                 ));
             }
             for (name, id) in [
+                ("journal binding", &grant.binding_id),
                 ("journal subject", &grant.subject_id),
                 ("journal session", &grant.session_id),
                 ("journal id", &grant.journal_id),
@@ -907,7 +869,6 @@ pub enum JobInputDisposition {
     Available,
     Reclaimed,
     Erased,
-    Invalidated,
 }
 
 impl JobInputDisposition {
@@ -916,17 +877,15 @@ impl JobInputDisposition {
             Self::Available => "available",
             Self::Reclaimed => "reclaimed",
             Self::Erased => "erased",
-            Self::Invalidated => "invalidated",
         }
     }
 }
 
-/// Host-authorized retirement; erasure and legacy invalidation do not change outcomes.
+/// Host-authorized retirement; erasure does not change outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobInputRetirementReason {
     Completed,
     ExplicitErasure,
-    LegacyInvalidation,
 }
 
 impl JobInputRetirementReason {
@@ -934,7 +893,6 @@ impl JobInputRetirementReason {
         match self {
             Self::Completed => JobInputDisposition::Reclaimed,
             Self::ExplicitErasure => JobInputDisposition::Erased,
-            Self::LegacyInvalidation => JobInputDisposition::Invalidated,
         }
     }
 }
@@ -1101,21 +1059,6 @@ pub struct BackendJobWorkerBinding {
     pub job_id: String,
     pub attempt_id: String,
     pub purpose: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BackendJobDeliveryRecord {
-    pub workspace_id: String,
-    pub delivery_id: String,
-    pub job_id: String,
-    pub attempt_id: String,
-    pub target: RuntimeWorkerRef,
-    pub state: BackendJobDeliveryState,
-    pub failure_category: Option<String>,
-    pub failure_detail: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-    pub delivered_at: Option<String>,
 }
 
 pub fn allocation_key(attempt_id: &str) -> String {
@@ -1425,6 +1368,50 @@ mod tests {
             "resource_reused": false
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn input_disposition_accepts_only_current_values_and_retirement_blocks_execution() {
+        for disposition in [
+            JobInputDisposition::Available,
+            JobInputDisposition::Reclaimed,
+            JobInputDisposition::Erased,
+        ] {
+            assert_eq!(
+                serde_json::from_value::<JobInputDisposition>(
+                    serde_json::to_value(disposition).unwrap()
+                )
+                .unwrap(),
+                disposition
+            );
+            let mut job = reservation().job;
+            job.input_disposition = disposition;
+            assert_eq!(
+                job.load_executable_request().is_ok(),
+                disposition == JobInputDisposition::Available
+            );
+        }
+        assert!(serde_json::from_str::<JobInputDisposition>("\"invalidated\"").is_err());
+        assert_eq!(
+            JobInputRetirementReason::Completed.disposition(),
+            JobInputDisposition::Reclaimed
+        );
+        assert_eq!(
+            JobInputRetirementReason::ExplicitErasure.disposition(),
+            JobInputDisposition::Erased
+        );
+    }
+
+    #[test]
+    fn executable_input_still_requires_original_body_and_intent() {
+        let job = reservation().job;
+        assert!(job.load_executable_request().is_ok());
+        let mut changed_body = job.clone();
+        changed_body.request.input = serde_json::json!({"title": "replacement"});
+        assert!(changed_body.load_executable_request().is_err());
+        let mut changed_intent = job;
+        changed_intent.request.instruction = "replacement instruction".into();
+        assert!(changed_intent.load_executable_request().is_err());
     }
 
     #[test]
@@ -1784,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_request_replay_keeps_its_exact_serialization() {
+    fn request_without_optional_grants_or_resource_roundtrips_exactly() {
         let request = request();
         let original_json = serde_json::to_string(&request).unwrap();
         assert!(!original_json.contains("grants"));
@@ -1871,8 +1858,8 @@ CREATE TRIGGER backend_job_identity_immutable BEFORE UPDATE OF
 BEGIN SELECT RAISE(ABORT, 'immutable Backend Job identity'); END;
 CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON backend_jobs
 WHEN (
-    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
-      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased'))
+      OR (OLD.input_disposition = 'reclaimed' AND NEW.input_disposition = 'erased'))
     AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
     AND json_type(NEW.request_json,'$.input') = 'null'
 ) IS NOT TRUE

@@ -61,8 +61,6 @@ pub struct NotificationDiagnostic {
     pub purpose: Option<String>,
     pub delivery_id: Option<String>,
     pub stage: NotificationDiagnosticStage,
-    /// A retained pre-cutover Job receipt contributes to this projection.
-    pub legacy_evidence: bool,
     /// Conservative: a persisted request without ACK is enough; this does not prove a send occurred.
     /// Can remain true alongside a later preflight failure, rejection or historical recipient.
     pub acceptance_outcome_unknown: bool,

@@ -72,9 +72,9 @@ work. `retry_candidate` is saved evidence, not authorization to send.
 ACK is sufficient, and does not prove a network attempt occurred. Later preflight
 failure cannot disprove earlier acceptance. Multiple authorized assignment targets
 without an ACK are reported as ambiguous rather than attributed to the original
-Worker; an ACK identifies the accepted target. Old Job receipts are marked with
-`legacy_evidence`, retaining the distinction between accepted and suppressed legacy
-Completed records. No modern ACK is fabricated from suppression.
+Worker; an ACK identifies the accepted target. Job diagnostics use only the current
+notification ledger. The schema migration discards obsolete Job receipts; ordinary
+routing and diagnostics do not interpret them or fabricate modern ACKs.
 
 The response contains public references and bounded reason codes, not notification
 body text, binding credentials, capabilities, or private session content. Runtime

@@ -243,18 +243,12 @@ pub(super) fn dispatch(
 
 /// Read the existing candidate dispositions and terminal surface outcome for this
 /// exact consolidation attempt. Recovery does not rerun candidate decisions or
-/// surface generation, and migration-retired Jobs never reach the domain lookup.
+/// surface generation; immutable input and exact attempt ownership are still required.
 pub(super) fn lookup_result(
     api: &WorkspaceApi,
     job: &crate::backend_job::BackendJobRecord,
     attempt: &BackendJobAttemptRecord,
 ) -> Result<Option<serde_json::Value>> {
-    if api
-        .store
-        .backend_job_was_migrated(api.workspace_id(), &job.request.job_id)?
-    {
-        return Ok(None);
-    }
     let Some(grant) = &job.request.grants.subjektiv_consolidation else {
         return Ok(None);
     };

@@ -5,7 +5,7 @@
 //! receipts). Published 114..121 databases retain their version, receipt names,
 //! policy, Job states, root records and erasure fences. They need no domain DDL
 //! merely to acquire the common storage identity/lifetime owned by the caller.
-//! Ordered 122..129 receipts add configuration, Job execution, startup results,
+//! Ordered 122..130 receipts add configuration, Job execution, startup results,
 //! bounded Job causes, Service outcomes, Journal removal, Plan retirement and independent
 //! publication/connection observations; each intermediate/fresh baseline stays exact.
 //! This does not attest policy transfer, execution termination or Journal release.
@@ -97,7 +97,7 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
         return verify_history_records(conn, current, &rows);
     }
     verify_execution_shape(conn)?;
-    super::backend_job_upgrade::verify(conn)?;
+    verify_execution_data(conn)?;
     let baseline = rows
         .first()
         .ok_or_else(|| invalid("missing migration receipts"))?;
@@ -145,7 +145,7 @@ fn verify_history_records(conn: &Connection, current: i64, rows: &[(i64, String)
     }
     if current == 123 {
         verify_execution_shape(conn)?;
-        super::backend_job_upgrade::verify(conn)?;
+        verify_execution_data(conn)?;
         if rows == [(current, super::SCHEMA_BASELINE_NAME.to_owned())] {
             verify_configuration_shape(conn)?;
             require_shape(conn, Stage::Base)?;
@@ -364,6 +364,7 @@ impl FailureTail {
         });
         tail.push((128, super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME));
         tail.push((129, super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME));
+        tail.push((130, super::backend_job_current::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -771,10 +772,16 @@ fn require_extension(conn: &Connection, sql: &str) -> Result<Shape> {
 }
 
 fn verify_raw_capture_shape(conn: &Connection, current: i64, rows: &[(i64, String)]) -> Result<()> {
+    // Prefix receipts describe history, not evidence tables retained after 130.
+    if super::current_schema_version(conn)? >= 130 {
+        return super::backend_job_current::verify(conn);
+    }
     let expected = extension_shape(super::backend_job_upgrade::RAW_SCHEMA)?;
     let actual = snapshot(conn)?;
     let mut execution = extension_shape(super::backend_job_upgrade::SCHEMA)?;
-    execution.extend(extension_shape(super::backend_job_recovery_store::SCHEMA)?);
+    execution.extend(extension_shape(
+        super::backend_job_upgrade::RECOVERY_SCHEMA,
+    )?);
     if current < 123
         && super::current_schema_version(conn)? < 123
         && execution.keys().any(|name| actual.contains_key(name))
@@ -804,10 +811,53 @@ fn verify_raw_capture_shape(conn: &Connection, current: i64, rows: &[(i64, Strin
     super::backend_job_upgrade::verify_pre_content(conn)
 }
 
+fn verify_execution_data(conn: &Connection) -> Result<()> {
+    if super::current_schema_version(conn)? >= 130 {
+        super::backend_job_current::verify(conn)
+    } else {
+        super::backend_job_upgrade::verify(conn)
+    }
+}
+
 fn verify_execution_shape(conn: &Connection) -> Result<()> {
-    require_extension(conn, super::backend_job_upgrade::RAW_SCHEMA)?;
-    require_extension(conn, super::backend_job_upgrade::SCHEMA)?;
-    require_extension(conn, super::backend_job_recovery_store::SCHEMA)?;
+    if super::current_schema_version(conn)? >= 130 {
+        super::backend_job_current::verify(conn)?;
+        verify_current_job_notification_shape(conn)?;
+        require_extension(conn, super::backend_job_reference_migration::SCHEMA)?;
+        require_extension(conn, super::backend_job_recovery_store::SCHEMA)?;
+    } else {
+        require_extension(conn, super::backend_job_upgrade::RAW_SCHEMA)?;
+        require_extension(conn, super::backend_job_upgrade::SCHEMA)?;
+        require_extension(conn, super::backend_job_upgrade::RECOVERY_SCHEMA)?;
+    }
+    Ok(())
+}
+
+// Historical references still contain schema-96 receipts. Only the current
+// expectation removes those tables and their attached programs; never weaken
+// verification of an actual historical database to fit the current installer.
+fn verify_current_job_notification_shape(conn: &Connection) -> Result<()> {
+    static EXPECTED: OnceLock<std::result::Result<Shape, String>> = OnceLock::new();
+    let select = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(name, object)| {
+                name.starts_with("notification_job_")
+                    && !super::backend_job_current::OBSOLETE_TABLES.contains(&object.1.as_str())
+                    && !super::backend_job_current::OBSOLETE_LIVE_TRIGGERS.contains(&name.as_str())
+            })
+            .collect()
+    };
+    let expected = EXPECTED
+        .get_or_init(|| {
+            (|| -> Result<Shape> { Ok(select(snapshot(&reference_base()?)?)) })()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(invalid)?;
+    if select(snapshot(conn)?) != *expected {
+        return Err(invalid("current Job notification schema mismatch"));
+    }
     Ok(())
 }
 
@@ -819,7 +869,7 @@ fn legacy_shape(conn: &Connection) -> Result<Shape> {
     for sql in [
         super::backend_job_upgrade::RAW_SCHEMA,
         super::backend_job_upgrade::SCHEMA,
-        super::backend_job_recovery_store::SCHEMA,
+        super::backend_job_upgrade::RECOVERY_SCHEMA,
     ] {
         for name in extension_shape(sql)?.keys() {
             shape.remove(name);
@@ -950,6 +1000,28 @@ fn upgraded_reference(conn: &Connection, mut shape: Shape) -> Result<Shape> {
             *tokens = declarations(tokens.clone())?;
         }
     }
+    if current >= 130 {
+        // Historical receipt families retain unrelated extensions, but obsolete
+        // Job evidence is absent in every current physical family.
+        shape.retain(|name, object| {
+            !super::backend_job_current::OBSOLETE_TABLES.contains(&object.1.as_str())
+                && !super::backend_job_current::OBSOLETE_LIVE_TRIGGERS.contains(&name.as_str())
+        });
+        if let Some((_, _, fields)) = shape.get_mut("backend_jobs") {
+            if let Some(index) = fields
+                .iter()
+                .position(|token| token == "literal:invalidated")
+            {
+                if index == 0 || fields[index - 1] != "," {
+                    return Err(invalid("unrecognized retained input disposition CHECK"));
+                }
+                fields.drain(index - 1..=index);
+            }
+        }
+        shape.extend(extension_shape(
+            crate::backend_job::INPUT_RETENTION_TRIGGERS,
+        )?);
+    }
     Ok(shape)
 }
 
@@ -1064,7 +1136,7 @@ fn verify_103_features(conn: &Connection, current: i64, rows: &[(i64, String)]) 
     }
     // Both migration branches have externally visible immutable receipts and
     // fences. Missing/modified triggers are not repaired opportunistically.
-    let expected = &references()?.stages[&Stage::Base];
+    let expected = upgraded_reference(conn, references()?.stages[&Stage::Base].clone())?;
     let actual = snapshot(conn)?;
     for name in [
         "passkey_metadata",
@@ -1438,6 +1510,64 @@ mod failure_format_tests {
     }
 
     #[test]
+    fn current_jobs_remove_obsolete_published_family_evidence_without_losing_current_extensions() {
+        let conn = fixture_123(Stage::Converged(121));
+        for version in 124..=129 {
+            apply(&conn, version).unwrap();
+        }
+        conn.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('owner','user','owner','Owner','1','1');
+            INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at) VALUES('w','owner','Workspace','active','1','1');
+            INSERT INTO backend_jobs(workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,state,current_attempt,created_at,updated_at) VALUES
+                ('w','old','fixture','digest','saved://input','{}','intent','failed',1,'1','2'),
+                ('w','current','fixture','digest','saved://input',json_object('job_id','current','purpose','fixture','input_ref','saved://input','input',NULL,'instruction','fixture','profile','builtin:backend-job'),'intent','failed',1,'1','2');
+            INSERT INTO backend_job_attempts(workspace_id,job_id,attempt_id,attempt,input_digest,state,deadline_at,created_at,updated_at) VALUES
+                ('w','old','old',1,'digest','failed','deadline','1','2'),
+                ('w','current','current',1,'digest','failed','deadline','1','2');
+            INSERT INTO backend_job_upgrade_history(workspace_id,job_id,state,updated_at) VALUES('w','old','failed','2');
+            INSERT INTO backend_job_attempt_upgrade_history(workspace_id,job_id,attempt_id,state,updated_at) VALUES('w','old','old','failed','2');
+            INSERT INTO backend_job_legacy_state_history(workspace_id,job_id,state) VALUES('w','old','unknown');
+            INSERT INTO backend_job_attempt_legacy_state_history(workspace_id,job_id,attempt_id,state) VALUES('w','old','old','unknown');
+            INSERT INTO backend_job_cleanup_invocation_owners VALUES
+                ('w','old','old','00000000-0000-0000-0000-000000000001','scope','device','inode','old-acquisition'),
+                ('w','current','current','00000000-0000-0000-0000-000000000002','scope','device','inode','current-acquisition');
+            INSERT INTO backend_job_cleanup_invocation_ends VALUES
+                ('w','old','old','00000000-0000-0000-0000-000000000001','old-ended'),
+                ('w','current','current','00000000-0000-0000-0000-000000000002','current-ended');").unwrap();
+        let saved_columns = columns(&conn);
+        let saved = values(&conn, &saved_columns);
+        apply(&conn, 130).unwrap();
+        verify_history(&conn, 130).unwrap();
+        let current_columns = columns(&conn);
+        let current = values(&conn, &current_columns);
+        for (table, before) in saved {
+            if !table.starts_with("backend_job")
+                && table != "__yoi_schema_migrations"
+                && !store::backend_job_current::OBSOLETE_TABLES.contains(&table.as_str())
+            {
+                assert_eq!(current[&table], before, "{table}");
+            }
+        }
+        for table in [
+            "backend_jobs",
+            "backend_job_attempts",
+            "backend_job_cleanup_invocation_owners",
+            "backend_job_cleanup_invocation_ends",
+        ] {
+            let ids = conn
+                .prepare(&format!("SELECT job_id FROM {table}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(ids, vec!["current"], "{table}");
+        }
+        for table in store::backend_job_current::OBSOLETE_TABLES {
+            assert!(!store::table_exists(&conn, table).unwrap());
+        }
+    }
+
+    #[test]
     fn retained_failure_tail_adds_connection_evidence_without_relabeling_receipts() {
         let conn = fixture_123(Stage::Base);
         store::migrate_failure_extension(
@@ -1461,7 +1591,7 @@ mod failure_format_tests {
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![127, 128, 129]
+            vec![127, 128, 129, 130]
         );
         apply(&conn, 127).unwrap();
         apply(&conn, 128).unwrap();
@@ -1585,7 +1715,7 @@ mod failure_format_tests {
             INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_at,updated_at)
             VALUES('workspace-a','owner','Saved workspace','active','1','1');
             INSERT INTO backend_jobs(workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,state,current_attempt,result_json,result_digest,created_at,updated_at,input_disposition)
-            VALUES('workspace-a','saved-job','journal','digest','input','{}','fingerprint','completed',1,'{\"saved\":true}','result-digest','1','1','erased');
+            VALUES('workspace-a','saved-job','journal','digest','input',json_object('job_id','saved-job','purpose','journal','input_ref','input','input',NULL,'instruction','fixture','profile','builtin:backend-job'),'fingerprint','completed',1,'{\"saved\":true}','result-digest','1','1','erased');
             INSERT INTO backend_job_attempts(workspace_id,job_id,attempt_id,attempt,input_digest,state,deadline_at,result_json,result_digest,created_at,updated_at)
             VALUES('workspace-a','saved-job','saved-attempt',1,'digest','completed','2','{\"saved\":true}','result-digest','1','1');
             INSERT INTO plugin_service_consumers(workspace_id,consumer_id,runtime_id,worker_id,installation_id,plan_id,service_name,subscriptions_json,cursor,last_ack_event_id)
@@ -1615,6 +1745,18 @@ mod failure_format_tests {
         );
         old_columns.remove("typed_ticket_orchestration_plans");
         old_columns.remove("ticket_schema_migrations");
+        // Schema 130 drops these empty historical extensions rather than retain
+        // them as a second current contract. Rollback still snapshots all tables.
+        for table in store::backend_job_current::OBSOLETE_TABLES {
+            if old_columns.remove(*table).is_some() {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
         let component_receipts = values(
             &conn,
             &BTreeMap::from([(
@@ -1724,7 +1866,7 @@ mod failure_format_tests {
                 .take(5)
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            vec![129, 128, 127, 126, 125]
+            vec![130, 129, 128, 127, 126]
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(snapshot(&conn).unwrap(), shape, "dry-run changed DDL");
@@ -1749,11 +1891,11 @@ mod failure_format_tests {
         assert_eq!(
             &history[history.len() - 5..],
             &[
-                (125, tail_migration_name(125).unwrap().to_owned()),
                 (126, tail_migration_name(126).unwrap().to_owned()),
                 (127, tail_migration_name(127).unwrap().to_owned()),
                 (128, tail_migration_name(128).unwrap().to_owned()),
                 (129, tail_migration_name(129).unwrap().to_owned()),
+                (130, tail_migration_name(130).unwrap().to_owned()),
             ]
         );
         let upgraded_shape = snapshot(&conn).unwrap();

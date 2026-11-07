@@ -1,13 +1,45 @@
-//! Component tests use retained schema-113 DDL and real SQLite transactions.
-//! Runner tests use the store's actual plan/apply/open paths, not a second ledger.
-//! They run in the ordinary workspace-server lib target once the root registers
-//! this module AND the migration. No Runtime/process termination or external
-//! Journal checkpoint completion is simulated or claimed by these tests.
+//! Historical conversion tests stop at schema 123, before schema 130 discards
+//! obsolete Jobs and their history. They use retained DDL, production migration
+//! plans/steps and real SQLite transactions, never a current runtime over old Jobs.
+//! Current-schema fresh/upgrade parity is checked separately below. No Runtime
+//! termination or external Journal checkpoint completion is simulated or claimed.
 use super::*;
 use crate::backend_job::BackendJobRequest;
-use crate::store::{self as store_owner, ControlPlaneStore};
+use crate::store as store_owner;
 use rusqlite::{TransactionBehavior, params, types::Value};
 use std::path::Path;
+
+const HISTORICAL_UPGRADE_VERSION: i64 = 123;
+
+// Use the production recognizer and ordered migration implementations, but stop
+// at the contract under test. Current store open intentionally proceeds to 130.
+fn migrate_to_historical_boundary(conn: &Connection) -> Result<()> {
+    let plan = store_owner::workspace_schema_migration_plan(conn)?;
+    assert!(plan.current_schema_version <= HISTORICAL_UPGRADE_VERSION);
+    for step in plan
+        .migrations
+        .iter()
+        .filter(|step| step.version <= HISTORICAL_UPGRADE_VERSION)
+    {
+        let migration = store_owner::MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == step.version && migration.name == step.name)
+            .expect("production historical migration");
+        (migration.apply)(conn)?;
+    }
+    assert_eq!(
+        store_owner::current_schema_version(conn)?,
+        HISTORICAL_UPGRADE_VERSION
+    );
+    store_owner::storage_formats::verify_history(conn, HISTORICAL_UPGRADE_VERSION)
+}
+
+fn open_historical_boundary(path: &Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    store_owner::configure_sqlite(&conn).unwrap();
+    migrate_to_historical_boundary(&conn).unwrap();
+    conn
+}
 
 const JOB_VALUES: &str = "workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,current_attempt,result_json,result_digest,created_at,updated_at,completed_at";
 const ATTEMPT_VALUES: &str = "workspace_id,job_id,attempt_id,attempt,input_digest,runtime_id,worker_id,runtime_run_id,dispatched_at,deadline_at,result_json,result_digest,worker_cleanup_state,worker_cleanup_failure_category,worker_cleanup_failure_detail,worker_cleanup_updated_at,worker_cleanup_completed_at,created_at,updated_at,completed_at";
@@ -386,16 +418,15 @@ fn real_content_step_receipt_failure_rolls_back_raw_capture_then_retries_into_fi
         "SELECT * FROM backend_job_deliveries ORDER BY delivery_id",
     );
     conn.execute_batch("CREATE TEMP TRIGGER injected_final_receipt BEFORE INSERT ON main.__yoi_schema_migrations WHEN EXISTS(SELECT 1 FROM sqlite_schema WHERE name='backend_job_upgrade_history') BEGIN SELECT RAISE(ABORT,'injected final receipt'); END;").unwrap();
-    assert!(store_owner::apply_migrations(&conn).is_err());
+    assert!(migrate_to_historical_boundary(&conn).is_err());
     assert!(!store_owner::table_exists(&conn, "backend_job_upgrade_history").unwrap());
     assert_eq!(original, pre_content_values(&conn, true));
     conn.execute_batch("DROP TRIGGER injected_final_receipt")
         .unwrap();
-    store_owner::apply_migrations(&conn).unwrap();
+    migrate_to_historical_boundary(&conn).unwrap();
     assert_captured_cutover(&conn, &original, &delivery_after_content);
     drop(conn);
-    drop(store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap());
-    let conn = Connection::open(path).unwrap();
+    let conn = open_historical_boundary(&path);
     assert_captured_cutover(&conn, &original, &delivery_after_content);
 }
 
@@ -480,8 +511,7 @@ fn oldest_retained_row_fixtures_cross_the_real_content_hook_and_reopen_without_s
             "SELECT * FROM backend_job_deliveries ORDER BY delivery_id",
         );
         drop(conn);
-        drop(store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap());
-        let conn = Connection::open(&path).unwrap();
+        let conn = open_historical_boundary(&path);
         store_owner::configure_sqlite(&conn).unwrap();
         assert_captured_cutover(&conn, &original, &deliveries);
         insert_job(&conn, "post-cutover", "pending");
@@ -491,8 +521,7 @@ fn oldest_retained_row_fixtures_cross_the_real_content_hook_and_reopen_without_s
             "SELECT * FROM backend_job_upgrade_history ORDER BY job_id",
         );
         drop(conn);
-        drop(store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap());
-        let conn = Connection::open(&path).unwrap();
+        let conn = open_historical_boundary(&path);
         assert_eq!(
             history,
             rows(
@@ -511,36 +540,22 @@ fn oldest_retained_row_fixtures_cross_the_real_content_hook_and_reopen_without_s
 }
 
 #[test]
-fn real_input_retirement_atomically_scrubs_raw_evidence_and_retries_after_failure() {
-    use crate::backend_job::JobInputRetirementReason;
+fn historical_input_retirement_trigger_atomically_scrubs_raw_evidence_and_retries() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("retire-raw.sqlite");
     let conn = legacy_fixture_to_85(&path, 85);
     conn.execute_batch("UPDATE backend_jobs SET request_json=json_set(request_json,'$.input.body','unique-pre-content-body-to-erase') WHERE job_id='unstarted'").unwrap();
     store_owner::migrate_content_state_v85_to_v86(&conn).unwrap();
     drop(conn);
-    let store = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    let job = store
-        .get_backend_job("upgrade-workspace", "unstarted")
-        .unwrap()
-        .unwrap();
-    let conn = Connection::open(&path).unwrap();
+    let conn = open_historical_boundary(&path);
     store_owner::configure_sqlite(&conn).unwrap();
     let bodies = rows(
         &conn,
         "SELECT j.request_json,r.request_json FROM backend_jobs j JOIN backend_job_pre_content_history r USING(workspace_id,job_id) WHERE j.job_id='unstarted'",
     );
     conn.execute_batch("CREATE TRIGGER injected_raw_retirement BEFORE UPDATE OF request_json ON backend_job_pre_content_history WHEN OLD.job_id='unstarted' BEGIN SELECT RAISE(ABORT,'injected raw retirement'); END;").unwrap();
-    assert!(
-        store
-            .reclaim_backend_job_input(
-                "upgrade-workspace",
-                "unstarted",
-                &job.input_digest,
-                JobInputRetirementReason::ExplicitErasure
-            )
-            .is_err()
-    );
+    let retire = "UPDATE backend_jobs SET input_disposition='erased',request_json=json_set(request_json,'$.input',json('null')) WHERE job_id='unstarted'";
+    assert!(conn.execute(retire, []).is_err());
     assert_eq!(
         bodies,
         rows(
@@ -550,14 +565,7 @@ fn real_input_retirement_atomically_scrubs_raw_evidence_and_retries_after_failur
     );
     conn.execute_batch("DROP TRIGGER injected_raw_retirement")
         .unwrap();
-    store
-        .reclaim_backend_job_input(
-            "upgrade-workspace",
-            "unstarted",
-            &job.input_digest,
-            JobInputRetirementReason::ExplicitErasure,
-        )
-        .unwrap();
+    assert_eq!(conn.execute(retire, []).unwrap(), 1);
     assert_eq!(
         rows(
             &conn,
@@ -572,17 +580,7 @@ fn real_input_retirement_atomically_scrubs_raw_evidence_and_retries_after_failur
     );
     verify(&conn).unwrap();
     drop(conn);
-    drop(store);
-    // The existing retirement owner performs secure_delete/VACUUM/checkpoint for
-    // the WHOLE database, including raw evidence, not only the live Job table.
-    let bytes = std::fs::read(&path).unwrap();
-    assert!(
-        !bytes
-            .windows(b"unique-pre-content-body-to-erase".len())
-            .any(|window| window == b"unique-pre-content-body-to-erase")
-    );
-    drop(store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap());
-    let conn = Connection::open(&path).unwrap();
+    let conn = open_historical_boundary(&path);
     assert_eq!(
         rows(
             &conn,
@@ -990,9 +988,7 @@ fn retained_baselines_reach_upgrade_via_the_real_runner_and_reopen_keeps_new_job
             store_owner::configure_sqlite(&conn).unwrap();
             seed_boundary(&conn);
         }
-        let store = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-        drop(store);
-        let conn = Connection::open(&path).unwrap();
+        let conn = open_historical_boundary(&path);
         store_owner::configure_sqlite(&conn).unwrap();
         verify(&conn).unwrap();
         if baseline >= 86 {
@@ -1019,8 +1015,7 @@ fn retained_baselines_reach_upgrade_via_the_real_runner_and_reopen_keeps_new_job
             "SELECT * FROM __yoi_schema_migrations ORDER BY version",
         );
         drop(conn);
-        drop(store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap());
-        let conn = Connection::open(&path).unwrap();
+        let conn = open_historical_boundary(&path);
         assert_eq!(
             history,
             rows(
@@ -1046,265 +1041,19 @@ fn retained_baselines_reach_upgrade_via_the_real_runner_and_reopen_keeps_new_job
 }
 
 #[test]
-fn store_retry_and_recovery_exclude_migrated_jobs_but_admit_a_new_request() {
+fn historical_runner_preserves_delivery_identity_and_saved_acceptance_evidence() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("api.sqlite");
-    store_owner::tests::prepare_retained_schema(&path, 113);
-    let conn = Connection::open(&path).unwrap();
-    store_owner::configure_sqlite(&conn).unwrap();
-    seed_workspace(&conn);
-    insert_job(&conn, "legacy-retry", "pending");
-    let old_attempt = crate::backend_job::attempt_id("legacy-retry", 1);
-    insert_attempt(&conn, "legacy-retry", &old_attempt, 1, "reserved");
-    conn.execute(
-        "UPDATE backend_job_attempts SET input_digest=?1 WHERE attempt_id=?2",
-        params![request("legacy-retry").input_digest().unwrap(), old_attempt],
-    )
-    .unwrap();
-    drop(conn);
-    let store = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    let old = store
-        .get_backend_job("upgrade-workspace", "legacy-retry")
-        .unwrap()
-        .unwrap();
-    assert_eq!(old.failure_category.as_deref(), Some(FAILURE_CATEGORY));
-    let retired_attempt = store
-        .get_backend_job_attempt("upgrade-workspace", "legacy-retry", &old_attempt)
-        .unwrap()
-        .unwrap();
-    assert!(
-        store
-            .probe_backend_job_recovery("upgrade-workspace", &retired_attempt)
-            .is_err()
-    );
-    let saved_domain_result = crate::backend_job::BackendJobResultSubmission {
-        job_id: "legacy-retry".into(),
-        attempt_id: old_attempt.clone(),
-        input_digest: retired_attempt.input_digest.clone(),
-        result: serde_json::json!({"saved":true}),
-    };
-    assert!(
-        store
-            .reconcile_backend_job_domain_result(
-                "upgrade-workspace",
-                &retired_attempt,
-                &saved_domain_result,
-                "2026-11-04T00:00:00Z"
-            )
-            .is_err()
-    );
-    // The old attempt has no Worker and no cleanup debt. Retry must still be
-    // rejected, not merely hidden by an unfinished-cleanup or attempt-budget gate.
-    assert!(
-        store
-            .reserve_backend_job_retry("upgrade-workspace", "legacy-retry", "2026-11-04T00:00:00Z")
-            .is_err()
-    );
-    assert!(
-        store
-            .list_recoverable_backend_job_attempts("upgrade-workspace", 100)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        store
-            .list_reserved_backend_job_attempts("upgrade-workspace", 100)
-            .unwrap()
-            .is_empty()
-    );
-    let next = store
-        .reserve_backend_job(
-            "upgrade-workspace",
-            &request("new-live"),
-            "2026-11-04T00:00:00Z",
-        )
-        .unwrap();
-    assert_eq!(next.job.state, crate::backend_job::BackendJobState::Pending);
-    drop(store);
-    let reopened = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    let recoverable = reopened
-        .list_recoverable_backend_job_attempts("upgrade-workspace", 100)
-        .unwrap();
-    assert_eq!(recoverable.len(), 1);
-    assert_eq!(recoverable[0].job_id, "new-live");
-    assert_eq!(
-        reopened
-            .get_backend_job("upgrade-workspace", "legacy-retry")
-            .unwrap()
-            .unwrap(),
-        old
-    );
-}
-
-#[test]
-fn store_delivery_reconciliation_keeps_the_original_delivery_id_after_cutover() {
-    use crate::backend_job::BackendJobDeliveryState;
-    use worker_runtime::identity::RuntimeWorkerRef;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("delivery-api.sqlite");
-    drop(retained_fixture(&path));
-    let store = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    let target = RuntimeWorkerRef::new("target-runtime", "target-worker");
-    let recovered = store
-        .recover_backend_job_deliveries("upgrade-workspace", "2026-11-04T00:00:00Z")
-        .unwrap();
-    assert!(
-        recovered
-            .iter()
-            .any(|record| record.delivery_id == "delivery-4"
-                && record.state == BackendJobDeliveryState::Pending)
-    );
-    let (claimed, was_claimed) = store
-        .reserve_backend_job_delivery(
-            "upgrade-workspace",
-            "delivery-4",
-            "running",
-            &target,
-            "2026-11-04T00:00:01Z",
-        )
-        .unwrap();
-    assert!(was_claimed);
-    assert_eq!(claimed.delivery_id, "delivery-4");
-    let finished = store
-        .finish_backend_job_delivery(
-            "upgrade-workspace",
-            "delivery-4",
-            BackendJobDeliveryState::Completed,
-            None,
-            None,
-            "2026-11-04T00:00:02Z",
-        )
-        .unwrap();
-    let replay = store
-        .finish_backend_job_delivery(
-            "upgrade-workspace",
-            "delivery-4",
-            BackendJobDeliveryState::Completed,
-            None,
-            None,
-            "2026-11-04T00:00:03Z",
-        )
-        .unwrap();
-    assert_eq!(finished, replay);
-    drop(store);
-    let conn = Connection::open(path).unwrap();
-    assert_eq!(
-        rows(&conn, "SELECT count(*) FROM backend_job_deliveries"),
-        vec![vec![Value::Integer(5)]]
-    );
-    assert_retired(&conn);
-}
-
-#[test]
-fn store_terminal_replays_and_retirement_preserve_old_causes_and_results() {
-    use crate::backend_job::{
-        BackendJobAttemptState, BackendJobResultSubmission, JobInputRetirementReason,
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("terminal-api.sqlite");
-    store_owner::tests::prepare_retained_schema(&path, 113);
-    let conn = Connection::open(&path).unwrap();
-    store_owner::configure_sqlite(&conn).unwrap();
-    seed_workspace(&conn);
-    let value = serde_json::json!({"already":"accepted"});
-    let (result_digest, result_json) =
-        job::result_digest(&value, request("x").limits.max_result_bytes).unwrap();
-    for state in ["completed", "failed"] {
-        let id = format!("terminal-api-{state}");
-        insert_job(&conn, &id, state);
-        let attempt = crate::backend_job::attempt_id(&id, 1);
-        insert_attempt(&conn, &id, &attempt, 1, state);
-        conn.execute("UPDATE backend_job_attempts SET input_digest=?1,runtime_run_id='retained-run',worker_cleanup_state='completed',worker_cleanup_completed_at='retained-cleanup-end' WHERE attempt_id=?2",
-            params![request(&id).input_digest().unwrap(),attempt]).unwrap();
-        if state == "completed" {
-            conn.execute(
-                "UPDATE backend_jobs SET result_json=?1,result_digest=?2 WHERE job_id=?3",
-                params![result_json, result_digest, id],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE backend_job_attempts SET result_json=?1,result_digest=?2 WHERE job_id=?3",
-                params![result_json, result_digest, id],
-            )
-            .unwrap();
-        }
-    }
-    let query = "SELECT job_id,state,result_json,result_digest,failure_category,failure_detail,completed_at FROM backend_jobs ORDER BY job_id";
+    let path = dir.path().join("delivery-history.sqlite");
+    let conn = retained_fixture(&path);
+    let query = "SELECT * FROM backend_job_deliveries ORDER BY delivery_id";
     let before = rows(&conn, query);
+    migrate_to_historical_boundary(&conn).unwrap();
+    assert_eq!(rows(&conn, query), before);
+    assert_retired(&conn);
     drop(conn);
-    let store = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    let id = "terminal-api-completed";
-    let attempt_id = crate::backend_job::attempt_id(id, 1);
-    let attempt = store
-        .get_backend_job_attempt("upgrade-workspace", id, &attempt_id)
-        .unwrap()
-        .unwrap();
-    let replay = store
-        .accept_backend_job_result(
-            "upgrade-workspace",
-            attempt.worker.as_ref().unwrap(),
-            &BackendJobResultSubmission {
-                job_id: id.into(),
-                attempt_id,
-                input_digest: request(id).input_digest().unwrap(),
-                result: value,
-            },
-            "2026-11-04T00:00:00Z",
-        )
-        .unwrap();
-    assert!(replay.replayed);
-    let failed_id = "terminal-api-failed";
-    let failed_attempt = crate::backend_job::attempt_id(failed_id, 1);
-    let failed = store
-        .finish_backend_job_attempt(
-            "upgrade-workspace",
-            failed_id,
-            &failed_attempt,
-            BackendJobAttemptState::Failed,
-            "old-attempt-cause",
-            "old attempt detail",
-            "2026-11-04T00:00:01Z",
-        )
-        .unwrap();
-    assert_eq!(
-        failed.failure_category.as_deref(),
-        Some("old-attempt-cause")
-    );
-    for (id, reason) in [
-        (id, JobInputRetirementReason::Completed),
-        (failed_id, JobInputRetirementReason::LegacyInvalidation),
-    ] {
-        store
-            .reclaim_backend_job_input(
-                "upgrade-workspace",
-                id,
-                &request(id).input_digest().unwrap(),
-                reason,
-            )
-            .unwrap();
-        store
-            .reclaim_backend_job_input(
-                "upgrade-workspace",
-                id,
-                &request(id).input_digest().unwrap(),
-                JobInputRetirementReason::ExplicitErasure,
-            )
-            .unwrap();
-    }
-    drop(store);
-    let conn = Connection::open(path).unwrap();
-    assert_eq!(before, rows(&conn, query));
-    assert_eq!(
-        rows(
-            &conn,
-            "SELECT DISTINCT input_disposition,json_type(request_json,'$.input') FROM backend_jobs"
-        ),
-        vec![vec![
-            Value::Text("erased".into()),
-            Value::Text("null".into())
-        ]]
-    );
-    verify(&conn).unwrap();
+    let conn = open_historical_boundary(&path);
+    assert_eq!(rows(&conn, query), before);
+    assert_retired(&conn);
 }
 
 #[test]
@@ -1319,7 +1068,7 @@ fn owning_runner_receipt_failure_rolls_back_conversion_and_retry_commits_once() 
     conn.execute_batch("CREATE TEMP TRIGGER injected_upgrade_receipt_failure BEFORE INSERT ON main.__yoi_schema_migrations
         WHEN EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='backend_job_upgrade_history')
         BEGIN SELECT RAISE(ABORT,'injected owning upgrade receipt failure'); END;").unwrap();
-    assert!(store_owner::apply_migrations(&conn).is_err());
+    assert!(migrate_to_historical_boundary(&conn).is_err());
     assert!(!store_owner::table_exists(&conn, "backend_job_upgrade_history").unwrap());
     assert_eq!(
         jobs,
@@ -1338,13 +1087,13 @@ fn owning_runner_receipt_failure_rolls_back_conversion_and_retry_commits_once() 
     assert!(enabled);
     conn.execute_batch("DROP TRIGGER injected_upgrade_receipt_failure")
         .unwrap();
-    store_owner::apply_migrations(&conn).unwrap();
+    migrate_to_historical_boundary(&conn).unwrap();
     assert_retired(&conn);
     let receipts = rows(
         &conn,
         "SELECT * FROM __yoi_schema_migrations ORDER BY version",
     );
-    store_owner::apply_migrations(&conn).unwrap();
+    migrate_to_historical_boundary(&conn).unwrap();
     assert_eq!(
         receipts,
         rows(
@@ -1377,8 +1126,7 @@ fn both_103_receipts_and_baseline_only_identities_use_the_real_upgrade_runner() 
                 "SELECT * FROM __yoi_schema_migrations WHERE version<=103 ORDER BY version",
             );
             drop(conn);
-            drop(store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap());
-            let conn = Connection::open(path).unwrap();
+            let conn = open_historical_boundary(&path);
             assert_retired(&conn);
             assert_eq!(
                 before,
@@ -1432,7 +1180,8 @@ fn fresh_creation_and_empty_retained_upgrade_have_identical_job_ddl() {
             }
         }
         signature.extend(rows(&conn,"SELECT type,name,replace(replace(replace(sql,char(10),''),char(13),''),' ','') FROM sqlite_schema WHERE name LIKE 'backend_job%' AND type IN ('trigger','index') AND sql IS NOT NULL ORDER BY type,name"));
-        verify(&conn).unwrap();
+        store_owner::backend_job_current::verify(&conn).unwrap();
+        assert_eq!(store_owner::current_schema_version(&conn).unwrap(), 130);
         signature
     }
     assert_eq!(objects(&migrated), objects(&fresh));
@@ -1483,7 +1232,9 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
     expected_receipts.extend(
         store_owner::MIGRATIONS
             .iter()
-            .filter(|migration| migration.version > 85)
+            .filter(|migration| {
+                migration.version > 85 && migration.version <= HISTORICAL_UPGRADE_VERSION
+            })
             .map(|migration| {
                 vec![
                     Value::Integer(migration.version),
@@ -1506,7 +1257,7 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
             "{error}"
         );
     }
-    store_owner::apply_migrations(&conn).unwrap();
+    migrate_to_historical_boundary(&conn).unwrap();
     let receipts = rows(
         &conn,
         "SELECT version,name FROM __yoi_schema_migrations ORDER BY version",
@@ -1521,10 +1272,9 @@ fn captured_history_is_accepted_at_each_real_retained_prefix_and_cannot_be_forge
     );
     assert_eq!(
         store_owner::current_schema_version(&conn).unwrap(),
-        store_owner::LATEST_SCHEMA_VERSION
+        HISTORICAL_UPGRADE_VERSION
     );
-    super::super::storage_formats::verify_history(&conn, store_owner::LATEST_SCHEMA_VERSION)
-        .unwrap();
+    super::super::storage_formats::verify_history(&conn, HISTORICAL_UPGRADE_VERSION).unwrap();
     assert_eq!(original, pre_content_values(&conn, true));
     assert!(conn.execute_batch("INSERT INTO backend_job_pre_content_history SELECT * FROM backend_job_pre_content_history LIMIT 1").is_err());
 }
@@ -1541,7 +1291,7 @@ fn raw_capture_shape_drift_is_rejected_before_the_runner_writes_or_retires_jobs(
         &conn,
         "SELECT * FROM __yoi_schema_migrations ORDER BY version",
     );
-    assert!(store_owner::apply_migrations(&conn).is_err());
+    assert!(migrate_to_historical_boundary(&conn).is_err());
     assert_eq!(
         jobs,
         rows(&conn, "SELECT * FROM backend_jobs ORDER BY job_id")
@@ -1555,12 +1305,12 @@ fn raw_capture_shape_drift_is_rejected_before_the_runner_writes_or_retires_jobs(
     );
     assert!(!store_owner::table_exists(&conn, "backend_job_upgrade_history").unwrap());
     conn.execute_batch("DROP INDEX forged_raw_index").unwrap();
-    store_owner::apply_migrations(&conn).unwrap();
+    migrate_to_historical_boundary(&conn).unwrap();
     verify(&conn).unwrap();
 }
 
 #[test]
-fn fresh_install_has_empty_histories_and_rejects_legacy_live_state_at_the_sql_boundary() {
+fn fresh_install_has_no_obsolete_histories_and_rejects_legacy_live_state_at_the_sql_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fresh-live.sqlite");
     drop(store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap());
@@ -1573,10 +1323,7 @@ fn fresh_install_has_empty_histories_and_rejects_legacy_live_state_at_the_sql_bo
         "backend_job_upgrade_history",
         "backend_job_attempt_upgrade_history",
     ] {
-        assert_eq!(
-            rows(&conn, &format!("SELECT count(*) FROM {table}")),
-            vec![vec![Value::Integer(0)]]
-        );
+        assert!(!store_owner::table_exists(&conn, table).unwrap(), "{table}");
     }
     seed_workspace(&conn);
     insert_job(&conn, "new-live", "pending");
@@ -1623,7 +1370,7 @@ fn actual_runner_conversion_fault_restores_pragma_history_and_rows_then_reopens_
     // A connection-local fault is not a forged physical storage family. It fires
     // after Job conversion, in the actual ordered runner's attempt update.
     conn.execute_batch("CREATE TEMP TRIGGER actual_attempt_fault BEFORE UPDATE OF state ON main.backend_job_attempts WHEN NEW.state='failed' AND OLD.state NOT IN ('completed','failed') BEGIN SELECT RAISE(ABORT,'actual attempt conversion fault'); END;").unwrap();
-    let error = store_owner::apply_migrations(&conn).unwrap_err();
+    let error = migrate_to_historical_boundary(&conn).unwrap_err();
     assert!(
         error
             .to_string()
@@ -1655,36 +1402,29 @@ fn actual_runner_conversion_fault_restores_pragma_history_and_rows_then_reopens_
     );
     conn.execute_batch("DROP TRIGGER actual_attempt_fault")
         .unwrap();
-    store_owner::apply_migrations(&conn).unwrap();
+    migrate_to_historical_boundary(&conn).unwrap();
     assert_retired(&conn); // includes unchanged Completed/Failed and all historical attempts
     let saved = rows(
         &conn,
         "SELECT * FROM backend_job_attempt_upgrade_history ORDER BY job_id,attempt_id",
     );
     drop(conn);
-    let store = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    let fresh = store
-        .reserve_backend_job(
-            "upgrade-workspace",
-            &request("after-fault-retry"),
-            "2026-11-04T00:00:00Z",
-        )
-        .unwrap();
-    drop(store);
-    let store = store_owner::SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    assert_eq!(
-        store
-            .get_backend_job_attempt(
-                "upgrade-workspace",
-                "after-fault-retry",
-                &fresh.attempt.attempt_id
-            )
-            .unwrap()
-            .unwrap(),
-        fresh.attempt
+    let conn = open_historical_boundary(&path);
+    insert_job(&conn, "after-fault-retry", "pending");
+    insert_attempt(&conn, "after-fault-retry", "new-attempt", 1, "reserved");
+    let fresh = rows(
+        &conn,
+        "SELECT * FROM backend_job_attempts WHERE job_id='after-fault-retry'",
     );
-    drop(store);
-    let conn = Connection::open(path).unwrap();
+    drop(conn);
+    let conn = open_historical_boundary(&path);
+    assert_eq!(
+        fresh,
+        rows(
+            &conn,
+            "SELECT * FROM backend_job_attempts WHERE job_id='after-fault-retry'"
+        )
+    );
     assert_eq!(
         saved,
         rows(

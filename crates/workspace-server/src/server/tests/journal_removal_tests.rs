@@ -1627,19 +1627,28 @@ async fn completed_checkpoint_with_failed_job_cleanup_holds_writer_until_real_cl
 }
 
 #[tokio::test]
-async fn migration_failed_unrecorded_job_cannot_release_stopped_source_or_mint_replacement() {
+async fn erased_unrecorded_job_cannot_release_stopped_source_or_mint_replacement() {
     let f = SubjectRemovalFixture::new().await;
     let reserved = f.pending_journal();
-    // Reuse the existing post-migration fixture, not Remove/force-failure as a
-    // way of satisfying coverage. The migration suite owns the actual conversion.
-    fixture_journal_migration_stopped(&f.api, &reserved.job.request.job_id);
+    f.api
+        .store
+        .reclaim_backend_job_input(
+            TEST_WORKSPACE_ID,
+            &reserved.job.request.job_id,
+            &reserved.job.input_digest,
+            crate::backend_job::JobInputRetirementReason::ExplicitErasure,
+        )
+        .unwrap();
     let before = f
         .api
         .store
         .get_backend_job(TEST_WORKSPACE_ID, &reserved.job.request.job_id)
         .unwrap()
         .unwrap();
-    assert_eq!(before.state, BackendJobState::Failed);
+    assert_eq!(
+        before.input_disposition,
+        crate::backend_job::JobInputDisposition::Erased
+    );
     f.execution.take_inputs();
     let response = f.remove();
     assert_eq!(
@@ -1660,14 +1669,11 @@ async fn migration_failed_unrecorded_job_cannot_release_stopped_source_or_mint_r
     assert_eq!(after.input_digest, before.input_digest);
     assert_eq!(after.failure_category, before.failure_category);
     assert!(after.result.is_none());
-    assert!(
-        after.load_executable_request().unwrap().input
-            == before.load_executable_request().unwrap().input,
-        "migration failure preserves immutable input (body omitted)"
-    );
+    assert!(before.load_executable_request().is_err());
+    assert!(after.load_executable_request().is_err());
     assert!(
         f.execution.take_inputs().is_empty(),
-        "migration Failed must not be retried"
+        "erased input must not be reconstructed or dispatched"
     );
     assert_eq!(
         f.api

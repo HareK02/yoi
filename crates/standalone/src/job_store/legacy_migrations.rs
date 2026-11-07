@@ -116,265 +116,139 @@ pub(super) fn migrate_legacy_jobs(conn: &Connection) -> Result<(), JobStoreError
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+// Frozen schema fixtures for every supported storage boundary.
+pub(super) const RECOVERY_SCHEMA: &str = "
+CREATE TABLE job_version_history (
+    job_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL PRIMARY KEY,
+    job_state TEXT NOT NULL,
+    attempt_state TEXT NOT NULL,
+    failure TEXT
+);
+CREATE TRIGGER job_version_history_immutable BEFORE UPDATE ON job_version_history
+BEGIN SELECT RAISE(ABORT,'immutable previous Job state'); END;
+CREATE TRIGGER job_version_history_retained BEFORE DELETE ON job_version_history
+BEGIN SELECT RAISE(ABORT,'retained previous Job state'); END;
+CREATE TABLE job_version_stops (job_id TEXT NOT NULL PRIMARY KEY);
+CREATE TRIGGER job_version_stop_immutable BEFORE UPDATE ON job_version_stops
+BEGIN SELECT RAISE(ABORT,'immutable version stop'); END;
+CREATE TRIGGER job_version_stop_retained BEFORE DELETE ON job_version_stops
+BEGIN SELECT RAISE(ABORT,'retained version stop'); END;
+CREATE TABLE job_execution_ownership (
+    job_id TEXT NOT NULL REFERENCES job_intents(job_id),
+    attempt_id TEXT NOT NULL PRIMARY KEY REFERENCES job_attempts(attempt_id),
+    owner_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    writes_revoked INTEGER NOT NULL DEFAULT 0 CHECK(writes_revoked IN (0,1)),
+    cleanup_receipt TEXT,
+    CHECK(cleanup_receipt IS NULL OR writes_revoked=1)
+);
+CREATE TRIGGER job_execution_identity_immutable BEFORE UPDATE OF job_id,attempt_id,owner_id,run_id ON job_execution_ownership
+BEGIN SELECT RAISE(ABORT,'immutable Job execution binding'); END;
+CREATE TRIGGER job_execution_proof_monotonic BEFORE UPDATE ON job_execution_ownership
+WHEN NEW.writes_revoked < OLD.writes_revoked
+ OR (OLD.cleanup_receipt IS NOT NULL AND NEW.cleanup_receipt IS NOT OLD.cleanup_receipt)
+BEGIN SELECT RAISE(ABORT,'immutable execution proof'); END;
+CREATE TRIGGER job_execution_retained BEFORE DELETE ON job_execution_ownership
+BEGIN SELECT RAISE(ABORT,'retained Job execution'); END;
+";
 
-    fn request(id: &str) -> JobRequest {
-        JobRequest {
-            job_id: id.into(),
-            purpose: "migration".into(),
-            input_ref: "fixture:input".into(),
-            input: json!({"immutable":[1,2,3]}),
-            instruction: "Return a result".into(),
-            profile: "builtin:job".into(),
-            serialization_key: None,
-            limits: Default::default(),
-        }
-    }
+pub(super) const START_REJECTION_SCHEMA: &str = "
+CREATE TABLE job_start_rejections (
+    job_id TEXT NOT NULL REFERENCES job_intents(job_id),
+    attempt_id TEXT NOT NULL PRIMARY KEY REFERENCES job_attempts(attempt_id),
+    owner_id TEXT NOT NULL
+);
+CREATE TRIGGER job_start_rejection_guard BEFORE INSERT ON job_start_rejections
+WHEN NOT EXISTS(SELECT 1 FROM job_intents i JOIN job_attempts a ON a.job_id=i.job_id AND a.number=i.current_attempt
+    WHERE i.job_id=NEW.job_id AND a.attempt_id=NEW.attempt_id AND i.state='pending' AND a.state='reserved')
+ OR EXISTS(SELECT 1 FROM job_execution_ownership WHERE attempt_id=NEW.attempt_id)
+ OR EXISTS(SELECT 1 FROM job_domain_grants WHERE job_id=NEW.job_id)
+ OR EXISTS(SELECT 1 FROM job_version_stops WHERE job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'start rejection requires unstarted result-only reservation'); END;
+CREATE TRIGGER job_start_rejection_immutable BEFORE UPDATE ON job_start_rejections
+BEGIN SELECT RAISE(ABORT,'immutable Job start rejection'); END;
+CREATE TRIGGER job_start_rejection_retained BEFORE DELETE ON job_start_rejections
+BEGIN SELECT RAISE(ABORT,'retained Job start rejection'); END;
+";
 
-    fn seed(path: &Path, version: i64) -> (String, String, String) {
-        let mut conn = Connection::open(path).unwrap();
-        feature_storage::configure_connection(&conn).unwrap();
-        let tx = conn.transaction().unwrap();
-        tx.execute_batch(&SCHEMA.replace("input_digest", "input_revision"))
-            .unwrap();
-        if version == 2 {
-            tx.execute_batch(GRANT_SCHEMA).unwrap();
-        }
-        let mut original = serde_json::to_value(request("done")).unwrap();
-        original["input_revision"] = json!("old-token");
-        let original = serde_json::to_string_pretty(&original).unwrap();
-        // A Job result is opaque domain data, not a legacy attempt binding.
-        let receipt = "{\"accepted\":true,\"receipt_tag\":\"receipt-domain-data\"}".to_string();
-        let digest = job::result_digest(
-            &serde_json::from_str(&receipt).unwrap(),
-            job::ABSOLUTE_MAX_RESULT_BYTES,
-        )
-        .unwrap()
-        .0;
-        tx.execute("INSERT INTO job_intents (job_id,request_json,fingerprint,max_concurrent,state,current_attempt,acknowledged)
-                    VALUES ('done',?1,'legacy-fingerprint',8,'completed',2,1)", [&original]).unwrap();
-        tx.execute(
-            "INSERT INTO job_attempts (job_id,number,attempt_id,input_revision,state,failure)
-                    VALUES ('done',1,'done:attempt:1','old-token','failed','timeout')",
-            [],
-        )
-        .unwrap();
-        tx.execute("INSERT INTO job_attempts (job_id,number,attempt_id,input_revision,state,result_json,result_digest)
-                    VALUES ('done',2,'done:attempt:2','old-token','completed',?1,?2)", params![receipt,digest]).unwrap();
-        let grant = "{\"subject_id\":\"local-subject\",\"candidate_ids\":[\"c1\"]}".to_string();
-        if version == 2 {
-            tx.execute("INSERT INTO job_domain_grants VALUES ('done',?1)", [&grant])
-                .unwrap();
-        }
-        for (id, state) in [("pending", "reserved"), ("running", "dispatched")] {
-            let mut value = serde_json::to_value(request(id)).unwrap();
-            value["input_revision"] = json!("old-token");
-            tx.execute("INSERT INTO job_intents (job_id,request_json,fingerprint,max_concurrent,state,current_attempt)
-                        VALUES (?1,?2,'legacy-fingerprint',8,'pending',1)", params![id,serde_json::to_string(&value).unwrap()]).unwrap();
-            tx.execute(
-                "INSERT INTO job_attempts (job_id,number,attempt_id,input_revision,state)
-                        VALUES (?1,1,?2,'old-token',?3)",
-                params![id, job::attempt_id(id, 1), state],
-            )
-            .unwrap();
-        }
-        tx.pragma_update(None, "user_version", version).unwrap();
-        tx.commit().unwrap();
-        (original, receipt, grant)
-    }
+pub(super) const GRANTED_START_REJECTION_SCHEMA: &str = "
+DROP TRIGGER job_start_rejection_guard;
+CREATE TRIGGER job_start_rejection_guard BEFORE INSERT ON job_start_rejections
+WHEN NOT EXISTS(SELECT 1 FROM job_intents i JOIN job_attempts a ON a.job_id=i.job_id AND a.number=i.current_attempt
+    WHERE i.job_id=NEW.job_id AND a.attempt_id=NEW.attempt_id AND i.state='pending' AND a.state='reserved'
+      AND i.input_disposition='available')
+ OR EXISTS(SELECT 1 FROM job_execution_ownership WHERE attempt_id=NEW.attempt_id)
+ OR EXISTS(SELECT 1 FROM job_execution_ownership WHERE job_id=NEW.job_id AND (writes_revoked=0 OR cleanup_receipt IS NULL))
+ OR EXISTS(SELECT 1 FROM job_version_stops WHERE job_id=NEW.job_id)
+BEGIN SELECT RAISE(ABORT,'start rejection requires an available unstarted reservation and prior cleanup'); END;
+";
 
-    #[test]
-    fn legacy_archive_input_erasure_preserves_fingerprints_and_attempt_receipts() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jobs.sqlite3");
-        seed(&path, 2);
-        let mut store = JobStore::open(&path).unwrap();
-        let before: (String, String) = store
-            .conn
-            .query_row(
-                "SELECT fingerprint,attempts_json FROM legacy_job_archive WHERE job_id='done'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        let snapshot = store.get("done").unwrap();
-        store
-            .reclaim_input(
-                "done",
-                &snapshot.input_digest,
-                JobInputRetirementReason::ExplicitErasure,
-            )
-            .unwrap();
-        let (body, fingerprint, attempts): (String,String,String) = store.conn.query_row("SELECT request_json,fingerprint,attempts_json FROM legacy_job_archive WHERE job_id='done'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-        assert!(serde_json::from_str::<Value>(&body).unwrap()["input"].is_null());
-        assert_eq!((fingerprint, attempts), before);
-        assert!(store.conn.execute_batch("UPDATE legacy_job_archive SET request_json=json_set(request_json,'$.input','restored') WHERE job_id='done'").is_err());
-        drop(store);
-        let mut reopened = JobStore::open(&path).unwrap();
-        let receipt = reopened
-            .reserve_granted(request("done"), snapshot.domain_grant)
-            .unwrap();
-        assert_eq!(receipt.state, JobState::Completed);
-        assert_eq!(receipt.input_disposition, JobInputDisposition::Erased);
-        assert!(receipt.load_executable_request().is_err());
-    }
+pub(super) const SCHEMA_SIX: &str = "
+CREATE TABLE job_intents (
+    job_id TEXT PRIMARY KEY NOT NULL,
+    request_json TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    serialization_key TEXT,
+    max_concurrent INTEGER NOT NULL CHECK (max_concurrent BETWEEN 1 AND 65535),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'completed', 'failed', 'cancelled')),
+    current_attempt INTEGER NOT NULL CHECK (current_attempt BETWEEN 1 AND 255),
+    input_disposition TEXT NOT NULL DEFAULT 'available'
+        CHECK (input_disposition IN ('available','reclaimed','erased','invalidated')),
+    acknowledged INTEGER NOT NULL DEFAULT 0 CHECK (acknowledged IN (0, 1)),
+    CHECK (acknowledged = 0 OR state = 'completed'),
+    FOREIGN KEY (job_id, current_attempt) REFERENCES job_attempts(job_id, number)
+        DEFERRABLE INITIALLY DEFERRED
+);
+CREATE TABLE job_attempts (
+    job_id TEXT NOT NULL REFERENCES job_intents(job_id),
+    number INTEGER NOT NULL CHECK (number BETWEEN 1 AND 255),
+    attempt_id TEXT NOT NULL UNIQUE,
+    input_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('reserved', 'dispatched', 'completed', 'failed', 'cancelled')),
+    result_json TEXT,
+    result_digest TEXT,
+    failure TEXT,
+    PRIMARY KEY (job_id, number),
+    CHECK ((result_json IS NULL) = (result_digest IS NULL)),
+    CHECK (state <> 'completed' OR result_json IS NOT NULL)
+);
+CREATE UNIQUE INDEX job_serialization_singleflight ON job_intents(serialization_key)
+    WHERE serialization_key IS NOT NULL AND state = 'pending';
+CREATE INDEX job_attempt_state ON job_attempts(state);
+CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF
+    job_id, fingerprint, serialization_key, max_concurrent ON job_intents
+BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
+CREATE TRIGGER job_attempt_immutable BEFORE UPDATE OF
+    job_id, number, attempt_id, input_digest ON job_attempts
+BEGIN SELECT RAISE(ABORT, 'immutable Job attempt identity'); END;
+CREATE TRIGGER job_result_immutable BEFORE UPDATE OF result_json, result_digest ON job_attempts
+WHEN OLD.result_json IS NOT NULL AND
+    (NEW.result_json IS NOT OLD.result_json OR NEW.result_digest IS NOT OLD.result_digest)
+BEGIN SELECT RAISE(ABORT, 'immutable accepted Job result'); END;
+CREATE TRIGGER job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON job_intents
+WHEN (
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
+      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
+    AND json_type(NEW.request_json,'$.input') = 'null'
+) IS NOT TRUE
+BEGIN SELECT RAISE(ABORT, 'immutable Job input retirement'); END;
+";
 
-    #[test]
-    fn legacy_versions_preserve_intent_receipts_attempts_grants_and_replay() {
-        for version in [1, 2] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("jobs.sqlite3");
-            let (original, receipt, grant) = seed(&path, version);
-            let mut store = JobStore::open(&path).unwrap();
-            let grant_value =
-                (version == 2).then(|| serde_json::from_str::<Value>(&grant).unwrap());
-            let snapshot = store
-                .reserve_granted(request("done"), grant_value.clone())
-                .unwrap();
-            assert!(snapshot.acknowledged);
-            assert_eq!(snapshot.state, JobState::Completed);
-            assert_eq!(snapshot.attempt.number, 2);
-            assert_eq!(
-                snapshot.result,
-                Some(serde_json::from_str(&receipt).unwrap())
-            );
-            let replay = JobResultSubmission {
-                job_id: "done".into(),
-                attempt_id: snapshot.attempt.attempt_id.clone(),
-                input_digest: request("done").input_digest().unwrap(),
-                result: snapshot.result.clone().unwrap(),
-            };
-            assert_eq!(store.accept(&replay).unwrap(), snapshot);
-            let mut stale = replay.clone();
-            stale.attempt_id = "done:attempt:1".into();
-            assert!(matches!(
-                store.accept(&stale),
-                Err(JobStoreError::AttemptMismatch)
-            ));
-            let mut changed = request("done");
-            changed.input = json!({"different":true});
-            assert!(matches!(
-                store.reserve_granted(changed, grant_value.clone()),
-                Err(JobStoreError::IntentConflict(_))
-            ));
-            let archived: (String, String, String) = store.conn.query_row(
-                "SELECT request_json,fingerprint,attempts_json FROM legacy_job_archive WHERE job_id='done'", [],
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-            assert_eq!(archived.0, original);
-            assert_eq!(archived.1, "legacy-fingerprint");
-            let attempts: Value = serde_json::from_str(&archived.2).unwrap();
-            assert_eq!(attempts[0]["failure"], "timeout");
-            assert_eq!(attempts[1]["input_revision"], "old-token");
-            assert_eq!(attempts[1]["result_json"], receipt);
-            if version == 2 {
-                let persisted: String = store
-                    .conn
-                    .query_row("SELECT grant_json FROM job_domain_grants", [], |r| r.get(0))
-                    .unwrap();
-                assert_eq!(persisted, grant);
-            }
-            let digests: Vec<String> = store
-                .conn
-                .prepare(
-                    "SELECT input_digest FROM job_attempts WHERE job_id='done' ORDER BY number",
-                )
-                .unwrap()
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap();
-            assert_eq!(digests, vec![request("done").input_digest().unwrap(); 2]);
-            assert_eq!(store.get("running").unwrap().state, JobState::Failed);
-            assert_eq!(
-                store.get("running").unwrap().attempt.failure.as_deref(),
-                Some(recovery::UPDATE_INTERRUPTION)
-            );
-            assert!(store.get("running").unwrap().version_stopped);
-            assert_eq!(
-                store.reserve(request("pending")).unwrap().attempt.state,
-                JobAttemptState::Failed
-            );
-            assert!(
-                store
-                    .conn
-                    .execute_batch("DELETE FROM legacy_job_archive")
-                    .is_err()
-            );
-            assert!(
-                store
-                    .conn
-                    .execute_batch("UPDATE legacy_job_archive SET fingerprint='changed'")
-                    .is_err()
-            );
-            assert!(
-                store
-                    .conn
-                    .execute_batch("UPDATE job_intents SET fingerprint='changed'")
-                    .is_err()
-            );
-            assert!(
-                store
-                    .conn
-                    .execute_batch("UPDATE job_attempts SET input_digest='changed'")
-                    .is_err()
-            );
-            assert!(
-                !store
-                    .conn
-                    .prepare("PRAGMA foreign_key_check")
-                    .unwrap()
-                    .exists([])
-                    .unwrap()
-            );
-            drop(store);
-            let mut store = JobStore::open(&path).unwrap();
-            assert_eq!(
-                store.reserve_granted(request("done"), grant_value).unwrap(),
-                snapshot
-            );
-        }
-    }
-
-    #[test]
-    fn failed_migration_rolls_back_schema_archive_and_immutable_triggers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("jobs.sqlite3");
-        seed(&path, 2);
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "DROP TRIGGER job_intent_immutable;
-            UPDATE job_intents SET request_json='{}' WHERE job_id='running';
-            CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF request_json ON job_intents
-            BEGIN SELECT RAISE(ABORT,'immutable'); END;",
-        )
-        .unwrap();
-        drop(conn);
-        assert!(JobStore::open(&path).is_err());
-        let conn = Connection::open(&path).unwrap();
-        assert_eq!(
-            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-        assert!(conn.prepare("SELECT * FROM legacy_job_archive").is_err());
-        let binding: String = conn
-            .query_row(
-                "SELECT input_revision FROM job_attempts WHERE job_id='done' AND number=2",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(binding, "old-token");
-        assert!(
-            conn.execute_batch("UPDATE job_intents SET request_json='{}' WHERE job_id='done'")
-                .is_err()
-        );
-        assert!(
-            conn.execute_batch("UPDATE job_attempts SET input_revision='changed'")
-                .is_err()
-        );
-    }
-}
+pub(super) const INPUT_RETENTION_SCHEMA: &str = "
+ALTER TABLE job_intents ADD COLUMN input_disposition TEXT NOT NULL DEFAULT 'available'
+    CHECK (input_disposition IN ('available','reclaimed','erased','invalidated'));
+DROP TRIGGER job_intent_immutable;
+CREATE TRIGGER job_intent_immutable BEFORE UPDATE OF
+    job_id, fingerprint, serialization_key, max_concurrent ON job_intents
+BEGIN SELECT RAISE(ABORT, 'immutable Job intent'); END;
+CREATE TRIGGER job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON job_intents
+WHEN (
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
+      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
+    AND json_type(NEW.request_json,'$.input') = 'null'
+) IS NOT TRUE
+BEGIN SELECT RAISE(ABORT, 'immutable Job input retirement'); END;
+";

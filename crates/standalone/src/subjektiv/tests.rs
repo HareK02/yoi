@@ -308,15 +308,8 @@ async fn failed_consolidation_closes_only_attempt_and_preserves_unresolved_input
 }
 
 #[tokio::test]
-async fn failed_consolidation_retains_unreleased_stale_inactive_migrated_and_erased_controls() {
-    for case in [
-        "unreleased",
-        "stale",
-        "inactive",
-        "migrated",
-        "erased",
-        "changed_grant",
-    ] {
+async fn failed_consolidation_retains_unreleased_stale_inactive_and_erased_controls() {
+    for case in ["unreleased", "stale", "inactive", "erased", "changed_grant"] {
         let mut fixture = ConsolidationRecoveryFixture::new();
         if case != "unreleased" {
             fixture.confirm_execution_joined();
@@ -342,15 +335,6 @@ async fn failed_consolidation_retains_unreleased_stale_inactive_migrated_and_era
         }
         if case == "inactive" {
             fixture.body.host.live.store(false, Ordering::Release);
-        }
-        if case == "migrated" {
-            rusqlite::Connection::open(&fixture.body.jobs_path)
-                .unwrap()
-                .execute(
-                    "INSERT INTO job_version_stops(job_id) VALUES (?1)",
-                    [&fixture.saved.request.job_id],
-                )
-                .unwrap();
         }
         if case == "erased" {
             fixture
@@ -827,40 +811,20 @@ async fn consolidation_recovery_never_replays_incomplete_foreign_or_stale_receip
 }
 
 #[tokio::test]
-async fn consolidation_recovery_rejects_retired_input_version_stop_and_released_writer() {
-    for case in [
-        "erased",
-        "invalidated",
-        "version_stopped",
-        "released_writer",
-    ] {
+async fn consolidation_recovery_rejects_retired_input_and_released_writer() {
+    for case in ["erased", "released_writer"] {
         let fixture = ConsolidationRecoveryFixture::new();
         fixture.resolve_candidate();
         let generation = fixture.generation(&fixture.saved.attempt.attempt_id);
         fixture.publish(&generation);
         match case {
-            "erased" | "invalidated" => {
+            "erased" => {
                 fixture
                     .jobs
                     .reclaim_input(
                         &fixture.saved.request.job_id,
                         &fixture.saved.input_digest,
-                        if case == "erased" {
-                            crate::jobs::JobInputRetirementReason::ExplicitErasure
-                        } else {
-                            crate::jobs::JobInputRetirementReason::LegacyInvalidation
-                        },
-                    )
-                    .unwrap();
-            }
-            "version_stopped" => {
-                // Seed the persisted cutover marker, not a new migration or an
-                // execution termination proof.
-                rusqlite::Connection::open(&fixture.body.jobs_path)
-                    .unwrap()
-                    .execute(
-                        "INSERT INTO job_version_stops(job_id) VALUES (?1)",
-                        [&fixture.saved.request.job_id],
+                        crate::jobs::JobInputRetirementReason::ExplicitErasure,
                     )
                     .unwrap();
             }

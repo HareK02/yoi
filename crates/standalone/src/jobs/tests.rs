@@ -906,7 +906,6 @@ async fn host_restart_rejects_live_lease_then_fails_only_unconfirmed_dispatch_wi
             .unwrap()
             .starts_with("host_restart_execution_unconfirmed:")
     );
-    assert!(!failed.version_stopped);
     assert_eq!(failed.request, reserved.request);
     assert_eq!(failed.executions, dispatched.executions);
     assert!(!failed.executions_released());
@@ -930,7 +929,6 @@ async fn host_restart_rejects_live_lease_then_fails_only_unconfirmed_dispatch_wi
     assert_eq!(resumed.state, JobState::Completed);
     assert_eq!(resumed.attempt.attempt_id, unstarted.attempt.attempt_id);
     assert_eq!(resumed.attempt.number, 1);
-    assert!(!resumed.version_stopped);
     assert_eq!(reopened.get("interrupted").unwrap(), failed);
     assert!(matches!(
         reopened.try_shutdown(),
@@ -1364,7 +1362,6 @@ async fn cancelled_shutdown_waiter_keeps_execution_barrier_and_failed_input_on_r
     assert_eq!(stopped.request, reserved.request);
     assert_eq!(stopped.input_digest, reserved.input_digest);
     assert!(stopped.executions_released());
-    assert!(!stopped.version_stopped);
     let retry = reopened.retry(&stopped.request.job_id).unwrap();
     assert_eq!(retry.attempt.number, 2);
     assert_eq!(retry.request, reserved.request);

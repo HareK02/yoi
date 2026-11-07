@@ -405,10 +405,6 @@ async fn shutdown_preserves_reserved_intent_and_reopen_preserves_confirmed_failu
     assert_eq!(stopped.request, running.request);
     assert_eq!(stopped.attempt.attempt_id, running.attempt.attempt_id);
     assert!(stopped.executions_released());
-    assert!(
-        !stopped.version_stopped,
-        "ordinary shutdown is not a version cutover"
-    );
     let retry = jobs.retry("running").unwrap();
     assert_eq!(retry.attempt.number, 2);
     jobs.start_with_model_client("running", success())
@@ -551,7 +547,6 @@ async fn process_loss_fails_same_attempt_without_claiming_execution_cleanup() {
     assert!(!interrupted.executions_released());
     assert!(interrupted.executions[0].cleanup_receipt.is_none());
     assert!(!interrupted.executions[0].writes_revoked);
-    assert!(!interrupted.version_stopped);
     assert!(jobs.retry("interrupted").is_err());
     let replay = success();
     assert!(

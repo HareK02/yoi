@@ -11,8 +11,10 @@ mod compaction;
 mod connected_compaction;
 mod handoff;
 mod memory_links;
+mod migration;
 mod native_admission;
 mod recovery;
+mod reference_retirement;
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -537,7 +539,8 @@ fn large_original_is_chunked_without_claiming_unread_suffix() {
         .unwrap()
         .pop()
         .unwrap();
-    assert!(serde_json::to_vec(&snapshot.request.input).unwrap().len() < 128 * 1024);
+    // The shared Job cap includes the complete serialized input and permits equality.
+    assert!(serde_json::to_vec(&snapshot.request.input).unwrap().len() <= job::MAX_JOB_INPUT_BYTES);
     assert!(snapshot.request.input.to_string().contains("漢字"));
     assert!(adapter.finish().is_err());
 }
@@ -1048,21 +1051,19 @@ async fn real_job_tools_save_and_drain_last_input_without_another_turn() {
 }
 
 #[tokio::test]
-async fn persisted_pre_binding_job_recovers_only_under_original_session_lifetime_and_never_after_release()
- {
-    let mut fixture = Fixture::new("pre-upgrade pending Journal");
+async fn persisted_current_job_keeps_original_writer_lifetime_and_rejects_reconnection() {
+    let mut fixture = Fixture::new("current pending Journal");
     fixture.host().admit_journal(&fixture.context).unwrap();
     let (jobs, modern_id) = fixture.host().next_journal_job().unwrap().unwrap();
     let saved = jobs.get(&modern_id).unwrap();
     jobs.cancel(&modern_id).unwrap();
     let mut request = saved.request;
-    request.job_id = format!("legacy-journal:{}", uuid::Uuid::now_v7());
-    let mut legacy = saved.domain_grant.unwrap();
-    legacy.as_object_mut().unwrap().remove("writer_binding_id");
-    let pending = jobs.request_granted(request, legacy.clone()).unwrap();
+    request.job_id = format!("current-journal:{}", uuid::Uuid::now_v7());
+    let grant = saved.domain_grant.unwrap();
+    let pending = jobs.request_granted(request, grant.clone()).unwrap();
     assert_eq!(
         jobs.get(&pending.request.job_id).unwrap().domain_grant,
-        Some(legacy)
+        Some(grant)
     );
     jobs.start_with_model_client(&pending.request.job_id, JournalScript::default())
         .await
@@ -1096,7 +1097,7 @@ async fn persisted_pre_binding_job_recovers_only_under_original_session_lifetime
         .unwrap();
     assert!(
         next.host.journal_grant(&completed).is_err(),
-        "missing legacy metadata cannot rebind its original Session to the next body"
+        "a frozen writer binding cannot rebind its original Session to the next body"
     );
     next.close().unwrap();
 }
@@ -1156,7 +1157,6 @@ async fn shutdown_reopen_resumes_same_job_and_frozen_input_without_duplicate_cre
     assert_eq!(stopped.attempt.state, JobAttemptState::Failed);
     assert_eq!(stopped.attempt.attempt_id, original.attempt.attempt_id);
     assert_eq!(stopped.request, original.request);
-    assert!(!stopped.version_stopped);
     assert!(!stopped.executions.is_empty());
     assert!(stopped.executions_released());
     stopped_store.shutdown().await.unwrap();
@@ -1926,8 +1926,8 @@ async fn saved_body_jobs_process_over_a_hundred_entries_and_utf8_without_live_so
 }
 
 #[tokio::test]
-async fn descriptor_job_version_cutover_retains_input_and_records_without_live_recapture() {
-    let fixture = Fixture::new("original descriptor-only input");
+async fn descriptor_job_migration_removes_job_without_deleting_journal_outputs() {
+    let mut fixture = Fixture::new("original descriptor-only input");
     let (adapter, _, modern) = fixture.adapter();
     let jobs = fixture.host().jobs().unwrap();
     fixture
@@ -1941,26 +1941,15 @@ async fn descriptor_job_version_cutover_retains_input_and_records_without_live_r
         )
         .unwrap();
     jobs.cancel(&modern.request.job_id).unwrap();
-    let input = JournalInput::decode(&modern.request.input).unwrap();
-    let origins: Vec<_> = input
-        .capture
-        .entries
-        .iter()
-        .map(|entry| {
-            let (descriptor, _, _) = input.capture.recording_text(entry.order).unwrap();
-            SourceOrigin {
-                pointer: source_descriptor(&fixture.context.session_id, descriptor).pointer,
-                origin: descriptor.origin.clone(),
-            }
-        })
-        .collect();
-    let mut old_grant = adapter.grant.clone();
-    old_grant.origins = origins;
-    old_grant.writer_binding_id = None;
+    let mut old_grant = serde_json::to_value(&adapter.grant).unwrap();
+    old_grant
+        .as_object_mut()
+        .unwrap()
+        .remove("writer_binding_id");
+    old_grant["origins"] = serde_json::json!([]);
     let mut request = modern.request.clone();
     request.job_id = format!("legacy-descriptor:{}", uuid::Uuid::now_v7());
-    request.input =
-        serde_json::json!({"selected_ranges":old_grant.ranges,"origins":old_grant.origins});
+    request.input = serde_json::json!({"selected_ranges":adapter.grant.ranges,"origins":[]});
     let path = fixture._temp.path().join("descriptor-schema-five.sqlite3");
     recovery::seed_schema_five_journal(&path, &request, &old_grant);
     let generation = fixture
@@ -1969,12 +1958,12 @@ async fn descriptor_job_version_cutover_retains_input_and_records_without_live_r
         .store
         .prepare_journal_generation(
             &adapter.context,
-            &old_grant.journal_id,
+            &adapter.grant.journal_id,
             JobAttemptBinding {
                 job_id: request.job_id.clone(),
                 attempt_id: job::attempt_id(&request.job_id, 1),
             },
-            old_grant.ranges.clone(),
+            adapter.grant.ranges.clone(),
         )
         .unwrap();
     let context = JournalJobContext::validated(
@@ -2012,45 +2001,42 @@ async fn descriptor_job_version_cutover_retains_input_and_records_without_live_r
         .execute("UPDATE job_attempts SET state='dispatched'", [])
         .unwrap();
     drop(prior);
+    assert!(matches!(
+        crate::jobs::StandaloneJobs::open(&path, fixture._temp.path().into()),
+        Err(crate::jobs::JobServiceError::Store(
+            crate::job_store::JobStoreError::InvalidTransition(
+                "pending Job reference retirement requires the owning Subject Host"
+            )
+        ))
+    ));
+    // Install the migrated catalog in its owning Subject's temporary directory.
+    // Only reconnecting under that Subject lease may drain Feature references.
+    fixture.connection.close().unwrap();
+    fs::write(&fixture.connection.jobs_path, fs::read(&path).unwrap()).unwrap();
+    let path = fixture.connection.jobs_path.clone();
+    fixture.connection = StandaloneSubjects::open_existing(&fixture.host().catalog.state_root)
+        .unwrap()
+        .connect(
+            &fixture.connection.binding.subject_id,
+            fixture.host().worker_id,
+        )
+        .unwrap();
     let migrated = crate::jobs::StandaloneJobs::open(&path, fixture._temp.path().into()).unwrap();
-    let old = migrated.get(&request.job_id).unwrap();
-    assert!(old.version_stopped);
-    assert_eq!(old.state, JobState::Failed);
-    assert_eq!(old.attempt.state, JobAttemptState::Failed);
-    assert_eq!(
-        old.attempt.failure.as_deref(),
-        Some("バージョン更新による実行打切り")
-    );
-    assert_eq!(old.request, request);
-    assert_eq!(old.input_disposition, JobInputDisposition::Available);
-    assert!(!old.executions_released());
-    assert!(fixture.host().journal_grant(&old).is_err());
+    assert!(matches!(
+        migrated.get(&request.job_id),
+        Err(crate::jobs::JobServiceError::Store(
+            crate::job_store::JobStoreError::NotFound(_)
+        ))
+    ));
     fixture.append("new-not-selected", "LATEST SOURCE MUST NOT BE RECAPTURED");
-    let error = fixture
-        .host()
-        .recover_journal_job(&migrated, &old)
-        .unwrap_err();
-    assert!(
-        matches!(error, SubjektivHostError::Conflict { ref code, .. } if code == "journal_version_stopped")
-    );
     assert!(migrated.retry(&request.job_id).is_err());
     assert!(
         migrated
-            .resume_granted(&request.job_id, &old.attempt.attempt_id)
+            .resume_granted(&request.job_id, &job::attempt_id(&request.job_id, 1))
             .is_err()
     );
     assert!(migrated.pending().unwrap().is_empty());
-    assert_eq!(migrated.get(&request.job_id).unwrap(), old);
-    assert_eq!(
-        fixture
-            .host()
-            .catalog
-            .store
-            .active_journal_generation(&adapter.context, &adapter.grant.journal_id,)
-            .unwrap()
-            .unwrap(),
-        generation
-    );
+
     let entries = fixture
         .host()
         .catalog
@@ -2061,13 +2047,13 @@ async fn descriptor_job_version_cutover_retains_input_and_records_without_live_r
     assert_eq!(entries.items[0].id, saved.entry_id.unwrap());
     drop(migrated);
     let reopened = crate::jobs::StandaloneJobs::open(&path, fixture._temp.path().into()).unwrap();
-    assert_eq!(reopened.get(&request.job_id).unwrap(), old);
+    assert!(reopened.get(&request.job_id).is_err());
     assert_eq!(
         reopened
             .list_session_snapshots(&fixture.context.session_id, None, 100)
             .unwrap()
             .len(),
-        1
+        0
     );
     jobs.shutdown().await.unwrap();
 }
@@ -2424,7 +2410,6 @@ async fn close_cancels_retained_local_job_before_erase_can_acquire_exclusive_lea
     let failed = reopened.get(&id).unwrap();
     assert_eq!(failed.state, JobState::Failed);
     assert_eq!(failed.attempt.state, JobAttemptState::Failed);
-    assert!(!failed.version_stopped);
     assert_eq!(failed.attempt.number, 1);
     assert!(!failed.executions.is_empty());
     assert!(failed.executions_released());

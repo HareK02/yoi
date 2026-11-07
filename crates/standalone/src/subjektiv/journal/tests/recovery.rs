@@ -59,7 +59,6 @@ fn restart_reconciles_complete_checkpoint_but_retains_partial_input_and_all_unpr
         let failed = next.reconcile_host_restart().unwrap().pop().unwrap();
         assert_eq!(failed.state, JobState::Failed);
         assert_eq!(failed.executions, dispatched.executions);
-        assert!(!failed.version_stopped);
         drop(next);
         let jobs = crate::jobs::StandaloneJobs::open(&path, fixture._temp.path().into()).unwrap();
         // A missing live Session makes any source re-fetch an observable failure.
@@ -165,7 +164,6 @@ fn current_schema_reopen_preserves_unconfirmed_execution_and_blocks_journal_resu
         let reopened =
             crate::jobs::StandaloneJobs::open(&path, fixture._temp.path().into()).unwrap();
         assert_eq!(reopened.get(&original.request.job_id).unwrap(), retained);
-        assert!(!retained.version_stopped);
         assert!(!retained.executions_released());
         assert_eq!(retained.executions.len(), 1);
         assert!(!retained.executions[0].writes_revoked);
@@ -245,7 +243,7 @@ fn current_schema_reopen_preserves_unconfirmed_execution_and_blocks_journal_resu
 pub(super) fn seed_schema_five_journal(
     path: &std::path::Path,
     request: &job::JobRequest,
-    grant: &LocalJournalGrant,
+    grant: &serde_json::Value,
 ) {
     let mut conn = rusqlite::Connection::open(path).unwrap();
     feature_storage::configure_connection(&conn).unwrap();

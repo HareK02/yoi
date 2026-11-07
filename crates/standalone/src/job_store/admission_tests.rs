@@ -20,6 +20,8 @@ fn granted_admission_guard_upgrade_rolls_back_retries_preserves_reservations_and
     drop(store);
     let mut conn = Connection::open(&path).unwrap();
     feature_storage::configure_connection(&conn).unwrap();
+    conn.execute_batch("CREATE TABLE job_version_stops(job_id TEXT PRIMARY KEY NOT NULL)")
+        .unwrap();
     // v8 has no table/row changes. Restore the actual immutable v7 guard text.
     let old_guard = &START_REJECTION_SCHEMA[START_REJECTION_SCHEMA
         .find("CREATE TRIGGER job_start_rejection_guard")
@@ -45,6 +47,9 @@ fn granted_admission_guard_upgrade_rolls_back_retries_preserves_reservations_and
     conn.execute("INSERT INTO migration_fault VALUES('missing')", [])
         .unwrap();
     conn.pragma_update(None, "foreign_keys", true).unwrap();
+    let original_schema = super::super::migrations::tests::schema(&conn);
+    let original_intents = super::super::migrations::tests::rows(&conn, "job_intents", "1");
+    let original_attempts = super::super::migrations::tests::rows(&conn, "job_attempts", "1");
     assert!(
         initialize(&mut conn).is_err(),
         "actual FK check after DDL must abort the transaction"
@@ -66,12 +71,16 @@ fn granted_admission_guard_upgrade_rolls_back_retries_preserves_reservations_and
         "failed migration must restore old guard"
     );
     assert_eq!(
-        require_snapshot(&conn, &granted.request.job_id).unwrap(),
-        granted
+        super::super::migrations::tests::schema(&conn),
+        original_schema
     );
     assert_eq!(
-        require_snapshot(&conn, &dispatched.request.job_id).unwrap(),
-        dispatched
+        super::super::migrations::tests::rows(&conn, "job_intents", "1"),
+        original_intents
+    );
+    assert_eq!(
+        super::super::migrations::tests::rows(&conn, "job_attempts", "1"),
+        original_attempts
     );
     conn.execute_batch("DROP TABLE migration_fault").unwrap();
     initialize(&mut conn).unwrap();
@@ -84,9 +93,12 @@ fn granted_admission_guard_upgrade_rolls_back_retries_preserves_reservations_and
         dispatched
     );
     assert_eq!(
-        conn.query_row("SELECT count(*) FROM job_version_stops", [], |row| row
-            .get::<_, i64>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name='job_version_stops'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
         0
     );
     let schema = |conn: &Connection| {

@@ -193,8 +193,13 @@ impl StandaloneJobs {
     }
 
     pub(crate) fn open(path: &Path, cwd: PathBuf) -> Result<Self, JobServiceError> {
+        let mut store = JobStore::open(path)?;
+        // A Subject connection must drain its pinned retirement queue under its
+        // own lease first. Never expose Jobs or reconcile executions while domain
+        // references to migrated-away Jobs may still be active.
+        store.finish_domainless_reference_retirement()?;
         Ok(Self {
-            store: Arc::new(Mutex::new(Some(JobStore::open(path)?))),
+            store: Arc::new(Mutex::new(Some(store))),
             executions: Arc::new(Mutex::new(Executions {
                 closed: false,
                 shutdown_confirmed: false,
@@ -245,9 +250,7 @@ impl StandaloneJobs {
             .pending()?
             .into_iter()
             .filter(|saved| {
-                saved.domain_grant.is_none()
-                    && !saved.version_stopped
-                    && saved.attempt.state == JobAttemptState::Reserved
+                saved.domain_grant.is_none() && saved.attempt.state == JobAttemptState::Reserved
             })
             .map(|saved| (saved.request.job_id, saved.attempt.attempt_id))
             .collect())
@@ -580,8 +583,7 @@ impl StandaloneJobs {
             }
         }
         snapshot.load_executable_request()?;
-        if snapshot.version_stopped
-            || snapshot.state != JobState::Pending
+        if snapshot.state != JobState::Pending
             || snapshot.attempt.state != JobAttemptState::Reserved
         {
             return Err(JobStoreError::InvalidTransition(

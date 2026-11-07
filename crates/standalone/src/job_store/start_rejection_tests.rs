@@ -149,9 +149,12 @@ fn start_rejection_migration_adds_only_evidence_and_rolls_back_then_reopens_with
         0
     );
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM job_version_stops", [], |r| r
-            .get::<_, i64>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name='job_version_stops'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
         0
     );
     drop(conn);
@@ -160,7 +163,6 @@ fn start_rejection_migration_adds_only_evidence_and_rolls_back_then_reopens_with
     assert_eq!(saved.request, req);
     assert_eq!(saved.state, JobState::Pending);
     assert_eq!(saved.attempt.state, JobAttemptState::Reserved);
-    assert!(!saved.version_stopped);
     assert!(saved.start_rejected_by.is_none());
     store
         .fail_reserved_result(

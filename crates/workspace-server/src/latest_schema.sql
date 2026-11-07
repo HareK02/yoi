@@ -775,7 +775,7 @@ CREATE TABLE "worker_registry" (
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
         );
 CREATE TABLE backend_jobs (
-            input_disposition TEXT NOT NULL DEFAULT 'available' CHECK (input_disposition IN ('available','reclaimed','erased','invalidated')),
+            input_disposition TEXT NOT NULL DEFAULT 'available' CHECK (input_disposition IN ('available','reclaimed','erased')),
             workspace_id TEXT NOT NULL,
             job_id TEXT NOT NULL,
             purpose TEXT NOT NULL,
@@ -842,25 +842,6 @@ CREATE INDEX backend_job_attempts_recovery
         ON backend_job_attempts(workspace_id, state, deadline_at);
 CREATE INDEX backend_job_attempts_worker_cleanup
         ON backend_job_attempts(workspace_id, worker_cleanup_state, updated_at);
-CREATE TABLE backend_job_deliveries (
-            workspace_id TEXT NOT NULL,
-            delivery_id TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            attempt_id TEXT NOT NULL,
-            target_runtime_id TEXT NOT NULL,
-            target_worker_id TEXT NOT NULL,
-            state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'completed', 'failed', 'unknown')),
-            failure_category TEXT,
-            failure_detail TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            delivered_at TEXT,
-            PRIMARY KEY (workspace_id, delivery_id),
-            FOREIGN KEY (workspace_id, job_id, attempt_id)
-                REFERENCES backend_job_attempts(workspace_id, job_id, attempt_id) ON DELETE CASCADE
-        );
-CREATE INDEX backend_job_deliveries_pending
-        ON backend_job_deliveries(workspace_id, state, updated_at);
 CREATE TABLE worker_registry_observations (
     workspace_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
@@ -1636,8 +1617,8 @@ CREATE TRIGGER backend_job_identity_immutable BEFORE UPDATE OF
 BEGIN SELECT RAISE(ABORT, 'immutable Backend Job identity'); END;
 CREATE TRIGGER backend_job_input_retirement BEFORE UPDATE OF request_json, input_disposition ON backend_jobs
 WHEN (
-    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased','invalidated'))
-      OR (OLD.input_disposition IN ('reclaimed','invalidated') AND NEW.input_disposition = 'erased'))
+    ((OLD.input_disposition = 'available' AND NEW.input_disposition IN ('reclaimed','erased'))
+      OR (OLD.input_disposition = 'reclaimed' AND NEW.input_disposition = 'erased'))
     AND json_remove(NEW.request_json,'$.input') = json_remove(OLD.request_json,'$.input')
     AND json_type(NEW.request_json,'$.input') = 'null'
 ) IS NOT TRUE

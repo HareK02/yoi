@@ -2212,112 +2212,9 @@ async fn journal_reserved_restart_dispatches_exact_saved_intent_once() {
     assert_eq!(again.runtime_run_id, first.runtime_run_id);
 }
 
-// Seed the post-migration boundary, not a new live legacy state. Actual ordered
-// migration/rollback coverage belongs to backend_job_upgrade_tests; these fixtures
-// test consumers of its immutable marker and preserve independent cleanup evidence.
-fn fixture_journal_migration_stopped(api: &WorkspaceApi, job_id: &str) {
-    let connection = rusqlite::Connection::open(&api.config.database_path).unwrap();
-    let tx = connection.unchecked_transaction().unwrap();
-    tx.execute(
-        "INSERT INTO backend_job_upgrade_history
-        (workspace_id,job_id,state,failure_category,failure_detail,updated_at,completed_at)
-        SELECT workspace_id,job_id,state,failure_category,failure_detail,updated_at,completed_at
-        FROM backend_jobs WHERE workspace_id=?1 AND job_id=?2",
-        rusqlite::params![TEST_WORKSPACE_ID, job_id],
-    )
-    .unwrap();
-    tx.execute("INSERT INTO backend_job_attempt_upgrade_history
-        (workspace_id,job_id,attempt_id,state,failure_category,failure_detail,updated_at,completed_at)
-        SELECT workspace_id,job_id,attempt_id,state,failure_category,failure_detail,updated_at,completed_at
-        FROM backend_job_attempts WHERE workspace_id=?1 AND job_id=?2", rusqlite::params![TEST_WORKSPACE_ID,job_id]).unwrap();
-    for table in ["backend_job_attempts", "backend_jobs"] {
-        tx.execute(&format!("UPDATE {table} SET state='failed',failure_category='version_upgrade_execution_aborted',
-            failure_detail='version upgrade stopped this execution; no termination or recording proof',
-            completed_at=?3,updated_at=?3 WHERE workspace_id=?1 AND job_id=?2 AND state NOT IN ('completed','failed')"),
-            rusqlite::params![TEST_WORKSPACE_ID,job_id,Utc::now().to_rfc3339()]).unwrap();
-    }
-    tx.commit().unwrap();
-}
-
-#[tokio::test]
-async fn migration_stopped_checkpoint_is_excluded_from_recovery_result_acceptance_and_retry() {
-    let f = RuntimeFixture::new().await;
-    let dispatched = f.dispatch_input();
-    let worker = dispatched.attempt.worker.as_ref().unwrap();
-    f.checkpoint(worker);
-    let completion = subjektiv_journal::finish(&f.api, worker).unwrap();
-    let checkpoint = f
-        .store
-        .query_journal_operation(&f.host, &f.id, "checkpoint")
-        .unwrap();
-    let generation = f.store.active_journal_generation(&f.host, &f.id).unwrap();
-    fixture_journal_migration_stopped(&f.api, &f.request.job_id);
-    let stopped = current_journal_job(&f);
-    let stopped_attempt = current_journal_attempt(&f, &dispatched.attempt.attempt_id);
-    assert_eq!(stopped.state, BackendJobState::Failed);
-    assert_eq!(
-        stopped.failure_category.as_deref(),
-        Some("version_upgrade_execution_aborted")
-    );
-    f.execution.take_inputs();
-    // Even a callback retaining the pre-cutover Pending snapshot must consult the
-    // current migration marker before looking for an execution or saved completion.
-    subjektiv_journal::reconcile_attempt(&f.api, &dispatched.job, &dispatched.attempt).unwrap();
-    subjektiv_journal::recover_attempts(&f.api).unwrap();
-    f.api.recover_backend_jobs().unwrap();
-    assert!(
-        f.api
-            .accept_backend_job_result(
-                worker,
-                &BackendJobResultSubmission {
-                    job_id: f.request.job_id.clone(),
-                    attempt_id: stopped_attempt.attempt_id.clone(),
-                    input_digest: stopped_attempt.input_digest.clone(),
-                    result: serde_json::to_value(completion).unwrap(),
-                }
-            )
-            .is_err()
-    );
-    assert!(
-        f.api
-            .store
-            .reserve_backend_job_retry(
-                TEST_WORKSPACE_ID,
-                &f.request.job_id,
-                &Utc::now().to_rfc3339()
-            )
-            .is_err()
-    );
-    let after = current_journal_job(&f);
-    assert_eq!(after.state, BackendJobState::Failed);
-    assert_eq!(after.current_attempt, stopped.current_attempt);
-    assert_eq!(after.failure_category, stopped.failure_category);
-    assert_eq!(
-        after.load_executable_request().unwrap().input,
-        f.request.input
-    );
-    assert_eq!(after.input_digest, stopped.input_digest);
-    assert!(
-        after.result.is_none(),
-        "a migration Failed cannot be promoted from checkpoint"
-    );
-    assert_eq!(
-        f.store
-            .query_journal_operation(&f.host, &f.id, "checkpoint")
-            .unwrap(),
-        checkpoint
-    );
-    assert_eq!(
-        f.store.active_journal_generation(&f.host, &f.id).unwrap(),
-        generation
-    );
-    assert!(f.execution.take_inputs().is_empty());
-    assert!(subjektiv_journal::require_job_effects_ended(&f.api, &after).is_err());
-}
-
 #[tokio::test]
 async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_source_to_success() {
-    for unavailable in ["erased", "body_released", "retired", "deleted_worker"] {
+    for unavailable in ["erased", "body_released", "input_erased", "deleted_worker"] {
         let f = RuntimeFixture::new().await;
         // Join only this fixture's background recovery before constructing the cut.
         // This orders checkpoint/unavailability; it is not execution-ended evidence.
@@ -2356,14 +2253,14 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
             "body_released" => {
                 f.store.release_removed_journal_body(&f.host).unwrap();
             }
-            "retired" => {
+            "input_erased" => {
                 f.api
                     .store
                     .reclaim_backend_job_input(
                         TEST_WORKSPACE_ID,
                         &f.request.job_id,
                         &f.request.input_digest().unwrap(),
-                        crate::backend_job::JobInputRetirementReason::LegacyInvalidation,
+                        crate::backend_job::JobInputRetirementReason::ExplicitErasure,
                     )
                     .unwrap();
             }
@@ -2430,7 +2327,7 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
             Some(match unavailable {
                 "erased" => "journal_session_erased",
                 "body_released" => "journal_body_released",
-                "retired" => "journal_input_unavailable",
+                "input_erased" => "journal_input_unavailable",
                 "deleted_worker" => "journal_source_worker_missing",
                 _ => unreachable!(),
             })
@@ -2440,7 +2337,7 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
         assert_eq!(failed.input_digest, attempt.input_digest);
         assert_eq!(failed.input_digest, f.request.input_digest().unwrap());
         assert_eq!(failed.intent_fingerprint, f.request.fingerprint().unwrap());
-        if unavailable != "retired" {
+        if unavailable != "input_erased" {
             assert_eq!(failed.load_executable_request().unwrap(), &f.request);
         }
         assert!(
@@ -2459,7 +2356,7 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
         // The stale caller cannot execute. Available terminal input returns only
         // its saved Failed observation; explicitly retired input remains rejected.
         let replay = f.api.dispatch_backend_job_reservation(dispatched.clone());
-        if unavailable == "retired" {
+        if unavailable == "input_erased" {
             assert!(matches!(replay, Err(Error::WorkspacePermissionDenied(_))));
         } else {
             let replay = replay.unwrap();
@@ -2521,12 +2418,12 @@ async fn saved_checkpoint_never_promotes_erased_released_retired_or_missing_sour
         } else {
             assert!(f.store.journal_session_erased(&f.host).unwrap());
         }
-        if unavailable == "retired" {
+        if unavailable == "input_erased" {
             assert!(failed.load_executable_request().is_err());
             assert!(failed.request.input.is_null());
             assert_eq!(
                 failed.input_disposition,
-                crate::backend_job::JobInputDisposition::Invalidated
+                crate::backend_job::JobInputDisposition::Erased
             );
         }
         if unavailable == "deleted_worker" {
@@ -3468,10 +3365,6 @@ impl SubjectRemovalFixture {
             .unwrap();
     }
     fn pending_journal(&self) -> BackendJobReservation {
-        self.pending_journal_input(false)
-    }
-
-    fn pending_journal_input(&self, legacy: bool) -> BackendJobReservation {
         let capture =
             subjektiv_journal::capture_input(&self.api, &self.attr, 0, 0, 48 * 1024).unwrap();
         let ranges = subjektiv::journal::recording::capture_ranges(&capture).unwrap();
@@ -3489,41 +3382,15 @@ impl SubjectRemovalFixture {
             },
         )
         .unwrap();
-        let mut request =
+        let request =
             subjektiv_journal::recording_request(&self.host, self.attr.clone(), &id, input)
                 .unwrap();
-        if legacy {
-            let grant = request.grants.subjektiv_journal.as_mut().unwrap();
-            grant.binding_id.clear();
-            request.input =
-                serde_json::json!({"journal_id":id, "selected_ranges":grant.selected_ranges});
-        }
         let reserved = self
             .api
             .store
             .reserve_backend_job(TEST_WORKSPACE_ID, &request, &Utc::now().to_rfc3339())
             .unwrap();
-        if legacy {
-            self.store
-                .prepare_journal_generation(
-                    &self.host,
-                    &id,
-                    subjektiv::api::JobAttemptBinding {
-                        job_id: request.job_id.clone(),
-                        attempt_id: reserved.attempt.attempt_id.clone(),
-                    },
-                    request
-                        .grants
-                        .subjektiv_journal
-                        .as_ref()
-                        .unwrap()
-                        .selected_ranges
-                        .clone(),
-                )
-                .unwrap();
-        } else {
-            subjektiv_journal::prepare(&self.api, &reserved).unwrap();
-        }
+        subjektiv_journal::prepare(&self.api, &reserved).unwrap();
         reserved
     }
 
@@ -3938,9 +3805,9 @@ async fn subject_removal_prior_archive_policy_receipt_remains_recoverable() {
     assert_eq!(prepared.plan.policy_digest, recovered.plan.policy_digest);
 }
 
-async fn assert_unbound_pending_snapshot_keeps_source(legacy: bool, completed: bool) {
+async fn assert_unbound_pending_snapshot_keeps_source(completed: bool) {
     let f = SubjectRemovalFixture::new().await;
-    let reserved = f.pending_journal_input(legacy);
+    let reserved = f.pending_journal();
     let grant = reserved
         .job
         .request
@@ -4034,17 +3901,12 @@ async fn assert_unbound_pending_snapshot_keeps_source(legacy: bool, completed: b
 
 #[tokio::test]
 async fn subject_removal_keeps_unbound_checkpoint_without_execution_evidence() {
-    assert_unbound_pending_snapshot_keeps_source(false, true).await;
+    assert_unbound_pending_snapshot_keeps_source(true).await;
 }
 
 #[tokio::test]
-async fn subject_removal_keeps_legacy_checkpoint_without_execution_evidence() {
-    assert_unbound_pending_snapshot_keeps_source(true, true).await;
-}
-
-#[tokio::test]
-async fn subject_removal_blocks_legacy_unbound_pending_without_execution_evidence() {
-    assert_unbound_pending_snapshot_keeps_source(true, false).await;
+async fn subject_removal_blocks_unbound_pending_without_execution_evidence() {
+    assert_unbound_pending_snapshot_keeps_source(false).await;
 }
 
 #[tokio::test]
@@ -5289,33 +5151,19 @@ journal_recovery_cases! {
 }
 
 #[tokio::test]
-async fn legacy_journal_grant_preserves_wire_digest_but_authorizes_neither_writer() {
+async fn journal_grant_requires_binding_and_never_rebinds_released_writer() {
     let f = SubjectRemovalFixture::new().await;
-    let old = json!({"subject_id":f.attr.subject_id,"session_id":f.attr.session_id,"journal_id":"legacy-journal","selected_ranges":[]});
-    let wire = serde_json::to_string(&old).unwrap();
-    let grant: SubjektivJournalGrant = serde_json::from_str(&wire).unwrap();
-    assert!(grant.binding_id.is_empty());
-    assert_eq!(
-        serde_json::to_value(&grant).unwrap(),
-        old,
-        "old canonical request/digest must not acquire a new empty binding_id field"
-    );
-    let roundtrip = serde_json::to_string(&serde_json::to_value(&grant).unwrap()).unwrap();
-    assert_eq!(roundtrip, wire);
-    assert_eq!(
-        job::sha256(roundtrip.as_bytes()),
-        job::sha256(wire.as_bytes())
-    );
-    let mut bound = grant.clone();
+    let mut wire = json!({"subject_id":f.attr.subject_id,"session_id":f.attr.session_id,"journal_id":"journal","selected_ranges":[]});
+    assert!(serde_json::from_value::<SubjektivJournalGrant>(wire.clone()).is_err());
+    wire["binding_id"] = json!("");
+    let grant: SubjektivJournalGrant = serde_json::from_value(wire).unwrap();
+    assert!(matches!(
+        subjektiv_journal::host(&f.api, &f.store, &grant),
+        Err(Error::WorkspacePermissionDenied(_))
+    ));
+    let mut bound = grant;
     bound.binding_id = f.host.writer_binding_id().unwrap().into();
     assert!(subjektiv_journal::host(&f.api, &f.store, &bound).is_ok());
-    assert!(
-        matches!(
-            subjektiv_journal::host(&f.api, &f.store, &grant),
-            Err(Error::WorkspacePermissionDenied(_))
-        ),
-        "wire compatibility is not authority even for the original writer"
-    );
     let writer = JournalWriterBinding {
         subject_id: f.attr.subject_id.clone(),
         runtime_id: f.attr.runtime_id.clone(),
@@ -5330,14 +5178,18 @@ async fn legacy_journal_grant_preserves_wire_digest_but_authorizes_neither_write
     assert!(f.store.journal_writer_active(&successor).unwrap());
     assert!(!f.store.journal_writer_active(&writer).unwrap());
     assert_ne!(successor.binding_id, writer.binding_id);
-    assert!(
-        matches!(
-            subjektiv_journal::host(&f.api, &f.store, &grant),
-            Err(Error::WorkspacePermissionDenied(_))
-        ),
-        "legacy grant must never map to a later writer"
+    // Reconstruction retains the original context for receipt recovery; it is
+    // not current writer authority and must never resolve to the successor.
+    let retained = subjektiv_journal::host(&f.api, &f.store, &bound).unwrap();
+    assert_eq!(
+        retained.writer_binding_id(),
+        Some(writer.binding_id.as_str())
     );
-    assert_eq!(serde_json::to_value(&grant).unwrap(), old);
+    bound.binding_id = successor.binding_id;
+    assert!(matches!(
+        subjektiv_journal::host(&f.api, &f.store, &bound),
+        Err(Error::WorkspacePermissionDenied(_))
+    ));
 }
 
 /// Real embedded Runtime capture + SQLite + production dispatch; synthetic ordinary
@@ -7008,14 +6860,14 @@ mod lifecycle_barrier {
     }
 }
 
-mod journal_migration {
+mod journal_input_validation {
     use super::lifecycle_barrier::{joined, spawn};
     use super::*;
     use subjektiv::journal::recording::JournalInput;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn reserved_legacy_descriptor_fails_without_reselection_and_preserves_partial_checkpoint()
-    {
+    async fn descriptor_input_fails_current_validation_without_reselection_and_preserves_checkpoint()
+     {
         let f = SubjectRemovalFixture::new().await;
         let capture = subjektiv_journal::capture_input(&f.api, &f.attr, 0, 0, 48 * 1024).unwrap();
         let ranges = subjektiv::journal::recording::capture_ranges(&capture).unwrap();
@@ -7033,13 +6885,6 @@ mod journal_migration {
             subjektiv_journal::recording_request(&f.host, f.attr.clone(), &id, input).unwrap();
         legacy.job_id = "reserved-descriptor-only-legacy".into();
         legacy.input = json!({"journal_id":id, "selected_ranges":ranges});
-        legacy
-            .grants
-            .subjektiv_journal
-            .as_mut()
-            .unwrap()
-            .binding_id
-            .clear();
         let reserved = f
             .api
             .store
@@ -7139,10 +6984,13 @@ mod journal_migration {
         f.execution.take_inputs();
         let original = reserved.clone();
         let api = f.api.clone();
-        let rejected = joined(spawn(move || {
-            api.dispatch_backend_job_reservation(reserved)
-        }))
-        .unwrap();
+        assert!(
+            joined(spawn(move || {
+                api.dispatch_backend_job_reservation(reserved)
+            }))
+            .is_err()
+        );
+        subjektiv_journal::reconcile_attempt(&f.api, &original.job, &original.attempt).unwrap();
         let old = f
             .api
             .store
@@ -7159,12 +7007,10 @@ mod journal_migration {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(rejected.job, old);
-        assert_eq!(rejected.attempt, old_attempt);
         assert_eq!(old.state, BackendJobState::Failed);
         assert_eq!(
             old.failure_category.as_deref(),
-            Some("journal_descriptor_invalidated")
+            Some("journal_input_invalid")
         );
         assert_eq!(
             old.input_disposition,
@@ -7176,13 +7022,7 @@ mod journal_migration {
         assert_eq!(old.intent_fingerprint, fingerprint);
         assert_eq!(old.current_attempt, 1);
         assert!(old.result.is_none());
-        assert!(
-            !f.api
-                .store
-                .backend_job_was_migrated(TEST_WORKSPACE_ID, &legacy.job_id)
-                .unwrap(),
-            "descriptor rejection must not impersonate schema migration"
-        );
+
         assert_eq!(old_attempt.state, BackendJobAttemptState::Failed);
         assert_eq!(old_attempt.attempt_id, original.attempt.attempt_id);
         assert_eq!(old_attempt.attempt, 1);
@@ -7311,8 +7151,7 @@ mod journal_migration {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tampered_or_missing_body_snapshot_is_not_legacy_and_never_falls_back_to_available_source()
-     {
+    async fn tampered_or_missing_body_snapshot_never_falls_back_to_available_source() {
         for missing in [false, true] {
             let f = RuntimeFixture::new().await;
             f.api
@@ -7347,14 +7186,6 @@ mod journal_migration {
                 "generic immutable digest is valid; semantic body integrity is not"
             );
             f.execution.take_inputs();
-            let api = f.api.clone();
-            let candidate = bad.clone();
-            assert!(
-                !joined(spawn(move || subjektiv_journal::migrate_reserved_legacy(
-                    &api, &candidate
-                )))
-                .unwrap()
-            );
             let api = f.api.clone();
             assert!(joined(spawn(move || api.dispatch_backend_job_reservation(bad))).is_err());
             assert!(f.execution.take_inputs().is_empty());

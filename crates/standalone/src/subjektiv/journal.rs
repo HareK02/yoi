@@ -39,24 +39,49 @@ pub(super) const JOURNAL_OPERATIONS: &[&str] = &[
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalJournalGrant {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    writer_binding_id: Option<String>,
+    writer_binding_id: String,
     binding: StandaloneSubjectBinding,
     session_id: String,
     journal_id: String,
     ranges: Vec<JournalSourceRange>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    origins: Vec<SourceOrigin>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    operations: Option<Vec<String>>,
+    operations: Vec<String>,
 }
 impl LocalJournalGrant {
+    fn validate_stored(
+        request: &job::JobRequest,
+        value: &serde_json::Value,
+        input_available: bool,
+    ) -> Result<Self, String> {
+        let grant: Self = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        if request.purpose != PURPOSE
+            || grant.writer_binding_id.is_empty()
+            || grant.binding.subject_id.is_empty()
+            || grant.binding.scope_id.is_empty()
+            || grant.session_id.is_empty()
+            || grant.journal_id.is_empty()
+            || grant.ranges.is_empty()
+            || request.serialization_key.as_deref()
+                != Some(&format!("subjektiv-journal:{}", grant.journal_id))
+        {
+            return Err("invalid saved Journal grant identity or selection".into());
+        }
+        // Retirement intentionally removes the body, not its receipt/grant metadata.
+        if input_available {
+            let input = JournalInput::decode(&request.input).map_err(|e| e.to_string())?;
+            if input.subject_id != grant.binding.subject_id
+                || input.journal_id != grant.journal_id
+                || input.capture.session_id != grant.session_id
+                || input.selected_ranges != grant.ranges
+            {
+                return Err("saved Journal body identity/ranges differ from grant".into());
+            }
+        }
+        Ok(grant)
+    }
+
     fn authorize_operation(&self, operation: &str) -> Result<(), SubjektivHostError> {
         if !JOURNAL_OPERATIONS.contains(&operation)
-            || self
-                .operations
-                .as_ref()
-                .is_some_and(|keys| !keys.iter().any(|key| key == operation))
+            || !self.operations.iter().any(|key| key == operation)
         {
             return Err(SubjektivHostError::PermissionDenied(format!(
                 "operation `{operation}` is outside the frozen Journal Job grant"
@@ -64,12 +89,6 @@ impl LocalJournalGrant {
         }
         Ok(())
     }
-}
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceOrigin {
-    pointer: JournalSourcePointer,
-    origin: session_store::public_material::PublicMaterialOrigin,
 }
 
 impl StandaloneSubjects {
@@ -286,6 +305,16 @@ fn authority(
 }
 
 impl LocalSubjectHost {
+    /// Storage migration uses the same current payload contract as normal Journal admission.
+    /// This validates saved bytes only: no live source, writer renewal, or domain mutation.
+    pub(crate) fn validate_stored_journal_job(
+        request: &job::JobRequest,
+        grant: &serde_json::Value,
+        input_available: bool,
+    ) -> Result<(), String> {
+        LocalJournalGrant::validate_stored(request, grant, input_available).map(|_| ())
+    }
+
     /// The reservation is obtained by this Host from its actual Controller and kept through
     /// final reconciliation and durable revocation. A stopped body cannot supply this proof.
     pub(crate) fn release_for_handoff(
@@ -619,9 +648,7 @@ impl LocalSubjectHost {
                         // remained in the ledger, never in this running Job's frozen input.
                     }
                     Ok(snapshot)
-                        if snapshot.state == JobState::Failed
-                            && snapshot.executions_released()
-                            && !snapshot.version_stopped =>
+                        if snapshot.state == JobState::Failed && snapshot.executions_released() =>
                     {
                         // The next pass reconciles saved operations/checkpoints and resumes
                         // this exact Job/input within its attempt budget, without resampling.
@@ -699,16 +726,6 @@ impl LocalSubjectHost {
                         if grant.journal_id != journal.id {
                             continue;
                         }
-                        if saved.version_stopped {
-                            // Migration is not normal recovery or Journal completion.
-                            // Keep the original ranges/input, even when fully checkpointed.
-                            if !self.saved_ranges_reflected(&context, &grant)?
-                                || !saved.executions_released()
-                            {
-                                return Err(SubjektivHostError::Conflict { code: "journal_version_stopped".into(), message: "Version-stopped Journal retains input/checkpoint and unproven execution obligations".into() });
-                            }
-                            continue;
-                        }
                         match saved.state {
                             JobState::Completed => self.complete_journal_job(&jobs, saved)?,
                             JobState::Pending
@@ -739,13 +756,12 @@ impl LocalSubjectHost {
                     continue;
                 }
                 let grant = LocalJournalGrant {
-                    writer_binding_id: Some(self.writer.binding_id.clone()),
+                    writer_binding_id: self.writer.binding_id.clone(),
                     binding: self.binding.clone(),
                     session_id: journal.source_session_id,
                     journal_id: journal.id.clone(),
                     ranges: input.selected_ranges.clone(),
-                    origins: vec![],
-                    operations: Some(self.freeze_operations(JOURNAL_OPERATIONS)?),
+                    operations: self.freeze_operations(JOURNAL_OPERATIONS)?,
                 };
                 let request = self.journal_request(&journal.id, &input)?;
                 let saved = jobs
@@ -798,14 +814,6 @@ impl LocalSubjectHost {
             });
         }
         let saved = &current;
-        if saved.version_stopped {
-            return Err(SubjektivHostError::Conflict {
-                code: "journal_version_stopped".into(),
-                message:
-                    "Version-stopped Journal cannot resume or convert checkpoints into completion"
-                        .into(),
-            });
-        }
         self.journal_grant(saved)?; // verifies the immutable body; never fetch live text
         let grant = self.journal_grant_scope(saved)?;
         let context = authority(self, &grant.session_id)?;
@@ -1301,16 +1309,16 @@ impl LocalSubjectHost {
         &self,
         snapshot: &JobSnapshot,
     ) -> Result<LocalJournalGrant, SubjektivHostError> {
-        let grant: LocalJournalGrant =
-            serde_json::from_value(snapshot.domain_grant.clone().ok_or_else(|| {
+        let grant = LocalJournalGrant::validate_stored(
+            &snapshot.request,
+            snapshot.domain_grant.as_ref().ok_or_else(|| {
                 SubjektivHostError::InvalidArgument("missing Journal delegation".into())
-            })?)
-            .map_err(|error| SubjektivHostError::InvalidArgument(error.to_string()))?;
+            })?,
+            snapshot.input_disposition == crate::jobs::JobInputDisposition::Available,
+        )
+        .map_err(SubjektivHostError::InvalidArgument)?;
         if grant.binding != self.binding
-            || grant
-                .writer_binding_id
-                .as_ref()
-                .is_some_and(|id| id != &self.writer.binding_id)
+            || grant.writer_binding_id != self.writer.binding_id
             || snapshot.request.purpose != PURPOSE
             || snapshot.request.serialization_key.as_deref()
                 != Some(&format!("subjektiv-journal:{}", grant.journal_id))
@@ -1319,9 +1327,7 @@ impl LocalSubjectHost {
                 "Job input/grant does not match this Journal capability".into(),
             ));
         }
-        // Pre-binding persisted Jobs lack the new field. They may resume only after the
-        // Host has bound their ORIGINAL Session to this lifetime. Session binding is immutable;
-        // missing grant metadata never maps an old Session onto a later body/reconnection.
+        // The frozen grant and original Session must both name this active writer lifetime.
         if !self
             .catalog
             .store
@@ -1358,18 +1364,7 @@ impl LocalSubjectHost {
         snapshot
             .load_executable_request()
             .map_err(|e| SubjektivHostError::InvalidArgument(e.to_string()))?;
-        let grant = self.journal_grant_scope(snapshot)?;
-        let input = JournalInput::decode(&snapshot.request.input).map_err(journal_error)?;
-        if input.subject_id != self.binding.subject_id
-            || input.journal_id != grant.journal_id
-            || input.capture.session_id != grant.session_id
-            || input.selected_ranges != grant.ranges
-        {
-            return Err(SubjektivHostError::InvalidArgument(
-                "saved Journal body identity/ranges differ from grant".into(),
-            ));
-        }
-        Ok(grant)
+        self.journal_grant_scope(snapshot)
     }
 
     fn complete_journal_job(

@@ -1,24 +1,5 @@
 [
   {
-    "path": "crates/standalone/src/job_store/recovery.rs",
-    "kind": "saved_data",
-    "reason": "旧standalone Job schema 1/2の実migration fixtureに必要な保存列・JSON key。旧入力tokenの保持と新digestへの既存移行を検証する境界だけに残し、現行実行の状態・CASへ流用しない。",
-    "lines": [
-      {
-        "sha256": "969de6ed2a496597ba3d80cc06e76d273e73a641e438eee10cb8b708696f29ad",
-        "count": 1
-      },
-      {
-        "sha256": "c69cf30db18c35ff26a854bf47ecd4f67bc70513ab41a7b74b78e232e2e34a68",
-        "count": 1
-      },
-      {
-        "sha256": "f88b9c3ac64944b6e957f9d85a54081925f70cbd2563d936f2a5f9d746093940",
-        "count": 2
-      }
-    ]
-  },
-  {
     "path": "crates/workspace-server/src/backend_job_upgrade.rs",
     "kind": "saved_data",
     "reason": "schema85以前のJob/全attemptの原保存列をschema86の本文変換前に同transactionで捕捉・検証する読み取り/移行境界。旧tokenを履歴として保ち、raw本文は既Job消去ownerと連動してretireする。現行Job入力digestの別名や新しい実行状態を作らない。",
@@ -141,7 +122,10 @@
     "kind": "saved_data",
     "reason": "schema 6の固定保存Subject行を投入し、最新migrationが旧retiredとarchive原文を黙って消去・再活性化せず、明示削除だけで消去する検証に必要な旧SQL列名。現行writerや競合制御には使わない。",
     "lines": [
-      { "sha256": "defca5951b3d48785514b25912044fa3fc252659311b09a31fa2e64af2a19049", "count": 1 }
+      {
+        "sha256": "defca5951b3d48785514b25912044fa3fc252659311b09a31fa2e64af2a19049",
+        "count": 1
+      }
     ]
   },
   {
@@ -149,8 +133,14 @@
     "kind": "saved_data",
     "reason": "最古対応v1 schemaの保存済Subject JSONとSQLをそのまま作成し、最新migrationが元出典を保持する検証に必要な固定綴り。現行writerや状態判断には使わない。",
     "lines": [
-      { "sha256": "e30d8ddbb500aa10a4a23c52a1f34abbf1b6a8f3692501bb3b74084b63db911c", "count": 1 },
-      { "sha256": "ed4d9edc0c05bf5ab788da52e8b1e44f4543c57d13b9a002144dbdc4430b5837", "count": 1 }
+      {
+        "sha256": "e30d8ddbb500aa10a4a23c52a1f34abbf1b6a8f3692501bb3b74084b63db911c",
+        "count": 1
+      },
+      {
+        "sha256": "ed4d9edc0c05bf5ab788da52e8b1e44f4543c57d13b9a002144dbdc4430b5837",
+        "count": 1
+      }
     ]
   },
   {
@@ -221,69 +211,6 @@
     "lines": [
       {
         "sha256": "54c30cb3198eb16e57c7e580fce4dc058f89e793b77a2955be317aa38b490138",
-        "count": 1
-      }
-    ]
-  },
-  {
-    "path": "crates/standalone/src/job_store/legacy_migrations.rs",
-    "kind": "saved_data",
-    "reason": "JobStore::openがschema 1/2 DBを移行する際の旧attempt列・request key、およびその実データfixture。原request/fingerprint/attemptをimmutable archiveへ退避して内容digestを再計算し、receipt・failure・grant・replayを保持する。削除すると既存Jobsを開けず、rollback時の旧binding保持検証も失う。",
-    "lines": [
-      {
-        "sha256": "91b31d4f17e2c3b826887aa989655998930699db07190ae182cab69479b4157b",
-        "count": 1
-      },
-      {
-        "sha256": "95afb0c8b156e3d2bed11671f1c35f9f74d1589fc20d540f4b16c8d7c887f2ec",
-        "count": 1
-      },
-      {
-        "sha256": "869701cd7b0975f2837f6d9e61fddd0c9b6da36b0250cd77653aee9ca6343c01",
-        "count": 1
-      },
-      {
-        "sha256": "16cb51c05f2f830669af2440ba1e92b1d10f1aff6fa2933cebb36f055a28f926",
-        "count": 1
-      },
-      {
-        "sha256": "0a183581dadfa685bb2b3a58bd300883f2649816e1a63b4e90f903b6494036e0",
-        "count": 1
-      },
-      {
-        "sha256": "af70f24d3b73b08f64576a21ecfe31b605cbf9ba4bd3b3c446fb0d921e949bd9",
-        "count": 1
-      },
-      {
-        "sha256": "a37ba64e23c033ccac9057cec0c881c4826616e154d5a60dbeeae3c6a97f0dbd",
-        "count": 1
-      },
-      {
-        "sha256": "f555731b0a9a79e6be6307d196f1eea1247ecb0f24c8c49c26492cf64d1a0f78",
-        "count": 1
-      },
-      {
-        "sha256": "7aa68b52c228a072d05fa14a37d238736291b76177ad9a2e0c38cfe0d6d7f426",
-        "count": 1
-      },
-      {
-        "sha256": "4768381600ae71cb90f054f8cba748a4b3273194250bba05f3acedab56b480e2",
-        "count": 1
-      },
-      {
-        "sha256": "0e576b0e9502be2d0c26d4707d2703bc660513a97b6a2e7782de67731fae0823",
-        "count": 1
-      },
-      {
-        "sha256": "06ece4e9cdf7ff9d0db0982d037ec3f9a97490a879b51b847ef03289e039e5d4",
-        "count": 1
-      },
-      {
-        "sha256": "3579e071aaf8beea6580b3701356b31277181ea5bf1e76c017170b3643951672",
-        "count": 1
-      },
-      {
-        "sha256": "58e1d6ca58f896a644dd2b95be1e7a2afde9f62ede07fea2fff6ced2c145d68b",
         "count": 1
       }
     ]
@@ -2425,6 +2352,135 @@
       },
       {
         "sha256": "3476b390e729656e898805367f93d86368a1660d7fc59142f588767470eb6b4f",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/standalone/src/job_store/migration_tests.rs",
+    "kind": "saved_data",
+    "reason": "旧standalone Job schema1/2の保存列・JSONキーを再現しschema10で実行記録を破棄する移行テスト。domain input中の同名文字列はopaqueとして現行Jobを誤破棄しないことも検証する。現行実行の別名ではない。",
+    "lines": [
+      {
+        "sha256": "242718fad4b5fda67173bd0af21983a25bc4c971ed9e29d96a7b359c63e7fb24",
+        "count": 1
+      },
+      {
+        "sha256": "fe9ae4728e7757e4c0b953216e571cdc332c192f676d6d631b5495b5b904da30",
+        "count": 1
+      },
+      {
+        "sha256": "607698bfb01086293587e4461be941e5799120c02dc335deaeed3ce6267b5cd3",
+        "count": 1
+      },
+      {
+        "sha256": "497dcc979262c1d8287e2a8846dd4813909ceb460a6308d1181c2ed366a42521",
+        "count": 1
+      },
+      {
+        "sha256": "69a61099d4d7e8b63f963f12547676863b63613864cfc37dcbc76f040d56c84e",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/standalone/src/job_store/migrations.rs",
+    "kind": "saved_data",
+    "reason": "schema10への一回限りの移行入力。旧request envelopeとschema1/2の旧列を識別して旧Jobを関連参照ごと除去し、通常処理では解釈しない。",
+    "lines": [
+      {
+        "sha256": "bc50238c2b132338c4e7ff65b90e37fc7adf38f7148b023f090a59c87f3a91e9",
+        "count": 1
+      },
+      {
+        "sha256": "8b81d503055428f78624cafbb270d514c94e41d0e0e22e22f07981710cbb718f",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/backend_job_current.rs",
+    "kind": "saved_data",
+    "reason": "schema130移行専用の旧request envelope識別。旧入力キーを持つJobを実行用保存から除去するために綴りを保持し、現行decoderへ互換aliasを加えない。",
+    "lines": [
+      {
+        "sha256": "fa143edd8f95196d115adf3b87e25a93ef215f3238754d1fab37df116c4332e6",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/backend_job_current_tests.rs",
+    "kind": "saved_data",
+    "reason": "保持された旧schemaの列・request envelopeを再現する移行テスト。schema130で旧Jobのみが除去され、現行Jobと成果物・通知が維持されることを確認する。",
+    "lines": [
+      {
+        "sha256": "c7e42467c6d1b1e524e205b426084050ef46c301ec75f593887393773fae02ab",
+        "count": 1
+      },
+      {
+        "sha256": "030aed0d240185b411ef3a190dbd718e00df8e91f0ac799ff39fa524a6f704de",
+        "count": 1
+      },
+      {
+        "sha256": "3dbc5ddc6a8af8b0ce21a957fbfb407f9f187453f875714e8b01da4d65564c7b",
+        "count": 1
+      },
+      {
+        "sha256": "b0e0b3e2742c5c0b101dd35f41c8f7c072b3243af8caee1c5588a11fa0794648",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/standalone/src/job_store/legacy_migrations.rs",
+    "kind": "saved_data",
+    "reason": "旧standalone schema1/2からの保持migrationを再現する保存列・JSON key。schema10の移行回帰fixture構築でのみ用い、通常Job readerや実行処理には使わない。",
+    "lines": [
+      {
+        "sha256": "91b31d4f17e2c3b826887aa989655998930699db07190ae182cab69479b4157b",
+        "count": 1
+      },
+      {
+        "sha256": "95afb0c8b156e3d2bed11671f1c35f9f74d1589fc20d540f4b16c8d7c887f2ec",
+        "count": 1
+      },
+      {
+        "sha256": "869701cd7b0975f2837f6d9e61fddd0c9b6da36b0250cd77653aee9ca6343c01",
+        "count": 1
+      },
+      {
+        "sha256": "16cb51c05f2f830669af2440ba1e92b1d10f1aff6fa2933cebb36f055a28f926",
+        "count": 1
+      },
+      {
+        "sha256": "0a183581dadfa685bb2b3a58bd300883f2649816e1a63b4e90f903b6494036e0",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/standalone/src/subjektiv/journal/tests/reference_retirement.rs",
+    "kind": "rejection_test",
+    "reason": "旧Job形式を保存した移行fixture。移行境界で旧実行記録を削除し、Journal参照を解除することを検証する。通常処理の互換名として使用しない。",
+    "lines": [
+      {
+        "sha256": "3c39dd4940ee1c59023bd0d00de837e6bd8cbc7f53b0251af304dee54eeadd20",
+        "count": 1
+      }
+    ]
+  },
+  {
+    "path": "crates/workspace-server/src/backend_job_reference_migration_tests.rs",
+    "kind": "rejection_test",
+    "reason": "旧Job形式を保存した移行fixture。移行境界で旧実行記録を削除し、Journal参照を解除することを検証する。通常処理の互換名として使用しない。",
+    "lines": [
+      {
+        "sha256": "3dbc5ddc6a8af8b0ce21a957fbfb407f9f187453f875714e8b01da4d65564c7b",
+        "count": 1
+      },
+      {
+        "sha256": "691d11f5ff7f8d4509cce9eb5fc6ad78a13d1e20d62327bacf7634572f61a48c",
         "count": 1
       }
     ]

@@ -149,7 +149,7 @@ async fn job_notification_routing_common_policy_distinguishes_suppression_failur
         assert_eq!(item.job_id.as_deref(),Some(name));
         assert!(diagnostics.source_checks[0].captured);
         assert_eq!(diagnostics.source_checks[0].origin_present,Some(true));
-        assert!(!item.model_processing_confirmed && !item.legacy_evidence);
+        assert!(!item.model_processing_confirmed);
         if disposition=="deliver" {
             assert_eq!(item.stage,server_api::NotificationDiagnosticStage::RequestPersisted);
             assert_eq!(item.target_worker_id.as_deref(),Some("replacement"));
@@ -553,6 +553,78 @@ async fn job_notification_result_commit_reopen_parallel_recovery_and_fixed_targe
         .unwrap();
 }
 
+#[tokio::test]
+async fn job_notification_current_result_replay_and_delivery_need_no_legacy_tables() {
+    let (_directory, store) = tracking_store_fixture().await;
+    store.with_conn(|conn| {
+        // Explicitly remove the retired representation even if a fixture still
+        // installs the historical prefix. Current processing must never query it.
+        conn.execute_batch("DROP TABLE IF EXISTS notification_job_legacy_receipts;
+            DROP TABLE IF EXISTS backend_job_deliveries;")?;
+        notification_routing::jobs::verify(conn)?;
+        Ok(())
+    }).unwrap();
+    let (accepted, source) = job_notice_fixture(&store, "current-only", true);
+    let (_, no_target) = job_notice_fixture(&store, "current-only-no-target", false);
+    let saved = store.job_notification_source("w", &source.job_id, &source.attempt_id).unwrap();
+    assert_eq!(saved.delivery_id, source.delivery_id);
+    assert_eq!(store.list_pending_job_notifications("w", 100).unwrap().len(), 2);
+    let submission = BackendJobResultSubmission {
+        job_id: source.job_id.clone(),
+        attempt_id: source.attempt_id.clone(),
+        input_digest: accepted.attempt.input_digest.clone(),
+        result: accepted.job.result.clone().unwrap(),
+    };
+    assert!(store.accept_backend_job_result(
+        "w", accepted.attempt.worker.as_ref().unwrap(), &submission, RESOURCE_JOB_NOW,
+    ).unwrap().replayed);
+    let mut wrong_identity = source.clone();
+    wrong_identity.delivery_id = "old-nonderived-delivery".into();
+    assert!(store.route_job_notification(
+        "w", &wrong_identity, &JobNotificationFacts::Result("wrong identity".into()),
+    ).is_err());
+    assert!(!store.route_job_notification("w", &no_target, &JobNotificationFacts::NoFindings).unwrap());
+    assert!(!store.route_job_notification(
+        "w", &source, &JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed),
+    ).unwrap());
+    assert!(store.route_job_notification(
+        "w", &source, &JobNotificationFacts::Result("current pinned bytes".into()),
+    ).unwrap());
+    let pinned = store.job_notification_request("w", &source.delivery_id).unwrap();
+    let target = TicketWorkerNotificationTarget {
+        worker: RuntimeWorkerRef::new("r", "replacement"),
+        authentication_binding_id: "tracking-binding".into(),
+    };
+    assert_eq!(pinned, Some(("current pinned bytes".into(), target.worker.clone())));
+    assert_eq!(store.authorize_job_notification("w", &source.delivery_id, &target).unwrap(), None);
+    store.record_notification_delivery_failure(
+        "w", &NotificationDeliveryKey::WorkerNotification { delivery_id: source.delivery_id.clone() },
+        NotificationFailureCode::AcceptanceUnknown,
+    ).unwrap();
+    assert!(store.route_job_notification("w", &source, &JobNotificationFacts::StaleContent).unwrap());
+    assert_eq!(store.job_notification_request("w", &source.delivery_id).unwrap(), pinned);
+    let pending = store.list_pending_job_notifications("w", 100).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].delivery_id, source.delivery_id);
+    for _ in 0..2 {
+        store.ack_job_notification("w", &source.delivery_id, &target.worker).unwrap();
+    }
+    assert!(!store.route_job_notification(
+        "w", &source, &JobNotificationFacts::Result("must not resend".into()),
+    ).unwrap());
+    assert!(store.list_pending_job_notifications("w", 100).unwrap().is_empty());
+    assert_eq!(store.job_notification_request("w", &source.delivery_id).unwrap(), pinned);
+    assert!(job_notice_evidence(&store, &source).2);
+    store.with_conn(|conn| {
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_sources WHERE role='backend_job'", [], |r| r.get::<_, i64>(0))?, 2);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_requests", [], |r| r.get::<_, i64>(0))?, 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_acknowledgements", [], |r| r.get::<_, i64>(0))?, 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0))?, 0);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('backend_job_deliveries','notification_job_legacy_receipts')", [], |r| r.get::<_, i64>(0))?, 0);
+        Ok(())
+    }).unwrap();
+}
+
 fn job_notice_legacy_seed(
     conn: &Connection,
     name: &str,
@@ -760,52 +832,60 @@ fn job_notification_migration_retains_legacy_acks_suppressions_unknown_bytes_and
         )
         .unwrap();
     assert!(pinned.contains("Durable result digest: digest."));
-    drop(conn);
-    let store = SqliteWorkspaceStore::open_for_test(path).unwrap();
-    store.with_conn(|conn| {
-        assert_eq!(ticket_graph(conn), ticket_before);
-        assert_eq!(stored_fixture_rows(conn, "backend_job_deliveries"), before);
-        check_guards(conn);
-        Ok(())
-    }).unwrap();
-    let pending = store.list_pending_job_notifications("w", 100).unwrap();
-    assert_eq!(pending.len(), 4);
-    for (id,stage) in [(&accepted,server_api::NotificationDiagnosticStage::RuntimeAccepted),(&clean,server_api::NotificationDiagnosticStage::Suppressed),(&stale,server_api::NotificationDiagnosticStage::Suppressed),(&unknown,server_api::NotificationDiagnosticStage::AcceptanceUnknown),(&ambiguous,server_api::NotificationDiagnosticStage::Deferred)] {
-        let page=store.notification_diagnostics("w",&server_api::NotificationDiagnosticsQuery{delivery_id:Some(id.clone()),..Default::default()}).unwrap();
-        let item=&page.items[0];
-        assert_eq!(item.stage,stage);
-        assert!(item.legacy_evidence);
-        assert!(!item.model_processing_confirmed);
-        if id==&accepted {
-            assert!(!item.retry_candidate && !item.acceptance_outcome_unknown);
-            assert!(item.target_worker_id.is_some());
-        }
-        let json=serde_json::to_string(item).unwrap();
-        assert!(!json.contains("record_json") && !json.contains("notification_suppressed"));
+    for job in ["no-target", "commit-gap"] {
+        let (id, undecided): (String, bool) = conn.query_row(
+            "SELECT s.input_event_id,d.source_sequence IS NULL FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence WHERE s.workspace_id='w' AND s.role='backend_job' AND json_extract(s.facts_json,'$.backend_job.job_id')=?1",
+            [job], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(id, crate::backend_job::delivery_id(job, &attempt_id(job, 1)));
+        assert!(undecided);
     }
-    let checker_body = store
-        .job_notification_request("w", &checker)
-        .unwrap()
-        .unwrap()
-        .0;
+    assert_eq!(conn.query_row(
+        "SELECT json_extract(facts_json,'$.backend_job.delivery_id') FROM notification_sources WHERE workspace_id='w' AND input_event_id=?1",
+        [&unknown], |r| r.get::<_, String>(0),
+    ).unwrap(), unknown);
+    notification_routing::jobs::verify_schema96(&conn).unwrap();
+    let graph = |conn: &Connection| {
+        [
+            "notification_sources",
+            "notification_decisions",
+            "notification_requests",
+            "notification_acknowledgements",
+            "notification_job_legacy_receipts",
+            "notification_failures",
+        ]
+        .map(|table| stored_fixture_rows(conn, table))
+    };
+    let imported = graph(&conn);
+    drop(conn);
+    // Reopen the frozen schema-96 boundary, not a current executable store.
+    // Schema 130 intentionally discards these Jobs rather than continuing them.
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+    assert_eq!(current_schema_version(&conn).unwrap(), 96);
+    notification_routing::jobs::verify_schema96(&conn).unwrap();
+    assert_eq!(graph(&conn), imported);
+    assert_eq!(ticket_graph(&conn), ticket_before);
+    assert_eq!(stored_fixture_rows(&conn, "backend_job_deliveries"), before);
+    check_guards(&conn);
+    let checker_body: String = conn.query_row(
+        "SELECT content FROM notification_requests WHERE workspace_id='w' AND delivery_id=?1",
+        [&checker], |r| r.get(0),
+    ).unwrap();
     assert!(checker_body.contains("Content digest: original-digest"));
     assert!(checker_body.contains("Quote: \"Writer-only scope\""));
     assert!(checker_body.contains("not a new user request, approval gate"));
-    assert!(pending.iter().all(|s| s.delivery_id != accepted
-        && s.delivery_id != clean
-        && s.delivery_id != stale
-        && s.delivery_id != ambiguous
-        && s.delivery_id != multi_ack
-        && s.delivery_id != multi_unknown_retained
-        && s.delivery_id != multi_unknown));
-    assert_eq!(
-        store
-            .job_notification_request("w", &unknown)
-            .unwrap()
-            .unwrap()
-            .0,
-        pinned
-    );
+    assert_eq!(conn.query_row(
+        "SELECT content FROM notification_requests WHERE workspace_id='w' AND delivery_id=?1",
+        [&unknown], |r| r.get::<_, String>(0),
+    ).unwrap(), pinned);
+    // Historical validation still requires historical guards; current validation
+    // must not require the retired receipt representation.
+    conn.execute_batch("SAVEPOINT missing_legacy_guard; DROP TRIGGER notification_job_legacy_no_update;").unwrap();
+    assert!(notification_routing::jobs::verify_schema96(&conn).is_err());
+    notification_routing::jobs::verify(&conn).unwrap();
+    conn.execute_batch("ROLLBACK TO missing_legacy_guard; RELEASE missing_legacy_guard;").unwrap();
+    notification_routing::jobs::verify_schema96(&conn).unwrap();
 }
 
 #[tokio::test]
@@ -884,8 +964,12 @@ async fn job_notification_source_is_atomic_with_result_and_schema_guards_are_ver
             Ok(())
         })
         .unwrap();
+    store.with_conn(|conn| {
+        let error = notification_routing::jobs::verify(conn).unwrap_err();
+        assert!(error.to_string().contains("notification_job_targets_no_update"), "{error}");
+        Ok(())
+    }).unwrap();
     drop(store);
-    assert!(
-        matches!(SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")),Err(error) if error.to_string().contains("notification_job_targets_no_update"))
-    );
+    // Exact current schema validation can reject before the component validator.
+    assert!(SqliteWorkspaceStore::open_for_test(directory.path().join("workspace.db")).is_err());
 }

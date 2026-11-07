@@ -1735,27 +1735,45 @@ async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
         .unwrap();
     let delivery_id =
         crate::backend_job::delivery_id(&request.job_id, &acceptance.attempt.attempt_id);
-    let (_, claimed) = api
+    let source = api
         .store
-        .reserve_backend_job_delivery(
+        .job_notification_source(
             TEST_WORKSPACE_ID,
-            &delivery_id,
             &request.job_id,
-            &target,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+            &acceptance.attempt.attempt_id,
         )
         .unwrap();
-    assert!(claimed);
+    assert!(
+        api.store
+            .route_job_notification(
+                TEST_WORKSPACE_ID,
+                &source,
+                &crate::store::JobNotificationFacts::Result(
+                    "saved notification before interrupted transport".into()
+                ),
+            )
+            .unwrap()
+    );
+    let pinned = api
+        .store
+        .job_notification_request(TEST_WORKSPACE_ID, &delivery_id)
+        .unwrap()
+        .unwrap();
     let recoverable = api
         .store
-        .recover_backend_job_deliveries(
-            TEST_WORKSPACE_ID,
-            &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-        )
+        .list_pending_job_notifications(TEST_WORKSPACE_ID, 100)
         .unwrap();
     assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].delivery_id, delivery_id);
     execution.take_input_request_ids();
-    api.deliver_backend_job_result(&acceptance, &target);
+    notification_delivery::recover_job_notifications(&api);
+    assert_eq!(
+        api.store
+            .job_notification_request(TEST_WORKSPACE_ID, &delivery_id)
+            .unwrap()
+            .unwrap(),
+        pinned
+    );
     let request_ids = execution.take_input_request_ids();
     assert!(
         request_ids

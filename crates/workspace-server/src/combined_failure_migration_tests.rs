@@ -362,6 +362,11 @@ fn assert_plan(plan: &WorkspaceSchemaMigrationPlan, tail: Tail, current: i64) {
                 DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME,
                 ""
             )))
+            .chain(std::iter::once((
+                130,
+                backend_job_current::MIGRATION_NAME,
+                ""
+            )))
             .filter(|(version, _, _)| *version > current)
             .map(|(version, name, _)| (version, name))
             .collect::<Vec<_>>()
@@ -718,7 +723,8 @@ fn assert_journal_bridge_plan(plan: &WorkspaceSchemaMigrationPlan) {
         [
             (127, journal_removal_store::RETAINED_BRIDGE_NAME),
             (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME),
-            (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME)
+            (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME),
+            (130, backend_job_current::MIGRATION_NAME)
         ]
     );
 }
@@ -754,6 +760,13 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
         assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
         old_columns.remove("typed_ticket_orchestration_plans");
         old_columns.remove("ticket_schema_migrations");
+        // Schema130 removes obsolete Job history tables, not their current
+        // counterparts or the independently retained Journal removal metadata.
+        for table in backend_job_current::OBSOLETE_TABLES {
+            if old_columns.remove(*table).is_some() {
+                assert!(rows(&conn, &format!("SELECT * FROM {table}")).is_empty());
+            }
+        }
         let retained = values(&conn, &old_columns);
         drop(conn);
         let applied = SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -763,7 +776,10 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
             store.with_conn(|conn| {
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
                 assert_old_receipts(conn, &old_receipts);
-                assert_eq!(receipts(conn).len(), old_receipts.len()+3, "no empty intermediate receipts");
+                assert_eq!(receipts(conn).len(), old_receipts.len()+4, "no empty intermediate receipts");
+                for table in backend_job_current::OBSOLETE_TABLES {
+                    assert!(!table_exists(conn, table)?, "obsolete Job table remains: {table}");
+                }
                 assert_eq!(values(conn, &old_columns), retained, "all old columns and values must remain exact");
                 assert_eq!(failure_signature(conn), expected, "all changed tables, keys and programs match fresh composition");
                 storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;

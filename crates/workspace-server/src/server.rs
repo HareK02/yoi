@@ -5309,10 +5309,9 @@ impl WorkspaceApi {
         if matches!(
             reservation.job.input_disposition,
             crate::backend_job::JobInputDisposition::Erased
-                | crate::backend_job::JobInputDisposition::Invalidated
         ) {
             return Err(Error::WorkspacePermissionDenied(
-                "erased or invalidated Backend Job input cannot dispatch".into(),
+                "erased Backend Job input cannot dispatch".into(),
             ));
         }
         if reservation.job.state != BackendJobState::Pending
@@ -5325,26 +5324,6 @@ impl WorkspaceApi {
             });
         }
         reservation.job.load_executable_request()?;
-        if subjektiv_journal::migrate_reserved_legacy(self, &reservation)? {
-            let job = self
-                .store
-                .get_backend_job(self.workspace_id(), &reservation.job.request.job_id)?
-                .ok_or_else(|| Error::Store("retired legacy Job missing".into()))?;
-            let attempt = self
-                .store
-                .get_backend_job_attempt(
-                    self.workspace_id(),
-                    &reservation.job.request.job_id,
-                    &reservation.attempt.attempt_id,
-                )?
-                .ok_or_else(|| Error::Store("retired legacy attempt missing".into()))?;
-            return Ok(BackendJobReservation {
-                job,
-                attempt,
-                replayed: reservation.replayed,
-                resource_reused: reservation.resource_reused,
-            });
-        }
         subject_authorization::authorize_job_input(self, &reservation.job.request)
             .map_err(|error| error.error)?;
         subjektiv_journal::prepare(self, &reservation)?;

@@ -56,10 +56,6 @@ CREATE TABLE backend_job_reconciliation (
     PRIMARY KEY(workspace_id,job_id,attempt_id),
     FOREIGN KEY(workspace_id,job_id,attempt_id) REFERENCES backend_job_attempts(workspace_id,job_id,attempt_id) ON DELETE CASCADE
 );
-CREATE TRIGGER backend_job_reconciliation_no_legacy
-BEFORE INSERT ON backend_job_reconciliation
-WHEN EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=NEW.workspace_id AND h.job_id=NEW.job_id)
-BEGIN SELECT RAISE(ABORT,'pre-upgrade Backend Job cannot reconcile'); END;
 CREATE TABLE backend_job_execution_fences (
     workspace_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
@@ -91,20 +87,6 @@ pub struct BackendJobReconciliation {
     pub detail: String,
     pub next_action: String,
     pub updated_at: String,
-}
-
-pub(super) fn require_current_contract(
-    conn: &Connection,
-    workspace: &str,
-    job: &str,
-) -> Result<()> {
-    let legacy: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM backend_job_upgrade_history WHERE workspace_id=?1 AND job_id=?2)", params![workspace,job], |row|row.get(0))?;
-    if legacy {
-        return Err(Error::InvalidInput(
-            "pre-upgrade Backend Job cannot recover, retry or continue".into(),
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn history(
@@ -160,7 +142,7 @@ pub(super) fn record(
     }
     store.with_conn_mut(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_contract(&tx,workspace,&expected.job_id)?;
+
         let job = read_backend_job(&tx,workspace,&expected.job_id)?.ok_or_else(||Error::InvalidInput("Backend Job missing".into()))?;
         let current = read_backend_job_attempt(&tx,workspace,&expected.job_id,&expected.attempt_id)?.ok_or_else(||Error::InvalidInput("Backend Job attempt missing".into()))?;
         if workspace != expected.workspace_id || current != *expected || job.current_attempt != expected.attempt || job.input_digest != expected.input_digest || job.state != BackendJobState::Pending || expected.state.terminal() {
@@ -190,7 +172,7 @@ pub(super) fn claim_cleanup_owned(
 ) -> Result<(BackendJobAttemptRecord, bool)> {
     store.with_conn_mut(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_contract(&tx,workspace,&expected.job_id)?;
+
         require_history(&tx,workspace,expected_history,expected)?;
         if expected.worker.is_none() || expected.runtime_run_id.is_none() {
             return Err(Error::InvalidInput("cleanup requires the exact allocated Worker/run owner".into()));
@@ -225,7 +207,7 @@ pub(super) fn record_cleanup_preflight_failure(
     }
     store.with_conn_mut(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_contract(&tx, workspace, &expected.job_id)?;
+
         require_history(&tx, workspace, expected_history, expected)?;
         let job = require_retained_owner(&tx, workspace, expected)?;
         if job.current_attempt != expected.attempt
@@ -293,7 +275,7 @@ pub(super) fn finish_cleanup_owned(
     }
     store.with_conn_mut(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_contract(&tx,workspace,&expected.job_id)?;
+
         require_history(&tx,workspace,expected_history,expected)?;
         if expected.worker.is_none() || expected.runtime_run_id.is_none() || expected.worker_cleanup_state != Some(BackendJobWorkerCleanupState::Executing) {
             return Err(Error::InvalidInput("cleanup requires an executing exact Worker/run owner".into()));
@@ -317,7 +299,7 @@ pub(super) fn probe(
     let observed = store.with_conn(|conn| history(conn, workspace, &expected.job_id))?;
     store.with_conn_mut(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_contract(&tx, workspace, &expected.job_id)?;
+
         require_history(&tx, workspace, &observed, expected)?;
         require_retained_owner(&tx, workspace, expected)?;
         tx.execute("INSERT INTO backend_job_recovery_probes(workspace_id,job_id,attempt_id,successful_writes) VALUES(?1,?2,?3,1) ON CONFLICT(workspace_id,job_id,attempt_id) DO UPDATE SET successful_writes=successful_writes+1",params![workspace,expected.job_id,expected.attempt_id])?;
@@ -428,7 +410,7 @@ pub(super) fn record_fence(
     let observed = store.with_conn(|conn| history(conn, workspace, &expected.job_id))?;
     store.with_conn_mut(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_contract(&tx, workspace, &expected.job_id)?;
+
         require_history(&tx, workspace, &observed, expected)?;
         require_retained_owner(&tx, workspace, expected)?;
         // Strings are transport, not truthy markers. Only the Host's private
@@ -454,7 +436,6 @@ pub(super) fn has_fence(
     workspace: &str,
     expected: &BackendJobAttemptRecord,
 ) -> Result<bool> {
-    require_current_contract(conn, workspace, &expected.job_id)?;
     let current =
         read_backend_job_attempt(conn, workspace, &expected.job_id, &expected.attempt_id)?;
     if workspace != expected.workspace_id || current.as_ref() != Some(expected) {
@@ -507,7 +488,7 @@ pub(super) fn reconcile_domain_result(
     let observed = store.with_conn(|conn| history(conn, workspace, &expected.job_id))?;
     store.with_conn_mut(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_contract(&tx, workspace, &expected.job_id)?;
+
         require_history(&tx, workspace, &observed, expected)?;
         let job = require_current_owner(&tx, workspace, expected)?;
         subject_deletion_store::require_job_admission(&tx,workspace,&job.request)?;

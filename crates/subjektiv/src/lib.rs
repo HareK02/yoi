@@ -6,6 +6,7 @@ pub mod deletion;
 pub mod effect_admission;
 pub mod job;
 pub use deletion::{DeletionSubjectJob, SubjectDeletion};
+mod job_migration;
 pub mod journal;
 mod legacy_migrations;
 pub mod permissions;

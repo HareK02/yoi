@@ -1,30 +1,15 @@
 //! Backend Job adapter for the common notification ledger. Results, not Worker
 //! lifecycle, are the durable source. Fixed Worker recipients never follow leases.
 use super::*;
-use crate::backend_job::{
-    BackendJobAttemptState, BackendJobDeliveryRecord, BackendJobDeliveryState, BackendJobRequest,
-    BackendJobState,
-};
+use crate::backend_job::{BackendJobAttemptState, BackendJobState};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobNotificationSource {
-    pub job_id: String,
-    pub attempt_id: String,
-    pub delivery_id: String,
-}
+#[path = "job_notification_legacy.rs"]
+mod legacy;
+// Schema-boundary entry points only; no runtime path calls the historical importer.
+pub(in crate::store) use legacy::{install, verify_schema96};
 
-/// Domain facts, not a second notification policy. Rendering is performed by the
-/// domain adapter; only this routing module chooses deliver/suppress/defer.
-#[derive(Debug, Clone)]
-pub enum JobNotificationFacts {
-    Result(String),
-    NoFindings,
-    StaleContent,
-    /// SourceLookupFailed leaves routing undecided; other failures are terminal.
-    Failed(NotificationFailureCode),
-}
-
-pub(in crate::store) fn install(conn: &Connection) -> Result<()> {
+// Fresh schema construction: no old receipt tables or historical row import.
+pub(in crate::store) fn install_current(conn: &Connection) -> Result<()> {
     // Generalize the existing source parent without changing any sequence, request,
     // or receipt. The migration caller disables FK enforcement for this rebuild.
     let triggers = conn
@@ -68,13 +53,7 @@ pub(in crate::store) fn install(conn: &Connection) -> Result<()> {
             FOREIGN KEY(workspace_id,delivery_id) REFERENCES notification_requests(workspace_id,delivery_id));
         CREATE TRIGGER notification_job_targets_no_update BEFORE UPDATE ON notification_job_targets BEGIN SELECT RAISE(ABORT,'Job notification target is immutable'); END;
         CREATE TRIGGER notification_job_targets_no_delete BEFORE DELETE ON notification_job_targets BEGIN SELECT RAISE(ABORT,'Job notification target is immutable'); END;
-        CREATE TABLE notification_job_legacy_receipts (
-            workspace_id TEXT NOT NULL, delivery_id TEXT NOT NULL, record_json TEXT NOT NULL CHECK(json_valid(record_json)),
-            runtime_accepted INTEGER NOT NULL CHECK(runtime_accepted IN (0,1)),
-            PRIMARY KEY(workspace_id,delivery_id),
-            FOREIGN KEY(workspace_id,delivery_id) REFERENCES notification_decisions(workspace_id,delivery_id));
-        CREATE TRIGGER notification_job_legacy_no_update BEFORE UPDATE ON notification_job_legacy_receipts BEGIN SELECT RAISE(ABORT,'Legacy notification evidence is immutable'); END;
-        CREATE TRIGGER notification_job_legacy_no_delete BEFORE DELETE ON notification_job_legacy_receipts BEGIN SELECT RAISE(ABORT,'Legacy notification evidence is immutable'); END;")?;
+" )?;
     // Preparation may fail before a routing decision exists. Keep observations
     // against the common source, never invent a terminal decision to hold them.
     conn.execute_batch("CREATE TABLE notification_source_preparation_failures (
@@ -86,47 +65,30 @@ pub(in crate::store) fn install(conn: &Connection) -> Result<()> {
         CREATE TRIGGER notification_source_preparation_failures_no_update BEFORE UPDATE ON notification_source_preparation_failures BEGIN SELECT RAISE(ABORT,'Source preparation evidence is immutable'); END;
         CREATE TRIGGER notification_source_preparation_failures_no_delete BEFORE DELETE ON notification_source_preparation_failures BEGIN SELECT RAISE(ABORT,'Source preparation evidence is immutable'); END;")?;
     // Mutable scheduling only, independent of immutable source/decision evidence.
-    // Both undecided preparation retries and pinned deliveries use this clock.
     conn.execute_batch(
         "CREATE TABLE notification_source_offers (
         source_sequence INTEGER PRIMARY KEY REFERENCES notification_sources(sequence),
         last_offered INTEGER NOT NULL CHECK(last_offered > 0));",
     )?;
-    // Includes no-target results and the crash gap before the former reservation.
-    let identities = conn.prepare("SELECT a.workspace_id,a.job_id,a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.state='completed' AND j.state='completed' AND a.attempt=j.current_attempt")?
-        .query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (workspace, job, attempt) in identities {
-        capture(conn, &workspace, &job, &attempt)?;
-        import_legacy(conn, &workspace, &job, &attempt)?;
-    }
     Ok(())
 }
 
-struct NotificationResultSnapshot {
-    request: BackendJobRequest,
-    result: Option<serde_json::Value>,
-    result_digest: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobNotificationSource {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub delivery_id: String,
 }
 
-// The schema-96 import runs before later Job lifecycle migrations. Read only
-// the retained result envelope, not the executable Job's current-schema columns.
-fn read_result_snapshot(
-    conn: &Connection,
-    workspace: &str,
-    job: &str,
-) -> Result<NotificationResultSnapshot> {
-    let (request, result, result_digest): (String, Option<String>, Option<String>) = conn
-        .query_row(
-            "SELECT request_json, result_json, result_digest FROM backend_jobs WHERE workspace_id=?1 AND job_id=?2",
-            params![workspace, job],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-    Ok(NotificationResultSnapshot {
-        request: decode(&request)?,
-        result: result.map(|value| decode(&value)).transpose()?,
-        result_digest,
-    })
+/// Domain facts, not a second notification policy. Rendering is performed by the
+/// domain adapter; only this routing module chooses deliver/suppress/defer.
+#[derive(Debug, Clone)]
+pub enum JobNotificationFacts {
+    Result(String),
+    NoFindings,
+    StaleContent,
+    /// SourceLookupFailed leaves routing undecided; other failures are terminal.
+    Failed(NotificationFailureCode),
 }
 
 pub(in crate::store) fn capture(
@@ -135,15 +97,39 @@ pub(in crate::store) fn capture(
     job: &str,
     attempt: &str,
 ) -> Result<()> {
-    let id = retained_delivery_id(conn, workspace, job, attempt)?;
+    let id = crate::backend_job::delivery_id(job, attempt);
+    let record = read_backend_job(conn, workspace, job)?
+        .ok_or_else(|| Error::InvalidInput("Job notification source disappeared".into()))?;
+    capture_result(
+        conn,
+        workspace,
+        job,
+        attempt,
+        &id,
+        &record.request.purpose,
+        &record.request.notification_target,
+        record.result_digest.as_deref(),
+    )
+}
+
+// Shared ledger encoding, not legacy lookup or routing. Historical migration
+// supplies its own frozen snapshot; normal capture reads the current Job record.
+fn capture_result(
+    conn: &Connection,
+    workspace: &str,
+    job: &str,
+    attempt: &str,
+    id: &str,
+    purpose: &str,
+    target: &Option<RuntimeWorkerRef>,
+    result_digest: Option<&str>,
+) -> Result<()> {
     let source = JobNotificationSource {
         job_id: job.into(),
         attempt_id: attempt.into(),
-        delivery_id: id.clone(),
+        delivery_id: id.into(),
     };
-    let job = read_result_snapshot(conn, workspace, job)?;
-    let target = &job.request.notification_target;
-    let facts = serde_json::json!({"principal_kind":if target.is_some(){Some("worker")}else{None}, "principal_id":null,"runtime_id":target.as_ref().map(|w|&w.runtime_id),"worker_id":target.as_ref().map(|w|&w.worker_id),"status":null,"case_state":"open","released":false,"backend_job":source,"recipient_kind":"fixed_worker","job_purpose":job.request.purpose,"result_digest":job.result_digest});
+    let facts = serde_json::json!({"principal_kind":if target.is_some(){Some("worker")}else{None}, "principal_id":null,"runtime_id":target.as_ref().map(|w|&w.runtime_id),"worker_id":target.as_ref().map(|w|&w.worker_id),"status":null,"case_state":"open","released":false,"backend_job":source,"recipient_kind":"fixed_worker","job_purpose":purpose,"result_digest":result_digest});
     conn.execute("INSERT OR IGNORE INTO notification_sources(workspace_id,ticket_id,input_event_id,role,assignment_id,kind,facts_json) VALUES(?1,NULL,?2,'backend_job','','backend_job_result',?3)",params![workspace,id,json(&facts)?])?;
     Ok(())
 }
@@ -155,7 +141,7 @@ pub(in crate::store) fn pending(
 ) -> Result<Vec<JobNotificationSource>> {
     store.with_conn_mut(|conn| {
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows = tx.prepare("SELECT s.facts_json,s.sequence FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence LEFT JOIN notification_source_offers o ON o.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role='backend_job' AND (d.source_sequence IS NULL OR d.disposition='deliver') AND NOT EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=s.input_event_id) AND NOT EXISTS(SELECT 1 FROM notification_job_legacy_receipts l WHERE l.workspace_id=?1 AND l.delivery_id=s.input_event_id AND l.runtime_accepted=1) ORDER BY COALESCE(o.last_offered,0),s.sequence LIMIT ?2")?
+        let rows = tx.prepare("SELECT s.facts_json,s.sequence FROM notification_sources s LEFT JOIN notification_decisions d ON d.source_sequence=s.sequence LEFT JOIN notification_source_offers o ON o.source_sequence=s.sequence WHERE s.workspace_id=?1 AND s.role='backend_job' AND (d.source_sequence IS NULL OR d.disposition='deliver') AND NOT EXISTS(SELECT 1 FROM notification_acknowledgements a WHERE a.workspace_id=?1 AND a.delivery_id=s.input_event_id) ORDER BY COALESCE(o.last_offered,0),s.sequence LIMIT ?2")?
             .query_map(params![workspace,limit.clamp(1,100) as i64],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         // Advance every offered source under the scan's write lock, even if no
@@ -207,14 +193,13 @@ pub(in crate::store) fn route(
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let job=read_backend_job(&tx,workspace,&source.job_id)?.ok_or_else(||Error::InvalidInput("Job notification source disappeared".into()))?;
         let attempt=read_backend_job_attempt(&tx,workspace,&source.job_id,&source.attempt_id)?.ok_or_else(||Error::InvalidInput("Job notification attempt disappeared".into()))?;
-        if job.state!=BackendJobState::Completed || attempt.state!=BackendJobAttemptState::Completed || attempt.attempt!=job.current_attempt || source.delivery_id!=retained_delivery_id(&tx,workspace,&source.job_id,&source.attempt_id)? {
+        if job.state!=BackendJobState::Completed || attempt.state!=BackendJobAttemptState::Completed || attempt.attempt!=job.current_attempt || source.delivery_id!=crate::backend_job::delivery_id(&source.job_id,&source.attempt_id) {
             return Err(Error::InvalidInput("Job notification requires its current committed result".into()));
         }
         capture(&tx,workspace,&source.job_id,&source.attempt_id)?;
-        import_legacy(&tx, workspace, &source.job_id, &source.attempt_id)?;
         let existing:Option<String>=tx.query_row("SELECT disposition FROM notification_decisions WHERE workspace_id=?1 AND delivery_id=?2",params![workspace,source.delivery_id],|r|r.get(0)).optional()?;
         if let Some(disposition)=existing {
-            let ack:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM notification_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2) OR EXISTS(SELECT 1 FROM notification_job_legacy_receipts WHERE workspace_id=?1 AND delivery_id=?2 AND runtime_accepted=1)",params![workspace,source.delivery_id],|r|r.get(0))?;
+            let ack:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM notification_acknowledgements WHERE workspace_id=?1 AND delivery_id=?2)",params![workspace,source.delivery_id],|r|r.get(0))?;
             tx.commit()?; return Ok(disposition=="deliver" && !ack);
         }
         if job.request.notification_target.is_some() && matches!(facts, JobNotificationFacts::Failed(NotificationFailureCode::SourceLookupFailed)) {
@@ -278,136 +263,6 @@ fn save_decision(
     Ok(())
 }
 
-// Old rows did not store request bytes. Only the original deterministic renderers
-// may reconstruct an interrupted request; no current Ticket contents participate.
-// Accepted legacy rows keep their actual evidence, never a fabricated new request.
-fn import_legacy(conn: &Connection, workspace: &str, job_id: &str, attempt_id: &str) -> Result<()> {
-    let id = retained_delivery_id(conn, workspace, job_id, attempt_id)?;
-    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM notification_decisions WHERE workspace_id=?1 AND delivery_id=?2)",params![workspace,id],|r|r.get(0))?;
-    if exists {
-        return Ok(());
-    }
-    let Some(old) = read_backend_job_delivery(conn, workspace, &id)? else {
-        return Ok(());
-    };
-    let accepted =
-        old.state == BackendJobDeliveryState::Completed && old.failure_category.is_none();
-    let count:i64=conn.query_row("SELECT COUNT(*) FROM backend_job_deliveries WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3",params![workspace,job_id,attempt_id],|r|r.get(0))?;
-    let mut content = None;
-    let mut failure = legacy_failure(&old);
-    let (disposition, reason) = match old.failure_category.as_deref() {
-        _ if accepted => ("deliver", NotificationReason::Result),
-        _ if count > 1 => {
-            failure = Some(NotificationFailureCode::PreparationFailed);
-            ("defer", NotificationReason::SourceUnavailable)
-        }
-        Some("notification_suppressed_no_findings") => ("suppress", NotificationReason::NoFindings),
-        Some("notification_suppressed_stale_ticket_content") => {
-            ("suppress", NotificationReason::StaleContent)
-        }
-        _ if old.state == BackendJobDeliveryState::Completed => {
-            ("defer", NotificationReason::SourceUnavailable)
-        }
-        Some(
-            "invalid_checker_input"
-            | "invalid_checker_result"
-            | "current_ticket_content_unavailable"
-            | "notification_too_large",
-        ) => ("defer", NotificationReason::SourceUnavailable),
-        _ => {
-            let snapshot = read_result_snapshot(conn, workspace, job_id)?;
-            let facts = if snapshot.request.notification_target.as_ref() != Some(&old.target) {
-                JobNotificationFacts::Failed(NotificationFailureCode::PreparationFailed)
-            } else {
-                legacy_result_facts(&snapshot, job_id, attempt_id)
-            };
-            let decision = policy(snapshot.request.notification_target.is_some(), &facts);
-            match facts {
-                JobNotificationFacts::Result(body) => content = Some(body),
-                JobNotificationFacts::Failed(code) => failure = Some(code),
-                // A valid empty result could not have passed the old sender's
-                // findings gate even if it crashed before recording suppression.
-                JobNotificationFacts::NoFindings => failure = None,
-                JobNotificationFacts::StaleContent => {}
-            }
-            decision
-        }
-    };
-    save_decision(conn, workspace, &id, disposition, reason)?;
-    conn.execute(
-        "INSERT INTO notification_job_legacy_receipts VALUES(?1,?2,?3,?4)",
-        params![workspace, id, json(&old)?, accepted],
-    )?;
-    if !accepted && disposition != "suppress" {
-        if let Some(failure) = failure {
-            save_failure(conn, workspace, &id, failure)?;
-        }
-    }
-    if disposition == "deliver" {
-        if let Some(content) = content {
-            conn.execute(
-                "INSERT INTO notification_requests VALUES(?1,?2,?3,?4)",
-                params![workspace, id, content, json(&old.target)?],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn legacy_result_facts(
-    snapshot: &NotificationResultSnapshot,
-    job_id: &str,
-    attempt_id: &str,
-) -> JobNotificationFacts {
-    let content = if snapshot.request.purpose == crate::ticket_item_checker::PURPOSE {
-        let Some(result) = &snapshot.result else {
-            return JobNotificationFacts::Failed(NotificationFailureCode::InvalidResult);
-        };
-        match crate::ticket_item_checker::validate_result(&snapshot.request.input, result) {
-            Ok(result) if result.findings.is_empty() => return JobNotificationFacts::NoFindings,
-            Ok(_) => {}
-            Err(_) => return JobNotificationFacts::Failed(NotificationFailureCode::InvalidResult),
-        }
-        crate::ticket_item_checker::render_result(&snapshot.request.input, result)
-    } else {
-        Ok(format!(
-            "Backend Job `{job_id}` completed attempt `{attempt_id}` for `{}`. Durable result digest: {}.",
-            snapshot.request.purpose,
-            snapshot.result_digest.as_deref().unwrap_or("unavailable")
-        ))
-    };
-    match content {
-        Ok(content) if content.len() > crate::backend_job::MAX_JOB_DELIVERY_BYTES => {
-            JobNotificationFacts::Failed(NotificationFailureCode::ContentTooLarge)
-        }
-        Ok(content) if !content.is_empty() && !content.contains('\0') => {
-            JobNotificationFacts::Result(content)
-        }
-        _ => JobNotificationFacts::Failed(NotificationFailureCode::RenderingFailed),
-    }
-}
-
-fn legacy_failure(old: &BackendJobDeliveryRecord) -> Option<NotificationFailureCode> {
-    use NotificationFailureCode as F;
-    match old.failure_category.as_deref() {
-        Some("notification_outcome_unknown") => Some(F::AcceptanceUnknown),
-        Some("notification_rejected") => Some(F::RuntimeRejected),
-        Some("notification_too_large") => Some(F::ContentTooLarge),
-        Some("invalid_checker_input" | "invalid_checker_result") => Some(F::InvalidResult),
-        Some("current_ticket_content_unavailable") => Some(F::SourceLookupFailed),
-        _ if matches!(
-            old.state,
-            BackendJobDeliveryState::Sending
-                | BackendJobDeliveryState::Unknown
-                | BackendJobDeliveryState::Completed
-        ) =>
-        {
-            Some(F::AcceptanceUnknown)
-        }
-        _ => None,
-    }
-}
-
 /// None authorizes this exact send target; a typed denial is not a DB failure.
 pub(in crate::store) fn authorize(
     store: &SqliteWorkspaceStore,
@@ -444,9 +299,6 @@ pub(in crate::store) fn verify(conn: &Connection) -> Result<()> {
         "notification_job_targets",
         "notification_job_targets_no_update",
         "notification_job_targets_no_delete",
-        "notification_job_legacy_receipts",
-        "notification_job_legacy_no_update",
-        "notification_job_legacy_no_delete",
     ] {
         let present: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
@@ -460,20 +312,6 @@ pub(in crate::store) fn verify(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn retained_delivery_id(
-    conn: &Connection,
-    workspace: &str,
-    job: &str,
-    attempt: &str,
-) -> Result<String> {
-    // The production legacy sender used the derived ID, but retained receipts are
-    // authoritative even when imported history contains a non-derived identity.
-    // If history contains multiple identities, an actual ACK wins; otherwise the
-    // importer defers the ambiguity instead of manufacturing another send.
-    let saved:Option<String>=conn.query_row("SELECT delivery_id FROM backend_job_deliveries WHERE workspace_id=?1 AND job_id=?2 AND attempt_id=?3 ORDER BY (state='completed' AND failure_category IS NULL) DESC,created_at,delivery_id LIMIT 1",params![workspace,job,attempt],|r|r.get(0)).optional()?;
-    Ok(saved.unwrap_or_else(|| crate::backend_job::delivery_id(job, attempt)))
 }
 
 pub(in crate::store) fn source(
