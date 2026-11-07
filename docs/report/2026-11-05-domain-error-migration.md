@@ -120,3 +120,23 @@ baseline一致だけを理由に免除せず、失敗点から確認できる範
 利用者の容量整理指示に対し、自Workdirの旧incrementalだけを実削除した。`cache-cleanup-20261107T0833Z/{plan,retained-before,result}.json` に全1,132対象（旧unit 1,043・旧session 89）と保持inventory/証拠hash照合を保存。targetは238,319,665,152→81,070,227,456 B、回収157,249,437,696 B、filesystem空き46,600,257,536→203,800,150,016 B。最新123 unitと全binary/依存/fingerprint/ログ/画像、source/未commit差分は保持・不変。全clean・他Workdir・共有環境・稼働processは操作していない。
 
 `t845-composition-final-root-static-1` は最終6 test bodyと本記録を含むsnapshotでroot `cargo check --offline --locked -j2`、`cargo fmt --all -- --check`、`git diff --check HEAD`、状態契約命名検査が13.610秒・exit 0/sourceSame（596 matching、0 unapproved、0 stale）。既存dead-code/ts-rs warningは残る。公開provider exact、同MRの直属fresh全要件review/verdictは別の証拠として確認する。この記録は残余の免除、全要件合格、採用・配備・Ticket完了を主張しない。
+
+
+### Repository P2の実接続修正（2026-11-07）
+
+e67dfa1aaの独立reviewは、Repository lookup/登録経路が実HTTP・生成Rust client・Webへ未接続であるP2を指摘した。上表のRepository行は当時の接続範囲を過大に記載していた。修正では原因の正本を server-api の repository_failure へ移し、Backendは元lookup sourceを保持する。登録intent競合は決定点でtyped化し、HTTPのstatusと既存intent再送/CASを保持した。list/detail/logのscoped/alias、createは既存Problem encoder/client hookへ接続し、Webのlist/detail/createに加えて詳細画面のlogも同じreceiver/closed domain decoderを使う。shared RepositoryApiErrorのcontrol原因は既存枝を保ち、生成schemaは排他的なobject/stringのoneOfとする。受信した原因にBrowser再公開capabilityは付けない。
+
+固定証拠は target/t815-evidence/repository-fix-* のpreflight/result/logと repository-fix-evidence-binding.json に保存した。全command、通常feature、rustc 1.95.0、dirty source各SHA、binary SHA、exit/timeout、空きsampleへ辿れる。次の件数は重複する選択試験を合算しない。
+
+- generated-refresh-4 は正規OpenAPI・6派生TS・domain生成とroot check、185.712秒、exit 0/sourceSame。build-3 は通常11crate no-run、366.284秒、exit 0/sourceSame、artifact25。
+- http-native-3 は初回に失敗した同じ10件を4.56秒で全成功。http-native-2 はRepository通常88成功・2 ignored、113.90秒。実Bearer loopback router/SQLite/registry→生成Rust client、scoped/aliasのunknown/unsupported、登録intentの200再送/409競合、保存値/件数不変、HTTP非依存Tool投影と非露出を確認する。
+- native-normal-1 は通常3386件・全登録targetを実行し全成功、内側exit 0/timeout 0。外側wrapperはexit 1/sourceSame=falseであり、成功へ読み替えない。差分は既存ts-rs export-testによるConfigTreeSnapshot.ts一件のformatだけで、正規Deno formatterにより元tracked bytesへ戻ることを確認した。Rust/依存/feature/共有初期化はその後不変であり、この実行結果を再利用する。
+- real-web-3 は実Server/SQLite→production detail/log/create receiver/codecを別Deno processから通し、typed reason/operation/status/receipt、安全説明、同intent再送、異intent競合を確認、3.79秒で1成功、exit 0/sourceSame。Worker executionはdeterministic fixtureでありモデル起動や画面E2Eとはしない。
+- web-5 は0 check errors/warnings、871 unit・823 component成功、buildとbridge type check成功、24.830秒、exit 0/sourceSame。元の503 text/plain component期待は変更しない。これは未知のHTTP fallbackであり、typed Problemをgeneric説明へ落として合格させたものではない。Repository単体10件は別途operation/reason/status/receipt・安全説明・壊れた/未知/過大応答を確認する。
+- generated-check-1 はOpenAPI・6TS・domainの正規check、root check/fmt/diff/命名検査成功、10.170秒、exit 0/sourceSame。doc-doctest-1 は変更2crate docと各0登録doctest、314.848秒、exit 0/sourceSame。
+
+先行失敗を消していない。native初回9/1はAPI宣言にProblem media/client hookがなく、生成clientが原因を失う実regressionであった。宣言とlogの既存502を正規生成元で修正して同10件を再実行した。Web初回のcomponent旧期待1失敗、その誤適応後の再失敗、bridge初回type checkの3失敗、新log単体のJSON key順依存assert失敗は各raw logへ残す。正しいHTTP fallbackへ期待を戻し、明示型と既存extensionless import用のsloppy-importsでbridgeをcheckし、log成功は意味のあるfield毎にassertした。schema生成初期失敗やtest import不足も未実行として残る。
+
+目視はrepository-lookup-before-4/after-2の各12画像（1440/768/390、light/dark、synthetic owner、lookupと登録競合）とreview-context.jsonを実装者が確認した。旧保存Web buildのRepository API sourceはa9d857467とe67dfaでbyte一致し、画像hashを固定。変更後は詳細/Recent commitsの原因と登録競合が開閉なしに読め、狭幅でも折返しと操作位置を維持し、新規overflowなし。既存Repository key入力patternの/v console warningは両buildで再現し、当該Svelte source不変の既存問題として残す。beforeだけのbody cancel/Worker read取消も別記。合成HTTP画面は実Backendの認可・保存証拠ではない。
+
+このP2修正で前記7件のServer残余、初回Service flake、外側600秒timeoutを解決したとはしない。Repository以外のdomain/DDL/lockfile/復旧writerは不変で、先行の当該境界の成功証拠を再利用する。通常source公開/provider exactと同MR直属fresh全scope reviewは、この記録から独立した判断である。

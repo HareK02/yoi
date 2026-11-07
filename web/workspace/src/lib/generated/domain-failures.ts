@@ -43,9 +43,9 @@ export type RepositoryAccessReason = "plain_http_source_unsupported" | "unknown_
 
 export type RepositoryFailureDetails = { operation: RepositoryFailureOperation; reason: RepositoryFailureReason; };
 
-export type RepositoryFailureOperation = "summary" | "summary_by_key" | "recent_log" | "observe_merge_target" | "observe_commit" | "ensure_ancestor";
+export type RepositoryFailureOperation = "register" | "summary" | "summary_by_key" | "recent_log" | "observe_merge_target" | "observe_commit" | "ensure_ancestor";
 
-export type RepositoryFailureReason = "unknown_repository" | "unsupported_provider" | "missing_default_selector" | "invalid_selector" | "commit_not_found" | "invalid_commit_relation" | "provider_failure";
+export type RepositoryFailureReason = "registration_intent_conflict" | "unknown_repository" | "unsupported_provider" | "missing_default_selector" | "invalid_selector" | "commit_not_found" | "invalid_commit_relation" | "provider_failure";
 
 export type WorkdirDenialReason = "scope_resolution_unavailable" | "scope_comparison_unavailable" | "scoped_capability_denied" | "logical_scope_exceeded" | "invalid_scoped_path" | "child_write_lease_conflict" | "empty_scope" | "parent_capability_denied" | "command_requires_writable_scope" | "parent_scope_exceeded" | "cwd_outside_readable_scope" | "read_only_session" | "external_root_symlink" | "external_root_changed" | "external_root_moved" | "external_scope_symlink" | "attachment_scope_exceeded" | "delegated_scope_exceeded" | "checkout_output_root_exceeded" | "provider_root_exceeded" | "provider_symlink_denied" | "checkout_target_denied" | "checkout_create_parent_denied" | "checkout_search_path_denied" | "checkout_enumeration_denied" | "path_out_of_scope" | "symlink_target_out_of_scope" | "path_read_only" | "os_permission_denied" | "unclassified_permission_denied";
 
@@ -354,12 +354,14 @@ export const DOMAIN_FAILURE_CONTRACTS = {
       "invalid_selector": "invalid_input",
       "missing_default_selector": "invalid_input",
       "provider_failure": "dependency",
+      "registration_intent_conflict": "conflict",
       "unknown_repository": "invalid_input",
       "unsupported_provider": "dependency"
     },
     "category_field": "reason",
     "fields": {
       "operation": [
+        "register",
         "summary",
         "summary_by_key",
         "recent_log",
@@ -368,6 +370,7 @@ export const DOMAIN_FAILURE_CONTRACTS = {
         "ensure_ancestor"
       ],
       "reason": [
+        "registration_intent_conflict",
         "unknown_repository",
         "unsupported_provider",
         "missing_default_selector",
@@ -386,6 +389,7 @@ export const DOMAIN_FAILURE_CONTRACTS = {
       "invalid_selector",
       "missing_default_selector",
       "provider_failure",
+      "registration_intent_conflict",
       "unknown_repository",
       "unsupported_provider"
     ],

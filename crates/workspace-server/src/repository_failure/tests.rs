@@ -4,8 +4,8 @@
 use super::*;
 use crate::repositories::{ConfiguredRepository, RepositoryRegistryReader};
 use error_contract::{
-    Budget, CorrelationRef, DecodeFailure, decode_failure, encode_projected_failure,
-    project_failure,
+    Budget, CorrelationRef, DecodeFailure, OperationContext, decode_failure,
+    encode_projected_failure, project_failure,
 };
 use serde_json::{Value, json};
 use server_api::{RepositoryObservedStatus, RepositorySource, RepositorySourceKind};

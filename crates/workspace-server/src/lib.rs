@@ -252,6 +252,8 @@ pub enum Error {
     SubjectBodySuperseded,
     #[error("Worker lifecycle observation is stale; this request was not accepted")]
     WorkerLifecycleObservationStale,
+    #[error("Repository key {repository_key} already exists with different registration intent")]
+    RepositoryRegistrationConflict { repository_key: String },
     #[error("Repository conflict: {0}")]
     RepositoryConflict(String),
     #[error("Registry inconsistency: {0}")]

@@ -28020,10 +28020,7 @@ async fn scoped_create_repository(
                     (StatusCode::OK, true)
                 }
                 RepositoryInsertOutcome::Existing(_) => {
-                    return Err(Error::RepositoryConflict(format!(
-                "Repository key {repository_key} already exists with different registration intent"
-            ))
-            .into());
+                    return Err(Error::RepositoryRegistrationConflict { repository_key }.into());
                 }
             };
 
@@ -41094,6 +41091,45 @@ impl ApiError {
     }
 
     fn into_repository_api_error(self) -> server_api::RepositoryApiError {
+        use crate::repository_failure::{
+            RepositoryFailureDetails, RepositoryFailureOperation, RepositoryFailureReason,
+            RepositoryFailureVisibility,
+        };
+        let repository = match &self.error {
+            Error::RepositoryLookup(failure) => Some(*failure.details()),
+            Error::RepositoryRegistrationConflict { .. } => Some(RepositoryFailureDetails {
+                operation: RepositoryFailureOperation::Register,
+                reason: RepositoryFailureReason::RegistrationIntentConflict,
+            }),
+            _ => None,
+        };
+        if let Some(cause) = repository {
+            // The lookup/registration handlers have passed their existing current
+            // admission checks. Only closed cause fields cross either boundary.
+            let facts = error_contract::FailureFacts::new(cause).expect("closed Repository cause");
+            let visibility = RepositoryFailureVisibility {
+                can_view_cause: true,
+            };
+            let browser =
+                error_contract::project_failure::<error_contract::Browser, _>(&facts, &visibility)
+                    .expect("authorized closed Repository Browser cause");
+            let transfer = error_contract::project_failure::<error_contract::InternalTransfer, _>(
+                &facts,
+                &visibility,
+            )
+            .expect("authorized closed Repository transfer cause");
+            return server_api::RepositoryApiError::new(
+                api_error_status(&self.error).as_u16(),
+                cause.reason.as_str(),
+                browser.explanation(),
+                Vec::new(),
+            )
+            .with_failure(
+                protocol::startup_failure::StartupFailureAttachment::from_projected(&transfer)
+                    .expect("bounded closed Repository cause"),
+            )
+            .with_repository_projection(browser);
+        }
         let control = api_control_cause(&self.error);
         let status = api_error_status(&self.error);
         let message = self
@@ -41183,6 +41219,7 @@ fn api_error_status(error: &Error) -> StatusCode {
             match failure.details().reason {
                 RepositoryFailureReason::UnknownRepository => StatusCode::NOT_FOUND,
                 RepositoryFailureReason::UnsupportedProvider => StatusCode::BAD_REQUEST,
+                RepositoryFailureReason::RegistrationIntentConflict => StatusCode::CONFLICT,
                 RepositoryFailureReason::MissingDefaultSelector
                 | RepositoryFailureReason::InvalidSelector
                 | RepositoryFailureReason::CommitNotFound
@@ -41208,7 +41245,8 @@ fn api_error_status(error: &Error) -> StatusCode {
         Error::BrowserReopenConfirmationRequired | Error::WorkspacePermissionDenied(_) => {
             StatusCode::FORBIDDEN
         }
-        Error::TicketAssignmentConflict(_)
+        Error::RepositoryRegistrationConflict { .. }
+        | Error::TicketAssignmentConflict(_)
         | Error::WorkdirAttachmentConflict(_)
         | Error::WorkdirOccupied { .. }
         | Error::WorkspaceConfigConflict(_)
@@ -41390,6 +41428,15 @@ impl IntoResponse for ApiError {
             message: response_message.clone(),
             diagnostics: self.diagnostics.clone(),
         };
+        if matches!(
+            &self.error,
+            Error::RepositoryLookup(_) | Error::RepositoryRegistrationConflict { .. }
+        ) {
+            let error = self.into_repository_api_error();
+            let mut response = api_macros::axum::http_error_response(status, error);
+            response.extensions_mut().insert(log);
+            return response;
+        }
         if let Some(cause) = api_control_cause(&self.error) {
             let error = runtime_api::RuntimeApiError::new(
                 status.as_u16(),
@@ -41610,6 +41657,7 @@ mod tests {
     mod embedded_owned_execution_tests;
     mod external_checkout_tests;
     mod protocol_backpressure_tests;
+    mod repository_http_contract_tests;
     mod restore_workdir_tests;
     mod restored_parent_control_tests;
     mod startup_result_tests;
@@ -71820,57 +71868,7 @@ mod tests {
 
     #[tokio::test]
     async fn repository_log_rejects_unknown_or_unsupported_configured_repository() {
-        let root = tempfile::tempdir().unwrap();
-        let mut config = test_server_config(root.path());
-        config.repositories = vec![ConfiguredRepository {
-            id: "files".to_string(),
-            repository_key: "files".to_string(),
-            provider: "local_fs".to_string(),
-            source: server_api::RepositorySource {
-                kind: server_api::RepositorySourceKind::LocalPath,
-                uri: root.path().display().to_string(),
-            },
-            source_fingerprint: "sha256:test".to_string(),
-            observed_status: server_api::RepositoryObservedStatus::Unverified,
-            observed_at: None,
-            path: Some(root.path().to_path_buf()),
-            default_selector: None,
-        }];
-        let store = test_control_store(&config);
-        let api = WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap();
-        let app = build_inner_router(api);
-
-        let unknown = request_json(
-            app.clone(),
-            "GET",
-            "/api/repositories/test-repository/log",
-            None,
-            StatusCode::NOT_FOUND,
-        )
-        .await;
-        assert_eq!(
-            unknown["diagnostics"][0]["code"],
-            "repository_not_configured"
-        );
-
-        let unsupported = request_json(
-            app,
-            "GET",
-            "/api/repositories/files/log",
-            None,
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-        assert_eq!(
-            unsupported["diagnostics"][0]["code"],
-            "repository_provider_unsupported"
-        );
+        repository_http_contract_tests::assert_lookup_and_registration_contract().await;
     }
 
     #[tokio::test]

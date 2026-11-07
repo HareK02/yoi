@@ -12,6 +12,9 @@ pub mod authorization;
 mod configuration_error;
 pub mod configuration_failure;
 pub use configuration_error::ConfigurationApiError;
+mod repository_error;
+pub mod repository_failure;
+pub use repository_error::RepositoryBoundary;
 mod repository_access_error;
 pub mod repository_access_failure;
 pub use repository_access_error::RepositoryAccessApiError;
@@ -107,6 +110,10 @@ pub type ServerApiClientError = client_support::ClientError<ServerApiError>;
 #[serde(deny_unknown_fields)]
 pub struct RepositoryApiError {
     #[serde(skip)]
+    repository: Option<repository_failure::RepositoryFailureDetails>,
+    #[serde(skip)]
+    repository_problem: Option<Vec<u8>>,
+    #[serde(skip)]
     control: Option<protocol::control_failure::RuntimeControlCause>,
     pub error: String,
     pub message: String,
@@ -123,7 +130,7 @@ pub struct RepositoryApiError {
 #[allow(dead_code)]
 #[derive(JsonSchema)]
 #[schemars(deny_unknown_fields)]
-struct ControlProblemPublicationSchema {
+struct RepositoryProblemPublicationSchema {
     #[schemars(rename = "type", length(max = 2048))]
     type_uri: String,
     #[schemars(length(min = 1, max = 2048))]
@@ -134,11 +141,24 @@ struct ControlProblemPublicationSchema {
     detail: String,
     #[schemars(length(max = 2048))]
     instance: String,
-    yoi_failure:
-        error_contract::codec::FailureEnvelope<protocol::control_failure::RuntimeControlCause>,
+    yoi_failure: error_contract::codec::FailureEnvelope<RepositoryProblemCauseSchema>,
 }
 
-impl api_macros::openapi::OpenApiSchema for ControlProblemPublicationSchema {}
+// The details owners have exclusive wire shapes, rather than two overlapping
+// Problem objects: Repository is a closed object and control is a string enum.
+struct RepositoryProblemCauseSchema;
+impl JsonSchema for RepositoryProblemCauseSchema {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RepositoryProblemCauseSchema".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({"oneOf": [
+            repository_failure::RepositoryFailureDetails::json_schema(generator),
+            protocol::control_failure::RuntimeControlCause::json_schema(generator)
+        ]})
+    }
+}
+impl api_macros::openapi::OpenApiSchema for RepositoryProblemPublicationSchema {}
 
 impl api_macros::openapi::OpenApiSchema for RepositoryApiError {
     fn response_schema(
@@ -147,7 +167,9 @@ impl api_macros::openapi::OpenApiSchema for RepositoryApiError {
     ) -> Result<serde_json::Value, api_macros::openapi::OpenApiError> {
         match content_type {
             "application/json" => builder.schema_ref::<Self>(),
-            "application/problem+json" => builder.schema_ref::<ControlProblemPublicationSchema>(),
+            "application/problem+json" => {
+                builder.schema_ref::<RepositoryProblemPublicationSchema>()
+            }
             _ => Err(api_macros::openapi::OpenApiError::InvalidContract(
                 "unsupported control error representation".into(),
             )),
@@ -178,6 +200,8 @@ impl RepositoryApiError {
             error: error.into(),
             message: message.into(),
             diagnostics,
+            repository: None,
+            repository_problem: None,
             failure: None,
             control: None,
             status,
@@ -195,6 +219,13 @@ impl RepositoryApiError {
 
 impl api_macros::HttpError for RepositoryApiError {
     fn custom_response(&self) -> Option<api_macros::HttpErrorResponse> {
+        if let Some(body) = &self.repository_problem {
+            return Some(api_macros::HttpErrorResponse {
+                status: self.status,
+                content_type: error_contract::problem::PROBLEM_CONTENT_TYPE,
+                body: body.clone().into(),
+            });
+        }
         self.control.and_then(|cause| {
             runtime_api::RuntimeApiError::new(500, cause.reason(), cause.explanation())
                 .with_control(cause)
@@ -218,6 +249,28 @@ impl api_macros::reqwest::HttpClientError for RepositoryApiError {
             .unwrap_or("")
             .trim();
         if media.eq_ignore_ascii_case("application/problem+json") {
+            match response.decode_problem::<repository_failure::RepositoryFailureDetails>(
+                &RepositoryBoundary,
+                repository_error::budget(),
+            ) {
+                error_contract::DecodeFailure::Known(received) => {
+                    let details = *received.facts().cause();
+                    let mut error = Self::new(
+                        response.status().as_u16(),
+                        details.reason.as_str(),
+                        "Repository returned a typed failure.",
+                        Vec::new(),
+                    );
+                    error.repository = Some(details);
+                    return Ok(error);
+                }
+                error_contract::DecodeFailure::Corrupt(_) => {
+                    return Err(ClientFailure::ErrorResponseDecode {
+                        status: response.status().as_u16(),
+                    });
+                }
+                error_contract::DecodeFailure::Unsupported(_) => {}
+            }
             let source = runtime_api::RuntimeApiError::decode_error(response)?;
             let cause = source
                 .control_cause()
@@ -2944,7 +2997,9 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_list(
         &self,
@@ -2957,7 +3012,9 @@ pub trait ServerApi {
         error_status = 400,
         additional_error_statuses = [401, 403, 404, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_list_alias(&self) -> Result<RepositoryListResponse, RepositoryApiError>;
 
@@ -2967,7 +3024,9 @@ pub trait ServerApi {
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_detail(
         &self,
@@ -2981,7 +3040,9 @@ pub trait ServerApi {
         error_status = 404,
         additional_error_statuses = [400, 401, 403, 500],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_detail_alias(
         &self,
@@ -2996,6 +3057,8 @@ pub trait ServerApi {
         additional_error_statuses = [401, 403, 404, 409, 413, 415, 422, 500],
         bearer_auth = true,
         browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"],
         normalize_body_errors = true
     )]
     async fn repository_create(
@@ -3041,9 +3104,11 @@ pub trait ServerApi {
         "/api/w/{workspace_id}/repositories/{repository_key}/log",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
+        additional_error_statuses = [401, 403, 404, 500, 502],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_log(
         &self,
@@ -3056,9 +3121,11 @@ pub trait ServerApi {
         "/api/repositories/{repository_key}/log",
         status = 200,
         error_status = 400,
-        additional_error_statuses = [401, 403, 404, 500],
+        additional_error_statuses = [401, 403, 404, 500, 502],
         bearer_auth = true,
-        browser_auth = true
+        browser_auth = true,
+        client_error_hook = true,
+        additional_error_content_types = ["application/problem+json"]
     )]
     async fn repository_log_alias(
         &self,
