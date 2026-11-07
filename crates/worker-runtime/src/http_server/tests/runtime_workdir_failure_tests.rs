@@ -409,6 +409,7 @@ async fn signed_http_session_open_rejects_bad_capability_scope_and_owner_binding
             let body = if case == "owner_binding" {
                 serde_json::to_vec(&OpenWorkdirSessionRequest {
                     owner_worker_id: Some(foreign_worker.worker_id.to_string()),
+                    ..Default::default()
                 })
                 .unwrap()
             } else {

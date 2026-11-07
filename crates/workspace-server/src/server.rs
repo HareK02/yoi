@@ -530,7 +530,13 @@ struct WorkdirCommandSession {
     terminal_at: Option<std::time::Instant>,
 }
 
+#[derive(Clone)]
 enum RegisteredWorkdirSession {
+    Retired {
+        worker: RuntimeWorkerRef,
+        attachment_alias: Option<String>,
+        source: WorkdirSessionHandle,
+    },
     Attachment {
         worker: RuntimeWorkerRef,
         session: WorkdirSessionHandle,
@@ -546,6 +552,7 @@ enum RegisteredWorkdirSession {
 struct WorkdirSessionRegistry {
     attachments: HashMap<RuntimeWorkerRef, WorkdirSessionHandle>,
     commands: HashMap<(RuntimeWorkerRef, CommandHandle), WorkdirCommandSession>,
+    retired: Vec<RegisteredWorkdirSession>,
 }
 
 impl WorkdirSessionRegistry {
@@ -637,7 +644,13 @@ impl WorkdirSessionRegistry {
             .len()
             .saturating_sub(MAX_RETAINED_TERMINAL_COMMANDS);
         for (handle, _) in terminal.into_iter().take(excess) {
-            self.commands.remove(&(worker.clone(), handle));
+            if let Some(command) = self.commands.remove(&(worker.clone(), handle)) {
+                self.retired.push(RegisteredWorkdirSession::Retired {
+                    worker: worker.clone(),
+                    attachment_alias: Some(command.attachment_alias),
+                    source: command.source,
+                });
+            }
         }
     }
 
@@ -654,7 +667,7 @@ impl WorkdirSessionRegistry {
             })
             .map(|((_, handle), _)| handle.clone())
             .collect::<Vec<_>>();
-        command_handles
+        let mut taken = command_handles
             .into_iter()
             .filter_map(|external_handle| {
                 self.commands
@@ -665,7 +678,9 @@ impl WorkdirSessionRegistry {
                         session,
                     })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        taken.extend(self.take_retired(worker, Some(attachment_alias)));
+        taken
     }
 
     // Stop owns the concrete provider sessions observed before dispatch, not
@@ -689,7 +704,28 @@ impl WorkdirSessionRegistry {
                     })
                 }),
         );
+        observed.extend(
+            self.retired
+                .iter()
+                .filter(|item| {
+                    matches!(item,
+            RegisteredWorkdirSession::Retired { worker: owner, .. } if owner == worker)
+                })
+                .cloned(),
+        );
         observed
+    }
+
+    fn take_retired(
+        &mut self,
+        worker: &RuntimeWorkerRef,
+        alias: Option<&str>,
+    ) -> Vec<RegisteredWorkdirSession> {
+        let (taken, retained) = self.retired.drain(..).partition(|item| matches!(item,
+            RegisteredWorkdirSession::Retired { worker: owner, attachment_alias, .. }
+                if owner == worker && alias.is_none_or(|alias| attachment_alias.as_deref().is_none_or(|current| current == alias))));
+        self.retired = retained;
+        taken
     }
 
     fn take_observed(
@@ -699,6 +735,15 @@ impl WorkdirSessionRegistry {
         observed
             .iter()
             .filter_map(|item| match item {
+                RegisteredWorkdirSession::Retired { worker, source, .. } => self
+                    .retired
+                    .iter()
+                    .position(|item| {
+                        matches!(item,
+                        RegisteredWorkdirSession::Retired { worker: owner, source: current, .. }
+                            if owner == worker && Arc::ptr_eq(current, source))
+                    })
+                    .map(|index| self.retired.remove(index)),
                 RegisteredWorkdirSession::Attachment { worker, session } => self
                     .attachments
                     .get(worker)
@@ -765,13 +810,25 @@ impl WorkdirSessionRegistry {
                 });
             }
         }
+        sessions.extend(self.take_retired(worker, None));
         sessions
     }
 
     fn restore(&mut self, registered: RegisteredWorkdirSession) {
         match registered {
+            retired @ RegisteredWorkdirSession::Retired { .. } => self.retired.push(retired),
             RegisteredWorkdirSession::Attachment { worker, session } => {
-                self.attachments.insert(worker, session);
+                if let Some(current) = self.attachments.get(&worker) {
+                    if !Arc::ptr_eq(current, &session) {
+                        self.retired.push(RegisteredWorkdirSession::Retired {
+                            worker,
+                            attachment_alias: None,
+                            source: session,
+                        });
+                    }
+                } else {
+                    self.attachments.insert(worker, session);
+                }
             }
             RegisteredWorkdirSession::Command {
                 worker,
@@ -821,6 +878,7 @@ async fn close_registered_workdir_sessions(
         let session = match item {
             RegisteredWorkdirSession::Attachment { session, .. } => session,
             RegisteredWorkdirSession::Command { session, .. } => &session.source,
+            RegisteredWorkdirSession::Retired { source, .. } => source,
         };
         match session.close().await {
             Ok(()) => {
@@ -2925,9 +2983,13 @@ impl WorkerRemovalService {
             {
                 return Ok(waiting);
             }
-            if close_worker_workdir_sessions(&self.workdir_sessions, &target)
+            if runtime
+                .close_owned_workdir_sessions(target, None)
                 .await
                 .is_err()
+                || close_worker_workdir_sessions(&self.workdir_sessions, &target)
+                    .await
+                    .is_err()
             {
                 let _ = self.store.fail_worker_removal(
                     &self.workspace_id,
@@ -3062,9 +3124,13 @@ impl WorkerRemovalService {
         {
             return Ok(waiting);
         }
-        if close_worker_workdir_sessions(&self.workdir_sessions, &target)
+        if runtime
+            .close_owned_workdir_sessions(target, None)
             .await
             .is_err()
+            || close_worker_workdir_sessions(&self.workdir_sessions, &target)
+                .await
+                .is_err()
         {
             let _ = self.store.fail_worker_removal(
                 &self.workspace_id,
@@ -22409,11 +22475,24 @@ async fn open_current_worker_workdir_session_locked(
         close_current_worker_attachment_session_locked(api, worker).await?;
     }
     let owner_worker_id = runtime_local_owner_worker_id(worker, runtime_id);
-    let source = api
-        .runtime
-        .open_workdir_session(runtime_id, &workdir.workdir_id, owner_worker_id)
-        .await
-        .map_err(|error| error.into_error())?;
+    let source = tracing::Instrument::instrument(
+        api.runtime.open_owned_workdir_session(
+            runtime_id,
+            &workdir.workdir_id,
+            owner_worker_id,
+            workdir::http::RemoteWorkdirSessionOwner {
+                worker_runtime_id: worker.runtime_id.clone(),
+                worker_id: worker.worker_id.clone(),
+                attachment_connection_id: link.connection_id.clone(),
+            },
+        ),
+        tracing::info_span!("backend_workdir_session", runtime_id = %runtime_id,
+            worker_runtime_id = %worker.runtime_id, worker_id = %worker.worker_id,
+            attachment_connection_id = %link.connection_id, attachment_alias = %link.alias,
+            workdir_id = %workdir.workdir_id),
+    )
+    .await
+    .map_err(|error| error.into_error())?;
     let session = workdir::WorkdirToolBroker::with_capabilities(source, effective_capabilities)
         .tool_session();
     let replaced = api
@@ -23260,6 +23339,14 @@ async fn detach_current_worker_workdir(
             Ok(link)
         })
         .await?;
+    api.runtime
+        .close_owned_workdir_sessions(worker, Some(&link.connection_id))
+        .await
+        .map_err(|error| Error::RuntimeOperationFailed {
+            runtime_id: worker.runtime_id.clone(),
+            code: "workdir_session_close_unconfirmed".into(),
+            message: error.to_string(),
+        })?;
     close_current_worker_attachment_session_locked(api, worker).await?;
     close_current_worker_command_sessions_for_alias_locked(api, worker, alias).await?;
     // Even unconditional HTTP requests condition the mutation on the lifetime just read
@@ -23535,6 +23622,13 @@ async fn scoped_execute_current_worker_workdir_operation(
             if page.terminal.is_some() {
                 // Retain the binding for a retry after an unknown HTTP outcome.
                 api.workdir_sessions.lock().unwrap().mark_terminal(&worker, &external_handle);
+                // Output retry retention is not ownership of the evicted provider.
+                // Keep failed cleanup in the registry without overwriting the result.
+                let retired = api.workdir_sessions.lock().unwrap().take_retired(&worker, None);
+                if let Err(error) = close_registered_workdir_sessions(&api.workdir_sessions, retired).await {
+                    tracing::warn!(worker_id = %worker.worker_id, runtime_id = %worker.runtime_id,
+                        error = %error, "terminal command session cleanup remains unconfirmed");
+                }
             }
             WorkdirSessionOperationResult::CommandOutput(page)
         }
