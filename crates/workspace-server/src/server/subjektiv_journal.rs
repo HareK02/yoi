@@ -518,12 +518,19 @@ pub(super) fn bind_host_session(
     api: &WorkspaceApi,
     attr: crate::subjektiv::SubjectSessionAttribution,
 ) -> Result<()> {
-    bind_host_session_for_registration(api, attr).map_err(|failure| failure.error)
+    bind_host_session_for_registration(api, attr, SessionRegistrationCaller::InternalRecovery)
+        .map_err(|failure| failure.error)
+}
+
+pub(super) enum SessionRegistrationCaller<'a> {
+    Signed(&'a server_api::ServerRuntimeSource),
+    InternalRecovery,
 }
 
 pub(super) fn bind_host_session_for_registration(
     api: &WorkspaceApi,
     attr: crate::subjektiv::SubjectSessionAttribution,
+    caller: SessionRegistrationCaller<'_>,
 ) -> ApiResult<()> {
     let gate = lifecycle_lock(api, &attr.subject_id)?;
     let _guard = gate
@@ -549,6 +556,19 @@ pub(super) fn bind_host_session_for_registration(
         ));
     }
     let store = store(api)?;
+    let store = match caller {
+        SessionRegistrationCaller::Signed(source) => {
+            subject_authorization::authenticated_subject_effect_store(
+                api,
+                &store,
+                &worker,
+                &attr.subject_id,
+                "session.record",
+                source,
+            )
+        }
+        SessionRegistrationCaller::InternalRecovery => store,
+    };
     if store
         .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
         .map_err(session_registration::journal_error)?

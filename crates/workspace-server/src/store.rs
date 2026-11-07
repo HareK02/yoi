@@ -4313,19 +4313,50 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    /// Current policy and singleton ownership stay fenced through the bounded
-    /// native Feature commit. The callback must not reenter either store.
+    /// Check the original signed identity on the authority connection retained
+    /// through the protected result or effect, never a new trust lookup as proof.
+    pub(crate) fn require_authenticated_subject_request(
+        connection: &Connection,
+        workspace_id: &str,
+        source: &server_api::ServerRuntimeSource,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<()> {
+        let current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings WHERE workspace_id=?1 AND runtime_id=?2 AND binding_id=?3 AND revoked_at IS NULL)",
+            params![workspace_id, source.runtime_id, source.authentication_binding_id],
+            |row| row.get(0),
+        )?;
+        if !current
+            || source.runtime_id != worker.runtime_id
+            || source.worker_id.as_deref() != Some(worker.worker_id.as_str())
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Subject request authentication binding changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Current policy, signed binding and singleton ownership stay fenced through
+    /// the bounded native Feature commit. The callback must not reenter either store.
     pub(crate) fn with_current_subject_body_policy<T>(
         &self,
         workspace_id: &str,
         subject_id: &str,
         expected: &WorkerSingletonLease,
         source: &crate::subjektiv::chat::ChatPolicySource,
+        request_source: &server_api::ServerRuntimeSource,
         publish: impl FnOnce(&server_api::authorization::SubjectPolicySource) -> Result<T>,
     ) -> Result<T> {
         use crate::subjektiv::chat::ChatPolicySource;
         use server_api::authorization::SubjectPolicySource;
         self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |tx| {
+            Self::require_authenticated_subject_request(
+                tx,
+                workspace_id,
+                request_source,
+                &expected.worker,
+            )?;
             let canonical = crate::config_adoption::canonical(tx, workspace_id)?;
             let policy = match (canonical, source) {
                 (false, ChatPolicySource::Local(Some(policy))) => policy.clone(),

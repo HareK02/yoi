@@ -1020,7 +1020,14 @@ async fn pending_release_binding_refusal_retains_original_conflict_source() {
         &session,
     )
     .unwrap();
-    let error = session_registration::bind_host_session(&f.api, attr).unwrap_err();
+    // This cause/source unit uses the trusted internal registration boundary;
+    // the signed route and original request binding have connected coverage.
+    let error = subjektiv_journal::bind_host_session_for_registration(
+        &f.api,
+        attr,
+        subjektiv_journal::SessionRegistrationCaller::InternalRecovery,
+    )
+    .unwrap_err();
     assert_eq!(
         error.session_registration_cause,
         Some(SessionRegistrationCause::binding_mismatch())

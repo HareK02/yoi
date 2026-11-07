@@ -140,7 +140,7 @@ impl SubjektivStore {
                 ));
             }
         }
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             crate::require_subject_in_connection(tx, subject)?;
             crate::deletion::require_live_worker(tx, runtime, worker)?;
             let state: Option<String> = tx.query_row("SELECT state FROM subjects WHERE subject_id=?1", [subject], |r| r.get(0)).optional()?;
@@ -170,7 +170,7 @@ impl SubjektivStore {
         attribution: SubjectSessionAttribution,
     ) -> JournalResult<JournalHostContext> {
         let mut host = JournalHostContext::validated_session(self, attribution)?;
-        self.database.try_transaction(|tx| {
+        self.journal_transaction(|tx| {
             let attr = host.attribution.as_ref().expect("validated Session");
             if binding.subject_id != attr.subject_id || binding.runtime_id != attr.runtime_id || binding.worker_id != attr.worker_id {
                 return Err(denied());

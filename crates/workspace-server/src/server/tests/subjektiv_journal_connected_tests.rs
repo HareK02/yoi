@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 
 use super::super::restored_parent_control_tests::connected_restore_tempdir;
 
+#[path = "session_embedded_binding_tests.rs"]
+mod signed_session_binding;
+
 fn connected_subject_permissions(
     subject: &str,
 ) -> Vec<server_api::authorization::ScopedPermission> {

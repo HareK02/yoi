@@ -298,6 +298,8 @@ pub(super) async fn worker_operation(
         request,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
     .await
 }
@@ -312,7 +314,18 @@ pub(super) async fn worker_operation_before_feature(
     request: ChatWorkerRequest,
     observe: Arc<dyn Fn() + Send + Sync>,
 ) -> ApiResult<ChatWorkerResponse> {
-    worker_operation_inner(api, context, workspace, request, Some(observe)).await
+    worker_operation_inner(api, context, workspace, request, Some(observe), None).await
+}
+
+#[cfg(test)]
+pub(super) async fn worker_operation_before_host(
+    api: WorkspaceApi,
+    context: ServerRequestContext,
+    workspace: String,
+    request: ChatWorkerRequest,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> ApiResult<ChatWorkerResponse> {
+    worker_operation_inner(api, context, workspace, request, None, Some(observe)).await
 }
 
 async fn worker_operation_inner(
@@ -321,12 +334,24 @@ async fn worker_operation_inner(
     workspace: String,
     request: ChatWorkerRequest,
     #[cfg(test)] before_feature: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)] before_host: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> ApiResult<ChatWorkerResponse> {
     api.host_executors
         .feature()?
         .run(move || -> ApiResult<_> {
             validate_workspace_scope(&api, &workspace)?;
             let initial = subjektiv_worker_scope_from_store(&api, &workspace, &context)?;
+            let request_source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied("chat requires a signed Runtime source".into())
+            })?;
+            api.config_store.with_conn(|connection| {
+                crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                    connection,
+                    &workspace,
+                    request_source,
+                    &initial.worker,
+                )
+            })?;
             if !matches!(initial.authority, SubjektivStoredScopeAuthority::Subject) {
                 return Err(Error::WorkspacePermissionDenied(
                     "chat publication and reads require the current Subject body".into(),
@@ -374,6 +399,10 @@ async fn worker_operation_inner(
             // Memory already holds that connection when it requests registry write.
             store
                 .with_chat_transaction(&scope.subject_id, |chat| {
+                    #[cfg(test)]
+                    if let Some(observe) = before_host {
+                        observe();
+                    }
                     Ok((|| -> ApiResult<_> {
                         let registry = api.permission_registry.read().map_err(|_| {
                             Error::WorkspacePermissionDenied(
@@ -387,6 +416,7 @@ async fn worker_operation_inner(
                                 &scope.subject_id,
                                 &lease,
                                 &source,
+                                request_source,
                                 |policy| {
                                     Ok((|| -> ApiResult<_> {
                                         authorize_chat_policy(

@@ -3,6 +3,8 @@
 mod public_assignment;
 #[path = "server_residual_execution_tests.rs"]
 mod residual;
+#[path = "server_session_binding_tests.rs"]
+mod signed_binding;
 use super::*;
 use crate::SqliteWorkspaceStore;
 use crate::db_executor::{DbExecutor, DbExecutorLimits, DbOperationLifetime};
@@ -970,6 +972,16 @@ impl HeldRuntimeReply {
         Self::with_response(path, None)
     }
     fn with_response(path: Option<String>, response: Option<serde_json::Value>) -> Self {
+        Self::with_response_count(path, response, 1)
+    }
+    // Hold only the first response; subsequent exact-request controls use the
+    // same endpoint without changing Runtime trust merely to replace the fake.
+    fn with_response_count(
+        path: Option<String>,
+        response: Option<serde_json::Value>,
+        count: usize,
+    ) -> Self {
+        assert!(count > 0);
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -978,11 +990,14 @@ impl HeldRuntimeReply {
         let upstream_released = Arc::new(AtomicBool::new(false));
         let flag = upstream_released.clone();
         let thread = std::thread::spawn(move || {
+            let mut entered = Some(entered);
+            let mut remaining = count;
             loop {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
                 stream.set_read_timeout(Some(WATCHDOG)).unwrap();
+                stream.set_write_timeout(Some(WATCHDOG)).unwrap();
                 let Ok(Some(request)) = read_runtime_fixture_request(&mut stream) else {
                     return;
                 };
@@ -992,11 +1007,13 @@ impl HeldRuntimeReply {
                     let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                     continue;
                 }
-                let _ = entered.send(request);
-                let _ = permit.recv_timeout(WATCHDOG);
-                flag.store(true, Ordering::SeqCst);
-                if let Some(response) = response {
-                    let body = serde_json::to_vec(&response).unwrap();
+                if let Some(entered) = entered.take() {
+                    let _ = entered.send(request);
+                    let _ = permit.recv_timeout(WATCHDOG);
+                    flag.store(true, Ordering::SeqCst);
+                }
+                if let Some(response) = response.as_ref() {
+                    let body = serde_json::to_vec(response).unwrap();
                     let header = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
@@ -1006,7 +1023,10 @@ impl HeldRuntimeReply {
                 } else {
                     let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 }
-                break;
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
             }
         });
         Self {
@@ -1143,6 +1163,7 @@ async fn session_runtime_subject(
     if let Some(operation) = match kind {
         "read" => Some("session.read"),
         "search" => Some("session.search"),
+        "list" => Some("session.list"),
         _ => None,
     } {
         open_subjektiv_store(&fixture.api)
@@ -1243,7 +1264,14 @@ async fn session_runtime_subject(
         actor: None,
         worker_source: None,
         runtime_source: Some(server_api::ServerRuntimeSource {
-            authentication_binding_id: "fixture-binding".into(),
+            // Older handler-only tests use a fixture inbound context. Preserve
+            // the original recorded binding at setup, never a post-wait lookup.
+            authentication_binding_id: fixture
+                .store
+                .get_workspace_runtime_binding(WORKSPACE, &worker.runtime_id)
+                .unwrap()
+                .unwrap()
+                .binding_id,
             runtime_id: worker.runtime_id.clone(),
             worker_id: Some(worker.worker_id.clone()),
         }),

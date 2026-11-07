@@ -25354,7 +25354,15 @@ async fn scoped_record_subjektiv_session(
                 &attribution.subject_id,
                 "session.record",
             )?;
-            session_registration::bind_host_session(&api, attribution.clone())?;
+            let source = context.runtime_source.as_ref().ok_or_else(|| {
+                session_registration::Judgment::SessionRecord.error(
+                    Error::WorkspacePermissionDenied(
+                        "Session registration requires a signed Runtime source".into(),
+                    ),
+                    protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
+                )
+            })?;
+            session_registration::bind_host_session(&api, attribution.clone(), source)?;
             Ok(Json(server_api::SubjektivRecordSessionResponse {
                 subject_id: attribution.subject_id,
                 session_id: attribution.session_id,
@@ -25455,6 +25463,16 @@ async fn scoped_subjektiv_session_backend(
     context: server_api::ServerRequestContext,
     Json(request): Json<server_api::SubjektivSessionBackendRequest>,
 ) -> ApiResult<Json<server_api::SubjektivSessionBackendResponse>> {
+    subjektiv_session_backend_before_return(api, path, context, request, || {}).await
+}
+
+async fn subjektiv_session_backend_before_return(
+    api: WorkspaceApi,
+    path: ScopedWorkspacePath,
+    context: server_api::ServerRequestContext,
+    request: server_api::SubjektivSessionBackendRequest,
+    before_return: impl FnOnce() + Send + 'static,
+) -> ApiResult<Json<server_api::SubjektivSessionBackendResponse>> {
     api.host_executors
         .host()?
         .run(move || {
@@ -25466,6 +25484,19 @@ async fn scoped_subjektiv_session_backend(
                 SubjektivWorkerAuthority::Subject,
                 "Session history read",
             )?;
+            let request_source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Session reads require a signed Runtime source".into(),
+                )
+            })?;
+            api.config_store.with_conn(|connection| {
+                crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                    connection,
+                    &path.workspace_id,
+                    request_source,
+                    &controller,
+                )
+            })?;
             let operation = match &request.operation {
                 server_api::SubjektivSessionBackendOperation::List(_) => "session.list",
                 server_api::SubjektivSessionBackendOperation::Search(_) => "session.search",
@@ -25519,37 +25550,48 @@ async fn scoped_subjektiv_session_backend(
                     )
                 }
             };
-            // Runtime transport may wait while policy, body ownership or an
-            // observation grant changes. Never deliver its earlier authorized data.
-            let (current_subject, current_controller, current_authority) =
-                subjektiv_subject_scope(&api, &path.workspace_id, &context)?;
-            require_subjektiv_worker_authority(
-                current_authority,
-                SubjektivWorkerAuthority::Subject,
-                "Session history return",
-            )?;
-            if current_subject != subject_id || current_controller != controller {
-                return Err(Error::WorkspacePermissionDenied(
-                    "Session principal changed during read".into(),
-                )
-                .into());
-            }
-            authorize_subjektiv_operation(
-                &api,
-                &controller,
-                &path.workspace_id,
-                &subject_id,
-                operation,
-            )?;
-            revalidate_subjektiv_session_response(
-                &api,
-                &store,
-                &path.workspace_id,
-                &subject_id,
-                &controller,
-                &response,
-            )?;
-            Ok(Json(response))
+            before_return();
+            // Runtime may wait while trust, policy, ownership or observation
+            // changes. Fence the coherent Feature/catalog/Host return scope; all
+            // nested reads use its query readers, and none calls Runtime here.
+            service_authority::with_service_authority(&api, |current, connection| {
+                crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                    connection,
+                    &path.workspace_id,
+                    request_source,
+                    &controller,
+                )?;
+                Ok((|| -> ApiResult<_> {
+                    let scope =
+                        subjektiv_worker_scope_from_store(current, &path.workspace_id, &context)?;
+                    if scope.subject_id != subject_id
+                        || scope.worker != controller
+                        || !matches!(scope.authority, SubjektivStoredScopeAuthority::Subject)
+                    {
+                        return Err(Error::WorkspacePermissionDenied(
+                            "Session principal changed during read".into(),
+                        )
+                        .into());
+                    }
+                    authorize_subjektiv_operation(
+                        current,
+                        &controller,
+                        &path.workspace_id,
+                        &subject_id,
+                        operation,
+                    )?;
+                    let subjects = open_subjektiv_store(current)?;
+                    revalidate_subjektiv_session_response(
+                        current,
+                        &subjects,
+                        &path.workspace_id,
+                        &subject_id,
+                        &controller,
+                        &response,
+                    )?;
+                    Ok(Json(response))
+                })())
+            })?
         })
         .await
 }

@@ -1,6 +1,7 @@
-//! Short synchronous Plugin scopes retain Feature, catalog and Host authority.
+//! Short synchronous protected Feature scopes retain catalog and Host authority.
 //! Nested checks use independent query-only connections while the original native
-//! transactions and original registry lease remain held through Host commit.
+//! transactions and registry lease remain held through commit or result construction.
+//! Callbacks must not call Runtime/network or reenter the original write owners.
 use super::*;
 
 /// Retain the verified request's trust identity across executor/lock waits.

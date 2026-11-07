@@ -1007,7 +1007,7 @@ impl SubjektivStore {
     ) -> Result<SubjectSessionAttribution> {
         validate_session_attribution(&attribution)?;
         let raw = serde_json::to_string(&attribution)?;
-        self.database.try_transaction(|transaction| {
+        self.memory_transaction(|transaction| {
             require_active_subject(transaction, &attribution.subject_id)?;
             write_session_attribution(transaction, attribution, raw)
         })

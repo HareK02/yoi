@@ -32,6 +32,8 @@
 //! These tests require the parent-owned module registration and memory_before_effect
 //! hook; this file exposes no production helper and changes no existing fixture.
 use super::*;
+#[path = "session_registration_binding_tests.rs"]
+mod registration;
 use server_api::{
     SubjektivMemoryBackendOperation as Op, SubjektivMemoryBackendRequest as MemoryRequest,
     SubjektivMemoryBackendResponse as MemoryResponse,

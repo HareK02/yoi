@@ -1541,21 +1541,16 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
         api.store = catalog.clone();
         let authority = WorkerAuthorityView::from(&api);
         if let Some(source) = &self.runtime_source {
-            catalog.with_conn(|connection| {
-                let current: bool = connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings WHERE workspace_id=?1 AND runtime_id=?2 AND binding_id=?3 AND revoked_at IS NULL)",
-                    rusqlite::params![api.workspace_id(), source.runtime_id, source.authentication_binding_id],
-                    |row| row.get(0),
-                )?;
-                if !current || source.runtime_id != self.worker.runtime_id
-                    || source.worker_id.as_deref() != Some(self.worker.worker_id.as_str())
-                {
-                    return Err(Error::WorkspacePermissionDenied(
-                        "Subject request authentication binding changed".into(),
-                    ));
-                }
-                Ok(())
-            }).map_err(|error| reject(error.into()))?;
+            catalog
+                .with_conn(|connection| {
+                    crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                        connection,
+                        api.workspace_id(),
+                        source,
+                        &self.worker,
+                    )
+                })
+                .map_err(|error| reject(error.into()))?;
         }
         catalog
             .with_conn(|connection| {

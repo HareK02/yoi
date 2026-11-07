@@ -6,6 +6,8 @@
 //! is scripted. All endpoints and storage are ephemeral; no live model is used.
 use super::*;
 use server_api::{ChatConversation, ChatMessagePage, ChatReceiveResponse};
+#[path = "chat_binding_tests.rs"]
+mod signed_binding;
 #[path = "chat_web_connected.rs"]
 mod web_connected;
 
@@ -548,6 +550,32 @@ async fn chat_subject_owner_writer_fence_covers_feature_commit_and_rejects_other
     let store = open_subjektiv_store(&f.api).unwrap();
     let request =
         serde_json::from_value(send(&c.id, "fenced-send", None)["request"].clone()).unwrap();
+    let bytes = serde_json::to_vec(&json!({"operation":send(&c.id, "fenced-send", None)})).unwrap();
+    let signed = runtime_source_request(
+        &f.identity,
+        Some(&f.source.worker_id),
+        "POST",
+        &chat_worker_path(),
+        bytes.clone(),
+    );
+    let verified = crate::worker_source::verify_runtime_request_source_proof(
+        &f.api,
+        signed.headers()[worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER]
+            .to_str()
+            .unwrap(),
+        TEST_WORKSPACE_ID,
+        worker_runtime::auth::WORKSPACE_REQUEST_PERMISSION,
+        "POST",
+        &chat_worker_path(),
+        &worker_runtime::auth::request_body_digest(&bytes),
+    )
+    .await
+    .unwrap();
+    let request_source = server_api::ServerRuntimeSource {
+        runtime_id: verified.runtime_id,
+        worker_id: verified.worker_id,
+        authentication_binding_id: verified.authentication_binding_id,
+    };
     let message = store
         .with_chat_transaction(&f.subject, |chat| {
             let source = chat.policy_source().clone();
@@ -558,6 +586,7 @@ async fn chat_subject_owner_writer_fence_covers_feature_commit_and_rejects_other
                     &f.subject,
                     &lease,
                     &source,
+                    &request_source,
                     |_| {
                         // Independent Server ownership mutation stays fenced until the
                         // already-held Feature transaction commits, without reentry.
