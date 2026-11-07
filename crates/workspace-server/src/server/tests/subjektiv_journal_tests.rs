@@ -354,6 +354,11 @@ async fn journal_host_capacity_rejection_keeps_same_reservation_autonomously_own
         )
         .unwrap();
     bind_fixture_session(&store, attr);
+    let binding = api
+        .config_store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &source.runtime_id)
+        .unwrap()
+        .unwrap();
     let callback = || {
         subjektiv_journal::recording_route(
             State(api.clone()),
@@ -364,7 +369,7 @@ async fn journal_host_capacity_rejection_keeps_same_reservation_autonomously_own
                 crate::worker_source::VerifiedRuntimeRequestSource {
                     runtime_id: source.runtime_id.clone(),
                     worker_id: Some(source.worker_id.clone()),
-                    authentication_binding_id: "fixture-verified-binding".into(),
+                    authentication_binding_id: binding.binding_id.clone(),
                     token_id_hash: None,
                 },
             )),

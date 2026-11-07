@@ -2,7 +2,7 @@
 
 ## 対象と判断の範囲
 
-T-815要求digest `86c40fb57d3110da8886636da524d9bdc45f9211470188962b57f1fea63bb55c` に対する実装途中の記録。着手基点は `4de62650dad111dc6c96c450a8a31fe4c6b1c4ac`。共通adapterとJournal tailを取り込んだ後、T-852の `71c350dd2f4db25a31c3e4b33037970d2bc3e3fa` を通常mergeした。合成treeは `66594e5be451249125d2df3ffe1cf69c2e28e1d0`、未共有mergeのsubject修正後のcommitは `7451afbc2e49b017965fcfecb7dc83e693a0f571`。このtree以降の追加差分も検証対象であり、この記録だけから全要件合格・公開source一致・独立review承認を判断しない。
+T-815要求digest `86c40fb57d3110da8886636da524d9bdc45f9211470188962b57f1fea63bb55c` に対する実装・検証記録。着手基点は `4de62650dad111dc6c96c450a8a31fe4c6b1c4ac`。T-852、T-837、公開されたT-845を通常合成し、直近のmergeは `f8a3f6524d7f504cb7d960795e1362e48634f14b`、treeは `f750e9af251cf87fe86183cf4561a14ecf3186af`（parents: checkpoint `166a4767b` とT-845 `fc67ce8be30a9f9a30df0aec505fb57874075324`）。後続のJournal試験fixture修正は実認証bindingを使う変更であり、製品認可を緩和しない。この記録だけから全要件合格・公開source一致・独立review承認を判断しない。
 
 共通coreはT-810、HTTP/clientはT-812、Web receiverはT-813、Tool/Job/Service結果境界はT-814を使う。domainは既存の原因を `FailureCause` / `WireDetails` / `ProjectFor` へ接続し、共通formatter、codec、秘匿規則、設定writerを複製しない。Worker起動原因は採用済みT-840/T-843を利用する。
 
@@ -59,9 +59,26 @@ Runtime failed-create publicationのAfterRenameも別の接続点である。cre
 
 ## 保存schemaとの合成
 
-canonical/retained startup・Job・Serviceの公開済み履歴とJournal bridge/receiptを維持し、T-815の独立publication/connection観測は単一appendのWorkspace migration 128に合成した。Runtimeの16→17は別storeの変更である。既存receiptやmigration名を整理目的で書き換えず、空migrationやshape recognizer迂回で合格させない。最古対応schema、実DDL、値・制約・履歴、rollback/retry/reopenの検証は登録されたmigration suiteが所有する。
+canonical/retained startup・Job・Serviceの公開済み履歴とJournal bridge/receiptを維持し、T-815の独立publication/connection観測は、先採用T-845のPlan廃止128/Ticket schema 17の後に単一appendのWorkspace migration 129として追加した。Runtimeの16→17は別storeの変更である。既存receiptやmigration名を整理目的で書き換えず、空migrationやshape recognizer迂回で合格させない。最古対応schema、実DDL、値・制約・履歴、rollback/retry/reopenの検証は登録されたmigration suiteが所有する。
 
 ## 固定source別の証拠と未確認事項
+
+T-845通常合成時の `t845-composition-build-1` / `t845-composition-migrations-1` は通常11crate test buildと、failure-format・combined・host Plan retirement・Job原因移行・config原因23件の成功（exit 0/sourceSame）を保存する。T-845の凍結Host113/Ticket10 SQL、Ticket schema所有者、Host113/128 migration本体は公開targetとbyte一致を確認した。`t845-composition-generated-refresh-1` と `t845-composition-generated-check-1` はroot check、canonical OpenAPI・6派生TS・domain/protocol/config生成と実cmp、fmt/diff/命名検査の成功を保存する。
+
+`composition-baseline-build-1` / `composition-baseline-build-confirm-1` / `composition-baseline-comparison-1` は独立にcheckoutしたclean target `71c350dd2f4db25a31c3e4b33037970d2bc3e3fa` のbinary SHA `74f98f675d7b926bfa62abb2df6802f95d71c4a29ffc84cfac0ba5286c1a3590` を固定する。`composition-baseline-failures-1/group-{0,1}.stdout` とT-845合成後 `t845-residual-1/focus.stdout` では、次の7件の失敗箇所と観測された原因が一致する。名前だけの一致から共通原因を推定したものではなく、これらを成功件数に含めない。
+
+| 試験 | baselineと合成後で一致する残余 |
+| --- | --- |
+| `chat_delegation_connected::reassignment_during_private_chat_result_evaluation_refuses_old_report_as_execution_authority` / `restricted_chat_uses_current_ticket_assignee_target_and_saved_result_before_publication` | target Subjectの文言を要求するassertに、403の型付き `runtime_control/result_unavailable` が返る |
+| `ticket_worker_messaging_connected::public_two_subject_ticket_spawn_notify_edit_result_retry_and_fences` | 同じwrong-assignee probeの文言assertと403/`result_unavailable` |
+| `rejected_orchestrator_spawn_stays_offline_and_can_be_retried` | 旧provider断片文言を要求するdiagnostic assert |
+| `restored_parent_control_tests::restored_runtime_parent_lists_and_inputs_existing_child` | 取消後の旧 `unknown worker` 文言assertと具体的なWorker不存在説明 |
+| `unset_subject_mcp_activation_denies_before_discovery_process_spawn` | 旧 `mcp` 文言assertと `FeatureLifecycle` の403認可拒否 |
+| `failed_subject_spawn_releases_occupancy_only_after_runtime_proof` | string-only fixtureのspawn結果Unknownに対して旧Rejectedを要求するassert |
+
+上記は共通Runtime/起動・認可系の既存残余として保持し、UnknownをRejectedに変えたり公開説明を旧provider文字列へ戻して合格させない。Journal capacity試験の別のbinding不一致はT-837の現bindingを使うfixtureへ修正し、`t845-composition-journal-binding-2` で元のcapacity・同reservation所有の保証が成功した。Service migrationの旧fresh期待差はT-845合成後に成功した。
+
+`t845-normal-consumers-1`の登録3386件は1件失敗だった。生成前にcompileしたOpenAPIの `include_str!` が原因で、生成後の通常再build `t845-composition-build-2` と `t845-composition-openapi-recovery-2` で実一致を確認した。この通常runのsourceSame=falseはConfigTreeSnapshotの既存TS export-testによる整形差のみであり、Deno formatter適用で元tracked bytesへ戻ったことを確認した。旧binary結果とfresh artifact20の結果は別証拠として保持する。
 
 正確なcommand、feature、toolchain/environment、source payload SHA、binary hash、exit/timeout、資源sampleは `target/t815-evidence/` の各preflight/resultとraw logに保存する。下記は同じ候補の重複しない総件数ではなく、段階別の証拠索引である。
 
