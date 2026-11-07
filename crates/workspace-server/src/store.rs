@@ -4304,6 +4304,19 @@ impl SqliteWorkspaceStore {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_current_subject_body<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        publish: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |_| {
+            publish()
+        })
+    }
+
     /// Check the original signed identity on the authority connection retained
     /// through the protected result or effect, never a new trust lookup as proof.
     pub(crate) fn require_authenticated_subject_request(
