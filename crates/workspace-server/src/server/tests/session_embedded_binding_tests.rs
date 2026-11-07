@@ -280,6 +280,16 @@ impl SignedEmbeddedSession {
             .expect("real signed Host registration");
         assert_eq!(attribution.subject_id, subject.id);
         assert_eq!(attribution.worker_id, worker.worker_id);
+        // RunEnd commits history, but does not certify external Journal Job cleanup.
+        // Settle the seed's real recording before measuring only the return race.
+        connected_wait_for_recording(
+            &api,
+            &store,
+            &attribution,
+            &model.jobs,
+            "signed-session-seed",
+        )
+        .await;
         if api
             .store
             .get_active_worker_control_grant(TEST_WORKSPACE_ID, &worker, &worker)
@@ -512,7 +522,9 @@ fn assert_positive(kind: &str, session: &str, response: SessionResponse) {
 }
 
 async fn session_case(change: Change) {
-    let mut f = bounded(SignedEmbeddedSession::new()).await;
+    let mut f = tokio::time::timeout(Duration::from_secs(60), SignedEmbeddedSession::new())
+        .await
+        .expect("Embedded Session setup including bounded Journal settlement");
     let before = f.domain_snapshot();
     let search = serde_json::to_vec(&SessionRequest {
         operation: Op::Search(
@@ -639,7 +651,39 @@ async fn session_case(change: Change) {
         assert_eq!(f.binding().binding_id, current_binding);
         assert_eq!(f.domain_snapshot(), before);
     }
+    // Keep the Host reactor available until the live body and accepted callbacks
+    // have joined; abort-only fixture Drop is the failure fallback, not success.
+    let stopped = bounded(connected_stop_worker(&f.api, &f.worker))
+        .await
+        .unwrap();
+    assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+    for job in f
+        .api
+        .store
+        .list_backend_journal_jobs(TEST_WORKSPACE_ID, &f.session, None, 100)
+        .unwrap()
+    {
+        assert_eq!(job.state, BackendJobState::Completed);
+        subjektiv_journal::require_job_effects_ended(&f.api, &job).unwrap();
+    }
     bounded(f.api.stop_backend_job_recovery()).await;
+    for lane in [
+        &f.api.host_executors.host,
+        &f.api.host_executors.cleanup,
+        &f.api.host_executors.feature,
+    ] {
+        if let Some(Some(executor)) = lane.get() {
+            bounded(executor.drain()).await.unwrap();
+        }
+    }
+    bounded(f.api.store.db_executor().drain()).await.unwrap();
+    f._server.server.abort();
+    assert!(
+        bounded(&mut f._server.server)
+            .await
+            .unwrap_err()
+            .is_cancelled()
+    );
 }
 
 macro_rules! signed_session_case {
