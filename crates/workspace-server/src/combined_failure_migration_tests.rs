@@ -271,7 +271,7 @@ fn program_signature(sql: &str) -> String {
 // Column order can differ across additive histories, but types, defaults, keys,
 // foreign keys, indexes and trigger programs must match the fresh owner. Bounds
 // are exercised separately against populated rows (not inferred from SQL text).
-fn failure_signature(conn: &Connection) -> Vec<Vec<Value>> {
+pub(super) fn failure_signature(conn: &Connection) -> Vec<Vec<Value>> {
     let mut signature = Vec::new();
     for table in [
         "worker_create_reservations",

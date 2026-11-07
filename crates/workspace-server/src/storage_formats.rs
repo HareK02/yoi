@@ -74,6 +74,11 @@ fn invalid(message: impl std::fmt::Display) -> Error {
 /// Every other row, gap, mixed family, unknown suffix and missing object fails.
 pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     let rows = super::workspace_schema_migration_history(conn)?;
+    if current > super::LATEST_SCHEMA_VERSION {
+        return Err(invalid(format!(
+            "unknown baseline or current version: {rows:?}"
+        )));
+    }
     verify_publication_shape(conn, current)?;
     verify_connection_observation_shape(conn, current)?;
     let tail = failure_tail(conn, current, &rows)?;

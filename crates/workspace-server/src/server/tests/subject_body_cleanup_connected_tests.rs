@@ -37,11 +37,12 @@ struct RuntimeHttpFailure {
     method: Method,
     path: String,
     status: StatusCode,
+    management: Option<workdir::management_failure::WorkdirManagementFailure>,
     code: Option<String>,
     message: Option<String>,
     closed_before_response: bool,
-    // Match the shared harness's nested-envelope view without discarding the
-    // flat Workdir envelope's actual code/message from our diagnostic evidence.
+    // Match the shared harness's display observation without using it as
+    // authority for the typed creation-probe expectation.
     harness_message: String,
 }
 
@@ -50,9 +51,11 @@ impl RuntimeHttpFailure {
         self.method == Method::GET
             && self.path == format!("/v1/working-directories/{workdir}")
             && self.status == StatusCode::NOT_FOUND
-            && self.code.as_deref() == Some("working_directory_not_found")
-            && self.message.as_deref()
-                == Some("working_directory_not_found: Runtime working directory was not found")
+            && self.management
+                == Some(workdir::management_failure::WorkdirManagementFailure {
+                    operation: workdir::management_failure::WorkdirManagementOperation::Detail,
+                    reason: workdir::management_failure::WorkdirManagementReason::NotFound,
+                })
     }
 
     fn is_expected_closed_session(&self) -> bool {
@@ -113,9 +116,24 @@ impl StopTransport {
         let bytes = response.bytes().await.unwrap();
         if status.is_client_error() || status.is_server_error() {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
-            // REST uses {error:{code,message}}, whereas Workdir transport errors
-            // are {code,message}. Keep only sanitized diagnostic fields, never
-            // authorization headers, request bodies or raw response bodies.
+            // Keep typed management Problems and the legacy session envelope
+            // distinct; neither diagnostic prose nor HTTP status invents a cause.
+            let content_type = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            let management = match api_macros::http::decode_problem_response::<
+                workdir::management_failure::WorkdirManagementFailure,
+            >(
+                &bytes,
+                status.as_u16(),
+                content_type,
+                &runtime_api::management_failure::ManagementBoundary,
+                error_contract::Budget::new(16384, 16384),
+            ) {
+                error_contract::DecodeFailure::Known(failure) => Some(*failure.facts().cause()),
+                _ => None,
+            };
             let error = body.get("error").unwrap_or(&body);
             let closed_before_response = path
                 .strip_suffix("/operations")
@@ -132,13 +150,18 @@ impl StopTransport {
                 method,
                 path: path.clone(),
                 status,
+                management,
                 code: error["code"].as_str().map(str::to_owned),
                 message: error["message"].as_str().map(str::to_owned),
                 closed_before_response,
-                harness_message: body["error"]["message"]
-                    .as_str()
-                    .unwrap_or("unknown fixture error")
-                    .to_owned(),
+                harness_message: if content_type == runtime_api::startup::PROBLEM_CONTENT_TYPE {
+                    body["detail"].as_str().expect("validated Problem detail")
+                } else {
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap_or("unknown fixture error")
+                }
+                .to_owned(),
             });
         }
         if is_stop && status.is_success() {

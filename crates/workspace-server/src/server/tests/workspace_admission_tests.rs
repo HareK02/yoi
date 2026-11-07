@@ -617,7 +617,7 @@ async fn same_workdir_attachment_conflict_is_preserved_while_owner_operation_run
     )
     .await;
     assert_eq!(
-        body["yoi_failure"]["details"]["reason"], "attachment_conflict",
+        body["yoi_failure"]["details"]["reason"], "workdir_occupied",
         "{body}"
     );
     assert!(!first.is_finished());

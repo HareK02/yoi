@@ -20962,7 +20962,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
             (83..=113)
-                .chain([122, 123, 124, 125, 126, 127])
+                .chain([122, 123, 124, 125, 126, 127, 128])
                 .collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -25392,7 +25392,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
             ((version + 1)..=113)
-                .chain([122, 123, 124, 125, 126, 127])
+                .chain([122, 123, 124, 125, 126, 127, 128])
                 .collect::<Vec<_>>()
         );
         drop(conn);
@@ -25434,7 +25434,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
                          (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
                          (126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
-                         (127, journal_removal_store::MIGRATION_NAME.into())]);
+                         (127, journal_removal_store::MIGRATION_NAME.into()),
+                         (128, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -29803,7 +29804,10 @@ INSERT INTO worker_registry (
     async fn backend_job_cause_migration_125_is_additive_atomic_and_reopens_like_fresh() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cause-migration.sqlite");
-        let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
+        prepare_retained_schema(&path, 124);
+        let conn = Connection::open(&path).unwrap();
+        configure_sqlite(&conn).unwrap();
+        let store = SqliteWorkspaceStore::in_memory_fixture().unwrap();
         seed_resource_job_workspace(&store).await;
         for id in [
             "cause-old-pending",
@@ -29849,29 +29853,132 @@ INSERT INTO worker_registry (
             )
         })
         .collect();
-        store.with_conn(|conn| {
-            // Fixture-only reconstruction of the previous additive schema. No
-            // production downgrade API or mutation of historical receipts ships.
-            conn.execute_batch("ALTER TABLE plugin_service_consumers DROP COLUMN last_outcome_json;
-                UPDATE __yoi_schema_migrations SET version=125 WHERE version=126;
-                ALTER TABLE backend_jobs DROP COLUMN failure_cause;
-                ALTER TABLE backend_job_attempts DROP COLUMN failure_cause;
-                ALTER TABLE backend_job_attempts DROP COLUMN worker_cleanup_failure_cause;
-                UPDATE __yoi_schema_migrations SET version=124 WHERE version=125;")?;
-            storage_formats::verify_history(conn, 124)?;
-            conn.execute_batch("CREATE TRIGGER inject_cause_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=125 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;")?;
-            assert!(migrate_backend_job_causes_v124_to_v125(conn).is_err());
-            assert_eq!(current_schema_version(conn)?, 124);
-            let present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('backend_jobs') WHERE name='failure_cause')", [], |row| row.get(0))?;
-            assert!(!present, "ALTER TABLE must roll back with receipt failure");
-            let attempt_present: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('backend_job_attempts') WHERE name IN ('failure_cause','worker_cleanup_failure_cause'))", [], |row| row.get(0))?;
-            assert!(!attempt_present);
-            conn.execute_batch("DROP TRIGGER inject_cause_migration")?;
-            migrate_backend_job_causes_v124_to_v125(conn)?;
-            assert_eq!(current_schema_version(conn)?, 125);
-            assert!(migrate_backend_job_causes_v124_to_v125(conn).is_err(), "not applied twice");
-            Ok(())
-        }).unwrap();
+        // Copy canonical rows into only the columns of the genuine predecessor;
+        // neither its DDL nor its migration receipts are reconstructed from latest.
+        let mut legacy_rows = Vec::new();
+        for table in [
+            "accounts",
+            "workspaces",
+            "backend_jobs",
+            "backend_job_attempts",
+        ] {
+            let columns = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let names = columns.join(",");
+            let query = format!("SELECT {names} FROM {table} ORDER BY rowid");
+            let rows = store
+                .with_conn(|source| Ok(fixture_query_rows(source, &query)))
+                .unwrap();
+            let placeholders = vec!["?"; columns.len()].join(",");
+            for row in &rows {
+                let precluded = (table == "backend_job_attempts")
+                    .then(|| {
+                        columns
+                            .iter()
+                            .position(|name| name == "allocation_precluded_at")
+                            .unwrap()
+                    })
+                    .filter(|index| row[*index] != rusqlite::types::Value::Null);
+                let mut insertion = row.clone();
+                if let Some(index) = precluded {
+                    insertion[index] = rusqlite::types::Value::Null;
+                    let state = columns.iter().position(|name| name == "state").unwrap();
+                    insertion[state] = rusqlite::types::Value::Text("reserved".into());
+                }
+                conn.execute(
+                    &format!("INSERT INTO {table} ({names}) VALUES ({placeholders})"),
+                    rusqlite::params_from_iter(&insertion),
+                )
+                .unwrap();
+                if let Some(index) = precluded {
+                    // Preserve existing negative-allocation proof through the
+                    // predecessor's real Reserved -> Failed transition, not an
+                    // INSERT that bypasses its proof-minting trigger.
+                    let workspace = columns
+                        .iter()
+                        .position(|name| name == "workspace_id")
+                        .unwrap();
+                    let attempt = columns
+                        .iter()
+                        .position(|name| name == "attempt_id")
+                        .unwrap();
+                    assert_eq!(conn.execute(
+                        "UPDATE backend_job_attempts SET state='failed',allocation_precluded_at=?1 WHERE workspace_id=?2 AND attempt_id=?3",
+                        params![&row[index], &row[workspace], &row[attempt]],
+                    ).unwrap(), 1);
+                }
+            }
+            assert_eq!(fixture_query_rows(&conn, &query), rows);
+            legacy_rows.push((query, rows));
+        }
+        drop(store);
+        assert_eq!(current_schema_version(&conn).unwrap(), 124);
+        storage_formats::verify_history(&conn, 124).unwrap();
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            assert!(!column_exists(&conn, table, column).unwrap());
+        }
+        conn.execute_batch("CREATE TRIGGER inject_cause_migration BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=125 BEGIN SELECT RAISE(ABORT,'injected receipt failure'); END;").unwrap();
+        let error = migrate_backend_job_causes_v124_to_v125(&conn).unwrap_err();
+        assert!(error.to_string().contains("injected receipt failure"));
+        assert_eq!(current_schema_version(&conn).unwrap(), 124);
+        storage_formats::verify_history(&conn, 124).unwrap();
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            assert!(
+                !column_exists(&conn, table, column).unwrap(),
+                "ALTER TABLE must roll back with receipt failure"
+            );
+        }
+        for (query, rows) in &legacy_rows {
+            assert_eq!(&fixture_query_rows(&conn, query), rows);
+        }
+        conn.execute_batch("DROP TRIGGER inject_cause_migration")
+            .unwrap();
+        migrate_backend_job_causes_v124_to_v125(&conn).unwrap();
+        assert_eq!(current_schema_version(&conn).unwrap(), 125);
+        storage_formats::verify_history(&conn, 125).unwrap();
+        assert!(
+            migrate_backend_job_causes_v124_to_v125(&conn).is_err(),
+            "not applied twice"
+        );
+        for (query, rows) in &legacy_rows {
+            assert_eq!(&fixture_query_rows(&conn, query), rows);
+        }
+        for (table, column) in [
+            ("backend_jobs", "failure_cause"),
+            ("backend_job_attempts", "failure_cause"),
+            ("backend_job_attempts", "worker_cleanup_failure_cause"),
+        ] {
+            assert!(column_exists(&conn, table, column).unwrap());
+            let invented: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(invented, 0, "legacy text must not become typed facts");
+        }
+        drop(conn);
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        store
+            .with_conn(|conn| {
+                assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
+                storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)
+            })
+            .unwrap();
         for (job, attempts) in &before {
             assert_eq!(
                 store
@@ -29917,14 +30024,35 @@ INSERT INTO worker_registry (
             );
         }
         let fresh = SqliteWorkspaceStore::in_memory_fixture().unwrap();
-        let signature = |conn: &Connection| -> Result<Vec<(String, String)>> {
-            Ok(conn.prepare("SELECT name,sql FROM sqlite_schema WHERE type='table' AND name IN ('backend_jobs','backend_job_attempts') ORDER BY name")?
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        let signature = |conn: &Connection| {
+            for (table, column) in [
+                ("backend_jobs", "failure_cause"),
+                ("backend_job_attempts", "failure_cause"),
+                ("backend_job_attempts", "worker_cleanup_failure_cause"),
+            ] {
+                let error = conn
+                    .execute(
+                        &format!(
+                            "UPDATE {table} SET {column}=?1 WHERE job_id='cause-post-migration'"
+                        ),
+                        [&"x".repeat(32769)],
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(error, rusqlite::Error::SqliteFailure(ref failure, _)
+                    if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+                    "oversized cause must fail its CHECK, not an unrelated guard: {error}"
+                );
+            }
+            Ok(combined_failure_migration_tests::failure_signature(conn))
         };
-        assert_eq!(
-            reopened.with_conn(signature).unwrap(),
-            fresh.with_conn(signature).unwrap()
-        );
+        let migrated_signature = reopened.with_conn(signature).unwrap();
+        // Additive histories have different physical column order. Compare the
+        // existing semantic signature and exercise bounds on real mutable rows.
+        let fresh_signature = fresh
+            .with_conn(|conn| Ok(combined_failure_migration_tests::failure_signature(conn)))
+            .unwrap();
+        assert_eq!(migrated_signature, fresh_signature);
     }
 
     // Storage component tests: seed already-saved result/cleanup receipts, without

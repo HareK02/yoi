@@ -121,8 +121,8 @@ fn path_entry_and_import_boundaries_never_publish_the_rejected_secret_text() {
                 SECRET,
             )
             .unwrap_err(),
-            "invalid_path",
-            "path is invalid",
+            "builtin_read_only",
+            "builtin namespace is read-only",
         ),
         (
             config_source::resolve_import(&path, &format!("https://private-{SECRET}/source"))

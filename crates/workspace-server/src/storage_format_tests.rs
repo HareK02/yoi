@@ -211,7 +211,7 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
         if name == "__yoi_schema_migrations" {
             continue;
         }
-        let mut columns = super::super::table_columns(conn, &name)
+        let columns = super::super::table_columns(conn, &name)
             .unwrap()
             .into_iter()
             .filter(|column| {
@@ -235,13 +235,6 @@ fn immutable_rows(conn: &Connection) -> Vec<(String, Vec<String>)> {
             })
             .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
             .collect::<Vec<_>>();
-        if name == "backend_job_attempts"
-            && !super::super::column_exists(conn, &name, "allocation_precluded_at").unwrap()
-        {
-            assert!(super::super::current_schema_version(conn).unwrap() < 123);
-            // Migration adds no allocation/termination proof for retained attempts.
-            columns.push("NULL AS allocation_precluded_at".into());
-        }
         let columns = columns.join(",");
         let mut statement = conn
             .prepare(&format!("SELECT {columns} FROM \"{name}\""))
@@ -280,6 +273,17 @@ fn exercise_published_runner(stage: Stage, baseline: i64, predecessor: Option<(F
         // Actual production open/ordered runner, including the new migration.
         super::super::prepare_connection(&conn).unwrap();
         assert_eq!(super::super::current_schema_version(&conn).unwrap(), 128);
+        let allocation_precluded: Option<String> = conn
+            .query_row(
+                "SELECT allocation_precluded_at FROM backend_job_attempts WHERE attempt_id='saved-attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            allocation_precluded.is_none(),
+            "migration must not invent allocation proof"
+        );
         let actual = immutable_rows(&conn);
         for (table, rows) in &expected {
             assert_eq!(
