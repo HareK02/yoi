@@ -29,6 +29,8 @@ mod subject_body_tests;
 mod subject_job_model_supply;
 #[path = "subject_permission_management_tests.rs"]
 mod subject_permission_management;
+#[path = "subject_ticket_migration_connected_tests.rs"]
+mod subject_ticket_migration_connected;
 #[path = "ticket_parent_connected_tests.rs"]
 mod ticket_parent_connected;
 #[path = "ticket_worker_messaging_connected_tests.rs"]
@@ -3443,10 +3445,26 @@ impl ConnectedWorkerHarness {
         Self::start_configured(model, None, app_layer).await
     }
 
+    async fn start_with_database<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        prepare: impl FnOnce(&ServerConfig),
+    ) -> Self {
+        Self::start_prepared(model, None, |router| router, prepare).await
+    }
+
     async fn start_configured<M: agen::llm_client::LlmClient + Clone + 'static>(
         model: M,
         plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
         app_layer: impl FnOnce(Router) -> Router,
+    ) -> Self {
+        Self::start_prepared(model, plugin_https_transport, app_layer, |_| {}).await
+    }
+
+    async fn start_prepared<M: agen::llm_client::LlmClient + Clone + 'static>(
+        model: M,
+        plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
+        app_layer: impl FnOnce(Router) -> Router,
+        prepare: impl FnOnce(&ServerConfig),
     ) -> Self {
         const RUNTIME: &str = CONNECTED_RUNTIME;
         let dir = tempfile::tempdir().unwrap();
@@ -3463,6 +3481,7 @@ impl ConnectedWorkerHarness {
 
         let mut config = test_server_config(dir.path());
         config.backend_base_url = Some(backend_url.clone());
+        prepare(&config);
         // The embedded Runtime is unused. Connected Workers execute on the real
         // Runtime assembled below, not on this Host fixture's embedded backend.
         let control = Arc::new(test_control_store(&config));

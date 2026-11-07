@@ -68,7 +68,7 @@ fn assert_publication(
 }
 
 #[tokio::test]
-async fn async_chat_profile_prunes_execution_tools_without_granting_authority() {
+async fn ordinary_subject_profile_exposes_coordination_without_execution_or_policy_grants() {
     let temp = tempfile::tempdir().unwrap();
     let _sandbox = worker_allocation::test_util::RuntimeDirSandbox::new(temp.path());
     let resolved = manifest::ProfileResolver::new()
@@ -82,6 +82,9 @@ async fn async_chat_profile_prunes_execution_tools_without_granting_authority() 
         )
         .unwrap();
     let mut manifest = resolved.manifest;
+    assert!(manifest.scope.allow.is_empty());
+    assert!(manifest.delegation_scope.allow.is_empty());
+    assert!(!manifest.feature.flow.enabled);
     // This case isolates registration restrictions from independently tested
     // Subject startup Memory/Journal authorization and chat Host requirements.
     manifest.feature.subjektiv.profile.enabled = false;
@@ -105,8 +108,9 @@ async fn async_chat_profile_prunes_execution_tools_without_granting_authority() 
         "SubWorkerSpawn",
         "WebFetch",
         "WebSearch",
-        "SpawnTicketWorker",
         "JobRun",
+        "OpenMergeRequest",
+        "SubmitMergeRequestReview",
     ] {
         assert!(
             !names.iter().any(|name| name == forbidden),
@@ -120,12 +124,25 @@ async fn async_chat_profile_prunes_execution_tools_without_granting_authority() 
         "WorkerList",
         "QueryObjective",
         "ShowTicket",
+        "SpawnTicketWorker",
+        "TicketAssignmentTrackingQuery",
+        "TicketAssignmentTrackingUpdate",
+        "TicketImplementationResultQuery",
+        "ShowMergeRequest",
+        "CheckMergeRequestReadiness",
+        "CompleteMergeRequest",
+        "WorkdirCreate",
     ] {
         assert!(
             names.iter().any(|name| name == required),
             "chat body lacks {required}: {names:?}"
         );
     }
+    let state = session_store::collect_state(&controller.handle.committed_entries());
+    let prompt = state.system_prompt.unwrap();
+    assert!(prompt.contains("## Assigned Ticket coordination"));
+    assert!(prompt.contains("TicketAssignmentTrackingUpdate"));
+    assert!(prompt.contains("## Ticket workflow"));
     assert!(
         client.requests.lock().unwrap().is_empty(),
         "Profile activation must not issue authority or read protected content"

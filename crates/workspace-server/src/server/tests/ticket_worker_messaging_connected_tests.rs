@@ -4,6 +4,8 @@
 //! Acceptance alone is not execution: completion requires Read/Write/Read/result
 //! and an actual public Notify reply observed by the originating model.
 use super::*;
+#[path = "subject_ticket_normal_connected_tests.rs"]
+mod ordinary_subject;
 use agen::llm_client::{
     event::{Event, StopReason},
     types::{ContentPart, Item},

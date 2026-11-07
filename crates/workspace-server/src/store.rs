@@ -18262,6 +18262,11 @@ mod worker_create_failure_store_tests;
 mod test_support;
 
 #[cfg(test)]
+pub(crate) fn prepare_retained_test_schema(path: &std::path::Path, version: i64) {
+    tests::prepare_retained_schema(path, version);
+}
+
+#[cfg(test)]
 mod tests {
     include!("assignment_tracking_tests.rs");
     include!("assignment_delivery_tests.rs");

@@ -14,6 +14,19 @@
 //! No Runtime/FeatureStorage calls, routing, grants, restore or receipt replay
 //! occur here. The caller owns the surrounding transaction and Workspace version;
 //! on any error it must roll back the whole transaction, including Ticket work.
+//!
+//! Cutover is an owner decision after migration/reopen, not part of this migration.
+//! Observe the retained assignment, unfinished implementations, pending input and
+//! saved results first. Explicitly select/create the destination Subject and adopt
+//! its execution/delegation policy through canonical configuration; then start its
+//! ordinary body. Assign with the observed legacy assignment ID as the expected
+//! current pointer and a new operation identity. The new body may read retained
+//! evidence and decide how to continue; ambiguous in-flight work must be reconciled
+//! before another attempt is started. Never rewrite a receipt, source principal or
+//! delivery ACK to the new Subject, replay old pending starts, or implicitly restore
+//! an old body. Failed cutover leaves historical work available for another explicit
+//! owner decision; reverting application code is not permission to undo migration
+//! receipts or revive the legacy actor.
 use super::*;
 
 pub(super) const LEGACY_DIAGNOSTIC: &str = "Legacy Orchestrator identity retained without a trustworthy historical Subject mapping; nonoperational, explicit authorized Subject assignment required. Saved history and receipts do not grant execution authority.";

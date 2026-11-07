@@ -1,6 +1,6 @@
 {
     slug = "async-chat";
-    description = "Explicitly connected Subject chat and asynchronous Worker delegation.";
+    description = "Connected Subject conversation and assigned Ticket coordination through bounded background Workers; operations require current policy and domain authority.";
     # Omitted scope and delegation_scope resolve to no filesystem authority.
     model = { ref = "codex-oauth/gpt-6.1-sol"; };
     engine = { instruction = "role.async_chat"; reasoning = "high"; };
@@ -23,12 +23,12 @@
         worker = { enabled = true; direct_spawn = true; };
         workspace_worker_discovery = { enabled = false; };
         objective = { enabled = true; };
-        manage_workdir = { enabled = false; };
+        manage_workdir = { enabled = true; };
         workdir_catalog = { enabled = false; };
         workspace_config = { enabled = false; };
-        ticket = { enabled = true; authoring = false; thread = false; intake = false; workflow = false; };
-        merge_request = { show = false; open = false; review = false; readiness_check = false; complete = false; };
-        orchestration = { enabled = false; };
+        ticket = { enabled = true; authoring = false; thread = false; intake = false; workflow = true; };
+        merge_request = { show = true; open = false; review = false; readiness_check = true; complete = true; };
+        orchestration = { enabled = true; };
     };
     web = { enabled = false; };
 
@@ -60,6 +60,13 @@
             { tool = "ShowObjective"; pattern = "*"; action = "allow"; },
             { tool = "QueryTicket"; pattern = "*"; action = "allow"; },
             { tool = "ShowTicket"; pattern = "*"; action = "allow"; },
+            { tool = "SpawnTicketWorker"; pattern = "*"; action = "allow"; },
+            { tool = "TicketAssignmentTrackingUpdate"; pattern = "*"; action = "allow"; },
+            { tool = "ShowMergeRequest"; pattern = "*"; action = "allow"; },
+            { tool = "CheckMergeRequestReadiness"; pattern = "*"; action = "allow"; },
+            { tool = "CompleteMergeRequest"; pattern = "*"; action = "allow"; },
+            { tool = "WorkdirList"; pattern = "*"; action = "allow"; },
+            { tool = "WorkdirCreate"; pattern = "*"; action = "allow"; },
             { tool = "WorkspaceTagList"; pattern = "*"; action = "allow"; },
             { tool = "TicketAssignmentTrackingQuery"; pattern = "*"; action = "allow"; },
             { tool = "TicketAssignmentTrackingHistory"; pattern = "*"; action = "allow"; },

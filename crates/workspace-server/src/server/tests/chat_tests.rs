@@ -1932,7 +1932,17 @@ pub(super) async fn adopt_chat_policy(
     subject: &str,
     execution: &str,
 ) -> server_api::ConfigurationAdoptionReceipt {
-    adopt_chat_configuration(api, owner, Some((subject, execution))).await
+    adopt_subject_policy(api, owner, subject, execution, "{}").await
+}
+
+pub(super) async fn adopt_subject_policy(
+    api: &WorkspaceApi,
+    owner: &str,
+    subject: &str,
+    execution: &str,
+    delegation: &str,
+) -> server_api::ConfigurationAdoptionReceipt {
+    adopt_chat_configuration(api, owner, Some((subject, execution, delegation))).await
 }
 
 pub(super) async fn adopt_chat_defaults(
@@ -1947,7 +1957,7 @@ pub(super) async fn adopt_chat_defaults(
 async fn adopt_chat_configuration(
     api: &WorkspaceApi,
     owner: &str,
-    replacement: Option<(&str, &str)>,
+    replacement: Option<(&str, &str, &str)>,
 ) -> server_api::ConfigurationAdoptionReceipt {
     let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
     catalog
@@ -1979,7 +1989,7 @@ async fn adopt_chat_configuration(
     );
     let source: server_api::ConfigurationSourceResponse = serde_json::from_slice(&bytes).unwrap();
     let changes = replacement
-        .map(|(subject, execution)| {
+        .map(|(subject, execution, delegation)| {
             let needle = format!("subject_id = {}", serde_json::to_string(subject).unwrap());
             let matches: Vec<_> = source
                 .state
@@ -2031,7 +2041,7 @@ async fn adopt_chat_configuration(
             let mut content = policy_file.content.clone();
             content.replace_range(
                 start..end,
-                &format!("{{ {needle}; execution = {execution}; delegation = {{}}; }}"),
+                &format!("{{ {needle}; execution = {execution}; delegation = {delegation}; }}"),
             );
             server_api::ConfigTreeChange::Update {
                 path: policy_path.clone(),
