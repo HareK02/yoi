@@ -21701,6 +21701,13 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 WorkspaceSchemaMigrationStep {version:111, name:"Typed Plugin Ticket extension data and atomic mutation receipts".into()},
                 WorkspaceSchemaMigrationStep {version:112, name:"Ticket Service outbox and fenced consumers".into()},
                 WorkspaceSchemaMigrationStep {version:113, name:"Ticket work-decomposition parent links".into()},
+                WorkspaceSchemaMigrationStep {version:122, name:crate::config_adoption::MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:123, name:backend_job_upgrade::MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:124, name:WORKER_CREATE_FAILURE_MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:125, name:backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:126, name:SERVICE_OUTCOME_MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:127, name:journal_removal_store::MIGRATION_NAME.into()},
+                WorkspaceSchemaMigrationStep {version:128, name:DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()},
             ]
         );
 
@@ -21824,6 +21831,13 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (111, "Typed Plugin Ticket extension data and atomic mutation receipts".to_string()),
 (112, "Ticket Service outbox and fenced consumers".to_string()),
 (113, "Ticket work-decomposition parent links".to_string()),
+(122, crate::config_adoption::MIGRATION_NAME.into()),
+(123, backend_job_upgrade::MIGRATION_NAME.into()),
+(124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
+(125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
+(126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
+(127, journal_removal_store::MIGRATION_NAME.into()),
+(128, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);

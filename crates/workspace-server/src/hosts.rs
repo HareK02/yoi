@@ -8199,8 +8199,7 @@ fn runtime_api_diagnostic(
             }
             if let Some(startup) = error.error.startup {
                 let mut diagnostic = remote_startup_diagnostic(runtime_id, status, startup);
-                diagnostic.control =
-                    Some(protocol::control_failure::RuntimeControlCause::ExecutionRejected);
+                diagnostic.control = Some(cause);
                 return diagnostic;
             }
             let startup = None;
@@ -8301,21 +8300,35 @@ fn remote_http_status_diagnostic(
         }
     };
     let mut body = Vec::new();
-    let read_ok = response
+    let read = response
         .take((MAX_RUNTIME_PING_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .is_ok()
-        && body.len() <= MAX_RUNTIME_PING_RESPONSE_BYTES;
-    if read_ok
-        && content_type.as_deref().is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .eq_ignore_ascii_case("application/problem+json")
-        })
-    {
+        .read_to_end(&mut body);
+    if body.len() > MAX_RUNTIME_PING_RESPONSE_BYTES {
+        return runtime_api_diagnostic(
+            runtime_id,
+            runtime_api::client_support::ClientError::Failure(
+                runtime_api::client_support::ClientFailure::ResponseTooLarge {
+                    limit: MAX_RUNTIME_PING_RESPONSE_BYTES,
+                },
+            ),
+        );
+    }
+    if read.is_err() {
+        return runtime_api_diagnostic(
+            runtime_id,
+            runtime_api::client_support::ClientError::Failure(
+                runtime_api::client_support::ClientFailure::Transport,
+            ),
+        );
+    }
+    if content_type.as_deref().is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/problem+json")
+    }) {
         // Use the Runtime-owned representation dispatch, exactly as the generated
         // client does. Startup/control Problems must not become Workdir failures.
         let decoded = runtime_api::RuntimeApiError::decode_http_error(
@@ -8331,9 +8344,7 @@ fn remote_http_status_diagnostic(
             },
         );
     }
-    let error = read_ok
-        .then(|| serde_json::from_slice::<RuntimeHttpErrorResponse>(&body).ok())
-        .flatten();
+    let error = serde_json::from_slice::<RuntimeHttpErrorResponse>(&body).ok();
     if let Some(startup) = error.as_ref().and_then(|error| error.error.startup.clone()) {
         return remote_startup_diagnostic(runtime_id, status, startup);
     }
@@ -12104,14 +12115,14 @@ mod tests {
 
     #[test]
     fn remote_attachment_observation_requires_the_exact_worker_and_request() {
-        let worker_id = "00000000-0000-0000-0000-000000000001";
+        let worker_id = "00000000-0000-7000-8000-000000000001";
         for (observed_worker, attachments, expected) in [
             (
                 worker_id,
                 json!([]),
                 Some(runtime_api::WorkerWorkdirAttachmentsMatch::Matching),
             ),
-            ("00000000-0000-0000-0000-000000000002", json!([]), None),
+            ("00000000-0000-7000-8000-000000000002", json!([]), None),
             (
                 worker_id,
                 json!([{
@@ -12129,7 +12140,7 @@ mod tests {
             .to_string();
             let (base_url, server) = serve_mock_http(vec![mock_response(
                 "POST",
-                "/v1/workers/00000000-0000-0000-0000-000000000001/workdir-attachments/observe",
+                "/v1/workers/00000000-0000-7000-8000-000000000001/workdir-attachments/observe",
                 true,
                 200,
                 body,
@@ -12329,6 +12340,152 @@ mod tests {
             assert_eq!(result.cause, None);
             assert!(result.worker.is_none());
             server.join().unwrap();
+        }
+    }
+
+    fn receive_remote_status_problem(
+        status: u16,
+        media: &'static str,
+        body: String,
+    ) -> RuntimeDiagnostic {
+        let mut response = mock_response("GET", "/", true, status, body);
+        response.content_type = media;
+        let (url, server) = serve_mock_http(vec![response]);
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(url)
+            .bearer_auth("secret-token")
+            .send()
+            .unwrap();
+        let actual = response.status();
+        let diagnostic = remote_http_status_diagnostic("remote", actual, response);
+        server.join().unwrap();
+        diagnostic
+    }
+
+    fn startup_status_problem() -> runtime_api::startup::ProblemResponse {
+        use runtime_api::startup::*;
+        WorkerCreateFailure::from_cause(
+            StartupCause::Session(
+                protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
+            ),
+            StartupOperationFacts {
+                acceptance: CreationAcceptance::Unknown,
+                execution: ExecutionOutcome::Unknown,
+                finalize: None,
+                backend_compensation: None,
+                correlation: None,
+            },
+        )
+        .unwrap()
+        .problem(
+            StartupBoundary::Runtime,
+            &SessionFailureVisibility {
+                can_view_cause: true,
+            },
+            "",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn remote_status_http_dispatches_management_control_and_startup_without_cross_domain_relabeling()
+     {
+        use workdir::management_failure::{
+            WorkdirManagementFailure, WorkdirManagementOperation, WorkdirManagementReason,
+        };
+        let cause = WorkdirManagementFailure {
+            operation: WorkdirManagementOperation::Create,
+            reason: WorkdirManagementReason::NotFound,
+        };
+        let management = runtime_api::management_failure::management_problem(cause).unwrap();
+        let control =
+            runtime_api::control_failure::control_problem(RuntimeControlCause::RuntimeStopped)
+                .unwrap();
+        let startup = startup_status_problem();
+        for (index, status, media, body) in [
+            (
+                0,
+                management.status,
+                management.content_type,
+                management.body.to_vec(),
+            ),
+            (
+                1,
+                control.status,
+                control.content_type,
+                control.body.to_vec(),
+            ),
+            (2, startup.status, startup.content_type, startup.into_body()),
+        ] {
+            let mut body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            body["detail"] = json!("PRIVATE_SENTINEL raw_http_body /private/path");
+            body["yoi_failure"]["explanation"] =
+                json!("PRIVATE_SENTINEL raw_http_body /private/path");
+            let diagnostic = receive_remote_status_problem(status, media, body.to_string());
+            assert_eq!(diagnostic.workdir, (index == 0).then_some(cause));
+            assert_eq!(diagnostic.startup.is_some(), index == 2);
+            assert_eq!(
+                diagnostic.control,
+                match index {
+                    0 => None,
+                    1 => Some(RuntimeControlCause::RuntimeStopped),
+                    _ => Some(RuntimeControlCause::ExecutionRejected),
+                }
+            );
+            let public = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!public.contains("PRIVATE_SENTINEL"));
+            assert!(!public.contains("raw_http_body"));
+            assert!(!public.contains("/private/path"));
+        }
+    }
+
+    #[test]
+    fn remote_status_http_keeps_unsupported_startup_and_corrupt_transport_as_receiver_observations()
+    {
+        let problem = startup_status_problem();
+        let mut unsupported: serde_json::Value = serde_json::from_slice(problem.body()).unwrap();
+        unsupported["yoi_failure"]["details_version"] = json!(65535);
+        let control =
+            runtime_api::control_failure::control_problem(RuntimeControlCause::RuntimeStopped)
+                .unwrap();
+        for (status, media, body, expected) in [
+            (
+                problem.status,
+                problem.content_type,
+                unsupported.to_string(),
+                Some(RuntimeControlCause::ResultUnavailable),
+            ),
+            (
+                409,
+                control.content_type,
+                String::from_utf8(control.body.to_vec()).unwrap(),
+                Some(RuntimeControlCause::InvalidResponse),
+            ),
+            (
+                503,
+                "application/problem+json",
+                "invalid JSON".into(),
+                Some(RuntimeControlCause::InvalidResponse),
+            ),
+            (
+                503,
+                "application/json",
+                String::from_utf8(control.body.to_vec()).unwrap(),
+                None,
+            ),
+            (
+                503,
+                "application/problem+json",
+                "x".repeat(MAX_RUNTIME_PING_RESPONSE_BYTES + 1),
+                Some(RuntimeControlCause::ResponseTooLarge),
+            ),
+        ] {
+            let diagnostic = receive_remote_status_problem(status, media, body);
+            assert!(diagnostic.workdir.is_none());
+            assert_eq!(diagnostic.control, expected, "{diagnostic:?}");
         }
     }
 

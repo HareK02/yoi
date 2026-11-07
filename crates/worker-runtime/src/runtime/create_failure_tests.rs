@@ -458,6 +458,156 @@ fn connected_create_commit_write_faults_preserve_acceptance_and_io_facts() {
 }
 
 #[cfg(feature = "fs-store")]
+fn assert_reopened_aggregate_authority(saved: &[u8], path: &std::path::Path) {
+    let mut expected: serde_json::Value = serde_json::from_slice(saved).unwrap();
+    let observed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    // Opening a new process invalidates the old live Restore observation, not
+    // its request owners, operation receipts or attachment generation.
+    expected["restore_guard"]["observation_token"] =
+        observed["restore_guard"]["observation_token"].clone();
+    assert_eq!(observed, expected);
+}
+
+#[cfg(feature = "fs-store")]
+#[test]
+fn failed_create_rollback_retains_record_when_canonical_refresh_fails() {
+    use crate::fs_store::AtomicWriteFault;
+
+    for read_fault in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(root.path().join("runtime"));
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        *backend.before_spawn_result.lock().unwrap() = Some(Box::new({
+            let runtime = runtime.clone();
+            move || {
+                let state = runtime.lock().unwrap();
+                let store = state.fs_store().unwrap();
+                store.fail_next_worker_write(AtomicWriteFault::AfterRename);
+                if read_fault {
+                    store.fail_next_worker_reconcile_read();
+                } else {
+                    store.fail_next_worker_reconcile_sync();
+                }
+            }
+        }));
+        let mut request = task_request("uncertain rollback");
+        request.initial_input = Some(WorkerInput::user("accepted once"));
+        let worker_ref = WorkerRef::new(request.worker_id);
+        let error = runtime.create_worker(request).unwrap_err();
+        assert_eq!(
+            error.create_failure().unwrap().operation().execution,
+            ExecutionOutcome::Accepted
+        );
+        assert_eq!(
+            error
+                .create_failure()
+                .unwrap()
+                .operation()
+                .finalize
+                .unwrap()
+                .compensation,
+            CompensationOutcome::Unknown
+        );
+        let RuntimeError::WorkerCreateFailed { source, .. } = error else {
+            unreachable!()
+        };
+        assert!(matches!(
+            *source,
+            RuntimeError::StoreCommitOutcomeUnknown { .. }
+        ));
+        let record_path = options
+            .root
+            .join("workers")
+            .join(worker_ref.worker_id.to_string())
+            .join("worker.json");
+        let saved = std::fs::read(&record_path).unwrap();
+        assert!(
+            runtime
+                .lock()
+                .unwrap()
+                .unreconciled_worker_writes
+                .contains(&worker_ref.worker_id)
+        );
+        assert_eq!(backend.dispatched_inputs.lock().unwrap().len(), 1);
+        assert_eq!(*backend.stop_count.lock().unwrap(), 1);
+        drop(runtime);
+        drop(backend);
+        let reopened = Runtime::with_fs_store(options).unwrap();
+        assert_eq!(reopened.list_workers().unwrap().len(), 1);
+        assert_reopened_aggregate_authority(&saved, &record_path);
+    }
+}
+
+#[cfg(feature = "fs-store")]
+#[test]
+fn failed_create_reconciliation_never_adopts_different_owner_stop_or_attachment() {
+    use crate::fs_store::AtomicWriteFault;
+
+    for change in ["owner", "stop", "attachment"] {
+        let root = tempfile::tempdir().unwrap();
+        let options = FsRuntimeStoreOptions::new(root.path().join("runtime"));
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_fs_store_and_execution_backend(options.clone(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let request = task_request("original creation");
+        let worker_ref = WorkerRef::new(request.worker_id);
+        runtime.create_worker(request).unwrap();
+        let operation_lock = runtime.worker_operation_lock(worker_ref.worker_id).unwrap();
+        let operation_guard = operation_lock.lock().unwrap();
+        let mut state = runtime.lock().unwrap();
+        let original = state.worker(&worker_ref).unwrap().clone();
+        let mut newer = original.clone();
+        match change {
+            "owner" => {
+                newer.request.as_mut().unwrap().initial_input =
+                    Some(WorkerInput::user("different original request"))
+            }
+            "stop" => newer = newer.stopped_candidate(WorkerLifecycleOperationId::new()).0,
+            "attachment" => newer.workdir_attachments_guard.rotate(),
+            _ => unreachable!(),
+        }
+        state
+            .fs_store()
+            .unwrap()
+            .fail_next_worker_write(AtomicWriteFault::AfterRename);
+        assert!(matches!(
+            state.persist_worker_record_with_fence(&newer),
+            Err(RuntimeError::StoreCommitOutcomeUnknown { .. })
+        ));
+        let path = options
+            .root
+            .join("workers")
+            .join(worker_ref.worker_id.to_string())
+            .join("worker.json");
+        let saved = std::fs::read(&path).unwrap();
+        state.reconcile_failed_create_publication(&original);
+        assert!(
+            state
+                .unreconciled_worker_writes
+                .contains(&worker_ref.worker_id)
+        );
+        drop(state);
+        let (_, _, outcome) = runtime
+            .rollback_failed_create_with_phase(&worker_ref)
+            .unwrap_err();
+        assert_eq!(outcome, StartupPersistenceOutcome::OutcomeUnknown);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(*backend.stop_count.lock().unwrap(), 0);
+        drop(operation_guard);
+        drop(runtime);
+        drop(backend);
+        let reopened = Runtime::with_fs_store(options).unwrap();
+        assert_eq!(reopened.list_workers().unwrap().len(), 1);
+        assert_reopened_aggregate_authority(&saved, &path);
+    }
+}
+
+#[cfg(feature = "fs-store")]
 #[test]
 fn connected_create_cleanup_persistence_faults_never_replace_primary() {
     for delete_fault in [false, true] {

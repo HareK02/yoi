@@ -4248,7 +4248,13 @@ impl Runtime {
         *persistence_phase = Some(StartupFailurePhase::RuntimeSnapshotSave);
         state.persist_runtime_snapshot()?;
         *persistence_phase = Some(StartupFailurePhase::RuntimeReconciliationRecordSave);
-        state.persist_worker_record_with_fence(&candidate)?;
+        if let Err(error) = state.persist_worker_record_with_fence(&candidate) {
+            #[cfg(feature = "fs-store")]
+            if matches!(error, RuntimeError::StoreCommitOutcomeUnknown { .. }) {
+                state.reconcile_failed_create_publication(&candidate);
+            }
+            return Err(error);
+        }
         let detail = candidate.detail();
         state.workers.insert(worker_ref.worker_id, candidate);
         *persistence_phase = None;
@@ -7027,6 +7033,30 @@ impl RuntimeState {
                 Err(error)
             }
             outcome => outcome,
+        }
+    }
+
+    /// The create owner still holds the Worker operation lock and the exact
+    /// failed publication candidate. Only a durable full-aggregate match can
+    /// discharge its write fence; a different receipt, owner, Stop or attachment
+    /// generation is not this creation. This does not authorize rollback: the
+    /// caller retains its original error and separately requires scope shutdown.
+    #[cfg(feature = "fs-store")]
+    fn reconcile_failed_create_publication(&mut self, candidate: &WorkerRecord) {
+        if let RuntimePersistence::Fs(store) = &self.persistence {
+            match store.reconcile_worker_record(&candidate.persisted_record()) {
+                Ok((observed, true)) => {
+                    if let Err(error) = self.apply_canonical_worker_record(observed) {
+                        tracing::warn!(worker_id = %candidate.worker_id, error = %error,
+                            "Failed-create publication remains uncertain after canonical reconciliation");
+                    }
+                }
+                Ok((_, false)) => {}
+                Err(error) => {
+                    tracing::warn!(worker_id = %candidate.worker_id, error = %error,
+                        "Failed-create publication remains uncertain after canonical reconciliation");
+                }
+            }
         }
     }
 

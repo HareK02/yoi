@@ -2481,6 +2481,16 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false}));
+        assert!(generate_runtime_typescript(&document.to_string()).is_ok());
+
+        let duplicate =
+            document["components"]["schemas"]["RuntimeWorkerSpawnAcceptanceRequirement"]["oneOf"]
+                [0]
+            .clone();
+        document["components"]["schemas"]["RuntimeWorkerSpawnAcceptanceRequirement"]["oneOf"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
         let error = generate_runtime_typescript(&document.to_string()).unwrap_err();
         assert!(error.to_string().contains("ambiguous oneOf"));
     }
