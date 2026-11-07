@@ -4194,6 +4194,7 @@ pub struct RemoteWorkerRuntime {
     host_id: String,
     resource_broker: BackendResourceBroker,
     http: BlockingHttpClient,
+    workdir_cleanup_http: BlockingHttpClient,
     async_http: AsyncHttpClient,
     request_timeout: Duration,
 }
@@ -4346,15 +4347,20 @@ impl RemoteWorkerRuntime {
         };
         let timeout = config.timeout;
         let blocking_resolution = pinned_endpoint.clone();
-        let http = run_blocking_http(move || {
-            let mut builder = BlockingHttpClient::builder()
-                .timeout(timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy();
-            if let Some((host, addresses)) = &blocking_resolution {
-                builder = builder.resolve_to_addrs(host, addresses);
-            }
-            builder.build()
+        let (http, workdir_cleanup_http) = run_blocking_http(move || {
+            let build_client = |timeout: Option<Duration>| {
+                let mut builder = BlockingHttpClient::builder()
+                    .timeout(timeout)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .no_proxy();
+                if let Some((host, addresses)) = &blocking_resolution {
+                    builder = builder.resolve_to_addrs(host, addresses);
+                }
+                builder.build()
+            };
+            // Cleanup duration depends on the retained tree. A response deadline
+            // does not cancel Runtime deletion, so it must not bound this wait.
+            Ok::<_, reqwest::Error>((build_client(Some(timeout))?, build_client(None)?))
         })
         .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
             runtime_id: config.runtime_id.clone(),
@@ -4393,6 +4399,7 @@ impl RemoteWorkerRuntime {
             cached_status: config.cached_status,
             resource_broker: BackendResourceBroker::default(),
             http,
+            workdir_cleanup_http,
             async_http,
             request_timeout: timeout,
         })
@@ -5325,9 +5332,13 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         &self,
         working_directory_id: &str,
     ) -> RuntimeWorkingDirectoryResult {
-        match self.delete_json::<RuntimeHttpWorkingDirectoryResponse>(&format!(
-            "/v1/working-directories/{working_directory_id}"
-        )) {
+        let path = format!("/v1/working-directories/{working_directory_id}");
+        match self.send_json::<RuntimeHttpWorkingDirectoryResponse>(
+            &path,
+            "DELETE",
+            &[],
+            self.workdir_cleanup_http.delete(self.endpoint(&path)),
+        ) {
             Ok(response) => RuntimeWorkingDirectoryResult {
                 state: InternalWorkerOperationState::Accepted,
                 working_directory: Some(response.working_directory),
@@ -6828,6 +6839,7 @@ pub fn placeholder_spawn_response(host_id: impl Into<String>) -> WorkerSpawnResu
 #[cfg(test)]
 mod tests {
     mod restore_auth_tests;
+    mod workdir_cleanup_tests;
     mod workspace_auth_tests;
 
     use super::*;
