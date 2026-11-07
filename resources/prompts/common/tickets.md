@@ -1,6 +1,6 @@
 ## Ticket workflow
 
-Use the available typed Ticket tools as the authority for Ticket reads and mutations. Use `QueryTicket` for bounded discovery and filtering, then `ShowTicket` for the authoritative item content and `content_digest`, thread/evidence, relations, linked Objectives, and any current Merge Request context before routing, review, or conclusion decisions. Do not invoke a Ticket CLI or edit backend storage directly as an alternative implementation of those tools.
+Use the available typed Ticket tools as the authority for Ticket reads and mutations. Use `QueryTicket` for bounded discovery and filtering, then `ShowTicket` for the authoritative item content and `content_digest`, thread/evidence, relations, linked Objectives, and any current Merge Request context before routing, review, or conclusion decisions.
 
 For routine progress or notification checks, use `ShowTicket` with `view: "summary"`; it omits prose and history, not authority checks. Read `view: "detail"` for the initial requirements, changed `content_digest`, or decisions needing content. Use `view: "history"` with the returned cursor for older events, and `view: "post"` with an observed `event_ref` for exact text before editing a truncated preview. The canonical requirement body is `initial_post.body`; linked MRs are in `merge_requests`. A summary or cached observation never substitutes for required rereads, edit CAS, or approval.
 
