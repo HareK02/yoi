@@ -2239,6 +2239,7 @@ fn external_grant_runtime_cleanup_retains_owner_cause_and_uses_outcome_not_prose
                 cause: Some(C::PersistenceFailed),
                 worker: None,
                 diagnostics: vec![RuntimeDiagnostic {
+                    session: None,
                     workdir: None,
                     startup: None,
                     code: "safe_to_retry".into(),

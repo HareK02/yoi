@@ -20611,7 +20611,8 @@ mod tests {
             merge_request::migrate(&conn).unwrap();
             conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
                 .unwrap();
-            create_latest_workspace_schema(&conn).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            create_latest_workspace_schema(&tx).unwrap();
             conn.execute(
                 "INSERT INTO __yoi_schema_migrations(version, name) VALUES (?1, ?2)",
                 params![baseline_version, SCHEMA_BASELINE_NAME],
@@ -20627,6 +20628,7 @@ mod tests {
                 )
                 .unwrap();
             }
+            tx.commit().unwrap();
             verify_schema_history(&conn, LATEST_SCHEMA_VERSION).unwrap();
         }
     }
@@ -22188,7 +22190,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            (52..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            (52..=113)
+                .chain(122..=LATEST_SCHEMA_VERSION)
+                .collect::<Vec<_>>()
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
         let conn = Connection::open(&path).unwrap();
@@ -22197,8 +22201,14 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             LATEST_SCHEMA_VERSION
         );
         assert_eq!(
-            workspace_schema_migration_history(&conn).unwrap().len(),
-            (LATEST_SCHEMA_VERSION - 50 + 1) as usize
+            workspace_schema_migration_history(&conn)
+                .unwrap()
+                .into_iter()
+                .map(|(version, _)| version)
+                .collect::<Vec<_>>(),
+            (50..=113)
+                .chain(122..=LATEST_SCHEMA_VERSION)
+                .collect::<Vec<_>>()
         );
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());

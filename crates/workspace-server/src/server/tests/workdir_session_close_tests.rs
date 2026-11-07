@@ -99,6 +99,7 @@ struct CloseTransport {
     open_release: Semaphore,
     attempts: Mutex<Vec<String>>,
     runtime_closes: Mutex<Vec<(String, StatusCode)>>,
+    removals: std::sync::atomic::AtomicUsize,
     direct_runtime: Mutex<Option<Router>>,
     pending_dispatches: Mutex<Vec<bool>>,
     dispatched: Notify,
@@ -111,6 +112,11 @@ impl CloseTransport {
         let is_close = request.method() == Method::DELETE
             && request.uri().path().starts_with("/v1/workdir-sessions/");
         let path = request.uri().path().to_owned();
+        if request.method() == Method::DELETE && path.starts_with("/v1/working-directories/") {
+            state
+                .removals
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         let is_open = request.method() == Method::POST
             && path.starts_with("/v1/working-directories/")
             && path.ends_with("/sessions");
@@ -261,6 +267,7 @@ impl Fixture {
             open_release: Semaphore::new(0),
             attempts: Mutex::new(Vec::new()),
             runtime_closes: Mutex::new(Vec::new()),
+            removals: Default::default(),
             direct_runtime: Mutex::new(None),
             pending_dispatches: Mutex::new(Vec::new()),
             dispatched: Notify::new(),
@@ -1737,7 +1744,19 @@ async fn concurrent_detach_failure_and_worker_remove_retry_close_the_same_owned_
         })
     };
     fixture.transport.release.add_permits(1);
-    assert!(detach.await.unwrap().is_err());
+    let error = detach.await.unwrap().unwrap_err();
+    assert!(matches!(
+        &error.error,
+        Error::WorkdirSessionCloseFailed { .. }
+    ));
+    let public = error.into_workdir_attachment_api_error(
+        workdir::management_failure::WorkdirManagementOperation::Detach,
+    );
+    assert!(matches!(
+        public.cause(),
+        Some(server_api::workdir_management_error::WorkdirManagementCause::Session(cause))
+            if cause.operation == workdir::failure::WorkdirFailureOperation::SessionClose
+    ));
     let result = remove.await.unwrap().unwrap();
     assert_eq!(result.status, StatusCode::OK.as_u16(), "{}", result.body);
     let attempts = fixture.transport.attempts();
@@ -1815,4 +1834,96 @@ async fn detach_drains_a_cancelled_attachment_open_not_present_in_the_backend_se
 async fn worker_remove_drains_a_cancelled_attachment_open_not_present_in_the_backend_session_cache()
 {
     cancelled_attachment_open_is_drained_by_terminal_owner(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_close_failure_preserves_session_cause_and_never_dispatches_directory_removal() {
+    use error_contract::{Browser, DecodeFailure, FailureFacts, Tool, project_failure};
+    use workdir::failure::{
+        WorkdirFailureDetails, WorkdirFailureOperation, WorkdirFailureVisibility,
+    };
+    let fixture = Fixture::new().await;
+    let session = fixture.open().await;
+    fixture.transport.fail_next(CloseFault::HoldThenReject);
+    drop(session);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.transport.entered.notified(),
+    )
+    .await
+    .expect("last handle starts its retained close");
+    fixture.transport.fail_next(CloseFault::Reject);
+    fixture.transport.release.add_permits(1);
+    let api = fixture.api().clone();
+    let runtime_id = fixture.runtime_id.clone();
+    let workdir_id = fixture.workdir_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        api.runtime
+            .cleanup_working_directory(&runtime_id, &workdir_id)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.state, InternalWorkerOperationState::Rejected);
+    assert_eq!(
+        workdir_cleanup_failure_category(&result),
+        "session_close_unconfirmed"
+    );
+    assert_eq!(
+        fixture
+            .transport
+            .removals
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(fixture.materialization_root.exists());
+    let saved = serde_json::to_vec(&result.diagnostics).unwrap();
+    let mut reopened: Vec<RuntimeDiagnostic> = serde_json::from_slice(&saved).unwrap();
+    let cause = reopened[0].session.unwrap();
+    assert_eq!(cause.operation, WorkdirFailureOperation::SessionClose);
+    assert!(reopened[0].workdir.is_none() && reopened[0].control.is_none());
+    let facts = FailureFacts::new(cause).unwrap();
+    let visibility = WorkdirFailureVisibility {
+        can_view_cause: true,
+    };
+    let browser = project_failure::<Browser, _>(&facts, &visibility).unwrap();
+    let tool = project_failure::<Tool, _>(&facts, &visibility).unwrap();
+    assert_eq!(browser.details(), tool.details());
+    assert_eq!(browser.explanation(), tool.explanation());
+    reopened[0].message = "TEST_ONLY_SECRET /private/provider raw prose now says success".into();
+    reopened[0].code = "arbitrary_changed_diagnostic_code".into();
+    let public = workdir_management_diagnostics(reopened);
+    assert_eq!(public[0].message, browser.explanation());
+    match public[0]
+        .failure
+        .as_ref()
+        .unwrap()
+        .decode::<WorkdirFailureDetails>()
+    {
+        DecodeFailure::Known(received) => assert_eq!(received.facts().cause(), &cause),
+        _ => panic!("typed close evidence must survive current Browser projection"),
+    }
+    assert!(
+        !serde_json::to_string(&public)
+            .unwrap()
+            .contains("TEST_ONLY_SECRET")
+    );
+    assert_eq!(
+        fixture
+            .transport
+            .removals
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    fixture.assert_removed().await;
+    assert_eq!(
+        fixture
+            .transport
+            .removals
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    let attempts = fixture.transport.attempts();
+    assert!(attempts.len() >= 3);
+    assert!(attempts.iter().all(|path| path == &attempts[0]));
 }

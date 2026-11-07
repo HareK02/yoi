@@ -1,197 +1,75 @@
-# T-815 domain公開境界の調査・接続記録
+# T-815 domain公開境界の接続・検証記録
 
-## 観測範囲
+## 対象と判断の範囲
 
-調査基点は `main / rebuild/d929-coordinated@4de62650dad111dc6c96c450a8a31fe4c6b1c4ac`（tree `0050b5fa231ed768907738d5110330a1e7ceab92`）。T-815の現要求digestは `86c40fb57d3110da8886636da524d9bdc45f9211470188962b57f1fea63bb55c`。これは着手時の調査と接続途中の記録であり、全ACの合格、配備、先行候補の承認を示さない。
+T-815要求digest `86c40fb57d3110da8886636da524d9bdc45f9211470188962b57f1fea63bb55c` に対する実装途中の記録。着手基点は `4de62650dad111dc6c96c450a8a31fe4c6b1c4ac`。共通adapterとJournal tailを取り込んだ後、T-852の `71c350dd2f4db25a31c3e4b33037970d2bc3e3fa` を通常mergeした。合成treeは `66594e5be451249125d2df3ffe1cf69c2e28e1d0`、未共有mergeのsubject修正後のcommitは `7451afbc2e49b017965fcfecb7dc83e693a0f571`。このtree以降の追加差分も検証対象であり、この記録だけから全要件合格・公開source一致・独立review承認を判断しない。
 
-T-810の純粋coreと採用済みT-840/T-843を利用する。共通HTTP/clientはT-812、Web受信・表示はT-813、Tool/Job/Service境界はT-814が所有する。ここで別formatter、codec、秘匿処理、設定writer、操作状態機械を作らない。
+共通coreはT-810、HTTP/clientはT-812、Web receiverはT-813、Tool/Job/Service結果境界はT-814を使う。domainは既存の原因を `FailureCause` / `WireDetails` / `ProjectFor` へ接続し、共通formatter、codec、秘匿規則、設定writerを複製しない。Worker起動原因は採用済みT-840/T-843を利用する。
 
-## 発生源からconsumerへの移行表
+## 発生源からconsumerへの対応
 
-| domain / 発生源 | 現行のtyped情報と変換 | consumerと残る接続 |
+この表は本候補の接続点と検証責務を示す。各行の存在はその全試験成功を意味せず、下記の固定source別証拠と区別する。
+
+| 発生源・正本 | domain接続 | consumer・公開境界 |
 | --- | --- | --- |
-| Repository lookup | `RepositoryLookupError` の7variantを `repository_failure::RepositoryFailure` が原sourceごと保持する | `repository_lookup` と `repository_merge_evidence_error` のDebug変換を除き、`Error::RepositoryLookup` へ接続した。HTTP分類は操作とtyped reasonから決定し、既存公開diagnostic codeを保つ。共通HTTP応答とWebへのdetails接続は未完。 |
-| Repository構成・SSH access | `scoped_create_repository` の同一intent replayと異intent競合、`require_workspace_owner`、`repository_access.rs` のcredential/trust/CAS検査 | 登録、SSH操作、Workdir materialization、Web repository-access。汎用 `RepositoryConflict(String)` / `WorkspacePermissionDenied(String)` の全発生元を一つのRepository理由と誤認せず、Repositoryの決定点でtyped causeを付ける。秘密の鍵やleaseをdetailsへ渡さない。 |
-| Workdir provider | `WorkdirError::classification_source`、`denial_reason`、`failure_reason`、`WorkdirTransportError` | 本差分の `workdir::failure` が既存型からT-810へ接続する。元sourceはローカルに保持し、Browser/Tool/transfer/storage/telemetryにはclosed detailsだけを投影する。既存HTTP/statusや操作実行は変更しない。 |
-| Workdir Runtime / Backend | `RuntimeHttpWorkdirError`、`RuntimeRegistryError::WorkdirSessionOpenFailed`、`InternalWorkdirOperationError::into_contract_error` | `WorkdirOperationApiError` は理由をserver-local metadataに保持するがwireではskipする。T-812の共通response/clientへの接続と生成型変更が残る。owner mismatchの404等、外側境界の秘匿分類を内側codeで上書きしない。 |
-| Workdir Tool / 監査 | `WorkspaceAttachedWorkdirSession::operate`、`WorkdirSessionOperationResponse`、`WorkdirAuditFailure` | Server既存のcall-local collectorを `workdir::audit` へ移し、Worker受信と登録7Toolへ共有接続した。T-814のstatus-neutral出力を使い、成功/content/attachments・元terminal dispositionと監査の閉鎖原因を別々に保持する。主原因・native WIP全体の移行とは別sliceである。 |
-| Workdir deferred open / cleanup | `DeferredWorkdirSession` はopener task失敗、open失敗、identity mismatchを区別。失敗したcloseの所有者も保持する | openerは `Result<WorkdirSessionHandle, String>` のため、より具体的な原因は現契約から証明できない。identity mismatch後のcleanup理由はログだけ。元原因をcleanupで置換せず、別の副次結果として接続する作業が残る。 |
-| Workdir removal | `WorkdirRemovalOperation`、request fingerprint、attempt、disposition、failure category、既存reconciliation | `workdir_removal_response`、Web `workdir-removal.ts`、Worker lifecycle Tool。復旧は観測のみで削除を再実行しない。Backend/Worker/Webの説明表はdomain説明へ集約するが、結果・再実行条件はこの正本を利用する。 |
-| Drive storage / HTTP | `workspace_drive::failure::DriveFailure` が9variantの元errorを保持し、closed operation/reasonを共通coreへ投影する。metadata/receiptは既存同一transactionのまま | 実storageでconflict/CAS/grant/replay/fence/SQLite障害からcodecまで検証した。`server_drive.rs::domain_error` はまだ既存公開codeへ縮退し、共通HTTP/Toolへの接続は未完。storage原因はremote更新の確定/Unknownを証明しない。 |
-| Drive Worker / Tool | `DriveClientFailure` が実 `DriveError` を保持し、`workspace_drive_client` のclosed operation/reasonへ投影する | 既存Unavailable/Unknownから細かいtransport理由を捏造しない。登録Tool入口を共有execution_failureへ接続し、元class/codeとUnknownの元Host request IDは原因と独立したresultへ保持する。既存Store再openとモデル入力の詳細枝刈り後もsummaryに元ID・非再送案内を残す。native WIP・HTTP・背景は別の未完接続。 |
-| config owner採用 | `ConfigurationFailure` が現 `ConfigTreeError` 15variantのsourceと、採用決定点のcatalog/head/export/source/owner/request理由を保持する | source helper、実SQLite採用、owner HTTPのsource/preview/adopt/reconcileへ接続した。owner確認済みcallの型付き原因はT-812 Problem/T-813 Web receiverへ投影する。T-838のwriter/transaction/receiptは変更せず、HTTP分類はtyped reasonから決定する。認可前・未型付けpolicy/contentの既存公開authoring診断はlegacyのまま。背景publicationと非Web接続は残る。 |
-| config Worker論理tree | `ConfigFailure` はBackend決定点のoperation/stage/reasonと元 `WipOperationError` を保持し、`workspace_config_client` へ投影する | content/attachment/Workdir管理の既存callerは元WIP結果へ明示変換する。Unknown/非再送、CAS、scope/connection再確認を維持するが、この旧経路だけの試験をowner採用の証拠にしない。T-814結果境界への最終接続は残る。 |
-| 内部 / 背景 | Drive maintenance、config採用後のRuntime publication、既存Job/Service結果 | configのpublicationはcommit後best effortで失敗を返却/保存していない。採用receiptをrollback/Unknownへ変更せず、T-814の共有保存/照会方式へ副次失敗を接続する。別ledgerは作らない。 |
+| Repository lookup、登録intent、source/access/trustと期待CAS | `repository_failure` と `repository_access_failure` が元lookup/決定点のtyped理由を保持する。汎用権限errorや競合文字列からRepository理由を推定しない | `server.rs` / `repository_access.rs` → `RepositoryApiError` / Repository access APIの共通Problem → Web `failure/domains.ts` とrepository-access画面。shared RepositoryApiErrorの起動・設定・Runtime等の利用者も生成型/共通receiverを使う |
+| Workdir provider、session open・操作・close | `workdir::failure` は既存 `WorkdirTransportErrorCode` と任意のdenial/failure reasonを保つ。旧providerで理由が欠けた場合は欠けたまま保持する | Runtime署名HTTP、`RuntimeRegistryError::WorkdirSessionOpenFailed`、`WorkdirOperationApiError`、WorkerのHTTP/native WIP、登録Read/Write/Edit/Glob/Grep/Bash/ViewImage。外側502等の境界分類と内側provider原因を分離する |
+| Workdirのcall-local監査receipt | `workdir::audit` のcollectorをServer/Workerで共用する。成功content、失敗、Cancelled/Interruptedと監査結果は独立 | 共通Tool出力を追記し元content/attachmentsを維持する。元request/receiptの同一性と非再送は元結果が所有し、監査失敗で元操作を失敗へ変えない |
+| Workdir inventory/create/detail/cleanup、Backend removal operation | Runtime/Backend決定点の `WorkdirManagementFailure`。removalは既存request fingerprint、attempt、disposition、failure categoryとreconciliationを利用する | `RuntimeDiagnostic.workdir` → `WorkingDirectoryManagementDiagnostic` / `WorkdirManagementApiError` → Web管理画面と既存Tool/CLI。removal復旧のreadは観測のみで削除を再dispatchしない |
+| attachment、外部grant fence/connection/cleanup | `attachment_failure`、`external_grant_failure`、`grant_cleanup_operation`。元結果、session close、Backend unlink、Runtime同期、補償、監査と保存失敗を関連する別観測として保持する | Attach/Detach・grant create/inspect/revoke/connect、Worker self-attachment、CLI workdir-share。RuntimeのMatching/Different/Unconfirmedは元operationのreceipt/世代/全requestとBackend CASなしに完了や再送許可にならない |
+| T-852のretained/orphan session cleanup | 既存 `WorkdirCleanupFailure` / `WorkdirFailureDetails` に接続する。`RuntimeDiagnostic.session` はclosed SessionClose原因、Detachは `WorkdirSessionCloseFailed` を保持する | Browser/Toolで既存Session原因を再投影する。close未確認とWorkdir removal非dispatchを分離し、retained session identityで通常cleanupする。新しいattachmentや別Workerのsessionを古いcloseで解放しない |
+| Drive storage/HTTP/maintenance | `workspace_drive::failure::DriveFailure` が元storage errorを保持し、`server_drive.rs` が共通HTTPへ投影する。maintenanceは既存結果を利用する | `server-api` Drive応答、Web共通receiver、Worker HTTP/native WIP/登録Tool。既存class/code、Host request ID、CAS、権限、OutcomeUnknownを原因と独立に維持する |
+| config source/preview/採用/照合 | `ConfigurationFailure` がtree errorとcatalog/head/export/source/owner/request決定点を保持する。設定source/採用writer/同transaction receiptは既存T-838の正本 | owner APIのProblem、Web設定画面、既存同request照合。採用成功後のpublicationは採用receiptの成功を上書きしない |
+| config採用後Runtime publication | `config_publication` が既存adoption receiptと全request fingerprint/sourceを結び、Runtimeごとの結果・原因を共有 `BackgroundFailure` / `StoredFailure` で保持する | owner照会から現在権限で再投影する。古いqueued sourceを現sourceへ採用せず、保存履歴を再dispatch許可にしない |
+| Worker config tree/attachとTool履歴 | `ConfigFailure` が元WIP errorとoperation/stage/reasonを保持する。構造化invocationのoptional failure attachmentは既存Session receiptへ保存する | 実Feature/Worker/Tool結果、native WIP、append/reopen/prune後のモデル入力。未知・破損・現在認可不能のoptional証拠だけを非開示とし、元Unknown/同request/非再送は維持する |
 
-### 共通consumerと生成物
+### 生成と混在version
 
-`RepositoryApiError` はRepository専用ではない。Subject body、Worker起動、Runtime trust/management、configuration adoption、permissions、client CLI、Worker Toolにも共有される。`failure` は基点で起動専用attachmentを受けるため、非起動domainをその型に偽装しない。
+生成元は既存Server/Runtime/config API trait・OpenAPI・`repository_openapi_typescript` とdomain schema generator。`web/workspace/src/lib/generated` に別の手書きschemaを置かない。`WorkdirManagementCause` はmanagement、session、Runtime controlという既存の閉鎖原因の受信carrierであり、owner objectはunknown fieldを拒否し、OpenAPIは排他的な `oneOf` を使う。混合objectを一つの原因へ都合よくdecodeしない。
 
-Web `api/workspace-model.ts::parseRepositoryApiError` は `diagnostics/error/message` のみをexact-keyで受ける。`api/runtime-management.ts::repositoryApiError` にも独立parserがある。型の追加だけではruntime parserの拒否を防げない。T-813の共有decoderへ移行する単位で、既存readerを照合する。
+HTTP受信ではstatus、media、identity、byte上限を共有receiverで検査する。未知reason/version、破損、過大応答、transport失敗を既知の拒否に捏造しない。起動・Runtime control・Workdir managementの原因は互いに置換しない。decoderが観測したUnsupported/Invalid/ResponseTooLarge等を後段の汎用ExecutionRejectedで上書きしない。正常long-pollと待機timeoutを操作失敗へ変換しない。
 
-生成元は `server-api` のAPI trait/OpenAPIと既存 `repository_openapi_typescript`。Repository、Workdir、Drive、Runtime、Worker launch、configuration adoption等の各生成器を、それぞれの変更元に合わせて検証する。共通型の手書きTS複製は作らない。T-813のsource `work/t813-error-web@838b6cd3c3dbf45fe555958ef9c017f1bc09bc6b` から共有receiver/modelとbounded HTTP text readerを選択再利用した。domainのdetails decoderは `failure/domains.ts` に置き、Rust所有schemaと `FailureCause::identity` から生成した型・closed allowlistに照合する。生成は既存OpenAPI TypeScript rendererを使い、未知reason/versionと破損を区別する。これはconsumer画面の全移行や正式review完了を示さない。
+## 公開field対応と非露出
 
-## Workdir公開field対応と制約
-
-`workdir::failure` は新しい共通coreではなく、既存Workdir型をT-810の `FailureCause` / `WireDetails` / `ProjectFor` に対応させるdomain adapterである。
-
-| 情報 | 内部の保持 | 投影する情報 / 条件 |
+| 原情報 | 公開する閉鎖field | ローカル限定・独立した正本 |
 | --- | --- | --- |
-| 原原因 | `WorkdirFailure` が元 `WorkdirError` とsource chainを所有 | 原errorのSerializeやDisplayをencoderへ渡さない。 |
-| 対象操作 | 既存 `WorkdirSessionOperation` のvariantからclosed kindを取る | 操作kindと、その固定の人間向け表現。引数、path、command、内容は取らない。 |
-| 既存分類 | `WorkdirTransportErrorCode` | `classification` をそのまま保持。Categoryは集計用でありHTTP/retry/完了の判定には使わない。 |
-| 観測された理由 | 既存 `WorkdirDenialReason` / `WorkdirFailureReason` | Workdirとそのfailure diagnosticsの現在の閲覧許可を呼出し境界が確認した場合にclosed valueと固定説明を公開する。visibilityのdefaultは拒否。enumであるだけで一般利用者へ無条件公開しない。 |
-| 旧providerの理由欠落 | 受信transportのOptionをlocal error再構成前に保持 | `from_transport_error` を利用し欠落は欠落のまま。理由らしいmessageから推定しない。 |
-| 補足context / 相関 | 元facts/受信envelopeは信頼しない | 操作/段階はclosed factsから再構築。受信説明、operation_ref、任意correlation、任意contextはコピーしない。安全な相関の責任境界接続はT-812成果との統合で行う。 |
-| Unknown、監査、cleanup、同request照合 | 既存domain結果が正本 | この原因型へretryable、mutation identity、汎用rollback状態を追加しない。成功時監査receiptをこの実行失敗型へ変換しない。 |
+| Repository lookup/access source | operation、既存variant/決定点由来のreason | Repository/provider診断、selector、path、鍵、lease本文。登録intent、access/trustと期待CASは別の正本 |
+| Workdir session source | operation、classification、任意のdenial_reason/failure_reason | 引数、path、command、内容、生HTTP/provider本文。受信の任意説明/context/correlationは再公開しない |
+| Workdir management source | operation、reason。session/Runtime原因は既存unionの別枝 | inventoryやscopeの現在権限。管理HTTP境界とRuntime内部のstatusは独立 |
+| 監査receipt | closed stage/reason/operation_outcome | 元operation ID、正本receipt、効果回数、Unknown/Cancelled/Interrupted。operation ID hash等の既存運用相関を原因のretry authorityにしない |
+| Drive source/client | closed operation/reason、既存class/code | SQL/blob/path/name/content。remote Unknownをstorage原因から確定させない |
+| config owner/client | closed operation/reason、必要なstage | source/schema本文、import/path、catalog/head/receipt/policy。元WIP UnknownとBackend同request照合は別契約 |
 
-Browserとモデル向けToolは、現在の可視性が同じなら同じ原因意味・説明を使う。保存/transferからの再公開にも再投影を要求し、保存時の公開ラベルを新しい閲覧者の権限にしない。全opaque sourceを公開するのでも、具体原因を一律omittedへ消すのでもない。
+visibilityはdefault拒否。Browser/Toolだけでなくtransfer/storage/telemetryも該当診断への現在の権限を境界が確認する。保存時の公開ラベルを将来の閲覧権限にしない。現在可視性が同じBrowser/Toolには同じ意味を投影し、原sourceのDisplayをSerializeしてから原因へ戻さない。公開可能な具体原因を「private details omitted」の一文へ消す方式にも戻さない。
 
-## Repository・Drive・configの公開field対応
+## 正本・相関・復旧の調査経路
 
-これらの追加でも共通coreのdomain match、formatter、秘匿処理、codecを増やしていない。domainが `FailureCause` / `WireDetails` / `ProjectFor` を実装し、既存codecへ同じ方法で接続する。
-
-| domain | sourceから採る公開field | ローカル限定・独立する正本 |
+| 事象 | 確認する正本と必要権限 | 行ってはいけない推論 |
 | --- | --- | --- |
-| Repository | `RepositoryFailureDetails { operation, reason }`。reasonは元lookup variantのみ。provider一般失敗から細かい原因を推測しない | Repository ID/key、provider名、selector、commit、path、provider診断は元source内に限る。access/grant/trust/登録intentの競合はこのlookup原因とは別の決定点。 |
-| Drive storage | `DriveFailureDetails { operation, reason }`。reasonは元storage error variantのみ | `Invalid` は複数の不正条件、`Conflict` はCAS/name/folder/request競合を含み、それ以上の細分化を捏造しない。SQL/blob/storage source、名前/内容/物理identityは非公開。remote Unknownは別の結果契約。 |
-| config | `ConfigurationFailureDetails { operation, reason }`。tree variantまたは実際の採用/owner分岐で決まった理由 | path/import/source/schema本文/診断を公開しない。tree sourceは保持するが既知の分岐に架空のsource errorを作らない。joint migration baseline検査はsource/export不一致のまま保持する。head/catalog/receipt/policyはT-838の正本。 |
+| Repository拒否/競合 | 認証されたWorkspace操作者が現source、登録intent、access/trustと期待CASを再読する。秘密管理はownerの独立判断 | 同名存在、説明文、categoryから元intent成功や権限追加を推定しない。鍵・生provider本文を問合せへ貼らない |
+| Workdir監査/操作Unknown | 当該呼出しの元Host request/receiptと同request照合。現在のattachment/scope/connection、操作の既存公開結果を確認する | 監査失敗やUnavailableを未実行とせず、別IDの更新を作らない |
+| Stop受理後cleanup失敗 | Stopの受理結果と独立したcleanup cause、retained session/使用guard、元終了receiptを確認する | cleanupを再試行するためStopを再送しない。受理receiptだけで実scope終了を断定しない |
+| retained/orphan session未解放 | 元Runtime connection、Worker/attachment connection/session IDを既存診断で相関する。正常Remove/Detach/cleanupはその所有者が保持するclose identityを使う | 件数をゼロにする、古いcloseを新sessionへ当てる、readをclose/削除の権限にすることを避ける |
+| Workdir removal未確定 | 既存operation、request fingerprint、attempt/owner、materialization fingerprint、dispositionを再読する | recovery readで再削除しない。現在NotFoundや同じ表示名だけで別materializationへ元操作を採用しない |
+| 外部grant/attachment cleanup | fence intent、frozen admission/full request、session/unlink checkpoint、Runtimeの元operation receipt/current generation、Backend fullsetとCASを照合する | Differentを未実行/再送許可にしない。Matchingだけで元の同試行完了にしない。同setの別試行・同key/Worker ABAを遡及採用しない |
+| Drive OutcomeUnknown | 元Host request IDと保存されたreceipt/結果を照会し、現在のgrantと観測entryのCASを確認する | directory内容の一致、分類、説明変更から元更新の完了や新規再送権限を作らない |
+| config採用/publication | ownerが既存adoption receiptと全request fingerprintを照合し、publication結果は独立に照会する | publication失敗で採用をUnknown/失敗に変更しない。古いsourceのqueued結果や照会をwriter/再送許可にしない |
 
-各domainのvisibilityはdefault拒否で、Browser/Toolだけでなくtransfer/storage/telemetryも現在の診断可視性を要求する。許可後の説明はclosed factsと操作の固定表現から再構成し、受信説明や任意context/correlationを転送しない。安全な原因を公開することと、原sourceを全公開することは別である。
+Runtime failed-create publicationのAfterRenameも別の接続点である。create ownerのoperation lock内で固定した元candidate全aggregateを既存canonical readとdurability barrierで照合し、一致する場合にだけそのwrite fenceを解除する。元Unknown errorは保持する。read/sync失敗やowner/Stop/attachment世代不一致ではfenceを残す。rollbackはread単独の副作用ではなく、別途確認した元cleanup operation-bound scope terminationを必要とする。汎用read helperに削除/停止権限を追加しない。
 
-実Gitのancestry拒否と実SQLite採用のhead/catalog/source/entry拒否からBrowser/Tool/codecまでの接続を検証した。採用失敗後のsource/policy/head/receiptと同request replayも検証したが、これは実Tool結果の保存・照会、HTTP→Web、相関検索基盤の完成証拠ではない。保存バイトの再読試験も、新しい背景結果storeの実装や検証とは区別する。
+## 保存schemaとの合成
 
-## 相関検索から正本・復旧へのrunbook
+canonical/retained startup・Job・Serviceの公開済み履歴とJournal bridge/receiptを維持し、T-815の独立publication/connection観測は単一appendのWorkspace migration 128に合成した。Runtimeの16→17は別storeの変更である。既存receiptやmigration名を整理目的で書き換えず、空migrationやshape recognizer迂回で合格させない。最古対応schema、実DDL、値・制約・履歴、rollback/retry/reopenの検証は登録されたmigration suiteが所有する。
 
-以下は既存の結果正本と必要権限を示す調査時点の手順である。まだ公開されていないstatus APIや新しい操作権限の存在を仮定しない。
+## 固定source別の証拠と未確認事項
 
-| 事象 | 参照・相関と必要権限 | 正本と安全な対処 |
-| --- | --- | --- |
-| Repository拒否/競合 | 認証されたWorkspace操作者。secret管理はWorkspace owner。既存の操作と安全なRepository keyを確認し、秘密そのものや生provider本文を問い合わせへ貼らない | 登録intent、現Repository source/access/trust、期待CASを再読する。競合は同名成功の証明ではない。権限追加は失敗表示ではなくownerの独立判断で行う。 |
-| Workdir認可/session-open | 現Workdir/Workerへの閲覧・操作権限。運用ログ閲覧は別の権限。既存ログの固定operation/stageとID fingerprintで範囲を絞る | Runtime/Backendの現在のowner binding、session/attachment、grant期限を照合する。404等の秘匿境界を迂回して他ownerの存在を公開しない。session-open一般失敗からprovider内部原因を捏造しない。 |
-| Workdir操作成功＋監査失敗 | 公開audit receiptのoperation identityを保全。ログ側のoperation ID hashとstageで検索。監査store閲覧は認可された運用担当のみ | 元operation resultと監査receiptを別々に読む。監査失敗で成功を取り消さず、mutationを再送しない。保存された監査状態の修復は既存監査責任境界で判断する。 |
-| Workdir cleanup/削除Unknown | 現Workdirへの管理権限。現公開結果と、認可されたServer側の既存removal operation/store観測を照合する | disposition/request fingerprint/attemptを保持し、既存reconciliationで存在・所有・cleanup結果を読む。公開operation-status APIの追加を仮定しない。Unknownやtimeoutで別requestの削除を開始しない。元原因とcleanup失敗を分け、未解放ownerを保持する。 |
-| Drive更新後Unknown | Workspace-bound Drive grantと対象scope。元request IDと入力を保持し、既存request-statusを同IDで照会。内部ログでは既存hashed correlationを利用 | `Committed` のidentity/metadata検証でのみ確定する。未commit snapshotや照会失敗は未実行の証明ではない。新IDでcreate/write/uploadを繰り返さず、CAS/grantを緩めない。 |
-| config owner採用の応答不明 | 現在のWorkspace owner。完全な元request（operation ID、期待head/catalog/export、source変更）を保持し、owner reconcile APIを使用 | `Adopted` は既存receiptを参照する。`PendingTransfer` / `NotObserved` は不明のまま。旧source-tree writerやWorker writerへ迂回しない。明示的に同一requestを再開できる既存契約と、新規採用を区別する。古いreceiptを現在policyへ再適用しない。 |
-| config採用成功＋Runtime publication失敗 | ownerが採用receiptを確認し、認可された運用担当がRuntime側の現観測を確認 | source保存、policy commit、次のcurrent-policy checkとRuntimeへのbest-effort publicationは別結果。publication失敗で成功採用を未実行としない。共有背景adapterへの原因保存接続は未完である。 |
+正確なcommand、feature、toolchain/environment、source payload SHA、binary hash、exit/timeout、資源sampleは `target/t815-evidence/` の各preflight/resultとraw logに保存する。下記は同じ候補の重複しない総件数ではなく、段階別の証拠索引である。
 
-相関IDは検索用であり、Drive request ID、config operation ID、Workdirのfingerprint/attemptを置き換えない。HTTP status、severity、reason prefix、retry hint、文面は再実行の許可ではない。通常long-poll空応答は故障記録へ変換しない。
+- `grant-production-validation-20261106.md` は合成前のRuntime operation/persistence、Server cleanup/attachmentのproduction caller接続と失敗反復の記録。新target全体の合格に転用しない。
+- `target-composition-validation-20261106.md` と `composition-migration-tests-2` / `generated-check-1` は最初のtarget合成・単一128・生成の固定source条件を記録する。
+- `composition-normal-build-6` / `composition-normal-runtime-4` は71c合成前のfailed-create限定修正と通常Runtime/yoiの成功。新combined条件の証拠ではない。旧runtime1/2/3の失敗は別に残す。
+- `composition-normal-build-8` / `composition-session-focus-1` / `composition-normal-runtime-5` は71c合成後のWorkdir/session/Runtime/tools/yoiを記録する。build7の初期化漏れcompile失敗は0 testであり、成功に読み替えない。後続Detach原因接続とmigration fixture更新はまだこの成功sourceに含まれない。
+- `composition-server-shards-1` は通常Serverの一部。外側Bash600秒timeoutと内側shardのexit/timeoutは別事実で、全Server成功ではない。未完ケース、migrationの古いtail期待、既存termination/Embedded/Feature storage fixture等の失敗は個別にtriageし、baseline未確認をbaseline扱いしない。
+- `composition-visual-review.json` は実Web＋合成HTTP/WS/WASMの4scenario限定目視。変更後38画像と変更前代表画像を実装者が開き、1440/768/390、light/dark、owner/non-owner、原因の即時可視性と既存狭幅overflow等を確認した。実Backend永続効果や新retained-close失敗画面の証明とは区別する。
 
-## 既存回帰と追加検証の対応
-
-既存試験の所在を調査したもので、ここに名前があること自体は実行成功を示さない。
-
-- Repository: `repository_log_rejects_unknown_or_unsupported_configured_repository`、`repository_secret_management_is_owner_only`、`configured_repository_import_rejects_changed_source_intent`、`ssh_rotation_http_fences_key_identity_and_replays_exact_operations`、`repositories::tests::sanitizes_remote_credentials_and_local_paths`。
-- Workdir理由/秘密: `workdir/tests/{denial_reasons,fs_denial_origins,remote_denial_reasons,failure_diagnostics}.rs`。API/logは `server/tests/api_logging_tests.rs` と `api_logging_tests/workdir_open.rs`、署名Runtime openは `http_server/tests/runtime_workdir_failure_tests.rs`。
-- 正常long-poll: `real_http_waiting_command_survives_long_poll_expiry`。監査/効果回数は `workspace_admission_tests/audit_tests.rs` の成功、拒否、応答喪失、timeout、dispatch前監査失敗の各試験。session close/recoveryは `workdir_session_close_tests.rs` とdeferred Workdir試験。
-- Drive: `production_mutation_loss_reconciles_only_original_identity_and_never_resends`、`production_deadline_does_not_cancel_effect_or_infer_uncommitted_from_snapshot`、`http_reply_loss_keeps_original_receipt_and_retained_effect_without_reexecution`、Server `drive_api_tests.rs`、`workspace-drive/tests/storage.rs`。更新回数、同ID照合、CAS、再openを維持する。
-- config: `editing_head_rejects_aba_and_parallel_editors_but_receipts_reconcile_lost_responses`、`failure_at_each_storage_boundary_rolls_back_and_reopens_the_previous_adoption`、`server_failure_after_seal_rolls_back_and_reopen_resumes_only_the_exact_full_request`、`server_configuration_adoption_tests.rs` のowner/origin/異内容同ID/旧writer拒否/receipt非再適用、Web adoption API/editor試験。
-- 本差分のWorkdir domain試験: 実Local provider＋ReadOnly wrapper＋本番dispatcherから投影/共通codecへ接続し、拒否と非更新を確認する。Browser/Tool意味一致、受信文面変更不変、保存バイト再読時の現在可視性、秘密非露出、旧理由欠落、Unknownと原因の独立、unsupported/corrupt/小さいboundary budgetを検査する。
-
-最後のdomain試験は、まだ実HTTP→Web、実Tool envelope、既存背景storeの保証ではない。T-812/813/814の公開artifactを利用した接続試験、生成物、Web check/build/browserと実画像目視、Server/Runtime build、全要件への正式reviewが残る。
-
-## 共有artifactの選択再利用と認可status
-
-T-812 `8d3912229443400d730ffc21e43a113938926fb8` からAPI macroのHTTP/reqwest error hookとbounded Problem adapter、T-814 `1d6d7c40148c395588d6cbce5155d23b8b9d9318` からTool/Agen/WIPの実行失敗保持とprotocol背景codecの依存closureを再利用する。共通coreのbyte/depth guardは二候補の公開入口を同居させ、domain別matchや別encoderを追加しない。Workspace DBの候補124/125、Job/Service writer/query、Standalone DB変更はこの選択に含めない。共有sourceの未review部分やrequest-changesを解消済みとは扱わず、採用後の試験を別sourceへ無条件流用しない。
-
-WorkerのHost認可応答は、T-812の生成clientとは別の `WorkspaceClient` 境界を通る。実response statusを `WorkspaceClientError::AuthorizationRejected { status }` に保持し、Drive/config/Workdirと影響する既存consumerへ渡す。401/403だけが型付き拒否、他statusやtransport failureは拒否の確定ではない。body/Display中の「HTTP status 403」から拒否を作らない。bound-checkも同じ所有分岐を使い、Subjektivの旧prefix判定を型へ置換する。認可要求やgrant、元更新結果、dispatch/retry規則は変更しない。
-
-認可status変更後のWorker通常suiteは、checkout内の `target/restore-test-environment/t815-shared/{config,data,run}` を起動環境のYOI各pathへ指定して実行した。最初の全suiteで発見したconsumer分類/文言assertの8失敗は本変更の回帰として修正し、全targetとdoctestを再実行した。元実行ログと再実行ログはsession証拠を正本とし、未完HTTP/UI/背景結果の保証へ拡張しない。
-
-## Repository access管理APIのHTTP→Web接続checkpoint
-
-`3d4079568` 後の接続slice。純粋な `RepositoryAccessDetails` とその既存allowlistを `server-api::repository_access_failure` へ移し、ローカル `RepositoryAccessFailure` の原source保持はServerに残した。`/api/w/{workspace_id}/settings/repository-access` 配下12操作を `RepositoryAccessApiError` / T-812の共通Problem response・生成client hookへ接続する。現在のowner-only secret管理検査後に生じたtyped access原因のみBrowser投影し、認可前・request rejection・未型付けの既存失敗は従来JSONのまま。resource permission一般を診断可視性へ昇格させない。
-
-- 公開fieldはclosed `operation/reason` と共通envelope。credential/trust不存在404、CAS・参照・既存credential競合409、その他の既知access入力拒否400は管理route所有の明示分類であり、Category/本文から決めない。鍵・fingerprint・元operation ID・path・provider本文は公開しない。
-- Webのページ操作とsection loaderはT-813のbounded receiver / `failureNotice` を使う。未知version/reason・破損は区別し、旧本文から原因を作らず、旧JSONの認可/失敗表示は維持する。説明変更でmutationの自動再送、CAS更新、結果確定を行わない。
-- `server::tests::ssh_rotation_http_fences_key_identity_and_replays_exact_operations` は実routerと実SQLiteの404/409、秘密非露出、CAS/replayに加え、loopback経由の本番生成Rust clientと、Webが読む同一JSON fixtureまで接続する。受信値だけではHTTP再投影できないことも確認する。Web fixtureはこの実HTTP応答との完全一致を検査し、別々のfake結果を接続保証にしない。
-
-### 今回実行した検証と限界
-
-基点 `3d4079568` にこのsliceを加えたdirty候補。Rust testは `CARGO_TARGET_DIR=target/t815 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0`、通常root checkは既存debug targetを使用した。各logは `target/t815-evidence/` に保存し、コマンド/exitはsessionの実行証拠を参照する。
-
-| 検証 | 結果 / log |
-| --- | --- |
-| `cargo check -p yoi-workspace-server` / `cargo check` | 成功。`access-server-check.log` / `access-root-check.log`。既存dead-code警告あり。 |
-| 上記HTTP test / `cargo test -p yoi-workspace-server --lib repository_access` | 1 / 26成功。`access-http-problem.log` / `access-domain-regression.log`。全Server suiteではない。 |
-| `cargo test -p server-api` | 137成功、canonical artifact staleの1失敗。正規 `export_openapi` 後、`canonical_openapi_artifact_is_current` は1成功（他137は同一codeの先行証拠を再利用）。`access-server-api-tests.log` / `access-openapi-current.log`。 |
-| Repository access Web receiver/loader / 実Page component | 13 / 10成功。`access-web-test.log` / `access-component-test.log`。最初のloader legacy文言回帰は従来表示を維持して修正、新componentの誤ったhostボタン選択も修正した。 |
-| `deno task check` / Web build / visual harness check | 成功、Web checkは0 errors/0 warnings。`access-web-check.log` / `access-visual-{before,after}-build.log` / `access-visual-harness-check.log`。 |
-
-### 目視確認
-
-`tools/web-ux/browser-tests/repository_access_failure_review.ts` で実Web build＋合成HTTP（実Backend認証の証拠ではない）を使用した。変更前は `3d4079568` のarchiveから隔離build、変更後は当該slice。ownerのcredential rotation不存在、1440/768/390px、light/darkの前後12画像と各 `review-context.json`・ARIAを実装者が開いて確認した。
-
-- 前: `target/web-ux/t815/access-before-3d4079568-r4/`。後: `target/web-ux/t815/access-after-current/`。各manifestにbuild index hash、source、route、HTTP document status、期待404と診断、画像hash、要求回数を保持。
-- 全条件でdocument 200、意図した404以外の新規browser errorなし、mutation 1回、横overflowなし。原因と操作をalert本文で判別でき、詳細を開く必要なし。mobileでも折返しと操作の順序を維持し、秘密入力をmaskした。判定はこの6条件について **pass**。
-- 最初のcaptureは共有fixtureの現permission field欠落で失敗した。製品の認可を変更せず、他の既存review harness同様に合成workspace応答へ `delete_subjects` fieldを補った。失敗artifactも保持し、成功画像と混同しない。旧表示がbodyをcancelする期待ERR_ABORTEDは変更前の当該mutationだけに限定して診断する。
-
-このcheckpointはRepository構成全域・Workdir・Drive/config・実Tool/history・背景正本保存再読・監査/cleanup副次結果の完了や正式reviewを示さない。広域Rustの追加再buildは容量上の親判断で一時繰延べ、既成功の未変更検証を重複実行しない。生成物変更と検証影響は最終候補で再評価する。
-
-## Drive登録Toolから既存Session履歴への接続checkpoint
-
-`bb4caeaaa` 後のslice。Tool登録factoryは実 `DriveBackend` を呼び、発生した `DriveError` を原sourceごと `DriveClientFailure` に保持してT-814の `tools::failure::execution_failure` へ渡す。closed resultの元class/codeとmutation観測は説明文から独立し、Unknownには当該Host callの64桁request IDだけを許す。具体的原因は既存Toolでも公開されていた当該callのenumに限り、保存causeや別resourceの可視性を昇格させない。provider本文・path・grant・raw認可本文は入れない。
-
-- `cargo test -p worker --lib feature::builtin::drive`: 66成功、exit 0、`target/t815-evidence/drive-tool-all-tests.log`。既存debug target、通常feature。HTTP応答喪失/期限超過/Unknown/CAS/権限境界もこの範囲で回帰確認した。
-- 詳細枝刈りassert追加後の `cargo test -p worker --lib registered_failure_contract`: 3成功、exit 0、build 30.4秒、`target/t815-evidence/drive-registered-history-tests-final.log`。production変更は上記66成功時と同一。新3テストは登録factory→本番backend→共有result→実WorkerSessionStore append/reopen→モデル入力cloneの `agen::prune::project` を接続する。代替はWorkspace transportのみで、mutation persistence自体の保証は既存real-HTTP試験と区別する。
-- Unknownは元POST1回・同ID照合1回のまま。Uncommitted snapshotを未実行とせず、枝刈り後summaryも元request ID・非再送案内・error dispositionを保持する。拒否はdata dispatchなし、競合code/class保持、説明変更で結果状態を変更せず、履歴正本のcontentを枝刈りしないことを確認した。
-
-このsliceはDrive native WIP、全HTTP/Web、背景store/query、Workdir/config経路や正式reviewの完了を示さない。既成功の未変更Server/root検証は再実行していない。測定時の空き47GiB、当checkout `target/debug` 約43GiB・`target/t815` 約16GiB。追加cleanや全体並列設定変更はしていない。
-
-## Configuration adoptionの実HTTP→Web接続checkpoint
-
-`98b3030d4` 後のslice。pure `ConfigurationFailureDetails` とallowlistをserver-apiへ移し、Serverは原 `ConfigTreeError` と決定点を保持する。owner source/preview/adopt/reconcileの4APIをT-812 Problem response/client hookへ接続した。catalogの現在ownerを確認したcallのみBrowserへ投影し、認可前・owner不一致はcause visibilityを与えず従来JSONのままにする。内側Categoryではなく、このowner APIの従来reason→400/403/409分類を明示的に保つ。
-
-BrowserはT-813 `receiveProblem` / `failureNotice` / domain decoderを使い、共有 `readBoundedText` で既存成功・legacy応答もbounded受信する。未知version/reasonと破損は区別する。既存の公開authoring診断（read-only builtin import等）はbounded legacyのまま保持し、旧本文から型付き原因や安全な再送を推論しない。現採用writer・operation ID・CAS・transfer seal・receipt・既存reconcileは変更していない。
-
-### 実行証拠と失敗の分類
-
-Rustは既存 `CARGO_TARGET_DIR=target/t815 CARGO_PROFILE_TEST_DEBUG=0 CARGO_PROFILE_DEV_DEBUG=0`、通常featureを使用。各logは `target/t815-evidence/`。最終候補全体のroot check・広域Server suite・正式reviewは未実施であり、この表の成功へ含めない。
-
-| 検証 | 結果 / log |
-| --- | --- |
-| `cargo check -p server-api` | 成功、22.6秒、`config-api-check.log`。 |
-| `cargo test -p yoi-workspace-server --lib configuration_http_problem` | 1成功、`config-http-problem-fixed.log`。本番catalog router・owner/session・SQLite→loopback→生成Rust clientとWebが読む同一fixtureを接続。非ownerにはcauseなし、非更新をsource/policy/head/receipt/legacy authorityから再読確認。最初は移動に伴うtest用OperationContext import欠落でcompile失敗し修正。 |
-| `cargo test -p yoi-workspace-server --lib configuration_adoption_http_integration` | 最終8成功、`config-adoption-http-regression-fixed.log`。最初7成功/1失敗は先のRepository access固定説明への旧prose期待不整合。本件回帰として安全な具体説明への期待へ更新し再走。旧秘密情報へ表示を戻していない。 |
-| `cargo test -p yoi-workspace-server --lib configuration_failure` | 5成功、`config-domain-regression.log`。原source、Browser/Tool意味・秘密境界・現在可視性を確認。 |
-| `cargo test -p server-api` | 最終lib138・integration2+2・doctest0成功、`config-server-api-tests-final.log`。最初133成功/5失敗は先のcanonical hashに対するRepository/Runtime/Ticket/Companion/Worker生成header stale。各正規generatorとcheckで更新して再走、`config-generated-refresh.log`。configuration OpenAPIも正規生成。 |
-| Web config API/adoption tests | 23成功、`config-web-test-fixed.log`。新2件は同HTTP fixture、説明変更、未知/破損、完全な同request1回を検証。最初のJSON fixture型wideningによる2型エラーはunknown比較へ修正した。 |
-| Web check / build | 成功、0 errors/0 warnings、`config-web-check.log` / `config-visual-after-build.log`。 |
-
-### 目視確認
-
-既存 `configuration_adoption_review.ts` へcatalog-conflict scenarioを追加し、実Web/実WASM＋合成HTTPで撮影した。実認証・永続効果の証拠は上記Server suiteであり、合成画面で代替しない。
-
-- 前: `target/web-ux/t815/config-before-3d4079568-r2/`（既存archive build `target/t815-visual-before/web/workspace/build`）。3d4079568から98b3030d4のconfig API/editor sourceはGit差分なしのため同画面baselineとして再利用。manifestのsourceはlauncher HEADであり、前buildのsourceではない。buildRoot/index hashと旧access captureのarchive出典を併せて照合する。
-- 後: `target/web-ux/t815/config-after-current/`（このdirty sliceのWeb build）。各 `review-context.json` とARIA、owner409/非owner403、1440/768/390px・light/darkの前後24画像を実装者が開いて確認した。競合は生JSONから具体的な操作・catalog変更説明へ改善、詳細を開かず判断でき、元の再読操作とlocal candidateを保つ。non-ownerは前後同一描画でeditorを出さない。横overflowや意図しないbrowser診断なし、mutationは1回。この条件で **pass**。
-- 最初のharness checkは既存generated TSの拡張子なしimportで失敗し、既存実WASM harnessに必要な `--sloppy-imports` でcheck/runした。最初のbefore captureは意図した409のconsole診断を未分類だったため失敗。許す診断を当該routeのHTTP409と正確なconsole文だけに限定して再撮影し、失敗artifactも保持した。
-
-このcheckpointはRepository構成全域、Drive HTTP/native WIP、Workdirの監査/cleanup、config背景publicationの保存/再読や正式reviewの完了ではない。測定時空39GiB、自debug43GiB/t81519GiB。新target・追加clean・全体並列設定変更なし。T-814所有の実Content-Type運搬/native cause hookは未公開時点では仮定せず、公開sourceと実検証を受けて接続する。
-
-## Workdir監査receiptの登録Tool接続checkpoint
-
-`82e388e6` 後のslice。Server既存のfuture-local audit collectorを `workdir::audit` へ移し、Server/Workerが同じcapture/notifyを使用する。共有sessionのlast-report欄や新しい監査ledgerは作らない。捕捉範囲はfutureごとで、並行call・nested capture・spawnされたtaskを混同せず、境界を跨ぐ既存receiptは明示的に受け渡す。即時運用ログは従来の所有境界に残す。
-
-T-814の公開 `c2223322034758e68a8d03fef00c53beda81f7c4` をfetch/照合し、`tools::failure::failure_output` を同一内容で再利用した。既存coreの `validate_json_input` と互換であり、core全体の上書きや別formatter/codecは追加しない。全caller検索で外部 `check_json_bounds` 利用がなくなったことを確認後、codecの公開範囲も同じ共有sourceへ合わせ、再度root checkを通した。guardの実装・制限は不変なので、機能試験は同一条件の先行証拠を再利用する。登録Read/Write/Edit/Glob/Grep/Bash/ViewImageはcurrent callのreceiptを捕捉し、元content/attachmentsを残して共有出力を追記する。成功をError化せず、Cancelled/Interruptedも維持する。Errorの元class/conflict codeと監査outcomeは独立した公開resultに保持する。過大な副次出力は共有fallbackに従い、元content/attachmentsと非再送説明を失わせない。
-
-`WorkdirAuditFailureDetails` の公開fieldはclosed stage/reason/operation_outcomeだけで、受信operation_idやprovider本文をコピーしない。現在の認可済み操作から受けた当該callの閉鎖事実に限り投影する。正本receipt/operation identityは引き続きBackendと既存HTTP応答が所有し、運用相関は元receiptとWorkerログのoperation ID hash/stageを使用する。Tool summaryから検索用identityや未実行を捏造しない。
-
-### 実行証拠と限界
-
-Rustは既存debug target、Workdir全suiteだけは既存 `CARGO_TARGET_DIR=target/t815` を再利用。通常feature（Workdir全suiteは `--features http-client`）。logは `target/t815-evidence/`、コマンドとexitはsession記録を参照する。
-
-| 検証 | 結果 / log |
-| --- | --- |
-| `cargo test -p workdir --lib audit::` | 新規2成功、`workdir-audit-capture-tests.log`。並行/nested/unscopedの分離、Browser/Tool意味一致、現在可視性、受信identity非露出。 |
-| `cargo test -p workdir --features http-client` | lib163、integration31、doctest0成功、`workdir-audit-all-workdir.log`。deny/unknown/HTTP/秘密境界も含む。 |
-| `cargo test -p tools` | lib116・integration10+42・doctest0成功、`workdir-audit-all-tools.log`。新規3は過大出力、並行分離、error/cancel/interrupted不変。 |
-| `cargo test -p worker --lib feature::builtin::manage_workdir` | 43成功、`workdir-audit-manage-regression.log`。新規登録Read/Writeは本番session/adapterから実Session append/reopen/pruneまで接続。Read成功とcontent、Write Unknown・audit Unknownを別々に保持、Writeはstat1+write1で再送なし。代替はWorkspace transportであり、DB効果回数の証拠とは区別する。 |
-| `cargo test -p worker --lib registered_failure_contract` | 共有Session fixture抽出後3成功、`workdir-audit-drive-history-regression-all.log`。最初の過度に限定したfilterは0件のため検証証拠にせず、実module filterへ修正した。 |
-| `cargo test -p yoi-workspace-server --lib server::tests::workspace_admission_tests::audit_tests` | 実HTTP/SQLite 13成功、`workdir-audit-http-regression.log`。collector抽出後の成功＋監査失敗、元拒否、応答喪失、timeout、dispatch前失敗、既存効果回数を検証。隔離起動環境は `target/restore-test-environment/t815-audit/{config,data,run}`。後続のTool decoratorだけの変更ではこのHTTP/audit codeは不変のため証拠を再利用する。 |
-| `cargo check` | 成功、`workdir-audit-root-check-final.log`。TUI/Serverを含む通常root compile closure。既存dead-code警告あり。 |
-
-これは監査通知の登録Tool接続であり、Workdir主原因・全HTTP/Web・cleanup、native WIP、Drive HTTP/native、config背景の保存/照会、最終全scope reviewの完成ではない。追加clean・全体並列設定変更なし。
-
-## 並行変更との結合点
-
-T-837は現行Feature認可、主体/委譲、管理UIを変更中である。可視性決定を古い保存receiptや起動時grantへ固定せず、採用source上の現在の境界で確認する。T-842は削除、Job記録、writer解放、Workdir detachと共有DTO/保存結果を変更中である。削除待ちを完了へ投影せず、元結果・secondary failureと未解放資源を保持する。共有file名だけで依存とせず、target移動時に実際の型・feature・保存/初期化・回復経路の結合影響を再評価する。
+通常Server残scope、失敗/timeoutの分類と必要な修正、最終root check・生成整合・format/diff/命名、新sourceでの証拠再利用条件、公開provider exact、同MRの直属fresh全要件review/verdictは引き続き必要。この記録はその完了・採用・配備を主張しない。

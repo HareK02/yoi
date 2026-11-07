@@ -23478,10 +23478,11 @@ async fn detach_current_worker_workdir(
     api.runtime
         .close_owned_workdir_sessions(worker, Some(&link.connection_id))
         .await
-        .map_err(|error| Error::RuntimeOperationFailed {
+        .map_err(|error| Error::WorkdirSessionCloseFailed {
             runtime_id: worker.runtime_id.clone(),
-            code: "workdir_session_close_unconfirmed".into(),
-            message: error.to_string(),
+            failure: crate::workdir_cleanup_failure::WorkdirCleanupFailure::SessionCloses(vec![
+                error,
+            ]),
         })?;
     close_current_worker_attachment_session_locked(api, worker).await?;
     close_current_worker_command_sessions_for_alias_locked(api, worker, alias).await?;
@@ -27644,6 +27645,7 @@ fn skill_api_error(error: skills::SkillError) -> ApiError {
                 message: format!("unknown Skill `{name}`"),
             },
             vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -29376,7 +29378,12 @@ fn workdir_management_diagnostics(
     diagnostics
         .into_iter()
         .map(|diagnostic| {
-            let projected = diagnostic.workdir.and_then(|cause| {
+            use server_api::workdir_management_error::WorkdirManagementCause;
+            let cause = diagnostic
+                .workdir
+                .map(WorkdirManagementCause::Management)
+                .or_else(|| diagnostic.session.map(WorkdirManagementCause::Session));
+            let projected = cause.and_then(|cause| {
                 FailureFacts::new(cause)
                     .and_then(|facts| {
                         project_failure::<Browser, _>(
@@ -29391,9 +29398,7 @@ fn workdir_management_diagnostics(
             server_api::WorkingDirectoryManagementDiagnostic {
                 code: projected
                     .as_ref()
-                    .map_or("workdir_diagnostic_unavailable", |p| {
-                        p.details().reason.as_str()
-                    })
+                    .map_or("workdir_diagnostic_unavailable", |p| p.identity().reason)
                     .into(),
                 severity: match diagnostic.severity {
                     HostDiagnosticSeverity::Info => server_api::DiagnosticSeverity::Info,
@@ -31319,6 +31324,7 @@ fn prepare_workspace_workdir_create(
                             .to_string(),
                     ),
                     vec![RuntimeDiagnostic {
+            session: None,
             workdir: None,
             startup: None,
             control: None,
@@ -31476,6 +31482,7 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 Error::UnknownRuntime(reserved.resolved_runtime_id),
                 vec![RuntimeDiagnostic {
+                    session: None,
                     workdir: None,
                     control: None,
                     startup: None,
@@ -31502,6 +31509,7 @@ async fn create_workspace_working_directory(
                 message: "Selected Runtime is not connected".to_string(),
             },
             vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -31561,6 +31569,7 @@ async fn create_workspace_working_directory(
             return Err(ApiError::with_diagnostics(
                 error.into_error(),
                 vec![RuntimeDiagnostic {
+                    session: None,
                     workdir: None,
                     control: None,
                     startup: None,
@@ -31602,6 +31611,7 @@ async fn create_workspace_working_directory(
                 return Err(ApiError::with_diagnostics(
                     error.into_error(),
                     vec![RuntimeDiagnostic {
+                        session: None,
                         workdir: None,
                         control: None,
                         startup: None,
@@ -31644,6 +31654,7 @@ async fn create_workspace_working_directory(
             diagnostics.insert(
                 0,
                 RuntimeDiagnostic {
+                    session: None,
                     workdir: None,
                     control: None,
                     startup: None,
@@ -31798,6 +31809,14 @@ fn workdir_cleanup_failure_category(
     if result.state == InternalWorkerOperationState::Unsupported {
         return "unsupported_target";
     }
+    if result
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.session)
+        .any(|cause| cause.operation == workdir::failure::WorkdirFailureOperation::SessionClose)
+    {
+        return "session_close_unconfirmed";
+    }
     result
         .diagnostics
         .iter()
@@ -31824,6 +31843,9 @@ fn workdir_cleanup_failure_category(
 
 fn workdir_removal_failure_guidance(category: &str) -> &'static str {
     match category {
+        "session_close_unconfirmed" => {
+            "Workdir removal was not dispatched because closing a retained operation session is unconfirmed. Restore session-provider access and use normal cleanup with the retained close identity; do not assume that the session or its use guard was released."
+        }
         "mount_present" => {
             "A mount remains inside the Workdir. Confirm its owner and usage, have that owner safely release it, then retry deletion. Yoi does not unmount external resources."
         }
@@ -32400,6 +32422,7 @@ fn build_runtime_cleanup_plan(
                 let mut diagnostics = error.diagnostics;
                 if diagnostics.is_empty() {
                     diagnostics.push(RuntimeDiagnostic {
+                        session: None,
                         workdir: None,
                         control: None,
                         startup: None,
@@ -36535,6 +36558,7 @@ fn reject_workdir_for_embedded_runtime(runtime_id: &str, has_workdir: bool) -> A
             message: "The embedded Runtime does not accept working directories".to_string(),
         },
         vec![RuntimeDiagnostic {
+            session: None,
             workdir: None,
             control: None,
             startup: None,
@@ -36979,6 +37003,7 @@ fn lifecycle_failure_detail(
 
 fn spawn_compensation_diagnostic(code: &str, message: String) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        session: None,
         workdir: None,
         control: None,
         startup: None,
@@ -37988,6 +38013,7 @@ fn project_workspace_worker_with_attachments(
             summary.state = "unavailable".to_string();
             summary.worker_state = None;
             summary.diagnostics.push(RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -38957,6 +38983,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> InternalWorker
         },
         workdir_attachments: Vec::new(),
         diagnostics: vec![RuntimeDiagnostic {
+            session: None,
             workdir: None,
             control: None,
             startup: None,
@@ -39004,6 +39031,7 @@ fn worker_summary_from_projection(
         Vec::new()
     } else {
         vec![RuntimeDiagnostic {
+            session: None,
             workdir: None,
             control: None,
             startup: None,
@@ -39660,6 +39688,7 @@ fn validate_working_directory_claims_for_browser(
                         message: "working directory relative_cwd must stay inside the Runtime-owned working directory".to_string(),
                     },
                     vec![RuntimeDiagnostic {
+            session: None,
             workdir: None,
             startup: None,
             control: None,
@@ -40253,6 +40282,7 @@ fn settings_diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        session: None,
         workdir: None,
         control: None,
         startup: None,
@@ -40428,6 +40458,7 @@ fn workspace_id_mismatch_error() -> ApiError {
     ApiError::with_diagnostics(
         Error::WorkspaceIdMismatch,
         vec![RuntimeDiagnostic {
+            session: None,
             workdir: None,
             control: None,
             startup: None,
@@ -40544,6 +40575,7 @@ impl ApiErrorLog {
                 .diagnostics
                 .iter()
                 .map(|diagnostic| RuntimeDiagnostic {
+                    session: None,
                     workdir: None,
                     control: None,
                     startup: None,
@@ -40582,6 +40614,7 @@ impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         let diagnostics = match &error {
             Error::RepositoryLookup(cause) => vec![RuntimeDiagnostic {
+                session: None,
                 control: None,
                 workdir: None,
                 startup: None,
@@ -40601,6 +40634,7 @@ impl From<Error> for ApiError {
             Error::DbCapacityExceeded
             | Error::DbExecutorUnavailable
             | Error::DbOperationOutcomeUnknown => vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -40614,6 +40648,7 @@ impl From<Error> for ApiError {
                 message: error.to_string(),
             }],
             Error::WorkdirSessionOpenFailed { transport, .. } => vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -40622,6 +40657,7 @@ impl From<Error> for ApiError {
                 message: transport.message.clone(),
             }],
             Error::RuntimeOperationFailed { code, message, .. } => vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -40630,6 +40666,7 @@ impl From<Error> for ApiError {
                 message: sanitize_backend_error(message),
             }],
             Error::WorkspaceSigningIdentity { code, message } => vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -40638,6 +40675,7 @@ impl From<Error> for ApiError {
                 message: sanitize_backend_error(message),
             }],
             Error::Ticket(ticket_error) => vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -40687,6 +40725,7 @@ impl From<Error> for ApiError {
                 subjektiv_diagnostic_code(message)
                     .map(|code| {
                         vec![RuntimeDiagnostic {
+                            session: None,
                             workdir: None,
                             control: None,
                             startup: None,
@@ -40730,6 +40769,7 @@ impl ApiError {
         Self::with_diagnostics(
             error,
             vec![RuntimeDiagnostic {
+                session: None,
                 control: None,
                 code: reason.as_str().into(),
                 severity: HostDiagnosticSeverity::Error,
@@ -44521,6 +44561,7 @@ mod tests {
                     worker: None,
                     acceptance_evidence: Vec::new(),
                     diagnostics: vec![RuntimeDiagnostic {
+                        session: None,
                         workdir: None,
                         control: None,
                         startup: None,
@@ -46451,6 +46492,7 @@ mod tests {
             kind: "ticket_backend_error".to_string(),
             message: "sqlite error: FOREIGN KEY constraint failed".to_string(),
             diagnostics: vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -53127,6 +53169,7 @@ mod tests {
     #[test]
     fn unrecoverable_pending_workspace_restore_is_typed_for_replacement() {
         let diagnostics = [RuntimeDiagnostic {
+            session: None,
             workdir: None,
             control: None,
             startup: None,
@@ -53141,6 +53184,7 @@ mod tests {
     #[test]
     fn workdir_runtime_miss_uses_exact_typed_code() {
         let typed_not_found = [RuntimeDiagnostic {
+            session: None,
             workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                 operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                 reason: workdir::management_failure::WorkdirManagementReason::NotFound,
@@ -53158,6 +53202,7 @@ mod tests {
         assert!(workdir_runtime_miss_is_not_found(&typed_not_found));
 
         let unrelated = [RuntimeDiagnostic {
+            session: None,
             workdir: None,
             control: None,
             startup: None,
@@ -64284,6 +64329,7 @@ mod tests {
             &api,
             deleted,
             &[RuntimeDiagnostic {
+                session: None,
                 workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                     reason: workdir::management_failure::WorkdirManagementReason::NotFound,
@@ -64316,6 +64362,7 @@ mod tests {
             &api,
             unknown,
             &[RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -66143,6 +66190,7 @@ mod tests {
             InternalWorkerOperationState::Rejected,
             None,
             vec![RuntimeDiagnostic {
+                session: None,
                 workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                     reason: workdir::management_failure::WorkdirManagementReason::NotFound,
@@ -66199,7 +66247,7 @@ mod tests {
             workdir_removal_result(
                 InternalWorkerOperationState::Rejected,
                 None,
-                vec![RuntimeDiagnostic { workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy }),
+                vec![RuntimeDiagnostic { session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupResourceBusy }),
                     control: None,
                     startup: None,
                     code: "working_directory_cleanup_resource_busy".into(),
@@ -66431,6 +66479,7 @@ mod tests {
 
         let (missing_operation, _) = reserve_removal_fixture(&api, "provider-not-found");
         let not_found = RuntimeDiagnostic {
+            session: None,
             workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                 operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                 reason: workdir::management_failure::WorkdirManagementReason::NotFound,
@@ -66472,6 +66521,7 @@ mod tests {
                 InternalWorkerOperationState::Accepted,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
                     workdir: None,
                     control: None,
                     startup: None,
@@ -66591,6 +66641,7 @@ mod tests {
                 InternalWorkerOperationState::Unsupported,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
                     workdir: None,
                     control: None,
                     startup: None,
@@ -66643,6 +66694,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
                     workdir: reason.map(|reason| WorkdirManagementFailure {
                         operation: Operation::Cleanup,
                         reason,
@@ -66680,6 +66732,7 @@ mod tests {
                 InternalWorkerOperationState::Rejected,
                 None,
                 vec![RuntimeDiagnostic {
+                    session: None,
                     workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Cleanup, reason: workdir::management_failure::WorkdirManagementReason::CleanupMountPresent }),
                     control: None,
                     startup: None,
@@ -66832,7 +66885,7 @@ mod tests {
                 workdir_removal_result(
                     InternalWorkerOperationState::Rejected,
                     None,
-                    vec![RuntimeDiagnostic { workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Detail, reason: workdir::management_failure::WorkdirManagementReason::CleanupPermissionDenied }),
+                    vec![RuntimeDiagnostic { session: None, workdir: Some(workdir::management_failure::WorkdirManagementFailure { operation: workdir::management_failure::WorkdirManagementOperation::Detail, reason: workdir::management_failure::WorkdirManagementReason::CleanupPermissionDenied }),
                     control: None,
                         startup: None,
                         code: "working_directory_cleanup_permission_denied".into(),
@@ -67025,6 +67078,7 @@ mod tests {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                session: None,
                 workdir: Some(workdir::management_failure::WorkdirManagementFailure {
                     operation: workdir::management_failure::WorkdirManagementOperation::Detail,
                     reason: workdir::management_failure::WorkdirManagementReason::NotFound,
@@ -67054,6 +67108,7 @@ mod tests {
             state: InternalWorkerOperationState::Rejected,
             working_directory: None,
             diagnostics: vec![RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -68751,6 +68806,7 @@ mod tests {
     fn provider_rejection_ignores_opaque_code_and_severity() {
         let diagnostics = vec![
             RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -68759,6 +68815,7 @@ mod tests {
                 message: "capacity is low".to_string(),
             },
             RuntimeDiagnostic {
+                session: None,
                 workdir: None,
                 control: None,
                 startup: None,
@@ -68821,6 +68878,7 @@ mod tests {
             })
             .unwrap();
         let diagnostics = vec![RuntimeDiagnostic {
+            session: None,
             workdir: None,
             control: None,
             startup: None,

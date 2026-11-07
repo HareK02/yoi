@@ -169,14 +169,18 @@ fn close_abandoned_remote_sessions(
 }
 
 fn unconfirmed_workdir_session_cleanup(error: WorkdirError) -> RuntimeWorkingDirectoryResult {
+    let cause = crate::workdir_cleanup_failure::WorkdirCleanupFailure::SessionCloses(vec![error])
+        .details()[0];
+    let mut diagnostic = diagnostic(
+        "working_directory_session_close_unconfirmed",
+        HostDiagnosticSeverity::Error,
+        "Workdir session closing remains unconfirmed; removal was not dispatched",
+    );
+    diagnostic.session = Some(cause);
     RuntimeWorkingDirectoryResult {
         state: InternalWorkerOperationState::Rejected,
         working_directory: None,
-        diagnostics: vec![diagnostic(
-            "working_directory_session_close_unconfirmed",
-            HostDiagnosticSeverity::Error,
-            error.to_string(),
-        )],
+        diagnostics: vec![diagnostic],
     }
 }
 
@@ -193,6 +197,8 @@ pub struct RuntimeDiagnostic {
     /// Closed Runtime observations, not historical authorization or retry permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<workdir::management_failure::WorkdirManagementFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<workdir::failure::WorkdirFailureDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<RuntimeControlCause>,
     /// Internal startup observations; public consumers must separately authorize projection.
@@ -8606,6 +8612,7 @@ fn diagnostic(
     message: impl Into<String>,
 ) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
+        session: None,
         workdir: None,
         control: None,
         startup: None,
