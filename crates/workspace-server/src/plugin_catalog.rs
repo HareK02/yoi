@@ -57,6 +57,9 @@ impl PluginCatalogError {
     }
 }
 
+mod manifest_cache;
+pub(crate) use manifest_cache::ArtifactManifestCache;
+
 const WORKSPACE_BYTES: i64 = 1024 * 1024 * 1024;
 const ACTOR_UPLOAD_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_UPLOADS: i64 = 128;
@@ -258,7 +261,18 @@ fn artifact_metadata(
                 external_write: t.external_write,
             })
             .collect(),
-        services: decode(&encode(&m.services)?)?,
+        // Permission entry bindings remain in immutable package bytes; the
+        // management DTO is not a second declaration/authorization source.
+        services: m
+            .services
+            .iter()
+            .map(|service| {
+                Ok(PluginServiceMetadata {
+                    name: service.name.clone(),
+                    subscriptions: decode(&encode(&service.subscriptions)?)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
         connections: decode(&encode(&m.connections)?)?,
         requested_grants: decode(&encode(&m.requested_grants)?)?,
         data_collections: decode(&encode(&m.data_collections)?)?,
@@ -811,6 +825,8 @@ pub fn plugin_reference_remove(
     tx.execute("DELETE FROM plugin_references WHERE workspace_id=?1 AND kind=?2 AND owner=?3 AND installation_id=?4 AND artifact_digest=?5",params![workspace,kind.name(),owner,installation,artifact_digest])?;
     Ok(())
 }
+
+pub(crate) mod permissions;
 
 #[cfg(test)]
 #[path = "plugin_data/catalog_tests.rs"]

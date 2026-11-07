@@ -23,9 +23,9 @@ impl ApiBoundary<ConfigurationFailureDetails> for ConfigurationBoundary {
         use ConfigurationFailureReason::*;
         let status = match details.reason {
             OwnerRequired => HttpFailureStatus::Forbidden,
-            PublicationDispatchUnavailable | PublicationProjectionUnavailable => {
-                HttpFailureStatus::Internal
-            }
+            PublicationDispatchUnavailable
+            | PublicationProjectionUnavailable
+            | PublicationRegistryUnavailable => HttpFailureStatus::Internal,
             CatalogChanged
             | EditingHeadChanged
             | LegacyExportChanged
@@ -34,6 +34,7 @@ impl ApiBoundary<ConfigurationFailureDetails> for ConfigurationBoundary {
             | WorkspaceDraining
             | RequestIdentityConflict => HttpFailureStatus::Conflict,
             InvalidPath
+            | BuiltinReadOnly
             | InvalidImport
             | ImportEscape
             | AlreadyExists

@@ -86,7 +86,7 @@ mod configuration_adoption_http_integration {
             let legacy_update = SubjectPermissionsUpdate {
                 operation_id: "adoption-http-existing-policy".into(),
                 expected_change_id: legacy
-                    .subject_permissions(&subject)
+                    .current_subject_policy(&subject)
                     .unwrap()
                     .map(|policy| policy.change_id),
                 execution: vec![workspace_permission("ticket.query")],
@@ -274,6 +274,75 @@ mod configuration_adoption_http_integration {
                 Err(crate::subjektiv::SubjektivError::PermissionAuthoritySealed),
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn permission_management_uses_owner_and_atomic_source_catalog_resolution() {
+        let f = Fixture::new().await;
+        let path = format!("/api/w/{TEST_WORKSPACE_ID}/permission-catalog");
+        for (token, expected) in [
+            (&f.owner, StatusCode::OK),
+            (&f.foreign, StatusCode::FORBIDDEN),
+        ] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(&path)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let (status, _) = f.call(request).await;
+            assert_eq!(status, expected);
+        }
+        let stored = f.adopt_draft("permission-resolution-source").await;
+        let source = f.source().await;
+        assert!(source.source_stored);
+        assert_eq!(
+            source.history_head.as_deref(),
+            Some(stored.history_head.as_str())
+        );
+        let registry = f.api.permission_registry.read().unwrap();
+        assert_eq!(source.catalog, registry.host().catalog());
+        assert_eq!(
+            source.catalog_digest,
+            crate::config_adoption::catalog_digest(registry.host()).unwrap()
+        );
+        for policy in source.policies {
+            let current = f
+                .api
+                .config_store
+                .adopted_subject_policy(TEST_WORKSPACE_ID, &policy.subject_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(policy.change_id, current.change_id);
+            assert_eq!(policy.execution, current.source.execution.assignment());
+            assert_eq!(
+                policy.execution_resolution,
+                *registry
+                    .host()
+                    .resolve(Some(&policy.execution))
+                    .projection()
+            );
+            assert_eq!(
+                policy.delegation_resolution,
+                *registry
+                    .host()
+                    .resolve(Some(&policy.delegation))
+                    .projection()
+            );
+        }
+        drop(registry);
+        let assignment = assignment("ticket.read");
+        let body = json!({"assignment": assignment});
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/w/{TEST_WORKSPACE_ID}/permissions/validate"))
+            .header("authorization", format!("Bearer {}", f.owner))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, resolution) = f.call(request).await;
+        assert_eq!(status, StatusCode::OK, "{resolution}");
+        assert!(resolution["allowed"].get("ticket.read").is_some());
     }
 
     struct CliBearer(String);
@@ -2290,6 +2359,62 @@ mod configuration_adoption_http_integration {
         assert_eq!(observations[1]["failure"]["failure"]["reason"], "editing_head_changed");
         assert_eq!(body["publication"]["history_head"], first.history_head);
         assert_eq!(fixture.source().await.history_head, Some(second.history_head));
+    }
+
+    #[tokio::test]
+    async fn publication_registry_failure_preserves_committed_receipt_and_never_resends_on_lookup_or_replay() {
+        let host = HostExecutors::default();
+        host.host.set(Some(crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
+            workers: std::num::NonZeroUsize::new(1).unwrap(),
+            queued: std::num::NonZeroUsize::new(4).unwrap(),
+        }).unwrap())).ok().unwrap();
+        let fixture = Fixture::with_publication_host(host).await;
+        let executor = fixture.api.host_executors.host().unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        executor.dispatch(move || {
+            let _ = ready.send(());
+            blocked.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
+        }).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), started).await.unwrap().unwrap();
+        let draft = fixture.source().await;
+        let adoption = request(&draft, "publication-registry-unavailable", vec![]);
+        let receipt = fixture.commit(&adoption).await;
+        assert!(receipt.source_stored && receipt.policy_committed);
+        let durable = fixture.durable();
+        let registry = fixture.api.permission_registry.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = registry.write().unwrap();
+            panic!("TEST_ONLY_SECRET /private/registry-path");
+        }).join().is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain()).await.unwrap().unwrap();
+        let suffix = format!("/publication/{}", adoption.operation_id);
+        let (status, before) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::OK, "{before}");
+        let observations = before["publication"]["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 2, "a failed registry refresh must not notify Runtime");
+        assert_eq!(observations[0]["stage"], "dispatch");
+        assert_eq!(observations[0]["outcome"], "observed");
+        assert_eq!(observations[1]["stage"], "projection");
+        assert_eq!(observations[1]["outcome"], "unconfirmed");
+        let browser = &observations[1]["failure"]["failure"];
+        assert_eq!(browser["reason"], "publication_registry_unavailable");
+        assert!(browser["explanation"].as_str().unwrap().contains("adopted"));
+        assert!(!before.to_string().contains("TEST_ONLY_SECRET"));
+        assert!(!before.to_string().contains("/private/registry-path"));
+        let retained = fixture.api.config_store.configuration_publication(TEST_WORKSPACE_ID, &fixture.owner_account, &adoption.operation_id).unwrap().unwrap();
+        let tool = retained.observations[1].failure.as_ref().unwrap()
+            .project_for::<error_contract::Tool, server_api::configuration_failure::ConfigurationFailureDetails>(
+                &server_api::configuration_failure::ConfigurationFailureVisibility { can_view_cause: true }).unwrap();
+        assert_eq!(tool.explanation(), browser["explanation"].as_str().unwrap());
+        assert_eq!(fixture.commit(&adoption).await, receipt);
+        fixture.owner_call("/reconcile", &adoption, StatusCode::OK).await;
+        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain()).await.unwrap().unwrap();
+        let (status, after) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after, before);
+        assert_eq!(fixture.durable(), durable);
     }
 
 }

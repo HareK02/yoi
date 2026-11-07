@@ -272,11 +272,82 @@ pub struct PluginPackageManifest {
     pub requested_grants: Vec<PluginRequestedGrant>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_collections: Vec<PluginDataCollection>,
+    /// Payload-free Feature declarations, not requested or effective grants.
+    /// Only the trusted Workspace loader binds these to an installed identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permission_namespaces:
+        BTreeMap<feature_permissions::NamespaceId, feature_permissions::NamespaceDeclaration>,
 }
 
 impl PluginPackageManifest {
     pub fn declared_surfaces(&self) -> BTreeSet<PluginSurface> {
         self.surfaces.iter().copied().collect()
+    }
+
+    /// Offline shape/ownership/graph validation only. No installed identity or
+    /// runtime authority can be obtained from a package. Cross-Feature references
+    /// remain subject to the live registry's diagnostics and ownership checks.
+    pub fn validate_permission_declarations(&self) -> Result<(), String> {
+        use feature_permissions::{FeatureIdentity, PermissionHost, WorkspaceId};
+        let mut host = PermissionHost::new(WorkspaceId::parse("offline-plugin-validation")?);
+        let feature = host
+            .register_feature(FeatureIdentity::parse("offline-plugin")?)
+            .map_err(|error| error.to_string())?;
+        let mut handles = BTreeMap::new();
+        for namespace in self.permission_namespaces.keys() {
+            handles.insert(
+                namespace.clone(),
+                host.bind_namespace(&feature, namespace.clone())
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        // Stage names first so declaration order cannot reject valid multi-
+        // namespace references. External references are checked by the loader.
+        for (namespace, declaration) in &self.permission_namespaces {
+            let mut names = declaration.clone();
+            for permission in &mut names.permissions {
+                permission.children.clear();
+            }
+            for set in &mut names.sets {
+                set.children.clear();
+            }
+            host.declare(&handles[namespace], names)
+                .map_err(|error| error.to_string())?;
+        }
+        for (namespace, declaration) in &self.permission_namespaces {
+            match host.declare(&handles[namespace], declaration.clone()) {
+                Ok(())
+                | Err(feature_permissions::PermissionError::UnknownKey(_))
+                | Err(feature_permissions::PermissionError::UnknownSet(_)) => (),
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        for key in self
+            .tools
+            .iter()
+            .filter_map(|tool| tool.permission.as_ref())
+            .chain(
+                self.services
+                    .iter()
+                    .filter_map(|service| service.permission.as_ref()),
+            )
+        {
+            if !self
+                .permission_namespaces
+                .get(&key.namespace())
+                .is_some_and(|declaration| {
+                    declaration
+                        .permissions
+                        .iter()
+                        .any(|definition| definition.key == *key)
+                })
+            {
+                return Err(format!(
+                    "Plugin entry permission is not owned/declared by this package: {key}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -293,6 +364,9 @@ pub enum PluginTicketEventType {
 pub struct PluginServiceManifest {
     pub name: String,
     pub subscriptions: Vec<PluginTicketEventType>,
+    /// Entry capability owned by this Plugin; Host/callee checks still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<feature_permissions::PermissionKey>,
 }
 
 pub const PLUGIN_COMPONENT_SERVICE_WORLD: &str = "yoi:plugin/ticket-service-plugin@2.2.0";
@@ -327,6 +401,9 @@ pub struct PluginToolManifest {
     pub error_codes: Vec<String>,
     #[serde(default)]
     pub external_write: bool,
+    /// Entry capability owned by this Plugin, in addition to plan/Host limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<feature_permissions::PermissionKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1072,6 +1149,14 @@ fn validate_manifest(
             "safe id, name and version are required".into(),
         ));
     }
+    manifest
+        .validate_permission_declarations()
+        .map_err(|error| {
+            reject(
+                PluginDiagnosticKind::Malformed,
+                format!("invalid permission declaration: {error}"),
+            )
+        })?;
     let service_world = manifest.runtime.world == PLUGIN_COMPONENT_SERVICE_WORLD;
     if if service_world {
         manifest.surfaces != [PluginSurface::Service]
@@ -2150,5 +2235,75 @@ mod ticket_manifest_tests {
                 .kind,
             PluginDiagnosticKind::Api
         );
+    }
+}
+
+#[cfg(test)]
+mod feature_permission_tests {
+    use super::*;
+    use feature_permissions::{NamespaceId, PermissionKey};
+
+    fn fixture() -> PluginPackageManifest {
+        toml::from_str(include_str!(
+            "../../../resources/plugin/templates/rust-component-tool/plugin.toml"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn plugin_permission_declarations_roundtrip_without_becoming_requested_grants() {
+        let mut manifest = fixture();
+        assert!(manifest.permission_namespaces.is_empty());
+        let declaration = serde_json::from_value(serde_json::json!({
+            "permissions": [
+                {"key":"external.use", "description":"use", "children":["external.use.deep"]},
+                {"key":"external.use.deep", "description":"deep", "children":[]}
+            ],
+            "sets":[{"set":"companion", "children":[{"kind":"namespace", "value":{"namespace":"external", "keys":["external.use"]}}]}]
+        })).unwrap();
+        manifest
+            .permission_namespaces
+            .insert(NamespaceId::parse("external").unwrap(), declaration);
+        manifest.tools[0].permission = Some(PermissionKey::parse("external.use.deep").unwrap());
+        manifest.validate_permission_declarations().unwrap();
+        let roundtrip: PluginPackageManifest =
+            toml::from_str(&toml::to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(manifest, roundtrip);
+        assert!(roundtrip.requested_grants.is_empty());
+        manifest.tools[0].permission = Some(PermissionKey::parse("ticket.read").unwrap());
+        assert!(manifest.validate_permission_declarations().is_err());
+    }
+
+    #[test]
+    fn plugin_permission_declarations_reject_spoofed_owner_payload_cycle_and_wrong_namespace() {
+        let mut manifest = fixture();
+        let ns = NamespaceId::parse("external").unwrap();
+        let declaration = serde_json::json!({"permissions":[{"key":"external.use", "description":"use", "children":["external.use"]}], "sets":[]});
+        manifest.permission_namespaces.insert(
+            ns.clone(),
+            serde_json::from_value(declaration.clone()).unwrap(),
+        );
+        assert!(manifest.validate_permission_declarations().is_err());
+        manifest
+            .permission_namespaces
+            .get_mut(&ns)
+            .unwrap()
+            .permissions[0]
+            .key = PermissionKey::parse("ticket.read").unwrap();
+        assert!(manifest.validate_permission_declarations().is_err());
+        for extra in [
+            serde_json::json!({"owner":"builtin:ticket"}),
+            serde_json::json!({"payload":{"ticket_id":"T-1"}}),
+        ] {
+            let mut invalid = declaration.clone();
+            invalid
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(
+                serde_json::from_value::<feature_permissions::NamespaceDeclaration>(invalid)
+                    .is_err()
+            );
+        }
     }
 }

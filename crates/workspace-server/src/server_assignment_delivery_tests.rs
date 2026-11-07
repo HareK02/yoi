@@ -134,16 +134,66 @@ fn delivery_scan(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
 }
 
 fn delivery_stop(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
-    api.runtime
-        .stop_worker(
-            worker,
-            WorkerLifecycleRequest {
-                stop_intent: None,
-                reason: None,
-                ticket_assignment: None,
-            },
-        )
-        .unwrap();
+    match api
+        .runtime
+        .stop_worker(worker, WorkerLifecycleRequest::default())
+    {
+        Ok(stopped) => assert_eq!(
+            stopped.state,
+            InternalWorkerOperationState::Accepted,
+            "{:?}",
+            stopped.diagnostics
+        ),
+        Err(RuntimeRegistryError::UnknownWorker { worker: missing }) => {
+            assert_eq!(missing, *worker);
+            // Terminal Jobs have their own cleanup owner, which can remove the
+            // Worker before fixture teardown. Absence alone proves nothing: use
+            // the exact attempt's canonical Controller/Host-drain fence.
+            let mut bindings = api
+                .config_store
+                .with_conn(|conn| {
+                    let mut query = conn.prepare(
+                        "SELECT job_id, attempt_id FROM backend_job_attempts
+                         WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3",
+                    )?;
+                    let rows = query.query_map(
+                        rusqlite::params![api.workspace_id(), worker.runtime_id, worker.worker_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(Error::from)
+                })
+                .unwrap();
+            assert_eq!(
+                bindings.len(),
+                1,
+                "missing Worker requires one unambiguous canonical Job attempt"
+            );
+            let (job_id, attempt_id) = bindings.pop().unwrap();
+            let attempt = api
+                .store
+                .get_backend_job_attempt(api.workspace_id(), &job_id, &attempt_id)
+                .unwrap()
+                .expect("bound Job attempt disappeared");
+            assert_eq!(attempt.worker.as_ref(), Some(worker));
+            assert!(attempt.state.terminal(), "{attempt:?}");
+            api.require_backend_job_attempt_effects_ended(&attempt)
+                .expect("missing Job Worker has no exact scope termination and Host drain proof");
+        }
+        Err(error) => panic!("fixture Worker stop failed: {error:?}"),
+    }
+}
+
+#[tokio::test]
+#[should_panic(expected = "missing Worker requires one unambiguous canonical Job attempt")]
+async fn delivery_teardown_does_not_treat_unproven_worker_absence_as_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (api, _) = assignment_test_api_with_recording_backend(dir.path()).await;
+    let missing = RuntimeWorkerRef::new(
+        EMBEDDED_WORKER_RUNTIME_ID,
+        worker_runtime::identity::WorkerId::now_v7().to_string(),
+    );
+    delivery_stop(&api, &missing);
 }
 
 async fn delivery_recording_fixture(
@@ -1020,6 +1070,19 @@ impl delivery_execution::WorkerExecutionBackend for DeliveryResponseLossBackend 
         } else {
             result
         }
+    }
+    fn termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+    ) -> std::result::Result<Option<delivery_execution::WorkerExecutionTermination>, String> {
+        self.inner.termination_receipt(worker)
+    }
+    fn reconcile_termination_receipt(
+        &self,
+        worker: &worker_runtime::identity::WorkerRef,
+        saved: &delivery_execution::WorkerExecutionTermination,
+    ) -> std::result::Result<Option<delivery_execution::WorkerExecutionTermination>, String> {
+        self.inner.reconcile_termination_receipt(worker, saved)
     }
     fn dispatch_method(
         &self,

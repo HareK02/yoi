@@ -79,23 +79,48 @@ pub fn background_failure_from_startup(
     BackgroundFailure::from_startup_primary(&failure.primary)
 }
 
-/// Select retained startup facts by type, never by diagnostic severity, prose or
-/// position. Conflicting typed primaries are projection failure, not permission
-/// to silently pick one or replace it with a generic Job cause.
+/// Select retained startup/control facts by type, never by diagnostic severity,
+/// prose or position. Generic execution rejection/failure describes the outer
+/// startup result, not a second primary. Specific conflicting typed causes are
+/// projection failure, never permission to pick one or use a generic Job cause.
 pub(crate) fn diagnostic_failure_cause(
     diagnostics: &[crate::hosts::RuntimeDiagnostic],
     fallback: BackgroundJobCause,
 ) -> std::result::Result<BackgroundFailure, error_contract::ContractError> {
     let mut primary = None;
-    for startup in diagnostics
+    let has_startup = diagnostics
         .iter()
-        .filter_map(|diagnostic| diagnostic.startup.as_ref())
-    {
-        let cause = background_failure_from_startup(startup)?;
-        if primary.as_ref().is_some_and(|known| known != &cause) {
-            return Err(error_contract::ContractError::ProjectionUnavailable);
+        .any(|diagnostic| diagnostic.startup.is_some());
+    for diagnostic in diagnostics {
+        let startup = diagnostic
+            .startup
+            .as_ref()
+            .map(background_failure_from_startup)
+            .transpose()?;
+        let control = diagnostic
+            .control
+            .filter(|cause| {
+                !has_startup
+                    || !matches!(
+                        cause,
+                        protocol::control_failure::RuntimeControlCause::ExecutionRejected
+                            | protocol::control_failure::RuntimeControlCause::ExecutionFailed
+                    )
+            })
+            .map(|cause| {
+                let facts = error_contract::FailureFacts::new(cause)?;
+                BackgroundFailure::from_projected(&error_contract::project_failure::<
+                    error_contract::Storage,
+                    _,
+                >(&facts, &())?)
+            })
+            .transpose()?;
+        for cause in startup.into_iter().chain(control) {
+            if primary.as_ref().is_some_and(|known| known != &cause) {
+                return Err(error_contract::ContractError::ProjectionUnavailable);
+            }
+            primary = Some(cause);
         }
-        primary = Some(cause);
     }
     match primary {
         Some(primary) => Ok(primary),
@@ -1174,6 +1199,153 @@ mod tests {
         typed.startup.as_mut().unwrap().primary =
             serde_json::from_value(serde_json::json!("corrupt attachment")).unwrap();
         assert!(diagnostic_failure_cause(&[typed], BackgroundJobCause::DispatchFailed).is_err());
+    }
+
+    #[test]
+    fn diagnostic_control_cause_survives_order_severity_prose_and_duplicate_observations() {
+        use crate::hosts::{HostDiagnosticSeverity, RuntimeDiagnostic};
+        use protocol::control_failure::RuntimeControlCause;
+
+        for &cause in RuntimeControlCause::ALL {
+            let mut typed =
+                RuntimeDiagnostic::new("unrelated", "info", "TEST_ONLY_SECRET /private/path");
+            typed.control = Some(cause);
+            let unrelated = RuntimeDiagnostic::new("input_failed", "error", "not the primary");
+            for fallback in [
+                BackgroundJobCause::InputFailed,
+                BackgroundJobCause::ReconciliationRequired,
+            ] {
+                let first = diagnostic_failure_cause(&[unrelated.clone(), typed.clone()], fallback)
+                    .unwrap();
+                let mut changed = typed.clone();
+                changed.severity = HostDiagnosticSeverity::Error;
+                changed.code = "another_code".into();
+                changed.message = "changed explanation".into();
+                let reordered = diagnostic_failure_cause(
+                    &[changed, unrelated.clone(), typed.clone()],
+                    fallback,
+                )
+                .unwrap();
+                assert_eq!(first, reordered);
+                assert!(!first.as_storage_str().contains("TEST_ONLY_SECRET"));
+                assert!(!first.as_storage_str().contains("/private/path"));
+                let stored = StoredFailure::from_storage(first.as_storage_str().into());
+                match stored.decode::<RuntimeControlCause>() {
+                    error_contract::DecodeFailure::Known(received) => {
+                        assert_eq!(received.facts().cause(), &cause);
+                    }
+                    _ => panic!("typed control cause was not retained: {cause:?}"),
+                }
+                let error = Error::RuntimeControlFailed {
+                    runtime_id: "runtime-a".into(),
+                    cause,
+                };
+                assert_eq!(first, operation_failure_cause(&error, fallback).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_diagnostic_controls_are_explicitly_ambiguous_in_either_order() {
+        use crate::hosts::RuntimeDiagnostic;
+        use protocol::control_failure::RuntimeControlCause;
+
+        let mut authorization = RuntimeDiagnostic::new("ignored", "info", "authorization");
+        authorization.control = Some(RuntimeControlCause::AuthorizationFailed);
+        let mut transport = RuntimeDiagnostic::new("ignored", "error", "transport");
+        transport.control = Some(RuntimeControlCause::TransportFailed);
+        for diagnostics in [
+            vec![authorization.clone(), transport.clone()],
+            vec![transport, authorization],
+        ] {
+            assert!(matches!(
+                diagnostic_failure_cause(&diagnostics, BackgroundJobCause::InputFailed),
+                Err(error_contract::ContractError::ProjectionUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn diagnostic_startup_and_control_primaries_are_ambiguous_even_on_one_diagnostic() {
+        use crate::hosts::RuntimeDiagnostic;
+        use protocol::control_failure::RuntimeControlCause;
+        use protocol::session_failure::{
+            SessionRegistrationCause, session_registration_attachment,
+        };
+
+        let mut startup = RuntimeDiagnostic::new("ignored", "info", "startup");
+        startup.startup = Some(runtime_api::WorkerStartupFailure {
+            primary: session_registration_attachment(SessionRegistrationCause::binding_mismatch())
+                .unwrap(),
+            secondary: vec![],
+            persistence: None,
+            resources: None,
+            io_kind: None,
+        });
+        let primary =
+            diagnostic_failure_cause(&[startup.clone()], BackgroundJobCause::DispatchFailed)
+                .unwrap();
+        for outer in [
+            RuntimeControlCause::ExecutionRejected,
+            RuntimeControlCause::ExecutionFailed,
+        ] {
+            let mut wrapped = startup.clone();
+            wrapped.control = Some(outer);
+            assert_eq!(
+                diagnostic_failure_cause(&[wrapped], BackgroundJobCause::DispatchFailed).unwrap(),
+                primary
+            );
+        }
+        let mut control = RuntimeDiagnostic::new("ignored", "error", "control");
+        control.control = Some(RuntimeControlCause::AuthorizationFailed);
+        let mut combined = startup.clone();
+        combined.control = control.control;
+        for diagnostics in [
+            vec![startup.clone(), control.clone()],
+            vec![control.clone(), startup.clone()],
+            vec![combined],
+        ] {
+            assert!(matches!(
+                diagnostic_failure_cause(&diagnostics, BackgroundJobCause::ReconciliationRequired),
+                Err(error_contract::ContractError::ProjectionUnavailable)
+            ));
+        }
+
+        startup.startup.as_mut().unwrap().primary =
+            serde_json::from_value(serde_json::json!("corrupt attachment")).unwrap();
+        for diagnostics in [
+            vec![startup.clone(), control.clone()],
+            vec![control, startup],
+        ] {
+            assert!(
+                diagnostic_failure_cause(&diagnostics, BackgroundJobCause::InputFailed).is_err(),
+                "a valid control must not hide an unprojectable startup primary"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_without_typed_primaries_use_only_the_owner_selected_fallback() {
+        use crate::hosts::RuntimeDiagnostic;
+
+        for diagnostics in [
+            vec![],
+            vec![RuntimeDiagnostic::new(
+                "authorization_failed",
+                "error",
+                "runtime_control authorization_failed",
+            )],
+        ] {
+            for fallback in [
+                BackgroundJobCause::InputFailed,
+                BackgroundJobCause::ReconciliationRequired,
+            ] {
+                assert_eq!(
+                    diagnostic_failure_cause(&diagnostics, fallback).unwrap(),
+                    fallback.storage().unwrap()
+                );
+            }
+        }
     }
 
     #[test]

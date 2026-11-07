@@ -145,7 +145,7 @@ pub fn attest_input_delivery(
     selected_ranges: &[JournalSourceRange],
 ) -> JournalResult<()> {
     validate_input_digest(input_digest)?;
-    store.database.try_transaction(|tx| {
+    store.journal_transaction(|tx| {
         super::lifecycle::reject_erased(tx, &context.host)?;
         let generation = super::store::job(store, tx, context, true)?;
         if generation.selected_ranges != selected_ranges {
@@ -230,7 +230,7 @@ fn execute_inner(
     input_digest: Option<&str>,
     mut read_source: impl FnMut(&JournalSource, u64, usize) -> JournalResult<recording::JournalMaterial>,
 ) -> JournalResult<JournalJobResponse> {
-    let generation = store.database.try_with_connection(|tx| {
+    let generation = store.journal_connection(|tx| {
         super::lifecycle::reject_erased(tx, &context.host)?;
         let generation = super::store::job(store, tx, context, true)?;
         if let Some(input_digest) = input_digest {
@@ -252,7 +252,7 @@ fn execute_inner(
             JournalJobResponse::Saved(receipt)
         }
         JournalJobRequest::ReadState => {
-            let state = store.database.try_with_connection(|tx| {
+            let state = store.journal_connection(|tx| {
                 let generation = super::store::job(store, tx, context, true)?;
                 let current =
                     super::store::journal(tx, &context.host, &generation.journal_id, true)?;
@@ -452,7 +452,7 @@ fn execute_inner(
         ));
     }
     if let Some((order, range)) = delivered {
-        store.database.try_transaction(|tx| {
+        store.journal_transaction(|tx| {
             // A response that cannot fit the tool budget or loses its live generation must
             // not attest bytes. Lost responses can safely reread the identical source page.
             super::store::job(store, tx, context, true)?;
@@ -470,7 +470,7 @@ fn execute_inner(
         })?;
     }
     // Also check empty source reads and Initial snapshot responses (no delivery write).
-    store.database.try_with_connection(|tx| {
+    store.journal_connection(|tx| {
         super::store::job(store, tx, context, false)?;
         Ok::<_, JournalError>(())
     })?;
@@ -482,7 +482,7 @@ fn require_delivery(
     context: &JournalJobContext,
     selected: &[JournalSourceRange],
 ) -> JournalResult<()> {
-    store.database.try_with_connection(|tx| {
+    store.journal_connection(|tx| {
         super::store::job(store, tx, context, true)?;
         for range in selected {
             let saved: Option<String> = tx.query_row(
@@ -508,7 +508,7 @@ pub fn finish(
     store: &SubjektivStore,
     context: &JournalJobContext,
 ) -> JournalResult<JournalJobCompletion> {
-    store.database.try_transaction(|tx| {
+    store.journal_transaction(|tx| {
         let generation = super::store::job(store, tx, context, false)?;
         let saved: Option<String> = tx
             .query_row(

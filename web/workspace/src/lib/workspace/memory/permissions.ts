@@ -1,300 +1,297 @@
 import type {
-  PermissionOperationDescriptor,
-  PermissionResource,
+  OriginStep,
+  PermissionAssignment,
+  PermissionCatalog,
+  PermissionDiagnostic,
+  PermissionReference,
+  PermissionResolution,
+} from "#lib/generated/feature-permissions.generated.ts";
+import type {
+  ConfigurationMigrationDiagnostic,
+  ConfigurationSourceResponse,
+  ConfigurationSubjectPolicy,
+} from "#lib/generated/configuration-adoption.generated.ts";
+import type {
   ScopedPermission,
-  SubjectPermissionInterruption,
   SubjectPermissions,
-  SubjectPermissionsMutationResponse,
-  SubjectPermissionsResponse,
-  SubjectPermissionsUpdate,
 } from "#lib/generated/memory-api.ts";
 import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
+import { parseConfigurationSourceResponse } from "#lib/workspace/config-source/api.ts";
 
-export type { PermissionResource, ScopedPermission };
-export type Policy = SubjectPermissions;
-export type PolicyUpdate = SubjectPermissionsUpdate;
-export type Operation = Omit<PermissionOperationDescriptor, "availability"> & {
-  available: boolean;
-  unavailable_reason: string | null;
-};
-export type PermissionView = Omit<SubjectPermissionsResponse, "operations"> & {
-  operations: Operation[];
-};
-export type Interruption = SubjectPermissionInterruption;
-export type Mutation = SubjectPermissionsMutationResponse;
 export type Lane = "execution" | "delegation";
-
-const MAX_BYTES = 1_048_576;
-const fields = {
-  workspace: ["workspace_id"],
-  worker_operation: ["workspace_id"],
-  plugin_installation: ["workspace_id", "installation_id"],
-  ticket: ["workspace_id", "ticket_id"],
-  objective: ["workspace_id", "objective_id"],
-  merge_request: ["workspace_id", "merge_request_id"],
-  subject: ["workspace_id", "subject_id"],
-  drive_entry: ["workspace_id", "node_id"],
-  drive_request: ["workspace_id", "request_id"],
-  repository: ["workspace_id", "repository_key"],
-  workdir_attachment: ["workspace_id", "connection_id"],
-  workspace_config: ["workspace_id", "path", "recursive"],
-  network: ["url"],
-  sub_worker: ["runtime_id", "worker_id", "name"],
-  feature: [],
-  workdir: ["working_directory_id", "path", "recursive"],
-  worker: ["runtime_id", "worker_id"],
-  job: ["workspace_id", "job_id"],
-} satisfies Record<PermissionResource["kind"], string[]>;
+export type Policy = ConfigurationSubjectPolicy;
+export type PermissionView = {
+  source: ConfigurationSourceResponse;
+  policy: Policy | null;
+};
+const MAX_BYTES = 8 * 1024 * 1024;
+function invalid(): never {
+  throw new Error("Invalid permission response");
+}
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("Invalid permission response");
+    return invalid();
   }
   return value as Record<string, unknown>;
 }
+function record(value: unknown, keys: string[]): Record<string, unknown> {
+  const result = object(value);
+  if (
+    keys.some((key) => !(key in result)) ||
+    Object.keys(result).some((key) => !keys.includes(key))
+  ) return invalid();
+  return result;
+}
 function text(value: unknown): string {
-  if (typeof value !== "string" || value.length > 16_384) {
-    throw new Error("Invalid permission text");
-  }
+  if (typeof value !== "string" || value.length > 16384) return invalid();
   return value;
 }
 function bool(value: unknown): boolean {
-  if (typeof value !== "boolean") throw new Error("Invalid permission flag");
+  if (typeof value !== "boolean") return invalid();
   return value;
 }
-function list<T>(value: unknown, parse: (item: unknown) => T): T[] {
-  if (!Array.isArray(value) || value.length > 256) {
-    throw new Error("Invalid permission list");
-  }
+function list<T>(value: unknown, parse: (value: unknown) => T): T[] {
+  if (!Array.isArray(value) || value.length > 4096) return invalid();
   return value.map(parse);
 }
-export function parseResource(value: unknown): PermissionResource {
-  const r = object(value);
-  const kind = text(r.kind) as PermissionResource["kind"];
-  if (!Object.hasOwn(fields, kind)) throw new Error("Unknown resource kind");
-  const keys: string[] = fields[kind];
-  if (
-    Object.keys(r).some((key) => key !== "kind" && !keys.includes(key)) ||
-    keys.some((key) => !(key in r))
-  ) throw new Error("Invalid resource fields");
-  for (const key of keys) key === "recursive" ? bool(r[key]) : text(r[key]);
-  return r as PermissionResource;
-}
-export function parsePermission(value: unknown): ScopedPermission {
-  const p = object(value);
-  return { operation: text(p.operation), resource: parseResource(p.resource) };
-}
-export function parsePolicy(value: unknown): Policy {
-  const p = object(value);
+export function parseReference(value: unknown): PermissionReference {
+  const ref = record(value, ["kind", "value"]);
+  if (ref.kind === "set") return { kind: "set", value: text(ref.value) };
+  if (ref.kind !== "namespace") return invalid();
+  const namespace = record(ref.value, ["namespace", "keys"]);
   return {
-    change_id: text(p.change_id),
-    execution: list(p.execution, parsePermission),
-    delegation: list(p.delegation, parsePermission),
+    kind: "namespace",
+    value: {
+      namespace: text(namespace.namespace),
+      keys: list(namespace.keys, text),
+    },
   };
 }
-export function parseView(value: unknown): PermissionView {
-  const v = object(value);
+export function parseAssignment(value: unknown): PermissionAssignment {
+  const assignment = record(value, ["grants", "exclusions", "revoked"]);
   return {
-    permissions: v.permissions === null ? null : parsePolicy(v.permissions),
-    can_manage: bool(v.can_manage),
-    operations: list(v.operations, (value) => {
-      const o = object(value);
-      const availability = object(o.availability);
-      if (
-        availability.kind !== "available" && availability.kind !== "unavailable"
-      ) throw new Error("Unknown operation availability");
+    grants: list(assignment.grants, parseReference),
+    exclusions: list(assignment.exclusions, parseReference),
+    revoked: bool(assignment.revoked),
+  };
+}
+export function parseCatalog(value: unknown): PermissionCatalog {
+  const catalog = record(value, ["workspace", "namespaces"]);
+  return {
+    workspace: text(catalog.workspace),
+    namespaces: list(catalog.namespaces, (value) => {
+      const namespace = record(value, [
+        "namespace",
+        "feature",
+        "enabled",
+        "declaration",
+      ]);
+      const declaration = record(namespace.declaration, [
+        "permissions",
+        "sets",
+      ]);
       return {
-        operation: text(o.operation),
-        label: text(o.label),
-        description: text(o.description),
-        resource_kinds: list(o.resource_kinds, (value) => {
-          const kind = text(value) as PermissionResource["kind"];
-          if (!Object.hasOwn(fields, kind)) {
-            throw new Error("Unknown resource kind");
-          }
-          return kind;
-        }),
-        available: availability.kind === "available",
-        unavailable_reason: availability.kind === "unavailable"
-          ? text(availability.reason)
-          : null,
+        namespace: text(namespace.namespace),
+        feature: text(namespace.feature),
+        enabled: bool(namespace.enabled),
+        declaration: {
+          permissions: list(declaration.permissions, (value) => {
+            const permission = record(value, [
+              "key",
+              "description",
+              "children",
+            ]);
+            return {
+              key: text(permission.key),
+              description: text(permission.description),
+              children: list(permission.children, text),
+            };
+          }),
+          sets: list(declaration.sets, (value) => {
+            const set = record(value, ["set", "children"]);
+            return {
+              set: text(set.set),
+              children: list(set.children, parseReference),
+            };
+          }),
+        },
       };
     }),
   };
+}
+// Retained domain restrictions are read-only migration evidence, never inputs on a key.
+function parseLegacyPermission(value: unknown): ScopedPermission {
+  const permission = record(value, ["operation", "resource"]);
+  const resource = object(permission.resource);
+  text(resource.kind);
+  for (const value of Object.values(resource)) {
+    if (typeof value !== "boolean") text(value);
+  }
+  return {
+    operation: text(permission.operation),
+    resource,
+  } as ScopedPermission;
+}
+function parseLegacy(value: unknown): SubjectPermissions | null {
+  if (value === null) return null;
+  const policy = record(value, ["change_id", "execution", "delegation"]);
+  return {
+    change_id: text(policy.change_id),
+    execution: list(policy.execution, parseLegacyPermission),
+    delegation: list(policy.delegation, parseLegacyPermission),
+  };
+}
+export function parsePolicy(value: unknown, workspaceId: string): Policy {
+  const policy = record(value, [
+    "subject_id",
+    "change_id",
+    "execution",
+    "delegation",
+    "execution_resolution",
+    "delegation_resolution",
+    "legacy_constraints",
+  ]);
+  return {
+    subject_id: text(policy.subject_id),
+    change_id: text(policy.change_id),
+    execution: parseAssignment(policy.execution),
+    delegation: parseAssignment(policy.delegation),
+    execution_resolution: parseResolution(
+      policy.execution_resolution,
+      workspaceId,
+    ),
+    delegation_resolution: parseResolution(
+      policy.delegation_resolution,
+      workspaceId,
+    ),
+    legacy_constraints: parseLegacy(policy.legacy_constraints),
+  };
+}
+export function parseSource(
+  value: unknown,
+  workspaceId: string,
+): ConfigurationSourceResponse {
+  const editing = parseConfigurationSourceResponse(value);
+  const raw = object(value);
+  const catalog = parseCatalog(raw.catalog);
+  if (catalog.workspace !== workspaceId) return invalid();
+  const policies = list(
+    raw.policies,
+    (policy) => parsePolicy(policy, workspaceId),
+  );
+  if (
+    new Set(policies.map((policy) => policy.subject_id)).size !==
+      policies.length
+  ) return invalid();
+  const migration_diagnostics = list(
+    raw.migration_diagnostics,
+    (value): ConfigurationMigrationDiagnostic => {
+      const item = object(value);
+      if (item.kind === "converted") {
+        record(value, ["kind", "subject_id", "operation"]);
+        return {
+          kind: "converted" as const,
+          subject_id: text(item.subject_id),
+          operation: text(item.operation),
+        };
+      }
+      if (
+        item.kind !== "domain_constraint" &&
+        item.kind !== "explicit_configuration_required"
+      ) return invalid();
+      record(value, ["kind", "subject_id", "permission"]);
+      return {
+        kind: item.kind,
+        subject_id: text(item.subject_id),
+        permission: parseLegacyPermission(item.permission),
+      };
+    },
+  );
+  return { ...editing, catalog, policies, migration_diagnostics };
+}
+export function parseResolution(
+  value: unknown,
+  workspaceId: string,
+): PermissionResolution {
+  const resolution = record(value, ["workspace", "allowed", "diagnostics"]);
+  const workspace = text(resolution.workspace);
+  if (workspace !== workspaceId) return invalid();
+  const entries = Object.entries(object(resolution.allowed));
+  if (entries.length > 4096) return invalid();
+  const allowed = Object.fromEntries(
+    entries.map(([key, paths]) => [
+      text(key),
+      list(paths, (path) =>
+        list(path, (value): OriginStep => {
+          const step = record(value, ["kind", "value"]);
+          if (
+            step.kind !== "set" && step.kind !== "feature" &&
+            step.kind !== "key"
+          ) return invalid();
+          return { kind: step.kind, value: text(step.value) };
+        })),
+    ]),
+  );
+  const diagnostics = list(
+    resolution.diagnostics,
+    (value): PermissionDiagnostic => {
+      const item = object(value);
+      if (item.kind === "unset" || item.kind === "revoked") {
+        record(value, ["kind"]);
+        return { kind: item.kind };
+      }
+      if (
+        item.kind !== "unknown_set" && item.kind !== "unknown_namespace" &&
+        item.kind !== "unknown_key" && item.kind !== "disabled_feature" &&
+        item.kind !== "excluded"
+      ) return invalid();
+      record(value, ["kind", "value"]);
+      return { kind: item.kind, value: text(item.value) };
+    },
+  );
+  return { workspace, allowed, diagnostics };
 }
 export class PermissionHttpError extends Error {
   constructor(public status: number) {
     super(`Permission request rejected (HTTP ${status}).`);
   }
 }
-const path = (workspaceId: string, subjectId: string) =>
-  workspaceApiPath(
+async function request(
+  fetchFn: typeof fetch,
+  path: string,
+): Promise<unknown> {
+  const response = await fetchFn(path);
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new PermissionHttpError(response.status);
+  }
+  return await readBoundedJson(response, MAX_BYTES);
+}
+export async function readPolicySource(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+): Promise<ConfigurationSourceResponse> {
+  return parseSource(
+    await request(fetchFn, workspaceApiPath(workspaceId, "/config/adoption")),
     workspaceId,
-    `/subjektiv/subjects/${encodeURIComponent(subjectId)}/permissions`,
   );
+}
 export async function readPermissions(
   fetchFn: typeof fetch,
   workspaceId: string,
   subjectId: string,
 ): Promise<PermissionView> {
-  const response = await fetchFn(path(workspaceId, subjectId));
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw new PermissionHttpError(response.status);
-  }
-  return parseView(await readBoundedJson(response, MAX_BYTES));
+  const source = await readPolicySource(fetchFn, workspaceId);
+  const policy =
+    source.policies.find((policy) => policy.subject_id === subjectId) ?? null;
+  // The Server binds policy, catalog and both resolutions to this one source
+  // response. Arbitrary-assignment validation is not a saved-policy observation.
+  return { source, policy };
 }
-export async function writePermissions(
-  fetchFn: typeof fetch,
-  workspaceId: string,
-  subjectId: string,
-  request: PolicyUpdate,
-): Promise<Mutation> {
-  const response = await fetchFn(path(workspaceId, subjectId), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(request),
-  });
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw new PermissionHttpError(response.status);
-  }
-  const v = object(await readBoundedJson(response, MAX_BYTES));
-  return {
-    permissions: parsePolicy(v.permissions),
-    interruptions: list(v.interruptions, (value) => {
-      const i = object(value);
-      return {
-        runtime_id: text(i.runtime_id),
-        worker_id: text(i.worker_id),
-        cancellation_accepted: bool(i.cancellation_accepted),
-        backend_command_sessions_closed: bool(
-          i.backend_command_sessions_closed,
-        ),
-        diagnostics: list(i.diagnostics, text),
-      };
-    }),
-  };
+export function referenceLabel(reference: PermissionReference): string {
+  return reference.kind === "set"
+    ? `Set · ${reference.value}`
+    : `Namespace · ${reference.value.namespace} · ${
+      reference.value.keys.join(", ") || "(no keys)"
+    }`;
 }
-export function permissionKey(permission: ScopedPermission): string {
-  return JSON.stringify([
-    permission.operation,
-    Object.entries(permission.resource).sort(([a], [b]) => a.localeCompare(b)),
-  ]);
-}
-export function policyDiff(
-  before: ScopedPermission[],
-  after: ScopedPermission[],
-) {
-  return {
-    added: after.filter((p) =>
-      !before.some((b) => permissionKey(b) === permissionKey(p))
-    ),
-    removed: before.filter((p) =>
-      !after.some((a) => permissionKey(a) === permissionKey(p))
-    ),
-  };
-}
-export function resourceLabel(resource: PermissionResource): string {
-  const labels: Record<string, string> = {
-    workspace: "Current workspace",
-    worker_operation: "Worker operation use (target control grant required)",
-    plugin_installation: "Plugin installation",
-    subject: "Subject",
-    ticket: "Ticket",
-    objective: "Objective",
-    merge_request: "Merge request",
-    workdir: "Workdir",
-    workspace_config: "Workspace configuration",
-    network: "URL",
-    drive_entry: "Drive entry",
-    drive_request: "Drive request",
-    repository: "Repository",
-    workdir_attachment: "Workdir connection",
-    feature: "MCP activation / legacy feature",
-    worker: "Legacy Worker target",
-    sub_worker: "Internal SubWorker",
-    job: "Job",
-  };
-  const identifiers = Object.entries(resource).filter(([key]) =>
-    !["kind", "workspace_id", "recursive"].includes(key)
-  ).map(([_, value]) => String(value));
-  return `${labels[resource.kind]}${
-    identifiers.length ? ` · ${identifiers.join(" / ")}` : ""
-  }${
-    "recursive" in resource && resource.recursive
-      ? " (including descendants)"
-      : ""
-  }`;
-}
-// 保存値の正本ではなく、同じ操作の完全一致再送に必要な入力だけをtab内に保持する。
-export function attemptKey(workspaceId: string, subjectId: string): string {
-  return `yoi.subject-permissions:${JSON.stringify([workspaceId, subjectId])}`;
-}
-export function readAttempt(
-  storage: Pick<Storage, "getItem">,
-  workspaceId: string,
-  subjectId: string,
-): PolicyUpdate | null {
-  const raw = storage.getItem(attemptKey(workspaceId, subjectId));
-  if (raw === null) return null;
-  if (raw.length > MAX_BYTES) {
-    throw new Error(
-      "Saved permission request is unreadable. Do not start another save.",
-    );
-  }
-  const v = object(JSON.parse(raw));
-  return {
-    operation_id: text(v.operation_id),
-    expected_change_id: v.expected_change_id === null
-      ? null
-      : text(v.expected_change_id),
-    execution: list(v.execution, parsePermission),
-    delegation: list(v.delegation, parsePermission),
-  };
-}
-export function makeResource(
-  kind: PermissionResource["kind"],
-  workspaceId: string,
-  subjectId: string,
-  inputs: Record<string, string>,
-  recursive: boolean,
-): PermissionResource {
-  const r: Record<string, unknown> = { kind };
-  for (const key of fields[kind]) {
-    r[key] = key === "workspace_id"
-      ? workspaceId
-      : key === "recursive"
-      ? recursive
-      : key === "subject_id"
-      ? (inputs[key]?.trim() || subjectId)
-      : inputs[key]?.trim() ?? "";
-    if (
-      typeof r[key] === "string" && !(r[key] as string).length && key !== "path"
-    ) throw new Error("Enter the required target resource.");
-  }
-  if (kind === "workdir" && !r.path) r.path = ".";
-  return parseResource(r);
-}
-export function resourceFields(kind: PermissionResource["kind"]): string[] {
-  return fields[kind].filter((key) =>
-    !["workspace_id", "recursive"].includes(key)
-  );
-}
-export const fieldLabel: Record<string, string> = {
-  installation_id: "Plugin installation identifier",
-  ticket_id: "Ticket identifier",
-  objective_id: "Objective identifier",
-  merge_request_id: "Merge request identifier",
-  subject_id: "Subject identifier (empty means this Subject)",
-  node_id: "Drive entry number",
-  request_id: "Drive request identifier",
-  repository_key: "Repository key",
-  connection_id: "Workdir connection identifier",
-  path: "Relative path",
-  url: "Exact HTTP(S) URL",
-  working_directory_id: "Workdir identifier",
-  job_id: "Job identifier",
-  runtime_id: "Runtime identifier",
-  worker_id: "Worker identifier",
-  name: "Internal SubWorker name",
-};

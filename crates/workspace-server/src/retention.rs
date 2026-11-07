@@ -316,6 +316,7 @@ impl SqliteWorkspaceStore {
 
     /// An automatic Job cleanup may create its first canonical child, but cannot
     /// replace one hidden by authority/staleness filters after an uncertain effect.
+    /// Blocked plans never pass begin/admit execution and remain diagnostic plans.
     /// The predecessor check and first-plan save share the canonical writer Tx.
     pub(crate) fn plan_job_cleanup_worker_removal(
         &self,
@@ -347,7 +348,7 @@ impl SqliteWorkspaceStore {
             let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if first_job_cleanup_child {
                 let prior: Option<String> = tx.query_row(
-                    "SELECT plan_id FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 ORDER BY created_at,operation_id LIMIT 1",
+                    "SELECT plan_id FROM worker_removal_operations WHERE workspace_id=?1 AND runtime_id=?2 AND worker_id=?3 AND state!='blocked' ORDER BY created_at,operation_id LIMIT 1",
                     params![req.workspace_id,req.worker.runtime_id,req.worker.worker_id], |row| row.get(0),
                 ).optional()?;
                 if let Some(plan_id) = prior {
@@ -3800,6 +3801,70 @@ mod tests {
         let replacement = store.plan_worker_removal(&request, &inv()).unwrap();
         assert_eq!(replacement.worker_updated_at, "2026-08-24T00:00:01Z");
         assert_ne!(replacement.plan_id, plan.plan_id);
+    }
+
+    #[test]
+    fn automatic_job_cleanup_admits_first_execution_only_after_a_blocked_plan_clears() {
+        let store = setup();
+        let request = req();
+        store
+            .update_worker_retention("w", &request.worker, "pinned", "2026-08-24T00:00:01Z")
+            .unwrap();
+        assert!(matches!(
+            store.plan_job_cleanup_worker_removal(&request, &inv()),
+            Err(WorkerRetentionError::Blocked(blockers)) if blockers == vec![WorkerRemovalBlocker::Hold]
+        ));
+        store.with_conn(|connection| {
+            assert_eq!(connection.query_row(
+                "SELECT count(*) FROM worker_removal_operations WHERE workspace_id='w' AND runtime_id='r' AND worker_id=?1",
+                [request.worker.worker_id.as_str()], |row| row.get::<_, i64>(0),
+            )?, 0, "automatic admission refusal must not create a child");
+            Ok(())
+        }).unwrap();
+        // Explicit planning may retain a diagnostic Blocked row. It never
+        // authorizes execution or prevents cleanup's first admitted child.
+        let blocked = store.plan_worker_removal(&request, &inv()).unwrap();
+        assert_eq!(blocked.state, WorkerRemovalPlanState::Blocked);
+        assert!(
+            store
+                .prepare_worker_removal_execution("w", &blocked.plan_id, &blocked.input_fingerprint)
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_worker_removal_execution("w", &request.worker)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .update_worker_retention("w", &request.worker, "normal", "2026-08-24T00:00:02Z")
+            .unwrap();
+        let first = store
+            .plan_job_cleanup_worker_removal(&request, &inv())
+            .unwrap();
+        assert_ne!(first.operation_id, blocked.operation_id);
+        let execution = store
+            .prepare_worker_removal_execution("w", &first.plan_id, &first.input_fingerprint)
+            .unwrap();
+        assert_eq!(execution.runtime_request.operation_id, first.operation_id);
+        assert!(
+            store
+                .plan_job_cleanup_worker_removal(&request, &inv())
+                .is_err()
+        );
+        store
+            .with_conn(|connection| {
+                assert_eq!(
+                    load_plan(connection, &blocked.plan_id)?.unwrap().state,
+                    WorkerRemovalPlanState::Blocked
+                );
+                assert_eq!(
+                    load_plan(connection, &first.plan_id)?.unwrap().state,
+                    WorkerRemovalPlanState::Executing
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

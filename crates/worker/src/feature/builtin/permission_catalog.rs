@@ -1,134 +1,48 @@
-//! Server-side registration of the compiled builtin operation declarations.
-//!
-//! This is a trusted builtin loader, not a wire-catalog importer. Namespace
-//! ownership is listed here explicitly; neither a permission spelling nor a
-//! management request chooses an owner. The existing operation descriptors own
-//! exact names. No dotted-prefix children are inferred. Profiles/provider scopes
-//! and actual operation authorization remain independent of this metadata load.
+//! Trusted metadata composition of Feature-owned declarations, independent of
+//! Tool enablement. The legacy resource editor is not an operation authority.
 
-use super::super::FeatureInstallError;
-use feature_permissions::{
-    FeatureIdentity, NamespaceDeclaration, NamespaceId, NamespacePermissions, PermissionDefinition,
-    PermissionHost, PermissionKey, PermissionReference, PermissionSetId, SetContribution,
-    WorkspaceId,
-};
-use std::collections::BTreeMap;
+use super::super::{FeatureInstallError, FeatureRegistryBuilder};
+use super::FeaturePermissionRegistry;
+use crate::feature::builtin;
+use feature_permissions::{PermissionHost, WorkspaceId};
 
-const OWNERS: &[(&str, &str)] = &[
-    ("filesystem", "builtin:workdir"),
-    ("bash", "builtin:bash"),
-    ("workdir", "builtin:workdir"),
-    ("worker", "builtin:worker"),
-    ("subworker", "builtin:sub-worker-control"),
-    ("ticket", "builtin:ticket"),
-    ("objective", "builtin:objective"),
-    ("merge_request", "builtin:merge-request"),
-    ("repository", "builtin:repository"),
-    ("drive", "builtin:drive"),
-    ("workspace_config", "builtin:workspace-config"),
-    ("memory", "builtin:memory"),
-    ("journal", "builtin:journal-recording"),
-    ("chat", "builtin:subjektiv-chat"),
-    ("session", "builtin:session-explore"),
-    ("web", "builtin:web"),
-    ("notification", "builtin:notification"),
-];
+pub fn builtin_permission_registry(
+    workspace: WorkspaceId,
+) -> Result<FeaturePermissionRegistry, FeatureInstallError> {
+    let mut builder = FeatureRegistryBuilder::new();
+    // This is module composition, not a namespace/resource ownership table.
+    // Each participant supplies its own registered identity and declaration.
+    for declaration in [
+        &builtin::manage_workdir::permission_declaration::FILESYSTEM,
+        &builtin::bash::permission_declaration::DECLARATION,
+        &builtin::manage_workdir::permission_declaration::DECLARATION,
+        &builtin::manage_worker::permission_declaration::DECLARATION,
+        &builtin::manage_worker::permission_declaration::SUBWORKER,
+        &builtin::ticket::permission_declaration::DECLARATION,
+        &builtin::objective::permission_declaration::DECLARATION,
+        &builtin::merge_request::permission_declaration::DECLARATION,
+        &builtin::repository_permissions::DECLARATION,
+        &builtin::drive::permission_declaration::DECLARATION,
+        &builtin::workspace_config::permission_declaration::DECLARATION,
+        &builtin::memory::permission_declaration::DECLARATION,
+        &builtin::journal::permission_declaration::DECLARATION,
+        &builtin::subjektiv_chat::permission_declaration::DECLARATION,
+        &builtin::session_explore::permission_declaration::DECLARATION,
+        &builtin::web::permission_declaration::DECLARATION,
+        &builtin::notification_permissions::DECLARATION,
+        &builtin::plugin_host_permissions::DECLARATION,
+    ] {
+        builder = builder.with_module(super::BuiltinPermissionFeature(declaration));
+    }
+    builder.permission_registry(workspace)
+}
 
 pub fn builtin_permission_host(
     workspace: WorkspaceId,
 ) -> Result<PermissionHost, FeatureInstallError> {
-    let invalid = |e: &dyn std::fmt::Display| FeatureInstallError::InvalidDescriptor(e.to_string());
-    let mut host = PermissionHost::new(workspace);
-    let mut features = BTreeMap::new();
-    // MCP's scalar startup permission is the retained T-787 exception, not a
-    // payload-free operation key. Do not invent mcp.* authority or a Set for it.
-    // Legacy migration retains it as an explicit-configuration-required diagnostic.
-    let operations = server_api::authorization::subject_permission_operations()
-        .into_iter()
-        .filter(|operation| operation.operation != "mcp")
-        .collect::<Vec<_>>();
-    for (namespace, owner) in OWNERS {
-        let feature = match features.get(owner) {
-            Some(feature) => feature,
-            None => {
-                let feature = host
-                    .register_feature(FeatureIdentity::parse(*owner).map_err(|e| invalid(&e))?)
-                    .map_err(|e| invalid(&e))?;
-                features.entry(owner).or_insert(feature)
-            }
-        };
-        let id = NamespaceId::parse(*namespace).map_err(|e| invalid(&e))?;
-        let handle = host
-            .bind_namespace(feature, id.clone())
-            .map_err(|e| invalid(&e))?;
-        let permissions = operations
-            .iter()
-            .filter(|operation| operation.operation.split('.').next() == Some(namespace))
-            .map(|operation| {
-                Ok(PermissionDefinition {
-                    key: PermissionKey::parse(operation.operation.clone())
-                        .map_err(|e| invalid(&e))?,
-                    description: operation.description.clone(),
-                    children: vec![],
-                })
-            })
-            .collect::<Result<Vec<_>, FeatureInstallError>>()?;
-        let keys = permissions
-            .iter()
-            .map(|definition| definition.key.clone())
-            .collect();
-        host.declare(
-            &handle,
-            NamespaceDeclaration {
-                permissions,
-                sets: vec![SetContribution {
-                    set: PermissionSetId::parse(*namespace).map_err(|e| invalid(&e))?,
-                    children: vec![PermissionReference::Namespace(NamespacePermissions {
-                        namespace: id,
-                        keys,
-                    })],
-                }],
-            },
-        )
-        .map_err(|e| invalid(&e))?;
-    }
-    // A new builtin operation needs an intentional namespace ownership decision.
-    for operation in operations {
-        if !OWNERS
-            .iter()
-            .any(|(namespace, _)| operation.operation.split('.').next() == Some(*namespace))
-        {
-            return Err(FeatureInstallError::InvalidDescriptor(format!(
-                "builtin operation has no namespace owner: {}",
-                operation.operation
-            )));
-        }
-    }
-    Ok(host)
+    Ok(builtin_permission_registry(workspace)?.into_host())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn builtin_keys_are_complete_exact_and_have_no_inferred_children() {
-        let host = builtin_permission_host(WorkspaceId::parse("workspace-a").unwrap()).unwrap();
-        let catalog = host.catalog();
-        let mut keys = std::collections::BTreeSet::new();
-        for namespace in catalog.namespaces {
-            for permission in namespace.declaration.permissions {
-                assert!(permission.children.is_empty());
-                assert!(keys.insert(permission.key.as_str().to_owned()));
-            }
-        }
-        assert!(!keys.contains("mcp"));
-        assert_eq!(
-            keys,
-            server_api::authorization::subject_permission_operations()
-                .into_iter()
-                .filter(|operation| operation.operation != "mcp")
-                .map(|o| o.operation)
-                .collect()
-        );
-    }
-}
+#[path = "permission_catalog_tests.rs"]
+mod tests;

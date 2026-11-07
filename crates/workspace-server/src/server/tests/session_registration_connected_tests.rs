@@ -114,7 +114,7 @@ impl RegistrationFixture {
         // Armed only after real Subject creation with its normal default policy.
         // The callback is a deterministic synchronization point, not a fake Host
         // rejection: the original signed request and real handler remain intact.
-        let revoke = Arc::new(Mutex::new(None::<(WorkspaceApi, String, PathBuf)>));
+        let revoke = Arc::new(Mutex::new(None::<(WorkspaceApi, String, PathBuf, String)>));
         let hook = revoke.clone();
         let callbacks = Arc::new(Mutex::new(Vec::new()));
         let observed = callbacks.clone();
@@ -156,19 +156,18 @@ impl RegistrationFixture {
                             worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER
                         ));
                         let armed = hook.lock().unwrap().take();
-                        let pin_root = armed.as_ref().map(|(_, _, root)| root.clone());
+                        let pin_root = armed.as_ref().map(|(_, _, root, _)| root.clone());
                         let metadata_fault_root = pin_root.clone().filter(|_| {
                             matches!(fault, RegistrationFault::DenyWithMetadataReadFailure)
                         });
-                        if let Some((api, subject, _)) = armed {
+                        if let Some((api, subject, _, owner)) = armed {
                             let store = open_subjektiv_store(&api).unwrap();
-                            let policy = store.subject_permissions(&subject).unwrap().unwrap();
-                            assert!(
-                                policy
-                                    .execution
-                                    .iter()
-                                    .any(|p| p.operation == "session.record")
+                            let policy = store.current_subject_policy(&subject).unwrap().unwrap();
+                            assert_eq!(
+                                policy.execution,
+                                server_api::authorization::subject_default_permission_assignment()
                             );
+                            assert!(policy.legacy_constraints.is_none());
                             if matches!(fault, RegistrationFault::ReleasePending) {
                                 let key = crate::subjektiv::subject_worker_singleton_key(&subject).unwrap();
                                 let lease = api.store
@@ -185,22 +184,16 @@ impl RegistrationFixture {
                                 assert_eq!(api.store.current_worker_singleton_owner(TEST_WORKSPACE_ID, &key).unwrap(), Some(lease.clone()));
                                 *reserved.lock().unwrap() = Some((lease, writer));
                             } else if !matches!(fault, RegistrationFault::CommittedResponseLost) {
-                                store
-                                    .set_subject_permissions(
-                                        &subject,
-                                        &SubjectPermissionsUpdate {
-                                            operation_id: "session-registration-revoke-at-callback"
-                                                .into(),
-                                            expected_change_id: Some(policy.change_id),
-                                            execution: policy
-                                                .execution
-                                                .into_iter()
-                                                .filter(|p| p.operation != "session.record")
-                                                .collect(),
-                                            delegation: policy.delegation,
-                                        },
-                                    )
-                                    .unwrap();
+                                // Change the current Feature assignment through its sole
+                                // adoption writer at the real signed callback boundary.
+                                // Retain the default set and exclude only session.record.
+                                super::chat_tests::adopt_chat_policy(
+                                    &api,
+                                    &owner,
+                                    &subject,
+                                    r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#,
+                                )
+                                .await;
                             }
                         }
                         let (parts, body) = request.into_parts();
@@ -268,20 +261,20 @@ impl RegistrationFixture {
             .id;
         let initial = open_subjektiv_store(&connected.api)
             .unwrap()
-            .subject_permissions(&subject)
+            .current_subject_policy(&subject)
             .unwrap()
             .unwrap();
-        assert!(
-            initial
-                .execution
-                .iter()
-                .any(|p| p.operation == "session.record")
+        assert_eq!(
+            initial.execution,
+            server_api::authorization::subject_default_permission_assignment()
         );
+        assert!(initial.legacy_constraints.is_none());
         if !matches!(fault, RegistrationFault::Allow) {
             *revoke.lock().unwrap() = Some((
                 connected.api.clone(),
                 subject.clone(),
                 connected.runtime_root.clone(),
+                connected.owner.clone(),
             ));
         }
         Self {
@@ -831,14 +824,23 @@ async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() 
             .unwrap()
             .is_empty()
     );
-    assert!(
-        !store
-            .subject_permissions(&fixture.subject)
-            .unwrap()
-            .unwrap()
-            .execution
-            .iter()
-            .any(|p| p.operation == "session.record")
+    let denied_policy = store
+        .current_subject_policy(&fixture.subject)
+        .unwrap()
+        .unwrap();
+    assert!(denied_policy.legacy_constraints.is_none());
+    assert_eq!(
+        denied_policy.execution.grants,
+        server_api::authorization::subject_default_permission_assignment().grants
+    );
+    assert_eq!(
+        denied_policy.execution.exclusions,
+        vec![feature_permissions::PermissionReference::Namespace(
+            feature_permissions::NamespacePermissions {
+                namespace: feature_permissions::NamespaceId::parse("session").unwrap(),
+                keys: vec![feature_permissions::PermissionKey::parse("session.record").unwrap()],
+            },
+        )]
     );
 
     let failures = fixture.connected.runtime_startup_failures.lock().unwrap();
@@ -1018,7 +1020,14 @@ async fn pending_release_binding_refusal_retains_original_conflict_source() {
         &session,
     )
     .unwrap();
-    let error = session_registration::bind_host_session(&f.api, attr).unwrap_err();
+    // This cause/source unit uses the trusted internal registration boundary;
+    // the signed route and original request binding have connected coverage.
+    let error = subjektiv_journal::bind_host_session_for_registration(
+        &f.api,
+        attr,
+        subjektiv_journal::SessionRegistrationCaller::InternalRecovery,
+    )
+    .unwrap_err();
     assert_eq!(
         error.session_registration_cause,
         Some(SessionRegistrationCause::binding_mismatch())
@@ -1046,7 +1055,7 @@ async fn release_fence_refusal_survives_signed_registration_and_metadata_reopen(
     let api = &fixture.connected.api;
     let store = open_subjektiv_store(api).unwrap();
     let policy = store
-        .subject_permissions(&fixture.subject)
+        .current_subject_policy(&fixture.subject)
         .unwrap()
         .unwrap();
     let error = scoped_create_workspace_worker(
@@ -1062,7 +1071,7 @@ async fn release_fence_refusal_survives_signed_registration_and_metadata_reopen(
     let session = fixture.assert_callback(StatusCode::CONFLICT);
     let (lease, writer) = fixture.release_fence.lock().unwrap().clone().unwrap();
     assert_eq!(
-        store.subject_permissions(&fixture.subject).unwrap(),
+        store.current_subject_policy(&fixture.subject).unwrap(),
         Some(policy)
     );
     assert!(store.session_attribution(&session).unwrap().is_none());
@@ -1136,7 +1145,7 @@ async fn permitted_session_registration_reaches_real_factory_and_saved_confirmat
     let fixture = RegistrationFixture::new(RegistrationFault::Allow).await;
     let initial = open_subjektiv_store(&fixture.connected.api)
         .unwrap()
-        .subject_permissions(&fixture.subject)
+        .current_subject_policy(&fixture.subject)
         .unwrap()
         .unwrap();
     let Json(created) = scoped_create_workspace_worker(
@@ -1153,7 +1162,7 @@ async fn permitted_session_registration_reaches_real_factory_and_saved_confirmat
     let store = open_subjektiv_store(&fixture.connected.api).unwrap();
     assert_eq!(
         store
-            .subject_permissions(&fixture.subject)
+            .current_subject_policy(&fixture.subject)
             .unwrap()
             .unwrap(),
         initial

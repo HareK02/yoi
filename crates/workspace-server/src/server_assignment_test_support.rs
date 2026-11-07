@@ -11,10 +11,55 @@ async fn assignment_test_api_with_recording_backend(
     (api, execution)
 }
 
-fn bootstrap_test_assignment_session(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
+// These legacy suites deliberately install exact scoped fixtures by normal CAS.
+// A Feature source supplies only its change ID, never a projection of shared sets.
+// Existing legacy grants remain in their original lanes and retain their resources.
+fn extend_legacy_assignment_fixture_permissions(
+    store: &crate::subjektiv::SubjektivStore,
+    subject: &str,
+    operation_id: String,
+    permissions: Vec<server_api::authorization::ScopedPermission>,
+) {
+    use server_api::authorization::{SubjectPermissionsUpdate, SubjectPolicySource};
+    let (expected_change_id, previous) = match store.subject_policy_source(subject).unwrap() {
+        Some(SubjectPolicySource::Legacy(policy)) => (Some(policy.change_id.clone()), Some(policy)),
+        Some(SubjectPolicySource::Feature(policy)) => (Some(policy.change_id), None),
+        None => (None, None),
     };
+    let mut execution = previous
+        .as_ref()
+        .map(|p| p.execution.clone())
+        .unwrap_or_default();
+    for permission in permissions {
+        if !execution.contains(&permission) {
+            execution.push(permission);
+        }
+    }
+    if previous.as_ref().is_some_and(|p| p.execution == execution) {
+        return;
+    }
+    let delegation = previous
+        .as_ref()
+        .map(|p| p.delegation.clone())
+        .unwrap_or_default();
+    let saved = store
+        .set_subject_permissions(
+            subject,
+            &SubjectPermissionsUpdate {
+                operation_id,
+                expected_change_id,
+                execution: execution.clone(),
+                delegation: delegation.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(saved.execution, execution);
+    assert_eq!(saved.delegation, delegation);
+    assert_eq!(store.subject_permissions(subject).unwrap().unwrap(), saved);
+}
+
+fn bootstrap_test_assignment_session(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
+    use server_api::authorization::{PermissionResource, ScopedPermission};
     use session_store::WorkerMetadataStore;
     assert_eq!(worker.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
     let lease = api
@@ -24,37 +69,21 @@ fn bootstrap_test_assignment_session(api: &WorkspaceApi, worker: &RuntimeWorkerR
         .unwrap();
     let subject = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX).unwrap();
     let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(subject).unwrap();
-    let mut execution = previous
-        .as_ref()
-        .map(|p| p.execution.clone())
-        .unwrap_or_default();
-    let before = execution.clone();
-    for operation in ["session.record", "journal.recording.request"] {
-        let permission = ScopedPermission {
-            operation: operation.into(),
-            resource: PermissionResource::Subject {
-                workspace_id: api.workspace_id().into(),
-                subject_id: subject.into(),
-            },
-        };
-        if !execution.contains(&permission) {
-            execution.push(permission);
-        }
-    }
-    if before != execution {
-        store
-            .set_subject_permissions(
-                subject,
-                &SubjectPermissionsUpdate {
-                    operation_id: format!("assignment-session-{}", worker.worker_id),
-                    expected_change_id: previous.as_ref().map(|p| p.change_id.clone()),
-                    execution,
-                    delegation: previous.map(|p| p.delegation).unwrap_or_default(),
+    extend_legacy_assignment_fixture_permissions(
+        &store,
+        subject,
+        format!("assignment-session-{}", worker.worker_id),
+        ["session.record", "journal.recording.request"]
+            .into_iter()
+            .map(|operation| ScopedPermission {
+                operation: operation.into(),
+                resource: PermissionResource::Subject {
+                    workspace_id: api.workspace_id().into(),
+                    subject_id: subject.into(),
                 },
-            )
-            .unwrap();
-    }
+            })
+            .collect(),
+    );
     let name = format!("worker-runtime-{}", worker.worker_id);
     let aggregate = session_store::worker_metadata::WorkerAggregateStore::new(
         api.config
@@ -113,9 +142,7 @@ async fn reflect_test_assignment_session(
     worker: &RuntimeWorkerRef,
     expected_public_output: &str,
 ) {
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-    };
+    use server_api::authorization::{PermissionResource, ScopedPermission};
     use subjektiv::journal::transport::{JournalJobRequest, JournalJobResponse};
     use subjektiv::journal::{JournalAction, JournalEntryState, JournalOperation};
 
@@ -126,47 +153,29 @@ async fn reflect_test_assignment_session(
         .unwrap();
     let subject = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX).unwrap();
     let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(subject).unwrap().unwrap();
-    let mut execution = previous.execution.clone();
-    for operation in [
-        "journal.job.input.read",
-        "journal.job.input.supply",
-        "journal.state.read",
-        "journal.entry.create",
-        "journal.position.update",
-        "journal.checkpoint",
-        "journal.finish",
-    ] {
-        let permission = ScopedPermission {
+    extend_legacy_assignment_fixture_permissions(
+        &store,
+        subject,
+        format!("assignment-journal-{}", worker.worker_id),
+        [
+            "journal.job.input.read",
+            "journal.job.input.supply",
+            "journal.state.read",
+            "journal.entry.create",
+            "journal.position.update",
+            "journal.checkpoint",
+            "journal.finish",
+        ]
+        .into_iter()
+        .map(|operation| ScopedPermission {
             operation: operation.into(),
             resource: PermissionResource::Subject {
                 workspace_id: api.workspace_id().into(),
                 subject_id: subject.into(),
             },
-        };
-        if !execution.contains(&permission) {
-            execution.push(permission);
-        }
-    }
-    store
-        .set_subject_permissions(
-            subject,
-            &SubjectPermissionsUpdate {
-                operation_id: format!("assignment-journal-{}", worker.worker_id),
-                expected_change_id: Some(previous.change_id.clone()),
-                execution,
-                delegation: previous.delegation.clone(),
-            },
-        )
-        .unwrap();
-    let saved_permissions = store.subject_permissions(subject).unwrap().unwrap();
-    assert!(
-        previous
-            .execution
-            .iter()
-            .all(|permission| saved_permissions.execution.contains(permission))
+        })
+        .collect(),
     );
-    assert_eq!(saved_permissions.delegation, previous.delegation);
     let attrs = store
         .subject_session_attributions(subject)
         .unwrap()
@@ -275,20 +284,46 @@ async fn reflect_test_assignment_session(
         };
         token = receipt.state_token;
     }
-    let completion = subjektiv_journal::finish(api, journal_worker).unwrap();
+    // The ordinary recovery owner may settle a complete saved checkpoint before
+    // the model's final result arrives. Exercise that owner instead of racing a
+    // second live-attempt Finish request against its canonical completion.
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let current_job = api
+                .store
+                .get_backend_job(api.workspace_id(), &job.request.job_id)
+                .unwrap()
+                .unwrap();
+            let current_attempt = api
+                .store
+                .get_backend_job_attempt(
+                    api.workspace_id(),
+                    &job.request.job_id,
+                    &attempt.attempt_id,
+                )
+                .unwrap()
+                .unwrap();
+            if current_attempt.state == BackendJobAttemptState::Completed {
+                break current_attempt;
+            }
+            assert_eq!(current_attempt.state, BackendJobAttemptState::Dispatched);
+            match subjektiv_journal::reconcile_attempt(api, &current_job, &current_attempt) {
+                Ok(()) | Err(Error::RepositoryConflict(_)) => {}
+                Err(error) => panic!("Journal checkpoint recovery failed: {error}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("saved Journal checkpoint did not settle its actual attempt");
+    let value = completed
+        .result
+        .as_ref()
+        .expect("actual saved Journal result");
+    subjektiv_journal::validate_result(api, &job.request, &completed, value).unwrap();
+    let completion: subjektiv::journal::transport::JournalJobCompletion =
+        serde_json::from_value(value.clone()).unwrap();
     assert_eq!(completion.state_token, token);
-    let accepted = api
-        .accept_backend_job_result(
-            journal_worker,
-            &BackendJobResultSubmission {
-                job_id: job.request.job_id.clone(),
-                attempt_id: attempt.attempt_id.clone(),
-                input_digest: attempt.input_digest,
-                result: serde_json::to_value(completion).unwrap(),
-            },
-        )
-        .unwrap();
-    assert_eq!(accepted.attempt.state, BackendJobAttemptState::Completed);
     wait_for_backend_job_worker_cleanup(
         api,
         &job.request.job_id,
@@ -335,6 +370,80 @@ async fn remove_test_assignment_body(api: &WorkspaceApi, worker: &RuntimeWorkerR
         .await
         .unwrap();
     assert_eq!(removed.status, StatusCode::OK.as_u16(), "{}", removed.body);
+}
+
+#[tokio::test]
+async fn assignment_disconnect_after_restore_keeps_shutdown_and_old_protocol_fenced() {
+    use worker_runtime::execution::WorkerExecutionBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (api, execution) = assignment_test_api_with_recording_backend(dir.path()).await;
+    let started = start_attention_test_orchestrator(&api).await;
+    let worker = RuntimeWorkerRef::new(
+        EMBEDDED_WORKER_RUNTIME_ID,
+        started.worker.unwrap().worker_id,
+    );
+    let worker_ref = worker_runtime::identity::WorkerRef::new(
+        worker_runtime::identity::WorkerId::parse(&worker.worker_id).unwrap(),
+    );
+    let old = execution
+        .clone()
+        .attach_worker_protocol(&worker_ref)
+        .unwrap();
+    let stopped = api
+        .runtime
+        .stop_worker(&worker, WorkerLifecycleRequest::default())
+        .unwrap();
+    assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
+    let first = api.runtime.backend_job_termination(&worker).unwrap().unwrap();
+    assert!(old.validate().is_err());
+
+    execution.accept_restores();
+    let restored = start_attention_test_orchestrator(&api).await;
+    assert_eq!(restored.disposition, "restored");
+    assert_eq!(restored.worker.unwrap().worker_id, worker.worker_id);
+    let current = execution
+        .clone()
+        .attach_worker_protocol(&worker_ref)
+        .unwrap();
+    current.validate().unwrap();
+    assert!(old.validate().is_err());
+    let submit = || protocol::Method::Submit {
+        submission_request_id: "disconnected-body-input".into(),
+        input: vec![],
+    };
+    assert!(old.dispatch(submit()).is_err());
+
+    let disconnected = subjektiv_journal::release_subject(
+        &api,
+        serde_json::from_value(json!({
+            "worker": worker, "operation_id": "disconnect-restored-body",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        disconnected.state,
+        runtime_api::SubjectReleaseState::Disconnected
+    );
+    current.validate().unwrap();
+    assert!(current.dispatch(submit()).is_err());
+    let stopped = api
+        .runtime
+        .stop_worker(&worker, WorkerLifecycleRequest::default())
+        .unwrap();
+    assert_eq!(
+        stopped.state,
+        InternalWorkerOperationState::Accepted,
+        "{:?}",
+        stopped.diagnostics
+    );
+    let second = api.runtime.backend_job_termination(&worker).unwrap().unwrap();
+    assert_ne!(first.execution_id, second.execution_id);
+    assert!(second.confirms_scope_shutdown(&worker_ref, second.stop_operation_id));
+    assert!(current.validate().is_err());
+    assert!(current.dispatch(submit()).is_err());
+    assert!(old.dispatch(submit()).is_err());
 }
 
 impl DeterministicExecutionBackend {
@@ -392,7 +501,8 @@ impl DeterministicExecutionBackend {
                 }) {
                     return Err("Subject disconnect has no exact receiver reservation".into());
                 }
-                execution.method_rx.lock().unwrap().take();
+                // Disconnect fences new mutations in dispatch; it is not Stop.
+                // Keep the receiver alive for canonical Shutdown and scope drain.
                 S::Disconnected
             }
         };

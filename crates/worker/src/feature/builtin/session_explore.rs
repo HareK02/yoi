@@ -5,6 +5,8 @@
 //! references, privacy, and exploration bounds. It exposes history to internal verifiers and similar
 //! consumers without business-mutation capabilities.
 
+pub(crate) mod permission_declaration;
+
 use std::sync::Arc;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
@@ -60,6 +62,13 @@ impl SessionExploreFeature {
 }
 
 impl FeatureModule for SessionExploreFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin("session-explore", "Session Explore")
             .with_description(

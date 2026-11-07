@@ -1885,9 +1885,7 @@ fn is_builtin_path(path: &VirtualPath) -> bool {
 
 fn validate_workspace_path(path: &VirtualPath) -> Result<(), ConfigTreeError> {
     if is_builtin_path(path) {
-        return Err(ConfigTreeError::InvalidPath(format!(
-            "{path}: builtin namespace is read-only"
-        )));
+        return Err(ConfigTreeError::BuiltinReadOnly(path.clone()));
     }
     Ok(())
 }
@@ -2289,6 +2287,8 @@ fn format_digest(bytes: &[u8]) -> String {
 pub enum ConfigTreeError {
     #[error("invalid virtual config path: {0}")]
     InvalidPath(String),
+    #[error("{0}: builtin namespace is read-only")]
+    BuiltinReadOnly(VirtualPath),
     #[error("invalid virtual config import: {0}")]
     InvalidImport(String),
     #[error("virtual config import escapes the tree: {0}")]

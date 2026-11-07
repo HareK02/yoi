@@ -22,10 +22,22 @@ impl SqliteWorkspaceStore {
     // Only the fresh API fixture may use this after copying its verified template.
     // Open a distinct connection without replacing the DB or sharing a transaction.
     pub(crate) fn connect_prepared_fixture(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        configure_sqlite(&conn)?;
+        drop(Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?);
+        // Template preparation skips repeated domain migrations, never native
+        // ownership. Effect admission needs the same physical Host fence as production.
+        let owner = feature_storage::FeatureStorage::for_server_database(path)?;
+        let database = owner.open_host_catalog(
+            path,
+            "server-catalog",
+            "Host configured Server database",
+            |connection| configure_sqlite(connection),
+        )?;
         Ok(Self {
-            conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
+            conn: StoreConnection::Managed(database),
+            plugin_manifest_cache: Arc::default(),
             db_executor: crate::db_executor::DbExecutor::new(
                 crate::db_executor::DbExecutorLimits::default(),
             )?,
@@ -57,6 +69,7 @@ impl SqliteWorkspaceStore {
         configure_sqlite(&conn)?;
         Ok(Self {
             conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
+            plugin_manifest_cache: Arc::default(),
             db_executor: crate::db_executor::DbExecutor::new(
                 crate::db_executor::DbExecutorLimits::default(),
             )?,
@@ -153,7 +166,11 @@ fn api_fixture_databases_isolate_writes_and_reopen_persisted_rows() {
         let handles: Vec<_> = ["first", "second"]
             .into_iter()
             .map(|name| {
-                let path = temp.path().join(format!("{name}.db"));
+                // A Server's native catalog belongs to its directory, not a
+                // filename. Independent Servers need distinct ownership roots.
+                let root = temp.path().join(name);
+                std::fs::create_dir(&root).unwrap();
+                let path = root.join("server.db");
                 scope.spawn(move || {
                     let store = SqliteWorkspaceStore::open_api_fixture(&path).unwrap();
                     store.with_conn(|conn| {

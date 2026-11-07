@@ -366,6 +366,22 @@ async fn runtime_orchestrator_tags_without_operation_policy_do_not_grant_assignm
             crate::subjektiv::SubjectRole::new("unprivileged-assignment-source").unwrap(),
         )
         .unwrap();
+    let subjects = open_subjektiv_store(&api).unwrap();
+    let initial = subjects
+        .current_subject_policy(&unprivileged.id)
+        .unwrap()
+        .unwrap();
+    subjects
+        .set_subject_permissions(
+            &unprivileged.id,
+            &server_api::authorization::SubjectPermissionsUpdate {
+                operation_id: "empty-unprivileged-assignment-source".into(),
+                expected_change_id: Some(initial.change_id),
+                execution: vec![],
+                delegation: vec![],
+            },
+        )
+        .unwrap();
     let forged = create_test_assignment_body(&api, &source.runtime_id, &unprivileged.id).await;
     // Runtime display metadata cannot mint operation policy. Backend ownership
     // remains this real, unprivileged Subject, even if the adapter advertises tags.

@@ -13,6 +13,10 @@ use server_api::{
 };
 use uuid::Uuid;
 
+mod transaction;
+use transaction::local_policy_source;
+pub use transaction::{ChatPolicySource, ChatTransaction};
+
 pub type Result<T> = std::result::Result<T, ChatError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -169,6 +173,8 @@ impl SubjektivStore {
 
     /// The Host must authorize `chat.read`, then pin that policy's existing change ID.
     /// It must hold current Subject body ownership through this FeatureStorage transaction.
+    /// Unsealed source compatibility only. Canonical Hosts must use
+    /// `with_chat_transaction` so current policy and ownership share one Server fence.
     pub fn chat_messages_for_subject_authorized(
         &self,
         subject: &str,
@@ -191,28 +197,14 @@ impl SubjektivStore {
         query: &ChatMessagePageQuery,
         expected_permission_change_id: Option<&str>,
     ) -> Result<ChatMessagePage> {
-        if query.after_sequence.is_some_and(|s| s > CHAT_MAX_COUNTER) {
-            return Err(ChatError::InvalidInput(
-                "message cursor exceeds JSON safe-integer range".into(),
-            ));
-        }
-        let limit = query.limit.unwrap_or(CHAT_DEFAULT_PAGE_LIMIT);
-        if !(1..=CHAT_MAX_PAGE_LIMIT).contains(&limit) {
-            return Err(ChatError::InvalidInput(format!(
-                "page limit must be in 1..={CHAT_MAX_PAGE_LIMIT}"
-            )));
-        }
         self.database.try_transaction(|tx| {
-            check_authorization(tx, principal, expected_permission_change_id)?;
-            let conversation = conversation(tx, principal, conversation_id)?;
-            let conversation_id = &conversation.id;
-            let after = query.after_sequence.unwrap_or(0) as i64;
-            let mut messages = tx.prepare(&format!("SELECT {MESSAGE_COLUMNS} FROM chat_messages WHERE conversation_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3"))?
-                .query_map(params![conversation_id, after, limit+1], message_row)?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let has_more = messages.len() > limit as usize;
-            messages.truncate(limit as usize);
-            Ok(ChatMessagePage { conversation, messages, has_more })
+            messages_in_transaction(
+                tx,
+                principal,
+                conversation_id,
+                query,
+                expected_permission_change_id,
+            )
         })
     }
 
@@ -246,7 +238,9 @@ impl SubjektivStore {
     }
 
     /// The Host must authorize `chat.send`, then pin that policy's existing change ID.
-    /// The ownership guard must span commit; its callback must not reenter the Backend Store.
+    /// Unsealed source compatibility only; canonical Hosts use `with_chat_transaction`.
+    /// Do not enter Server SQL and then acquire this Feature transaction (cutover's
+    /// order is Feature -> Server). No canonical-provider calls are made here.
     pub fn chat_send_message_authorized(
         &self,
         subject: &str,
@@ -283,65 +277,161 @@ impl SubjektivStore {
         input: Append<'_>,
         expected_permission_change_id: Option<&str>,
     ) -> Result<ChatMessage> {
-        identifier(input.operation_id)?;
-        if input.text.trim().is_empty() || input.text.len() > CHAT_MAX_TEXT_BYTES {
-            return Err(ChatError::InvalidInput(format!(
-                "text must be nonblank and at most {CHAT_MAX_TEXT_BYTES} UTF-8 bytes"
-            )));
-        }
-        for reference in [input.reply_to, input.work_ref]
-            .into_iter()
-            .flatten()
-            .chain(input.expected_last_user_message_id.into_iter().flatten())
-        {
-            identifier(reference)?;
-        }
         self.database.try_transaction(|tx| {
-            check_authorization(tx, principal, expected_permission_change_id)?;
-            let mut conversation = conversation(tx, principal, conversation_id)?;
-            let canonical_id = conversation.id.clone();
-            let conversation_id = canonical_id.as_str();
-            let (kind, sender_id) = principal.sender();
-            let saved = tx.query_row(&format!("SELECT {MESSAGE_COLUMNS} FROM chat_messages
-                WHERE conversation_id=?1 AND sender_kind=?2 AND sender_id=?3 AND operation_id=?4"),
-                params![conversation_id, kind, sender_id, input.operation_id], message_row).optional()?;
-            // Replay precedes the current-input fence: ACK loss must remain recoverable after
-            // another user input. The pinned observed user identity remains part of the full request.
-            if let Some(saved) = saved {
-                if saved.text != input.text || &saved.reply_to != input.reply_to || &saved.work_ref != input.work_ref
-                    || input.expected_last_user_message_id.is_some_and(|r| r != &saved.last_user_message_id) {
-                    return Err(ChatError::OperationConflict(input.operation_id.into()));
-                }
-                return Ok(saved);
-            }
-            if let Some(expected) = input.expected_last_user_message_id {
-                if expected != &conversation.last_user_message_id {
-                    return Err(ChatError::UserInputChanged { expected: expected.clone(), actual: conversation.last_user_message_id });
-                }
-            }
-            if let Some(reply_to) = input.reply_to {
-                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM chat_messages WHERE conversation_id=?1 AND id=?2)", params![conversation_id,reply_to], |r| r.get(0))?;
-                if !exists { return Err(ChatError::InvalidInput("reply_to must reference a message in this conversation".into())); }
-            }
-            let message_id = Uuid::now_v7().to_string();
-            if matches!(principal, Principal::Account(_)) {
-                conversation.last_user_message_id = Some(message_id.clone());
-                tx.execute("UPDATE chat_conversations SET last_user_message_id=?1 WHERE id=?2", params![message_id,conversation_id])?;
-            }
-            let last_sequence: u64 = tx.query_row("SELECT COALESCE(MAX(sequence),0) FROM chat_messages WHERE conversation_id=?1", [conversation_id], |r| r.get(0))?;
-            let sequence = last_sequence.checked_add(1).filter(|s| *s <= CHAT_MAX_COUNTER)
-                .ok_or_else(|| ChatError::InvalidInput("message sequence exhausted".into()))?;
-            let message = ChatMessage {
-                id: message_id, conversation_id: conversation_id.into(), sequence,
-                sender: match principal { Principal::Account(id) => ChatMessageSender::User { account_id: id.into() }, Principal::Subject(id) => ChatMessageSender::Subject { subject_id: id.into() } },
-                text: input.text.into(), reply_to: input.reply_to.clone(), work_ref: input.work_ref.clone(),
-                operation_id: input.operation_id.into(), last_user_message_id: conversation.last_user_message_id,
-            };
-            tx.execute("INSERT INTO chat_messages (id,conversation_id,sequence,sender_kind,sender_id,text,reply_to,work_ref,operation_id,last_user_message_id)
-                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![message.id,conversation_id,sequence,kind,sender_id,message.text,message.reply_to,message.work_ref,message.operation_id,message.last_user_message_id])?;
-            Ok(message)
+            append_in_transaction(
+                tx,
+                principal,
+                conversation_id,
+                input,
+                expected_permission_change_id,
+            )
         })
     }
+}
+
+fn messages_in_transaction(
+    tx: &Transaction<'_>,
+    principal: Principal<'_>,
+    conversation_id: &str,
+    query: &ChatMessagePageQuery,
+    expected_permission_change_id: Option<&str>,
+) -> Result<ChatMessagePage> {
+    if query.after_sequence.is_some_and(|s| s > CHAT_MAX_COUNTER) {
+        return Err(ChatError::InvalidInput(
+            "message cursor exceeds JSON safe-integer range".into(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(CHAT_DEFAULT_PAGE_LIMIT);
+    if !(1..=CHAT_MAX_PAGE_LIMIT).contains(&limit) {
+        return Err(ChatError::InvalidInput(format!(
+            "page limit must be in 1..={CHAT_MAX_PAGE_LIMIT}"
+        )));
+    }
+
+    check_authorization(tx, principal, expected_permission_change_id)?;
+    let conversation = conversation(tx, principal, conversation_id)?;
+    let conversation_id = &conversation.id;
+    let after = query.after_sequence.unwrap_or(0) as i64;
+    let mut messages = tx.prepare(&format!("SELECT {MESSAGE_COLUMNS} FROM chat_messages WHERE conversation_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3"))?
+                .query_map(params![conversation_id, after, limit+1], message_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+    let has_more = messages.len() > limit as usize;
+    messages.truncate(limit as usize);
+    Ok(ChatMessagePage {
+        conversation,
+        messages,
+        has_more,
+    })
+}
+
+fn append_in_transaction(
+    tx: &Transaction<'_>,
+    principal: Principal<'_>,
+    conversation_id: &str,
+    input: Append<'_>,
+    expected_permission_change_id: Option<&str>,
+) -> Result<ChatMessage> {
+    identifier(input.operation_id)?;
+    if input.text.trim().is_empty() || input.text.len() > CHAT_MAX_TEXT_BYTES {
+        return Err(ChatError::InvalidInput(format!(
+            "text must be nonblank and at most {CHAT_MAX_TEXT_BYTES} UTF-8 bytes"
+        )));
+    }
+    for reference in [input.reply_to, input.work_ref]
+        .into_iter()
+        .flatten()
+        .chain(input.expected_last_user_message_id.into_iter().flatten())
+    {
+        identifier(reference)?;
+    }
+
+    check_authorization(tx, principal, expected_permission_change_id)?;
+    let mut conversation = conversation(tx, principal, conversation_id)?;
+    let canonical_id = conversation.id.clone();
+    let conversation_id = canonical_id.as_str();
+    let (kind, sender_id) = principal.sender();
+    let saved = tx
+        .query_row(
+            &format!(
+                "SELECT {MESSAGE_COLUMNS} FROM chat_messages
+                WHERE conversation_id=?1 AND sender_kind=?2 AND sender_id=?3 AND operation_id=?4"
+            ),
+            params![conversation_id, kind, sender_id, input.operation_id],
+            message_row,
+        )
+        .optional()?;
+    // Replay precedes the current-input fence: ACK loss must remain recoverable after
+    // another user input. The pinned observed user identity remains part of the full request.
+    if let Some(saved) = saved {
+        if saved.text != input.text
+            || &saved.reply_to != input.reply_to
+            || &saved.work_ref != input.work_ref
+            || input
+                .expected_last_user_message_id
+                .is_some_and(|r| r != &saved.last_user_message_id)
+        {
+            return Err(ChatError::OperationConflict(input.operation_id.into()));
+        }
+        return Ok(saved);
+    }
+    if let Some(expected) = input.expected_last_user_message_id {
+        if expected != &conversation.last_user_message_id {
+            return Err(ChatError::UserInputChanged {
+                expected: expected.clone(),
+                actual: conversation.last_user_message_id,
+            });
+        }
+    }
+    if let Some(reply_to) = input.reply_to {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE conversation_id=?1 AND id=?2)",
+            params![conversation_id, reply_to],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(ChatError::InvalidInput(
+                "reply_to must reference a message in this conversation".into(),
+            ));
+        }
+    }
+    let message_id = Uuid::now_v7().to_string();
+    if matches!(principal, Principal::Account(_)) {
+        conversation.last_user_message_id = Some(message_id.clone());
+        tx.execute(
+            "UPDATE chat_conversations SET last_user_message_id=?1 WHERE id=?2",
+            params![message_id, conversation_id],
+        )?;
+    }
+    let last_sequence: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence),0) FROM chat_messages WHERE conversation_id=?1",
+        [conversation_id],
+        |r| r.get(0),
+    )?;
+    let sequence = last_sequence
+        .checked_add(1)
+        .filter(|s| *s <= CHAT_MAX_COUNTER)
+        .ok_or_else(|| ChatError::InvalidInput("message sequence exhausted".into()))?;
+    let message = ChatMessage {
+        id: message_id,
+        conversation_id: conversation_id.into(),
+        sequence,
+        sender: match principal {
+            Principal::Account(id) => ChatMessageSender::User {
+                account_id: id.into(),
+            },
+            Principal::Subject(id) => ChatMessageSender::Subject {
+                subject_id: id.into(),
+            },
+        },
+        text: input.text.into(),
+        reply_to: input.reply_to.clone(),
+        work_ref: input.work_ref.clone(),
+        operation_id: input.operation_id.into(),
+        last_user_message_id: conversation.last_user_message_id,
+    };
+    tx.execute("INSERT INTO chat_messages (id,conversation_id,sequence,sender_kind,sender_id,text,reply_to,work_ref,operation_id,last_user_message_id)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![message.id,conversation_id,sequence,kind,sender_id,message.text,message.reply_to,message.work_ref,message.operation_id,message.last_user_message_id])?;
+    Ok(message)
 }
 
 struct Append<'a> {
@@ -362,13 +452,15 @@ fn check_authorization(
         let Principal::Subject(subject) = principal else {
             return Err(ChatError::AuthorizationChanged);
         };
-        let actual: Option<String> = tx
-            .query_row(
-                "SELECT change_id FROM subject_permissions WHERE subject_id=?1",
-                [subject],
-                |row| row.get(0),
-            )
-            .optional()?;
+        if crate::permissions::transfer::is_sealed(tx)? {
+            // Canonical policies require the Host's Server-transaction snapshot via
+            // with_chat_transaction, not a retained head or recursive provider call.
+            return Err(ChatError::AuthorizationChanged);
+        }
+        let actual = local_policy_source(tx, subject)?.map(|source| match source {
+            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
+            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
+        });
         if actual.as_deref() != Some(expected) {
             return Err(ChatError::AuthorizationChanged);
         }

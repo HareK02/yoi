@@ -1,8 +1,9 @@
 //! Owner-only HTTP boundary for source adoption and the one-way legacy cutover.
 //!
-//! Every preview and adoption acquires the native Feature authority guard before
-//! entering the Server transaction. Subject references are checked against current
-//! metadata/deletion fences under its IMMEDIATE transaction, not a preloaded set.
+//! Every preview and adoption acquires the native Feature authority guard, then
+//! the permission registry, before entering the Server transaction. Subject
+//! references are checked against current metadata/deletion fences under its
+//! IMMEDIATE transaction, not a preloaded set.
 //! Preview and canonical saves never seal: their nonmutating Feature transaction
 //! remains held through the Server operation and rolls back when the guard drops.
 //!
@@ -55,42 +56,103 @@ pub(super) fn routes(service: WorkspaceServerApi) -> Router {
         .merge(
             server_api::configuration_adoption_api_axum::configuration_reconcile(service.clone()),
         )
-        .merge(server_api::configuration_adoption_api_axum::configuration_publication(service))
+        .merge(
+            server_api::configuration_adoption_api_axum::configuration_publication(service.clone()),
+        )
+        .merge(
+            server_api::feature_permissions::feature_permissions_api_axum::permission_catalog(
+                service.clone(),
+            ),
+        )
+        .merge(
+            server_api::feature_permissions::feature_permissions_api_axum::validate_permissions(
+                service,
+            ),
+        )
         .layer(middleware::from_fn_with_state(
             context_service,
             attach_server_request_context,
         ))
 }
 
-async fn owner_operation<T: Send + 'static>(
+pub(super) async fn owner_operation<T: Send + 'static>(
     service: &WorkspaceServerApi,
     context: ServerRequestContext,
     workspace: String,
     failure_operation: FailureOperation,
     operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
 ) -> std::result::Result<T, ConfigurationApiError> {
+    with_owner_operation(
+        service,
+        context,
+        workspace,
+        Some(failure_operation),
+        operation,
+        |error, can_view_cause| {
+            if can_view_cause {
+                if let Error::Configuration(cause) = &error.error {
+                    use error_contract::{Browser, FailureFacts, project_failure};
+                    let visibility = crate::configuration_failure::ConfigurationFailureVisibility {
+                        can_view_cause: true,
+                    };
+                    if let Ok(projected) = FailureFacts::new(*cause.details())
+                        .and_then(|facts| project_failure::<Browser, _>(&facts, &visibility))
+                    {
+                        return ConfigurationApiError::projected(projected);
+                    }
+                }
+            }
+            error.into_repository_api_error().into()
+        },
+    )
+    .await
+}
+
+pub(super) async fn owner_repository_operation<T: Send + 'static>(
+    service: &WorkspaceServerApi,
+    context: ServerRequestContext,
+    workspace: String,
+    operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
+) -> std::result::Result<T, server_api::RepositoryApiError> {
+    with_owner_operation(service, context, workspace, None, operation, |error, _| {
+        error.into_repository_api_error()
+    })
+    .await
+}
+
+async fn with_owner_operation<T: Send + 'static, E>(
+    service: &WorkspaceServerApi,
+    context: ServerRequestContext,
+    workspace: String,
+    failure_operation: Option<FailureOperation>,
+    operation: impl FnOnce(WorkspaceApi, String) -> Result<T> + Send + 'static,
+    project_error: impl Fn(ApiError, bool) -> E,
+) -> std::result::Result<T, E> {
     // These owner-only routes are mounted above Workspace fallback dispatch.
     // A Runtime proof must not be ignored in favor of a shared human credential.
     if context.transport_headers.iter().any(|(name, _)| {
         name.eq_ignore_ascii_case(worker_runtime::auth::RUNTIME_REQUEST_SOURCE_PROOF_HEADER)
     }) {
-        return Err(ApiError::from(Error::WorkspacePermissionDenied(
-            "Runtime source proofs cannot authorize owner configuration management".into(),
-        ))
-        .into_repository_api_error()
-        .into());
+        return Err(project_error(
+            ApiError::from(Error::WorkspacePermissionDenied(
+                "Runtime source proofs cannot authorize owner configuration management".into(),
+            )),
+            false,
+        ));
     }
     let actor = subject_authorization::administration_actor(&context)
-        .map_err(ApiError::into_repository_api_error)?
+        .map_err(|error| project_error(error, false))?
         .clone();
     let mut can_view_cause = false;
     let result: ApiResult<T> = async {
         let gate = service.admission_for_workspace(&workspace).await;
         let lease = gate.admit(false).ok_or_else(|| {
-            Error::from(ConfigurationFailure::new(
-                failure_operation,
-                FailureReason::WorkspaceDraining,
-            ))
+            failure_operation.map_or_else(
+                || Error::WorkspaceConfigConflict("Workspace deletion is draining requests".into()),
+                |operation| {
+                    ConfigurationFailure::new(operation, FailureReason::WorkspaceDraining).into()
+                },
+            )
         })?;
         crate::db_executor::with_operation_lifetime(Arc::new(lease), async {
             // Authenticate against catalog ownership before resolving an API:
@@ -101,19 +163,31 @@ async fn owner_operation<T: Send + 'static>(
                 .await?
                 .ok_or(Error::WorkspaceIdMismatch)?;
             if record.owner_account_id != actor.account_id {
-                return Err(Error::from(ConfigurationFailure::new(
-                    failure_operation,
-                    FailureReason::OwnerRequired,
-                ))
-                .into());
+                return Err(failure_operation
+                    .map_or_else(
+                        || {
+                            Error::WorkspacePermissionDenied(
+                                "configuration management requires the Workspace owner".into(),
+                            )
+                        },
+                        |operation| {
+                            ConfigurationFailure::new(operation, FailureReason::OwnerRequired)
+                                .into()
+                        },
+                    )
+                    .into());
             }
             can_view_cause = true;
             if record.state != "active" {
-                return Err(Error::from(ConfigurationFailure::new(
-                    failure_operation,
-                    FailureReason::WorkspaceInactive,
-                ))
-                .into());
+                return Err(failure_operation
+                    .map_or_else(
+                        || Error::WorkspaceConfigConflict("Workspace is not active".into()),
+                        |operation| {
+                            ConfigurationFailure::new(operation, FailureReason::WorkspaceInactive)
+                                .into()
+                        },
+                    )
+                    .into());
             }
             let api = service
                 .api_for_workspace(&workspace)
@@ -126,11 +200,13 @@ async fn owner_operation<T: Send + 'static>(
                 .store
                 .db_executor()
                 .run(move || {
-                    operation(api, actor.account_id).map_err(|error| match error {
-                        Error::Configuration(cause) => {
-                            cause.with_operation(failure_operation).into()
+                    operation(api, actor.account_id).map_err(|error| {
+                        match (error, failure_operation) {
+                            (Error::Configuration(cause), Some(operation)) => {
+                                cause.with_operation(operation).into()
+                            }
+                            (other, _) => other,
                         }
-                        other => other,
                     })
                 })
                 .await
@@ -139,22 +215,7 @@ async fn owner_operation<T: Send + 'static>(
         .await
     }
     .await;
-    result.map_err(|error| {
-        if can_view_cause {
-            if let Error::Configuration(cause) = &error.error {
-                use error_contract::{Browser, FailureFacts, project_failure};
-                let visibility = crate::configuration_failure::ConfigurationFailureVisibility {
-                    can_view_cause: true,
-                };
-                if let Ok(projected) = FailureFacts::new(*cause.details())
-                    .and_then(|facts| project_failure::<Browser, _>(&facts, &visibility))
-                {
-                    return ConfigurationApiError::projected(projected);
-                }
-            }
-        }
-        error.into_repository_api_error().into()
-    })
+    result.map_err(|error| project_error(error, can_view_cause))
 }
 
 fn conflict(message: &str) -> Error {
@@ -173,11 +234,12 @@ fn request_from_api(request: ConfigurationAdoptionRequest) -> Result<AdoptionReq
     })
 }
 
-fn host(workspace: &str) -> Result<PermissionHost> {
-    let workspace =
-        feature_permissions::WorkspaceId::parse(workspace).map_err(Error::InvalidInput)?;
-    worker::feature::permissions::builtin_permission_host(workspace)
-        .map_err(|error| Error::Config(error.to_string()))
+fn host(api: &WorkspaceApi) -> Result<PermissionHost> {
+    api.refresh_plugin_permission_registry()?;
+    api.permission_registry
+        .read()
+        .map(|registry| registry.host().clone())
+        .map_err(|_| Error::Config("current Feature declarations unavailable".into()))
 }
 
 fn raw_legacy(api: &WorkspaceApi) -> Result<SubjektivStore> {
@@ -249,7 +311,6 @@ fn baseline(seed: &MigrationSeed) -> ConfigurationMigrationBaseline<'_> {
 }
 
 struct Preparation {
-    host: PermissionHost,
     schema: ::config_source::WorkspaceConfigSchemaBundle,
     legacy: SubjektivStore,
     identity: DatabaseIdentity,
@@ -263,7 +324,7 @@ fn prepare(api: &WorkspaceApi, account: &str, request: &AdoptionRequest) -> Resu
             "legacy transfer is already adopted; reload current source",
         ));
     }
-    let host = host(&api.config.workspace_id)?;
+    let host = host(&api)?;
     let schema = api.config_schema_registry.compose()?;
     let legacy = raw_legacy(api)?;
     let sealed = if current.canonical {
@@ -298,7 +359,6 @@ fn prepare(api: &WorkspaceApi, account: &str, request: &AdoptionRequest) -> Resu
         None => legacy.database_identity().map_err(transfer_error)?,
     };
     Ok(Preparation {
-        host,
         schema,
         legacy,
         identity,
@@ -306,12 +366,21 @@ fn prepare(api: &WorkspaceApi, account: &str, request: &AdoptionRequest) -> Resu
     })
 }
 
-fn policy_to_api(policy: AdoptedSubjectPolicy) -> ConfigurationSubjectPolicy {
+fn policy_to_api(
+    policy: AdoptedSubjectPolicy,
+    host: &PermissionHost,
+) -> ConfigurationSubjectPolicy {
+    let execution = policy.source.execution.assignment();
+    let delegation = policy.source.delegation.assignment();
+    let execution_resolution = host.resolve(Some(&execution)).projection().clone();
+    let delegation_resolution = host.resolve(Some(&delegation)).projection().clone();
     ConfigurationSubjectPolicy {
         subject_id: policy.source.subject_id,
         change_id: policy.change_id,
-        execution: policy.source.execution.assignment(),
-        delegation: policy.source.delegation.assignment(),
+        execution,
+        delegation,
+        execution_resolution,
+        delegation_resolution,
         legacy_constraints: policy.legacy_constraints,
     }
 }
@@ -401,8 +470,11 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
             workspace_id,
             FailureOperation::Source,
             |api, account| {
+                // A source GET produces a nonauthoritative draft, not an admission
+                // lease. Retain one catalog snapshot without holding registry read
+                // across legacy Feature reads; preview/adopt revalidate its digest.
+                let host = host(&api)?;
                 let current = source_snapshot(&api, &account)?;
-                let host = host(&api.config.workspace_id)?;
                 let catalog_digest = crate::config_adoption::catalog_digest(&host)?;
                 let (state, expected_legacy_export, policies, diagnostics) = if current.canonical {
                     (current.state, None, current.policies, vec![])
@@ -438,7 +510,10 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                     catalog: host.catalog(),
                     catalog_digest,
                     expected_legacy_export,
-                    policies: policies.into_values().map(policy_to_api).collect(),
+                    policies: policies
+                        .into_values()
+                        .map(|policy| policy_to_api(policy, &host))
+                        .collect(),
                     migration_diagnostics: diagnostics.into_iter().map(diagnostic_to_api).collect(),
                 })
             },
@@ -462,7 +537,6 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                 // Detect operation-ID reuse even though preview itself never persists.
                 saved_result(&api, &account, &request)?;
                 let Preparation {
-                    host,
                     schema,
                     legacy,
                     identity,
@@ -473,15 +547,25 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                 // fences metadata updates through core validation, then rolls back.
                 let preview = legacy
                     .with_permission_authority_guard(&identity, |authority| {
-                        Ok(api.config_store.preview_configuration_adoption(
-                            &api.config.workspace_id,
-                            &account,
-                            &request,
-                            schema,
-                            &host,
-                            baseline.as_ref(),
-                            |subject| authority.require_subject(subject).map_err(transfer_error),
-                        ))
+                        Ok((|| -> Result<_> {
+                            // Feature DB -> registry -> Host, matching native Memory.
+                            // Keep current declarations pinned through core validation.
+                            let registry = api.permission_registry.read().map_err(|_| {
+                                Error::Config("current Feature declarations unavailable".into())
+                            })?;
+                            let host = registry.host();
+                            api.config_store.preview_configuration_adoption(
+                                &api.config.workspace_id,
+                                &account,
+                                &request,
+                                schema,
+                                &host,
+                                baseline.as_ref(),
+                                |subject| {
+                                    authority.require_subject(subject).map_err(transfer_error)
+                                },
+                            )
+                        })())
                     })
                     .map_err(transfer_error)??;
                 Ok(ConfigurationPreviewResponse {
@@ -512,7 +596,6 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                     return Ok(receipt_to_api(result));
                 }
                 let Preparation {
-                    host,
                     schema,
                     legacy,
                     identity,
@@ -525,7 +608,14 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                     .with_permission_authority_guard(&identity, |authority| {
                         // Keep Server failures as the inner Result. Only native gate
                         // acquisition/finalization failures belong to the outer lane.
-                        Ok(api.config_store.adopt_configuration(
+                        Ok((|| -> Result<_> {
+                            // Acquire declarations only after native Feature admission,
+                            // retaining them through seal and the Server commit.
+                            let registry = api.permission_registry.read().map_err(|_| {
+                                Error::Config("current Feature declarations unavailable".into())
+                            })?;
+                            let host = registry.host();
+                            api.config_store.adopt_configuration(
                         &api.config.workspace_id,
                         &account,
                         &request,
@@ -559,7 +649,8 @@ impl ConfigurationAdoptionApi for WorkspaceServerApi {
                                 policies: seed.policies.clone(),
                             })
                         },
-                    ))
+                        )
+                        })())
                     })
                     .map_err(transfer_error)??;
                 // Core and Feature guards are released before best-effort Runtime

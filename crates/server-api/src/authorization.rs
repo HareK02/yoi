@@ -55,6 +55,8 @@ use serde::{Deserialize, Serialize};
 
 mod catalog;
 pub use catalog::*;
+mod current_policy;
+pub use current_policy::*;
 mod subject_defaults;
 pub use subject_defaults::*;
 

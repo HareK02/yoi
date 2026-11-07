@@ -14,6 +14,7 @@ fn tree_reason(source: &ConfigTreeError) -> ConfigurationFailureReason {
     // Match variants explicitly; never parse Display or publish their payloads.
     match source {
         ConfigTreeError::InvalidPath(_) => InvalidPath,
+        ConfigTreeError::BuiltinReadOnly(_) => BuiltinReadOnly,
         ConfigTreeError::InvalidImport(_) => InvalidImport,
         ConfigTreeError::ImportEscape(_) => ImportEscape,
         ConfigTreeError::AlreadyExists(_) => AlreadyExists,

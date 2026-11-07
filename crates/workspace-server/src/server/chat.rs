@@ -9,6 +9,24 @@
 use super::*;
 use server_api::*;
 
+#[cfg(test)]
+static ADMISSION_OBSERVERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::SyncSender<()>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(super) fn observe_next_admission(subject: &str) -> std::sync::mpsc::Receiver<()> {
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    assert!(
+        ADMISSION_OBSERVERS
+            .lock()
+            .unwrap()
+            .insert(subject.into(), send)
+            .is_none()
+    );
+    receive
+}
+
 fn domain(error: crate::subjektiv::chat::ChatError) -> ApiError {
     use crate::subjektiv::chat::ChatError;
     match error {
@@ -203,17 +221,137 @@ pub(super) async fn receive(
     Ok(ChatReceiveResponse { message, delivery })
 }
 
+fn authorize_chat_policy(
+    registry: &worker::feature::permissions::FeaturePermissionRegistry,
+    workspace: &str,
+    subject: &str,
+    operation: &str,
+    policy: &server_api::authorization::SubjectPolicySource,
+) -> ApiResult<()> {
+    use ::feature_permissions::PermissionKey;
+    use server_api::authorization::{PermissionResource, ScopedPermission};
+    let denied = || {
+        Error::WorkspacePermissionDenied(format!(
+            "current Subject policy does not permit {operation}"
+        ))
+    };
+    if registry.host().catalog().workspace.as_str() != workspace {
+        return Err(denied().into());
+    }
+    let key = PermissionKey::parse(operation).map_err(|_| denied())?;
+    // The installed callee owns chat's namespace. Caller claims and textual
+    // namespace prefixes cannot select a different Feature's handle.
+    let feature = worker::feature::FeatureId::builtin("subjektiv-chat");
+    let namespace = registry
+        .namespace_handle(&feature, &key.namespace())
+        .ok_or_else(denied)?;
+    // Scalar legacy activation entries are retained as domain constraints; they
+    // neither fail unrelated chat access nor imply dotted operations.
+    let exact = ::feature_permissions::PermissionAssignment {
+        grants: vec![::feature_permissions::PermissionReference::Namespace(
+            ::feature_permissions::NamespacePermissions {
+                namespace: key.namespace(),
+                keys: vec![key.clone()],
+            },
+        )],
+        ..Default::default()
+    };
+    let (assignment, legacy) = match policy {
+        server_api::authorization::SubjectPolicySource::Feature(policy) => {
+            (&policy.execution, policy.legacy_constraints.as_ref())
+        }
+        server_api::authorization::SubjectPolicySource::Legacy(policy) => (&exact, Some(policy)),
+    };
+    let resolved = registry.host().resolve(Some(assignment));
+    if !registry
+        .host()
+        .allows(namespace, &resolved, &key)
+        .map_err(|_| denied())?
+    {
+        return Err(denied().into());
+    }
+    let needed = ScopedPermission {
+        operation: operation.into(),
+        resource: PermissionResource::Subject {
+            workspace_id: workspace.into(),
+            subject_id: subject.into(),
+        },
+    };
+    if let Some(legacy) = legacy {
+        if !legacy.execution.iter().any(|grant| grant.covers(&needed)) {
+            return Err(denied().into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn worker_operation(
     api: WorkspaceApi,
     context: ServerRequestContext,
     workspace: String,
     request: ChatWorkerRequest,
 ) -> ApiResult<ChatWorkerResponse> {
-    api.store
-        .db_executor()
+    worker_operation_inner(
+        api,
+        context,
+        workspace,
+        request,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+// Explicitly scoped to this invocation: parallel tests and other Workspace APIs
+// cannot intercept an unrelated request's native admission.
+#[cfg(test)]
+pub(super) async fn worker_operation_before_feature(
+    api: WorkspaceApi,
+    context: ServerRequestContext,
+    workspace: String,
+    request: ChatWorkerRequest,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> ApiResult<ChatWorkerResponse> {
+    worker_operation_inner(api, context, workspace, request, Some(observe), None).await
+}
+
+#[cfg(test)]
+pub(super) async fn worker_operation_before_host(
+    api: WorkspaceApi,
+    context: ServerRequestContext,
+    workspace: String,
+    request: ChatWorkerRequest,
+    observe: Arc<dyn Fn() + Send + Sync>,
+) -> ApiResult<ChatWorkerResponse> {
+    worker_operation_inner(api, context, workspace, request, None, Some(observe)).await
+}
+
+async fn worker_operation_inner(
+    api: WorkspaceApi,
+    context: ServerRequestContext,
+    workspace: String,
+    request: ChatWorkerRequest,
+    #[cfg(test)] before_feature: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)] before_host: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> ApiResult<ChatWorkerResponse> {
+    api.host_executors
+        .feature()?
         .run(move || -> ApiResult<_> {
             validate_workspace_scope(&api, &workspace)?;
             let initial = subjektiv_worker_scope_from_store(&api, &workspace, &context)?;
+            let request_source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied("chat requires a signed Runtime source".into())
+            })?;
+            api.config_store.with_conn(|connection| {
+                crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                    connection,
+                    &workspace,
+                    request_source,
+                    &initial.worker,
+                )
+            })?;
             if !matches!(initial.authority, SubjektivStoredScopeAuthority::Subject) {
                 return Err(Error::WorkspacePermissionDenied(
                     "chat publication and reads require the current Subject body".into(),
@@ -221,6 +359,14 @@ pub(super) async fn worker_operation(
                 .into());
             }
             let gate = subjektiv_journal::lifecycle_lock(&api, &initial.subject_id)?;
+            #[cfg(test)]
+            if let Some(observer) = ADMISSION_OBSERVERS
+                .lock()
+                .unwrap()
+                .remove(&initial.subject_id)
+            {
+                let _ = observer.send(());
+            }
             let _gate = gate
                 .lock()
                 .map_err(|_| Error::Store("Subject lifecycle lock poisoned".into()))?;
@@ -238,56 +384,73 @@ pub(super) async fn worker_operation(
                 ChatWorkerOperation::Send { .. } => "chat.send",
             };
             let store = open_subjektiv_store(&api)?;
-            // Observe before authorization, not after it: otherwise a revoked policy
-            // could replace the policy whose permission was just checked.
-            let policy = store
-                .subject_permissions(&scope.subject_id)
-                .map_err(subjektiv_store_error)?
-                .ok_or_else(|| {
-                    Error::WorkspacePermissionDenied("Subject permissions are unset".into())
-                })?;
-            authorize_subjektiv_operation(
-                &api,
-                &scope.worker,
-                &workspace,
-                &scope.subject_id,
-                operation,
-            )?;
             let lease = api
                 .store
                 .require_current_worker_singleton_owner(&workspace, &scope.worker)?
                 .ok_or_else(|| {
                     Error::WorkspacePermissionDenied("Subject body ownership is absent".into())
                 })?;
-            api.config_store.with_current_subject_body(
-                &workspace,
-                &scope.subject_id,
-                &lease,
-                || {
-                    Ok(match request.operation {
-                        ChatWorkerOperation::Read {
-                            conversation_id,
-                            query,
-                        } => store
-                            .chat_messages_for_subject_authorized(
-                                &scope.subject_id,
-                                &conversation_id,
-                                &query,
-                                &policy.change_id,
+            #[cfg(test)]
+            if let Some(observe) = before_feature {
+                observe();
+            }
+            // Match native Memory admission: Feature DB -> registry -> Host.
+            // Never pin the registry while waiting for the Feature connection;
+            // Memory already holds that connection when it requests registry write.
+            store
+                .with_chat_transaction(&scope.subject_id, |chat| {
+                    #[cfg(test)]
+                    if let Some(observe) = before_host {
+                        observe();
+                    }
+                    Ok((|| -> ApiResult<_> {
+                        let registry = api.permission_registry.read().map_err(|_| {
+                            Error::WorkspacePermissionDenied(
+                                "current Feature declarations unavailable".into(),
                             )
-                            .map(|page| ChatWorkerResponse::Messages { page })
-                            .map_err(domain),
-                        ChatWorkerOperation::Send { request } => store
-                            .chat_send_message_authorized(
+                        })?;
+                        let source = chat.policy_source().clone();
+                        api.config_store
+                            .with_current_subject_body_policy(
+                                &workspace,
                                 &scope.subject_id,
-                                &request,
-                                &policy.change_id,
+                                &lease,
+                                &source,
+                                request_source,
+                                |policy| {
+                                    Ok((|| -> ApiResult<_> {
+                                        authorize_chat_policy(
+                                            &registry,
+                                            &workspace,
+                                            &scope.subject_id,
+                                            operation,
+                                            policy,
+                                        )?;
+                                        let response = match &request.operation {
+                                            ChatWorkerOperation::Read {
+                                                conversation_id,
+                                                query,
+                                            } => chat
+                                                .messages(conversation_id, query)
+                                                .map(|page| ChatWorkerResponse::Messages { page }),
+                                            ChatWorkerOperation::Send { request } => {
+                                                chat.send(request).map(|message| {
+                                                    ChatWorkerResponse::Sent { message }
+                                                })
+                                            }
+                                        }
+                                        .map_err(domain)?;
+                                        // Both policy and ownership stay fenced through commit;
+                                        // replay is authorized before any saved result is read.
+                                        chat.commit().map_err(domain)?;
+                                        Ok(response)
+                                    })())
+                                },
                             )
-                            .map(|message| ChatWorkerResponse::Sent { message })
-                            .map_err(domain),
-                    })
-                },
-            )?
+                            .map_err(ApiError::from)?
+                    })())
+                })
+                .map_err(domain)?
         })
         .await
 }

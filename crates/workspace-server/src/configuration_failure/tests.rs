@@ -291,3 +291,30 @@ fn received_contract_mismatch_unknown_reason_and_raw_details_are_not_reinterpret
         StoredFailureRead::LegacyWithoutFacts
     ));
 }
+
+#[test]
+fn builtin_mutation_keeps_read_only_cause_without_exposing_the_virtual_path() {
+    let original = snapshot();
+    let error = original
+        .apply(&[ConfigTreeChange::Create {
+            path: VirtualPath::parse("$builtin/private-credential-secret.dcdl").unwrap(),
+            content_type: ConfigContentType::Decodal,
+            content: "{}".into(),
+        }])
+        .unwrap_err();
+    assert!(matches!(&error, ConfigTreeError::BuiltinReadOnly(_)));
+    let failure = ConfigurationFailure::from_tree(ConfigurationFailureOperation::Adopt, error);
+    assert!(matches!(
+        failure.source_error(),
+        Some(ConfigTreeError::BuiltinReadOnly(_))
+    ));
+    let wire = browser_tool_wire(&FailureFacts::new(failure).unwrap());
+    assert_eq!(wire["reason"], "builtin_read_only");
+    assert!(
+        wire["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("builtin namespace is read-only")
+    );
+    assert_eq!(original, snapshot());
+}

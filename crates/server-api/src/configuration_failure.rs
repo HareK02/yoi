@@ -53,6 +53,7 @@ impl ConfigurationFailureOperation {
 #[serde(rename_all = "snake_case")]
 pub enum ConfigurationFailureReason {
     InvalidPath,
+    BuiltinReadOnly,
     InvalidImport,
     ImportEscape,
     AlreadyExists,
@@ -77,12 +78,14 @@ pub enum ConfigurationFailureReason {
     RequestIdentityConflict,
     PublicationDispatchUnavailable,
     PublicationProjectionUnavailable,
+    PublicationRegistryUnavailable,
 }
 
 impl ConfigurationFailureReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidPath => "invalid_path",
+            Self::BuiltinReadOnly => "builtin_read_only",
             Self::InvalidImport => "invalid_import",
             Self::ImportEscape => "import_escape",
             Self::AlreadyExists => "already_exists",
@@ -107,6 +110,7 @@ impl ConfigurationFailureReason {
             Self::RequestIdentityConflict => "request_identity_conflict",
             Self::PublicationDispatchUnavailable => "publication_dispatch_unavailable",
             Self::PublicationProjectionUnavailable => "publication_projection_unavailable",
+            Self::PublicationRegistryUnavailable => "publication_registry_unavailable",
         }
     }
 
@@ -121,13 +125,14 @@ impl ConfigurationFailureReason {
             | Self::WorkspaceInactive
             | Self::WorkspaceDraining
             | Self::RequestIdentityConflict => Category::Conflict,
-            Self::PublicationDispatchUnavailable | Self::PublicationProjectionUnavailable => {
-                Category::Internal
-            }
+            Self::PublicationDispatchUnavailable
+            | Self::PublicationProjectionUnavailable
+            | Self::PublicationRegistryUnavailable => Category::Internal,
             Self::DuplicateSchemaProvider
             | Self::DuplicateSchemaNamespace
             | Self::InvalidSchemaContribution => Category::Internal,
             Self::InvalidPath
+            | Self::BuiltinReadOnly
             | Self::InvalidImport
             | Self::ImportEscape
             | Self::AlreadyExists
@@ -144,6 +149,7 @@ impl ConfigurationFailureReason {
     pub fn explanation(self) -> &'static str {
         match self {
             Self::InvalidPath => "a virtual configuration path is invalid",
+            Self::BuiltinReadOnly => "the builtin namespace is read-only",
             Self::InvalidImport => "a virtual configuration import is invalid",
             Self::ImportEscape => "a configuration import escapes the virtual source tree",
             Self::AlreadyExists => "a configuration entry already exists at the requested path",
@@ -185,6 +191,9 @@ impl ConfigurationFailureReason {
             Self::WorkspaceDraining => "Workspace deletion is draining configuration requests",
             Self::PublicationDispatchUnavailable => {
                 "the configuration was adopted, but the Host did not admit Runtime publication"
+            }
+            Self::PublicationRegistryUnavailable => {
+                "the configuration was adopted, but its current Feature permission catalog could not be refreshed"
             }
             Self::PublicationProjectionUnavailable => {
                 "the configuration was adopted, but its Runtime prompt projection could not be resolved"

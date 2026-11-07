@@ -22,6 +22,8 @@
 //! tree adds no Workflow/Repository registration, credential management, or Host configuration files.
 //! Shared WIP references, Client lifetimes, and unknown outcomes follow [`crate::wip`].
 
+pub(crate) mod permission_declaration;
+
 pub mod backend;
 mod content;
 mod contract;
@@ -272,6 +274,13 @@ pub fn workspace_config_invocation_descriptor() -> FeatureInvocationDescriptor {
 }
 
 impl FeatureModule for WorkspaceConfigFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let descriptor = FeatureDescriptor::builtin(FEATURE_ID, "Workspace config")
             .with_description("WIP-only logical Workspace config attachment preparation");

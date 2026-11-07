@@ -32,9 +32,10 @@ fn plugin_catalog_migration_matches_fresh_schema_from_oldest_retained_and_105() 
             // Plugin catalog remains migration 106 even when startup applies later steps.
             assert_eq!(after.iter().filter(|(version, _)| *version == 106).cloned().collect::<Vec<_>>(),
                 vec![(106, crate::plugin_catalog::MIGRATION_NAME.into())]);
-            assert_eq!(after.iter().filter(|(version, _)| *version == 122).cloned().collect::<Vec<_>>(),
-                vec![(122, crate::config_adoption::MIGRATION_NAME.into())]);
-            assert_eq!(after.last().unwrap(), &(128, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()));
+            let mut expected = before.clone();
+            expected.extend(MIGRATIONS.iter().filter(|migration| migration.version > version)
+                .map(|migration| (migration.version, migration.name.into())));
+            assert_eq!(after, expected);
             assert_eq!(current_schema_version(c)?, LATEST_SCHEMA_VERSION);
             assert_eq!(c.query_row("SELECT display_name FROM workspaces WHERE workspace_id='plugin-workspace'",[],|r|r.get::<_,String>(0))?,"Plugins");
             assert_eq!(c.query_row("SELECT count(*) FROM pragma_foreign_key_check",[],|r|r.get::<_,i64>(0))?,0);
@@ -67,33 +68,12 @@ fn plugin_catalog_migration_marker_failure_rolls_back_then_retries_without_chang
         .with_conn(|c| {
             assert_eq!(current_schema_version(c)?, LATEST_SCHEMA_VERSION);
             let mut expected = before.clone();
-            expected.push((106, crate::plugin_catalog::MIGRATION_NAME.into()));
-            expected.push((
-                107,
-                "Immutable Worker Plugin plans and retained pins".into(),
-            ));
-            expected.push((
-                108,
-                "Subject Ticket responsibility and current-body notification routing".into(),
-            ));
-            expected.push((
-                109,
-                "Durable Plugin Host invocations and HTTPS effect receipts".into(),
-            ));
-            expected.push((110, "Worker Plugin launch selection associations".into()));
-            expected.push((
-                111,
-                "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
-            ));
-            expected.push((112, "Ticket Service outbox and fenced consumers".into()));
-            expected.push((113, "Ticket work-decomposition parent links".into()));
-            expected.push((122, crate::config_adoption::MIGRATION_NAME.into()));
-            expected.push((123, backend_job_upgrade::MIGRATION_NAME.into()));
-            expected.push((124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()));
-            expected.push((125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()));
-            expected.push((126, SERVICE_OUTCOME_MIGRATION_NAME.into()));
-            expected.push((127, journal_removal_store::MIGRATION_NAME.into()));
-            expected.push((128, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()));
+            expected.extend(
+                MIGRATIONS
+                    .iter()
+                    .filter(|migration| migration.version > 105)
+                    .map(|migration| (migration.version, migration.name.into())),
+            );
             assert_eq!(workspace_schema_migration_history(c)?, expected);
             crate::plugin_catalog::verify_with_data(c)?;
             Ok(())

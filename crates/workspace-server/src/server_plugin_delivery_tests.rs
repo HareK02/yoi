@@ -397,13 +397,19 @@ impl DeliveryFixture {
     fn policy(&self, execution: Vec<ScopedPermission>, delegation: Vec<ScopedPermission>) {
         let subject = self.subject.as_ref().unwrap();
         let store = open_subjektiv_store(&self.api).unwrap();
-        let previous = store.subject_permissions(subject).unwrap();
+        let previous = store
+            .subject_policy_source(subject)
+            .unwrap()
+            .map(|policy| match policy {
+                server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
+                server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
+            });
         store
             .set_subject_permissions(
                 subject,
                 &SubjectPermissionsUpdate {
                     operation_id: uuid::Uuid::now_v7().to_string(),
-                    expected_change_id: previous.map(|p| p.change_id),
+                    expected_change_id: previous,
                     execution,
                     delegation,
                 },
@@ -477,7 +483,13 @@ async fn same_persisted_plan_remote_and_inprocess_return_exact_archive_and_diges
     assert_eq!(remote, source_bytes(&local, &f.request).await);
     assert_eq!(remote, f.bytes);
     assert_eq!(
-        format!("sha256:{}", Sha256::digest(&remote).iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+        format!(
+            "sha256:{}",
+            Sha256::digest(&remote)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
         f.request.artifact_digest
     );
     let unpacked = manifest::plugin::read_plugin_package_bytes(

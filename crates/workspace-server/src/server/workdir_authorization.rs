@@ -27,8 +27,20 @@ pub(super) fn authorize(
     if is_command_reconciliation(operation) {
         return Ok(());
     }
-    let permissions = super::subject_authorization::worker_permissions(api, worker)?;
-    authorize_permissions(permissions.as_deref(), &link.workdir_id, operation)
+    if !super::subject_authorization::has_subject_authority(api, worker)? {
+        return Ok(());
+    }
+    authorize_accesses(&link.workdir_id, operation, |operation, path, recursive| {
+        let requested = resource(&link.workdir_id, operation, path, recursive)?;
+        super::subject_authorization::authorize(
+            api,
+            worker,
+            &server_api::authorization::OperationAuthorizationRequest {
+                operation: requested.operation,
+                resource: requested.resource,
+            },
+        )
+    })
 }
 
 fn is_command_reconciliation(operation: &WorkdirSessionOperation) -> bool {
@@ -97,7 +109,7 @@ fn authorize_permissions(
         // Non-Subject Workers retain the existing provider/Profile/attachment ceilings.
         return Ok(());
     };
-    let check = |operation, path: &WorkdirPath, recursive| {
+    let check = |operation: &str, path: &WorkdirPath, recursive| {
         require(
             permissions,
             working_directory_id,
@@ -106,6 +118,14 @@ fn authorize_permissions(
             recursive,
         )
     };
+    authorize_accesses(working_directory_id, operation, check)
+}
+
+fn authorize_accesses(
+    working_directory_id: &str,
+    operation: &WorkdirSessionOperation,
+    check: impl Fn(&str, &WorkdirPath, bool) -> ApiResult<()>,
+) -> ApiResult<()> {
     match operation {
         WorkdirSessionOperation::Stat(request) => check(READ, &request.path, false),
         WorkdirSessionOperation::Read(request) => check(READ, &request.path, false),

@@ -32,6 +32,7 @@ mod chat;
 mod external_grant_failure;
 mod external_operation_audit;
 mod grant_cleanup;
+mod service_authority;
 mod session_registration;
 mod subject_authorization;
 mod subject_body;
@@ -67,6 +68,8 @@ mod plugin_runtime;
 pub use plugin_delivery::InProcessPluginArtifactSource;
 #[path = "server_configuration_adoption.rs"]
 mod configuration_adoption;
+#[path = "server_feature_permission_api.rs"]
+mod feature_permission_api;
 #[path = "server_workspace_config.rs"]
 mod workspace_config;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2180,9 +2183,11 @@ pub struct WorkspaceApi {
     signing_identities: WorkspaceSigningIdentityService,
     config_schema_registry: crate::config_source::WorkspaceConfigSchemaRegistry,
     prompt_projection_cache: crate::prompt_settings::WorkspacePromptProjectionCache,
+    permission_registry: Arc<RwLock<worker::feature::permissions::FeaturePermissionRegistry>>,
     feature_storage: crate::WorkspaceFeatureStorage,
     drive_host: Arc<crate::workspace_drive_host::WorkspaceDriveHost>,
     subjektiv_registration: crate::RegisteredFeature,
+    subject_authority_store: Option<crate::subjektiv::SubjektivStore>,
     authority: SqliteWorkspaceAuthority,
     _worker_projection_shutdown: Arc<WorkerProjectionShutdownGuard>,
     runtime: Arc<RuntimeRegistry>,
@@ -2213,6 +2218,12 @@ pub struct WorkspaceApi {
     attachment_upload_grants: Arc<Mutex<HashMap<String, AttachmentUploadGrant>>>,
     #[cfg(test)]
     plugin_https_transport: Option<Arc<crate::plugin_https::HttpsTransport>>,
+    #[cfg(test)]
+    journal_before_effect: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    #[cfg(test)]
+    memory_before_effect: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    #[cfg(test)]
+    subject_effect_admission_observer: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -3083,7 +3094,11 @@ impl WorkerRemovalService {
             Ok(plan) => plan,
             Err(error) => return WorkerRemovalFailure::retention_response(error),
         };
-        if let Some(owner) = job_cleanup_owner {
+        // A Blocked diagnostic plan cannot pass prepare and has no Runtime child.
+        // Keep continuity pinned for every executable/uncertain child, not a Hold.
+        if let Some(owner) = job_cleanup_owner
+            .filter(|_| plan.state != crate::retention::WorkerRemovalPlanState::Blocked)
+        {
             *owner
                 .lock()
                 .map_err(|_| "Job cleanup child owner poisoned".to_string())? =
@@ -5012,7 +5027,13 @@ impl WorkspaceApi {
                 .run(move || host.adopt_legacy_storage(&scope, &catalog))
                 .await?;
         }
+        let feature_permissions = worker::feature::permissions::builtin_permission_registry(
+            feature_permissions::WorkspaceId::parse(config.workspace_id.clone())
+                .map_err(Error::InvalidInput)?,
+        )
+        .map_err(|error| Error::Config(error.to_string()))?;
         let mut api = Self {
+            permission_registry: Arc::new(RwLock::new(feature_permissions)),
             host_executors,
             drive_host,
             config_store,
@@ -5023,6 +5044,7 @@ impl WorkspaceApi {
                 crate::prompt_settings::WorkspacePromptProjectionCache::default(),
             feature_storage,
             subjektiv_registration,
+            subject_authority_store: None,
             authority,
             _worker_projection_shutdown: Arc::new(WorkerProjectionShutdownGuard {
                 service: Arc::downgrade(&worker_projection),
@@ -5056,6 +5078,12 @@ impl WorkspaceApi {
             attachment_upload_grants: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             plugin_https_transport: None,
+            #[cfg(test)]
+            journal_before_effect: None,
+            #[cfg(test)]
+            memory_before_effect: None,
+            #[cfg(test)]
+            subject_effect_admission_observer: None,
         };
         // Restore the domain fence before this API can issue any Drive handle,
         // including blocked/failed deletions not scheduled for automatic recovery.
@@ -6578,7 +6606,8 @@ impl WorkspaceApi {
                 }
                 validate_ticket_start_dispatch(self, assignment)?;
                 if request.resolved_execution_grant.is_some()
-                    && subject_authorization::worker_permissions(self, &reserved_worker)?.is_none()
+                    && subject_authorization::has_subject_authority(self, &reserved_worker)?
+                        == false
                 {
                     return Err(Error::WorkspacePermissionDenied(
                         "Ticket execution grant disappeared before Runtime dispatch".into(),
@@ -6594,6 +6623,21 @@ impl WorkspaceApi {
                     worker_id,
                     &reservation_fingerprint,
                     "ticket_start_authority",
+                    None,
+                    &compensation_context,
+                    &reserved_attachments,
+                );
+                return Err(ApiError::with_diagnostics(error.error, diagnostics));
+            }
+        }
+        if let Some(grant) = request.resolved_execution_grant.as_ref() {
+            if let Err(error) = subject_authorization::revalidate_execution_grant(self, grant) {
+                let diagnostics = compensate_failed_workspace_worker_create(
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    "subject_delegation_authority",
                     None,
                     &compensation_context,
                     &reserved_attachments,
@@ -10513,16 +10557,21 @@ impl server_api::ServerApi for ServerApiContractService {
             .run(move || -> ApiResult<_> {
                 let store = open_subjektiv_store(&mutation_api)?;
                 let before = store
-                    .subject_permissions(&mutation_subject)
-                    .map_err(subjektiv_store_error)?;
-                let was_current = before.as_ref().map(|policy| &policy.change_id)
-                    == request.expected_change_id.as_ref();
+                    .subject_policy_source(&mutation_subject)
+                    .map_err(subjektiv_store_error)?
+                    .map(|policy| match policy {
+                        server_api::authorization::SubjectPolicySource::Feature(policy) => {
+                            policy.change_id
+                        }
+                        server_api::authorization::SubjectPolicySource::Legacy(policy) => {
+                            policy.change_id
+                        }
+                    });
+                let was_current = before.as_ref() == request.expected_change_id.as_ref();
                 let permissions = store
                     .set_managed_subject_permissions(&mutation_subject, &request)
                     .map_err(subjektiv_store_error)?;
-                let changed = was_current
-                    && before.as_ref().map(|source| &source.change_id)
-                        != Some(&permissions.change_id);
+                let changed = was_current && before.as_ref() != Some(&permissions.change_id);
                 Ok((permissions, changed))
             })
             .await
@@ -10540,13 +10589,18 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn subjektiv_subject_create(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
         request: server_api::SubjektivSubjectCreateRequest,
     ) -> std::result::Result<server_api::SubjektivSubjectResponse, server_api::RepositoryApiError>
     {
+        let actor = subject_authorization::administration_actor(&context)
+            .map_err(ApiError::into_repository_api_error)?
+            .clone();
         scoped_create_subjektiv_subject(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
+            Extension(actor),
             Json(request),
         )
         .await
@@ -18304,12 +18358,11 @@ fn ticket_start_delegation(
     }) = source
     {
         if agent_key.is_empty()
-            && subject_authorization::worker_permissions(
+            && subject_authorization::has_subject_authority(
                 api,
                 &RuntimeWorkerRef::new(runtime_id, worker_id),
             )
             .map_err(|error| error.error)?
-            .is_some()
         {
             return Err(Error::WorkspacePermissionDenied(
                 "Ticket execution initiation requires the current assigned Subject body; a delegated Worker cannot impersonate it".into(),
@@ -18362,9 +18415,8 @@ fn ticket_spawn_delegation(
         if let Some(worker) = worker.as_ref() {
             api.store
                 .require_current_worker_singleton_owner(&api.config.workspace_id, worker)?;
-            if subject_authorization::worker_permissions(api, worker)
+            if subject_authorization::has_subject_authority(api, worker)
                 .map_err(|error| error.error)?
-                .is_some()
             {
                 let (_, source) = authenticated_assignment_source(api, headers, context)?;
                 return ticket_start_delegation(api, Some(&source), observed_assignment_id);
@@ -24755,6 +24807,7 @@ const SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE: &str = "subjektiv-memory-consolida
 struct HostExecutors {
     host: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
     cleanup: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
+    feature: Arc<std::sync::OnceLock<Option<crate::db_executor::DbExecutor>>>,
 }
 
 impl HostExecutors {
@@ -24784,6 +24837,11 @@ impl HostExecutors {
     fn cleanup(&self) -> Result<crate::db_executor::DbExecutor> {
         Self::lane(&self.cleanup)
     }
+    // Protected Feature callbacks can wait on domain admission, but must leave
+    // both policy SQL and a Host awaiting Runtime callbacks free to progress.
+    fn feature(&self) -> Result<crate::db_executor::DbExecutor> {
+        Self::lane(&self.feature)
+    }
 }
 
 /// Poll mixed lifecycle workflows on finite Host ownership using the original Tokio handle,
@@ -24807,16 +24865,21 @@ where
 }
 
 fn open_legacy_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
+    if let Some(reader) = &api.subject_authority_store {
+        return Ok(reader.clone());
+    }
     crate::subjektiv::SubjektivStore::open(&api.feature_storage, &api.subjektiv_registration)
         .map_err(|error| ApiError::from(subjektiv_store_error(error)))
 }
 
 fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
-    let host = worker::feature::permissions::builtin_permission_host(
-        feature_permissions::WorkspaceId::parse(api.config.workspace_id.clone())
-            .map_err(|error| Error::InvalidInput(error.to_string()))?,
-    )
-    .map_err(|error| Error::Config(error.to_string()))?;
+    api.refresh_plugin_permission_registry()?;
+    let host = api
+        .permission_registry
+        .read()
+        .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?
+        .host()
+        .clone();
     Ok(
         open_legacy_subjektiv_store(api)?.with_canonical_permission_source(Arc::new(
             crate::config_adoption::CanonicalConfigurationSource {
@@ -25208,25 +25271,41 @@ fn subjektiv_subject_response(
 async fn scoped_create_subjektiv_subject(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Extension(actor): Extension<RequestActor>,
     Json(request): Json<server_api::SubjektivSubjectCreateRequest>,
 ) -> ApiResult<(StatusCode, Json<server_api::SubjektivSubjectResponse>)> {
-    api.host_executors
-        .host()?
-        .run(move || {
-            validate_workspace_scope(&api, &path.workspace_id)?;
-            let role = crate::subjektiv::SubjectRole::new(request.role)
-                .map_err(|error| Error::InvalidInput(error.to_string()))?;
-            crate::subjektiv::validate_subject_behavior(&request.behavior_md)
-                .map_err(|error| Error::InvalidInput(error.to_string()))?;
-            let subject = open_subjektiv_store(&api)?
-                .create_subject_idempotent(role, request.behavior_md, &request.operation_id)
-                .map_err(subjektiv_store_error)?;
-            Ok((
-                StatusCode::CREATED,
-                Json(subjektiv_subject_response(&api, subject)?),
-            ))
-        })
-        .await
+    let executor = api.host_executors.host()?;
+    run_host_workflow(executor, async move {
+        require_workspace_owner(&api, &path.workspace_id, &actor, "Subject creation").await?;
+        validate_workspace_scope(&api, &path.workspace_id)?;
+        let role = crate::subjektiv::SubjectRole::new(request.role)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        crate::subjektiv::validate_subject_behavior(&request.behavior_md)
+            .map_err(|error| Error::InvalidInput(error.to_string()))?;
+        let subjects = open_subjektiv_store(&api)?;
+        let subject = subjects
+            .create_subject_idempotent(role, request.behavior_md, &request.operation_id)
+            .map_err(subjektiv_store_error)?;
+        api.config_store.enroll_created_subject(
+            &path.workspace_id,
+            &actor.account_id,
+            &subjects,
+            &subject.id,
+            api.config_schema_registry.compose()?,
+            || {
+                let registry = api.permission_registry.read().map_err(|_| {
+                    Error::Config("current Feature declarations unavailable".into())
+                })?;
+                let host = registry.host().clone();
+                Ok((registry, host))
+            },
+        )?;
+        Ok((
+            StatusCode::CREATED,
+            Json(subjektiv_subject_response(&api, subject)?),
+        ))
+    })
+    .await
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25489,7 +25568,17 @@ async fn scoped_stage_subjektiv_candidate(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     context: server_api::ServerRequestContext,
-    Json(mut request): Json<server_api::SubjektivStageCandidateRequest>,
+    Json(request): Json<server_api::SubjektivStageCandidateRequest>,
+) -> ApiResult<Json<server_api::SubjektivStageCandidateResponse>> {
+    stage_subjektiv_candidate_before_native(api, path, context, request, || {}).await
+}
+
+async fn stage_subjektiv_candidate_before_native(
+    api: WorkspaceApi,
+    path: ScopedWorkspacePath,
+    context: server_api::ServerRequestContext,
+    mut request: server_api::SubjektivStageCandidateRequest,
+    before_native: impl FnOnce() + Send + 'static,
 ) -> ApiResult<Json<server_api::SubjektivStageCandidateResponse>> {
     api.host_executors
         .host()?
@@ -25547,9 +25636,29 @@ async fn scoped_stage_subjektiv_candidate(
                 request.operation.source_refs,
             );
             let record = crate::subjektiv::SubjectStagingRecord::attach(&subject_id, record);
-            let (staged, _) = open_subjektiv_store(&api)?
+            before_native();
+            #[cfg(test)]
+            if let Some(observe) = &api.memory_before_effect {
+                observe("memory.staging.write");
+            }
+            let store = open_subjektiv_store(&api)?;
+            let worker = RuntimeWorkerRef::new(&attribution.runtime_id, &attribution.worker_id);
+            let source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Memory staging requires an authenticated Runtime source".into(),
+                )
+            })?;
+            let effect_store = subject_authorization::authenticated_subject_effect_store(
+                &api,
+                &store,
+                &worker,
+                &subject_id,
+                "memory.staging.write",
+                source,
+            );
+            let (staged, _) = effect_store
                 .stage_candidate_with_attribution(record, attribution)
-                .map_err(|error| Error::InvalidInput(error.to_string()))?;
+                .map_err(subjektiv_store_error)?;
             Ok(Json(server_api::SubjektivStageCandidateResponse {
                 staging_id: staged.id,
             }))
@@ -25594,7 +25703,15 @@ async fn scoped_record_subjektiv_session(
                 &attribution.subject_id,
                 "session.record",
             )?;
-            session_registration::bind_host_session(&api, attribution.clone())?;
+            let source = context.runtime_source.as_ref().ok_or_else(|| {
+                session_registration::Judgment::SessionRecord.error(
+                    Error::WorkspacePermissionDenied(
+                        "Session registration requires a signed Runtime source".into(),
+                    ),
+                    protocol::session_failure::SessionRegistrationCause::binding_mismatch(),
+                )
+            })?;
+            session_registration::bind_host_session(&api, attribution.clone(), source)?;
             Ok(Json(server_api::SubjektivRecordSessionResponse {
                 subject_id: attribution.subject_id,
                 session_id: attribution.session_id,
@@ -25695,6 +25812,16 @@ async fn scoped_subjektiv_session_backend(
     context: server_api::ServerRequestContext,
     Json(request): Json<server_api::SubjektivSessionBackendRequest>,
 ) -> ApiResult<Json<server_api::SubjektivSessionBackendResponse>> {
+    subjektiv_session_backend_before_return(api, path, context, request, || {}).await
+}
+
+async fn subjektiv_session_backend_before_return(
+    api: WorkspaceApi,
+    path: ScopedWorkspacePath,
+    context: server_api::ServerRequestContext,
+    request: server_api::SubjektivSessionBackendRequest,
+    before_return: impl FnOnce() + Send + 'static,
+) -> ApiResult<Json<server_api::SubjektivSessionBackendResponse>> {
     api.host_executors
         .host()?
         .run(move || {
@@ -25706,16 +25833,30 @@ async fn scoped_subjektiv_session_backend(
                 SubjektivWorkerAuthority::Subject,
                 "Session history read",
             )?;
+            let request_source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Session reads require a signed Runtime source".into(),
+                )
+            })?;
+            api.config_store.with_conn(|connection| {
+                crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                    connection,
+                    &path.workspace_id,
+                    request_source,
+                    &controller,
+                )
+            })?;
+            let operation = match &request.operation {
+                server_api::SubjektivSessionBackendOperation::List(_) => "session.list",
+                server_api::SubjektivSessionBackendOperation::Search(_) => "session.search",
+                server_api::SubjektivSessionBackendOperation::Read(_) => "session.read",
+            };
             authorize_subjektiv_operation(
                 &api,
                 &controller,
                 &path.workspace_id,
                 &subject_id,
-                match &request.operation {
-                    server_api::SubjektivSessionBackendOperation::List(_) => "session.list",
-                    server_api::SubjektivSessionBackendOperation::Search(_) => "session.search",
-                    server_api::SubjektivSessionBackendOperation::Read(_) => "session.read",
-                },
+                operation,
             )?;
             let store = match open_subjektiv_store(&api) {
                 Ok(store) => store,
@@ -25758,9 +25899,99 @@ async fn scoped_subjektiv_session_backend(
                     )
                 }
             };
-            Ok(Json(response))
+            before_return();
+            // Runtime may wait while trust, policy, ownership or observation
+            // changes. Fence the coherent Feature/catalog/Host return scope; all
+            // nested reads use its query readers, and none calls Runtime here.
+            service_authority::with_service_authority(&api, |current, connection| {
+                crate::SqliteWorkspaceStore::require_authenticated_subject_request(
+                    connection,
+                    &path.workspace_id,
+                    request_source,
+                    &controller,
+                )?;
+                Ok((|| -> ApiResult<_> {
+                    let scope =
+                        subjektiv_worker_scope_from_store(current, &path.workspace_id, &context)?;
+                    if scope.subject_id != subject_id
+                        || scope.worker != controller
+                        || !matches!(scope.authority, SubjektivStoredScopeAuthority::Subject)
+                    {
+                        return Err(Error::WorkspacePermissionDenied(
+                            "Session principal changed during read".into(),
+                        )
+                        .into());
+                    }
+                    authorize_subjektiv_operation(
+                        current,
+                        &controller,
+                        &path.workspace_id,
+                        &subject_id,
+                        operation,
+                    )?;
+                    let subjects = open_subjektiv_store(current)?;
+                    revalidate_subjektiv_session_response(
+                        current,
+                        &subjects,
+                        &path.workspace_id,
+                        &subject_id,
+                        &controller,
+                        &response,
+                    )?;
+                    Ok(Json(response))
+                })())
+            })?
         })
         .await
+}
+
+fn revalidate_subjektiv_session_response(
+    api: &WorkspaceApi,
+    store: &crate::subjektiv::SubjektivStore,
+    workspace_id: &str,
+    subject_id: &str,
+    controller: &RuntimeWorkerRef,
+    response: &server_api::SubjektivSessionBackendResponse,
+) -> ApiResult<()> {
+    use server_api::{
+        SubjektivSessionBackendResponse as Response, SubjektivSessionBackendResult as Result,
+    };
+    let Response::Ok { result } = response else {
+        return Ok(());
+    };
+    let sessions: std::collections::BTreeSet<&str> = match result {
+        Result::List(page) => page
+            .items
+            .iter()
+            .map(|item| item.session_id.as_str())
+            .collect(),
+        Result::Search(page) => page
+            .items
+            .iter()
+            .map(|item| item.session_id.as_str())
+            .collect(),
+        Result::Read(page) => [page.session_id.as_str()].into_iter().collect(),
+    };
+    for session_id in sessions {
+        let attribution = store
+            .session_attribution(session_id)
+            .map_err(subjektiv_store_error)?
+            .filter(|attribution| attribution.subject_id == subject_id)
+            .ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Session attribution is no longer available".into(),
+                )
+            })?;
+        let source = authorized_subjektiv_session(api, workspace_id, controller, attribution)
+            .map_err(Error::Store)?;
+        if source.is_none_or(|source| source.expired) {
+            return Err(Error::WorkspacePermissionDenied(
+                "Session observation grant is no longer active".into(),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn subjektiv_session_list(
@@ -27028,26 +27259,27 @@ async fn scoped_subjektiv_memory_backend(
             } else {
                 subjektiv_subject_scope(&api, &path.workspace_id, &context)?
             };
+            let operation_name = match &request.operation {
+                Op::ResidentSummary(_) | Op::ResidentContext(_) => "memory.resident.read",
+                Op::ValidateProposal(_) => "memory.proposal.validate",
+                Op::ReceiptStatus(_) => "memory.receipt.read",
+                Op::StageExplicit(_) => "memory.staging.write",
+                Op::ListCandidates(_) => "memory.staging.list",
+                Op::ReadCandidate(_) => "memory.staging.read",
+                Op::DecideCandidate(_) => "memory.candidate.decide",
+                Op::PrepareSurface(_) => "memory.surface.prepare",
+                Op::PublishSurface(_) => "memory.surface.publish",
+                Op::FailSurface(_) => "memory.surface.fail",
+                Op::Query(_) => "memory.query",
+                Op::Read(_) => "memory.read",
+                Op::ListChanges(_) => "memory.changes.list",
+            };
             authorize_subjektiv_operation(
                 &api,
                 &source_worker,
                 &path.workspace_id,
                 &subject_id,
-                match &request.operation {
-                    Op::ResidentSummary(_) | Op::ResidentContext(_) => "memory.resident.read",
-                    Op::ValidateProposal(_) => "memory.proposal.validate",
-                    Op::ReceiptStatus(_) => "memory.receipt.read",
-                    Op::StageExplicit(_) => "memory.staging.write",
-                    Op::ListCandidates(_) => "memory.staging.list",
-                    Op::ReadCandidate(_) => "memory.staging.read",
-                    Op::DecideCandidate(_) => "memory.candidate.decide",
-                    Op::PrepareSurface(_) => "memory.surface.prepare",
-                    Op::PublishSurface(_) => "memory.surface.publish",
-                    Op::FailSurface(_) => "memory.surface.fail",
-                    Op::Query(_) => "memory.query",
-                    Op::Read(_) => "memory.read",
-                    Op::ListChanges(_) => "memory.changes.list",
-                },
+                operation_name,
             )?;
             let store = open_subjektiv_store(&api)?;
             // Authentication, live Worker/Job authority and committed Session provenance
@@ -27103,11 +27335,33 @@ async fn scoped_subjektiv_memory_backend(
                     )?
                 }
             };
-            Ok(Json(subjektiv::api::execute(
+            #[cfg(test)]
+            if let Some(observe) = &api.memory_before_effect {
+                observe(operation_name);
+            }
+            let source = context.runtime_source.as_ref().ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Memory operations require an authenticated Runtime source".into(),
+                )
+            })?;
+            let effect_store = subject_authorization::authenticated_subject_effect_store(
+                &api,
                 &store,
-                &host_context,
-                request.operation,
-            )?))
+                &source_worker,
+                &subject_id,
+                operation_name,
+                source,
+            );
+            let response =
+                subjektiv::api::execute(&effect_store, &host_context, request.operation)?;
+            authorize_subjektiv_operation(
+                &api,
+                &source_worker,
+                &path.workspace_id,
+                &subject_id,
+                operation_name,
+            )?;
+            Ok(Json(response))
         })
         .await
 }
@@ -28843,6 +29097,20 @@ fn authorize_known_worker_permission(
     }
     subject_authorization::WorkerAuthorityView::from(api)
         .authorize_control_permission(controller, subject, permission)
+        .map_err(|error| match error {
+            // This producer is a Worker control operation. Preserve only an
+            // actual authorization decision as the typed control cause; storage
+            // and configuration errors must not be guessed from Display text.
+            Error::WorkspacePermissionDenied(_) => Error::RuntimeControlFailed {
+                runtime_id: subject.runtime_id.clone(),
+                cause: protocol::control_failure::RuntimeControlCause::AuthorizationFailed,
+            },
+            Error::Config(_) => Error::RuntimeControlFailed {
+                runtime_id: subject.runtime_id.clone(),
+                cause: protocol::control_failure::RuntimeControlCause::ConfigurationUnavailable,
+            },
+            error => error,
+        })
 }
 
 async fn send_known_worker_input(
@@ -40971,7 +41239,8 @@ fn api_error_status(error: &Error) -> StatusCode {
             match failure.details().reason {
                 Reason::OwnerRequired => StatusCode::FORBIDDEN,
                 Reason::PublicationDispatchUnavailable
-                | Reason::PublicationProjectionUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
+                | Reason::PublicationProjectionUnavailable
+                | Reason::PublicationRegistryUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
                 Reason::CatalogChanged
                 | Reason::EditingHeadChanged
                 | Reason::LegacyExportChanged
@@ -40980,6 +41249,7 @@ fn api_error_status(error: &Error) -> StatusCode {
                 | Reason::WorkspaceDraining
                 | Reason::RequestIdentityConflict => StatusCode::CONFLICT,
                 Reason::InvalidPath
+                | Reason::BuiltinReadOnly
                 | Reason::InvalidImport
                 | Reason::ImportEscape
                 | Reason::AlreadyExists
@@ -41524,13 +41794,24 @@ mod tests {
         }
         fn assign(api: &WorkspaceApi, subject: &str, resources: Vec<PermissionResource>) {
             let store = open_subjektiv_store(api).unwrap();
-            let previous = store.subject_permissions(subject).unwrap();
+            let previous =
+                store
+                    .subject_policy_source(subject)
+                    .unwrap()
+                    .map(|policy| match policy {
+                        server_api::authorization::SubjectPolicySource::Feature(policy) => {
+                            policy.change_id
+                        }
+                        server_api::authorization::SubjectPolicySource::Legacy(policy) => {
+                            policy.change_id
+                        }
+                    });
             store
                 .set_subject_permissions(
                     subject,
                     &SubjectPermissionsUpdate {
                         operation_id: Uuid::now_v7().to_string(),
-                        expected_change_id: previous.map(|policy| policy.change_id),
+                        expected_change_id: previous,
                         execution: resources
                             .into_iter()
                             .map(|resource| ScopedPermission {
@@ -41555,6 +41836,7 @@ mod tests {
                 .create_subject(crate::subjektiv::SubjectRole::new("notification-source").unwrap())
                 .unwrap()
                 .id;
+            assign(&api, &subject, vec![]);
             let mut workers = Vec::new();
             for attached in [true, false] {
                 let Json(created) = create_workspace_worker(
@@ -50126,6 +50408,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
+            Extension(test_owner_actor()),
             Json(server_api::SubjektivSubjectCreateRequest {
                 operation_id: format!("create-subject-{}", uuid::Uuid::now_v7()),
                 role: "companion".to_string(),
@@ -50190,6 +50473,7 @@ mod tests {
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
+            Extension(test_owner_actor()),
             Json(server_api::SubjektivSubjectCreateRequest {
                 operation_id: format!("create-subject-{}", uuid::Uuid::now_v7()),
                 role: "reviewer".to_string(),
@@ -50688,7 +50972,7 @@ mod tests {
                 serde_json::to_vec(&body).unwrap(),
             )
         };
-        let initial = store.subject_permissions(&subject.id).unwrap().unwrap();
+        let initial = store.current_subject_policy(&subject.id).unwrap().unwrap();
         store
             .set_subject_permissions(
                 &subject.id,
@@ -50729,7 +51013,7 @@ mod tests {
                             resource: subject_resource.clone(),
                         },
                         ScopedPermission {
-                            operation: "worker.session.read".into(),
+                            operation: "subworker.observe".into(),
                             resource: child_resource.clone(),
                         },
                     ],
@@ -50740,7 +51024,7 @@ mod tests {
         for (body, expected) in [
             (subject_request.clone(), subject_resource),
             (
-                json!({"operation":"worker.session.read", "target":{"kind":"sub_worker", "name":"not-started-child"}}),
+                json!({"operation":"subworker.observe", "target":{"kind":"sub_worker", "name":"not-started-child"}}),
                 child_resource,
             ),
         ] {
@@ -50756,7 +51040,7 @@ mod tests {
         // A different child name cannot inherit this grant. Caller-provided Subject
         // identities are rejected at the wire boundary, not used as selectors.
         for body in [
-            json!({"operation":"worker.session.read", "target":{"kind":"sub_worker", "name":"other-child"}}),
+            json!({"operation":"subworker.observe", "target":{"kind":"sub_worker", "name":"other-child"}}),
             json!({"operation":"memory.resident.supply", "target":{"kind":"subject", "subject_id":"other-subject"}}),
         ] {
             let response = build_router(api.clone())
@@ -50853,7 +51137,7 @@ mod tests {
                     operation_id: "staging-scope-fixture".into(),
                     expected_change_id: open_subjektiv_store(&api)
                         .unwrap()
-                        .subject_permissions(&subject.id)
+                        .current_subject_policy(&subject.id)
                         .unwrap()
                         .map(|p| p.change_id),
                     execution,
@@ -50918,11 +51202,17 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        seed_test_delivery_binding(&api);
         let context = server_api::ServerRequestContext {
             actor: None,
             worker_source: None,
             runtime_source: Some(server_api::ServerRuntimeSource {
-                authentication_binding_id: "fixture-binding".into(),
+                authentication_binding_id: api
+                    .config_store
+                    .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &created.runtime_id)
+                    .unwrap()
+                    .unwrap()
+                    .binding_id,
                 runtime_id: created.runtime_id.clone(),
                 worker_id: Some(created.worker_id.clone()),
             }),
@@ -53276,13 +53566,15 @@ mod tests {
                 hook();
             }
             let release = self.subject_release.lock().unwrap();
-            if release.as_ref().is_some_and(|(_, state)| {
-                matches!(
-                    state,
-                    runtime_api::SubjectReleaseState::Reserved
-                        | runtime_api::SubjectReleaseState::Disconnected
-                )
-            }) {
+            if !matches!(method, protocol::Method::Shutdown { .. })
+                && release.as_ref().is_some_and(|(_, state)| {
+                    matches!(
+                        state,
+                        runtime_api::SubjectReleaseState::Reserved
+                            | runtime_api::SubjectReleaseState::Disconnected
+                    )
+                })
+            {
                 return Err(Self::unavailable());
             }
             // Drive the actual mock receiver synchronously; no method is routed
@@ -53355,7 +53647,16 @@ mod tests {
         }
     }
 
+    struct DeterministicAdmission {
+        workspace_id: Option<String>,
+        create_fingerprint: String,
+        deletion: Option<runtime_api::SubjectDeleteWorkerRequest>,
+    }
+
     struct DeterministicExecutionBackend {
+        admissions:
+            Arc<Mutex<HashMap<worker_runtime::identity::WorkerRef, DeterministicAdmission>>>,
+        subject_delete_checks: Mutex<Vec<runtime_api::SubjectDeleteWorkerRequest>>,
         receipts: Mutex<
             HashMap<
                 (worker_runtime::identity::WorkerRef, String),
@@ -53365,10 +53666,12 @@ mod tests {
                 ),
             >,
         >,
-        terminations: Mutex<
-            HashMap<
-                worker_runtime::identity::WorkerRef,
-                worker_runtime::execution::WorkerExecutionTermination,
+        terminations: Arc<
+            Mutex<
+                HashMap<
+                    worker_runtime::identity::WorkerRef,
+                    worker_runtime::execution::WorkerExecutionTermination,
+                >,
             >,
         >,
         lose_input_ack: std::sync::atomic::AtomicBool,
@@ -53424,8 +53727,10 @@ mod tests {
                     .as_nanos()
             );
             Self {
+                admissions: Arc::default(),
+                subject_delete_checks: Mutex::new(Vec::new()),
                 receipts: Mutex::new(HashMap::new()),
-                terminations: Mutex::new(HashMap::new()),
+                terminations: Arc::default(),
                 lose_input_ack: std::sync::atomic::AtomicBool::new(false),
                 reject_input_definitively: std::sync::atomic::AtomicBool::new(false),
                 assignment_release_enabled: std::sync::atomic::AtomicBool::new(false),
@@ -53456,6 +53761,16 @@ mod tests {
     }
 
     impl DeterministicExecutionBackend {
+        // Server-only reopen retains this substituted execution owner's genuine
+        // shutdown records. It does not attest a Runtime/provider process restart.
+        fn with_retained_stopped_executions(&self) -> Self {
+            Self {
+                admissions: self.admissions.clone(),
+                terminations: self.terminations.clone(),
+                ..Self::default()
+            }
+        }
+
         fn reject_inputs(&self, message: impl Into<String>) {
             *self.input_failure.lock().unwrap() = Some(message.into());
         }
@@ -53599,6 +53914,30 @@ mod tests {
             &self,
             request: worker_runtime::execution::WorkerExecutionSpawnRequest,
         ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            let mut admissions = self.admissions.lock().unwrap();
+            if admissions
+                .get(&request.worker_ref)
+                .is_some_and(|a| a.deletion.is_some())
+            {
+                return worker_runtime::execution::WorkerExecutionSpawnResult::Rejected(
+                    worker_runtime::execution::WorkerExecutionResult::rejected(
+                        worker_runtime::execution::WorkerExecutionOperation::Spawn,
+                        "Fixture Subject admission is fenced",
+                    ),
+                );
+            }
+            admissions.insert(
+                request.worker_ref.clone(),
+                DeterministicAdmission {
+                    workspace_id: request
+                        .workspace_scope
+                        .as_ref()
+                        .map(|scope| scope.workspace_id.clone()),
+                    create_fingerprint: request.request.create_fingerprint.clone(),
+                    deletion: None,
+                },
+            );
+            drop(admissions);
             if let Some(result) = self.typed_spawn_failure.lock().unwrap().take() {
                 return worker_runtime::execution::WorkerExecutionSpawnResult::Errored(result);
             }
@@ -53637,6 +53976,18 @@ mod tests {
             &self,
             request: &worker_runtime::execution::WorkerExecutionRestoreRequest,
         ) -> std::result::Result<(), worker_runtime::execution::WorkerExecutionResult> {
+            if self
+                .admissions
+                .lock()
+                .unwrap()
+                .get(&request.worker_ref)
+                .is_some_and(|a| a.deletion.is_some())
+            {
+                return Err(worker_runtime::execution::WorkerExecutionResult::rejected(
+                    worker_runtime::execution::WorkerExecutionOperation::Restore,
+                    "Fixture Subject admission is fenced",
+                ));
+            }
             if let Some(execution) = self.contexts.lock().unwrap().get(&request.worker_ref) {
                 return Err(worker_runtime::execution::WorkerExecutionResult::busy(
                     worker_runtime::execution::WorkerExecutionOperation::Restore,
@@ -53681,6 +54032,17 @@ mod tests {
                     working_directory: binding.status(),
                 })
                 .collect();
+            self.admissions.lock().unwrap().insert(
+                request.worker_ref.clone(),
+                DeterministicAdmission {
+                    workspace_id: request
+                        .workspace_scope
+                        .as_ref()
+                        .map(|scope| scope.workspace_id.clone()),
+                    create_fingerprint: request.request.create_fingerprint.clone(),
+                    deletion: None,
+                },
+            );
             self.contexts.lock().unwrap().insert(
                 request.worker_ref.clone(),
                 Arc::new(DeterministicWorkerExecution::new(
@@ -53762,6 +54124,8 @@ mod tests {
                 }
             });
             let bound_execution = Arc::downgrade(&execution);
+            let stopping_execution = bound_execution.clone();
+            let stop_owner = self.clone();
             let method_tx = execution.method_tx.clone();
             Ok(worker_runtime::execution::WorkerProtocolTransport::new(
                 worker_ref.clone(),
@@ -53780,7 +54144,25 @@ mod tests {
                         Ok(())
                     }
                 }),
-            ))
+            )
+            .with_stop_dispatch(Arc::new(move |request| {
+                let Some(captured) = stopping_execution.upgrade() else {
+                    return DeterministicWorkerExecution::unavailable();
+                };
+                let current = stop_owner
+                    .contexts
+                    .lock()
+                    .unwrap()
+                    .get(&request.worker_ref)
+                    .cloned();
+                if !current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &captured))
+                {
+                    return DeterministicWorkerExecution::unavailable();
+                }
+                stop_owner.stop_worker_operation(request)
+            })))
         }
 
         fn worker_snapshot(
@@ -53803,9 +54185,112 @@ mod tests {
 
         fn preflight_subject_delete_worker(
             &self,
-            _request: &runtime_api::SubjectDeleteWorkerRequest,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
         ) -> std::result::Result<(), String> {
+            let worker = worker_runtime::identity::WorkerRef::new(request.worker_id);
+            let admissions = self.admissions.lock().unwrap();
+            let Some(admission) = admissions.get(&worker) else {
+                // Runtime owns the never-materialized reservation/exclusion proof.
+                // An absent fixture resource alone cannot attest historical shutdown.
+                return if !self.contexts.lock().unwrap().contains_key(&worker)
+                    && !self.terminations.lock().unwrap().contains_key(&worker)
+                {
+                    Ok(())
+                } else {
+                    Err("Fixture creation identity unavailable".into())
+                };
+            };
+            if admission.workspace_id.as_deref() != Some(request.workspace_id.as_str())
+                || admission.create_fingerprint != request.create_fingerprint
+                || admission
+                    .deletion
+                    .as_ref()
+                    .is_some_and(|saved| saved != request)
+            {
+                return Err("Fixture Subject deletion identity changed".into());
+            }
             Ok(())
+        }
+
+        fn fence_subject_delete_worker(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> std::result::Result<(), String> {
+            self.preflight_subject_delete_worker(request)?;
+            self.admissions
+                .lock()
+                .unwrap()
+                .entry(worker_runtime::identity::WorkerRef::new(request.worker_id))
+                .or_insert_with(|| DeterministicAdmission {
+                    workspace_id: Some(request.workspace_id.clone()),
+                    create_fingerprint: request.create_fingerprint.clone(),
+                    deletion: None,
+                })
+                .deletion = Some(request.clone());
+            Ok(())
+        }
+
+        fn confirm_subject_delete_worker_absent(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+        ) -> std::result::Result<(), String> {
+            self.preflight_subject_delete_worker(request)?;
+            self.subject_delete_checks
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            if let Some(message) = self.subject_delete_failure.lock().unwrap().clone() {
+                return Err(message);
+            }
+            let worker = worker_runtime::identity::WorkerRef::new(request.worker_id);
+            if self
+                .admissions
+                .lock()
+                .unwrap()
+                .get(&worker)
+                .and_then(|a| a.deletion.as_ref())
+                != Some(request)
+                || self.contexts.lock().unwrap().contains_key(&worker)
+            {
+                return Err(
+                    "Fixture Subject admission not fenced or execution still present".into(),
+                );
+            }
+            // Historical shutdown is reconciled separately against the retained receipt.
+            Ok(())
+        }
+
+        fn subject_delete_worker_stop(
+            &self,
+            request: &runtime_api::SubjectDeleteWorkerRequest,
+            stop: worker_runtime::execution::WorkerExecutionStopRequest,
+            canonical: Option<&worker_runtime::execution::WorkerExecutionTermination>,
+        ) -> std::result::Result<worker_runtime::execution::WorkerExecutionResult, String> {
+            use worker_runtime::execution::*;
+            self.preflight_subject_delete_worker(request)?;
+            self.subject_delete_checks
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            if let Some(message) = self.subject_delete_failure.lock().unwrap().clone() {
+                return Err(message);
+            }
+            if let Some(saved) = canonical {
+                if !saved.confirms_scope_shutdown(&stop.worker_ref, stop.operation_id)
+                    || self
+                        .reconcile_termination_receipt(&stop.worker_ref, saved)?
+                        .as_ref()
+                        != Some(saved)
+                {
+                    return Err("Fixture canonical Stop no longer matches actual execution".into());
+                }
+                self.confirm_subject_delete_worker_absent(request)?;
+                let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+                result.execution_id = Some(saved.execution_id);
+                result.termination = Some(saved.clone());
+                return Ok(result);
+            }
+            Ok(self.stop_worker_operation(stop))
         }
 
         fn subject_delete_worker(
@@ -53870,6 +54355,12 @@ mod tests {
                     "No fixture execution or matching stop receipt",
                 );
             };
+            let shutdown_command_id = 1;
+            if let Err(result) = execution.dispatch(protocol::Method::Shutdown {
+                command: protocol::WorkerCommandEnvelope::new(shutdown_command_id),
+            }) {
+                return result;
+            }
             let mut result = self.stop_worker(&request.worker_ref);
             // This fixture has no real Controller/Features. Join its actual echo
             // threads before attesting its explicitly substituted execution boundary.
@@ -53897,7 +54388,7 @@ mod tests {
                 worker_ref: request.worker_ref.clone(),
                 stop_operation_id: request.operation_id,
                 execution_id: execution.execution_id,
-                shutdown_command_id: Some(1),
+                shutdown_command_id: Some(shutdown_command_id),
                 submissions,
                 feature_failures: Vec::new(),
             };
@@ -55203,13 +55694,25 @@ mod tests {
         assert_eq!(
             *attempt
                 .failure_cause
+                .as_ref()
                 .unwrap()
-                .project_for::<error_contract::Storage, crate::backend_job::BackgroundJobCause>(&())
+                .project_for::<error_contract::Storage, protocol::control_failure::RuntimeControlCause>(&())
                 .unwrap()
                 .details(),
-            crate::backend_job::BackgroundJobCause::InputFailed
+            protocol::control_failure::RuntimeControlCause::ExecutionRejected
         );
         assert_eq!(attempt.attempt, 1);
+        let reopened = SqliteWorkspaceStore::open_api_fixture(&api.config.database_path).unwrap();
+        let saved_job = reopened
+            .get_backend_job(api.workspace_id(), &request.job_id)
+            .unwrap()
+            .unwrap();
+        let saved_attempt = reopened
+            .get_backend_job_attempt(api.workspace_id(), &request.job_id, &attempt.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_job.failure_cause, job.failure_cause);
+        assert_eq!(saved_attempt.failure_cause, attempt.failure_cause);
     }
 
     #[tokio::test]
@@ -61837,6 +62340,9 @@ mod tests {
 
     include!("server_assignment_test_support.rs");
     include!("server_assignment_attention_tests.rs");
+    mod shared_subject_permissions_tests {
+        include!("server_shared_subject_permissions_tests.rs");
+    }
     mod subject_notification_recovery_tests {
         include!("server_subject_notification_recovery_tests.rs");
     }
@@ -71071,7 +71577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedded_runtime_fs_store_restores_catalog_and_stops_failed_execution() {
+    async fn embedded_runtime_fs_store_retains_catalog_when_restore_and_stop_are_unconfirmed() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path().join("workspace"));
         let store_root = config.embedded_runtime_store_root.clone();
@@ -71298,33 +71804,44 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
-        assert_eq!(
-            restored_execution.stops.lock().unwrap().as_slice(),
-            &[observation.worker_ref.clone()]
+        assert_eq!(stopped.state, InternalWorkerOperationState::Rejected);
+        assert!(
+            stopped.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("No fixture execution or matching stop receipt")
+            }),
+            "missing execution must remain unconfirmed: {:?}",
+            stopped.diagnostics
         );
-        let stopped_worker = restored.runtime.worker(&worker_ref).unwrap();
-        assert_eq!(stopped_worker.state, "stopped");
-        sync_worker_observation(&restored, &stopped_worker).unwrap();
-        seed_worker_session_for_cleanup(&dir.path().join("workspace"), &worker_ref);
-        let removed = removal
+        assert!(restored_execution.stops.lock().unwrap().is_empty());
+        assert!(
+            restored
+                .runtime
+                .backend_job_termination(&worker_ref)
+                .unwrap()
+                .is_none()
+        );
+        let retained_worker = restored.runtime.worker(&worker_ref).unwrap();
+        assert_ne!(retained_worker.state, "stopped");
+        sync_worker_observation(&restored, &retained_worker).unwrap();
+        let unconfirmed = removal
             .execute_async(
                 verified_source(),
                 &worker_ref.runtime_id,
                 &worker_ref.worker_id,
-                "remove stopped Worker after rejected automatic restore",
+                "unconfirmed Stop cannot authorize removal",
             )
             .await
             .unwrap();
-        assert_eq!(removed.status, StatusCode::OK.as_u16(), "{}", removed.body);
-        assert!(removed.body.contains("\"removed\":true"));
-        assert!(restored.runtime.worker(&worker_ref).is_err());
+        assert_eq!(unconfirmed.status, StatusCode::CONFLICT.as_u16());
+        assert!(restored.runtime.worker(&worker_ref).is_ok());
         assert!(
             restored
                 .store
                 .get_worker_registry(TEST_WORKSPACE_ID, &worker_ref)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
     }
 
@@ -71918,10 +72435,15 @@ mod tests {
                 },
             );
             assert_embedded_protocol_closed(&mut old).await;
-            assert_eq!(
-                execution.protocol_methods().len(),
-                1,
-                "delayed A method reached B"
+            assert!(
+                matches!(
+                    execution.protocol_methods().as_slice(),
+                    [
+                        (_, protocol::Method::ListCompletions { .. }),
+                        (_, protocol::Method::Shutdown { .. })
+                    ]
+                ),
+                "only A's completion and the actual stop may reach the execution"
             );
             assert_eq!(
                 runtime.worker_detail(&worker_ref).unwrap().status,
@@ -72038,10 +72560,16 @@ mod tests {
                 },
             );
             assert_embedded_protocol_ws_closed(&mut old).await;
-            assert_eq!(
-                execution.protocol_methods().len(),
-                2,
-                "delayed A method reached B"
+            assert!(
+                matches!(
+                    execution.protocol_methods().as_slice(),
+                    [
+                        (_, protocol::Method::SubmitTracked { .. }),
+                        (_, protocol::Method::ListCompletions { .. }),
+                        (_, protocol::Method::Shutdown { .. })
+                    ]
+                ),
+                "only A's submit/completion and the actual stop may reach the execution"
             );
             assert_eq!(
                 runtime.worker_detail(&worker_ref).unwrap().status,
@@ -72335,14 +72863,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(event, protocol::Event::TextDelta { text } if text == "execution-b"));
-        let delivered: Vec<_> = execution
-            .protocol_methods()
+        let methods = execution.protocol_methods();
+        assert!(matches!(
+            methods.as_slice(),
+            [
+                (_, protocol::Method::ListCompletions { .. }),
+                (_, protocol::Method::Shutdown { .. }),
+                (_, protocol::Method::ListCompletions { .. })
+            ]
+        ));
+        let delivered: Vec<_> = methods
             .into_iter()
-            .map(|(worker, method)| {
-                let protocol::Method::ListCompletions { request_id, .. } = method else {
-                    panic!("expected completion method");
-                };
-                (worker, request_id.unwrap())
+            .filter_map(|(worker, method)| match method {
+                protocol::Method::ListCompletions { request_id, .. } => {
+                    Some((worker, request_id.unwrap()))
+                }
+                protocol::Method::Shutdown { .. } => None,
+                _ => unreachable!("method sequence was checked above"),
             })
             .collect();
         assert_eq!(

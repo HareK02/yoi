@@ -6,6 +6,8 @@
 //! behind [`WorkspaceClient`].
 
 mod lifecycle_error;
+pub(crate) mod permission_declaration;
+
 pub mod wip;
 use lifecycle_error::LifecycleError;
 use server_api::workdir_management_error::WorkdirManagementCause;
@@ -129,6 +131,13 @@ pub fn manage_workdir_feature(client: Arc<dyn WorkspaceClient>) -> ManageWorkdir
 }
 
 impl FeatureModule for ManageWorkdirFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
             .with_description(FEATURE_DESCRIPTION)

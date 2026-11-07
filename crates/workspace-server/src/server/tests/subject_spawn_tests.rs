@@ -79,7 +79,7 @@ async fn subject_callbacks_finish_before_waiting_host_parents_release_capacity()
                     operation_id: format!("subject-callback-grant-{index}"),
                     expected_change_id: Some(
                         subjektiv
-                            .subject_permissions(&subject.id)
+                            .current_subject_policy(&subject.id)
                             .unwrap()
                             .unwrap()
                             .change_id,

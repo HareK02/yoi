@@ -293,11 +293,42 @@ pub(super) async fn execute(
     let config = api.config_store.clone();
     let executor = config.db_executor();
     executor.run(move || {
-        // Resolve aliases and the live Subject/delegation ceiling before any
-        // Ticket content or receipt is read. The DB transaction then fences
-        // catalog revoke, cancellation, parent deletion and competing writes.
-        let ticket_id = authorize_ticket(&api, &context, &workspace, &selector, action.access())?;
-        config.with_immediate_transaction(|tx| {
+        #[cfg(test)]
+        service::boundary_observation::observe(&record.plan_id, "data");
+        let access = action.access();
+        crate::server::service_authority::with_service_authority(&api, |current, tx| {
+            validate_workspace_scope(current, &workspace).map_err(|error| error.error)?;
+            let worker = subject_authorization::source_from_context(&context).map_err(|error| error.error)?;
+            crate::server::service_authority::require_authenticated_runtime_binding(
+                tx, &workspace, context.runtime_source.as_ref(),
+            )?;
+            if current.store.get_worker_registry(&workspace, &worker)?.is_none()
+                && !current.store.has_active_worker_create_reservation(&workspace, &worker)? {
+                return Err(policy::failure(PluginHostErrorCode::Denied));
+            }
+            let execution = subject_authorization::plugin_execution_identity(current, &worker)
+                .map_err(|error| match error.error {
+                    Error::RepositoryConflict(_) => policy::failure(PluginHostErrorCode::Denied),
+                    error => error,
+                })?;
+            if execution != record.execution { return Err(policy::failure(PluginHostErrorCode::Denied)); }
+            let mut operations = vec!["plugin.admit"];
+            let (tools, service) = match &record.consumer {
+                PluginConsumer::ToolCall { tool_name, .. } => (vec![tool_name.clone()], None),
+                PluginConsumer::Consumer { export_name, .. } => {
+                    operations.push("plugin.service.consume");
+                    (vec![], Some(export_name.as_str()))
+                }
+            };
+            for operation in operations {
+                subject_authorization::authorize(current, &worker, &OperationAuthorizationRequest {
+                    operation: operation.into(), resource: PermissionResource::PluginInstallation {
+                        workspace_id: workspace.clone(), installation_id: record.installation_id.clone(),
+                    },
+                }).map_err(|error| error.error)?;
+            }
+            current.authorize_plugin_entry(&worker, &admitted, &tools, service)?;
+            let ticket_id = authorize_ticket(current, &context, &workspace, &selector, access)?;
             let record = receipt::verify_record(tx, &record)?;
             let admitted = match &record.consumer {
                 PluginConsumer::ToolCall { tool_name, .. } => policy::authorize(tx, &workspace, &record.execution, &record.plan_id, &record.installation_id, &[tool_name.clone()], &PluginHostOperation::Admit)?,
@@ -324,7 +355,7 @@ pub(super) async fn execute(
                     Ok(PluginHostResponse::DataMutated { receipt })
                 }
                 Action::List(collection, cursor, limit) => {
-                    let namespace = store::Namespace { workspace_id: workspace, installation_id: record.installation_id, ticket_id, collection };
+                    let namespace = store::Namespace { workspace_id: workspace.clone(), installation_id: record.installation_id, ticket_id, collection };
                     Ok(PluginHostResponse::DataListed { page: store::list(tx, &namespace, cursor.as_deref(), limit, now_ms())? })
                 }
                 Action::Lookup(address, operation_key) => Ok(PluginHostResponse::DataMutationLookup { outcome: store::lookup_mutation(tx, &record, &store::namespace(&record, &ticket_id, &address), &address.key, &operation_key, now_ms())? }),

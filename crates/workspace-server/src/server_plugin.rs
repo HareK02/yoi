@@ -7,6 +7,90 @@ use server_api::*;
 
 type CatalogResult<T> = std::result::Result<T, RepositoryApiError>;
 
+impl WorkspaceApi {
+    /// Refresh before policy resolution, never from inside a config-store
+    /// transaction. Owner-adopted config pins are the source, not a guest claim.
+    pub(crate) fn refresh_plugin_permission_registry(&self) -> crate::Result<()> {
+        let mut registry = self
+            .permission_registry
+            .write()
+            .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?;
+        let root = ServerConfig::server_data_root_for_data_dir(&self.config.data_root)
+            .join("plugin-artifacts");
+        self.config_store
+            .sync_plugin_permission_registry(&root, self.workspace_id(), &mut registry)
+    }
+
+    /// Gate the exact immutable entry, using its registered Plugin namespace and
+    /// the original authenticated Worker. A guest key never becomes a Host key.
+    pub(super) fn authorize_plugin_entry(
+        &self,
+        worker: &RuntimeWorkerRef,
+        admitted: &crate::plugin_host::AdmittedPluginOperation,
+        tools: &[String],
+        service: Option<&str>,
+    ) -> crate::Result<()> {
+        let root = ServerConfig::server_data_root_for_data_dir(&self.config.data_root)
+            .join("plugin-artifacts");
+        let manifest = self.config_store.plugin_artifact_manifest(
+            &root,
+            self.workspace_id(),
+            admitted.pin.installation_id(),
+            admitted.pin.artifact_digest(),
+        )?;
+        let keys: Vec<_> = if let Some(name) = service {
+            manifest
+                .services
+                .iter()
+                .filter(|entry| entry.name == name)
+                .filter_map(|entry| entry.permission.clone())
+                .collect()
+        } else {
+            manifest
+                .tools
+                .iter()
+                .filter(|entry| tools.contains(&entry.name))
+                .filter_map(|entry| entry.permission.clone())
+                .collect()
+        };
+        if !keys.is_empty() {
+            self.refresh_plugin_permission_registry()?;
+        }
+        let feature = crate::plugin_catalog::permissions::plugin_feature_id(
+            admitted.pin.installation_id(),
+            admitted.pin.artifact_digest(),
+        )?;
+        for key in keys {
+            {
+                let registry = self.permission_registry.read().map_err(|_| {
+                    Error::Config("current Feature declarations unavailable".into())
+                })?;
+                if registry
+                    .namespace_handle(&feature, &key.namespace())
+                    .is_none()
+                {
+                    return Err(Error::WorkspacePermissionDenied(
+                        "Plugin entry Feature is no longer registered".into(),
+                    ));
+                }
+            }
+            subject_authorization::authorize_scope(
+                self,
+                worker,
+                &server_api::authorization::OperationAuthorizationRequest {
+                    operation: key.to_string(),
+                    resource: server_api::authorization::PermissionResource::PluginInstallation {
+                        workspace_id: self.workspace_id().into(),
+                        installation_id: admitted.pin.installation_id().into(),
+                    },
+                },
+            )
+            .map_err(|error| error.error)?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) fn router(service: Arc<ServerApiContractService>) -> Router {
     Router::new()
         .merge(
@@ -128,8 +212,15 @@ pub(super) async fn install(
     let store = api.config_store.clone();
     let actor = actor_identity(&actor);
     let executor = store.db_executor();
+    let stage_api = api.clone();
     executor
-        .run(move || store.plugin_install(&workspace, &actor, &request))
+        .run(move || {
+            let result = store.plugin_install(&workspace, &actor, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
         .await
         .map_err(failure)
 }
@@ -175,8 +266,16 @@ pub(super) async fn artifact_add(
     let store = api.config_store.clone();
     let actor = actor_identity(&actor);
     let executor = store.db_executor();
+    let stage_api = api.clone();
     executor
-        .run(move || store.plugin_add_artifact(&workspace, &actor, &installation_id, &request))
+        .run(move || {
+            let result =
+                store.plugin_add_artifact(&workspace, &actor, &installation_id, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
         .await
         .map_err(failure)
 }
@@ -192,8 +291,15 @@ pub(super) async fn revoke(
     let store = api.config_store.clone();
     let actor = actor_identity(&actor);
     let executor = store.db_executor();
+    let stage_api = api.clone();
     executor
-        .run(move || store.plugin_revoke(&workspace, &actor, &installation_id, &request))
+        .run(move || {
+            let result = store.plugin_revoke(&workspace, &actor, &installation_id, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
         .await
         .map_err(failure)
 }
@@ -209,8 +315,15 @@ pub(super) async fn uninstall(
     let store = api.config_store.clone();
     let actor = actor_identity(&actor);
     let executor = store.db_executor();
+    let stage_api = api.clone();
     executor
-        .run(move || store.plugin_uninstall(&workspace, &actor, &installation_id, &request))
+        .run(move || {
+            let result = store.plugin_uninstall(&workspace, &actor, &installation_id, &request)?;
+            // Replay receipts are historical; refresh from current catalog pins.
+            // Failure after commit is an unknown outcome, not a rollback claim.
+            stage_api.refresh_plugin_permission_registry()?;
+            Ok(result)
+        })
         .await
         .map_err(failure)
 }

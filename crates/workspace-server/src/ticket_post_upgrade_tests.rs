@@ -53,6 +53,8 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     let old_attributes = stored_fixture_rows(&conn, "typed_ticket_event_attributes");
     let old_references = stored_fixture_rows(&conn, "typed_ticket_event_references");
     let old_markers = stored_fixture_rows(&conn, "ticket_schema_migrations");
+    let old_history = workspace_schema_migration_history(&conn).unwrap();
+    assert_eq!(old_history, vec![(93, SCHEMA_BASELINE_NAME.into())]);
     drop(conn);
     let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
     assert_eq!(plan.current_schema_version, 93);
@@ -68,6 +70,9 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
             })
             .collect::<Vec<_>>()
     );
+    let expected_history: Vec<_> = old_history.into_iter()
+        .chain(plan.migrations.iter().map(|step| (step.version, step.name.clone())))
+        .collect();
     let conn = Connection::open(&path).unwrap();
     assert!(
         column_exists(&conn, "typed_tickets", "body").unwrap(),
@@ -82,6 +87,7 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     store.with_conn(|conn| {
         assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
+        assert_eq!(workspace_schema_migration_history(conn)?, expected_history);
         assert!(!column_exists(conn,"typed_tickets","body")?);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_events"),old_events);
         assert_eq!(stored_fixture_rows(conn,"typed_ticket_event_attributes"),old_attributes);
@@ -138,6 +144,7 @@ fn ticket_posts_schema93_preserves_initial_body_creator_comments_and_archived_au
     let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
     reopened
         .with_conn(|conn| {
+            assert_eq!(workspace_schema_migration_history(conn)?, expected_history);
             assert_eq!(
                 conn.query_row(
                     "SELECT COUNT(*) FROM typed_ticket_events WHERE event_index=-1",

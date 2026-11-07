@@ -10,6 +10,8 @@
 //! material so fallback can recover information intentionally omitted from an earlier
 //! complementary summary, without accumulating stale references in the next segment.
 
+pub(crate) mod permission_declaration;
+
 mod context_view;
 
 use crate::feature::{
@@ -435,6 +437,13 @@ impl JournalRecordingFeature {
     }
 }
 impl FeatureModule for JournalRecordingFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         FeatureDescriptor::builtin("journal-recording", "Journal recording admission")
             .with_hook(HookDeclaration::new(

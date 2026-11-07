@@ -27,13 +27,19 @@ pub(super) fn grant_memory_operations(api: &WorkspaceApi, subject: &str, operati
         PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
     };
     let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(subject).unwrap();
+    let previous = store
+        .subject_policy_source(subject)
+        .unwrap()
+        .map(|policy| match policy {
+            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
+            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
+        });
     store
         .set_subject_permissions(
             subject,
             &SubjectPermissionsUpdate {
                 operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: previous.map(|policy| policy.change_id),
+                expected_change_id: previous,
                 execution: operations
                     .iter()
                     .map(|operation| ScopedPermission {
@@ -124,14 +130,19 @@ fn stage(store: &crate::subjektiv::SubjektivStore, subject: &str, id: &str) {
         .stage_candidate(SubjectStagingRecord::attach(subject, record))
         .unwrap();
 }
-fn context(worker: &RuntimeWorkerRef) -> server_api::ServerRequestContext {
+fn context(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> server_api::ServerRequestContext {
+    let binding = api
+        .config_store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &worker.runtime_id)
+        .unwrap()
+        .unwrap();
     server_api::ServerRequestContext {
         actor: None,
         worker_source: None,
         runtime_source: Some(server_api::ServerRuntimeSource {
             runtime_id: worker.runtime_id.clone(),
             worker_id: Some(worker.worker_id.clone()),
-            authentication_binding_id: "fixture-binding".into(),
+            authentication_binding_id: binding.binding_id,
         }),
         origin: None,
         transport_headers: vec![],
@@ -147,7 +158,7 @@ async fn op(
         AxumPath(ScopedWorkspacePath {
             workspace_id: TEST_WORKSPACE_ID.into(),
         }),
-        context(worker),
+        context(&api, worker),
         Json(server_api::SubjektivMemoryBackendRequest { operation }),
     )
     .await
@@ -209,14 +220,14 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
             .is_none()
     );
     assert_eq!(
-        subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(worker))
+        subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, worker))
             .unwrap()
             .0,
         subject.id
     );
-    assert!(subjektiv_subject_scope(&api, "foreign", &context(worker)).is_err());
+    assert!(subjektiv_subject_scope(&api, "foreign", &context(&api, worker)).is_err());
     let ordinary = spawn_ticket_check_source(&api, "not-a-consolidator");
-    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&ordinary)).is_err());
+    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, &ordinary)).is_err());
     // A premature result cannot generate a surface or complete unresolved work.
     assert!(
         op(
@@ -323,7 +334,7 @@ async fn subjektiv_job_bounds_batch_auth_partial_receipts_surface_and_cleanup() 
             .unwrap()
             .is_some()
     );
-    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(worker)).is_err());
+    assert!(subjektiv_subject_scope(&api, TEST_WORKSPACE_ID, &context(&api, worker)).is_err());
     wait_for_backend_job_worker_cleanup(
         &api,
         &job.request.job_id,
@@ -928,6 +939,9 @@ async fn subjektiv_job_long_receipts_and_escaped_ids_fit_result_budget_without_l
 async fn subjektiv_job_rechecks_current_policy_and_preserves_provider_batch_ceiling() {
     let dir = tempfile::tempdir().unwrap();
     let (api, execution) = test_api_with_recording_backend(dir.path()).await;
+    // Observe current-policy intersection on a live attempt, independently of
+    // recovery retiring it after input-supply revocation. Recovery has its own tests.
+    let _recovery = api.backend_job_recovery.pause_steps_for_test().await;
     let store = open_subjektiv_store(&api).unwrap();
     let subject = store
         .create_subject(SubjectRole::new("live-job-policy").unwrap())
@@ -1136,10 +1150,7 @@ async fn unset_subject_consolidation_denies_before_job_dispatch() {
     .await
     .unwrap_err();
     assert!(
-        error
-            .error
-            .to_string()
-            .contains("memory.consolidation.request"),
+        matches!(error.error, Error::WorkspacePermissionDenied(ref message) if message.contains("permissions are unset")),
         "{error:?}"
     );
     assert!(execution.take_inputs().is_empty());
@@ -1166,6 +1177,9 @@ async fn subject_consolidation_request_without_supply_denies_before_model_input(
     let source = memory_job_source(&api, &subject.id).await;
     stage(&store, &subject.id, "not-supplied");
     grant_memory_operations(&api, &subject.id, &["memory.consolidation.request"]);
+    // Observe the synchronous supply refusal before the independent recovery
+    // owner retires its still-unallocated reservation, then verify recovery too.
+    let recovery = api.backend_job_recovery.pause_steps_for_test().await;
     let error = start_subjektiv_staging_consolidation(
         api.clone(),
         &subject.id,
@@ -1195,6 +1209,48 @@ async fn subject_consolidation_request_without_supply_denies_before_model_input(
     assert_eq!(
         saved.request.input["candidate_ids"],
         serde_json::json!(["not-supplied"])
+    );
+    assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
+    drop(recovery);
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let current = api
+                .store
+                .get_backend_job(TEST_WORKSPACE_ID, &saved.request.job_id)
+                .unwrap()
+                .unwrap();
+            if current.state == BackendJobState::Failed {
+                break current;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("supply refusal must also settle through independent recovery");
+    assert_eq!(
+        failed.request, saved.request,
+        "recovery must not replace frozen input"
+    );
+    let attempts = api
+        .store
+        .list_backend_job_attempts(TEST_WORKSPACE_ID, &saved.request.job_id)
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].state, BackendJobAttemptState::Failed);
+    assert!(
+        attempts[0].worker.is_none(),
+        "recovery cannot allocate without input supply"
+    );
+    assert!(execution.take_inputs().is_empty());
+    assert!(
+        api.store
+            .find_active_backend_job_for_resource(
+                TEST_WORKSPACE_ID,
+                &crate::backend_job::subjektiv_serialization_key(&subject.id),
+            )
+            .unwrap()
+            .is_none(),
+        "the retired reservation is no longer active"
     );
     assert_eq!(store.pending_staging_backlog(&subject.id).unwrap().0, 1);
 }

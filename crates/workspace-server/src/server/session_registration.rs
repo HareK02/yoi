@@ -48,9 +48,14 @@ impl Judgment {
 pub(super) fn bind_host_session(
     api: &WorkspaceApi,
     attribution: crate::subjektiv::SubjectSessionAttribution,
+    source: &server_api::ServerRuntimeSource,
 ) -> ApiResult<()> {
-    subjektiv_journal::bind_host_session_for_registration(api, attribution)
-        .map_err(|error| Judgment::SessionRecord.binding_rejection(error))
+    subjektiv_journal::bind_host_session_for_registration(
+        api,
+        attribution,
+        subjektiv_journal::SessionRegistrationCaller::Signed(source),
+    )
+    .map_err(|error| Judgment::SessionRecord.binding_rejection(error))
 }
 
 pub(super) fn journal_error(error: subjektiv::journal::JournalError) -> ApiError {
@@ -60,7 +65,12 @@ pub(super) fn journal_error(error: subjektiv::journal::JournalError) -> ApiError
         }
         _ => SessionRegistrationCause::outcome_unknown(),
     };
-    let mut failure = Judgment::SessionRecord.error(Error::Store(cause.to_string()), cause);
+    let outer = if matches!(error, subjektiv::journal::JournalError::PermissionDenied(_)) {
+        Error::WorkspacePermissionDenied(cause.to_string())
+    } else {
+        Error::Store(cause.to_string())
+    };
+    let mut failure = Judgment::SessionRecord.error(outer, cause);
     failure.session_registration_source = Some(Box::new(error));
     failure
 }
@@ -71,9 +81,20 @@ pub(super) fn domain_error(error: crate::subjektiv::SubjektivError) -> ApiError 
         | crate::subjektiv::SubjektivError::SessionAttributionConflict { .. } => {
             SessionRegistrationCause::binding_mismatch()
         }
+        crate::subjektiv::SubjektivError::AuthorizationDenied(_) => {
+            SessionRegistrationCause::denied(SessionPrincipal::Subject)
+        }
         _ => SessionRegistrationCause::outcome_unknown(),
     };
-    let mut failure = Judgment::SessionRecord.error(Error::InvalidInput(cause.to_string()), cause);
+    let outer = if matches!(
+        error,
+        crate::subjektiv::SubjektivError::AuthorizationDenied(_)
+    ) {
+        Error::WorkspacePermissionDenied(cause.to_string())
+    } else {
+        Error::InvalidInput(cause.to_string())
+    };
+    let mut failure = Judgment::SessionRecord.error(outer, cause);
     failure.session_registration_source = Some(Box::new(error));
     failure
 }
@@ -143,6 +164,28 @@ mod tests {
         );
         assert!(backend.session_registration_cause.is_none());
         assert!(backend.into_repository_api_error().failure.is_none());
+    }
+
+    #[test]
+    fn native_registration_denials_keep_refusal_and_original_cause() {
+        let memory = domain_error(crate::subjektiv::SubjektivError::AuthorizationDenied(
+            "private binding".into(),
+        ));
+        assert_eq!(api_error_status(&memory.error), StatusCode::FORBIDDEN);
+        assert_eq!(
+            memory.session_registration_cause.as_ref().unwrap().reason,
+            SessionRegistrationReason::PermissionDenied
+        );
+        assert!(memory.session_registration_source.is_some());
+        let journal = journal_error(subjektiv::journal::JournalError::PermissionDenied(
+            "private binding".into(),
+        ));
+        assert_eq!(api_error_status(&journal.error), StatusCode::FORBIDDEN);
+        assert_eq!(
+            journal.session_registration_cause.as_ref().unwrap().reason,
+            SessionRegistrationReason::BindingMismatch
+        );
+        assert!(journal.session_registration_source.is_some());
     }
 
     #[test]

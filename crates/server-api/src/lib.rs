@@ -1681,6 +1681,7 @@ pub trait ServerApi {
     )]
     async fn subjektiv_subject_create(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
         #[body] request: SubjektivSubjectCreateRequest,
     ) -> Result<SubjektivSubjectResponse, RepositoryApiError>;

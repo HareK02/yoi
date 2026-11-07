@@ -1,5 +1,7 @@
 //! Workspace-authority-backed Worker session management tools.
 
+pub(crate) mod permission_declaration;
+
 #[cfg(test)]
 #[path = "manage_worker_startup_tests.rs"]
 mod startup_tests;
@@ -565,6 +567,13 @@ impl SubWorkerControlFeature {
 }
 
 impl FeatureModule for SubWorkerControlFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::SUBWORKER.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin("sub-worker-control", "SubWorker Control")
             .with_description(
@@ -615,6 +624,13 @@ pub fn sub_worker_control_feature(
 }
 
 impl FeatureModule for ManageWorkerFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
             .with_description(FEATURE_DESCRIPTION)

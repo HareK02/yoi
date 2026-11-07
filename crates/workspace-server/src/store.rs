@@ -3191,6 +3191,7 @@ pub trait ControlPlaneStore: Send + Sync + WorkspaceDeletionStore {
 #[derive(Clone)]
 enum StoreConnection {
     Managed(feature_storage::FeatureDatabase),
+    AuthorityReader(Arc<Mutex<feature_storage::DatabaseWriterFence>>),
     Fixture(Arc<Mutex<Connection>>),
 }
 
@@ -3203,6 +3204,7 @@ impl From<feature_storage::FeatureStorageError> for Error {
 #[derive(Clone)]
 pub struct SqliteWorkspaceStore {
     conn: StoreConnection,
+    pub(crate) plugin_manifest_cache: Arc<crate::plugin_catalog::ArtifactManifestCache>,
     db_executor: crate::db_executor::DbExecutor,
 }
 
@@ -3222,6 +3224,7 @@ impl SqliteWorkspaceStore {
         )?;
         Ok(Self {
             conn: StoreConnection::Managed(database),
+            plugin_manifest_cache: Arc::default(),
             db_executor: crate::db_executor::DbExecutor::shared(),
         })
     }
@@ -3268,6 +3271,7 @@ impl SqliteWorkspaceStore {
         prepare_connection(&conn)?;
         Ok(Self {
             conn: StoreConnection::Fixture(Arc::new(Mutex::new(conn))),
+            plugin_manifest_cache: Arc::default(),
             db_executor,
         })
     }
@@ -3325,12 +3329,55 @@ impl SqliteWorkspaceStore {
                     "Drive requires a managed Server catalog".into(),
                 ))
             }
+            StoreConnection::AuthorityReader(_) => Err(Error::Store(
+                "reserved authority readers cannot issue Drive authority".into(),
+            )),
         }
+    }
+
+    /// Independent read owner for nested checks inside this catalog's write
+    /// transaction. The outer owner, not this read connection, fences authority.
+    pub(crate) fn transaction_query_reader(&self) -> Result<Self> {
+        let StoreConnection::Managed(database) = &self.conn else {
+            return Err(Error::Store(
+                "query reader requires a managed Host catalog".into(),
+            ));
+        };
+        Ok(Self {
+            conn: StoreConnection::Managed(database.query_reader()?),
+            plugin_manifest_cache: self.plugin_manifest_cache.clone(),
+            db_executor: self.db_executor.clone(),
+        })
+    }
+
+    /// Reserve Host authority and route every nested read through that transaction.
+    /// Using the ordinary connection could deadlock against a writer that holds its
+    /// mutex while waiting for this reservation. Clones retain the reservation, not
+    /// the ordinary connection; native query-only mode rejects accidental effects.
+    pub(crate) fn subject_authority_reader(&self) -> Result<Self> {
+        let fence = match &self.conn {
+            StoreConnection::Managed(database) => database.writer_fence()?,
+            StoreConnection::Fixture(_) | StoreConnection::AuthorityReader(_) => {
+                return Err(Error::Store(
+                    "Subject effect authority requires a managed Host catalog".into(),
+                ));
+            }
+        };
+        fence.with_connection(|connection| connection.pragma_update(None, "query_only", true))?;
+        Ok(Self {
+            conn: StoreConnection::AuthorityReader(Arc::new(Mutex::new(fence))),
+            plugin_manifest_cache: self.plugin_manifest_cache.clone(),
+            db_executor: self.db_executor.clone(),
+        })
     }
 
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         match &self.conn {
             StoreConnection::Managed(database) => database.try_with_connection(f),
+            StoreConnection::AuthorityReader(fence) => fence
+                .lock()
+                .map_err(|_| Error::Store("authority reader lock poisoned".into()))?
+                .with_connection(f),
             StoreConnection::Fixture(connection) => {
                 let conn = connection
                     .lock()
@@ -3346,6 +3393,9 @@ impl SqliteWorkspaceStore {
     ) -> Result<T> {
         match &self.conn {
             StoreConnection::Managed(database) => database.try_with_connection_mut(f),
+            StoreConnection::AuthorityReader(_) => Err(Error::Store(
+                "reserved authority readers cannot enter a write transaction".into(),
+            )),
             StoreConnection::Fixture(connection) => {
                 let mut conn = connection
                     .lock()
@@ -4343,6 +4393,83 @@ impl SqliteWorkspaceStore {
         expected: &WorkerSingletonLease,
         publish: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
+        self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |_| {
+            publish()
+        })
+    }
+
+    /// Check the original signed identity on the authority connection retained
+    /// through the protected result or effect, never a new trust lookup as proof.
+    pub(crate) fn require_authenticated_subject_request(
+        connection: &Connection,
+        workspace_id: &str,
+        source: &server_api::ServerRuntimeSource,
+        worker: &RuntimeWorkerRef,
+    ) -> Result<()> {
+        let current: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workspace_runtime_bindings WHERE workspace_id=?1 AND runtime_id=?2 AND binding_id=?3 AND revoked_at IS NULL)",
+            params![workspace_id, source.runtime_id, source.authentication_binding_id],
+            |row| row.get(0),
+        )?;
+        if !current
+            || source.runtime_id != worker.runtime_id
+            || source.worker_id.as_deref() != Some(worker.worker_id.as_str())
+        {
+            return Err(Error::WorkspacePermissionDenied(
+                "Subject request authentication binding changed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Current policy, signed binding and singleton ownership stay fenced through
+    /// the bounded native Feature commit. The callback must not reenter either store.
+    pub(crate) fn with_current_subject_body_policy<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        source: &crate::subjektiv::chat::ChatPolicySource,
+        request_source: &server_api::ServerRuntimeSource,
+        publish: impl FnOnce(&server_api::authorization::SubjectPolicySource) -> Result<T>,
+    ) -> Result<T> {
+        use crate::subjektiv::chat::ChatPolicySource;
+        use server_api::authorization::SubjectPolicySource;
+        self.with_current_subject_body_transaction(workspace_id, subject_id, expected, |tx| {
+            Self::require_authenticated_subject_request(
+                tx,
+                workspace_id,
+                request_source,
+                &expected.worker,
+            )?;
+            let canonical = crate::config_adoption::canonical(tx, workspace_id)?;
+            let policy = match (canonical, source) {
+                (false, ChatPolicySource::Local(Some(policy))) => policy.clone(),
+                (true, ChatPolicySource::Canonical) => {
+                    let raw: Option<String> = tx.query_row(
+                        "SELECT policy_json FROM workspace_configuration_policies WHERE workspace_id=?1 AND subject_id=?2",
+                        params![workspace_id, subject_id], |row| row.get(0),
+                    ).optional()?;
+                    let adopted: crate::policy_config::AdoptedSubjectPolicy = serde_json::from_str(
+                        &raw.ok_or_else(|| Error::WorkspacePermissionDenied("Subject policy is unset".into()))?
+                    ).map_err(|error| Error::Store(format!("invalid adopted Subject policy: {error}")))?;
+                    SubjectPolicySource::Feature(adopted.current())
+                }
+                _ => return Err(Error::WorkspacePermissionDenied(
+                    "Subject policy is unset or authority location changed".into(),
+                )),
+            };
+            publish(&policy)
+        })
+    }
+
+    fn with_current_subject_body_transaction<T>(
+        &self,
+        workspace_id: &str,
+        subject_id: &str,
+        expected: &WorkerSingletonLease,
+        publish: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let key = crate::subjektiv::subject_worker_singleton_key(subject_id)
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
         if expected.key != key {
@@ -4359,7 +4486,7 @@ impl SqliteWorkspaceStore {
                     "Subject body was released".into(),
                 ));
             }
-            publish()
+            publish(tx)
         })
     }
 
@@ -9180,7 +9307,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<BackendJobAttemptRecord>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR (a.state='completed' AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
+                "SELECT a.job_id, a.attempt_id FROM backend_job_attempts a JOIN backend_jobs j USING(workspace_id,job_id) WHERE a.workspace_id = ?1 AND (?3 IS NULL OR (a.job_id,a.attempt_id) > (?3,?4)) AND a.state IN ('completed', 'failed') AND a.runtime_id IS NOT NULL AND (a.worker_cleanup_state IN ('pending', 'failed', 'executing') OR ((a.state='completed' OR (a.state='failed' AND j.failure_category='journal_execution_terminated')) AND a.worker_cleanup_state='completed' AND a.attempt=j.current_attempt AND j.input_disposition='available' AND json_type(j.request_json,'$.grants.subjektiv_journal')='object')) AND NOT EXISTS(SELECT 1 FROM backend_job_upgrade_history h WHERE h.workspace_id=a.workspace_id AND h.job_id=a.job_id) ORDER BY a.job_id, a.attempt_id LIMIT ?2",
             )?;
             // Immutable identities keep the boundary stable while admitted
             // owners change cleanup state/timestamps. Selection grants no claim.
@@ -18391,6 +18518,55 @@ mod tests {
     include!("store_workspace_config_tests.rs");
     include!("plugin_plan/launch_migration_tests.rs");
 
+    #[test]
+    fn reserved_authority_reader_rejects_writes_and_retains_fence_until_last_clone_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        let reader = store.subject_authority_reader().unwrap();
+        assert!(
+            reader
+                .with_conn(|connection| {
+                    connection.execute_batch("CREATE TABLE unauthorized_effect(value TEXT)")?;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(reader.with_conn_mut(|_| Ok(())).is_err());
+        assert!(reader.drive_authority(&path).is_err());
+        assert!(reader.subject_authority_reader().is_err());
+        let clone = reader.clone();
+        drop(reader);
+        clone
+            .with_conn(|connection| {
+                assert_eq!(
+                    connection.query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name='unauthorized_effect'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let error = writer.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        drop(clone);
+        writer.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
+        assert!(
+            SqliteWorkspaceStore::in_memory_for_test()
+                .unwrap()
+                .subject_authority_reader()
+                .is_err()
+        );
+    }
+
     fn drive_grant_fixture(store: &SqliteWorkspaceStore) -> server_api::DriveGrantResponse {
         store.with_conn(|c| {
             c.execute_batch("INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at) VALUES('drive-owner','user','drive-owner','Owner','1','1');
@@ -20611,8 +20787,10 @@ mod tests {
             merge_request::migrate(&conn).unwrap();
             conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
                 .unwrap();
-            let tx = conn.unchecked_transaction().unwrap();
-            create_latest_workspace_schema(&tx).unwrap();
+            let transaction =
+                rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Exclusive)
+                    .unwrap();
+            create_latest_workspace_schema(&transaction).unwrap();
             conn.execute(
                 "INSERT INTO __yoi_schema_migrations(version, name) VALUES (?1, ?2)",
                 params![baseline_version, SCHEMA_BASELINE_NAME],
@@ -20628,7 +20806,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            tx.commit().unwrap();
+            transaction.commit().unwrap();
             verify_schema_history(&conn, LATEST_SCHEMA_VERSION).unwrap();
         }
     }
@@ -20783,7 +20961,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
-            (83..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            (83..=113)
+                .chain([122, 123, 124, 125, 126, 127])
+                .collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
         let assignment = store
@@ -21504,6 +21684,293 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         fixture.commit().unwrap();
     }
 
+    fn expected_retained_migration_chain() -> Vec<WorkspaceSchemaMigrationStep> {
+        vec![
+            WorkspaceSchemaMigrationStep {
+                version: 51,
+                name: WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 52,
+                name: RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 53,
+                name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 54,
+                name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 55,
+                name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 56,
+                name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 57,
+                name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 58,
+                name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 59,
+                name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 60,
+                name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 61,
+                name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 62,
+                name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 63,
+                name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 64,
+                name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 65,
+                name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 66,
+                name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 67,
+                name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 68,
+                name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 69,
+                name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 70,
+                name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 71,
+                name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 72,
+                name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 73,
+                name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 74,
+                name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 75,
+                name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 76,
+                name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 77,
+                name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 78,
+                name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 79,
+                name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 80,
+                name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 81,
+                name: "Backend Job immutable resource serialization".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 82,
+                name: "Ticket responsibility and unfinished work separation".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 83,
+                name: "Generic Ticket Worker roles and durable claims".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 84,
+                name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 85,
+                name: "content-addressed Flow sources".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 86,
+                name: "content-fenced config, Memory settings and Jobs".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 87,
+                name: "Repository SSH key identities and encrypted operation objects".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 88,
+                name: "Runtime binding identities and retention content contracts".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 89,
+                name: "descriptive legacy evidence columns".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 90,
+                name:
+                    "Runtime binding connection configuration and historical verification archive"
+                        .to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 91,
+                name: "Ticket open/closed cases and retained routing evidence".to_string(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 92,
+                name: "Ticket-owned assignment tracking".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 93,
+                name: "Durable assignment deliveries and source-bound startup fences".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 94,
+                name: "Canonical Ticket posts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 95,
+                name: "Common notification routing and durable Worker delivery".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 96,
+                name: "Backend Job common notification routing".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 97,
+                name: "MR notifications and authenticated implementation results".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 98,
+                name: "Assignment-independent implementation reports".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 99,
+                name: "Explicit hosting administrators and self-registration policy".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 100,
+                name: "Provisional users and scoped passkey activation".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 101,
+                name: "Durable explicit Subject body release".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 102,
+                name: "Durable failed Subject creation recovery".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 103,
+                name: "Passkey metadata and atomic addition results".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 104,
+                name: "Converge Passkey results and Job input retention".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 105,
+                name: "Durable Subject deletion snapshots and Job admission fences".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 106,
+                name: crate::plugin_catalog::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 107,
+                name: "Immutable Worker Plugin plans and retained pins".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 108,
+                name: "Subject Ticket responsibility and current-body notification routing".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 109,
+                name: "Durable Plugin Host invocations and HTTPS effect receipts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 110,
+                name: "Worker Plugin launch selection associations".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 111,
+                name: "Typed Plugin Ticket extension data and atomic mutation receipts".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 112,
+                name: "Ticket Service outbox and fenced consumers".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 113,
+                name: "Ticket work-decomposition parent links".into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 122,
+                name: crate::config_adoption::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 123,
+                name: backend_job_upgrade::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 124,
+                name: WORKER_CREATE_FAILURE_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 125,
+                name: backend_job_recovery_store::CAUSE_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 126,
+                name: SERVICE_OUTCOME_MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 127,
+                name: journal_removal_store::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 128,
+                name: DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into(),
+            },
+        ]
+    }
+
     #[test]
     fn schema_v50_plans_and_applies_the_complete_retained_chain() {
         let temp = tempfile::tempdir().unwrap();
@@ -21513,205 +21980,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 50);
         assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
-        assert_eq!(
-            plan.migrations,
-            vec![
-                WorkspaceSchemaMigrationStep {
-                    version: 51,
-                    name: WORKSPACE_RUNTIME_BINDINGS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 52,
-                    name: RUNTIME_BINDING_AUDIT_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 53,
-                    name: WORKSPACE_DELETION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 54,
-                    name: WORKSPACE_SIGNING_IDENTITY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 55,
-                    name: WORKSPACE_RUNTIME_BINDING_STATE_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 56,
-                    name: WORKSPACE_RUNTIME_VERIFICATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 57,
-                    name: LEGACY_EXTERNAL_RUNTIME_BINDING_CUTOVER_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 58,
-                    name: REMOVE_WORKDIR_CACHE_GENERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 59,
-                    name: WORKDIR_CREDENTIAL_CANDIDATE_SNAPSHOT_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 60,
-                    name: RUNTIME_REMOVAL_OPERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 61,
-                    name: REMOVE_WORKER_RUN_GENERATION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 62,
-                    name: WORKER_REGISTRY_PROJECTION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 63,
-                    name: MULTI_WORKDIR_ATTACHMENTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 64,
-                    name: EXTERNAL_WORKDIR_GRANTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 65,
-                    name: EXTERNAL_WORKDIR_CLEANUP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 66,
-                    name: TICKET_TARGETS_AND_WORKDIR_CAPABILITIES_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 67,
-                    name: EXTERNAL_WORKDIR_ACCESS_AND_OPTIONAL_EXPIRY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 68,
-                    name: EXTERNAL_WORKDIR_COMMAND_PERMISSION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 69,
-                    name: WORKDIR_COMMAND_ATTACHMENT_CAPABILITIES_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 70,
-                    name: BACKEND_JOB_RUNNER_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 71,
-                    name: BACKEND_JOB_DELIVERY_CLAIM_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 72,
-                    name: BACKEND_JOB_DISPATCH_QUEUE_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 73,
-                    name: WORKER_SINGLETON_OWNERSHIP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 74,
-                    name: ORDERED_WORKER_PROJECTION_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 75,
-                    name: RUNTIME_SCOPED_WORKER_IDENTITY_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 76,
-                    name: ARCHIVE_OBSERVE_GRANTS_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 77,
-                    name: BACKEND_JOB_WORKER_CLEANUP_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 78,
-                    name: WORKDIR_CONNECTION_ID_MIGRATION_NAME.to_string(),
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 79,
-                    name: WORKSPACE_CONFIG_GRANTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 80,
-                    name: WORKER_RESTORE_INTENTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 81,
-                    name: "Backend Job immutable resource serialization".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 82,
-                    name: "Ticket responsibility and unfinished work separation".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 83,
-                    name: "Generic Ticket Worker roles and durable claims".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 84,
-                    name: WORKSPACE_DRIVE_GRANTS_MIGRATION_NAME.to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 85,
-                    name: "content-addressed Flow sources".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 86,
-                    name: "content-fenced config, Memory settings and Jobs".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 87,
-                    name: "Repository SSH key identities and encrypted operation objects"
-                        .to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 88,
-                    name: "Runtime binding identities and retention content contracts".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 89,
-                    name: "descriptive legacy evidence columns".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 90,
-                    name: "Runtime binding connection configuration and historical verification archive".to_string()
-                },
-                WorkspaceSchemaMigrationStep {
-                    version: 91,
-                    name: "Ticket open/closed cases and retained routing evidence".to_string()
-                },
-                WorkspaceSchemaMigrationStep {version:92, name:"Ticket-owned assignment tracking".into()},
-                WorkspaceSchemaMigrationStep {version:93, name:"Durable assignment deliveries and source-bound startup fences".into()},
-                WorkspaceSchemaMigrationStep {version:94, name:"Canonical Ticket posts".into()},
-                WorkspaceSchemaMigrationStep {version:95, name:"Common notification routing and durable Worker delivery".into()},
-                WorkspaceSchemaMigrationStep {version:96, name:"Backend Job common notification routing".into()},
-                WorkspaceSchemaMigrationStep {version:97, name:"MR notifications and authenticated implementation results".into()},
-                WorkspaceSchemaMigrationStep {version:98, name:"Assignment-independent implementation reports".into()},
-                WorkspaceSchemaMigrationStep {version:99, name:"Explicit hosting administrators and self-registration policy".into()},
-                WorkspaceSchemaMigrationStep {version:100, name:"Provisional users and scoped passkey activation".into()},
-                WorkspaceSchemaMigrationStep {version:101, name:"Durable explicit Subject body release".into()},
-                WorkspaceSchemaMigrationStep {version:102, name:"Durable failed Subject creation recovery".into()},
-                WorkspaceSchemaMigrationStep {version:103, name:"Passkey metadata and atomic addition results".into()},
-                WorkspaceSchemaMigrationStep {version:104, name:"Converge Passkey results and Job input retention".into()},
-                WorkspaceSchemaMigrationStep {version:105, name:"Durable Subject deletion snapshots and Job admission fences".into()},
-                WorkspaceSchemaMigrationStep {version:106, name:crate::plugin_catalog::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:107, name:"Immutable Worker Plugin plans and retained pins".into()},
-                WorkspaceSchemaMigrationStep {version:108, name:"Subject Ticket responsibility and current-body notification routing".into()},
-                WorkspaceSchemaMigrationStep {version:109, name:"Durable Plugin Host invocations and HTTPS effect receipts".into()},
-                WorkspaceSchemaMigrationStep {version:110, name:"Worker Plugin launch selection associations".into()},
-                WorkspaceSchemaMigrationStep {version:111, name:"Typed Plugin Ticket extension data and atomic mutation receipts".into()},
-                WorkspaceSchemaMigrationStep {version:112, name:"Ticket Service outbox and fenced consumers".into()},
-                WorkspaceSchemaMigrationStep {version:113, name:"Ticket work-decomposition parent links".into()},
-                WorkspaceSchemaMigrationStep {version:122, name:crate::config_adoption::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:123, name:backend_job_upgrade::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:124, name:WORKER_CREATE_FAILURE_MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:125, name:backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:126, name:SERVICE_OUTCOME_MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:127, name:journal_removal_store::MIGRATION_NAME.into()},
-                WorkspaceSchemaMigrationStep {version:128, name:DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()},
-            ]
-        );
+        assert_eq!(plan.migrations, expected_retained_migration_chain());
 
         let unchanged = Connection::open(&path).unwrap();
         assert_eq!(current_schema_version(&unchanged).unwrap(), 50);
@@ -22181,17 +22450,16 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         let conn = Connection::open(&path).unwrap();
         configure_sqlite(&conn).unwrap();
         migrate_workspace_runtime_bindings_v50_to_v51(&conn).unwrap();
+        let history = workspace_schema_migration_history(&conn).unwrap();
         drop(conn);
 
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 51);
         assert_eq!(
-            plan.migrations
-                .iter()
-                .map(|migration| migration.version)
-                .collect::<Vec<_>>(),
-            (52..=113)
-                .chain(122..=LATEST_SCHEMA_VERSION)
+            plan.migrations,
+            expected_retained_migration_chain()
+                .into_iter()
+                .filter(|migration| migration.version > 51)
                 .collect::<Vec<_>>()
         );
         SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -22200,15 +22468,17 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             current_schema_version(&conn).unwrap(),
             LATEST_SCHEMA_VERSION
         );
+        let expected_history: Vec<_> = history
+            .into_iter()
+            .chain(
+                plan.migrations
+                    .iter()
+                    .map(|step| (step.version, step.name.clone())),
+            )
+            .collect();
         assert_eq!(
-            workspace_schema_migration_history(&conn)
-                .unwrap()
-                .into_iter()
-                .map(|(version, _)| version)
-                .collect::<Vec<_>>(),
-            (50..=113)
-                .chain(122..=LATEST_SCHEMA_VERSION)
-                .collect::<Vec<_>>()
+            workspace_schema_migration_history(&conn).unwrap(),
+            expected_history
         );
         assert!(column_exists(&conn, "worker_workdir_links", "alias").unwrap());
         assert!(column_exists(&conn, "worker_workdir_links", "capabilities").unwrap());
@@ -23260,31 +23530,45 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
         .unwrap();
         let error = apply_migrations(&conn).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not start with a retained schema baseline")
+            matches!(&error, Error::Store(message) if message.starts_with("Server storage format: unknown baseline or current version:")),
+            "{error:?}"
         );
     }
 
     #[test]
     fn startup_rejects_noncanonical_history_at_the_baseline_version() {
         let conn = Connection::open_in_memory().unwrap();
-        configure_sqlite(&conn).unwrap();
+        prepare_connection(&conn).unwrap();
         conn.execute(
             "INSERT INTO __yoi_schema_migrations (version, name) VALUES (1, 'legacy')",
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO __yoi_schema_migrations (version, name) VALUES (?1, ?2)",
-            params![LATEST_SCHEMA_VERSION, "workspace schema baseline"],
-        )
-        .unwrap();
+        let history = workspace_schema_migration_history(&conn).unwrap();
+        let schema = fixture_query_rows(
+            &conn,
+            "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name",
+        );
+        let writes: i64 = conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
         let error = apply_migrations(&conn).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not start with a retained schema baseline")
+            matches!(&error, Error::Store(message) if message == "Server storage format: missing failure migration predecessor"),
+            "{error:?}"
+        );
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap(), history);
+        assert_eq!(
+            fixture_query_rows(
+                &conn,
+                "SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name"
+            ),
+            schema
+        );
+        assert_eq!(
+            conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            writes
         );
     }
 
@@ -25107,7 +25391,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            ((version + 1)..=LATEST_SCHEMA_VERSION).collect::<Vec<_>>()
+            ((version + 1)..=113)
+                .chain([122, 123, 124, 125, 126, 127])
+                .collect::<Vec<_>>()
         );
         drop(conn);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -25142,7 +25428,13 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (110, "Worker Plugin launch selection associations".into()),
                          (111, "Typed Plugin Ticket extension data and atomic mutation receipts".into()),
                          (112, "Ticket Service outbox and fenced consumers".into()),
-                         (113, "Ticket work-decomposition parent links".into())]);
+                         (113, "Ticket work-decomposition parent links".into()),
+                         (122, crate::config_adoption::MIGRATION_NAME.into()),
+                         (123, backend_job_upgrade::MIGRATION_NAME.into()),
+                         (124, WORKER_CREATE_FAILURE_MIGRATION_NAME.into()),
+                         (125, backend_job_recovery_store::CAUSE_MIGRATION_NAME.into()),
+                         (126, SERVICE_OUTCOME_MIGRATION_NAME.into()),
+                         (127, journal_removal_store::MIGRATION_NAME.into())]);
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }
@@ -27172,12 +27464,29 @@ INSERT INTO worker_registry (
         )
         .unwrap();
 
+        let history = workspace_schema_migration_history(&conn).unwrap();
+        let schema = fixture_query_rows(
+            &conn,
+            "SELECT type,name,sql FROM sqlite_schema ORDER BY type,name",
+        );
         let error = apply_migrations(&conn).unwrap_err().to_string();
         assert!(
-            error.contains(&format!("schema version {future_version} is newer")),
+            error.contains("Server storage format: unknown baseline or current version"),
             "{error}"
         );
-        assert!(error.contains("refusing to serve"), "{error}");
+        assert!(
+            error.contains(&format!("({future_version}, \"future\")")),
+            "{error}"
+        );
+        assert_eq!(workspace_schema_migration_history(&conn).unwrap(), history);
+        assert_eq!(current_schema_version(&conn).unwrap(), future_version);
+        assert_eq!(
+            fixture_query_rows(
+                &conn,
+                "SELECT type,name,sql FROM sqlite_schema ORDER BY type,name",
+            ),
+            schema
+        );
     }
 
     #[test]

@@ -121,7 +121,7 @@ async fn job_fixture(
 
 fn replace_policy(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
     let store = open_subjektiv_store(api).unwrap();
-    let current = store.subject_permissions(subject).unwrap();
+    let current = store.current_subject_policy(subject).unwrap();
     store
         .set_subject_permissions(
             subject,

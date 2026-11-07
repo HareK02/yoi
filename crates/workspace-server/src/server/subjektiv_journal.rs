@@ -261,10 +261,55 @@ fn job_operation(request: &JournalJobRequest) -> &'static str {
     }
 }
 
+enum JournalCaller<'a> {
+    Signed(&'a crate::worker_source::VerifiedRuntimeRequestSource),
+    #[cfg(test)]
+    Internal,
+}
+impl JournalCaller<'_> {
+    fn effect_store(
+        &self,
+        api: &WorkspaceApi,
+        worker: &RuntimeWorkerRef,
+        subject: &str,
+        operation: &str,
+    ) -> Result<crate::subjektiv::SubjektivStore> {
+        let store = store(api)?;
+        Ok(match self {
+            Self::Signed(source) => subject_authorization::authenticated_subject_effect_store(
+                api,
+                &store,
+                worker,
+                subject,
+                operation,
+                &server_api::ServerRuntimeSource {
+                    runtime_id: source.runtime_id.clone(),
+                    worker_id: source.worker_id.clone(),
+                    authentication_binding_id: source.authentication_binding_id.clone(),
+                },
+            ),
+            #[cfg(test)]
+            Self::Internal => {
+                subject_authorization::subject_effect_store(api, &store, worker, subject, operation)
+            }
+        })
+    }
+}
+
+#[cfg(test)]
 pub(super) fn execute(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
     request: JournalJobRequest,
+) -> Result<JournalJobResponse> {
+    execute_for(api, worker, request, JournalCaller::Internal)
+}
+
+fn execute_for(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    request: JournalJobRequest,
+    caller: JournalCaller<'_>,
 ) -> Result<JournalJobResponse> {
     let (grant, _, _) = live(api, worker)?;
     let gate = lifecycle_lock(api, &grant.subject_id)?;
@@ -275,7 +320,11 @@ pub(super) fn execute(
     // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
     authorize(api, worker, &grant.subject_id, job_operation(&request))?;
-    let store = store(api)?;
+    #[cfg(test)]
+    if let Some(observe) = &api.journal_before_effect {
+        observe(job_operation(&request));
+    }
+    let store = caller.effect_store(api, worker, &grant.subject_id, job_operation(&request))?;
     let host = host(api, &store, &grant)?;
     let g = generation(&store, &host, &grant, &job, &attempt)?;
     let input = saved_input(&job.request, &grant)?;
@@ -358,9 +407,18 @@ pub(super) fn recover_delivery(
     reconcile_attempt_under_gate(api, &current_job, &current_attempt, true, guard)
 }
 
+#[cfg(test)]
 pub(super) fn finish(
     api: &WorkspaceApi,
     worker: &RuntimeWorkerRef,
+) -> Result<JournalJobCompletion> {
+    finish_for(api, worker, JournalCaller::Internal)
+}
+
+fn finish_for(
+    api: &WorkspaceApi,
+    worker: &RuntimeWorkerRef,
+    caller: JournalCaller<'_>,
 ) -> Result<JournalJobCompletion> {
     let (grant, _, _) = live(api, worker)?;
     let gate = lifecycle_lock(api, &grant.subject_id)?;
@@ -371,7 +429,11 @@ pub(super) fn finish(
     // Revalidate after waiting: erasure, cancellation or replacement may have won.
     let (grant, job, attempt) = live(api, worker)?;
     authorize(api, worker, &grant.subject_id, "journal.finish")?;
-    let store = store(api)?;
+    #[cfg(test)]
+    if let Some(observe) = &api.journal_before_effect {
+        observe("journal.finish");
+    }
+    let store = caller.effect_store(api, worker, &grant.subject_id, "journal.finish")?;
     let host = host(api, &store, &grant)?;
     let input = saved_input(&job.request, &grant)?;
     // prepare is an exact binding lookup too, including the saved completion of a closed generation.
@@ -456,12 +518,19 @@ pub(super) fn bind_host_session(
     api: &WorkspaceApi,
     attr: crate::subjektiv::SubjectSessionAttribution,
 ) -> Result<()> {
-    bind_host_session_for_registration(api, attr).map_err(|failure| failure.error)
+    bind_host_session_for_registration(api, attr, SessionRegistrationCaller::InternalRecovery)
+        .map_err(|failure| failure.error)
+}
+
+pub(super) enum SessionRegistrationCaller<'a> {
+    Signed(&'a server_api::ServerRuntimeSource),
+    InternalRecovery,
 }
 
 pub(super) fn bind_host_session_for_registration(
     api: &WorkspaceApi,
     attr: crate::subjektiv::SubjectSessionAttribution,
+    caller: SessionRegistrationCaller<'_>,
 ) -> ApiResult<()> {
     let gate = lifecycle_lock(api, &attr.subject_id)?;
     let _guard = gate
@@ -487,6 +556,19 @@ pub(super) fn bind_host_session_for_registration(
         ));
     }
     let store = store(api)?;
+    let store = match caller {
+        SessionRegistrationCaller::Signed(source) => {
+            subject_authorization::authenticated_subject_effect_store(
+                api,
+                &store,
+                &worker,
+                &attr.subject_id,
+                "session.record",
+                source,
+            )
+        }
+        SessionRegistrationCaller::InternalRecovery => store,
+    };
     if store
         .journal_worker_was_released(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
         .map_err(session_registration::journal_error)?
@@ -894,8 +976,16 @@ fn admit_sources(
     attribution: crate::subjektiv::SubjectSessionAttribution,
     dispatch_jobs: bool,
 ) -> Result<JournalRecordingResponse> {
+    admit_sources_in_store(api, attribution, dispatch_jobs, store(api)?)
+}
+
+fn admit_sources_in_store(
+    api: &WorkspaceApi,
+    attribution: crate::subjektiv::SubjectSessionAttribution,
+    dispatch_jobs: bool,
+    store: crate::subjektiv::SubjektivStore,
+) -> Result<JournalRecordingResponse> {
     authorize_source(api, &attribution, "journal.recording.request")?;
-    let store = store(api)?;
     let host =
         JournalHostContext::validated_session(&store, attribution.clone()).map_err(domain)?;
     if store.journal_session_erased(&host).map_err(domain)? {
@@ -952,7 +1042,7 @@ pub(super) async fn startup_route(
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
 ) -> ApiResult<Json<journal::startup::JournalStartupSnapshot>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
@@ -979,7 +1069,12 @@ pub(super) async fn startup_route(
                 subject,
                 "journal.startup.read",
             )?;
-            let store = store(&api)?;
+            let store = JournalCaller::Signed(&source).effect_store(
+                &api,
+                &worker,
+                subject,
+                "journal.startup.read",
+            )?;
             let reader = JournalHostContext::validated_reader(&store, subject).map_err(domain)?;
             let mut current_writer = None;
             for attr in store
@@ -1025,7 +1120,7 @@ pub(super) async fn compaction_route(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
     Json(input): Json<JournalCompactionRequest>,
 ) -> ApiResult<Json<journal::startup::JournalStartupSnapshot>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
@@ -1052,7 +1147,12 @@ pub(super) async fn compaction_route(
                 subject,
                 "journal.compaction.read",
             )?;
-            let store = store(&api)?;
+            let store = JournalCaller::Signed(&source).effect_store(
+                &api,
+                &worker,
+                subject,
+                "journal.compaction.read",
+            )?;
             let attribution = store
                 .session_attribution(&input.session_id)
                 .map_err(|error| Error::Store(error.to_string()))?
@@ -1494,7 +1594,7 @@ pub(super) async fn recording_route(
 ) -> ApiResult<Json<JournalRecordingResponse>> {
     // RunCommitted/restore may arrive while the parent holds Host. Admission uses the
     // independent lane, never queues recursively behind the waiting Runtime caller.
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
@@ -1523,7 +1623,12 @@ pub(super) async fn recording_route(
                 "journal.recording.request",
             )?;
             require_enabled(&api, &worker)?;
-            let store = store(&api)?;
+            let store = JournalCaller::Signed(&source).effect_store(
+                &api,
+                &worker,
+                subject,
+                "journal.recording.request",
+            )?;
             let attributions = store
                 .subject_session_attributions(subject)
                 .map_err(|e| Error::Store(e.to_string()))?;
@@ -1532,15 +1637,18 @@ pub(super) async fn recording_route(
                 .into_iter()
                 .filter(|a| a.runtime_id == worker.runtime_id && a.worker_id == worker.worker_id)
             {
-                response = admit(&api, attr)?;
+                response = admit_sources_in_store(&api, attr, true, store.clone())?;
             }
             Ok(Json(response))
         })
         .await
 }
-fn verified_worker(
+fn verified_source(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
-) -> ApiResult<RuntimeWorkerRef> {
+) -> ApiResult<(
+    crate::worker_source::VerifiedRuntimeRequestSource,
+    RuntimeWorkerRef,
+)> {
     let source = source
         .ok_or_else(|| {
             Error::WorkspacePermissionDenied(
@@ -1548,10 +1656,11 @@ fn verified_worker(
             )
         })?
         .0;
-    let worker = source.worker_id.ok_or_else(|| {
+    let worker = source.worker_id.as_ref().ok_or_else(|| {
         Error::WorkspacePermissionDenied("Journal requires main Worker identity".into())
     })?;
-    Ok(RuntimeWorkerRef::new(source.runtime_id, worker))
+    let worker = RuntimeWorkerRef::new(&source.runtime_id, worker);
+    Ok((source, worker))
 }
 
 pub(super) async fn job_route(
@@ -1560,12 +1669,16 @@ pub(super) async fn job_route(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
     Json(request): Json<JournalJobRequest>,
 ) -> ApiResult<Json<JournalJobResponse>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
+            #[cfg(test)]
+            if let Some(observe) = &api.journal_before_effect {
+                observe("journal.job.admission");
+            }
             validate_workspace_scope(&api, &path.workspace_id)?;
-            execute(&api, &worker, request)
+            execute_for(&api, &worker, request, JournalCaller::Signed(&source))
                 .map(Json)
                 .map_err(ApiError::from)
         })
@@ -2367,12 +2480,14 @@ pub(super) async fn finish_route(
     source: Option<axum::Extension<crate::worker_source::VerifiedRuntimeRequestSource>>,
     Json(_request): Json<Empty>,
 ) -> ApiResult<Json<JournalJobCompletion>> {
-    let worker = verified_worker(source)?;
+    let (source, worker) = verified_source(source)?;
     api.store
         .db_executor()
         .run(move || {
             validate_workspace_scope(&api, &path.workspace_id)?;
-            finish(&api, &worker).map(Json).map_err(ApiError::from)
+            finish_for(&api, &worker, JournalCaller::Signed(&source))
+                .map(Json)
+                .map_err(ApiError::from)
         })
         .await
 }
@@ -2513,10 +2628,39 @@ fn require_current_job(api: &WorkspaceApi, job: &BackendJobRecord) -> Result<()>
 
 fn can_resume_partial(job: &BackendJobRecord) -> bool {
     job.state == BackendJobState::Failed
-        && job.failure_category.as_deref() == Some("journal_attempt_fenced")
+        && matches!(
+            job.failure_category.as_deref(),
+            Some("journal_attempt_fenced" | "journal_execution_terminated")
+        )
         && job.input_disposition == crate::backend_job::JobInputDisposition::Available
         && job.current_attempt < job.request.limits.max_attempts
         && !legacy_descriptor(&job.request)
+}
+
+/// Continue only the frozen partial Job whose actual termination initiated cleanup.
+/// Reopen/retry rereads the same canonical Job and still checks all historical fences.
+pub(super) fn resume_after_execution_cleanup(
+    api: &WorkspaceApi,
+    job: &BackendJobRecord,
+    attempt: &BackendJobAttemptRecord,
+) -> Result<()> {
+    if job.failure_category.as_deref() != Some("journal_execution_terminated")
+        || !can_resume_partial(job)
+        || job.current_attempt != attempt.attempt
+    {
+        return Ok(());
+    }
+    let grant = job
+        .request
+        .grants
+        .subjektiv_journal
+        .as_ref()
+        .ok_or_else(|| Error::Store("Journal continuation grant missing".into()))?;
+    let attribution = store(api)?
+        .session_attribution(&grant.session_id)
+        .map_err(|error| Error::Store(error.to_string()))?
+        .ok_or_else(|| Error::Store("Journal continuation attribution missing".into()))?;
+    dispatch_saved_or_new(api, attribution, &grant.journal_id, false)
 }
 
 /// Outcome is not a shutdown receipt. Inspect every earlier attempt as well: a late
@@ -2845,22 +2989,23 @@ fn reconcile_attempt_under_gate(
         // The generic reserved-attempt owner can still dispatch this exact saved input.
         return Ok(());
     }
-    // A confirmed original Controller Stop is an interrupted outcome, NOT a
-    // Host-drain/cleanup receipt. Terminalize the attempt so the existing T-841
-    // cleanup owner can close admission and publish its independent exact fence.
-    // Retry below still requires that fence and the cleanup owner's actual return.
+    // An actual Runtime receipt can settle the failed execution outcome, but Host
+    // callbacks may still be returning. Terminalize first so the existing cleanup
+    // owner can close admission and drain the original resource; retry only after it.
     if api
         .require_backend_job_attempt_effects_ended(attempt)
         .is_err()
-        && api.backend_job_scope_termination(attempt).is_ok()
+        && api.backend_job_execution_termination(attempt)?.is_some()
     {
-        api.finish_backend_job_attempt(&job.request.job_id, &attempt.attempt_id,
-            BackendJobAttemptState::Failed, "journal_attempt_fenced",
-            "Original Runtime Controller scope Stop confirmed; Host effects and cleanup remain independently unconfirmed; retain input/checkpoints for bounded same-Job recovery")?;
-        return Ok(());
+        return fail_recovery(
+            api,
+            job,
+            attempt,
+            "journal_execution_terminated",
+            "Runtime execution ended before checkpoint completion; Host drain and cleanup remain pending",
+        );
     }
-    // This is a nonblocking receipt check, not a timeout or a Worker/map-absence test.
-    // Missing evidence leaves the accepted attempt owned by root receipt reconciliation.
+    // Missing evidence is neither rejection nor permission to reselect input.
     api.require_backend_job_attempt_effects_ended(attempt)?;
     for number in 1..attempt.attempt {
         let id = crate::backend_job::attempt_id(&job.request.job_id, number);

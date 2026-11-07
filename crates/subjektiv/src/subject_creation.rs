@@ -4,7 +4,8 @@
 //! identity, input fingerprint and any post-seal enrollment across erasure, preventing replay
 //! from recreating an erased Subject or restoring a revoked policy.
 use super::*;
-use server_api::authorization::{SubjectPermissions, subject_conversation_permissions};
+use feature_permissions::{PermissionAssignment, PermissionReference, PermissionSetId};
+use server_api::authorization::{CurrentSubjectPolicy, SUBJECT_DEFAULT_PERMISSION_SET};
 use sha2::{Digest, Sha256};
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
@@ -24,7 +25,7 @@ impl SubjektivStore {
     pub fn subject_permission_enrollment(
         &self,
         subject_id: &str,
-    ) -> Result<Option<SubjectPermissions>> {
+    ) -> Result<Option<server_api::authorization::SubjectPolicySource>> {
         self.database.try_transaction(|tx| {
             require_subject(tx, subject_id)?;
             if !permissions::transfer::has_table(tx, "permission_authority_seal")? {
@@ -75,10 +76,15 @@ impl SubjektivStore {
                  VALUES(?1,?2,?3,'active',?4,?5,?6)",
                 params![record.id,record.role.as_str(),record.behavior_md,serde_json::to_string(&record)?,record.created_at,record.updated_at],
             )?;
-            let source = SubjectPermissions {
+            let source = CurrentSubjectPolicy {
                 change_id: issued_id("permissions"),
-                execution: subject_conversation_permissions(self.scope_id(), &record.id),
-                delegation: vec![],
+                execution: PermissionAssignment {
+                    grants: vec![PermissionReference::Set(PermissionSetId::parse(SUBJECT_DEFAULT_PERMISSION_SET)
+                        .map_err(SubjektivError::InvalidRecord)?)],
+                    exclusions: vec![], revoked: false,
+                },
+                delegation: PermissionAssignment { grants: vec![], exclusions: vec![], revoked: false },
+                legacy_constraints: None,
             };
             let sealed = permissions::transfer::is_sealed(tx)?;
             if !sealed {

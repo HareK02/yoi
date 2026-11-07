@@ -31,6 +31,8 @@
 //! treated as unexecuted operations. Native omission and explicit nullable unions are distinct;
 //! native input changes do not change ordinary Tool omission/null behavior.
 
+pub(crate) mod permission_declaration;
+
 use crate::feature::{
     FeatureDescriptor, FeatureInstallContext, FeatureInstallError, FeatureInstructionContribution,
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ToolContribution,
@@ -309,6 +311,13 @@ impl MergeRequestFeature {
 }
 
 impl FeatureModule for MergeRequestFeature {
+    fn declare_permissions(
+        &self,
+        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
+    ) -> Result<(), FeatureInstallError> {
+        permission_declaration::DECLARATION.declare(registrar)
+    }
+
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
             .with_description(FEATURE_DESCRIPTION);

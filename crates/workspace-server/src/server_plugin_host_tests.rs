@@ -8,6 +8,8 @@
 mod authority_storage;
 #[path = "server_plugin_data_tests.rs"]
 mod data;
+#[path = "server_plugin_runtime_binding_tests.rs"]
+mod runtime_binding;
 
 use super::*;
 use crate::plugin_binding::PluginConnectionBinding;
@@ -49,6 +51,149 @@ struct Fixture {
     tool: &'static str,
     binding: Option<PluginConnectionBinding>,
     _directory: tempfile::TempDir,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeTrustChange {
+    KeyRotation,
+    ReactivateSameKey,
+    SameKeyAba,
+}
+
+fn replace_runtime_trust(f: &mut Fixture, change: RuntimeTrustChange) {
+    let store = &f.api.config_store;
+    let original = store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &f.source.runtime_id)
+        .unwrap()
+        .unwrap();
+    let mut replacement = original.clone();
+    match change {
+        RuntimeTrustChange::KeyRotation => {
+            f.identity = RuntimeIdentityMaterial::generate(&f.source.runtime_id).unwrap();
+            replacement.public_key = f.identity.public_key.clone();
+            replacement.public_key_fingerprint.clear();
+        }
+        RuntimeTrustChange::ReactivateSameKey => {
+            assert!(store.revoke_workspace_runtime_binding(
+                TEST_WORKSPACE_ID, &f.source.runtime_id, TEST_CREATED_AT,
+            ).unwrap());
+        }
+        RuntimeTrustChange::SameKeyAba => {
+            replacement.display_name.push_str("-replacement");
+            store.upsert_workspace_runtime_binding(replacement, true).unwrap();
+            replacement = original.clone();
+        }
+    }
+    store.upsert_workspace_runtime_binding(replacement, true).unwrap();
+    let current = store
+        .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &f.source.runtime_id)
+        .unwrap()
+        .unwrap();
+    assert!(current.revoked_at.is_none());
+    assert_ne!(current.binding_id, original.binding_id);
+    assert_eq!(current.public_key, f.identity.public_key);
+}
+
+async fn delegate_plugin_fixture(
+    f: &mut Fixture,
+) -> server_api::authorization::SubjectPermissions {
+    use server_api::authorization::WorkerDelegationRequest;
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
+    let source = store
+        .set_subject_permissions(
+            &f.subject,
+            &SubjectPermissionsUpdate {
+                operation_id: "delegate-plugin".into(),
+                expected_change_id: Some(previous.change_id),
+                execution: previous.execution.clone(),
+                delegation: previous.execution.clone(),
+            },
+        )
+        .unwrap();
+    let grant = subject_authorization::prepare_delegation(
+        &f.api,
+        &f.source,
+        Some(&WorkerDelegationRequest {
+            permissions: source.execution.clone(),
+            redelegation: vec![],
+        }),
+        &f.source.runtime_id,
+        PROFILE,
+        "delegated-profile-digest",
+        None,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let memory = f
+        .api
+        .config_store
+        .get_workspace_memory_settings(TEST_WORKSPACE_ID)
+        .unwrap();
+    let reserved = f
+        .api
+        .config_store
+        .reserve_worker_create(
+            TEST_WORKSPACE_ID,
+            &f.source.runtime_id,
+            "delegated-child",
+            "sha256:delegated-child",
+            None,
+            &memory,
+        )
+        .unwrap();
+    subject_authorization::bind_reserved_grant(&f.api, &grant, &reserved.worker_id.to_string())
+        .unwrap();
+    let child = RuntimeWorkerRef::new(&f.source.runtime_id, reserved.worker_id.to_string());
+    let identity = f
+        .api
+        .plugin_reserved_execution_identity(&child.runtime_id, &reserved, Some(&grant))
+        .unwrap();
+    let mut summary = f.api.runtime.worker(&f.source).unwrap();
+    summary.worker.worker_id = child.worker_id.clone();
+    summary.singleton_key = None;
+    f.runtime.workers.lock().unwrap().push(summary);
+    assert_eq!(
+        f.api.plugin_execution_identity(&child).await.unwrap(),
+        identity
+    );
+    let config = f
+        .api
+        .config_store
+        .load_workspace_config(TEST_WORKSPACE_ID)
+        .unwrap()
+        .unwrap();
+    f.plan = f
+        .api
+        .config_store
+        .with_immediate_transaction(|tx| {
+            let plan = crate::plugin_settings::resolve_worker_plugin_plan(
+                tx,
+                TEST_WORKSPACE_ID,
+                &config.snapshot.digest,
+                PROFILE,
+                identity,
+            )?;
+            crate::plugin_plan::plugin_plan_create(
+                tx,
+                "fixture-host",
+                "delegated-child-plan",
+                &plan,
+            )
+        })
+        .unwrap();
+    f.api
+        .config_store
+        .plugin_plan_transition(
+            TEST_WORKSPACE_ID,
+            &f.plan.plan_id,
+            PlanPinState::Pending,
+            PlanPinState::Active,
+        )
+        .unwrap();
+    f.source = child;
+    source
 }
 
 impl Fixture {
@@ -383,7 +528,13 @@ impl Fixture {
 
 fn set_policy(api: &WorkspaceApi, subject: &str, installation: &str, granted: bool) {
     let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(subject).unwrap();
+    let previous = store
+        .subject_policy_source(subject)
+        .unwrap()
+        .map(|policy| match policy {
+            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
+            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
+        });
     let execution = if granted {
         [
             "plugin.admit",
@@ -410,7 +561,7 @@ fn set_policy(api: &WorkspaceApi, subject: &str, installation: &str, granted: bo
             subject,
             &SubjectPermissionsUpdate {
                 operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: previous.map(|p| p.change_id),
+                expected_change_id: previous,
                 execution,
                 delegation: vec![],
             },
@@ -1408,9 +1559,9 @@ async fn tool_check_reuses_physical_subject_database_only_within_each_sync_scope
             owner.call(prepare(&f)).await.unwrap(),
             PluginHostResponse::Authorized
         ));
-        // Identity and permission checks are two separate synchronous scopes.
+        // Identity and permission checks share one native authority reservation.
         // The next call must open again rather than keeping a cross-call cache.
-        assert_check_physical_initializations(&f, before, 2);
+        assert_check_physical_initializations(&f, before, 1);
     }
     f.shutdown().await;
 }

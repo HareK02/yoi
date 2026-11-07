@@ -2868,6 +2868,7 @@ dependencies = [
  "builtin-source",
  "crc32fast",
  "decodal",
+ "feature-permissions",
  "jsonschema",
  "protocol",
  "secrets",
@@ -5047,6 +5048,7 @@ dependencies = [
  "async-trait",
  "client",
  "error-contract",
+ "feature-permissions",
  "feature-storage",
  "fs4",
  "futures",
@@ -5142,6 +5144,7 @@ name = "subjektiv"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "feature-permissions",
  "feature-storage",
  "job",
  "manifest",

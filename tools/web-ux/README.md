@@ -12,4 +12,4 @@
 - PlaywrightとNixで固定するbrowserの対応を、toolchain変更として同時に検証する。
 - 変更時は`deno.json`のcheck・testと必要なbrowser testを選ぶ。scenario変更では実際の画像と`review-context.json`を確認する。browser testの成功を目視の代わりにしない。
 
-Subject権限の操作確認には[`subject_permissions_review.ts`](browser-tests/subject_permissions_review.ts)、変更前の撮影には[`subject_permissions_before.ts`](browser-tests/subject_permissions_before.ts)を使う。実Webのビルドを合成HTTP fixtureで動かすため、採取結果は実Backendの認証・保存・認可・Worker制御の証拠ではない。画像と診断の目視確認も別途必要である。
+Subject権限の画面とsource採用の確認は、Web所有の[`permissions.browser.test.ts`](../../web/workspace/test/visual-review/permissions.browser.test.ts)で行う。`web/workspace`で`deno task build`後に`deno task test:browser:permissions`を実行する。実Webのビルドを合成HTTP fixtureで動かすため、採取結果は実Backendの認証・保存・実認可・Worker制御の証拠ではない。画像と診断の目視確認も別途必要である。

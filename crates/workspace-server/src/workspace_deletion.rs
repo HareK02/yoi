@@ -39,9 +39,18 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "plugin_installations",
     "artifacts",
     "audit_events",
+    "backend_job_delivery_pre_content_history",
+    "backend_job_attempt_pre_content_history",
+    "backend_job_pre_content_history",
+    "backend_job_attempt_upgrade_history",
+    "backend_job_upgrade_history",
+    "backend_job_reconciliation",
+    "backend_job_execution_fences",
+    "backend_job_recovery_probes",
     "backend_job_deliveries",
     "backend_job_attempts",
     "backend_jobs",
+    "external_workdir_connection_observations",
     "external_workdir_grants",
     "flow_source_contents",
     "flow_sources",
@@ -143,6 +152,10 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_tombstones",
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",
+    "workspace_configuration_publication_observations",
+    "workspace_configuration_receipts",
+    "workspace_configuration_policies",
+    "workspace_configuration_authorities",
     "workspace_config_entries",
     "workspace_config_grants",
     "workspace_drive_grants",
@@ -558,6 +571,9 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ("typed_ticket_assignment_tracking_operations", "typed_ticket_assignment_tracking_operations_no_delete"),
                 ("typed_ticket_case_history", "typed_ticket_case_history_no_delete"),
                 ("typed_ticket_legacy_workflow_snapshot", "typed_ticket_legacy_workflow_no_delete"),
+                ("workspace_configuration_authorities", "workspace_configuration_authorities_no_delete"),
+                ("workspace_configuration_publication_observations", "workspace_configuration_publication_no_delete"),
+                ("workspace_configuration_receipts", "workspace_configuration_receipts_no_delete"),
             ] {
                 let definition: String = tx.query_row(
                     "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name=?2",
@@ -1166,6 +1182,19 @@ mod tests {
                         )?;
                         conn.execute("INSERT INTO notification_source_preparation_failures(source_sequence,code) SELECT sequence,'source_lookup_failed' FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
                         conn.execute("INSERT INTO notification_source_offers(source_sequence,last_offered) SELECT sequence,1 FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
+                        let policy = crate::policy_config::AdoptedSubjectPolicy {
+                            source: crate::policy_config::SubjectAssignmentSource {
+                                subject_id: "retained-subject".into(),
+                                execution: Default::default(),
+                                delegation: Default::default(),
+                            },
+                            change_id: "retained-policy-change".into(),
+                            legacy_constraints: None,
+                        };
+                        conn.execute("INSERT INTO workspace_configuration_authorities VALUES(?1,'transfer','physical','export')", [workspace])?;
+                        conn.execute("INSERT INTO workspace_configuration_policies VALUES(?1,'retained-subject',?2)", params![workspace, serde_json::to_string(&policy).unwrap()])?;
+                        conn.execute("INSERT INTO workspace_configuration_receipts VALUES(?1,'adopt','fingerprint','{}')", [workspace])?;
+                        conn.execute("INSERT INTO workspace_configuration_publication_observations(workspace_id,operation_id,stage,runtime_id,outcome) VALUES(?1,'adopt','dispatch','','observed')", [workspace])?;
                         Ok(())
                     })
                     .unwrap();
@@ -1175,6 +1204,14 @@ mod tests {
                     for table in ["typed_ticket_case_history", "typed_ticket_legacy_workflow_snapshot", "ticket_worker_assignment_events", "typed_ticket_assignment_tracking_history", "typed_ticket_assignment_tracking_operations", "ticket_assignment_operations", "ticket_assignment_content_inputs"] {
                         assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
                         assert!(conn.execute(&format!("UPDATE {table} SET ticket_id=ticket_id WHERE workspace_id=?1"), [workspace]).is_err());
+                    }
+                    for (table, column) in [
+                        ("workspace_configuration_authorities", "transfer_identity"),
+                        ("workspace_configuration_publication_observations", "stage"),
+                        ("workspace_configuration_receipts", "request_fingerprint"),
+                    ] {
+                        assert!(conn.execute(&format!("DELETE FROM {table} WHERE workspace_id=?1"), [workspace]).is_err());
+                        assert!(conn.execute(&format!("UPDATE {table} SET {column}={column} WHERE workspace_id=?1"), [workspace]).is_err());
                     }
                     assert!(conn.execute("DELETE FROM notification_source_preparation_failures WHERE source_sequence IN (SELECT sequence FROM notification_sources WHERE workspace_id=?1)",[workspace]).is_err());
                     assert_eq!(conn.query_row("SELECT COUNT(*) FROM notification_source_preparation_failures p JOIN notification_sources s ON s.sequence=p.source_sequence WHERE s.workspace_id=?1",[workspace],|r|r.get::<_,i64>(0))?,1);
@@ -1201,6 +1238,10 @@ mod tests {
                 .unwrap()
                 .operation;
             let tables = [
+                "workspace_configuration_publication_observations",
+                "workspace_configuration_authorities",
+                "workspace_configuration_policies",
+                "workspace_configuration_receipts",
                 "typed_ticket_case_history",
                 "typed_ticket_case_metadata",
                 "typed_ticket_legacy_workflow_snapshot",

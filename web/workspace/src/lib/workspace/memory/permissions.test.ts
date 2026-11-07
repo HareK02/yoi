@@ -1,184 +1,191 @@
 import {
-  attemptKey,
-  makeResource,
-  parseView,
-  permissionKey,
-  policyDiff,
-  readAttempt,
-  readPermissions,
-  writePermissions,
-} from "./permissions.ts";
-import type { ScopedPermission } from "./permissions.ts";
+  deepStrictEqual as assertEquals,
+  rejects as assertRejects,
+  throws as assertThrows,
+} from "node:assert/strict";
 declare const Deno: {
   test(name: string, fn: () => void | Promise<void>): void;
 };
-function assert(condition: unknown): asserts condition {
-  if (!condition) throw new Error("Assertion failed");
-}
-const p: ScopedPermission = {
-  operation: "filesystem.read",
-  resource: {
-    kind: "workdir",
-    working_directory_id: "wd",
-    path: "src",
-    recursive: true,
-  },
+import {
+  parseAssignment,
+  parseCatalog,
+  parseResolution,
+  parseSource,
+  PermissionHttpError,
+  readPermissions,
+  referenceLabel,
+} from "./permissions.ts";
+import {
+  permissionResolution,
+  permissionSource,
+} from "../../../../test/permissions-fixture.ts";
+import catalogFixture from "../../../../../../crates/feature-permissions/tests/fixtures/catalog.json" with {
+  type: "json",
 };
-Deno.test("permission differences preserve exact legacy resource and separate lanes", () => {
-  const legacy: ScopedPermission = {
-    operation: "worker.notify",
-    resource: {
-      kind: "worker",
-      runtime_id: "runtime",
-      worker_id: "only-worker",
-    },
-  };
-  const direct = [legacy, p];
-  assert(policyDiff([legacy], direct).added.length === 1);
-  assert(policyDiff([legacy], direct).removed.length === 0);
-  assert(
-    permissionKey(p) ===
-      permissionKey({
-        operation: p.operation,
-        resource: {
-          recursive: true,
-          path: "src",
-          working_directory_id: "wd",
-          kind: "workdir",
-        },
-      }),
+import assignmentFixture from "../../../../../../crates/feature-permissions/tests/fixtures/assignment.json" with {
+  type: "json",
+};
+
+Deno.test("Feature declaration and Set/Namespace parsers preserve shared Rust multilevel children without prefix inference", () => {
+  assertEquals(parseCatalog(catalogFixture), catalogFixture);
+  assertEquals(parseAssignment(assignmentFixture), assignmentFixture);
+  assertEquals(
+    referenceLabel({ kind: "set", value: "ticket" }),
+    "Set · ticket",
   );
-  assert(policyDiff([legacy], []).removed[0] === legacy);
+  assertEquals(
+    referenceLabel({
+      kind: "namespace",
+      value: { namespace: "ticket", keys: ["ticket.hoge.fuga.finish"] },
+    }),
+    "Namespace · ticket · ticket.hoge.fuga.finish",
+  );
 });
-Deno.test("typed resource input binds workspace, preserves narrow paths and rejects missing targets", () => {
-  assert(
-    JSON.stringify(
-      makeResource("workdir", "w", "s", {
-        working_directory_id: "wd",
-        path: "src",
-      }, false),
-    ) ===
-      JSON.stringify({
-        kind: "workdir",
-        working_directory_id: "wd",
-        path: "src",
-        recursive: false,
-      }),
-  );
-  assert(
-    JSON.stringify(makeResource("subject", "w", "s", {}, false)) ===
-      JSON.stringify({ kind: "subject", workspace_id: "w", subject_id: "s" }),
-  );
-  let rejected = false;
-  try {
-    makeResource("ticket", "w", "s", {}, false);
-  } catch {
-    rejected = true;
-  }
-  assert(rejected);
-});
-Deno.test("catalog parsing refuses unknown resource types and malformed management permission", () => {
+Deno.test("permission assignments reject per-key payloads, legacy resources and inferred kinds", () => {
+  const assignment = permissionSource().policies[0].execution;
   for (
-    const value of [
-      { permissions: null, can_manage: "yes", operations: [] },
+    const ref of [
+      { kind: "ticket", value: "ticket" },
+      { kind: "set", value: "ticket", data: {} },
       {
-        permissions: null,
-        can_manage: true,
-        operations: [{
-          operation: "unknown",
-          label: "Unknown",
-          description: "",
-          resource_kinds: ["everything"],
-          availability: { kind: "available" },
-        }],
+        kind: "namespace",
+        value: {
+          namespace: "ticket",
+          keys: [{ key: "ticket.read", data: {} }],
+        },
+      },
+      {
+        kind: "namespace",
+        value: { namespace: "ticket", keys: ["ticket.read"], schema: {} },
+      },
+      {
+        operation: "ticket.read",
+        resource: { kind: "ticket", ticket_id: "T-1" },
       },
     ]
+  ) assertThrows(() => parseAssignment({ ...assignment, grants: [ref] }));
+});
+Deno.test("source binds Workspace and keeps revoked, excluded and retained domain constraints read-only", () => {
+  const source = permissionSource();
+  assertEquals(parseSource(source, "w"), source);
+  assertEquals(
+    parseSource(source, "w").policies[0].legacy_constraints?.execution[0]
+      .resource,
+    { kind: "ticket", workspace_id: "w", ticket_id: "T-837" },
+  );
+  assertThrows(() => parseSource(source, "another-workspace"));
+  assertThrows(() =>
+    parseSource({
+      ...source,
+      policies: [...source.policies, ...source.policies],
+    }, "w")
+  );
+  assertThrows(() =>
+    parseSource({
+      ...source,
+      policies: [{ ...source.policies[0], execution: [] }],
+    }, "w")
+  );
+});
+Deno.test("resolution requires matching Workspace and preserves server origin paths and diagnostics", () => {
+  const resolution = permissionResolution();
+  assertEquals(parseResolution(resolution, "w"), resolution);
+  assertThrows(() => parseResolution(resolution, "other"));
+  assertThrows(() =>
+    parseResolution({
+      ...resolution,
+      allowed: { "ticket.hoge": [[{ kind: "prefix", value: "ticket" }]] },
+    }, "w")
+  );
+});
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status });
+Deno.test("permission read uses policy and origin from one source snapshot without validate or a second read", async () => {
+  const source = permissionSource("w/one", "s");
+  const calls: { path: string; method: string }[] = [];
+  const fetcher = (async (input: unknown, init?: { method?: string }) => {
+    calls.push({ path: String(input), method: init?.method ?? "GET" });
+    return json(source);
+  }) as typeof fetch;
+  const view = await readPermissions(fetcher, "w/one", "s");
+  assertEquals(calls, [{
+    path: "/api/w/w%2Fone/config/adoption",
+    method: "GET",
+  }]);
+  assertEquals(view.source.history_head, "head:adopted");
+  assertEquals(
+    view.policy?.execution_resolution,
+    permissionResolution("w/one"),
+  );
+  assertEquals(
+    view.policy?.delegation_resolution,
+    permissionResolution("w/one", true),
+  );
+});
+Deno.test("explicit refresh replaces catalog, assignment and origins together without caching a prior resolution", async () => {
+  const first = permissionSource();
+  const next = permissionSource();
+  next.history_head = "head:revoked";
+  next.catalog_digest = "catalog:changed";
+  next.policies[0].change_id = "policy:revoked";
+  next.policies[0].execution = { grants: [], exclusions: [], revoked: true };
+  next.policies[0].execution_resolution = permissionResolution("w", true);
+  const replies = [first, next];
+  const fetcher =
+    (() => Promise.resolve(json(replies.shift()))) as typeof fetch;
+  const before = await readPermissions(fetcher, "w", "s");
+  const after = await readPermissions(fetcher, "w", "s");
+  assertEquals(before.policy?.execution_resolution, permissionResolution());
+  assertEquals(after.source.history_head, "head:revoked");
+  assertEquals(after.source.catalog_digest, "catalog:changed");
+  assertEquals(
+    after.policy?.execution_resolution,
+    permissionResolution("w", true),
+  );
+  assertEquals(after.policy?.execution.revoked, true);
+  assertEquals(replies, []);
+});
+Deno.test("missing, malformed or cross-Workspace inline resolution rejects the source rather than falling back to generic validate", async () => {
+  const source = permissionSource();
+  for (
+    const field of ["execution_resolution", "delegation_resolution"] as const
   ) {
-    let rejected = false;
-    try {
-      parseView(value);
-    } catch {
-      rejected = true;
+    const { [field]: _missing, ...incomplete } = source.policies[0];
+    for (
+      const policy of [incomplete, {
+        ...source.policies[0],
+        [field]: permissionResolution("another-workspace"),
+      }, {
+        ...source.policies[0],
+        [field]: { workspace: "w", allowed: {}, diagnostics: null },
+      }]
+    ) {
+      let requests = 0;
+      const fetcher = (() => {
+        requests++;
+        return Promise.resolve(json({ ...source, policies: [policy] }));
+      }) as typeof fetch;
+      await assertRejects(() => readPermissions(fetcher, "w", "s"));
+      assertEquals(requests, 1);
     }
-    assert(rejected);
   }
 });
-Deno.test("save retry keeps exact complete input scoped to Workspace and Subject", async () => {
-  const request = {
-    operation_id: "stable-operation",
-    expected_change_id: "old",
-    execution: [p],
-    delegation: [],
-  };
-  const memory = new Map([[attemptKey("w", "s"), JSON.stringify(request)]]);
-  const storage = { getItem: (key: string) => memory.get(key) ?? null };
-  assert(
-    JSON.stringify(readAttempt(storage, "w", "s")) === JSON.stringify(request),
-  );
-  assert(readAttempt(storage, "other", "s") === null);
-  assert(readAttempt(storage, "w", "other") === null);
-  const calls: { url: string; body: string }[] = [];
-  const fake = ((input: string, init?: RequestInit) => {
-    calls.push({ url: input, body: init?.body as string });
-    return Promise.resolve(
-      Response.json({
-        permissions: { change_id: "new", execution: [p], delegation: [] },
-        interruptions: [],
-      }),
+Deno.test("non-owner and source failure are not empty policies, missing Subject is never defaulted", async () => {
+  for (const status of [401, 403, 404, 500]) {
+    await assertRejects(
+      () =>
+        readPermissions(
+          (() => Promise.resolve(json({}, status))) as typeof fetch,
+          "w",
+          "s",
+        ),
+      PermissionHttpError,
     );
-  }) as typeof fetch;
-  await writePermissions(fake, "w", "s", request);
-  await writePermissions(fake, "w", "s", readAttempt(storage, "w", "s")!);
-  assert(calls[0].url === "/api/w/w/subjektiv/subjects/s/permissions");
-  assert(calls[0].body === calls[1].body);
-});
-Deno.test("read permission projection uses the existing scoped endpoint and no fallback grant", async () => {
-  let path = "";
-  const fake = ((input: string) => {
-    path = input;
-    return Promise.resolve(
-      Response.json({ permissions: null, can_manage: false, operations: [] }),
-    );
-  }) as typeof fetch;
-  const view = await readPermissions(fake, "space", "subject");
-  assert(path === "/api/w/space/subjektiv/subjects/subject/permissions");
-  assert(
-    view.permissions === null && !view.can_manage &&
-      view.operations.length === 0,
+  }
+  const view = await readPermissions(
+    (() => Promise.resolve(json(permissionSource()))) as typeof fetch,
+    "w",
+    "missing",
   );
-});
-
-Deno.test("Worker operation editor binds operation use without a target and preserves installed Plugin scopes", () => {
-  const resource = makeResource("worker_operation", "w", "s", {}, false);
-  assert(
-    JSON.stringify(resource) ===
-      JSON.stringify({ kind: "worker_operation", workspace_id: "w" }),
-  );
-  const view = parseView({
-    permissions: {
-      change_id: "saved",
-      execution: [{ operation: "worker.messaging", resource }],
-      delegation: [],
-    },
-    can_manage: true,
-    operations: [{
-      operation: "worker.messaging",
-      label: "Message Workers",
-      description: "Directional target grants remain separate",
-      resource_kinds: ["worker_operation"],
-      availability: { kind: "available" },
-    }],
-  });
-  assert(
-    view.operations[0].available &&
-      view.permissions?.execution[0].resource.kind === "worker_operation",
-  );
-  const installed = makeResource("plugin_installation", "w", "s", {
-    installation_id: "installed",
-  }, false);
-  assert(
-    installed.kind === "plugin_installation" &&
-      installed.workspace_id === "w" &&
-      installed.installation_id === "installed",
-  );
+  assertEquals(view.policy, null);
 });

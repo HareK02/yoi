@@ -55,6 +55,11 @@ impl RecoveryOwners {
     }
 
     #[cfg(test)]
+    pub(super) async fn pause_steps_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.step_admission.lock().await
+    }
+
+    #[cfg(test)]
     pub(super) fn recovery_owner_ids(&self) -> HashSet<String> {
         self.running.lock().unwrap().clone()
     }
@@ -1568,6 +1573,9 @@ impl WorkspaceApi {
             }
             subjektiv_journal::drain_after_completion(self, &job.request);
         }
+        if job.request.grants.subjektiv_journal.is_some() {
+            subjektiv_journal::resume_after_execution_cleanup(self, &job, &current)?;
+        }
         // Only after durable fences/retirement may live bookkeeping be forgotten.
         self.backend_job_recovery
             .hosts
@@ -1603,20 +1611,33 @@ impl WorkspaceApi {
         ))
     }
 
+    /// This Runtime receipt proves only scope termination, never Host drain.
     pub(super) fn backend_job_scope_termination(
         &self,
         attempt: &BackendJobAttemptRecord,
     ) -> Result<worker_runtime::execution::WorkerExecutionTermination> {
-        let worker = attempt.worker.as_ref().ok_or_else(|| {
-            Error::RepositoryConflict("Unbound allocation cannot prove execution ended".into())
-        })?;
-        let termination = self
+        self.backend_job_execution_termination(attempt)?
+            .ok_or_else(|| {
+                Error::RepositoryConflict("Actual Runtime scope termination receipt missing".into())
+            })
+    }
+
+    /// Actual Runtime termination can settle an execution outcome before Host cleanup.
+    /// It cannot by itself certify Host drain or authorize another attempt.
+    pub(super) fn backend_job_execution_termination(
+        &self,
+        attempt: &BackendJobAttemptRecord,
+    ) -> Result<Option<worker_runtime::execution::WorkerExecutionTermination>> {
+        let Some(worker) = attempt.worker.as_ref() else {
+            return Ok(None);
+        };
+        let Some(termination) = self
             .runtime
             .backend_job_termination(worker)
             .map_err(RuntimeRegistryError::into_error)?
-            .ok_or_else(|| {
-                Error::RepositoryConflict("Actual Runtime scope termination receipt missing".into())
-            })?;
+        else {
+            return Ok(None);
+        };
         if !termination.feature_failures.is_empty()
             || termination.scope
                 != worker_runtime::execution::WorkerExecutionTerminationScope::Controller
@@ -1630,7 +1651,7 @@ impl WorkspaceApi {
                     .into(),
             ));
         }
-        Ok(termination)
+        Ok(Some(termination))
     }
 
     pub(super) async fn fence_backend_job_effects(

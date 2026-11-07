@@ -114,6 +114,7 @@ impl JobGrant {
     }
 }
 
+#[derive(Clone)]
 pub struct PermissionHost {
     identity: Arc<()>,
     workspace: WorkspaceId,
@@ -183,6 +184,21 @@ impl PermissionHost {
             return Err(PermissionError::ForeignHandle);
         }
         Ok(())
+    }
+
+    /// Recover a namespace only from this Host's existing registered owner handle.
+    /// A name or wire Feature identity alone cannot mint a handle.
+    pub fn namespace_handle(
+        &self,
+        feature: &FeatureHandle,
+        namespace: &NamespaceId,
+    ) -> Result<NamespaceHandle, PermissionError> {
+        let handle = NamespaceHandle {
+            feature: feature.clone(),
+            namespace: namespace.clone(),
+        };
+        self.check_namespace(&handle)?;
+        Ok(handle)
     }
 
     pub fn bind_namespace(

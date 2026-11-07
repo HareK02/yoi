@@ -5,9 +5,9 @@
 //! recovery authority; shutdown does not delete either original Sessions or pending requests.
 
 use super::*;
-use crate::jobs::{
-    JobAttemptState, JobInputDisposition, JobInputRetirementReason, JobSnapshot, JobState,
-};
+#[cfg(test)]
+use crate::jobs::JobInputDisposition;
+use crate::jobs::{JobAttemptState, JobInputRetirementReason, JobSnapshot, JobState};
 use session_store::capture::{CaptureDto, CaptureLimits, RecordingPosition};
 use subjektiv::api::JobAttemptBinding;
 use subjektiv::journal::recording::JournalInput;
@@ -19,6 +19,22 @@ use worker::subjektiv::{JournalJobFinalizer, JournalJobHost, JournalJobToolsFeat
 mod tests;
 
 pub(super) const PURPOSE: &str = "subjektiv_journal";
+pub(super) const JOURNAL_OPERATIONS: &[&str] = &[
+    "journal.job.input.read",
+    "journal.job.input.supply",
+    "journal.state.read",
+    "journal.text.read",
+    "journal.operation.query",
+    "journal.operation.list",
+    "journal.operation.coverage.read",
+    "journal.entry.create",
+    "journal.entry.fix",
+    "journal.entry.rewrite",
+    "journal.position.update",
+    "journal.unchanged.confirm",
+    "journal.checkpoint",
+    "journal.finish",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +47,23 @@ struct LocalJournalGrant {
     ranges: Vec<JournalSourceRange>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     origins: Vec<SourceOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operations: Option<Vec<String>>,
+}
+impl LocalJournalGrant {
+    fn authorize_operation(&self, operation: &str) -> Result<(), SubjektivHostError> {
+        if !JOURNAL_OPERATIONS.contains(&operation)
+            || self
+                .operations
+                .as_ref()
+                .is_some_and(|keys| !keys.iter().any(|key| key == operation))
+        {
+            return Err(SubjektivHostError::PermissionDenied(format!(
+                "operation `{operation}` is outside the frozen Journal Job grant"
+            )));
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,13 +243,15 @@ pub(crate) fn prepare_worker_deletion(
 
 pub(super) fn journal_error(error: JournalError) -> SubjektivHostError {
     match error {
+        JournalError::Subject(subjektiv::SubjektivError::AuthorizationDenied(message))
+        | JournalError::PermissionDenied(message) => SubjektivHostError::PermissionDenied(message),
         JournalError::Conflict(message) => SubjektivHostError::Conflict {
             code: "journal_conflict".into(),
             message,
         },
-        JournalError::PermissionDenied(message)
-        | JournalError::InvalidInput(message)
-        | JournalError::NotFound(message) => SubjektivHostError::InvalidArgument(message),
+        JournalError::InvalidInput(message) | JournalError::NotFound(message) => {
+            SubjektivHostError::InvalidArgument(message)
+        }
         other => SubjektivHostError::Unavailable(other.to_string()),
     }
 }
@@ -445,7 +480,7 @@ impl LocalSubjectHost {
     }
 
     fn reconcile_journal_session(&self, session: &str) -> Result<bool, SubjektivHostError> {
-        self.ensure_live()?;
+        self.authorize_current("journal.job.input.read")?;
         let context = authority(self, session)?;
         if self
             .catalog
@@ -607,7 +642,8 @@ impl LocalSubjectHost {
     fn next_journal_job(
         &self,
     ) -> Result<Option<(crate::jobs::StandaloneJobs, String)>, SubjektivHostError> {
-        self.ensure_live()?;
+        self.authorize_current("journal.job.input.read")?;
+        self.authorize_current("journal.job.input.supply")?;
         let jobs = self.jobs()?;
         for saved in jobs.unacknowledged_results().map_err(service_error)? {
             if self.journal_grant_scope(&saved).is_ok() {
@@ -709,6 +745,7 @@ impl LocalSubjectHost {
                     journal_id: journal.id.clone(),
                     ranges: input.selected_ranges.clone(),
                     origins: vec![],
+                    operations: Some(self.freeze_operations(JOURNAL_OPERATIONS)?),
                 };
                 let request = self.journal_request(&journal.id, &input)?;
                 let saved = jobs
@@ -996,6 +1033,7 @@ impl LocalSubjectHost {
             &session_store::retention::SessionRetentionGuard,
         ) -> Result<T, SubjektivHostError>,
     ) -> Result<T, SubjektivHostError> {
+        self.authorize_current("journal.job.input.read")?;
         let sessions = crate::subjektiv_sessions::authorized_sessions_path(
             &self.catalog.state_root,
             &self.binding.scope_id,
@@ -1060,7 +1098,10 @@ impl LocalSubjectHost {
                     "no attested active lineage for the retained Session".into(),
                 )
             })?;
-        read(&sessions, session_id, active, &guard)
+        self.authorize_current("journal.job.input.read")?;
+        let result = read(&sessions, session_id, active, &guard)?;
+        self.authorize_current("journal.job.input.read")?;
+        Ok(result)
     }
 
     fn recording_capture(&self, session: &str) -> Result<CaptureDto, SubjektivHostError> {
@@ -1393,8 +1434,18 @@ pub(super) fn grant(
     snapshot: &JobSnapshot,
     fence: Arc<dyn crate::jobs::JobAttemptFence>,
 ) -> Result<worker::job::JobFeatureGrant, String> {
+    host.authorize_current("journal.job.input.read")
+        .map_err(|error| error.to_string())?;
+    host.authorize_current("journal.job.input.supply")
+        .map_err(|error| error.to_string())?;
     let grant = host
         .journal_grant(snapshot)
+        .map_err(|error| error.to_string())?;
+    grant
+        .authorize_operation("journal.job.input.read")
+        .map_err(|error| error.to_string())?;
+    grant
+        .authorize_operation("journal.job.input.supply")
         .map_err(|error| error.to_string())?;
     let context = authority(&host, &grant.session_id).map_err(|error| error.to_string())?;
     let input = JournalInput::decode(&snapshot.request.input).map_err(|e| e.to_string())?;
@@ -1421,6 +1472,8 @@ pub(super) fn grant(
     input
         .validate_generation(&generation)
         .map_err(|e| e.to_string())?;
+    host.authorize_current("journal.job.input.supply")
+        .map_err(|error| error.to_string())?;
     let adapter = Arc::new(LocalJournalHost {
         host,
         grant,
@@ -1430,11 +1483,14 @@ pub(super) fn grant(
         generation,
         input_digest,
         fence,
+        #[cfg(test)]
+        admission_observer: None,
     });
     Ok(worker::job::JobFeatureGrant {
         features: worker::feature::FeatureRegistryBuilder::new()
             .with_module(JournalJobToolsFeature::new(adapter.clone())),
         satisfied_requirements: vec![],
+        input_authority: Some(adapter.clone()),
         finalizer: Some(Arc::new(JournalJobFinalizer::new(adapter))),
     })
 }
@@ -1448,10 +1504,83 @@ struct LocalJournalHost {
     generation: JournalGeneration,
     input_digest: String,
     fence: Arc<dyn crate::jobs::JobAttemptFence>,
+    #[cfg(test)]
+    admission_observer: Option<JournalAdmissionObserver>,
 }
+
+struct LocalJournalEffectAuthority {
+    actual: authority::LocalMemoryEffectAuthority,
+    grant: LocalJournalGrant,
+    fence: Arc<dyn crate::jobs::JobAttemptFence>,
+}
+impl subjektiv::effect_admission::SubjectEffectAuthority for LocalJournalEffectAuthority {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
+        // execute/finish already hold enter() through the whole synchronous call.
+        // Only recheck the current attempt here; entering its gate again would recurse.
+        self.fence
+            .ensure_live()
+            .map_err(subjektiv::SubjektivError::AuthorizationDenied)?;
+        self.grant
+            .authorize_operation(&self.actual.operation)
+            .map_err(|error| subjektiv::SubjektivError::AuthorizationDenied(error.to_string()))?;
+        // Use the admitted connection for active Subject/writer/current policy. Calling
+        // live() or authorize_current() here would reenter this same Feature database.
+        // The real Local authority returns the current registry lease through commit/read.
+        subjektiv::effect_admission::SubjectEffectAuthority::enter(&self.actual, admission)
+    }
+}
+
+#[cfg(test)]
+type JournalAdmissionObserver = Arc<dyn Fn(&str) -> subjektiv::Result<()> + Send + Sync>;
+#[cfg(test)]
+struct ObservedJournalAuthority {
+    actual: LocalJournalEffectAuthority,
+    observer: JournalAdmissionObserver,
+}
+#[cfg(test)]
+impl subjektiv::effect_admission::SubjectEffectAuthority for ObservedJournalAuthority {
+    fn enter<'a>(
+        &'a self,
+        admission: &subjektiv::effect_admission::SubjectEffectAdmission<'_>,
+    ) -> subjektiv::Result<Box<dyn 'a + subjektiv::effect_admission::SubjectEffectLease>> {
+        (self.observer)(&self.actual.actual.operation)?;
+        subjektiv::effect_admission::SubjectEffectAuthority::enter(&self.actual, admission)
+    }
+}
+
 impl LocalJournalHost {
-    fn live(&self) -> Result<JournalJobContext, SubjektivHostError> {
-        self.host.ensure_live()?;
+    fn effect_store(&self, operation: &str) -> SubjektivStore {
+        let actual = LocalJournalEffectAuthority {
+            actual: authority::LocalMemoryEffectAuthority {
+                host: self.host.clone(),
+                operation: operation.into(),
+            },
+            grant: self.grant.clone(),
+            fence: self.fence.clone(),
+        };
+        #[cfg(test)]
+        if let Some(observer) = &self.admission_observer {
+            return self
+                .host
+                .catalog
+                .store
+                .with_subject_effect_authority(Arc::new(ObservedJournalAuthority {
+                    actual,
+                    observer: observer.clone(),
+                }));
+        }
+        self.host
+            .catalog
+            .store
+            .with_subject_effect_authority(Arc::new(actual))
+    }
+
+    fn live(&self, operation: &str) -> Result<JournalJobContext, SubjektivHostError> {
+        self.grant.authorize_operation(operation)?;
+        self.host.authorize_current(operation)?;
         self.fence
             .ensure_live()
             .map_err(SubjektivHostError::Unavailable)?;
@@ -1473,6 +1602,16 @@ impl LocalJournalHost {
         Ok(self.job_context.clone())
     }
 }
+#[async_trait::async_trait]
+impl worker::job::JobInputAuthority for LocalJournalHost {
+    async fn authorize_supply(&self) -> Result<(), String> {
+        let _effects = self.fence.enter()?;
+        self.live("journal.job.input.supply")
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl JournalJobHost for LocalJournalHost {
     fn execute(
         &self,
@@ -1482,32 +1621,53 @@ impl JournalJobHost for LocalJournalHost {
             .fence
             .enter()
             .map_err(SubjektivHostError::Unavailable)?;
-        let context = self.live()?;
+        let operation = match &request {
+            JournalJobRequest::Execute { operation } => match &operation.action {
+                JournalAction::Create { .. } => "journal.entry.create",
+                JournalAction::Rewrite { .. } => "journal.entry.rewrite",
+                JournalAction::Fix { .. } => "journal.entry.fix",
+                JournalAction::UpdatePosition { .. } => "journal.position.update",
+                JournalAction::ConfirmUnchanged => "journal.unchanged.confirm",
+                JournalAction::Checkpoint { .. } => "journal.checkpoint",
+            },
+            JournalJobRequest::ReadState => "journal.state.read",
+            JournalJobRequest::QueryOperation { .. } => "journal.operation.query",
+            JournalJobRequest::ReadOperationCoverage { .. } => "journal.operation.coverage.read",
+            JournalJobRequest::ListOperations { .. } => "journal.operation.list",
+            JournalJobRequest::ReadText { .. } => "journal.text.read",
+        };
+        let context = self.live(operation)?;
+        self.host.authorize_current("journal.job.input.supply")?;
         // The generic runner has supplied this exact immutable input before it can
         // invoke this bound tool. Preparation alone is not evidence of delivery.
         subjektiv::journal::service::attest_input_delivery(
-            &self.host.catalog.store,
+            &self.effect_store("journal.job.input.supply"),
             &context,
             &self.input_digest,
             &self.grant.ranges,
         )
         .map_err(journal_error)?;
-        subjektiv::journal::service::execute_snapshot(
-            &self.host.catalog.store,
+        let response = subjektiv::journal::service::execute_snapshot(
+            &self.effect_store(operation),
             &context,
             &self.input_digest,
             request,
         )
-        .map_err(journal_error)
+        .map_err(journal_error)?;
+        self.live(operation)?;
+        Ok(response)
     }
     fn finish(&self) -> Result<JournalJobCompletion, SubjektivHostError> {
         let _effects = self
             .fence
             .enter()
             .map_err(SubjektivHostError::Unavailable)?;
-        let context = self.live()?;
-        subjektiv::journal::service::finish(&self.host.catalog.store, &context)
-            .map_err(journal_error)
+        let context = self.live("journal.finish")?;
+        let result =
+            subjektiv::journal::service::finish(&self.effect_store("journal.finish"), &context)
+                .map_err(journal_error)?;
+        self.live("journal.finish")?;
+        Ok(result)
     }
 }
 

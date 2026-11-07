@@ -503,26 +503,52 @@ async fn backend_control_grant_does_not_replace_exact_operation_use_permission()
             .is_some()
     );
     assert_backend_denied(&f, &f.source, &target, Some(StatusCode::FORBIDDEN)).await;
-    // Old collection/Feature permissions and another Workspace never authorize
-    // individual current Worker operations, even with a real target grant.
-    let mut wrong_workspace = control_permissions();
-    for permission in &mut wrong_workspace {
-        permission.resource = PermissionResource::WorkerOperation {
-            workspace_id: "another-workspace".into(),
-        };
-    }
+    // Old collection/Feature permissions never authorize individual current
+    // Worker operations, even with a real target grant.
     for mut permissions in [
         CONTROL_OPERATIONS
             .iter()
             .map(|(operation, _)| workspace_permission(operation))
             .collect(),
         vec![activation("worker")],
-        wrong_workspace,
     ] {
         permissions.push(workspace_permission("worker.create"));
         f.seed_saved_policy(permissions, vec![]);
         assert_backend_denied(&f, &f.source, &target, Some(StatusCode::FORBIDDEN)).await;
     }
+    // A foreign Workspace is rejected at the typed writer boundary, not seeded
+    // as locally issuable authority. The failed save must leave policy unchanged;
+    // foreign-resource requests must also fail against the live signed consumer.
+    let mut wrong_workspace = control_permissions();
+    for permission in &mut wrong_workspace {
+        permission.resource = PermissionResource::WorkerOperation {
+            workspace_id: "another-workspace".into(),
+        };
+    }
+    let store = open_subjektiv_store(&f.api).unwrap();
+    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
+    let rejected = store.set_subject_permissions(
+        &f.subject,
+        &SubjectPermissionsUpdate {
+            operation_id: "reject-foreign-worker-operations".into(),
+            expected_change_id: Some(previous.change_id.clone()),
+            execution: wrong_workspace.clone(),
+            delegation: vec![],
+        },
+    );
+    assert!(matches!(
+        rejected,
+        Err(crate::subjektiv::SubjektivError::AuthorizationDenied(_))
+    ));
+    assert_eq!(
+        store.subject_permissions(&f.subject).unwrap(),
+        Some(previous)
+    );
+    for permission in &wrong_workspace {
+        let (status, body) = f.check(&f.source, permission).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+    assert_backend_denied(&f, &f.source, &target, Some(StatusCode::FORBIDDEN)).await;
     f.assign(vec![operation_permission("worker.messaging")], vec![])
         .await;
     assert_eq!(
@@ -942,4 +968,53 @@ async fn replaced_policy_and_body_never_revive_delegated_worker_control() {
     assert_ne!(replacement.worker_id, f.source.worker_id);
     assert_backend_denied(&f, &current, &target, None).await;
     assert_backend_denied(&f, &f.source, &target, Some(StatusCode::UNAUTHORIZED)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_policy_control_rejection_produces_typed_problem_without_runtime_effect() {
+    let f = OperationFixture::new().await;
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "worker"; keys = ["worker.create", "worker.stop"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let target = f.child("typed-control-target", vec![]).await;
+    f.adopt_policy(
+        r#"{ namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let before = effects(&f);
+    let request = runtime_source_request(
+        &f.identity,
+        Some(&f.source.worker_id),
+        "POST",
+        &format!(
+            "/api/w/{TEST_WORKSPACE_ID}/worker-control/workers/{}/{}/stop",
+            target.runtime_id, target.worker_id
+        ),
+        serde_json::to_vec(&json!({"reason":"private-control-canary"})).unwrap(),
+    );
+    let response = build_router(f.api.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
+    let body = to_bytes(response.into_body(), 16384).await.unwrap();
+    let decoded = api_macros::http::decode_problem_response::<
+        protocol::control_failure::RuntimeControlCause,
+    >(
+        &body,
+        403,
+        "application/problem+json",
+        &runtime_api::control_failure::ControlBoundary,
+        error_contract::Budget::new(16384, 16384),
+    );
+    let error_contract::DecodeFailure::Known(failure) = decoded else {
+        panic!("current policy rejection must retain typed control cause");
+    };
+    assert_eq!(
+        *failure.facts().cause(),
+        protocol::control_failure::RuntimeControlCause::AuthorizationFailed
+    );
+    assert!(!String::from_utf8_lossy(&body).contains("canary"));
+    assert_eq!(effects(&f), before);
 }

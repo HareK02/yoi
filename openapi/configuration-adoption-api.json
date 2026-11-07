@@ -383,6 +383,7 @@
         "description": "Observed causes only. These do not grant retries or establish an adoption result.",
         "enum": [
           "invalid_path",
+          "builtin_read_only",
           "invalid_import",
           "import_escape",
           "already_exists",
@@ -406,7 +407,8 @@
           "workspace_draining",
           "request_identity_conflict",
           "publication_dispatch_unavailable",
-          "publication_projection_unavailable"
+          "publication_projection_unavailable",
+          "publication_registry_unavailable"
         ],
         "type": "string"
       },
@@ -782,8 +784,15 @@
           "delegation": {
             "$ref": "#/components/schemas/PermissionAssignment"
           },
+          "delegation_resolution": {
+            "$ref": "#/components/schemas/PermissionResolution"
+          },
           "execution": {
             "$ref": "#/components/schemas/PermissionAssignment"
+          },
+          "execution_resolution": {
+            "$ref": "#/components/schemas/PermissionResolution",
+            "description": "Key resolution computed with this response's catalog and policy snapshot.\nThese explanations are not permission to bypass current domain checks."
           },
           "legacy_constraints": {
             "anyOf": [
@@ -804,7 +813,9 @@
           "subject_id",
           "change_id",
           "execution",
-          "delegation"
+          "delegation",
+          "execution_resolution",
+          "delegation_resolution"
         ],
         "type": "object"
       },
@@ -1122,6 +1133,61 @@
         ],
         "type": "object"
       },
+      "OriginStep": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "set",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "feature",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "key",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "PermissionAssignment": {
         "additionalProperties": false,
         "description": "`None` at the consuming policy boundary means unset. An empty assignment is\nexplicit deny-all; this crate never chooses or reinstates a default.",
@@ -1191,6 +1257,121 @@
         ],
         "type": "object"
       },
+      "PermissionDiagnostic": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unset",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "revoked",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unknown_set",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unknown_namespace",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "unknown_key",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "disabled_feature",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "excluded",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "PermissionReference": {
         "description": "The discriminant, not an identifier's spelling, selects a reference kind.",
         "oneOf": [
@@ -1229,6 +1410,39 @@
             "type": "object"
           }
         ]
+      },
+      "PermissionResolution": {
+        "additionalProperties": false,
+        "description": "A management projection, not an executable credential. Only the Host's opaque\nresolution can be queried through a namespace handle.",
+        "properties": {
+          "allowed": {
+            "additionalProperties": {
+              "items": {
+                "items": {
+                  "$ref": "#/components/schemas/OriginStep"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            "type": "object"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionDiagnostic"
+            },
+            "type": "array"
+          },
+          "workspace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace",
+          "allowed",
+          "diagnostics"
+        ],
+        "type": "object"
       },
       "PermissionResource": {
         "oneOf": [
@@ -1902,7 +2116,7 @@
   "info": {
     "title": "Workspace configuration adoption",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:7b515e5a0daafc1b0d65fcbd890f1d069439a1ec14933c648292dc0b83a23d6a"
+    "x-yoi-source-digest": "sha256:54cfb4724c519c40ba45a65a61aca4f306c9db3310cad07fb54d11bfebd4cc8e"
   },
   "openapi": "3.1.0",
   "paths": {

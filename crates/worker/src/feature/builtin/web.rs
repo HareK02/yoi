@@ -1,4 +1,6 @@
 //! Host authorization for the concrete network operation, independent of Tool registration.
+pub(crate) mod permission_declaration;
+
 use std::sync::Arc;
 
 use agen::tool::ToolError;

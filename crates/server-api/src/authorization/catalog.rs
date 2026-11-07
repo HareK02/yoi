@@ -1,8 +1,9 @@
-//! Management metadata over the existing policy, not an authorization source.
+//! Legacy resource-selector management compatibility, not the Feature catalog.
 //!
-//! Only the management replacement path validates against this catalog. Historical
-//! deserialization and execution grants retain their exact spelling and scope. New
-//! operations require an explicit catalog entry; dotted prefixes grant nothing.
+//! Existing scoped policy editing and migration still validate this exact input
+//! contract; no resource enum/selector below defines payload-free capabilities or
+//! shared-set membership. Current operation declarations come from Feature modules.
+//! Historical deserialization retains exact scope rather than widening to keys.
 use super::*;
 
 #[cfg(test)]

@@ -138,13 +138,22 @@ impl ApiError {
     }
 
     fn attachment_cause(&self, operation: Op) -> Option<Cause> {
-        source_cause(&self.error, operation).or_else(|| {
-            self.diagnostics
-                .iter()
-                .filter_map(|d| d.workdir)
-                .find(|cause| cause.operation == operation)
-                .map(Cause::Management)
-        })
+        let producer = self
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.workdir)
+            .find(|cause| cause.operation == operation)
+            .map(Cause::Management);
+        // A legacy conflict class cannot replace the producer's more specific
+        // typed reason. Native Runtime/session failures remain the primary cause.
+        if matches!(
+            self.error,
+            Error::WorkdirAttachmentConflict(_) | Error::WorkdirOccupied { .. }
+        ) {
+            producer.or_else(|| source_cause(&self.error, operation))
+        } else {
+            source_cause(&self.error, operation).or(producer)
+        }
     }
 
     pub(super) fn attachment_projection_failure(error: Error, operation: Op) -> Self {

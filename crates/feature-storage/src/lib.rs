@@ -374,7 +374,8 @@ impl FeatureStorage {
             inner: Arc::new(FeatureDatabaseInner {
                 scope_id: scope.into(),
                 feature_id: feature.into(),
-                accepting_operations: AtomicBool::new(true),
+                accepting_operations: Arc::new(AtomicBool::new(true)),
+                query_only: false,
                 connection: Mutex::new(Some(connection)),
                 root: self.inner.root.clone(),
                 lifecycle_established: self.inner.lifecycle_established.clone(),
@@ -595,7 +596,8 @@ impl FeatureStorage {
         let connection = Arc::new(FeatureDatabaseInner {
             scope_id: scope_id.to_string(),
             feature_id: registration.feature_id.clone(),
-            accepting_operations: AtomicBool::new(true),
+            accepting_operations: Arc::new(AtomicBool::new(true)),
+            query_only: false,
             connection: Mutex::new(Some(connection)),
             root: self.inner.root.clone(),
             lifecycle_established: self.inner.lifecycle_established.clone(),
@@ -1193,10 +1195,34 @@ impl DatabaseGuard<'_> {
     }
 }
 
+/// Native writer reservation on a separately owned connection. It prevents other
+/// connections/processes from changing authority while another database commits an
+/// effect. It is not a distributed atomic transaction and performs no domain writes.
+pub struct DatabaseWriterFence {
+    connection: Connection,
+    _lease: fs::File,
+}
+impl DatabaseWriterFence {
+    /// Read current authority through the already reserved native transaction;
+    /// opening another writer transaction here would contend with this fence.
+    pub fn with_connection<T, E>(
+        &self,
+        read: impl FnOnce(&Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        read(&self.connection)
+    }
+}
+impl Drop for DatabaseWriterFence {
+    fn drop(&mut self) {
+        let _ = self.connection.execute_batch("ROLLBACK");
+    }
+}
+
 struct FeatureDatabaseInner {
     scope_id: String,
     feature_id: String,
-    accepting_operations: AtomicBool,
+    accepting_operations: Arc<AtomicBool>,
+    query_only: bool,
     connection: Mutex<Option<Connection>>,
     root: PathBuf,
     lifecycle_established: Arc<owner::EstablishedLocks>,
@@ -1207,6 +1233,73 @@ struct FeatureDatabaseInner {
 }
 
 impl FeatureDatabase {
+    /// Independent, identity-checked read connection for nested authority checks.
+    /// The caller must retain the original native authority transaction across its
+    /// use: this reader grants neither a writer reservation nor a stable policy.
+    /// It shares owner shutdown and uses SQLite read-only mode, so it cannot be
+    /// upgraded into a writer or deadlock by reentering the owner's connection.
+    pub fn query_reader(&self) -> Result<Self> {
+        self.inner.ensure_accepting()?;
+        let connection =
+            Connection::open_with_flags(&self.inner.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.pragma_update(None, "query_only", true)?;
+        let lifecycle = owner::Lifecycle {
+            root: self.inner.root.clone(),
+            scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
+        };
+        let _lease = lifecycle.lock(false)?;
+        lifecycle.verify(&self.inner.binding, &self.inner.path, &connection)?;
+        Ok(Self {
+            inner: Arc::new(FeatureDatabaseInner {
+                scope_id: self.inner.scope_id.clone(),
+                feature_id: self.inner.feature_id.clone(),
+                accepting_operations: self.inner.accepting_operations.clone(),
+                query_only: true,
+                connection: Mutex::new(Some(connection)),
+                root: self.inner.root.clone(),
+                lifecycle_established: self.inner.lifecycle_established.clone(),
+                #[cfg(feature = "test-support")]
+                lifecycle_observation: self.inner.lifecycle_observation.clone(),
+                path: self.inner.path.clone(),
+                binding: self.inner.binding.clone(),
+            }),
+        })
+    }
+
+    /// Pins identity and reserves the native writer after any preceding lock wait.
+    /// Existing owner connections remain usable for reads, never writes. Acquire
+    /// effect-DB admission first, then this authority reservation, in a fixed order.
+    pub fn writer_fence(&self) -> Result<DatabaseWriterFence> {
+        if self.inner.query_only {
+            return Err(FeatureStorageError::operation(
+                "query readers cannot reserve writers",
+            ));
+        }
+        let lifecycle = owner::Lifecycle {
+            root: self.inner.root.clone(),
+            scope: self.inner.scope_id.clone(),
+            established: self.inner.lifecycle_established.clone(),
+            #[cfg(feature = "test-support")]
+            observation: self.inner.lifecycle_observation.clone(),
+        };
+        let lease = lifecycle.lock(false)?;
+        self.inner.ensure_accepting()?;
+        let connection =
+            Connection::open_with_flags(&self.inner.path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        lifecycle.verify(&self.inner.binding, &self.inner.path, &connection)?;
+        self.inner.ensure_accepting()?;
+        Ok(DatabaseWriterFence {
+            connection,
+            _lease: lease,
+        })
+    }
+
     pub fn identity(&self) -> &DatabaseIdentity {
         &self.inner.binding.identity
     }
@@ -1339,12 +1432,36 @@ impl FeatureDatabase {
     where
         E: From<FeatureStorageError>,
     {
+        self.try_transaction_admitted(|_| Ok(()), operation)
+    }
+
+    /// Runs admission after the native writer lock is acquired. The returned lease
+    /// remains alive through commit/rollback; it must not reenter this database.
+    pub fn try_transaction_admitted<T, E, L>(
+        &self,
+        admission: impl FnOnce(&Transaction<'_>) -> std::result::Result<L, E>,
+        operation: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<FeatureStorageError>,
+    {
         self.try_with_connection_mut(|connection| {
             let tx = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .transaction_with_behavior(if self.inner.query_only {
+                    TransactionBehavior::Deferred
+                } else {
+                    TransactionBehavior::Immediate
+                })
                 .map_err(FeatureStorageError::from)
                 .map_err(E::from)?;
-            let value = operation(&tx)?;
+            let _admission = admission(&tx)?;
+            let value = match operation(&tx) {
+                Ok(value) => value,
+                Err(error) => {
+                    drop(tx);
+                    return Err(error);
+                }
+            };
             tx.commit().map_err(|error| {
                 E::from(self.inner.binding.unknown(FeatureStorageError::from(error)))
             })?;

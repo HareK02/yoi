@@ -1,28 +1,33 @@
-//! Initial conversation authority, not a runtime fallback or a Profile capability.
+//! New Subjects persist a shared-set reference, not a fixed copy of operation keys.
+//! Feature declarations own its current contributions. This is creation input only,
+//! never a launch, restore, migration or unset-policy fallback. Existing individual,
+//! empty, excluded and revoked policies must remain unchanged.
 //!
-//! Hosts persist this set only while creating a new Subject. Existing Subjects opt in
-//! with the normal administrator CAS replacement: read the current source, merge only
-//! the desired entries into `execution`, preserve `delegation`, and submit that observed
-//! change ID with a stable operation ID. Never apply it on launch, restore or migration;
-//! an unset or explicitly emptied existing policy must remain denied. The Subject detail
-//! permissions editor and `GET`/`POST /api/w/{workspace}/subjektiv/subjects/{subject}/permissions`
-//! expose the same saved source and CAS. Replacing a source also invalidates previously
-//! delegated children; an administrator must deliberately review that effect before applying.
-//! No automatic opt-in or overwrite of individual exceptions is provided.
-//!
-//! `builtin:async-chat` requests the conversation composition and an explicit Subject
-//! connection selects the body. Neither action writes policy. All entries below target
-//! exactly that Subject in its storage scope; none covers Workspace, files, Workers or
-//! other Subjects. Background Worker delegation is deliberately empty. Host-owned
-//! Memory/Journal Jobs additionally require their kind/attempt/input/writer grants;
-//! these source permissions alone do not create or authorize an arbitrary Job.
+//! The legacy scoped helpers below remain for reading/migrating old callers. They
+//! are not the catalog or the new Subject default. Subject/domain ownership, Job
+//! kind/attempt/input/writer and provider constraints remain independent of keys.
 use super::{PermissionResource, ScopedPermission};
 
 pub const SUBJECT_CONVERSATION_PROFILE: &str = "builtin:async-chat";
 
-/// Basic body operations and the current-policy ceiling for standard memory Jobs.
-/// Confirmed Memory mutation remains behind consolidation; explicit remembering stages
-/// evidence, never directly edits confirmed Memory. Journal recording is a separate Job.
+pub const SUBJECT_DEFAULT_PERMISSION_SET: &str = "subject-default";
+pub const COMPANION_PERMISSION_SET: &str = "companion";
+pub const IMPLEMENTER_PERMISSION_SET: &str = "implementer";
+
+/// Persist this reference when creating a new Subject. A shared-set reference is
+/// intentionally live; limited child/Job grants must instead freeze issued keys.
+pub fn subject_default_permission_assignment() -> feature_permissions::PermissionAssignment {
+    feature_permissions::PermissionAssignment {
+        grants: vec![feature_permissions::PermissionReference::Set(
+            feature_permissions::PermissionSetId::parse(SUBJECT_DEFAULT_PERMISSION_SET)
+                .expect("static Subject default set ID"),
+        )],
+        ..Default::default()
+    }
+}
+
+/// Legacy exact-Subject scoped operations retained for old policy migration.
+/// New Subject creation must use `subject_default_permission_assignment` instead.
 pub const SUBJECT_CONVERSATION_OPERATIONS: &[&str] = &[
     "session.record",
     "session.list",

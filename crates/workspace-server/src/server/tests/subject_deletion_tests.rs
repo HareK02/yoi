@@ -132,12 +132,13 @@ async fn deletion_owner_scope_exact_retry_and_subject_isolation() {
         .create_subject(crate::subjektiv::SubjectRole::new("fresh").unwrap())
         .unwrap();
     assert_ne!(fresh.id, subject.id);
-    let source = store.subject_permissions(&fresh.id).unwrap().unwrap();
+    let source = store.current_subject_policy(&fresh.id).unwrap().unwrap();
     assert_eq!(
         source.execution,
-        server_api::authorization::subject_conversation_permissions(TEST_WORKSPACE_ID, &fresh.id)
+        server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(source.delegation.is_empty());
+    assert!(source.delegation.grants.is_empty());
+    assert!(source.legacy_constraints.is_none());
     assert_eq!(
         store
             .pending_staging_candidates(&fresh.id, 100)
@@ -644,7 +645,7 @@ async fn pending_consolidation_is_purged_and_captured_dispatch_and_late_result_a
 }
 
 #[tokio::test]
-async fn unmaterialized_body_and_job_reservations_finish_only_with_runtime_storage_absence_proof() {
+async fn unmaterialized_reservation_without_runtime_proof_stays_fenced_and_pending() {
     let dir = tempfile::tempdir().unwrap();
     let (api, _) = test_api_with_recording_backend(dir.path()).await;
     let store = open_subjektiv_store(&api).unwrap();
@@ -715,10 +716,12 @@ async fn unmaterialized_body_and_job_reservations_finish_only_with_runtime_stora
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["completed"], true);
+        // A Backend-only reservation is not Runtime original-absence evidence.
+        // Keep the permanent exclusion, but never invent a Stop/Purge receipt.
+        assert_eq!(body["completed"], false, "{body}");
         assert!(subject_authorization::worker_permissions(&api, &worker).is_err());
         let proved = api.config_store.with_conn(|conn| Ok(conn.query_row("SELECT originals_absent FROM subject_deletion_workers WHERE workspace_id=?1 AND subject_id=?2 AND runtime_id=?3 AND worker_id=?4", rusqlite::params![TEST_WORKSPACE_ID,subject.id,worker.runtime_id,worker.worker_id], |row|row.get::<_,bool>(0))?)).unwrap();
-        assert!(proved);
+        assert!(!proved);
         assert!(
             api.config_store
                 .recover_worker_removal_execution(TEST_WORKSPACE_ID, &worker)
@@ -738,14 +741,23 @@ async fn unmaterialized_body_and_job_reservations_finish_only_with_runtime_stora
                 )
                 .is_err()
         );
-        if let Some(singleton) = singleton {
-            assert!(
-                api.store
-                    .current_worker_singleton_owner(TEST_WORKSPACE_ID, &singleton)
-                    .unwrap()
-                    .is_none()
-            );
-        }
+        assert!(
+            !store
+                .subject_deletion(&subject.id)
+                .unwrap()
+                .unwrap()
+                .completed
+        );
+        let (status, replay) = delete_request(
+            &api,
+            &subject.id,
+            &format!("delete-reserved-{is_job}"),
+            Some(&owner),
+            TEST_WORKSPACE_ID,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay, body);
     }
 }
 
@@ -1143,6 +1155,15 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
             },
         )
         .unwrap();
+    let stop_receipt = execution
+        .terminations
+        .lock()
+        .unwrap()
+        .values()
+        .find(|receipt| receipt.worker_ref.worker_id.to_string() == worker.worker_id)
+        .unwrap()
+        .clone();
+    let stops_before = execution.stops.lock().unwrap().clone();
     let inventory = api.runtime.worker_retention_inventory(&worker).unwrap();
     let old = api
         .config_store
@@ -1178,6 +1199,15 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
     .await;
     assert_eq!(status, StatusCode::OK, "{pending}");
     assert_eq!(pending["completed"], false);
+    assert!(
+        execution
+            .subject_delete_checks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| { request.worker_id.to_string() == worker.worker_id }),
+        "the injected absence-check failure, not an unsupported backend, must keep deletion pending"
+    );
     let snapshot = api
         .config_store
         .subject_deletion_removal(TEST_WORKSPACE_ID, &worker)
@@ -1208,6 +1238,15 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
         .execute_worker_retention(&worker, saved.runtime_request)
         .unwrap();
     assert_eq!(replay, result);
+    assert_eq!(*execution.stops.lock().unwrap(), stops_before);
+    assert_eq!(
+        execution
+            .terminations
+            .lock()
+            .unwrap()
+            .get(&stop_receipt.worker_ref),
+        Some(&stop_receipt)
+    );
     let archive = result.archive.unwrap();
     assert!(
         dir.path()

@@ -13,7 +13,7 @@ export type ConfigurationFailureDetails = { operation: ConfigurationFailureOpera
 
 export type ConfigurationFailureOperation = "source" | "preview" | "adopt" | "reconcile" | "publication";
 
-export type ConfigurationFailureReason = "invalid_path" | "invalid_import" | "import_escape" | "already_exists" | "not_found" | "entry_conflict" | "entry_digest_mismatch" | "entry_path_mismatch" | "tree_digest_mismatch" | "path_changed_more_than_once" | "duplicate_path" | "duplicate_schema_provider" | "duplicate_schema_namespace" | "invalid_schema_contribution" | "limit_exceeded" | "catalog_changed" | "editing_head_changed" | "legacy_export_changed" | "source_content_changed" | "owner_required" | "workspace_inactive" | "workspace_draining" | "request_identity_conflict" | "publication_dispatch_unavailable" | "publication_projection_unavailable";
+export type ConfigurationFailureReason = "invalid_path" | "builtin_read_only" | "invalid_import" | "import_escape" | "already_exists" | "not_found" | "entry_conflict" | "entry_digest_mismatch" | "entry_path_mismatch" | "tree_digest_mismatch" | "path_changed_more_than_once" | "duplicate_path" | "duplicate_schema_provider" | "duplicate_schema_namespace" | "invalid_schema_contribution" | "limit_exceeded" | "catalog_changed" | "editing_head_changed" | "legacy_export_changed" | "source_content_changed" | "owner_required" | "workspace_inactive" | "workspace_draining" | "request_identity_conflict" | "publication_dispatch_unavailable" | "publication_projection_unavailable" | "publication_registry_unavailable";
 
 export type DriveApiErrorCode = "denied" | "not_found" | "conflict" | "invalid" | "limit" | "storage_unavailable" | "outcome_unknown";
 
@@ -59,7 +59,7 @@ export type WorkdirManagementFailure = { operation: WorkdirManagementOperation; 
 
 export type WorkdirManagementOperation = "create" | "list" | "detail" | "cleanup" | "repository_access" | "repository_ref" | "attach" | "detach" | "grant_create" | "grant_inspect" | "grant_revoke" | "grant_connect" | "grant_cleanup";
 
-export type WorkdirManagementReason = "embedded_worker_workdir_unsupported" | "external_workdir_legacy_permissions" | "workdir_attachment_registry_not_found" | "workdir_attachment_not_available" | "workdir_attachment_grant_bound_required" | "workdir_external_grant_unavailable" | "external_workdir_grant_state_outcome_unknown" | "external_workdir_grant_not_found" | "external_workdir_grant_creator_required" | "external_workdir_grant_display_name_invalid" | "external_workdir_grant_ttl_invalid" | "external_workdir_grant_provider_identity_invalid" | "external_workdir_grant_revoked" | "external_workdir_grant_expired" | "external_workdir_grant_audit_failed" | "external_workdir_grant_cleanup_persistence_failed" | "external_workdir_grant_cleanup_query_failed" | "external_workdir_grant_attachment_release_failed" | "external_workdir_grant_cleanup_outcome_unknown" | "workdir_attachment_conflict" | "workdir_occupied" | "working_directory_not_found" | "working_directory_not_active" | "working_directory_create_failed" | "working_directory_exists" | "working_directory_git_failed" | "working_directory_git_unavailable" | "working_directory_id_invalid" | "working_directory_list_failed" | "working_directory_materializer_unsupported" | "working_directory_record_invalid" | "working_directory_record_serialize_failed" | "working_directory_record_write_failed" | "working_directory_relative_cwd_escape_rejected" | "working_directory_relative_cwd_invalid" | "working_directory_relative_cwd_unavailable" | "working_directory_non_utf8_path" | "working_directory_root_unavailable" | "working_directory_remote_repository_access_invalid" | "working_directory_remote_repository_access_required" | "working_directory_remote_repository_host_trust_mismatch" | "working_directory_repository_access_binding_mismatch" | "working_directory_repository_access_expired" | "working_directory_repository_access_not_applicable" | "working_directory_repository_access_setup_failed" | "working_directory_repository_access_unavailable" | "working_directory_repository_agent_failed" | "working_directory_repository_agent_unavailable" | "working_directory_repository_limit_exceeded" | "working_directory_repository_materialization_authority_invalid" | "working_directory_repository_materialization_authority_required" | "working_directory_repository_plain_http_unsupported" | "working_directory_repository_provider_unsupported" | "working_directory_repository_selector_invalid" | "working_directory_repository_selector_unresolved" | "working_directory_repository_source_invalid" | "working_directory_repository_timeout" | "working_directory_repository_clone_failed" | "working_directory_repository_checkout_failed" | "working_directory_repository_policy_failed" | "working_directory_repository_access_denied" | "working_directory_repository_host_trust_failed" | "working_directory_repository_authentication_failed" | "working_directory_repository_connection_failed" | "working_directory_repository_not_found" | "repository_ref_not_found" | "repository_ref_provider_timeout" | "repository_ref_provider_unavailable" | "repository_ref_provider_auth_failed" | "repository_ref_response_invalid" | "repository_ref_selector_invalid" | "working_directory_cleanup_mount_present" | "working_directory_cleanup_mount_check_unavailable" | "working_directory_cleanup_permission_denied" | "working_directory_cleanup_resource_busy" | "working_directory_cleanup_storage_unavailable" | "working_directory_cleanup_ownership_unknown" | "working_directory_cleanup_changes_present" | "working_directory_cleanup_changes_unknown";
+export type WorkdirManagementReason = "embedded_worker_workdir_unsupported" | "external_workdir_legacy_permissions" | "workdir_attachment_registry_not_found" | "workdir_attachment_not_available" | "workdir_attachment_grant_bound_required" | "workdir_external_grant_unavailable" | "external_workdir_grant_state_outcome_unknown" | "external_workdir_grant_not_found" | "external_workdir_grant_creator_required" | "external_workdir_grant_display_name_invalid" | "external_workdir_grant_ttl_invalid" | "external_workdir_grant_provider_identity_invalid" | "external_workdir_grant_revoked" | "external_workdir_grant_expired" | "external_workdir_grant_activation_failed" | "external_workdir_connection_state_failed" | "external_workdir_connection_transport_failed" | "external_workdir_connection_protocol_failed" | "external_workdir_connection_persistence_failed" | "external_workdir_connection_query_failed" | "external_workdir_grant_audit_failed" | "external_workdir_grant_cleanup_persistence_failed" | "external_workdir_grant_cleanup_query_failed" | "external_workdir_grant_attachment_release_failed" | "external_workdir_grant_cleanup_outcome_unknown" | "workdir_attachment_conflict" | "workdir_attachment_persistence_failed" | "workdir_attachment_state_outcome_unknown" | "workdir_attachment_projection_failed" | "workdir_attachment_runtime_result_unavailable" | "workdir_occupied" | "working_directory_not_found" | "working_directory_not_active" | "working_directory_create_failed" | "working_directory_exists" | "working_directory_git_failed" | "working_directory_git_unavailable" | "working_directory_id_invalid" | "working_directory_list_failed" | "working_directory_materializer_unsupported" | "working_directory_record_invalid" | "working_directory_record_serialize_failed" | "working_directory_record_write_failed" | "working_directory_relative_cwd_escape_rejected" | "working_directory_relative_cwd_invalid" | "working_directory_relative_cwd_unavailable" | "working_directory_non_utf8_path" | "working_directory_root_unavailable" | "working_directory_remote_repository_access_invalid" | "working_directory_remote_repository_access_required" | "working_directory_remote_repository_host_trust_mismatch" | "working_directory_repository_access_binding_mismatch" | "working_directory_repository_access_expired" | "working_directory_repository_access_not_applicable" | "working_directory_repository_access_setup_failed" | "working_directory_repository_access_unavailable" | "working_directory_repository_agent_failed" | "working_directory_repository_agent_unavailable" | "working_directory_repository_limit_exceeded" | "working_directory_repository_materialization_authority_invalid" | "working_directory_repository_materialization_authority_required" | "working_directory_repository_plain_http_unsupported" | "working_directory_repository_provider_unsupported" | "working_directory_repository_selector_invalid" | "working_directory_repository_selector_unresolved" | "working_directory_repository_source_invalid" | "working_directory_repository_timeout" | "working_directory_repository_clone_failed" | "working_directory_repository_checkout_failed" | "working_directory_repository_policy_failed" | "working_directory_repository_access_denied" | "working_directory_repository_host_trust_failed" | "working_directory_repository_authentication_failed" | "working_directory_repository_connection_failed" | "working_directory_repository_not_found" | "repository_ref_not_found" | "repository_ref_provider_timeout" | "repository_ref_provider_unavailable" | "repository_ref_provider_auth_failed" | "repository_ref_response_invalid" | "repository_ref_selector_invalid" | "working_directory_cleanup_mount_present" | "working_directory_cleanup_mount_check_unavailable" | "working_directory_cleanup_permission_denied" | "working_directory_cleanup_resource_busy" | "working_directory_cleanup_storage_unavailable" | "working_directory_cleanup_ownership_unknown" | "working_directory_cleanup_changes_present" | "working_directory_cleanup_changes_unknown";
 
 export type WorkdirTransportErrorCode = "not_found" | "conflict" | "outcome_unknown" | "not_dispatched" | "unsupported" | "invalid_request" | "denied" | "out_of_scope" | "symlink_out_of_scope" | "broken_symlink" | "symlink_target_is_directory" | "read_only" | "is_directory" | "symlink_directory_not_traversed" | "unknown_command" | "unavailable" | "io" | "transport" | "internal";
 
@@ -69,6 +69,7 @@ export const DOMAIN_FAILURE_CONTRACTS = {
   "configuration": {
     "categories": {
       "already_exists": "invalid_input",
+      "builtin_read_only": "invalid_input",
       "catalog_changed": "conflict",
       "duplicate_path": "invalid_input",
       "duplicate_schema_namespace": "internal",
@@ -88,6 +89,7 @@ export const DOMAIN_FAILURE_CONTRACTS = {
       "path_changed_more_than_once": "invalid_input",
       "publication_dispatch_unavailable": "internal",
       "publication_projection_unavailable": "internal",
+      "publication_registry_unavailable": "internal",
       "request_identity_conflict": "conflict",
       "source_content_changed": "conflict",
       "tree_digest_mismatch": "invalid_input",
@@ -105,6 +107,7 @@ export const DOMAIN_FAILURE_CONTRACTS = {
       ],
       "reason": [
         "invalid_path",
+        "builtin_read_only",
         "invalid_import",
         "import_escape",
         "already_exists",
@@ -128,7 +131,8 @@ export const DOMAIN_FAILURE_CONTRACTS = {
         "workspace_draining",
         "request_identity_conflict",
         "publication_dispatch_unavailable",
-        "publication_projection_unavailable"
+        "publication_projection_unavailable",
+        "publication_registry_unavailable"
       ]
     },
     "reason_fields": [
@@ -136,6 +140,7 @@ export const DOMAIN_FAILURE_CONTRACTS = {
     ],
     "reasons": [
       "already_exists",
+      "builtin_read_only",
       "catalog_changed",
       "duplicate_path",
       "duplicate_schema_namespace",
@@ -155,6 +160,7 @@ export const DOMAIN_FAILURE_CONTRACTS = {
       "path_changed_more_than_once",
       "publication_dispatch_unavailable",
       "publication_projection_unavailable",
+      "publication_registry_unavailable",
       "request_identity_conflict",
       "source_content_changed",
       "tree_digest_mismatch",
@@ -720,6 +726,12 @@ export const DOMAIN_FAILURE_CONTRACTS = {
   "workdir_management": {
     "categories": {
       "embedded_worker_workdir_unsupported": "invalid_input",
+      "external_workdir_connection_persistence_failed": "dependency",
+      "external_workdir_connection_protocol_failed": "dependency",
+      "external_workdir_connection_query_failed": "dependency",
+      "external_workdir_connection_state_failed": "dependency",
+      "external_workdir_connection_transport_failed": "dependency",
+      "external_workdir_grant_activation_failed": "dependency",
       "external_workdir_grant_attachment_release_failed": "dependency",
       "external_workdir_grant_audit_failed": "dependency",
       "external_workdir_grant_cleanup_outcome_unknown": "unknown",
@@ -743,7 +755,11 @@ export const DOMAIN_FAILURE_CONTRACTS = {
       "workdir_attachment_conflict": "conflict",
       "workdir_attachment_grant_bound_required": "authorization",
       "workdir_attachment_not_available": "conflict",
+      "workdir_attachment_persistence_failed": "dependency",
+      "workdir_attachment_projection_failed": "dependency",
       "workdir_attachment_registry_not_found": "invalid_input",
+      "workdir_attachment_runtime_result_unavailable": "unknown",
+      "workdir_attachment_state_outcome_unknown": "unknown",
       "workdir_external_grant_unavailable": "dependency",
       "workdir_occupied": "conflict",
       "working_directory_cleanup_changes_present": "conflict",
@@ -831,12 +847,22 @@ export const DOMAIN_FAILURE_CONTRACTS = {
         "external_workdir_grant_provider_identity_invalid",
         "external_workdir_grant_revoked",
         "external_workdir_grant_expired",
+        "external_workdir_grant_activation_failed",
+        "external_workdir_connection_state_failed",
+        "external_workdir_connection_transport_failed",
+        "external_workdir_connection_protocol_failed",
+        "external_workdir_connection_persistence_failed",
+        "external_workdir_connection_query_failed",
         "external_workdir_grant_audit_failed",
         "external_workdir_grant_cleanup_persistence_failed",
         "external_workdir_grant_cleanup_query_failed",
         "external_workdir_grant_attachment_release_failed",
         "external_workdir_grant_cleanup_outcome_unknown",
         "workdir_attachment_conflict",
+        "workdir_attachment_persistence_failed",
+        "workdir_attachment_state_outcome_unknown",
+        "workdir_attachment_projection_failed",
+        "workdir_attachment_runtime_result_unavailable",
         "workdir_occupied",
         "working_directory_not_found",
         "working_directory_not_active",
@@ -903,6 +929,12 @@ export const DOMAIN_FAILURE_CONTRACTS = {
     ],
     "reasons": [
       "embedded_worker_workdir_unsupported",
+      "external_workdir_connection_persistence_failed",
+      "external_workdir_connection_protocol_failed",
+      "external_workdir_connection_query_failed",
+      "external_workdir_connection_state_failed",
+      "external_workdir_connection_transport_failed",
+      "external_workdir_grant_activation_failed",
       "external_workdir_grant_attachment_release_failed",
       "external_workdir_grant_audit_failed",
       "external_workdir_grant_cleanup_outcome_unknown",
@@ -926,7 +958,11 @@ export const DOMAIN_FAILURE_CONTRACTS = {
       "workdir_attachment_conflict",
       "workdir_attachment_grant_bound_required",
       "workdir_attachment_not_available",
+      "workdir_attachment_persistence_failed",
+      "workdir_attachment_projection_failed",
       "workdir_attachment_registry_not_found",
+      "workdir_attachment_runtime_result_unavailable",
+      "workdir_attachment_state_outcome_unknown",
       "workdir_external_grant_unavailable",
       "workdir_occupied",
       "working_directory_cleanup_changes_present",

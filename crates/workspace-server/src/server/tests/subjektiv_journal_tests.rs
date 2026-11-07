@@ -42,7 +42,7 @@ fn grant_journal_operations(store: &crate::subjektiv::SubjektivStore, subject: &
     use server_api::authorization::{
         PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
     };
-    let previous = store.subject_permissions(subject).unwrap();
+    let previous = store.current_subject_policy(subject).unwrap();
     store
         .set_subject_permissions(
             subject,
@@ -102,11 +102,13 @@ fn bind_fixture_session(
     store: &crate::subjektiv::SubjektivStore,
     attr: crate::subjektiv::SubjectSessionAttribution,
 ) -> JournalHostContext {
-    if store
-        .subject_permissions(&attr.subject_id)
-        .unwrap()
-        .is_none()
-    {
+    // This suite uses an explicit exact-Subject legacy fixture, not a scoped
+    // projection of the shared default. Preserve already configured legacy
+    // policies, including empty sources used by denial tests.
+    if !matches!(
+        store.subject_policy_source(&attr.subject_id).unwrap(),
+        Some(server_api::authorization::SubjectPolicySource::Legacy(_))
+    ) {
         grant_journal_operations(store, &attr.subject_id);
     }
     let binding = store
@@ -1301,18 +1303,20 @@ async fn terminal_journal_attempts_purge_real_tool_result_sessions_without_chang
     }
 }
 
-/// A real SQLite writer lock blocks Job completion while the separate Journal store
-/// can still save its checkpoint. Removing it does not drive recovery or resubmit input.
+/// A native SQLite writer fault; install after the intended preceding effects.
+/// Removing it does not drive recovery or resubmit input.
 struct JournalCompletionSaveFault(rusqlite::Connection);
 
 impl JournalCompletionSaveFault {
     fn install(f: &RuntimeFixture) -> Self {
-        f.job_store
-            .with_conn(|connection| {
-                connection.busy_timeout(std::time::Duration::ZERO)?;
-                Ok(())
-            })
-            .unwrap();
+        for store in [f.job_store.as_ref(), f.api.config_store.as_ref()] {
+            store
+                .with_conn(|connection| {
+                    connection.busy_timeout(std::time::Duration::ZERO)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
         let connection = rusqlite::Connection::open(&f.api.config.database_path).unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
         Self(connection)
@@ -1918,9 +1922,14 @@ async fn completion_save_fault_recovers_same_job_from_saved_checkpoint_without_u
             &Utc::now().to_rfc3339(),
         )
         .unwrap();
-    let fault = JournalCompletionSaveFault::install(&f);
+    // Fault the result-save phase, not the current-policy/catalog reads required
+    // to commit the Journal checkpoint. Hold the actual recovery step gate so it
+    // cannot settle the checkpoint before the storage fault is installed.
+    let recovery = f.api.backend_job_recovery.pause_steps_for_test().await;
     f.checkpoint(worker);
     let completion = subjektiv_journal::finish(&f.api, worker).unwrap();
+    let fault = JournalCompletionSaveFault::install(&f);
+    drop(recovery);
     let binding = subjektiv::api::JobAttemptBinding {
         job_id: f.request.job_id.clone(),
         attempt_id: dispatched.attempt.attempt_id.clone(),
@@ -2889,6 +2898,10 @@ async fn stopped_partial_journal_recovery_fences_old_attempt_and_resumes_same_im
     .unwrap() else {
         panic!("saved receipt")
     };
+    let owner =
+        crate::backend_job_host_effects::JobHostOwner::try_from(&dispatched.attempt).unwrap();
+    let effects = f.api.backend_job_recovery.effects(&owner).unwrap();
+    let returning_host_call = effects.admit(&owner).unwrap();
     f.api
         .runtime
         .stop_worker(
@@ -2902,13 +2915,59 @@ async fn stopped_partial_journal_recovery_fences_old_attempt_and_resumes_same_im
         .unwrap();
     f.execution.take_inputs();
     f.api.recover_backend_jobs().unwrap();
-    wait_for_backend_job_worker_cleanup(
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.api
+            .backend_job_recovery
+            .cleanup_before_writer_fence
+            .notified(),
+    )
+    .await
+    .unwrap();
+    let terminated = f
+        .api
+        .store
+        .get_backend_job_attempt(
+            TEST_WORKSPACE_ID,
+            &f.request.job_id,
+            &dispatched.attempt.attempt_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminated.state, BackendJobAttemptState::Failed);
+    assert_eq!(
+        terminated.failure_category.as_deref(),
+        Some("journal_execution_terminated")
+    );
+    assert!(
+        effects.admit(&owner).is_err(),
+        "terminal cleanup must close old Host admission"
+    );
+    assert!(
+        !f.api
+            .store
+            .has_backend_job_execution_fence(TEST_WORKSPACE_ID, &terminated)
+            .unwrap(),
+        "Runtime termination is not Host drain"
+    );
+    assert!(
+        f.execution.inputs.lock().unwrap().is_empty(),
+        "never supply another attempt while the original Host callback is retained"
+    );
+    drop(returning_host_call);
+    let cleaned = wait_for_backend_job_worker_cleanup(
         &f.api,
         &f.request.job_id,
         &dispatched.attempt.attempt_id,
         BackendJobWorkerCleanupState::Completed,
     )
     .await;
+    assert!(
+        f.api
+            .store
+            .has_backend_job_execution_fence(TEST_WORKSPACE_ID, &cleaned)
+            .unwrap()
+    );
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             if !f.execution.inputs.lock().unwrap().is_empty() {
@@ -3985,15 +4044,20 @@ async fn subject_removal_blocks_legacy_unbound_pending_without_execution_evidenc
 
 #[tokio::test]
 async fn subject_removal_prior_purge_receipt_recovers_without_inventing_erasure() {
-    assert_prior_purge_receipt(false).await;
+    assert_prior_purge_receipt(false, false).await;
 }
 
 #[tokio::test]
-async fn subject_removal_prior_pending_purge_receipt_recovers_with_stale_runtime_catalog() {
-    assert_prior_purge_receipt(true).await;
+async fn subject_removal_pending_purge_receipt_recovers_with_current_canonical_shutdown() {
+    assert_prior_purge_receipt(true, false).await;
 }
 
-async fn assert_prior_purge_receipt(stale_catalog: bool) {
+#[tokio::test]
+async fn subject_removal_missing_canonical_shutdown_never_adopts_stale_catalog_purge() {
+    assert_prior_purge_receipt(true, true).await;
+}
+
+async fn assert_prior_purge_receipt(stale_catalog: bool, missing_shutdown: bool) {
     let f = SubjectRemovalFixture::new().await;
     f.seed_completed_release_for_archive_recovery().await;
     let configured = f
@@ -4055,8 +4119,19 @@ async fn assert_prior_purge_receipt(stale_catalog: bool) {
         .prepare_worker_removal_execution(TEST_WORKSPACE_ID, &plan.plan_id, &plan.input_fingerprint)
         .unwrap();
     if stale_catalog {
-        // Fixture the Runtime delete-to-final-receipt crash window. Its live
-        // catalog deliberately remains stopped while the aggregate is gone.
+        let worker = worker_runtime::identity::WorkerRef::new(f.target.worker_id.parse().unwrap());
+        let shutdown = f
+            .execution
+            .terminations
+            .lock()
+            .unwrap()
+            .get(&worker)
+            .cloned()
+            .expect("fixture must retain its genuine Stop receipt");
+        assert!(shutdown.confirms_scope_shutdown(&worker, shutdown.stop_operation_id));
+        // The original v1 pending result has no embedded shutdown proof.
+        // Current canonical Stop must be reconciled independently; a stopped
+        // catalog and this historical receipt cannot replace missing proof.
         let request = &prepared.runtime_request;
         let pending = worker_runtime::retention::WorkerRetentionExecutionResult {
             operation_id: request.operation_id.clone(),
@@ -4101,8 +4176,64 @@ async fn assert_prior_purge_receipt(stale_catalog: bool) {
             "metadata_commit_failed",
         )
         .unwrap();
+    if missing_shutdown {
+        // Fault only the substituted execution owner's reconciliation evidence.
+        // Do not change the Runtime catalog, original operation or provider receipt.
+        let worker = worker_runtime::identity::WorkerRef::new(f.target.worker_id.parse().unwrap());
+        assert!(
+            f.execution
+                .terminations
+                .lock()
+                .unwrap()
+                .remove(&worker)
+                .is_some()
+        );
+    }
     let f = if stale_catalog { f } else { f.reopen().await };
     let response = f.remove();
+    if stale_catalog {
+        let path = f
+            .dir
+            .path()
+            .join(".test-embedded-runtime-store/retention/operations")
+            .join(format!("{}.json", plan.operation_id));
+        let receipt: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(
+            receipt.get("shutdown").is_none_or(Value::is_null),
+            "historical receipt must not be upgraded into shutdown evidence"
+        );
+        assert_eq!(receipt["result"]["source_removed"], !missing_shutdown);
+    }
+    if missing_shutdown {
+        assert_eq!(
+            response.status,
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            "{}",
+            response.body
+        );
+        assert!(response.body.contains("runtime_retention_failed"));
+        assert!(
+            f.api
+                .store
+                .get_worker_registry(TEST_WORKSPACE_ID, &f.target)
+                .unwrap()
+                .is_some()
+        );
+        let retained = f
+            .api
+            .config_store
+            .recover_worker_removal_execution(TEST_WORKSPACE_ID, &f.target)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.plan.operation_id, plan.operation_id);
+        assert_eq!(retained.plan.input_fingerprint, plan.input_fingerprint);
+        assert_ne!(
+            retained.plan.state,
+            crate::retention::WorkerRemovalPlanState::Succeeded
+        );
+        assert!(!f.store.journal_session_erased(&f.host).unwrap());
+        return;
+    }
     assert_eq!(
         response.status,
         StatusCode::OK.as_u16(),
@@ -4630,6 +4761,10 @@ impl SubjectRemovalFixture {
             store,
         } = self;
         let config = api.config.clone();
+        // Reopen the Server's stores/catalog while the external substituted
+        // execution owner retains its joined Stop receipts. A provider-process
+        // cold receipt reader is exercised by the production Runtime suites.
+        let retained_execution = Arc::new(execution.with_retained_stopped_executions());
         drop(api);
         // Reconstruct Server/Runtime over the same execution owner. Its real
         // Stop receipts survive; a new empty fake cannot certify a cold shutdown.
@@ -4642,6 +4777,7 @@ impl SubjectRemovalFixture {
                 control.clone(),
             ),
         );
+        let execution = retained_execution;
         let api = WorkspaceApi::new_with_execution_backend_and_broker(
             config,
             control,

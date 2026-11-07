@@ -2,37 +2,30 @@
 //! Authentication/Runtime connections are covered by the Backend connected chat suite.
 use super::*;
 use crate::tests::{open_store, role};
-use server_api::authorization::{SubjectPermissionsUpdate, validate_managed_subject_permissions};
+use server_api::authorization::SubjectPermissionsUpdate;
 
 #[test]
-fn creation_persists_self_scoped_execution_and_no_delegation() {
+fn creation_persists_real_shared_set_reference_and_no_delegation() {
     let dir = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(dir.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap();
-    let source = store.subject_permissions(&subject.id).unwrap().unwrap();
+    let source = store.current_subject_policy(&subject.id).unwrap().unwrap();
     assert_eq!(
-        source.execution,
-        subject_conversation_permissions("workspace-a", &subject.id)
+        source.execution.grants,
+        vec![PermissionReference::Set(
+            PermissionSetId::parse(SUBJECT_DEFAULT_PERMISSION_SET).unwrap()
+        )]
     );
-    assert!(source.delegation.is_empty());
-    validate_managed_subject_permissions(
-        None,
-        &SubjectPermissionsUpdate {
-            operation_id: "validate-initial".into(),
-            expected_change_id: None,
-            execution: source.execution.clone(),
-            delegation: vec![],
-        },
-    )
-    .unwrap();
-    for permission in source.execution {
-        let mut foreign = permission.clone();
-        foreign.resource = server_api::authorization::PermissionResource::Subject {
-            workspace_id: "workspace-a".into(),
-            subject_id: "other".into(),
-        };
-        assert!(!permission.covers(&foreign));
-    }
+    assert!(source.execution.exclusions.is_empty());
+    assert!(!source.execution.revoked);
+    assert!(source.delegation.grants.is_empty());
+    assert!(source.legacy_constraints.is_none());
+    assert!(matches!(
+        store.subject_policy_source(&subject.id).unwrap(),
+        Some(server_api::authorization::SubjectPolicySource::Feature(_))
+    ));
+    // A shared set is never copied into unrestricted legacy permissions.
+    assert!(store.subject_permissions(&subject.id).is_err());
 }
 
 #[test]
@@ -56,7 +49,7 @@ fn creation_replay_after_reopen_never_duplicates_or_restores_revoked_source() {
             Err(SubjektivError::SubjectCreationConflict(_))
         ));
         id = first.id;
-        let source = store.subject_permissions(&id).unwrap().unwrap();
+        let source = store.current_subject_policy(&id).unwrap().unwrap();
         revoked = store
             .set_subject_permissions(
                 &id,
@@ -107,7 +100,7 @@ fn permission_write_failure_rolls_back_subject_and_creation_receipt() {
     let subject = store
         .create_subject_idempotent(role(), String::new(), "atomic")
         .unwrap();
-    assert!(store.subject_permissions(&subject.id).unwrap().is_some());
+    assert!(store.current_subject_policy(&subject.id).unwrap().is_some());
 }
 
 #[test]
@@ -152,7 +145,7 @@ fn receipt_migration_preserves_existing_unset_and_revoked_policies_and_rolls_bac
     let old = SubjektivStore::open(&scope, &old_registration).unwrap();
     let unset = old.create_subject(role()).unwrap();
     let revoked = old.create_subject(role()).unwrap();
-    let source = old.subject_permissions(&revoked.id).unwrap().unwrap();
+    let source = old.current_subject_policy(&revoked.id).unwrap().unwrap();
     let empty = old
         .set_subject_permissions(
             &revoked.id,
@@ -217,5 +210,10 @@ fn receipt_migration_preserves_existing_unset_and_revoked_policies_and_rolls_bac
         Some(empty)
     );
     let fresh = upgraded.create_subject(role()).unwrap();
-    assert!(upgraded.subject_permissions(&fresh.id).unwrap().is_some());
+    assert!(
+        upgraded
+            .current_subject_policy(&fresh.id)
+            .unwrap()
+            .is_some()
+    );
 }

@@ -190,6 +190,7 @@ async fn builtin_journal_profile_installs_only_bound_tools_and_finalizes_saved_s
         Some(Box::new(client.clone())),
         &registry,
         JobFeatureGrant {
+            input_authority: None,
             features: FeatureRegistryBuilder::new()
                 .with_module(JournalJobToolsFeature::new(host.clone())),
             satisfied_requirements: vec![],
@@ -442,6 +443,72 @@ async fn selected_builtin_job_executes_with_catalog_contract_and_only_result_too
         assert_eq!(request.config.max_tokens, Some(MAX_JOB_TOKENS));
         assert!(request.system_prompt.as_ref().unwrap().ends_with(&contract));
     }
+}
+
+#[tokio::test]
+async fn prepared_job_rechecks_input_authority_before_provider_and_in_clones() {
+    struct SupplyAuthority(AtomicBool);
+    #[async_trait]
+    impl JobInputAuthority for SupplyAuthority {
+        async fn authorize_supply(&self) -> Result<(), String> {
+            self.0
+                .load(Ordering::SeqCst)
+                .then_some(())
+                .ok_or_else(|| "input supply revoked".to_owned())
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let registry = ProfileDiscovery::with_sources(None, None)
+        .discover()
+        .unwrap();
+    let authority = Arc::new(SupplyAuthority(AtomicBool::new(true)));
+    let client = ScriptedClient::new(vec![prose()]);
+    let prepared = prepare_job_from_registry_with_grant(
+        &request("builtin:job"),
+        root.path(),
+        Some(Box::new(client.clone())),
+        &registry,
+        JobFeatureGrant {
+            input_authority: Some(authority.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cloned_client = prepared.client.clone_boxed();
+    let sink = Arc::new(RecordingSink::default());
+    assert!(matches!(
+        prepared.run("allowed".into(), sink.clone(), |_| {}).await,
+        Err(JobExecutionError::MissingResult)
+    ));
+    let provider_request = client.requests.lock().unwrap()[0].clone();
+    authority.0.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        cloned_client.stream(provider_request).await,
+        Err(ClientError::Config(_))
+    ));
+    assert_eq!(
+        client.requests.lock().unwrap().len(),
+        1,
+        "revoked input must not reach provider"
+    );
+    assert!(sink.0.lock().unwrap().is_empty());
+
+    let denied_client = ScriptedClient::new(vec![]);
+    let prepared = prepare_job_from_registry_with_grant(
+        &request("builtin:job"),
+        root.path(),
+        Some(Box::new(denied_client.clone())),
+        &registry,
+        JobFeatureGrant {
+            input_authority: Some(authority.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let result = prepared.run("revoked".into(), sink.clone(), |_| {}).await;
+    assert!(result.is_err());
+    assert!(denied_client.requests.lock().unwrap().is_empty());
+    assert!(sink.0.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -835,6 +902,7 @@ async fn domain_grant_is_explicit_not_profile_derived_and_preserves_selected_pol
             Some(Box::new(client.clone())),
             &registry,
             JobFeatureGrant {
+                input_authority: None,
                 features: FeatureRegistryBuilder::new().with_module(marker.clone()),
                 satisfied_requirements: vec!["feature.task"],
                 finalizer: None,
@@ -895,6 +963,7 @@ fn domain_grant_does_not_satisfy_unrelated_profile_requirements() {
             Some(Box::new(ScriptedClient::new(vec![]))),
             &registry,
             JobFeatureGrant {
+                input_authority: None,
                 features: FeatureRegistryBuilder::new().with_module(GrantedTool::default()),
                 satisfied_requirements: vec!["feature.task"],
                 finalizer: None,
@@ -1006,6 +1075,7 @@ async fn result_finalization_is_awaited_with_selected_model_policy_and_no_orphan
         Some(Box::new(client.clone())),
         &registry,
         JobFeatureGrant {
+            input_authority: None,
             finalizer: Some(finalizer.clone()),
             ..Default::default()
         },
@@ -1075,6 +1145,7 @@ async fn cancellation_reaches_finalizer_and_runner_waits_for_cleanup_without_acc
         ]))),
         &registry,
         JobFeatureGrant {
+            input_authority: None,
             finalizer: Some(finalizer.clone()),
             ..Default::default()
         },
@@ -1134,6 +1205,7 @@ fn finalizer_can_refuse_selected_profile_before_execution() {
         Some(Box::new(client.clone())),
         &registry,
         JobFeatureGrant {
+            input_authority: None,
             finalizer: Some(finalizer.clone()),
             ..Default::default()
         },

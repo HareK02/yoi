@@ -87,6 +87,15 @@ pub(super) fn dispatch_publication(
                     )
                     .into());
                 }
+                // Refresh the derived catalog only after the committed source is
+                // rechecked. Failures belong to publication, not adoption; every
+                // protected operation independently refreshes before policy use.
+                api.refresh_plugin_permission_registry().map_err(|error| {
+                    Error::from(ConfigurationFailure::from_publication(
+                        FailureReason::PublicationRegistryUnavailable,
+                        error,
+                    ))
+                })?;
                 api.prompt_projection_cache
                     .resolve(&api.config.workspace_id, &current.state)
             })();
