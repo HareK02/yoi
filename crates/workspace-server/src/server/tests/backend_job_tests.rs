@@ -1695,6 +1695,8 @@ async fn backend_job_delivery_recovery_replays_same_tracked_notification_id() {
                 resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
             },
         )
         .unwrap()

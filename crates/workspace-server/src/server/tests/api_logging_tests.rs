@@ -123,6 +123,8 @@ async fn cleanup_retention_failures_preserve_cause_on_execution_and_recovery() {
                 resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
             },
         )
         .unwrap();
@@ -299,6 +301,8 @@ async fn generated_cancellation_errors_preserve_response_and_log_details() {
                 resolved_subjektiv_attached: false,
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
             },
         )
         .unwrap()

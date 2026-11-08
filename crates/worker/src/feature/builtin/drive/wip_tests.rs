@@ -1377,7 +1377,6 @@ async fn native_drive_failures_keep_typed_causes_settlement_and_unknown_receipt_
         let mut engine = agen::Engine::<_, agen::state::Mutable, ()>::new_annotated(NoLlm);
         let runtime = crate::wip::install_wip_mode_with_mounts(
             &mut engine,
-            None,
             "drive-failure-tools".into(),
             mounts,
         )
@@ -1522,7 +1521,7 @@ async fn model_tools_follow_inspect_declared_entries_for_discovery_creation_save
             .into_iter()
             .map(|(_, definition)| definition),
     );
-    crate::wip::install_wip_mode_with_mounts(&mut engine, None, "drive-model-tools".into(), mounts)
+    crate::wip::install_wip_mode_with_mounts(&mut engine, "drive-model-tools".into(), mounts)
         .unwrap();
     let handle = engine.tool_server_handle();
     handle.flush_pending();

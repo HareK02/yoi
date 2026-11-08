@@ -849,6 +849,11 @@ pub struct WorkerSpawnRequest {
     pub singleton_key: Option<String>,
     pub acceptance: WorkerSpawnAcceptanceRequirement,
     pub profile: ProfileSelector,
+    /// Caller-visible authority selection is part of create intent, unlike Host resolution.
+    #[serde(default)]
+    pub authorization: Option<server_api::launch_policy::WorkerCreationAuthorization>,
+    #[serde(skip, default)]
+    pub resolved_core_execution_grant: Option<server_api::authorization::CoreWorkerExecutionGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_assignment: Option<WorkerTicketAssignmentRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -10502,6 +10507,8 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
             resolved_workspace_api: Some(test_workspace_api()),
             resolved_memory_settings: Some(test_memory_settings()),
             resolved_subjektiv_attached: false,
@@ -10921,6 +10928,8 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
                     resolved_execution_grant: None,
+                    authorization: None,
+                    resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
                     resolved_subjektiv_attached: false,
@@ -11037,6 +11046,8 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
                     resolved_execution_grant: None,
+                    authorization: None,
+                    resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
                     resolved_subjektiv_attached: false,
@@ -11079,6 +11090,8 @@ mod tests {
                     resolved_worker_observation_grants: Vec::new(),
                     resolved_control_operation: None,
                     resolved_execution_grant: None,
+                    authorization: None,
+                    resolved_core_execution_grant: None,
                     resolved_workspace_api: Some(test_workspace_api()),
                     resolved_memory_settings: Some(test_memory_settings()),
                     resolved_subjektiv_attached: false,

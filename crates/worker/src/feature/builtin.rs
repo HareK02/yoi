@@ -39,6 +39,7 @@ pub(crate) mod repository_permissions;
 mod resource_projection;
 pub mod session_explore;
 pub(crate) mod sub_worker;
+pub(crate) mod subject_permissions;
 pub(crate) mod subjektiv_chat;
 pub(crate) mod subjektiv_memory;
 pub(crate) mod subjektiv_session;

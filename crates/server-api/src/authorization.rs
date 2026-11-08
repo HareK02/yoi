@@ -50,6 +50,11 @@
 //! Unset existing Subject policies deny new Subject execution/delegation; ordinary
 //! non-Subject Workers explicitly retain existing Backend/provider contracts.
 //! Standalone non-Workspace activation compatibility grants no Workspace operation.
+mod core_worker_grant;
+pub use core_worker_grant::{
+    CoreWorkerExecutionGrant, CoreWorkerGrantParent, CoreWorkerGrantSource,
+};
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 

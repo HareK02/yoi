@@ -36,7 +36,7 @@ impl FeatureModule for ObjectiveBackendFeature {
 }
 
 pub(crate) struct ObjectiveFeature {
-    native: Option<(WipNamespaceRoute, Option<ToolPermissionConfig>)>,
+    native: Option<WipNamespaceRoute>,
 }
 
 impl FeatureModule for ObjectiveFeature {
@@ -74,14 +74,9 @@ impl FeatureModule for ObjectiveFeature {
                 .tools()
                 .register(ToolContribution::new(name, definition))?;
         }
-        if let Some((route, permissions)) = &self.native {
+        if let Some(route) = &self.native {
             context.wip().register(WIP_MOUNT, |registry| {
-                mount_workspace_http_objective_wip(
-                    registry,
-                    backend.client.clone(),
-                    permissions.clone(),
-                    route,
-                )
+                mount_workspace_http_objective_wip(registry, backend.client.clone(), route)
             })?;
         }
         Ok(())
@@ -95,7 +90,7 @@ pub(crate) fn compose(
     registry: &mut FeatureRegistryBuilder,
     enabled: bool,
     client: Arc<dyn WorkspaceClient>,
-    native: Option<(WipNamespaceRoute, Option<ToolPermissionConfig>)>,
+    native: Option<WipNamespaceRoute>,
 ) -> std::io::Result<()> {
     if !enabled {
         return Ok(());

@@ -959,8 +959,10 @@ async fn replaced_policy_and_body_never_revive_delegated_worker_control() {
                     subject_id: f.subject.clone(),
                 }),
             },
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await

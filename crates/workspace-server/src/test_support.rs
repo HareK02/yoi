@@ -299,6 +299,8 @@ mod tests {
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
         }
     }
 

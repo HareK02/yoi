@@ -446,6 +446,9 @@ fn validate_profile_with_grant(
     satisfied: &[&str],
 ) -> Result<(), JobExecutionError> {
     let manifest::FeatureConfig {
+        filesystem,
+        filesystem_write,
+        bash,
         task,
         memory,
         subjektiv,
@@ -466,6 +469,12 @@ fn validate_profile_with_grant(
     } = &manifest.feature;
     let mut unavailable = Vec::new();
     for (name, enabled) in [
+        ("feature.filesystem", filesystem.enabled),
+        (
+            "feature.filesystem_write",
+            filesystem.enabled && filesystem_write.enabled,
+        ),
+        ("feature.bash", bash.enabled),
         ("feature.task", task.enabled),
         (
             "feature.memory",

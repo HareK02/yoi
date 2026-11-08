@@ -122,3 +122,120 @@ fn migration_dry_run_and_apply_share_the_original_repository_secret_authority() 
     }).unwrap();
     assert_eq!(std::fs::read(master_key).unwrap(), [42; 32]);
 }
+
+#[test]
+fn launch_policy_migration_preserves_adopted_configuration_and_rolls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    prepare_retained_schema(&path, 130);
+    let conn = Connection::open(&path).unwrap();
+    configure_sqlite(&conn).unwrap();
+    seed_migration_workspace(&conn);
+    let policy = crate::policy_config::AdoptedSubjectPolicy {
+        source: crate::policy_config::SubjectAssignmentSource {
+            subject_id: "subject".into(),
+            execution: Default::default(),
+            delegation: Default::default(),
+        },
+        change_id: "policy-change".into(),
+        legacy_constraints: None,
+    };
+    conn.execute_batch(
+        "INSERT INTO workspace_configuration_authorities
+            VALUES('space','transfer','physical','export');
+         INSERT INTO workspace_configuration_receipts
+            VALUES('space','adopt','fingerprint','{}');",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO workspace_configuration_policies VALUES('space','subject',?1)",
+        [serde_json::to_string(&policy).unwrap()],
+    )
+    .unwrap();
+    let adoption_records = |conn: &Connection| -> Result<_> {
+        Ok(conn.query_row(
+            "SELECT transfer_identity,legacy_physical_identity,legacy_export_digest,
+                    policy_json,request_fingerprint,result_json
+             FROM workspace_configuration_authorities
+             JOIN workspace_configuration_policies USING(workspace_id)
+             JOIN workspace_configuration_receipts USING(workspace_id)
+             WHERE workspace_id='space' AND subject_id='subject' AND operation_id='adopt'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?)
+    };
+    let before = adoption_records(&conn).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER interrupt_launch_policy_migration
+         BEFORE INSERT ON __yoi_schema_migrations WHEN NEW.version=131
+         BEGIN SELECT RAISE(ABORT,'injected launch policy migration interruption'); END;",
+    )
+    .unwrap();
+    let error = migrate_worker_launch_policies_to_v131(&conn).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected launch policy migration interruption"),
+        "{error}"
+    );
+    assert_eq!(current_schema_version(&conn).unwrap(), 130);
+    for table in [
+        "worker_launch_policies",
+        "worker_launch_policy_history",
+        "worker_launch_policy_operations",
+        "core_worker_execution_grants",
+        "core_worker_grant_revocations",
+        "core_worker_launch_bindings",
+    ] {
+        assert!(!table_exists(&conn, table).unwrap(), "{table}");
+    }
+    assert_eq!(adoption_records(&conn).unwrap(), before);
+    conn.execute_batch("DROP TRIGGER interrupt_launch_policy_migration")
+        .unwrap();
+    drop(conn);
+
+    let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
+    assert_eq!(plan.current_schema_version, 130);
+    assert!(plan.migration_required());
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(current_schema_version(&conn).unwrap(), 130);
+    assert!(!table_exists(&conn, "worker_launch_policies").unwrap());
+    assert_eq!(adoption_records(&conn).unwrap(), before);
+    drop(conn);
+
+    assert_eq!(SqliteWorkspaceStore::migrate_database(&path).unwrap(), plan);
+    let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+    assert_eq!(store.with_conn(adoption_records).unwrap(), before);
+    store
+        .with_conn(|conn| {
+            assert!(conn.execute("UPDATE workspace_configuration_authorities SET transfer_identity='replacement'", []).is_err());
+            assert!(conn.execute("DELETE FROM workspace_configuration_receipts", []).is_err());
+            assert_eq!(conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0))?, 0);
+            Ok(())
+        })
+        .unwrap();
+    let schema = |conn: &Connection| -> Result<Vec<(String, String)>> {
+        let mut statement = conn.prepare(
+            "SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL AND tbl_name IN
+             ('worker_launch_policies','worker_launch_policy_history',
+              'worker_launch_policy_operations','core_worker_execution_grants',
+              'core_worker_grant_revocations','core_worker_launch_bindings') ORDER BY name",
+        )?;
+        Ok(statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    };
+    let fresh = SqliteWorkspaceStore::in_memory_for_test().unwrap();
+    let expected = fresh.with_conn(schema).unwrap();
+    assert!(!expected.is_empty());
+    assert_eq!(store.with_conn(schema).unwrap(), expected);
+}

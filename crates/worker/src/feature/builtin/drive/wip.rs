@@ -29,7 +29,7 @@
 //! contract for its kind. Metadata, descriptor, validator, and handler are fixed to one publication;
 //! the route binds the entry/creation parent. Move destinations accept typed Entry paths.
 //! Interfaces describe operations for the entry kind; the Backend rejects writes under read-only
-//! grants. Native Invoke still applies original Tool permissions. [`crate::wip`] owns the shared
+//! grants. Native Invoke applies current Host and provider constraints. [`crate::wip`] owns the shared
 //! cache, validator, and cancellation contracts.
 use super::{
     DriveFeature, SPECS, Spec,
@@ -167,9 +167,7 @@ impl WipSubtreeProvider for DriveProvider {
             entry_specs(&entry)
         }
         .into_iter()
-        .filter(|spec| {
-            !mutation(spec) || (capabilities.write && publication_may_allow(&self.feature, spec))
-        })
+        .filter(|spec| !mutation(spec) || capabilities.write)
         .collect();
         let common_mutations: Vec<_> = specs
             .iter()
@@ -269,28 +267,6 @@ fn mutation(spec: &Spec) -> bool {
         spec.operation,
         "write" | "edit" | "delete" | "relocate" | "create_folder" | "create_text" | "save_workdir"
     )
-}
-
-fn publication_may_allow(feature: &DriveFeature, spec: &Spec) -> bool {
-    let Some(permissions) = &feature.permissions else {
-        return true;
-    };
-    // Like checkout publication, retain potentially allowed argument-dependent
-    // operations but hide an unconditional Deny/Ask ceiling. This is not an
-    // authorization decision: exact arguments are still checked at execution.
-    for rule in permissions
-        .rules
-        .iter()
-        .filter(|rule| rule.tool.eq_ignore_ascii_case(spec.name))
-    {
-        if rule.action == manifest::ToolPermissionAction::Allow {
-            return true;
-        }
-        if rule.pattern == "*" {
-            return false;
-        }
-    }
-    permissions.default_action == manifest::ToolPermissionAction::Allow
 }
 
 fn root_specs() -> Vec<Spec> {
@@ -566,17 +542,6 @@ impl WipOperationHandler for DriveHandler {
                 fields.insert("entry".into(), json!(self.entry.entry));
             }
             _ => {}
-        }
-        if let Some(permissions) = &self.feature.permissions {
-            if !matches!(
-                crate::permission::permission_action_for(permissions, spec.name, &input),
-                manifest::ToolPermissionAction::Allow
-            ) {
-                return Err(failure(
-                    ProtocolErrorCode::PermissionDenied,
-                    "Drive operation denied by tool permission; approval unavailable in native invocation",
-                ));
-            }
         }
         let output = self
             .feature

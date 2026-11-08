@@ -3,6 +3,7 @@ import type {
   BrowserWorkerWorkingDirectorySelection,
   BrowserWorkspaceOrchestratorResponse,
   CreateWorkspaceWorkerRequest,
+  WorkerCreationAuthorization,
   CreateWorkspaceWorkerTicketAssignmentRequest,
   Diagnostic,
   DiagnosticSeverity,
@@ -27,6 +28,7 @@ import type {
   WorkingDirectoryRepositoryOption,
   WorkspaceWorkerFeatureConnectionsRequest,
 } from "#lib/generated/worker-launch-api.ts";
+import { parseAssignment } from "#lib/workspace/memory/permissions.ts";
 import type { Segment } from "#lib/generated/protocol.ts";
 import {
   parseExternalWorkdirPermissions,
@@ -1009,6 +1011,30 @@ function segment(value: unknown, label: string): Segment {
   throw new Error(`${label}.kind is invalid: ${exhaustive}`);
 }
 
+function creationAuthorization(value: unknown): WorkerCreationAuthorization {
+  const item = record(value, "authorization");
+  if (item.kind === "human") {
+    exact(item, ["kind", "assignment"], "authorization");
+    return {
+      kind: "human",
+      ...(item.assignment === undefined ? {} : {
+        assignment: item.assignment === null ? null : parseAssignment(item.assignment),
+      }),
+    };
+  }
+  if (item.kind === "policy") {
+    exact(item, ["kind", "policy_id", "policy_revision"], "authorization");
+    const policyId = string(item.policy_id, "policy_id");
+    if (!/^[a-z][a-z0-9_-]{0,95}$/.test(policyId)) throw new Error("invalid policy_id");
+    const observed = number(item.policy_revision, "policy_revision");
+    if (observed < 1) throw new Error("policy_revision must be positive");
+    return { kind: "policy", policy_id: policyId,
+      policy_revision: observed as Extract<WorkerCreationAuthorization, { kind: "policy" }>["policy_revision"],
+    };
+  }
+  throw new Error("authorization.kind must be human or policy");
+}
+
 export function parseCreateWorkspaceWorkerRequest(
   value: unknown,
 ): CreateWorkspaceWorkerRequest {
@@ -1024,6 +1050,7 @@ export function parseCreateWorkspaceWorkerRequest(
       "workdir_attachments",
       "feature_connections",
       "control_operation_id",
+      "authorization",
     ],
     "Worker create request",
   );
@@ -1044,6 +1071,7 @@ export function parseCreateWorkspaceWorkerRequest(
       item.feature_connections,
       "feature_connections",
     ),
+    authorization: creationAuthorization(item.authorization),
     control_operation_id: nullableString(
       item.control_operation_id,
       "control_operation_id",

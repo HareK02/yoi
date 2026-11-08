@@ -1,11 +1,13 @@
-//! Before sealing, new Subjects receive their self-scoped source in the creation transaction.
+//! Before sealing, new Subjects receive execution/delegation permission references atomically.
 //! After sealing, creation retains enrollment evidence only; current reads never revive defaults.
 //! This path is never called by migration, launch, restore or permission reads. Receipts retain
 //! identity, input fingerprint and any post-seal enrollment across erasure, preventing replay
 //! from recreating an erased Subject or restoring a revoked policy.
 use super::*;
-use feature_permissions::{PermissionAssignment, PermissionReference, PermissionSetId};
-use server_api::authorization::{CurrentSubjectPolicy, SUBJECT_DEFAULT_PERMISSION_SET};
+use server_api::authorization::{
+    CurrentSubjectPolicy, subject_default_delegation_assignment,
+    subject_default_permission_assignment,
+};
 use sha2::{Digest, Sha256};
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
@@ -78,12 +80,8 @@ impl SubjektivStore {
             )?;
             let source = CurrentSubjectPolicy {
                 change_id: issued_id("permissions"),
-                execution: PermissionAssignment {
-                    grants: vec![PermissionReference::Set(PermissionSetId::parse(SUBJECT_DEFAULT_PERMISSION_SET)
-                        .map_err(SubjektivError::InvalidRecord)?)],
-                    exclusions: vec![], revoked: false,
-                },
-                delegation: PermissionAssignment { grants: vec![], exclusions: vec![], revoked: false },
+                execution: subject_default_permission_assignment(),
+                delegation: subject_default_delegation_assignment(),
                 legacy_constraints: None,
             };
             let sealed = permissions::transfer::is_sealed(tx)?;

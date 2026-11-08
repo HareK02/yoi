@@ -320,46 +320,12 @@ async fn classification_tools_require_backend_workspace_and_bound_list_results()
 }
 
 #[tokio::test]
-async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_identity() {
-    let client = recording(
-        json!([tag()]),
-        [expected_authorization("ticket.tags.set", Some("T-740"))],
-    );
+async fn classification_wip_requires_host_authority_and_route_bound_ticket_identity() {
+    use assignment_tracking::authorization_tests::{AuthorizedClient, ticket};
+
+    let client = AuthorizedClient::new(json!([tag()]));
     let tools =
         native_ticket_tools(client.clone(), TicketFeatureAccess::workspace_authoring()).unwrap();
-    let set = tools
-        .iter()
-        .find(|tool| tool.name == "TicketTagsSet")
-        .unwrap();
-    let (_, input, _) = cases().pop().unwrap();
-    let permissions = Some(ToolPermissionConfig {
-        default_action: ToolPermissionAction::Allow,
-        rules: vec![manifest::ToolPermissionRule {
-            tool: "TicketTagsSet".into(),
-            action: ToolPermissionAction::Deny,
-            pattern: input.to_string(),
-        }],
-    });
-    let error = execute_native_ticket_tool(
-        set,
-        &permissions,
-        input,
-        WipCallContext {
-            result_namespaces: Default::default(),
-            execution: ToolExecutionContext::direct(),
-            security_context: "worker".into(),
-        },
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        WipOperationError::Protocol(ProtocolError {
-            code: ProtocolErrorCode::PermissionDenied,
-            ..
-        })
-    ));
-    assert!(client.requests.lock().unwrap().is_empty());
     let handler = TicketItemWipHandler {
         tools: operation_map(
             tools
@@ -367,7 +333,6 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
                 .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
                 .collect(),
         ),
-        permissions: None,
         ticket_reference: "T-740".into(),
         collection_route: "/tickets".into(),
         merge_request_route: "/merge-requests".into(),
@@ -385,6 +350,25 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
         ("tags".into(), json_to_wip(&json!(["tag-1"])).unwrap()),
         ("observed".into(), json_to_wip(&json!({"tags":[]})).unwrap()),
     ]);
+    assert!(matches!(
+        handler
+            .call(
+                "tags_set",
+                &args,
+                WipCallContext {
+                    result_namespaces: Default::default(),
+                    execution: ToolExecutionContext::direct(),
+                    security_context: "worker".into(),
+                },
+            )
+            .await,
+        Err(WipOperationError::Protocol(ProtocolError {
+            code: ProtocolErrorCode::PermissionDenied,
+            ..
+        }))
+    ));
+    assert!(client.requests.lock().unwrap().is_empty());
+    client.grant("ticket.tags.set", ticket("T-740"));
     assert!(
         handler
             .call(
@@ -428,7 +412,11 @@ async fn classification_wip_uses_normal_permissions_and_route_bound_ticket_ident
             .await
             .is_err()
     );
-    assert!(client.authorizations.lock().unwrap().is_empty());
+    let authorizations = client.authorizations.lock().unwrap();
+    assert_eq!(authorizations.len(), 2);
+    assert!(authorizations.iter().all(|request| {
+        request.operation == "ticket.tags.set" && request.resource == ticket("T-740")
+    }));
     assert_eq!(client.requests.lock().unwrap().len(), 1);
     let read_only = TicketFeatureAccess::read_only().tool_names();
     assert!(read_only.contains(&"WorkspaceTagList"));

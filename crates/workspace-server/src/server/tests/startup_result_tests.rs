@@ -508,6 +508,8 @@ async fn assert_publication_fault_retains_committed_worker(query_failure: bool) 
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
             resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
         },
     );
     assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);

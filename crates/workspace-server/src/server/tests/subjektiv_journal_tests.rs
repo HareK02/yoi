@@ -90,6 +90,8 @@ fn spawn_journal_source(api: &WorkspaceApi, subject: &str, name: &str) -> Runtim
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
             resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
         },
     )
     .unwrap()
@@ -3163,8 +3165,10 @@ impl SubjectRemovalFixture {
                         subject_id: subject.id.clone(),
                     }),
                 },
-                control_operation_id: None,
-                execution_grant: None,
+                control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
             }),
         )
         .await

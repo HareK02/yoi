@@ -51,7 +51,6 @@ async fn public_operations_require_exact_ticket_grants_on_tool_and_wip() {
                     .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
                     .collect(),
             ),
-            permissions: None,
             ticket_reference: "T-743".into(),
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),

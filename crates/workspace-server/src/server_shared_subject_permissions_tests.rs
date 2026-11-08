@@ -45,7 +45,7 @@ async fn shared_subject_set_accepts_new_ticket_assignment_without_id_enrollment(
         policy.execution,
         server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(policy.delegation.grants.is_empty());
+    assert_eq!(policy.delegation, server_api::authorization::subject_default_delegation_assignment());
     assert!(policy.legacy_constraints.is_none());
     let body = create_test_assignment_body(&api, EMBEDDED_WORKER_RUNTIME_ID, &subject.id).await;
 

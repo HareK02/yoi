@@ -228,7 +228,10 @@ async fn body_same_request_concurrent_start_stop_outcome_and_restore_preserve_su
         created_policy.execution,
         server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(created_policy.delegation.grants.is_empty());
+    assert_eq!(
+        created_policy.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
     assert!(created_policy.legacy_constraints.is_none());
     super::chat_tests::adopt_chat_defaults(&f.connected.api, &f.connected.owner).await;
     let initial = store.current_subject_policy(&subject).unwrap().unwrap();

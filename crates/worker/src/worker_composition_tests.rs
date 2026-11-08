@@ -85,6 +85,9 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
     assert!(manifest.scope.allow.is_empty());
     assert!(manifest.delegation_scope.allow.is_empty());
     assert!(!manifest.feature.flow.enabled);
+    assert!(!manifest.feature.filesystem.enabled);
+    assert!(!manifest.feature.bash.enabled);
+    // Workdir operation authorization remains Host-owned, independently of publication.
     // This case isolates registration restrictions from independently tested
     // Subject startup Memory/Journal authorization and chat Host requirements.
     manifest.feature.subjektiv.profile.enabled = false;
@@ -105,12 +108,16 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
         "Glob",
         "Grep",
         "Bash",
+        "ViewImage",
         "SubWorkerSpawn",
         "WebFetch",
         "WebSearch",
         "JobRun",
         "OpenMergeRequest",
         "SubmitMergeRequestReview",
+        "TicketQueue",
+        "TicketMarkReady",
+        "TicketIntakeReady",
     ] {
         assert!(
             !names.iter().any(|name| name == forbidden),
@@ -119,19 +126,59 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
     }
     for required in [
         "WorkerSpawn",
+        "WorkerSendInput",
         "WorkerNotify",
+        "WorkerCancel",
         "WorkerStop",
+        "WorkerRestore",
+        "WorkerRemove",
         "WorkerList",
+        "ListWorkspaceWorkers",
+        "ViewSessionOverview",
+        "SearchSessionEntries",
+        "ReadSessionEntry",
         "QueryObjective",
+        "ShowObjective",
+        "ObjectiveCreate",
+        "ObjectiveEdit",
+        "ObjectiveSetState",
+        "ObjectiveLinkTicket",
+        "ObjectiveUnlinkTicket",
+        "QueryTicket",
         "ShowTicket",
+        "TicketCreate",
+        "TicketEditItem",
+        "TicketEditPost",
+        "TicketComment",
+        "TicketCaseUpdate",
+        "TicketRelationRecord",
+        "TicketRelationRemove",
+        "TicketDependencyCheck",
+        "TicketAssignmentAnswer",
+        "TicketOrchestratorAssign",
+        "TicketOrchestratorClear",
+        "TicketParentSet",
+        "TicketChildrenQuery",
+        "TicketTagsSet",
+        "WorkspaceTagList",
+        "WorkspaceTagCreate",
+        "WorkspaceTagRename",
+        "WorkspaceTagDelete",
         "SpawnTicketWorker",
         "TicketAssignmentTrackingQuery",
+        "TicketAssignmentTrackingHistory",
         "TicketAssignmentTrackingUpdate",
+        "TicketAssignmentsQuery",
+        "TicketAssignmentDiagnostics",
+        "TicketImplementationResult",
         "TicketImplementationResultQuery",
+        "NotificationDiagnostics",
         "ShowMergeRequest",
         "CheckMergeRequestReadiness",
         "CompleteMergeRequest",
+        "WorkdirList",
         "WorkdirCreate",
+        "WorkdirDelete",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -143,6 +190,28 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
     assert!(prompt.contains("## Assigned Ticket coordination"));
     assert!(prompt.contains("TicketAssignmentTrackingUpdate"));
     assert!(prompt.contains("## Ticket workflow"));
+    for required in [
+        "`subject-default` execution reference",
+        "`subject.delegate` delegation-ceiling reference",
+        "Profile activation does not enroll or expand them",
+        "Preserve configured references and exclusions, explicit-empty policies",
+        "revoked grants",
+        "bounded, explicitly scoped `execution_grant`",
+        "Reviewer redelegation authority within that actual grant",
+        "Runtime/domain checks independent",
+        "prefer `SpawnTicketWorker` for Ticket-bound work",
+        "General `WorkerSpawn` remains available for non-Ticket work",
+        "Assignment tools do not authorize self-assignment or automatic Worker starts",
+        "Preserve explicit user approval and closing conditions",
+        "not automatic cleanup",
+    ] {
+        assert!(
+            prompt.contains(required),
+            "chat prompt lacks authority boundary: {required}"
+        );
+    }
+    assert!(!prompt.contains("Subject creation enrolls conversation/Ticket acceptance only"));
+    assert!(!prompt.contains("through the existing `WorkerSpawn` Ticket fields"));
     assert!(
         client.requests.lock().unwrap().is_empty(),
         "Profile activation must not issue authority or read protected content"

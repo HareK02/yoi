@@ -156,7 +156,7 @@ pub fn grep_tool(session: WorkdirSessionHandle) -> ToolDefinition {
     routed_grep_tool(crate::routing::singleton_router(session))
 }
 
-pub(crate) fn routed_grep_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinition {
+pub fn routed_grep_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(GrepParams);
         let meta = ToolMeta::new("Grep")

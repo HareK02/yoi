@@ -22,8 +22,10 @@ async fn restore_keeps_offline_external_and_unmaterialized_repository_attachment
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await

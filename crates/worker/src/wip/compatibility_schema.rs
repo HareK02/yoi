@@ -279,7 +279,6 @@ mod integration_tests {
                 .description("Typed compatibility fixture")
                 .input_schema(schema),
             Arc::new(EchoInput(calls.clone())),
-            None,
         )
         .unwrap();
         let mut registry = WipMountRegistry::new();

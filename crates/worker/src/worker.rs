@@ -5055,7 +5055,7 @@ impl<C: LlmClient + 'static, St: Store> Worker<C, St> {
             log_writer: None,
             notification_committer: None,
         };
-        worker.apply_permissions_from_manifest();
+
         worker.apply_prune_from_manifest();
         Ok(worker)
     }
@@ -9819,7 +9819,6 @@ where
     }
 
     fn finish_pending_construction(mut self) -> Result<Self, WorkerError> {
-        self.apply_permissions_from_manifest();
         self.apply_prune_from_manifest();
         self.write_worker_metadata_pending()
             .map_err(|error| self.construction_failure(error))?;
@@ -10182,7 +10181,7 @@ where
             log_writer: None,
             notification_committer: None,
         };
-        worker.apply_permissions_from_manifest();
+
         worker.apply_prune_from_manifest();
         Ok(worker)
     }
@@ -10656,7 +10655,7 @@ where
         worker
             .session
             .restore_pending_activations(&state.extensions);
-        worker.apply_permissions_from_manifest();
+
         worker.apply_prune_from_manifest();
         let mut candidate = PreparedRestoredWorker {
             worker: Some(worker),
@@ -10688,7 +10687,7 @@ where
         self.pending_submission_handle()
             .reconcile_uploaded_file_pins()
             .map_err(|error| self.construction_failure(error.into()))?;
-        self.apply_permissions_from_manifest();
+
         self.apply_prune_from_manifest();
         // Persist inferred legacy retention before replacing its saved manifest.
         // A failed append leaves that older evidence intact for the next restore.

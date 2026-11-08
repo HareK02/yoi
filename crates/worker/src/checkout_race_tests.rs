@@ -195,7 +195,8 @@ fn provider(router: Arc<WorkdirSessionRouter>) -> Arc<Provider> {
     Arc::new(Provider {
         router,
         tracker: tools::Tracker::new(),
-        permissions: None,
+        enabled: true,
+        read_only: false,
         incarnation: "checkout-race-tests".into(),
         permits: Arc::new(tokio::sync::Semaphore::new(16)),
         deadline: DEADLINE,

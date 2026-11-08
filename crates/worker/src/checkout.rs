@@ -10,7 +10,7 @@
 //! Object validators bind the projection incarnation, attachment generation, and provider state
 //! so alias reuse after restore or detach cannot transfer old observations to a new connection.
 //! Publication also checks the generation recorded at acquisition. Possessing an Interface grants
-//! no authority: route-reconstructed permission inputs and current provider capability/scope are
+//! no authority: Feature configuration and current provider capability/scope are
 //! rechecked, as are the existing Write/Edit prior-Read and content-hash preconditions.
 //!
 //! Search-result entry coordinates come from typed provider paths without reobserving every result,
@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use agen::tool::ToolError;
 use async_trait::async_trait;
-use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use wip_protocol::{
@@ -37,7 +36,6 @@ use workdir::{
 };
 
 use crate::feature::builtin::manage_workdir::wip::{decode_identity, encode_identity};
-use crate::permission::permission_action_for;
 use crate::wip::{
     WipCallContext, WipMountError, WipMountRegistry, WipOperationError, WipOperationHandler,
     WipOperationOutput, WipProjection, WipProjectionKind, WipPublication, WipSubtreeMount,
@@ -54,18 +52,23 @@ pub fn checkout_root(alias: &str) -> String {
 }
 
 /// Register the native content namespace independently of inventory/lifecycle
-/// Features. Its capabilities come from current attachments, not Feature flags.
+/// Features. Provider capabilities remain an independent ceiling on Feature configuration.
 pub fn mount_checkouts(
     registry: &mut WipMountRegistry,
     router: Arc<WorkdirSessionRouter>,
     tracker: tools::Tracker,
-    permissions: Option<ToolPermissionConfig>,
+    enabled: bool,
+    read_only: bool,
 ) -> Result<(), WipMountError> {
+    if !enabled {
+        return Ok(());
+    }
     registry.allocate_namespace("checkout", "checkouts")?;
     let provider = Arc::new(Provider {
         router,
         tracker,
-        permissions,
+        enabled,
+        read_only,
         incarnation: uuid::Uuid::now_v7().to_string(),
         permits: Arc::new(tokio::sync::Semaphore::new(16)),
         deadline: DEADLINE,
@@ -81,32 +84,14 @@ pub fn mount_checkouts(
 struct Provider {
     router: Arc<WorkdirSessionRouter>,
     tracker: tools::Tracker,
-    permissions: Option<ToolPermissionConfig>,
+    enabled: bool,
+    read_only: bool,
     incarnation: String,
     permits: Arc<tokio::sync::Semaphore>,
     deadline: Duration,
 }
 
 impl Provider {
-    fn allowed(&self, tool: &str, input: &Json) -> bool {
-        self.permissions
-            .as_ref()
-            .is_none_or(|p| permission_action_for(p, tool, input) == ToolPermissionAction::Allow)
-    }
-    fn may_allow(&self, tool: &str) -> bool {
-        let Some(p) = &self.permissions else {
-            return true;
-        };
-        for rule in p.rules.iter().filter(|r| r.tool.eq_ignore_ascii_case(tool)) {
-            if rule.action == ToolPermissionAction::Allow {
-                return true;
-            }
-            if rule.pattern == "*" {
-                return false;
-            }
-        }
-        p.default_action == ToolPermissionAction::Allow
-    }
     fn parse(&self, path: &str) -> Option<(String, WorkdirPath)> {
         wip_protocol::validate_path(path).ok()?;
         let rest = path.strip_prefix("/checkouts/")?;
@@ -206,6 +191,9 @@ impl Provider {
         self: &Arc<Self>,
         path: &str,
     ) -> Result<Option<WipPublication>, ProtocolError> {
+        if !self.enabled {
+            return Ok(None);
+        }
         if path == ROOT {
             return WipPublication::self_scoped(self.collection()).map(Some);
         }
@@ -240,10 +228,6 @@ impl Provider {
         if !matches!(observation.kind, EntryKind::File | EntryKind::Directory) {
             return Ok(None);
         }
-        let permission_input = json!({"target_workdir":alias, "file_path":target.as_str()});
-        if observation.kind == EntryKind::File && !self.allowed("Read", &permission_input) {
-            return Ok(None);
-        }
         let workdir = selected.session.workdir().id().as_str().to_owned();
         let projection = self.entry_projection(
             path,
@@ -268,30 +252,34 @@ impl Provider {
         observation: CheckoutObservation,
     ) -> Option<WipProjection> {
         use crate::file_operation::Contract as C;
-        let has = |cap, name| observation.capabilities.supports(cap) && self.may_allow(name);
+        let has = |cap| {
+            self.enabled
+                && observation.capabilities.supports(cap)
+                && (!self.read_only || !matches!(cap, Cap::Write | Cap::Edit))
+        };
         let mut contracts = Vec::new();
         let kind = if observation.kind == EntryKind::File {
-            if has(Cap::Read, "Read") {
+            if has(Cap::Read) {
                 contracts.extend([C::ReadLines, C::SearchText, C::ReadBytes]);
             }
-            if has(Cap::Edit, "Edit") {
+            if has(Cap::Edit) {
                 contracts.push(C::Edit);
             }
-            if has(Cap::Write, "Write") {
+            if has(Cap::Write) {
                 contracts.push(C::Write);
             }
             "file"
         } else {
-            if has(Cap::Read, "List") {
+            if has(Cap::Read) {
                 contracts.push(C::List);
             }
-            if has(Cap::Glob, "Glob") {
+            if has(Cap::Glob) {
                 contracts.push(C::Glob);
             }
-            if has(Cap::Grep, "Grep") {
+            if has(Cap::Grep) {
                 contracts.push(C::Grep);
             }
-            if has(Cap::Write, "Write") {
+            if has(Cap::Write) {
                 contracts.push(C::CreateFile);
             }
             "directory"
@@ -366,6 +354,9 @@ impl WipSubtreeProvider for Arc<Provider> {
 
 impl Provider {
     async fn children_inner(self: &Arc<Self>, path: &str) -> Result<Vec<String>, ProtocolError> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
         if path == ROOT {
             let before = self.collection().object.validator.unwrap();
             if self.router.aliases().len() > MAX_NODES {
@@ -400,12 +391,24 @@ struct Collection {
 }
 #[async_trait]
 impl WipOperationHandler for Collection {
+    fn is_visible(&self) -> bool {
+        self.provider.enabled
+    }
+    fn operation_available(&self, operation: &str) -> bool {
+        self.provider.enabled && operation == "list"
+    }
     async fn call(
         &self,
         operation: &str,
         arguments: &BTreeMap<String, Value>,
         _context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
+        if !self.provider.enabled {
+            return Err(protocol(
+                ProtocolErrorCode::PermissionDenied,
+                "filesystem Feature is disabled",
+            ));
+        }
         if operation != "list" || !arguments.is_empty() {
             return Err(protocol(
                 ProtocolErrorCode::InvalidArguments,
@@ -550,9 +553,16 @@ impl WipOperationHandler for FileHandler {
         arguments: &BTreeMap<String, Value>,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
+        if !self.provider.enabled
+            || (self.provider.read_only && matches!(operation, "edit" | "write" | "create_file"))
+        {
+            return Err(protocol(
+                ProtocolErrorCode::PermissionDenied,
+                "filesystem Feature does not provide this operation",
+            ));
+        }
         if operation == "read_bytes" {
             let (offset, limit) = crate::file_operation::byte_range(arguments)?;
-            if !self.provider.allowed("Read",&json!({"target_workdir":self.alias,"file_path":self.target.as_str(),"offset":offset,"limit":limit})) {return Err(protocol(ProtocolErrorCode::PermissionDenied,"byte read denied"));}
             let _permit =
                 tokio::time::timeout(self.provider.deadline, self.provider.permits.acquire())
                     .await
@@ -600,9 +610,6 @@ impl WipOperationHandler for FileHandler {
         if matches!(operation, "read_lines" | "search_text") {
             let (offset, limit) =
                 crate::file_operation::window(arguments, operation == "search_text")?;
-            if !self.provider.allowed("Read",&json!({"target_workdir":self.alias,"file_path":self.target.as_str(),"offset":offset,"limit":limit})) {
-                return Err(protocol(ProtocolErrorCode::PermissionDenied,"text read denied"));
-            }
             let _permit =
                 tokio::time::timeout(self.provider.deadline, self.provider.permits.acquire())
                     .await
@@ -698,10 +705,7 @@ impl WipOperationHandler for FileHandler {
                 })?,
             );
         }
-        let mut permission_input = args.clone();
-        permission_input.insert("target_workdir".into(), json!(self.alias));
         if tool == "List" {
-            permission_input.insert("path".into(), json!(self.target.as_str()));
             if let Some(after) = args.get_mut("after") {
                 let entry = after.get("entry").and_then(Json::as_str).ok_or_else(|| {
                     protocol(
@@ -727,29 +731,6 @@ impl WipOperationHandler for FileHandler {
                 fields.remove("entry");
                 fields.insert("path".into(), json!(path.as_str()));
             }
-        } else if tool == "Glob" || tool == "Grep" {
-            let relative = args.get("path").and_then(Json::as_str).unwrap_or("");
-            permission_input.insert("path".into(), json!(join_under(&self.target, relative)?));
-        } else if tool == "Create" {
-            let relative = args.get("path").and_then(Json::as_str).ok_or_else(|| {
-                protocol(ProtocolErrorCode::InvalidArguments, "create requires path")
-            })?;
-            permission_input.remove("path");
-            permission_input.insert(
-                "file_path".into(),
-                json!(join_under(&self.target, relative)?),
-            );
-        } else {
-            permission_input.insert("file_path".into(), json!(self.target.as_str()));
-        }
-        if !self.provider.allowed(
-            if tool == "Create" { "Write" } else { tool },
-            &Json::Object(permission_input),
-        ) {
-            return Err(protocol(
-                ProtocolErrorCode::PermissionDenied,
-                "file operation denied; approval-required policy fails closed",
-            ));
         }
         let _permit = tokio::time::timeout(self.provider.deadline, self.provider.permits.acquire())
             .await
@@ -797,27 +778,6 @@ fn object_path(alias: &str, path: &WorkdirPath) -> String {
     } else {
         format!("{}/{}", checkout_root(alias), path.as_str())
     }
-}
-fn join_under(parent: &WorkdirPath, relative: &str) -> Result<String, WipOperationError> {
-    let child = WorkdirPath::new(relative).map_err(|_| {
-        protocol(
-            ProtocolErrorCode::InvalidArguments,
-            "path must stay relative to this directory",
-        )
-    })?;
-    if relative.starts_with('/') {
-        return Err(protocol(
-            ProtocolErrorCode::InvalidArguments,
-            "absolute paths are not permitted",
-        ));
-    }
-    Ok(if parent.is_root() {
-        child.as_str().into()
-    } else if child.is_root() {
-        parent.as_str().into()
-    } else {
-        format!("{}/{}", parent.as_str(), child.as_str())
-    })
 }
 fn operation(
     name: &str,

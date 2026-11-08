@@ -1,6 +1,6 @@
 # manifest
 
-Validates reusable Worker Profiles and resolves them into Manifests with launch-time names, paths, and permissions. This crate owns configuration types and resolution boundaries, not Worker execution or credential retrieval.
+Validates reusable Worker Profiles and resolves them into Manifests with launch-time names, paths, and Feature composition. Host operation grants are not Profile configuration. This crate owns configuration types and resolution boundaries, not Worker execution or credential retrieval.
 
 ## Main entry points
 

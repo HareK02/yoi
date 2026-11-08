@@ -408,20 +408,18 @@ async fn ordinary_subject_default_coder_review_publishes_mr_and_preserves_unrevi
     assert_eq!(status, StatusCode::CREATED, "{subject}");
     let subject = subject["id"].as_str().unwrap().to_owned();
     let subjects = open_subjektiv_store(&h.api).unwrap();
-    assert!(
-        subjects
-            .current_subject_policy(&subject)
-            .unwrap()
-            .unwrap()
-            .delegation
-            .grants
-            .is_empty()
+    let created_policy = subjects.current_subject_policy(&subject).unwrap().unwrap();
+    assert_eq!(
+        created_policy.execution,
+        server_api::authorization::subject_default_permission_assignment()
     );
-    // Canonical operation-key policy BEFORE delegation: no fixture Profile,
-    // SQL grant insertion, individual Ticket policy patch or fixed Orchestrator.
-    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject,
-        r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "worker"; keys = ["worker.create", "worker.observe"]; }, { namespace = "merge_request"; keys = ["merge_request.read", "merge_request.readiness", "merge_request.complete"]; }]; }"#,
-        r#"{ namespaces = [{ namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; }, { namespace = "bash"; keys = ["bash.execute"]; }, { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; }, { namespace = "merge_request"; keys = ["merge_request.open"]; }]; }"#).await;
+    assert_eq!(
+        created_policy.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
+    // Enroll the unchanged creation defaults in canonical configuration. The
+    // actual child grant below remains bounded to its Workdir and Ticket.
+    super::super::chat_tests::adopt_chat_defaults(&h.api, &h.owner).await;
     let policy = subjects.current_subject_policy(&subject).unwrap();
     let body_path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/body");
     let body = ok(&h, "POST", &format!("{body_path}/start"), json!({
@@ -565,8 +563,8 @@ async fn ordinary_subject_default_coder_review_publishes_mr_and_preserves_unrevi
             "operation_id":"mr-connected-other-subject","role":"other MR Subject","behavior_md":""})).await;
     assert_eq!(status, StatusCode::CREATED, "{other}");
     let other = other["id"].as_str().unwrap();
-    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, other,
-        r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#, "{}").await;
+    super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, other, FULL_EXECUTION, "{}")
+        .await;
     let other_body = ok(&h, "POST",
         &format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{other}/body/start"),
         json!({"request_id":"mr-connected-other-start","expected_current":null,"expected_observation_token":null})).await;
@@ -734,8 +732,9 @@ const REVIEWER_NAME: &str = "full-r2-independent-reviewer";
 const FULL_SOURCE: &str = "work/full-r2-source";
 const FULL_TARGET: &str = "full-r2-temp-target";
 const FULL_CONTENT: &str = "full R2 independently reviewed candidate\n";
-const FULL_EXECUTION: &str = r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "worker"; keys = ["worker.create", "worker.observe", "worker.messaging"]; }, { namespace = "merge_request"; keys = ["merge_request.read", "merge_request.readiness", "merge_request.complete"]; }]; }"#;
-const FULL_DELEGATION: &str = r#"{ namespaces = [{ namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; }, { namespace = "bash"; keys = ["bash.execute"]; }, { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write"]; }, { namespace = "merge_request"; keys = ["merge_request.open", "merge_request.read", "merge_request.readiness", "merge_request.review"]; }, { namespace = "subworker"; keys = ["subworker.spawn", "subworker.observe", "subworker.stop"]; }, { namespace = "worker"; keys = ["worker.list", "worker.messaging"]; }]; }"#;
+const FULL_EXECUTION: &str = r#"{ sets = ["subject-default"]; }"#;
+const FULL_DELEGATION: &str =
+    r#"{ namespaces = [{ namespace = "subject"; keys = ["subject.delegate"]; }]; }"#;
 
 fn summary_ok(request: &agen::llm_client::Request, id: &str) -> bool {
     tool_result(request, id).is_some_and(|(error, output)| {
@@ -1582,11 +1581,31 @@ async fn normal_subject(
         .current_subject_policy(&subject)
         .unwrap()
         .unwrap();
-    assert!(policy.delegation.grants.is_empty());
-    super::super::chat_tests::adopt_subject_policy(
-        &h.api, &h.owner, &subject, execution, delegation,
-    )
-    .await;
+    assert_eq!(
+        policy.execution,
+        server_api::authorization::subject_default_permission_assignment()
+    );
+    assert_eq!(
+        policy.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
+    if execution == FULL_EXECUTION && delegation == FULL_DELEGATION {
+        // The positive scenario keeps both actual creation assignments intact.
+        super::super::chat_tests::adopt_chat_defaults(&h.api, &h.owner).await;
+        assert_eq!(
+            open_subjektiv_store(&h.api)
+                .unwrap()
+                .current_subject_policy(&subject)
+                .unwrap()
+                .unwrap(),
+            policy
+        );
+    } else {
+        super::super::chat_tests::adopt_subject_policy(
+            &h.api, &h.owner, &subject, execution, delegation,
+        )
+        .await;
+    }
     let started = ok(h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/body/start"),json!({
         "request_id":format!("{key}-start"),"expected_current":null,"expected_observation_token":null})).await;
     assert_eq!(started["disposition"], "accepted", "{started}");

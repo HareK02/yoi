@@ -2,7 +2,7 @@
 //!
 //! The `ticket` crate owns the Ticket domain and regular Tools; the Backend owns Workspace state,
 //! relationships, and audit. This module connects a scoped Workspace client to the enabled Tools.
-//! Shared WIP references, permissions, and unknown outcomes follow [`crate::wip`].
+//! Shared WIP references and unknown outcomes follow [`crate::wip`].
 //!
 //! # Route-bound subjects
 //!
@@ -10,7 +10,7 @@
 //! `T-*` or canonical internal IDs, never resolving Objective keys or deeper suffixes as Tickets.
 //! Item subjects come exclusively from the route; related targets remain explicit typed inputs.
 //! The `native` module owns the native action contracts, descriptor and input conversion. Enabled domain
-//! actions retain the Profile publication ceiling and operation-specific permission identities;
+//! actions retain the Feature access flags and operation-specific Host authorization;
 //! neither native presence nor Feature activation grants Backend authority. The Tool and native
 //! input boundaries converge on shared domain execution without inspecting each other's schemas.
 //!
@@ -58,7 +58,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -80,7 +79,6 @@ use crate::feature::{
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ServiceDeclaration,
     ServiceId, ToolContribution, ToolDeclaration, ToolDefinition,
 };
-use crate::permission::permission_action_for;
 use crate::wip::{
     WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
     WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
@@ -763,7 +761,7 @@ impl TicketFeatureAccess {
     }
 
     fn allows_tool(self, name: &str) -> bool {
-        // Profile tool policy controls case-decision access in both modes.
+        // Feature access flags control case-decision publication in both modes.
         // The Backend verifies actor/Workspace identity and CAS/replay, not
         // orchestration assignment as an additional case-decision permission.
         READ_ONLY_TOOL_NAMES.contains(&name)
@@ -2102,7 +2100,6 @@ pub fn mount_workspace_http_ticket_wip(
     registry: &mut WipMountRegistry,
     client: Arc<dyn WorkspaceClient>,
     access: TicketFeatureAccess,
-    permissions: Option<ToolPermissionConfig>,
     namespace_route: &WipNamespaceRoute,
 ) -> Result<(), WipMountError> {
     let collection_route = namespace_route.root().to_string();
@@ -2164,7 +2161,6 @@ pub fn mount_workspace_http_ticket_wip(
         descriptor: collection_descriptor,
         handler: Arc::new(TicketCollectionWipHandler {
             tools: operation_map(collection_tools),
-            permissions: permissions.clone(),
             collection_route: collection_route.clone(),
             merge_request_route: merge_request_route.clone(),
             objective_route: objective_route.clone(),
@@ -2186,7 +2182,6 @@ pub fn mount_workspace_http_ticket_wip(
         descriptor: item_descriptor,
         resolver: Arc::new(TicketItemResolver {
             tools: operation_map(item_tools),
-            permissions,
             collection_route: collection_route.clone(),
             merge_request_route: merge_request_route.clone(),
             objective_route: objective_route.clone(),
@@ -2207,7 +2202,6 @@ fn operation_map(tools: Vec<NativeTicketTool>) -> HashMap<String, NativeTicketTo
 
 struct TicketCollectionWipHandler {
     tools: HashMap<String, NativeTicketTool>,
-    permissions: Option<ToolPermissionConfig>,
     collection_route: String,
     merge_request_route: String,
     objective_route: String,
@@ -2233,7 +2227,7 @@ impl WipOperationHandler for TicketCollectionWipHandler {
             &self.objective_route,
         )?;
         let result_namespaces = context.result_namespaces.clone();
-        let response = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
+        let response = execute_native_ticket_tool(tool, input, context).await?;
         if operation == "create" {
             record_ticket_observation(&self.observations, None, &response, true);
         }
@@ -2250,7 +2244,6 @@ impl WipOperationHandler for TicketCollectionWipHandler {
 
 struct TicketItemResolver {
     tools: HashMap<String, NativeTicketTool>,
-    permissions: Option<ToolPermissionConfig>,
     collection_route: String,
     merge_request_route: String,
     objective_route: String,
@@ -2282,7 +2275,6 @@ impl WipDynamicItemResolver for TicketItemResolver {
             },
             handler: Arc::new(TicketItemWipHandler {
                 tools: self.tools.clone(),
-                permissions: self.permissions.clone(),
                 ticket_reference: item_reference.into(),
                 collection_route: self.collection_route.clone(),
                 merge_request_route: self.merge_request_route.clone(),
@@ -2295,7 +2287,6 @@ impl WipDynamicItemResolver for TicketItemResolver {
 
 struct TicketItemWipHandler {
     tools: HashMap<String, NativeTicketTool>,
-    permissions: Option<ToolPermissionConfig>,
     ticket_reference: String,
     collection_route: String,
     merge_request_route: String,
@@ -2322,7 +2313,7 @@ impl WipOperationHandler for TicketItemWipHandler {
             &self.objective_route,
         )?;
         let result_namespaces = context.result_namespaces.clone();
-        let response = execute_native_ticket_tool(tool, &self.permissions, input, context).await?;
+        let response = execute_native_ticket_tool(tool, input, context).await?;
         if operation == "parent_set" {
             // Old-parent CAS IDs may not have a locally observed canonical alias. A receipt
             // is not a fresh representation; conservatively invalidate rather than leave a
@@ -2358,11 +2349,9 @@ impl WipOperationHandler for TicketItemWipHandler {
 
 async fn execute_native_ticket_tool(
     tool: &NativeTicketTool,
-    permissions: &Option<ToolPermissionConfig>,
     input: Value,
     context: WipCallContext,
 ) -> Result<Value, WipOperationError> {
-    authorize_native_ticket(permissions, &tool.name, &input)?;
     if let Some(value) = parent_links::execute_value(tool.client.clone(), &tool.name, input.clone())
     {
         return value.map_err(map_ticket_tool_error);
@@ -2532,29 +2521,6 @@ async fn execute_ticket_domain(
         context,
     )
     .await
-}
-
-fn authorize_native_ticket(
-    permissions: &Option<ToolPermissionConfig>,
-    tool_name: &str,
-    input: &Value,
-) -> Result<(), WipOperationError> {
-    let Some(permissions) = permissions else {
-        return Ok(());
-    };
-    match permission_action_for(permissions, tool_name, input) {
-        ToolPermissionAction::Allow => Ok(()),
-        ToolPermissionAction::Deny => Err(protocol_failure(
-            ProtocolErrorCode::PermissionDenied,
-            format!("permission denied for projected tool `{tool_name}`"),
-        )),
-        ToolPermissionAction::Ask => Err(protocol_failure(
-            ProtocolErrorCode::PermissionDenied,
-            format!(
-                "permission approval is unavailable for projected tool `{tool_name}`; denied fail-closed"
-            ),
-        )),
-    }
 }
 
 // Only render the public API error envelope, never an arbitrary proxy body or
@@ -2970,7 +2936,6 @@ mod tests {
                     .iter()
                     .find(|tool| tool.name == "TicketCaseUpdate")
                     .unwrap(),
-                &None,
                 decision_input(),
                 WipCallContext {
                     result_namespaces: Default::default(),
@@ -3271,7 +3236,6 @@ mod tests {
             assert!(!read.parameters.iter().any(|param| param.name == "id"));
             let resolver = TicketItemResolver {
                 tools: operation_map(tools),
-                permissions: None,
                 collection_route: "/tickets".into(),
                 merge_request_route: "/merge-requests".into(),
                 objective_route: "/objectives".into(),
@@ -3562,7 +3526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn case_update_preserves_backend_cas_authority_rejections_and_wip_permission_gate() {
+    async fn case_update_preserves_backend_cas_and_authority_rejections() {
         for (status, code) in [
             (403, ProtocolErrorCode::PermissionDenied),
             (409, ProtocolErrorCode::InvalidArguments),
@@ -3576,7 +3540,6 @@ mod tests {
                 .unwrap();
             let error = execute_native_ticket_tool(
                 tool,
-                &None,
                 decision_input(),
                 WipCallContext {
                     result_namespaces: Default::default(),
@@ -3591,36 +3554,6 @@ mod tests {
             );
             assert_eq!(client.requests.lock().unwrap().len(), 1);
         }
-        let client = decision_client(200, TicketState::Closed);
-        let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
-        let tool = tools
-            .iter()
-            .find(|tool| tool.name == "TicketCaseUpdate")
-            .unwrap();
-        let permissions = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: Vec::new(),
-        });
-        let error = execute_native_ticket_tool(
-            tool,
-            &permissions,
-            decision_input(),
-            WipCallContext {
-                result_namespaces: Default::default(),
-                execution: ToolExecutionContext::direct(),
-                security_context: "author".into(),
-            },
-        )
-        .await
-        .expect_err("WIP denial prevents dispatch");
-        assert!(matches!(
-            error,
-            WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
-                ..
-            })
-        ));
-        assert!(client.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3664,7 +3597,6 @@ mod tests {
         assert!(summary.contains("never automatically replay"));
         let resolver = TicketItemResolver {
             tools: operation_map(tools),
-            permissions: None,
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -3821,7 +3753,6 @@ mod tests {
                 "http://backend",
             )),
             TicketFeatureAccess::review(),
-            None,
             &namespace_route,
         )
         .unwrap();
@@ -3835,7 +3766,6 @@ mod tests {
         let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
-            permissions: None,
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -3848,7 +3778,7 @@ mod tests {
     }
 
     #[test]
-    fn native_ticket_permission_input_preserves_presence_and_route_identity() {
+    fn native_ticket_input_preserves_presence_and_route_identity() {
         let arguments = json_to_wip(&json!({"content":{"title":"New"}})).unwrap();
         let WipValue::Record(arguments) = arguments else {
             unreachable!()
@@ -3892,17 +3822,6 @@ mod tests {
         )
         .unwrap_or_else(|_| panic!("native comment"));
         assert_eq!(input["ticket"], "T-42");
-        let permissions = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: Vec::new(),
-        });
-        assert!(matches!(
-            authorize_native_ticket(&permissions, "TicketComment", &input),
-            Err(WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
-                ..
-            }))
-        ));
     }
 
     #[test]
@@ -3910,7 +3829,6 @@ mod tests {
         let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
-            permissions: None,
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -3958,7 +3876,6 @@ mod tests {
         let observations = Arc::new(Mutex::new(TicketObservationState::default()));
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
-            permissions: None,
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -3997,7 +3914,6 @@ mod tests {
         }
         let resolver = TicketItemResolver {
             tools: HashMap::new(),
-            permissions: None,
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -4799,7 +4715,6 @@ mod tests {
                         .unwrap();
                         let handler = TicketCollectionWipHandler {
                             tools: operation_map(tools),
-                            permissions: None,
                             collection_route: "/tickets".into(),
                             merge_request_route: "/merge-requests".into(),
                             objective_route: "/objectives".into(),
@@ -5219,7 +5134,6 @@ mod tests {
                                 )
                                 .unwrap(),
                             ),
-                            permissions: None,
                             collection_route: "/tickets".into(),
                             merge_request_route: "/merge-requests".into(),
                             objective_route: "/objectives".into(),
@@ -5532,7 +5446,6 @@ mod tests {
             tools: operation_map(
                 native_ticket_tools(client.clone(), TicketFeatureAccess::read_only()).unwrap(),
             ),
-            permissions: None,
             ticket_reference: "T-739".into(),
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),

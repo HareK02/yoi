@@ -127,8 +127,9 @@ pub struct WorkerLifecycleSpawnRequest {
     pub ticket_id: Option<String>,
     /// Required for ordinary and Ticket spawn; exact retries reuse this ID and full input.
     pub operation_id: Option<String>,
-    /// Explicit requested authority. Profile selection alone grants nothing.
-    pub execution_grant: Option<server_api::authorization::WorkerDelegationRequest>,
+    /// Workspace launch policy and observed authorization revision.
+    pub policy_id: String,
+    pub policy_revision: u64,
     pub display_name: String,
     pub initial_submit: Vec<Segment>,
 }

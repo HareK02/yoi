@@ -77,6 +77,7 @@ pub(crate) fn preview_migration(
             .map(|policy| policy.source.clone())
             .collect(),
         remove_subjects: vec![],
+        ..Default::default()
     };
     let changes = draft_changes(&original, &source)?;
     // Caller's real application provider bundle (including PromptSchema) is
@@ -159,6 +160,7 @@ fn migrate_policies(
                 &PermissionSource {
                     subjects: vec![policy.source.clone()],
                     remove_subjects: vec![],
+                    ..Default::default()
                 },
                 |_| Ok(()),
             )?;
@@ -771,6 +773,8 @@ mod tests {
                 delegation: AssignmentSource::default(),
             }],
             remove_subjects: vec!["removed".into()],
+            sets: vec![],
+            human_worker_default: AssignmentSource::default(),
         };
         let main_path = path(MAIN_CONFIG_ENTRYPOINT).unwrap();
         let (rendered, mut changes) =

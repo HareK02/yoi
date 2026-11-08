@@ -53,9 +53,15 @@ impl Fixture {
 }
 fn runtime(router: Arc<WorkdirSessionRouter>, view: BashOutputView) -> WipRuntime {
     let mut registry = WipMountRegistry::new();
-    crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), None)
-        .unwrap();
-    crate::feature::builtin::bash::mount(&mut registry, router, view, None).unwrap();
+    crate::checkout::mount_checkouts(
+        &mut registry,
+        router.clone(),
+        tools::Tracker::new(),
+        true,
+        false,
+    )
+    .unwrap();
+    crate::feature::builtin::bash::mount(&mut registry, router, view, true).unwrap();
     WipRuntime::new(WipHost::new(registry), SecurityContext::new("bash-test"), 0).unwrap()
 }
 fn value(output: ToolOutput) -> Json {
@@ -408,59 +414,25 @@ async fn native_timeout_and_cancellation_keep_terminal_evidence_instead_of_succe
 }
 
 #[tokio::test]
-async fn common_read_and_search_permissions_are_independent_from_bash_execution() {
+async fn bash_feature_off_hides_execution_and_retained_output_even_with_live_provider() {
     let f = Fixture::new();
     let result = f.run("printf needle").await;
     let path = result["stdout_entry"].as_str().unwrap();
     let mut registry = WipMountRegistry::new();
-    crate::feature::builtin::bash::mount(
-        &mut registry,
-        f.router.clone(),
-        f.view.clone(),
-        Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: vec![manifest::ToolPermissionRule {
-                tool: "Grep".into(),
-                pattern: "*".into(),
-                action: ToolPermissionAction::Allow,
-            }],
-        }),
-    )
-    .unwrap();
-    let restricted = WipRuntime::new(
-        WipHost::new(registry),
-        SecurityContext::new("restricted"),
-        0,
-    )
-    .unwrap();
-    restricted.inspect(path.into(), false).await.unwrap();
+    crate::feature::builtin::bash::mount(&mut registry, f.router.clone(), f.view.clone(), false)
+        .unwrap();
+    assert!(registry.routes().next().is_none());
+    assert!(!registry.has_subtree("/bash-output"));
+    let disabled =
+        WipRuntime::new(WipHost::new(registry), SecurityContext::new("disabled"), 0).unwrap();
+    assert!(disabled.inspect(path.into(), false).await.is_err());
     assert!(
-        invoke(&restricted, path, Contract::ReadBytes, "read", json!({}))
-            .await
-            .is_err()
-    );
-    assert!(
-        invoke(&restricted, path, Contract::ReadLines, "read", json!({}))
-            .await
-            .is_err()
-    );
-    let found = invoke(
-        &restricted,
-        path,
-        Contract::SearchText,
-        "search",
-        json!({"pattern":"needle"}),
-    )
-    .await
-    .unwrap();
-    assert!(found["matches"].as_array().unwrap().len() == 1);
-    assert!(
-        restricted
+        disabled
             .invoke(
                 "/bash-output".into(),
                 contextual_reference("yoi.bash/command/v1", "/bash-output"),
                 "run".into(),
-                json!({"input":{"command":"touch denied","cwd":"."}}),
+                json!({"input":{"command":"touch denied", "cwd":"."}}),
                 Default::default()
             )
             .await

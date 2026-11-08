@@ -9,6 +9,7 @@ import "./base.dcdl" // {
     };
 
     feature = {
+        filesystem_write = { enabled = false; };
         task = { enabled = true; };
         memory = { enabled = false; };
         subjektiv = { enabled = true; };

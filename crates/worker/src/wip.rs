@@ -77,7 +77,6 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use http::{Request, Response};
-use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
@@ -97,8 +96,6 @@ use wip_protocol::{
     OperationDeclaration, ParameterDeclaration, ProtocolError, ProtocolErrorCode,
     ProtocolInteraction, ReturnDeclaration, TypeExpr, Value,
 };
-
-use crate::permission::permission_action_for;
 
 mod binding;
 mod compatibility_schema;
@@ -2127,7 +2124,6 @@ struct CompatibilityHandler {
     name: String,
     schema: Json,
     tool: Arc<dyn Tool>,
-    permissions: Option<ToolPermissionConfig>,
 }
 
 #[async_trait]
@@ -2168,26 +2164,6 @@ impl WipOperationHandler for CompatibilityHandler {
                 format!("tool input violates its original JSON Schema: {error}"),
             )));
         }
-        if let Some(permissions) = &self.permissions {
-            match permission_action_for(permissions, &self.name, &input) {
-                ToolPermissionAction::Allow => {}
-                ToolPermissionAction::Deny => {
-                    return Err(WipOperationError::Protocol(protocol_error(
-                        ProtocolErrorCode::PermissionDenied,
-                        format!("permission denied for projected tool `{}`", self.name),
-                    )));
-                }
-                ToolPermissionAction::Ask => {
-                    return Err(WipOperationError::Protocol(protocol_error(
-                        ProtocolErrorCode::PermissionDenied,
-                        format!(
-                            "permission approval is unavailable for projected tool `{}`; denied fail-closed",
-                            self.name
-                        ),
-                    )));
-                }
-            }
-        }
         let input_json = serde_json::to_string(&input).map_err(|error| {
             WipOperationError::Protocol(protocol_error(
                 ProtocolErrorCode::InvalidArguments,
@@ -2227,7 +2203,6 @@ impl WipOperationHandler for CompatibilityHandler {
 fn compatibility_projection(
     meta: ToolMeta,
     tool: Arc<dyn Tool>,
-    permissions: Option<ToolPermissionConfig>,
 ) -> Result<WipProjection, WipMountError> {
     jsonschema::validator_for(&meta.input_schema).map_err(|error| {
         WipMountError::InvalidProjection {
@@ -2291,7 +2266,6 @@ fn compatibility_projection(
         name: meta.name.clone(),
         schema: meta.input_schema,
         tool,
-        permissions,
     });
     Ok(WipProjection {
         route: route.clone(),
@@ -2927,15 +2901,9 @@ impl Drop for DispatchedCallGuard {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn install_wip_mode<C: LlmClient, A: Send + Sync>(
     engine: &mut Engine<C, Mutable, A>,
-    permissions: Option<ToolPermissionConfig>,
     security_context: String,
 ) -> Result<Arc<WipRuntime>, String> {
-    install_wip_mode_with_mounts(
-        engine,
-        permissions,
-        security_context,
-        WipMountRegistry::new(),
-    )
+    install_wip_mode_with_mounts(engine, security_context, WipMountRegistry::new())
 }
 
 /// Host extension point for aggregating Feature-owned native projections before
@@ -2944,7 +2912,6 @@ pub(crate) fn install_wip_mode<C: LlmClient, A: Send + Sync>(
 /// route/interface collisions remain fatal.
 pub fn install_wip_mode_with_mounts<C: LlmClient, A: Send + Sync>(
     engine: &mut Engine<C, Mutable, A>,
-    permissions: Option<ToolPermissionConfig>,
     security_context: String,
     mut registry: WipMountRegistry,
 ) -> Result<Arc<WipRuntime>, String> {
@@ -2973,8 +2940,8 @@ pub fn install_wip_mode_with_mounts<C: LlmClient, A: Send + Sync>(
         let capability = format!("tool:{}", meta.name);
         let name = meta.name.clone();
         if !registry.replaces_compatibility(&capability) {
-            let projection = compatibility_projection(meta, tool, permissions.clone())
-                .map_err(|error| error.to_string())?;
+            let projection =
+                compatibility_projection(meta, tool).map_err(|error| error.to_string())?;
             registry
                 .mount(projection)
                 .map_err(|error| error.to_string())?;
@@ -3335,17 +3302,10 @@ mod tests {
             }))
     }
 
-    fn registry_with_tool(
-        name: &str,
-        calls: Arc<AtomicUsize>,
-        permissions: Option<ToolPermissionConfig>,
-    ) -> WipMountRegistry {
+    fn registry_with_tool(name: &str, calls: Arc<AtomicUsize>) -> WipMountRegistry {
         let mut registry = WipMountRegistry::new();
         registry
-            .mount(
-                compatibility_projection(meta(name), Arc::new(EchoTool { calls }), permissions)
-                    .unwrap(),
-            )
+            .mount(compatibility_projection(meta(name), Arc::new(EchoTool { calls })).unwrap())
             .unwrap();
         registry
     }
@@ -3395,7 +3355,7 @@ mod tests {
         for index in 0..24 {
             wip.register_tool(echo_definition(format!("Echo{index}"), Arc::clone(&calls)));
         }
-        let runtime = install_wip_mode(&mut wip, None, "worker-a".into()).unwrap();
+        let runtime = install_wip_mode(&mut wip, "worker-a".into()).unwrap();
         wip.tool_server_handle().flush_pending();
         assert_eq!(
             wip.tool_server_handle()
@@ -3414,7 +3374,7 @@ mod tests {
         for index in 0..48 {
             larger.register_tool(echo_definition(format!("Echo{index}"), Arc::clone(&calls)));
         }
-        let larger = install_wip_mode(&mut larger, None, "worker-b".into())
+        let larger = install_wip_mode(&mut larger, "worker-b".into())
             .unwrap()
             .metrics();
         assert!(larger.ordinary_schema_bytes > metrics.ordinary_schema_bytes);
@@ -3427,7 +3387,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         engine.register_tool(echo_definition("Echo".into(), Arc::clone(&calls)));
-        install_wip_mode(&mut engine, None, "worker-a".into()).unwrap();
+        install_wip_mode(&mut engine, "worker-a".into()).unwrap();
         let tools = engine.tool_server_handle();
         tools.flush_pending();
         let inspected = transport_output_json(
@@ -3496,13 +3456,12 @@ mod tests {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut registry = registry_with_tool("Echo", calls, None);
+        let mut registry = registry_with_tool("Echo", calls);
         let mut native = compatibility_projection(
             meta("Echo"),
             Arc::new(EchoTool {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
-            None,
         )
         .unwrap();
         native.kind = WipProjectionKind::Native;
@@ -3517,7 +3476,6 @@ mod tests {
             Arc::new(EchoTool {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
-            None,
         )
         .unwrap();
         collision.route = "/tools/Echo".into();
@@ -4053,7 +4011,6 @@ mod tests {
                 Arc::new(EchoTool {
                     calls: Arc::new(AtomicUsize::new(0)),
                 }),
-                None,
             )
             .unwrap();
             projection.route = route.into();
@@ -4782,7 +4739,6 @@ mod tests {
     fn catalog_transport_runtime(
         client: Arc<dyn crate::worker::WorkspaceClient>,
         manage: bool,
-        permissions: Option<ToolPermissionConfig>,
     ) -> Arc<WipRuntime> {
         use crate::feature::FeatureRegistryBuilder;
         use crate::feature::builtin::manage_workdir::{
@@ -4796,11 +4752,9 @@ mod tests {
         assert!(!report.has_errors());
         assert_eq!(report.installed_tool_names().len(), 5);
         let mut registry = WipMountRegistry::new();
-        mount_workspace_workdir_wip(&mut registry, &feature, true, manage, permissions.clone())
-            .unwrap();
+        mount_workspace_workdir_wip(&mut registry, &feature, true, manage).unwrap();
         let runtime =
-            install_wip_mode_with_mounts(&mut engine, permissions, "worker-a".into(), registry)
-                .unwrap();
+            install_wip_mode_with_mounts(&mut engine, "worker-a".into(), registry).unwrap();
         for name in [
             "WorkdirList",
             "WorkdirCreate",
@@ -4821,7 +4775,7 @@ mod tests {
         client.state.lock().unwrap().workdirs = (0..205).map(|n| json!({
             "working_directory_id":format!("wd-{n:03}"), "source":{"kind":"repository", "repository_key":"registered-key"}, "status":"active"
         })).collect();
-        let runtime = catalog_transport_runtime(client.clone(), false, None);
+        let runtime = catalog_transport_runtime(client.clone(), false);
         let interface = observed_contextual_interface(&runtime, "/workdirs").await;
         let mut cursor = Json::Null;
         let mut ids = BTreeSet::new();
@@ -4875,56 +4829,6 @@ mod tests {
                 .all(|r| !r.path.ends_with("/working-directories")),
             "WIP must not use a capped legacy inventory"
         );
-
-        let permissions = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: vec![
-                manifest::ToolPermissionRule {
-                    tool: "WorkdirList".into(),
-                    pattern: "*".into(),
-                    action: ToolPermissionAction::Allow,
-                },
-                manifest::ToolPermissionRule {
-                    tool: "WorkdirRead".into(),
-                    pattern: "*wd-204*".into(),
-                    action: ToolPermissionAction::Allow,
-                },
-            ],
-        });
-        let runtime = catalog_transport_runtime(client, false, permissions);
-        let interface = observed_contextual_interface(&runtime, "/workdirs").await;
-        let first = transport_call_json(
-            &runtime,
-            "/workdirs",
-            &interface,
-            "list",
-            json!({"limit":100}),
-        )
-        .await;
-        assert_eq!(first["empty"], true);
-        assert_eq!(
-            first["has_more"], true,
-            "empty filtered page is not terminal"
-        );
-        let second = transport_call_json(
-            &runtime,
-            "/workdirs",
-            &interface,
-            "list",
-            json!({"limit":100, "cursor":first["next_cursor"]}),
-        )
-        .await;
-        assert_eq!(second["has_more"], true);
-        let last = transport_call_json(
-            &runtime,
-            "/workdirs",
-            &interface,
-            "list",
-            json!({"limit":100, "cursor":second["next_cursor"]}),
-        )
-        .await;
-        assert_eq!(last["items"][0]["working_directory_id"], "wd-204");
-        assert_eq!(last["has_more"], false);
     }
 
     #[tokio::test]
@@ -4936,7 +4840,7 @@ mod tests {
                 "connection_id":format!("lifetime-{n:03}"), "alias":format!("alias-{n:03}"), "working_directory_id":"wd", "capabilities":{"bits":25}
             })).collect();
             let first_fifty = client.state.lock().unwrap().attachments[..50].to_vec();
-            let runtime = catalog_transport_runtime(client.clone(), true, None);
+            let runtime = catalog_transport_runtime(client.clone(), true);
             let interface = observed_contextual_interface(&runtime, "/workdir-attachments").await;
             let old_validator = runtime
                 .host
@@ -4994,7 +4898,7 @@ mod tests {
         use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
         use crate::worker::WorkspaceRequestMethod;
         let client = Arc::new(CatalogClient::default());
-        let runtime = catalog_transport_runtime(client.clone(), true, None);
+        let runtime = catalog_transport_runtime(client.clone(), true);
         let root = transport_output_json(runtime.tree("/".into(), 1, false).await.unwrap());
         let paths = root["tree"]["children"]
             .as_array()
@@ -5159,7 +5063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_native_transport_read_only_and_read_without_list_permissions() {
+    async fn catalog_native_transport_catalog_only_retains_host_authorization() {
         use crate::feature::builtin::manage_workdir::wip::tests::CatalogClient;
         use crate::worker::WorkspaceRequestMethod;
         let client = Arc::new(CatalogClient::default());
@@ -5167,7 +5071,7 @@ mod tests {
             "working_directory_id":"wd-read", "status":"active", "cleanliness":"clean",
             "source":{"kind":"repository", "repository_key":"registered-key"},
         }));
-        let runtime = catalog_transport_runtime(client.clone(), false, None);
+        let runtime = catalog_transport_runtime(client.clone(), false);
         runtime.tree("/".into(), 1, false).await.unwrap();
         let collection_interface = observed_contextual_interface(&runtime, "/workdirs").await;
         assert_eq!(
@@ -5227,18 +5131,6 @@ mod tests {
                 .iter()
                 .all(|request| request.method == WorkspaceRequestMethod::Get)
         );
-        let read_only = ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: ["RepositoryRead", "WorkdirRead"]
-                .iter()
-                .map(|name| manifest::ToolPermissionRule {
-                    tool: (*name).into(),
-                    pattern: "*".into(),
-                    action: ToolPermissionAction::Allow,
-                })
-                .collect(),
-        };
-        let runtime = catalog_transport_runtime(client.clone(), false, Some(read_only));
         for path in ["/repositories/registered-key", "/workdirs/wd-read"] {
             let interface = observed_contextual_interface(&runtime, path).await;
             assert_eq!(
@@ -5315,7 +5207,6 @@ mod tests {
                 catalog: catalog.clone(),
             }),
             true,
-            None,
         );
         let interface = observed_contextual_interface(&runtime, "/workdirs").await;
         let error = runtime
@@ -5591,7 +5482,6 @@ mod tests {
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         let runtime = install_wip_mode_with_mounts(
             &mut engine,
-            None,
             "worker-a".into(),
             native_image_registry(false),
         )
@@ -5637,13 +5527,8 @@ mod tests {
     #[tokio::test]
     async fn native_attachments_do_not_bypass_return_value_validation() {
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
-        install_wip_mode_with_mounts(
-            &mut engine,
-            None,
-            "worker-a".into(),
-            native_image_registry(true),
-        )
-        .unwrap();
+        install_wip_mode_with_mounts(&mut engine, "worker-a".into(), native_image_registry(true))
+            .unwrap();
         let tools = engine.tool_server_handle();
         tools.flush_pending();
         tools
@@ -5841,7 +5726,6 @@ mod tests {
             let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
             let runtime = install_wip_mode_with_mounts(
                 &mut engine,
-                None,
                 "worker-a".into(),
                 native_failure_registry(code.clone(), message, attach_failure, calls.clone()),
             )
@@ -5980,7 +5864,6 @@ mod tests {
             let mut engine = Engine::new(client.clone());
             let runtime = install_wip_mode_with_mounts(
                 &mut engine,
-                None,
                 "worker-a".into(),
                 native_failure_registry(
                     ProtocolErrorCode::InvalidArguments,
@@ -6064,13 +5947,8 @@ mod tests {
             requests: Arc::new(Mutex::new(Vec::new())),
         };
         let mut engine = Engine::new(client.clone());
-        install_wip_mode_with_mounts(
-            &mut engine,
-            None,
-            "worker-a".into(),
-            native_image_registry(false),
-        )
-        .unwrap();
+        install_wip_mode_with_mounts(&mut engine, "worker-a".into(), native_image_registry(false))
+            .unwrap();
         let tools = engine.tool_server_handle();
         tools.flush_pending();
         tools
@@ -6213,7 +6091,7 @@ mod tests {
     #[tokio::test]
     async fn stateful_discover_inspect_call_round_trip_validates_original_schema() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let host = WipHost::new(registry_with_tool("Echo", Arc::clone(&calls), None));
+        let host = WipHost::new(registry_with_tool("Echo", Arc::clone(&calls)));
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 4096).unwrap();
 
         runtime.tree("/".into(), 2, false).await.unwrap();
@@ -6255,7 +6133,7 @@ mod tests {
     #[tokio::test]
     async fn sessions_are_isolated_and_stale_validators_fail_before_dispatch() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let host = WipHost::new(registry_with_tool("Echo", Arc::clone(&calls), None));
+        let host = WipHost::new(registry_with_tool("Echo", Arc::clone(&calls)));
         let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
         runtime.tree("/".into(), 2, false).await.unwrap();
         runtime
@@ -6435,7 +6313,6 @@ mod tests {
             Arc::new(EchoTool {
                 calls: Arc::clone(&calls),
             }),
-            None,
         )
         .unwrap();
         collection.route = collection_route.clone();
@@ -6646,7 +6523,7 @@ mod tests {
             .replace_compatibility_tools("/objectives", ["Echo"])
             .unwrap();
         let runtime =
-            install_wip_mode_with_mounts(&mut engine, None, "worker-a".into(), registry).unwrap();
+            install_wip_mode_with_mounts(&mut engine, "worker-a".into(), registry).unwrap();
         assert!(runtime.host.projection("/tools/Echo").is_none());
         assert!(runtime.host.projection("/tools/Other").is_some());
         assert!(runtime.host.projection("/objectives").is_some());
@@ -6708,13 +6585,11 @@ mod tests {
             &mut authoring_registry,
             authoring_client.clone(),
             authoring_access,
-            None,
             &route,
         )
         .unwrap();
         let authoring = install_wip_mode_with_mounts(
             &mut authoring_engine,
-            None,
             "authoring-worker".into(),
             authoring_registry,
         )
@@ -6846,13 +6721,11 @@ mod tests {
             &mut workflow_registry,
             workflow_client.clone(),
             workflow_access,
-            None,
             &route,
         )
         .unwrap();
         let workflow = install_wip_mode_with_mounts(
             &mut workflow_engine,
-            None,
             "workflow-worker".into(),
             workflow_registry,
         )
@@ -6957,17 +6830,12 @@ status: 200,
             &mut coder_registry,
             coder_client.clone(),
             coder_config,
-            None,
             &route,
         )
         .unwrap();
-        let coder = install_wip_mode_with_mounts(
-            &mut coder_engine,
-            None,
-            "coder-worker".into(),
-            coder_registry,
-        )
-        .unwrap();
+        let coder =
+            install_wip_mode_with_mounts(&mut coder_engine, "coder-worker".into(), coder_registry)
+                .unwrap();
         let discovered = coder.tree("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
         assert!(discovered.contains("/merge-requests"));
@@ -7081,13 +6949,11 @@ status: 200,
             &mut reviewer_registry,
             reviewer_client,
             reviewer_config,
-            None,
             &route,
         )
         .unwrap();
         let reviewer = install_wip_mode_with_mounts(
             &mut reviewer_engine,
-            None,
             "reviewer-worker".into(),
             reviewer_registry,
         )
@@ -7176,13 +7042,11 @@ status: 200,
             &mut orchestrator_registry,
             orchestrator_client.clone(),
             orchestrator_config,
-            None,
             &route,
         )
         .unwrap();
         let orchestrator = install_wip_mode_with_mounts(
             &mut orchestrator_engine,
-            None,
             "orchestrator-worker".into(),
             orchestrator_registry,
         )
@@ -7337,14 +7201,6 @@ status: 200,
         {
             engine.register_tool(definition);
         }
-        let permissions = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Allow,
-            rules: vec![manifest::ToolPermissionRule {
-                tool: "ObjectiveCreate".into(),
-                pattern: serde_json::to_string(&json!({"title": "Denied"})).unwrap(),
-                action: ToolPermissionAction::Deny,
-            }],
-        });
         let mut registry = WipMountRegistry::new();
         let namespace_route = registry
             .allocate_namespace("objective", "objectives")
@@ -7352,13 +7208,11 @@ status: 200,
         crate::feature::builtin::objective::mount_workspace_http_objective_wip(
             &mut registry,
             client.clone(),
-            permissions.clone(),
             &namespace_route,
         )
         .unwrap();
         let runtime =
-            install_wip_mode_with_mounts(&mut engine, permissions, "worker-a".into(), registry)
-                .unwrap();
+            install_wip_mode_with_mounts(&mut engine, "worker-a".into(), registry).unwrap();
 
         let discovered = runtime.tree("/".into(), 3, false).await.unwrap();
         let discovered = discovered.content.unwrap();
@@ -7379,18 +7233,6 @@ status: 200,
             )
             .await
             .unwrap();
-        let denied = runtime
-            .call(
-                collection_path.into(),
-                crate::wip::root_reference("yoi.objective/collection/v1"),
-                "create".into(),
-                json!({"title": "Denied"}),
-                ToolExecutionContext::direct(),
-            )
-            .await
-            .unwrap_err();
-        assert!(denied.to_string().contains("PermissionDenied"));
-        assert_eq!(client.requests().len(), 1);
         let created = runtime
             .call(
                 collection_path.into(),
@@ -7464,7 +7306,7 @@ status: 200,
     async fn prepare_runtime_with_tool(name: &str, tool: Arc<dyn Tool>) -> WipRuntime {
         let mut registry = WipMountRegistry::new();
         registry
-            .mount(compatibility_projection(meta(name), tool, None).unwrap())
+            .mount(compatibility_projection(meta(name), tool).unwrap())
             .unwrap();
         let runtime =
             WipRuntime::new(WipHost::new(registry), SecurityContext::new("worker-a"), 0).unwrap();
@@ -7760,38 +7602,6 @@ status: 200,
                 ..
             }
         ));
-    }
-
-    #[tokio::test]
-    async fn projected_permission_policy_is_applied_to_original_tool_identity() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let permissions = ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: Vec::new(),
-        };
-        let host = WipHost::new(registry_with_tool(
-            "Echo",
-            Arc::clone(&calls),
-            Some(permissions),
-        ));
-        let runtime = WipRuntime::new(host, SecurityContext::new("worker-a"), 0).unwrap();
-        runtime.tree("/".into(), 2, false).await.unwrap();
-        runtime
-            .prepare_call_observations("/tools/Echo".into(), false)
-            .await
-            .unwrap();
-        let error = runtime
-            .call(
-                "/tools/Echo".into(),
-                crate::wip::root_reference("yoi.tool/Echo/v1"),
-                "call".into(),
-                json!({"input":{"message": "ok"}}),
-                ToolExecutionContext::direct(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("PermissionDenied"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
     include!("wip/ticket_native_tests.rs");
 }

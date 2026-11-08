@@ -9,9 +9,7 @@ use crate::builtin_profile::{
     BUILTIN_DEFAULT_PROFILE, builtin_profile_catalog_snapshot, builtin_profile_entrypoints,
     resolve_builtin_profile_artifact,
 };
-use crate::config::{
-    CompactionConfigPartial, FeatureConfigPartial, PermissionConfigPartial, SessionConfigPartial,
-};
+use crate::config::{CompactionConfigPartial, FeatureConfigPartial, SessionConfigPartial};
 use crate::model::{AuthRef, ModelManifest};
 use crate::{
     EngineManifestConfig, McpConfig, McpStdioCwdPolicy, Permission, ResolveError, ScopeConfig,
@@ -649,7 +647,6 @@ fn resolve_profile_value(
             workspace_base,
         )?,
         session: profile.session,
-        permissions: profile.permissions,
         feature: profile.feature,
         mcp: profile.mcp,
         plugins: profile.plugins,
@@ -694,8 +691,6 @@ struct ProfileConfig {
     delegation_scope: Option<ProfileScopeConfig>,
     #[serde(default)]
     session: Option<SessionConfigPartial>,
-    #[serde(default)]
-    permissions: Option<PermissionConfigPartial>,
     #[serde(default)]
     feature: FeatureConfigPartial,
     #[serde(default)]
@@ -1620,8 +1615,7 @@ mod tests {
         for catalog in [None, Some(false), Some(true)] {
             let mut artifact = serde_json::json!({
                 "worker": { "mode": "tools" },
-                "feature": { "manage_workdir": { "enabled": false } },
-                "permissions": { "default_action": "deny" }
+                "feature": { "manage_workdir": { "enabled": false } }
             });
             if let Some(enabled) = catalog {
                 artifact["feature"]["workdir_catalog"] = serde_json::json!({ "enabled": enabled });
@@ -1645,10 +1639,6 @@ mod tests {
             assert_eq!(manifest.worker.mode, crate::WorkerMode::Tools);
             assert!(manifest.scope.allow.is_empty());
             assert!(manifest.delegation_scope.allow.is_empty());
-            assert_eq!(
-                manifest.permissions.as_ref().unwrap().default_action,
-                crate::ToolPermissionAction::Deny
-            );
             validate_profile_execution_target(&manifest, ProfileExecutionTarget::Standalone)
                 .unwrap();
 
@@ -1731,7 +1721,59 @@ mod tests {
     }
 
     #[test]
-    fn builtin_async_chat_exposes_only_opted_in_chat_and_bounded_features() {
+    fn profiles_reject_removed_permissions_without_discarding_old_denies() {
+        let tmp = TempDir::new().unwrap();
+        for policy in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"default_action":"deny"}),
+        ] {
+            let error = resolve_profile_artifact_value(
+                serde_json::json!({"permissions": policy}),
+                ProfileSource::Archive {
+                    archive_id: "old-profile".into(),
+                    source: "test".into(),
+                },
+                tmp.path(),
+                "test-worker",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("permissions"), "{error}");
+        }
+    }
+
+    #[test]
+    fn builtin_read_only_profiles_keep_inspection_without_write_supply() {
+        let tmp = TempDir::new().unwrap();
+        for name in [
+            "reviewer",
+            "backend-job",
+            "memory-consolidation",
+            "subjektiv-memory-consolidation",
+        ] {
+            let resolved = ProfileResolver::new()
+                .with_workspace_base(tmp.path())
+                .resolve(
+                    &ProfileSelector::source_named(ProfileRegistrySource::Builtin, name),
+                    ProfileResolveOptions::with_worker_name("read-worker"),
+                )
+                .unwrap();
+            let manifest = resolved.manifest;
+            assert!(manifest.feature.filesystem.enabled, "{name}");
+            assert!(!manifest.feature.filesystem_write.enabled, "{name}");
+            assert!(
+                manifest
+                    .scope
+                    .allow
+                    .iter()
+                    .all(|rule| rule.permission == Permission::Read),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_async_chat_exposes_coordination_without_filesystem_authority() {
         let tmp = TempDir::new().unwrap();
         let resolved = ProfileResolver::new()
             .with_workspace_base(tmp.path())
@@ -1761,83 +1803,38 @@ mod tests {
         assert!(!feature.flow.enabled);
         assert!(feature.worker.enabled);
         assert!(feature.worker.direct_spawn);
-        assert!(!feature.workspace_worker_discovery.enabled);
+        assert!(feature.workspace_worker_discovery.enabled);
         assert!(feature.objective.enabled);
         assert!(feature.ticket.enabled);
-        assert!(!feature.ticket.authoring);
-        assert!(!feature.ticket.thread);
+        assert!(feature.ticket.authoring);
+        assert!(feature.ticket.thread);
         assert!(!feature.ticket.intake);
-        assert!(!feature.ticket.workflow);
-        assert!(!feature.merge_request.show);
+        assert!(feature.ticket.workflow);
+        assert!(feature.merge_request.show);
         assert!(!feature.merge_request.open);
         assert!(!feature.merge_request.review);
-        assert!(!feature.merge_request.readiness_check);
-        assert!(!feature.merge_request.complete);
+        assert!(feature.merge_request.readiness_check);
+        assert!(feature.merge_request.complete);
+        assert!(feature.manage_workdir.enabled);
+        assert!(feature.orchestration.enabled);
+        assert_eq!(
+            manifest.web.as_ref().and_then(|web| web.enabled),
+            Some(false)
+        );
         for flag in [
             feature.web,
             feature.image,
             feature.drive,
-            feature.manage_workdir,
             feature.workdir_catalog,
             feature.workspace_config,
-            feature.orchestration,
         ] {
             assert!(!flag.enabled);
         }
 
-        let permissions = manifest.permissions.unwrap();
-        assert_eq!(
-            permissions.default_action,
-            crate::ToolPermissionAction::Deny
-        );
-        // Exact tool names and all-argument rules let the Worker statically hide
-        // denied filesystem tools while its permission hook enforces each call.
-        let allowed = permissions
-            .rules
-            .iter()
-            .map(|rule| {
-                assert_eq!(rule.action, crate::ToolPermissionAction::Allow);
-                assert_eq!(rule.pattern, "*");
-                rule.tool.as_str()
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(allowed.len(), permissions.rules.len());
-        assert_eq!(
-            allowed,
-            BTreeSet::from([
-                "ConversationRead",
-                "ConversationSend",
-                "WorkerList",
-                "WorkerSpawn",
-                "WorkerSendInput",
-                "WorkerNotify",
-                "WorkerCancel",
-                "WorkerStop",
-                "WorkerRestore",
-                "ViewSessionOverview",
-                "SearchSessionEntries",
-                "ReadSessionEntry",
-                "SubjektivSessionList",
-                "SubjektivSessionSearch",
-                "SubjektivSessionRead",
-                "SubjektivMemoryQuery",
-                "SubjektivMemoryRead",
-                "SubjektivMemoryListChanges",
-                "SubjektivMemoryRemember",
-                "SubjektivMemoryProposeChange",
-                "QueryObjective",
-                "ShowObjective",
-                "QueryTicket",
-                "ShowTicket",
-                "WorkspaceTagList",
-                "TicketAssignmentTrackingQuery",
-                "TicketAssignmentTrackingHistory",
-                "TicketAssignmentsQuery",
-                "TicketAssignmentDiagnostics",
-                "TicketImplementationResultQuery",
-                "NotificationDiagnostics",
-            ])
-        );
+        assert!(!feature.filesystem.enabled);
+        assert!(!feature.filesystem_write.enabled);
+        assert!(!feature.bash.enabled);
+        assert!(resolved.manifest_snapshot.get("permissions").is_none());
     }
 
     #[test]

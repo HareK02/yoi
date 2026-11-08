@@ -6,7 +6,6 @@ pub(crate) mod permission_declaration;
 
 use crate::{
     file_operation::{self, Contract},
-    permission::permission_action_for,
     wip::{
         WipCallContext, WipMountError, WipMountRegistry, WipOperationError, WipOperationHandler,
         WipOperationOutput, WipProjection, WipProjectionKind, WipPublication, WipSubtreeMount,
@@ -15,8 +14,6 @@ use crate::{
 };
 use agen::tool::{Tool, ToolError};
 use async_trait::async_trait;
-use manifest::{ToolPermissionAction, ToolPermissionConfig};
-use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use tools::{BashTool, bash_output::BashOutputView};
@@ -33,13 +30,16 @@ pub(crate) fn mount(
     registry: &mut WipMountRegistry,
     router: Arc<WorkdirSessionRouter>,
     view: BashOutputView,
-    permissions: Option<ToolPermissionConfig>,
+    enabled: bool,
 ) -> Result<(), WipMountError> {
+    if !enabled {
+        return Ok(());
+    }
     registry.allocate_namespace("bash", "bash-output")?;
     let provider = Arc::new(Provider {
         service: BashTool::new(router, view.clone()),
         view,
-        permissions,
+        enabled,
         incarnation: uuid::Uuid::now_v7().to_string(),
     });
     registry.mount(provider.root())?;
@@ -53,33 +53,12 @@ pub(crate) fn mount(
 struct Provider {
     service: BashTool,
     view: BashOutputView,
-    permissions: Option<ToolPermissionConfig>,
+    enabled: bool,
     incarnation: String,
 }
 impl Provider {
-    fn allowed(&self, tool: &str, args: &Json) -> bool {
-        self.view.is_active()
-            && self
-                .permissions
-                .as_ref()
-                .is_none_or(|p| permission_action_for(p, tool, args) == ToolPermissionAction::Allow)
-    }
-    fn may_allow(&self, tool: &str) -> bool {
-        if !self.view.is_active() {
-            return false;
-        }
-        let Some(p) = &self.permissions else {
-            return true;
-        };
-        for rule in p.rules.iter().filter(|r| r.tool.eq_ignore_ascii_case(tool)) {
-            if rule.action == ToolPermissionAction::Allow {
-                return true;
-            }
-            if rule.pattern == "*" {
-                return false;
-            }
-        }
-        p.default_action == ToolPermissionAction::Allow
+    fn available(&self) -> bool {
+        self.enabled && self.view.is_active()
     }
     fn root(self: &Arc<Self>) -> WipProjection {
         let interface = contextual_reference("yoi.bash/command/v1", ROOT);
@@ -157,7 +136,7 @@ impl Provider {
 #[async_trait]
 impl WipSubtreeProvider for Arc<Provider> {
     async fn publication(&self, path: &str) -> Result<Option<WipPublication>, ProtocolError> {
-        if !self.view.is_active() {
+        if !self.available() {
             return Ok(None);
         }
         if path == ROOT {
@@ -173,16 +152,11 @@ impl WipSubtreeProvider for Arc<Provider> {
         let Some(metadata) = self.view.metadata(&id) else {
             return Ok(None);
         };
-        if !self.may_allow("Read") && !self.may_allow("Grep") {
-            return Ok(None);
-        }
-        let mut contracts = vec![];
-        if self.may_allow("Read") {
-            contracts.extend([Contract::ReadLines, Contract::ReadBytes]);
-        }
-        if self.may_allow("Grep") {
-            contracts.push(Contract::SearchText);
-        }
+        let contracts = vec![
+            Contract::ReadLines,
+            Contract::ReadBytes,
+            Contract::SearchText,
+        ];
         let primary = contracts[0];
         let interface = primary.reference();
         let descriptor = primary.descriptor();
@@ -229,10 +203,10 @@ struct Run {
 #[async_trait]
 impl WipOperationHandler for Run {
     fn is_visible(&self) -> bool {
-        self.provider.view.is_active()
+        self.provider.available()
     }
     fn operation_available(&self, op: &str) -> bool {
-        op == "run" && self.provider.may_allow("Bash")
+        op == "run" && self.provider.available()
     }
     async fn call(
         &self,
@@ -251,7 +225,7 @@ impl WipOperationHandler for Run {
             .ok_or_else(|| fail(ProtocolErrorCode::InvalidArguments, "input is required"))?;
         let input =
             wip_to_json(input).map_err(|e| fail(ProtocolErrorCode::InvalidArguments, &e))?;
-        if !self.provider.allowed("Bash", &input) {
+        if !self.provider.available() {
             return Err(fail(
                 ProtocolErrorCode::PermissionDenied,
                 "Bash not permitted",
@@ -324,15 +298,15 @@ impl File {
 #[async_trait]
 impl WipOperationHandler for File {
     fn is_visible(&self) -> bool {
-        self.provider.view.metadata(&self.id).is_some()
+        self.provider.available() && self.provider.view.metadata(&self.id).is_some()
     }
     fn object_validator(&self) -> Option<Vec<u8>> {
         self.is_visible().then(|| self.validator.clone())
     }
     fn operation_available(&self, op: &str) -> bool {
         match op {
-            "read_lines" | "read_bytes" | "read" => self.provider.may_allow("Read"),
-            "search_text" | "search" => self.provider.may_allow("Grep"),
+            "read_lines" | "read_bytes" | "read" => self.provider.available(),
+            "search_text" | "search" => self.provider.available(),
             _ => false,
         }
     }
@@ -343,21 +317,6 @@ impl WipOperationHandler for File {
         _: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         if !self.operation_available(op) {
-            return Err(fail(
-                ProtocolErrorCode::PermissionDenied,
-                "output operation not permitted",
-            ));
-        }
-        let mut input = wip_to_json(&Value::Record(args.clone()))
-            .map_err(|e| fail(ProtocolErrorCode::InvalidArguments, &e))?;
-        let tool = if op == "search_text" {
-            input["path"] = json!(self.path);
-            "Grep"
-        } else {
-            input["file_path"] = json!(self.path);
-            "Read"
-        };
-        if !self.provider.allowed(tool, &input) {
             return Err(fail(
                 ProtocolErrorCode::PermissionDenied,
                 "output operation not permitted",
@@ -450,5 +409,54 @@ fn field(name: &str, r#type: TypeExpr) -> FieldDeclaration {
         required: true,
         documentation: None,
         r#type,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disabled_bash_handlers_reject_execution_and_output_without_provider_dispatch() {
+        let router = Arc::new(WorkdirSessionRouter::new());
+        let view = BashOutputView::new();
+        let provider = Arc::new(Provider {
+            service: BashTool::new(router, view.clone()),
+            view,
+            enabled: false,
+            incarnation: "disabled".into(),
+        });
+        let context = || WipCallContext {
+            result_namespaces: Default::default(),
+            execution: Default::default(),
+            security_context: "test".into(),
+        };
+        assert!(provider.publication(ROOT).await.unwrap().is_none());
+        let run = Run {
+            provider: provider.clone(),
+        };
+        assert!(!run.is_visible());
+        assert!(!run.operation_available("run"));
+        let input = json_to_wip(&serde_json::json!({"command":"exit 0", "cwd":"."})).unwrap();
+        let result = run
+            .call("run", &BTreeMap::from([("input".into(), input)]), context())
+            .await;
+        assert!(
+            matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::PermissionDenied)
+        );
+        let file = File {
+            provider,
+            id: "retained".into(),
+            stream: None,
+            path: "/bash-output/retained/order".into(),
+            validator: vec![1],
+        };
+        for operation in ["read_bytes", "read_lines", "search_text"] {
+            assert!(!file.operation_available(operation));
+            let result = file.call(operation, &BTreeMap::new(), context()).await;
+            assert!(
+                matches!(result, Err(WipOperationError::Protocol(error)) if error.code == ProtocolErrorCode::PermissionDenied)
+            );
+        }
     }
 }

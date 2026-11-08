@@ -151,7 +151,11 @@ pub(crate) use journal_removal_store::{
     record_physical_failure as record_journal_removal_physical_failure,
 };
 
-const LATEST_SCHEMA_VERSION: i64 = 130;
+const LATEST_SCHEMA_VERSION: i64 = 131;
+#[path = "store/core_worker_launch.rs"]
+mod core_worker_launch;
+#[path = "store/launch_policy.rs"]
+mod launch_policy;
 const TICKET_PLAN_RETIREMENT_MIGRATION_NAME: &str =
     "Retire Ticket orchestration plans into historical comments";
 pub(crate) const DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME: &str =
@@ -578,6 +582,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 130,
         name: backend_job_current::MIGRATION_NAME,
         apply: backend_job_current::migrate,
+    },
+    Migration {
+        version: 131,
+        name: crate::launch_policy::MIGRATION_NAME,
+        apply: migrate_worker_launch_policies_to_v131,
     },
 ];
 
@@ -17208,10 +17217,24 @@ fn migrate_plugin_receipts_v108_to_v109(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_worker_launch_policies_to_v131(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::launch_policy::SCHEMA)?;
+    tx.execute_batch(include_str!("core_worker_launch.sql"))?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(131,?1)",
+        [crate::launch_policy::MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_prefix(conn, include_str!("latest_schema.sql"), true)?;
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
+    conn.execute_batch(crate::launch_policy::SCHEMA)?;
+    conn.execute_batch(include_str!("core_worker_launch.sql"))?;
     conn.execute_batch(backend_job_recovery_store::SCHEMA)?;
     conn.execute_batch(backend_job_reference_migration::SCHEMA)?;
     conn.execute_batch(include_str!("worker_create_failure_schema.sql"))?;
@@ -24044,6 +24067,8 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
             resolved_worker_observation_grants: Vec::new(),
             resolved_control_operation: None,
             resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
             resolved_workspace_api: None,
             resolved_memory_settings: None,
             resolved_subjektiv_attached: false,

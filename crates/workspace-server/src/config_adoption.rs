@@ -165,12 +165,7 @@ impl subjektiv::CanonicalPermissionSource for CanonicalConfigurationSource {
             return Err(subjektiv::SubjektivError::PermissionTransferConflict);
         }
         self.store
-            .adopted_subject_policy(workspace, subject)
-            .and_then(|policy| {
-                policy
-                    .map(|policy| policy.legacy_read(&self.host))
-                    .transpose()
-            })
+            .adopted_subject_legacy_permissions(workspace, subject, &self.host)
             .map_err(|error| {
                 subjektiv::SubjektivError::InvalidRecord(format!(
                     "canonical configuration policy unavailable: {error}"
@@ -710,6 +705,12 @@ fn prepare(
     };
     Ok((current, state, source))
 }
+
+mod worker_permissions;
+
+#[cfg(test)]
+#[path = "config_adoption/worker_permissions_tests.rs"]
+mod worker_permissions_tests;
 
 #[cfg(test)]
 #[path = "config_adoption_tests.rs"]

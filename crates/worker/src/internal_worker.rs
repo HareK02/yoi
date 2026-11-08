@@ -950,6 +950,11 @@ pub(crate) async fn prepare_internal_worker_session(
     worker.attach_alerter(alerter.clone());
     worker.attach_working_event_tx(event_tx.clone());
     worker.attach_in_flight_events(in_flight.clone());
+    // Internal parents accept durable child-completion notifications without a
+    // Controller. Bind their own store and pending state before the first run
+    // installs the interceptor; event forwarding alone cannot commit that input.
+    worker.attach_log_writer(Arc::new(worker.log_writer_handle()));
+    worker.wire_history_persistence();
     let greeting = Arc::new(RwLock::new(build_greeting(&worker)));
     wire_event_bridges_on_engine(&mut worker, &event_tx, &alerter, &in_flight);
     let usage_greeting = greeting.clone();

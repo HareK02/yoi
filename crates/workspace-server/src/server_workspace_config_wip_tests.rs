@@ -890,7 +890,6 @@ async fn workspace_config_real_selected_invoke_backend_wip_edit_create_delete_im
         &worker::feature::builtin::manage_workdir::ManageWorkdirFeature::new(client.clone()),
         true,
         false,
-        None,
     )
     .unwrap();
     let wip = worker::wip::WipRuntime::from_mounts(
@@ -1307,7 +1306,6 @@ async fn assert_config_production_http_adapter(
         &worker::feature::builtin::manage_workdir::ManageWorkdirFeature::new(client),
         true,
         false,
-        None,
     )
     .unwrap();
     let wip = worker::wip::WipRuntime::from_mounts(
@@ -1540,8 +1538,8 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
         }),
     )
     .await

@@ -10,6 +10,135 @@ use workdir::{WorkdirSessionCapability, WorkdirSessionRouter};
 
 const TASK: &str = "Read marker.txt from each attached Workdir.";
 
+#[derive(Debug, Default)]
+struct ParentFilesystemAuthority {
+    revoked: AtomicBool,
+}
+
+impl WorkspaceClient for ParentFilesystemAuthority {
+    fn workspace_id(&self) -> Option<&str> {
+        Some("workspace-test")
+    }
+    fn kind(&self) -> &str {
+        "test-parent-authority"
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn execute(&self, _: WorkspaceRequest) -> Result<WorkspaceResponse, WorkspaceClientError> {
+        panic!("this fixture supplies only the Host Workdir authorization boundary")
+    }
+    fn authorize_operation_scope(
+        &self,
+        operation: &str,
+        resource: &server_api::authorization::PermissionResource,
+    ) -> Result<Option<server_api::authorization::PermissionResource>, WorkspaceClientError> {
+        let grant = server_api::authorization::PermissionResource::Workdir {
+            working_directory_id: "attachment-id".into(),
+            path: ".".into(),
+            recursive: true,
+        };
+        if operation == "filesystem.read"
+            && !self.revoked.load(Ordering::SeqCst)
+            && grant.covers(resource)
+        {
+            Ok(Some(grant))
+        } else {
+            Err(WorkspaceClientError::Request(
+                "parent direct authority denied".into(),
+            ))
+        }
+    }
+}
+
+#[tokio::test]
+async fn parent_feature_off_child_feature_on_uses_live_parent_direct_authority() {
+    let mut fixture = EnvironmentFixture::new(&[("checkout", "")]);
+    fixture.manifest.feature.filesystem.enabled = false;
+    fixture.manifest.feature.filesystem_write.enabled = false;
+    fixture.manifest.feature.bash.enabled = false;
+    fixture.profiles = write_project_profile_registry(
+        &fixture.root,
+        None,
+        &[("coder", "coder.toml", CODER_PROFILE)],
+    );
+    let authority = Arc::new(ParentFilesystemAuthority::default());
+    let authorized = Arc::new(WorkdirSessionRouter::new());
+    authorized
+        .attach(
+            workdir::WorkdirAttachmentAlias::new("checkout").unwrap(),
+            crate::authorized_workdir::authorized_workdir_session(
+                fixture.sessions.resolve(None).unwrap().session,
+                authority.clone(),
+                "attachment-id".into(),
+            ),
+        )
+        .unwrap();
+    let (record, client) = fixture
+        .spawn(
+            "parent",
+            fixture.registry.clone(),
+            workdir::WorkdirToolBrokerRouter::new(authorized.clone()),
+            json!({"name":"feature-child", "task":TASK, "profile":"project:coder",
+            "scope":[{"target":".","permission":"read"}]}),
+        )
+        .await;
+    assert!(record.installed_tools.iter().any(|name| name == "Read"));
+    let child = record.workdir_tool_scope.session_router();
+    assert_environment_and_reads(&child, &client, &[("checkout", "", false)]);
+    authority.revoked.store(true, Ordering::SeqCst);
+    let denied = child
+        .resolve(None)
+        .unwrap()
+        .session
+        .read(workdir::ReadRequest {
+            path: workdir::WorkdirPath::new("marker.txt").unwrap(),
+            offset: 0,
+            limit: 10,
+            max_bytes: 4096,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        denied
+            .to_string()
+            .contains("parent direct authority denied")
+    );
+    fixture
+        .registry
+        .remove_internal("feature-child")
+        .await
+        .unwrap();
+    let tool = SubWorkerSpawnTool::new(
+        "parent".into(),
+        crate::worker::WorkerWorkspaceContext::local_filesystem(None),
+        ParentNotificationTarget::Durable(Arc::new(|_| {})),
+        fixture.runtime.path().into(),
+        fixture.root.clone(),
+        Some(workdir::WorkdirToolBrokerRouter::new(authorized)),
+        fixture.registry.clone(),
+        fixture.manifest.clone(),
+        PromptCatalogSource::builtins_only(),
+        fixture.profiles.clone(),
+    )
+    .with_internal_client(Box::new(EnvironmentClient::default()));
+    let denied = tool
+        .execute(
+            &json!({"name":"denied-child", "task":TASK, "profile":"project:coder",
+            "scope":[{"target":".","permission":"read"}]})
+            .to_string(),
+            agen::tool::ToolExecutionContext::direct(),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        denied
+            .to_string()
+            .contains("parent direct authority denied")
+    );
+    assert!(fixture.registry.get_internal("denied-child").is_none());
+}
+
 fn prompt_environments(prompt: &str) -> Vec<Value> {
     let section = prompt
         .split_once("## Workdir execution environment\n")

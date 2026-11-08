@@ -34,6 +34,7 @@ pub fn builtin_permission_registry(
     ] {
         builder = builder.with_module(super::BuiltinPermissionFeature(declaration));
     }
+    builder = builder.with_module(builtin::subject_permissions::SubjectPermissionsFeature);
     builder.permission_registry(workspace)
 }
 

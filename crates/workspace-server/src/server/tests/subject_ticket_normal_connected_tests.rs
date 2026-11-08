@@ -363,6 +363,15 @@ async fn next(rx: &mut tokio::sync::mpsc::Receiver<Value>) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn ordinary_two_subjects_builtin_coders_edit_validate_save_evaluate_and_track() {
+    ordinary_subject_scenario(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn tailored_background_handling_grant_does_not_bypass_current_subject_body() {
+    ordinary_subject_scenario(true).await;
+}
+
+async fn ordinary_subject_scenario(background_handling_control: bool) {
     crate::restore_test_environment::require_restore_test_environment();
     let (edited, mut edits) = tokio::sync::mpsc::channel(4);
     let (evaluated, mut evaluations) = tokio::sync::mpsc::channel(8);
@@ -390,14 +399,14 @@ async fn ordinary_two_subjects_builtin_coders_edit_validate_save_evaluate_and_tr
             .await;
         assert_eq!(status, StatusCode::CREATED, "{subject}");
         let subject = subject["id"].as_str().unwrap().to_owned();
-        assert!(
-            subjects
-                .current_subject_policy(&subject)
-                .unwrap()
-                .unwrap()
-                .delegation
-                .grants
-                .is_empty()
+        let created_policy = subjects.current_subject_policy(&subject).unwrap().unwrap();
+        assert_eq!(
+            created_policy.execution,
+            server_api::authorization::subject_default_permission_assignment()
+        );
+        assert_eq!(
+            created_policy.delegation,
+            server_api::authorization::subject_default_delegation_assignment()
         );
         let branch = format!("ordinary-{label}");
         assert!(
@@ -431,11 +440,26 @@ async fn ordinary_two_subjects_builtin_coders_edit_validate_save_evaluate_and_tr
                 .unwrap()
                 .success()
         );
-        // Configure operation keys, never individual Ticket IDs or a fixture Profile.
-        // The child is frozen to this Workdir and the assigned Ticket at delegation.
-        super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject,
-            r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "worker"; keys = ["worker.create", "worker.observe"]; }, { namespace = "ticket"; keys = ["ticket.assignment.assign"]; }]; }"#,
-            r#"{ namespaces = [{ namespace = "filesystem"; keys = ["filesystem.read", "filesystem.write"]; }, { namespace = "bash"; keys = ["bash.execute"]; }, { namespace = "ticket"; keys = ["ticket.read", "ticket.relation.read", "ticket.implementation_result.write", "ticket.assignment.update"]; }]; }"#).await;
+        // The positive case carries the actual creation assignments through
+        // canonical enrollment without adding operation keys. Only the separate
+        // domain-negative case permits child handling, to test the body fence
+        // rather than merely failing its delegation ceiling.
+        if background_handling_control {
+            super::super::chat_tests::adopt_subject_policy(
+                &h.api,
+                &h.owner,
+                &subject,
+                r#"{ sets = ["subject-default"]; }"#,
+                r#"{ namespaces = [{ namespace = "subject"; keys = ["subject.delegate"]; }, { namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,
+            )
+            .await;
+        } else {
+            super::super::chat_tests::adopt_chat_defaults(&h.api, &h.owner).await;
+            assert_eq!(
+                subjects.current_subject_policy(&subject).unwrap().unwrap(),
+                created_policy
+            );
+        }
         let body = start(&h, &subject, &format!("ordinary-start-{label}")).await;
         assert_eq!(
             body["observation"]["worker"]["profile"],
@@ -505,8 +529,10 @@ async fn ordinary_two_subjects_builtin_coders_edit_validate_save_evaluate_and_tr
             ticket_permission(&ticket, "ticket.read"),
             ticket_permission(&ticket, "ticket.relation.read"),
             ticket_permission(&ticket, "ticket.implementation_result.write"),
-            ticket_permission(&ticket, "ticket.assignment.update"),
         ]);
+        if background_handling_control {
+            permissions.push(ticket_permission(&ticket, "ticket.assignment.update"));
+        }
         let spawn = json!({"ticket_id":ticket,"runtime_id":CONNECTED_RUNTIME,"profile":"builtin:coder","flow":null,
             "orchestrator_assignment_id":assigned["assignment"]["assignment_id"],
             "initial_request":format!("{EDITOR}{}",json!({"ticket":ticket,"content":content})),

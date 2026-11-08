@@ -209,8 +209,10 @@ impl Fixture {
                     initial_submit: vec![],
                     workdir_attachments: vec![],
                     feature_connections: Default::default(),
-                    control_operation_id: None,
-                    execution_grant: None,
+                    control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                    authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                        assignment: None,
+                    },
                 }),
             )
             .await
@@ -803,8 +805,10 @@ async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replace
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -1635,7 +1639,7 @@ fn native_tools_with_checkouts(
     let mut mounts = worker::wip::WipMountRegistry::new();
     worker::feature::builtin::drive::wip::mount_drive_wip(&mut mounts, feature).unwrap();
     if let Some(router) = router {
-        worker::checkout::mount_checkouts(&mut mounts, router, tools::Tracker::new(), None)
+        worker::checkout::mount_checkouts(&mut mounts, router, tools::Tracker::new(), true, false)
             .unwrap();
     }
     let mut engine = agen::Engine::<_, agen::state::Mutable, ()>::new_annotated(NoLlm);
@@ -1645,8 +1649,7 @@ fn native_tools_with_checkouts(
             .into_iter()
             .map(|(_, definition)| definition),
     );
-    worker::wip::install_wip_mode_with_mounts(&mut engine, None, "drive-reader".into(), mounts)
-        .unwrap();
+    worker::wip::install_wip_mode_with_mounts(&mut engine, "drive-reader".into(), mounts).unwrap();
     let handle = engine.tool_server_handle();
     handle.flush_pending();
     assert!(

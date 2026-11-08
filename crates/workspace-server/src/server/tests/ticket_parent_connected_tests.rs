@@ -160,13 +160,11 @@ async fn tool_and_native_parent_mutations_share_metadata_only_authority_and_dura
                 &mut mounts,
                 client.clone(),
                 TicketFeatureAccess::workspace_authoring(),
-                None,
                 &route,
             )
             .unwrap();
             worker::wip::install_wip_mode_with_mounts(
                 host.engine_mut(),
-                None,
                 "parent-contract".into(),
                 mounts,
             )

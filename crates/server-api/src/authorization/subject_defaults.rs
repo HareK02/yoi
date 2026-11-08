@@ -10,17 +10,43 @@ use super::{PermissionResource, ScopedPermission};
 
 pub const SUBJECT_CONVERSATION_PROFILE: &str = "builtin:async-chat";
 
+/// Direct conversation and orchestration capabilities; never filesystem execution.
 pub const SUBJECT_DEFAULT_PERMISSION_SET: &str = "subject-default";
+/// Ceiling for explicitly scoped implementation/review Workers, not body authority.
+pub const SUBJECT_DELEGATE_PERMISSION: &str = "subject.delegate";
 pub const COMPANION_PERMISSION_SET: &str = "companion";
 pub const IMPLEMENTER_PERMISSION_SET: &str = "implementer";
 
 /// Persist this reference when creating a new Subject. A shared-set reference is
 /// intentionally live; limited child/Job grants must instead freeze issued keys.
 pub fn subject_default_permission_assignment() -> feature_permissions::PermissionAssignment {
+    shared_set_assignment(SUBJECT_DEFAULT_PERMISSION_SET)
+}
+
+/// Creation-only delegation ceiling. Existing empty/revoked delegation stays empty;
+/// each Worker request must still freeze explicit operation/resource grants, including
+/// any bounded Reviewer redelegation, within the currently resolved children.
+pub fn subject_default_delegation_assignment() -> feature_permissions::PermissionAssignment {
+    use feature_permissions::{
+        NamespaceId, NamespacePermissions, PermissionAssignment, PermissionKey, PermissionReference,
+    };
+    PermissionAssignment {
+        grants: vec![PermissionReference::Namespace(NamespacePermissions {
+            namespace: NamespaceId::parse("subject").expect("static Subject namespace"),
+            keys: vec![
+                PermissionKey::parse(SUBJECT_DELEGATE_PERMISSION)
+                    .expect("static Subject permission"),
+            ],
+        })],
+        ..Default::default()
+    }
+}
+
+fn shared_set_assignment(set: &str) -> feature_permissions::PermissionAssignment {
     feature_permissions::PermissionAssignment {
         grants: vec![feature_permissions::PermissionReference::Set(
-            feature_permissions::PermissionSetId::parse(SUBJECT_DEFAULT_PERMISSION_SET)
-                .expect("static Subject default set ID"),
+            feature_permissions::PermissionSetId::parse(set)
+                .expect("static Subject permission set ID"),
         )],
         ..Default::default()
     }

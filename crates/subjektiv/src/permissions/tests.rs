@@ -808,7 +808,10 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
             .unwrap()
         )]
     );
-    assert!(fresh_source.delegation.grants.is_empty());
+    assert_eq!(
+        fresh_source.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
     assert!(
         store
             .record_session_attribution(

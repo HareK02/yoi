@@ -25,6 +25,9 @@ compaction = {
 };
 
 feature = {
+    filesystem = { enabled = true; };
+    filesystem_write = { enabled = true; };
+    bash = { enabled = true; };
     # Activation only; Backend Drive grants remain independent.
     drive = { enabled = false; };
     task = { enabled = true; };

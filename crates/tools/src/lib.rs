@@ -20,23 +20,23 @@ pub mod workdir_audit;
 mod workdir_error;
 mod write;
 
-pub use bash::{BashResult, BashTool, bash_tool};
+pub use bash::{BashResult, BashTool, bash_tool, routed_bash_tool};
 pub use checkout::{CheckoutToolOutput, execute_checkout_tool};
-pub use edit::edit_tool;
+pub use edit::{edit_tool, routed_edit_tool};
 pub use error::ToolsError;
-pub use glob::glob_tool;
-pub use grep::grep_tool;
-pub use read::read_tool;
+pub use glob::{glob_tool, routed_glob_tool};
+pub use grep::{grep_tool, routed_grep_tool};
+pub use read::{read_tool, routed_read_tool};
 pub use tracker::{ChangeStat, Tracker};
 pub use view_image::{
     detect_image_mime, read_workdir_bytes, routed_view_image_tool, view_image_tool,
 };
 pub use web::{WebOperationAuthorizer, WebTools, web_fetch_tool, web_search_tool};
 pub use workdir_error::WorkdirToolError;
-pub use write::write_tool;
+pub use write::{routed_write_tool, write_tool};
 
 /// Build the filesystem/command tool surface for a single Workdir session.
-/// Profile/manifest policy may narrow this set further in the Engine.
+/// Feature composition selects publication; providers retain operation authorization.
 pub fn core_builtin_tools(
     session: workdir::WorkdirSessionHandle,
     tracker: Tracker,

@@ -20,6 +20,16 @@ Featureの有効化、Tool・service・hookの登録、セッション内状態�
 
 MCPはT-787の移行対象外とする暫定例外であり、既存の `mcp` 起動認可と `PermissionResource::Feature` を保持する。discoveryは外部プロセスを起動するため、既存の拒否を共通コード整理で失わせない。この例外を他のFeatureへ拡張せず、MCPの各呼出し・restoreに新しい操作認可が整備されたとも扱わない。
 
+### Subjectの標準権限セット
+
+新規Subjectは、直接実行の`execution`に既存の共有セット`subject-default`、委譲上限の`delegation`にNamespace `subject`の権限キー`subject.delegate`への参照を保存する。Subject Featureは`subject.orchestrate`と`subject.delegate`の意味と明示的なchildrenを所有する。childrenが参照する操作キーの所有者や実認可は各Featureに残り、Subjectごとに固定操作一覧をコピーしない。意味的な権限の束を新しいトップレベルセットとして増やさない。
+
+- `subject-default`は会話・Memory/Journalの既存寄与を保持し、`subject.orchestrate`への寄与を通じてObjective/Ticketの読取り・整理・判断、Workerの探索・委譲制御・観測、Workdirの一覧・作成・削除、MRの確認・統合記録を提供する。担当・現在本体・control grant・CAS・独立承認・retention等のdomain条件を免除しない。Subject本体にfilesystem/Bash、MRの作成・レビュー、設定管理権限は与えない。
+- `subject.delegate`の明示childrenは背景Workerの実装・調査・独立レビューに必要な能力の上限とする。`subject.orchestrate`や`subject-default`には含めず、直接実行と委譲上限を分離する。各起動では必要な操作とTicket・Workdir等の対象を明示し、限定された実効grantを固定する。Reviewerへの再委譲もその明示範囲内とする。本体の発言/Memory/Journal identity、担当変更・handling判断、案件終了、MR統合記録、権限管理を委譲しない。
+- ProfileのFeatureとTool許可は利用面の構成であり、セット参照や対象grantの代わりではない。長時間の実装・検証・Git操作は背景Workerへ渡す。
+
+既存の共有セット保持主体は現行寄与の変更を反映する。一方、既存の未設定・空・除外・失効policyやID限定の旧制約を、新規作成defaultで置換しない。特に以前の空の`delegation`へ`subject.delegate`を自動追加しない。採用する場合は通常の認可済み設定変更として行い、既存委譲の失効への影響も確認する。起動・restore・migration・作成要求の再送は初期割当の再実行ではない。
+
 ### 認可境界と継続実行
 
 認可はHostに束縛された主体から、アクセス・供給・作用の直前に行う。共通のFeature内部処理やHost/provider境界を使い、Tool・WIP・typed service・起動・restore・hook・背景処理の入口差で省略しない。providerの所有・scope・capability・CAS等の検査は操作権限と合成する別の制約であり、互いの代替ではない。信頼されたFeature実装が境界を呼ぶ責務を持ち、任意コードの自動捕捉やsandboxを保証するものではない。

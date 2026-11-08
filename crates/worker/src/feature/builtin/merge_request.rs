@@ -11,7 +11,7 @@
 //! Their declarations drive descriptor generation, input validation, and command-field conversion.
 //! Tool mode parses its own DTOs. Both enter the shared typed command dispatcher, including Backend
 //! operation authorization; native never calls `Tool::execute`. Only configured actions are mounted.
-//! [`crate::wip`] owns shared reference, permission, Client-lifetime, and unknown-outcome contracts.
+//! [`crate::wip`] owns shared reference, Client-lifetime, and unknown-outcome contracts.
 //!
 //! # Injected review capability
 //!
@@ -38,7 +38,6 @@ use crate::feature::{
     FeatureInstructionDeclaration, FeatureInstructionId, FeatureModule, ToolContribution,
     ToolDeclaration, ToolDefinition,
 };
-use crate::permission::permission_action_for;
 use crate::wip::{
     WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
     WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
@@ -47,7 +46,7 @@ use crate::wip::{
 use crate::worker::{WorkspaceClient, WorkspaceRequest, WorkspaceRequestMethod};
 use agen::tool::{Tool, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use manifest::{MergeRequestFeatureConfig, ToolPermissionAction, ToolPermissionConfig};
+use manifest::MergeRequestFeatureConfig;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -440,7 +439,6 @@ pub fn mount_workspace_http_merge_request_wip(
     registry: &mut WipMountRegistry,
     client: Arc<dyn WorkspaceClient>,
     config: MergeRequestFeatureConfig,
-    permissions: Option<ToolPermissionConfig>,
     namespace_route: &WipNamespaceRoute,
 ) -> Result<(), WipMountError> {
     let collection_route = namespace_route.root().to_string();
@@ -493,7 +491,6 @@ pub fn mount_workspace_http_merge_request_wip(
         descriptor: collection_descriptor,
         handler: Arc::new(MergeRequestCollectionWipHandler {
             tools: merge_request_operation_map(collection_tools),
-            permissions: permissions.clone(),
             collection_route: collection_route.clone(),
             observations: Arc::clone(&observations),
         }),
@@ -512,7 +509,6 @@ pub fn mount_workspace_http_merge_request_wip(
         descriptor: item_descriptor,
         resolver: Arc::new(MergeRequestItemResolver {
             tools: merge_request_operation_map(item_tools),
-            permissions,
             collection_route: collection_route.clone(),
             observations,
         }),
@@ -533,7 +529,6 @@ fn merge_request_operation_map(
 
 struct MergeRequestCollectionWipHandler {
     tools: HashMap<String, NativeMergeRequestTool>,
-    permissions: Option<ToolPermissionConfig>,
     collection_route: String,
     observations: MergeRequestObservations,
 }
@@ -551,9 +546,7 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
             .get(operation)
             .ok_or_else(merge_request_operation_not_found)?;
         let namespaces = context.result_namespaces.clone();
-        let response =
-            execute_native_merge_request_tool(tool, &self.permissions, arguments, None, context)
-                .await?;
+        let response = execute_native_merge_request_tool(tool, arguments, None, context).await?;
         let reference = merge_request_reference(&response)
             .filter(|reference| is_merge_request_route_reference(reference))
             .ok_or_else(|| {
@@ -575,7 +568,6 @@ impl WipOperationHandler for MergeRequestCollectionWipHandler {
 
 struct MergeRequestItemResolver {
     tools: HashMap<String, NativeMergeRequestTool>,
-    permissions: Option<ToolPermissionConfig>,
     collection_route: String,
     observations: MergeRequestObservations,
 }
@@ -605,7 +597,6 @@ impl WipDynamicItemResolver for MergeRequestItemResolver {
             },
             handler: Arc::new(MergeRequestItemWipHandler {
                 tools: self.tools.clone(),
-                permissions: self.permissions.clone(),
                 merge_request_id: item_reference.into(),
                 collection_route: self.collection_route.clone(),
                 observations: Arc::clone(&self.observations),
@@ -616,7 +607,6 @@ impl WipDynamicItemResolver for MergeRequestItemResolver {
 
 struct MergeRequestItemWipHandler {
     tools: HashMap<String, NativeMergeRequestTool>,
-    permissions: Option<ToolPermissionConfig>,
     merge_request_id: String,
     collection_route: String,
     observations: MergeRequestObservations,
@@ -637,7 +627,6 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
         let namespaces = context.result_namespaces.clone();
         let response = execute_native_merge_request_tool(
             tool,
-            &self.permissions,
             arguments,
             Some(&self.merge_request_id),
             context,
@@ -666,7 +655,6 @@ impl WipOperationHandler for MergeRequestItemWipHandler {
 
 async fn execute_native_merge_request_tool(
     tool: &NativeMergeRequestTool,
-    permissions: &Option<ToolPermissionConfig>,
     arguments: &BTreeMap<String, WipValue>,
     bound_merge_request: Option<&str>,
     _context: WipCallContext,
@@ -686,9 +674,6 @@ async fn execute_native_merge_request_tool(
         }
     }
     let input = native_merge_request_input(tool, arguments, bound_merge_request)?;
-    // Legacy Tool permission patterns remain an additional fail-closed ceiling, evaluated on
-    // normalized domain fields. Backend authorization is always performed by command::execute_value.
-    authorize_native_merge_request(permissions, &tool.name, &input)?;
     let command = native::command(tool.kind, input)?;
     command::execute_value(tool.client.clone(), command)
         .map_err(|error| map_merge_request_tool_error(error, tool.kind.mutating()))
@@ -709,29 +694,6 @@ fn native_merge_request_input(
             .insert(field.into(), Value::String(merge_request_id.into()));
     }
     Ok(input)
-}
-
-fn authorize_native_merge_request(
-    permissions: &Option<ToolPermissionConfig>,
-    tool_name: &str,
-    input: &Value,
-) -> Result<(), WipOperationError> {
-    let Some(permissions) = permissions else {
-        return Ok(());
-    };
-    match permission_action_for(permissions, tool_name, input) {
-        ToolPermissionAction::Allow => Ok(()),
-        ToolPermissionAction::Deny => Err(merge_request_protocol_failure(
-            ProtocolErrorCode::PermissionDenied,
-            format!("permission denied for projected tool `{tool_name}`"),
-        )),
-        ToolPermissionAction::Ask => Err(merge_request_protocol_failure(
-            ProtocolErrorCode::PermissionDenied,
-            format!(
-                "permission approval is unavailable for projected tool `{tool_name}`; denied fail-closed"
-            ),
-        )),
-    }
 }
 
 fn map_merge_request_tool_error(error: ToolError, _mutating: bool) -> WipOperationError {
@@ -1112,7 +1074,6 @@ mod tests {
         ]);
         let output = execute_native_merge_request_tool(
             &tool,
-            &None,
             &arguments,
             Some("MR-1"),
             WipCallContext {
@@ -1320,14 +1281,12 @@ mod tests {
                 review: true,
                 ..Default::default()
             },
-            None,
             &namespace_route,
         )
         .unwrap();
         assert_eq!(registry.routes().collect::<Vec<_>>(), ["/merge-requests"]);
         let resolver = MergeRequestItemResolver {
             tools: HashMap::new(),
-            permissions: None,
             collection_route: "/merge-requests".into(),
             observations: Arc::new(Mutex::new(MergeRequestObservationState::default())),
         };
@@ -1343,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn native_input_preserves_null_omission_permissions_and_route_identity() {
+    fn native_input_preserves_null_omission_and_route_identity() {
         let tool = native_merge_request_tools(
             Arc::new(TestWorkspaceHttpClient::new("workspace", "http://unused")),
             MergeRequestFeatureConfig {
@@ -1371,21 +1330,6 @@ mod tests {
             ),
             Err(WipOperationError::Protocol(ProtocolError {
                 code: ProtocolErrorCode::InvalidArguments,
-                ..
-            }))
-        ));
-        let permissions = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Allow,
-            rules: vec![manifest::ToolPermissionRule {
-                tool: "ShowMergeRequest".into(),
-                pattern: serde_json::to_string(&omitted).unwrap(),
-                action: ToolPermissionAction::Deny,
-            }],
-        });
-        assert!(matches!(
-            authorize_native_merge_request(&permissions, "ShowMergeRequest", &omitted),
-            Err(WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
                 ..
             }))
         ));
@@ -1432,7 +1376,6 @@ mod tests {
         };
         let rejected = execute_native_merge_request_tool(
             &tool,
-            &None,
             &input,
             Some("MR-2"),
             WipCallContext {
@@ -1453,7 +1396,6 @@ mod tests {
 
         execute_native_merge_request_tool(
             &tool,
-            &None,
             &input,
             Some("MR-1"),
             WipCallContext {
@@ -1476,7 +1418,6 @@ mod tests {
         let observations = Arc::new(Mutex::new(MergeRequestObservationState::default()));
         let resolver = MergeRequestItemResolver {
             tools: HashMap::new(),
-            permissions: None,
             collection_route: "/merge-requests".into(),
             observations: Arc::clone(&observations),
         };
@@ -1505,7 +1446,6 @@ mod tests {
         let observations = Arc::new(Mutex::new(MergeRequestObservationState::default()));
         let resolver = MergeRequestItemResolver {
             tools: HashMap::new(),
-            permissions: None,
             collection_route: "/merge-requests".into(),
             observations: Arc::clone(&observations),
         };
@@ -1748,7 +1688,6 @@ mod tests {
         .unwrap();
         let result = execute_native_merge_request_tool(
             &native,
-            &None,
             &BTreeMap::new(),
             Some("MR-1"),
             WipCallContext {

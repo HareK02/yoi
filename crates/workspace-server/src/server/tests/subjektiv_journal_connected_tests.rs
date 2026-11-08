@@ -351,7 +351,7 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
                 subjektiv: Some(server_api::SubjektivWorkerConnectionRequest { subject_id: subject.into() }),
-            }, control_operation_id: None, execution_grant: None,
+            }, control_operation_id: Some(uuid::Uuid::now_v7().to_string()), authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
         }),
     ).await.unwrap();
     RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
@@ -539,7 +539,10 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     // Exercise creation-time authority through real recording and startup callbacks,
     // without a management grant or an execution/delegation policy replacement.
     let initial_policy = store.current_subject_policy(&subject.id).unwrap().unwrap();
-    assert!(initial_policy.delegation.grants.is_empty());
+    assert_eq!(
+        initial_policy.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
     let old = connected_create(&api, &subject.id, "connected-old-body").await;
     let old_attr = store
         .subject_session_attributions(&subject.id)
@@ -1946,8 +1949,10 @@ async fn connected_restore_fixture_with_pending_head(
                         subject_id: subject.id.clone(),
                     }),
                 },
-                control_operation_id: None,
-                execution_grant: None,
+                control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
             }),
         )
         .await

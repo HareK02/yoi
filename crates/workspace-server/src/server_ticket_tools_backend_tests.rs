@@ -171,12 +171,11 @@ impl TicketSurface {
             &mut mounts,
             client,
             access,
-            None,
             &route,
         )
         .unwrap();
         let mut engine = agen::Engine::<_, agen::state::Mutable, ()>::new_annotated(NoTicketLlm);
-        worker::wip::install_wip_mode_with_mounts(&mut engine, None, "ticket-tools".into(), mounts)
+        worker::wip::install_wip_mode_with_mounts(&mut engine, "ticket-tools".into(), mounts)
             .unwrap();
         let handle = engine.tool_server_handle();
         handle.flush_pending();

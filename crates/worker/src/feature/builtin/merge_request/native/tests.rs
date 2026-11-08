@@ -38,8 +38,7 @@ pub(super) fn runtime(client: Arc<dyn WorkspaceClient>) -> WipRuntime {
     let route = registry
         .allocate_namespace("merge-request", "changes")
         .unwrap();
-    mount_workspace_http_merge_request_wip(&mut registry, client, all_config(), None, &route)
-        .unwrap();
+    mount_workspace_http_merge_request_wip(&mut registry, client, all_config(), &route).unwrap();
     WipRuntime::from_mounts(registry, "mr-native-test".into()).unwrap()
 }
 
@@ -426,7 +425,6 @@ async fn mr_only_inspect_supplies_reserved_ticket_coordinates_without_observing_
             open: true,
             ..Default::default()
         },
-        None,
         &route,
     )
     .unwrap();

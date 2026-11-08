@@ -11,6 +11,7 @@ pub use api_macros::{ApiContract, BinaryBody, HttpMethod, TransportMetadata, Web
 pub mod authorization;
 mod configuration_error;
 pub mod configuration_failure;
+pub mod launch_policy;
 pub use configuration_error::ConfigurationApiError;
 mod repository_error;
 pub mod repository_failure;
@@ -9961,6 +9962,9 @@ pub struct RuntimeWorkerSpawnWorkingDirectoryAttachmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerSpawnRequest {
+    /// Mandatory caller intent, independent of Profile and Host-resolved authority.
+    pub authorization: launch_policy::WorkerCreationAuthorization,
+    pub control_operation_id: String,
     pub intent: RuntimeWorkerSpawnIntent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
@@ -11432,10 +11436,8 @@ pub struct CreateWorkspaceWorkerRequest {
     /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
     #[serde(default)]
     pub control_operation_id: Option<String>,
-    /// Requested least-authority child permissions. Host derives the origin; this
-    /// input cannot assert Subject identity or create a body/singleton attachment.
-    #[serde(default)]
-    pub execution_grant: Option<authorization::WorkerDelegationRequest>,
+    /// Host authenticates the policy caller or human initial issuer separately.
+    pub authorization: launch_policy::WorkerCreationAuthorization,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -14067,7 +14069,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
-            execution_grant: None,
+            authorization: launch_policy::WorkerCreationAuthorization::Human { assignment: None },
         })
         .unwrap();
         assert_eq!(
@@ -14082,7 +14084,7 @@ mod tests {
                 "workdir_attachments": [],
                 "feature_connections": {},
                 "control_operation_id": null,
-                "execution_grant": null,
+                "authorization": { "kind": "human", "assignment": null },
             })
         );
     }

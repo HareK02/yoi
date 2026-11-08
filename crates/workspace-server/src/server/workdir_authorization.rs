@@ -27,9 +27,6 @@ pub(super) fn authorize(
     if is_command_reconciliation(operation) {
         return Ok(());
     }
-    if !super::subject_authorization::has_subject_authority(api, worker)? {
-        return Ok(());
-    }
     authorize_accesses(&link.workdir_id, operation, |operation, path, recursive| {
         let requested = resource(&link.workdir_id, operation, path, recursive)?;
         super::subject_authorization::authorize(

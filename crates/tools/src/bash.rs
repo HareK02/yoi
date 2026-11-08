@@ -478,7 +478,7 @@ pub fn bash_tool(session: WorkdirSessionHandle, output: BashOutputView) -> ToolD
     routed_bash_tool(crate::routing::singleton_router(session), output)
 }
 
-pub(crate) fn routed_bash_tool(
+pub fn routed_bash_tool(
     router: Arc<WorkdirSessionRouter>,
     output: BashOutputView,
 ) -> ToolDefinition {

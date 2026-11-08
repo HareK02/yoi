@@ -142,10 +142,7 @@ pub fn write_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefini
     routed_write_tool(crate::routing::singleton_router(session), tracker)
 }
 
-pub(crate) fn routed_write_tool(
-    router: Arc<WorkdirSessionRouter>,
-    tracker: Tracker,
-) -> ToolDefinition {
+pub fn routed_write_tool(router: Arc<WorkdirSessionRouter>, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(WriteParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));

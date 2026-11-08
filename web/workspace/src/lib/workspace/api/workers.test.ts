@@ -328,10 +328,28 @@ Deno.test("Worker create request parser requires the complete shared request", (
       relative_cwd: null,
     }],
     feature_connections: {},
-    control_operation_id: null,
+    authorization: { kind: "human", assignment: null }, control_operation_id: "create-op",
   };
 
   assertEquals(parseCreateWorkspaceWorkerRequest(request), request);
+  for (const policy_revision of [1, Number.MAX_SAFE_INTEGER]) {
+    const authorization = { kind: "policy", policy_id: "coder", policy_revision };
+    assertEquals(parseCreateWorkspaceWorkerRequest({ ...request, authorization }).authorization, authorization);
+  }
+  for (const policy_revision of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, "1", null]) {
+    assertThrows(() => parseCreateWorkspaceWorkerRequest({
+      ...request, authorization: { kind: "policy", policy_id: "coder", policy_revision },
+    }), Error, "policy_revision");
+  }
+  for (const authorization of [undefined, null, { kind: "default" },
+    { kind: "policy", policy_id: "coder", policy_revision: 1, assignment: {} },
+    { kind: "policy", policy_id: "bad.id", policy_revision: 1 }]) {
+    assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, authorization }), Error,
+      authorization && "policy_id" in authorization && authorization.policy_id === "bad.id"
+        ? "policy_id" : "authorization");
+  }
+  assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, execution_grant: {} }), Error,
+    "unknown field execution_grant");
   assertEquals(
     parseCreateWorkspaceWorkerRequest({
       ...request,
@@ -390,7 +408,7 @@ Deno.test("Worker launch request preserves typed Feature invocations and rejects
     { name: "enabled", value: { kind: "boolean", value: true } },
   ] };
   const request = { runtime_id: "runtime-a", display_name: "Worker A", profile: "builtin:coder", ticket_assignment: null,
-    initial_submit: [{ kind: "feature_invoke", invocation }], workdir_attachments: [], feature_connections: {}, control_operation_id: null };
+    initial_submit: [{ kind: "feature_invoke", invocation }], workdir_attachments: [], feature_connections: {}, authorization: { kind: "human", assignment: null }, control_operation_id: "create-op" };
   assertEquals(parseCreateWorkspaceWorkerRequest(request).initial_submit, request.initial_submit);
   assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, initial_submit: [{ kind: "feature_invoke", invocation: {
     ...invocation, arguments: [{ name: "count", value: { kind: "integer", value: 9007199254740992 } }],

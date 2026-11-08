@@ -1,13 +1,15 @@
 use super::*;
 
 #[tokio::test]
-async fn notification_wip_executes_same_read_and_honors_profile_denial() {
+async fn notification_wip_executes_same_read_and_honors_host_denial() {
+    use assignment_tracking::authorization_tests::{AuthorizedClient, ticket};
     for denied in [false, true] {
-        let client = Arc::new(Client {
-            requests: Mutex::new(vec![]),
-            status: 200,
-            body: json!({"items":[],"next_cursor":null,"source_checks":[]}).to_string(),
-        });
+        let client = AuthorizedClient::new(json!({
+            "items":[],"next_cursor":null,"source_checks":[]
+        }));
+        if !denied {
+            client.grant("notification.diagnostics.read", ticket("T-755"));
+        }
         let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::read_only()).unwrap();
         let handler = TicketCollectionWipHandler {
             tools: operation_map(
@@ -16,10 +18,6 @@ async fn notification_wip_executes_same_read_and_honors_profile_denial() {
                     .filter(|t| t.projection.surface == NativeTicketSurface::Collection)
                     .collect(),
             ),
-            permissions: denied.then_some(ToolPermissionConfig {
-                default_action: ToolPermissionAction::Deny,
-                rules: vec![],
-            }),
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -41,6 +39,19 @@ async fn notification_wip_executes_same_read_and_honors_profile_denial() {
             )
             .await;
         assert_eq!(result.is_err(), denied);
+        if denied {
+            assert!(matches!(
+                result,
+                Err(WipOperationError::Protocol(ProtocolError {
+                    code: ProtocolErrorCode::PermissionDenied,
+                    ..
+                }))
+            ));
+        }
+        let authorizations = client.authorizations.lock().unwrap();
+        assert_eq!(authorizations.len(), 1);
+        assert_eq!(authorizations[0].operation, "notification.diagnostics.read");
+        assert_eq!(authorizations[0].resource, ticket("T-755"));
         let requests = client.requests.lock().unwrap();
         assert_eq!(requests.len(), usize::from(!denied));
         if !denied {

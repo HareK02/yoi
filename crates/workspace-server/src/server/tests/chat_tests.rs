@@ -1359,7 +1359,10 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         created_policy.execution,
         server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(created_policy.delegation.grants.is_empty());
+    assert_eq!(
+        created_policy.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
     assert!(created_policy.legacy_constraints.is_none());
     // Adopt that same shared default through T-838's only writer. No individual
     // conversation/Ticket ID grant is appended before the real Controller runs.

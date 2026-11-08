@@ -15,8 +15,7 @@ use crate::{
     MemoryExtractionProfileConfig, MemoryFeatureProfileConfig, MemoryResidentProfileConfig,
     MergeRequestFeatureConfig, ResolvedMemoryFeatureConfig, ResolvedSubjektivFeatureConfig,
     ScopeConfig, SessionConfig, SkillsConfig, SubjektivFeatureProfileConfig, TicketFeatureConfig,
-    ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerFeatureConfig,
-    WorkerManifest, WorkerMeta,
+    ToolOutputLimits, WebConfig, WorkerFeatureConfig, WorkerManifest, WorkerMeta,
 };
 
 /// Merges partial configuration into a validated [`crate::WorkerManifest`].
@@ -28,6 +27,7 @@ use crate::{
 /// semantics. This type does not imply implicit discovery or merging of user/project
 /// Manifest files during normal startup.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerManifestConfig {
     #[serde(default)]
     pub worker: WorkerMetaConfig,
@@ -45,13 +45,9 @@ pub struct WorkerManifestConfig {
     pub delegation_scope: ScopeConfig,
     #[serde(default)]
     pub session: Option<SessionConfigPartial>,
-    /// Optional `[permissions]` section. `None` means the permission layer
-    /// is disabled; `Some` requires `default_action` during final resolve.
-    #[serde(default)]
-    pub permissions: Option<PermissionConfigPartial>,
     /// Built-in feature/tool-surface enablement. Absent tool flags resolve
-    /// disabled after cascade merge; the read-only WIP workdir catalog defaults
-    /// enabled without granting authority.
+    /// disabled after cascade merge except filesystem/Bash; the read-only WIP
+    /// workdir catalog defaults enabled without granting authority.
     #[serde(default)]
     pub feature: FeatureConfigPartial,
     /// Explicit Model Context Protocol provider declarations. Config parsing
@@ -75,6 +71,12 @@ pub struct WorkerManifestConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureConfigPartial {
+    #[serde(default)]
+    pub filesystem: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub filesystem_write: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub bash: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub task: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
@@ -114,6 +116,17 @@ pub struct FeatureConfigPartial {
 impl FeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
+            filesystem: merge_option(
+                self.filesystem,
+                other.filesystem,
+                FeatureFlagConfigPartial::merge,
+            ),
+            filesystem_write: merge_option(
+                self.filesystem_write,
+                other.filesystem_write,
+                FeatureFlagConfigPartial::merge,
+            ),
+            bash: merge_option(self.bash, other.bash, FeatureFlagConfigPartial::merge),
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
             memory: merge_option(self.memory, other.memory, MemoryFeatureConfigPartial::merge),
             subjektiv: merge_option(
@@ -176,6 +189,7 @@ impl FeatureConfigPartial {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeatureFlagConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -418,6 +432,21 @@ impl MemoryConsolidationProfileConfigPartial {
 impl From<FeatureConfigPartial> for FeatureConfig {
     fn from(value: FeatureConfigPartial) -> Self {
         Self {
+            filesystem: FeatureFlagConfig {
+                enabled: value
+                    .filesystem
+                    .and_then(|flag| flag.enabled)
+                    .unwrap_or(true),
+            },
+            filesystem_write: FeatureFlagConfig {
+                enabled: value
+                    .filesystem_write
+                    .and_then(|flag| flag.enabled)
+                    .unwrap_or(true),
+            },
+            bash: FeatureFlagConfig {
+                enabled: value.bash.and_then(|flag| flag.enabled).unwrap_or(true),
+            },
             task: value.task.map(FeatureFlagConfig::from).unwrap_or_default(),
             memory: value
                 .memory
@@ -645,6 +674,9 @@ impl From<MergeRequestFeatureConfig> for MergeRequestFeatureConfigPartial {
 impl From<FeatureConfig> for FeatureConfigPartial {
     fn from(value: FeatureConfig) -> Self {
         Self {
+            filesystem: Some(value.filesystem.into()),
+            filesystem_write: Some(value.filesystem_write.into()),
+            bash: Some(value.bash.into()),
             task: Some(value.task.into()),
             memory: Some(value.memory.into()),
             subjektiv: Some(value.subjektiv.into()),
@@ -720,14 +752,6 @@ pub struct FileUploadLimitsPartial {
 pub struct SessionConfigPartial {
     #[serde(default)]
     pub record_event_trace: Option<bool>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PermissionConfigPartial {
-    #[serde(default)]
-    pub default_action: Option<crate::ToolPermissionAction>,
-    #[serde(default, rename = "rule")]
-    pub rules: Vec<ToolPermissionRule>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -826,8 +850,9 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
 }
 
 impl WorkerManifestConfig {
-    /// Parse a partial manifest from a TOML string. Unknown top-level or
-    /// nested fields emit a `tracing::warn!` and are ignored; use
+    /// Parse a partial manifest from a TOML string. Unknown top-level fields
+    /// are rejected, including removed tool permission policies. Tolerated nested
+    /// fields emit a `tracing::warn!` and are ignored; use
     /// `tracing_subscriber` with `WARN` enabled to surface them to the
     /// operator. Removed fields with an explicit replacement (including
     /// `feature.workers`) are rejected before deserialization.
@@ -841,7 +866,8 @@ impl WorkerManifestConfig {
 
     /// Base config populated with the in-code per-field defaults listed in
     /// [`crate::defaults`]. This is not a selectable Profile and does not
-    /// enable launch authority or normal Tools. The read-only WIP workdir
+    /// enable launch authority. Filesystem/Bash supply preserves the historical
+    /// defaults; other tool features remain opt-in. The read-only WIP workdir
     /// catalog defaults enabled independently. Profile and one-file Manifest
     /// resolvers start from this layer so every per-field default lives at
     /// exactly one call site (the `defaults` module).
@@ -927,11 +953,6 @@ impl WorkerManifestConfig {
             scope: merge_scope(self.scope, upper.scope),
             delegation_scope: merge_scope(self.delegation_scope, upper.delegation_scope),
             session: merge_option(self.session, upper.session, SessionConfigPartial::merge),
-            permissions: merge_option(
-                self.permissions,
-                upper.permissions,
-                PermissionConfigPartial::merge,
-            ),
             feature: self.feature.merge(upper.feature),
             mcp: merge_mcp_config(self.mcp, upper.mcp),
             plugins: upper.plugins.or(self.plugins),
@@ -1053,16 +1074,6 @@ impl SessionConfigPartial {
     fn merge(self, upper: Self) -> Self {
         Self {
             record_event_trace: upper.record_event_trace.or(self.record_event_trace),
-        }
-    }
-}
-
-impl PermissionConfigPartial {
-    fn merge(mut self, upper: Self) -> Self {
-        self.rules.extend(upper.rules);
-        Self {
-            default_action: upper.default_action.or(self.default_action),
-            rules: self.rules,
         }
     }
 }
@@ -1364,18 +1375,6 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
                 .unwrap_or(false),
         };
 
-        let permissions = cfg
-            .permissions
-            .map(|p| {
-                Ok(ToolPermissionConfig {
-                    default_action: p
-                        .default_action
-                        .ok_or(ResolveError::MissingField("permissions.default_action"))?,
-                    rules: p.rules,
-                })
-            })
-            .transpose()?;
-
         let compaction = cfg
             .compaction
             .map(|c| -> Result<CompactionConfig, ResolveError> {
@@ -1447,7 +1446,6 @@ impl TryFrom<WorkerManifestConfig> for WorkerManifest {
             scope: cfg.scope,
             delegation_scope: cfg.delegation_scope,
             session,
-            permissions,
             feature: FeatureConfig::from(cfg.feature),
             mcp: cfg.mcp,
             plugins: cfg.plugins.unwrap_or_default(),
@@ -1495,7 +1493,6 @@ mod tests {
                 deny: Vec::new(),
             },
             delegation_scope: ScopeConfig::default(),
-            permissions: None,
             feature: FeatureConfigPartial::default(),
             mcp: McpConfig::default(),
             plugins: None,
@@ -1588,7 +1585,6 @@ mod tests {
         assert_eq!(manifest.worker.name, "test");
         assert_eq!(manifest.worker.mode, crate::WorkerMode::Tools);
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
-        assert!(manifest.permissions.is_none());
     }
 
     #[test]
@@ -1753,50 +1749,6 @@ mod tests {
 
         let manifest: WorkerManifest = cfg.try_into().unwrap();
         assert!(manifest.session.record_event_trace);
-    }
-
-    #[test]
-    fn resolve_permissions_requires_default_action_when_present() {
-        let mut cfg = minimal_valid();
-        cfg.permissions = Some(PermissionConfigPartial {
-            default_action: None,
-            rules: Vec::new(),
-        });
-
-        let err = WorkerManifest::try_from(cfg).unwrap_err();
-
-        assert!(matches!(
-            err,
-            ResolveError::MissingField("permissions.default_action")
-        ));
-    }
-
-    #[test]
-    fn resolve_permissions_preserves_actions_and_rule_order() {
-        let mut cfg = minimal_valid();
-        cfg.permissions = Some(PermissionConfigPartial {
-            default_action: Some(crate::ToolPermissionAction::Ask),
-            rules: vec![
-                ToolPermissionRule {
-                    tool: "Bash".into(),
-                    pattern: "rm *".into(),
-                    action: crate::ToolPermissionAction::Deny,
-                },
-                ToolPermissionRule {
-                    tool: "Read".into(),
-                    pattern: "*".into(),
-                    action: crate::ToolPermissionAction::Allow,
-                },
-            ],
-        });
-
-        let manifest: WorkerManifest = cfg.try_into().unwrap();
-        let permissions = manifest.permissions.unwrap();
-
-        assert_eq!(permissions.default_action, crate::ToolPermissionAction::Ask);
-        assert_eq!(permissions.rules.len(), 2);
-        assert_eq!(permissions.rules[0].tool, "Bash");
-        assert_eq!(permissions.rules[1].tool, "Read");
     }
 
     #[test]
@@ -2003,42 +1955,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_permissions_accumulates_rules_and_upper_default_wins() {
-        let lower = WorkerManifestConfig {
-            permissions: Some(PermissionConfigPartial {
-                default_action: Some(crate::ToolPermissionAction::Allow),
-                rules: vec![ToolPermissionRule {
-                    tool: "Bash".into(),
-                    pattern: "git *".into(),
-                    action: crate::ToolPermissionAction::Allow,
-                }],
-            }),
-            ..Default::default()
-        };
-        let upper = WorkerManifestConfig {
-            permissions: Some(PermissionConfigPartial {
-                default_action: Some(crate::ToolPermissionAction::Deny),
-                rules: vec![ToolPermissionRule {
-                    tool: "Bash".into(),
-                    pattern: "rm *".into(),
-                    action: crate::ToolPermissionAction::Deny,
-                }],
-            }),
-            ..Default::default()
-        };
-
-        let merged = lower.merge(upper).permissions.unwrap();
-
-        assert_eq!(
-            merged.default_action,
-            Some(crate::ToolPermissionAction::Deny)
-        );
-        assert_eq!(merged.rules.len(), 2);
-        assert_eq!(merged.rules[0].pattern, "git *");
-        assert_eq!(merged.rules[1].pattern, "rm *");
-    }
-
-    #[test]
     fn merge_tool_output_per_tool_keywise() {
         let lower = WorkerManifestConfig {
             engine: EngineManifestConfig {
@@ -2134,6 +2050,93 @@ mod tests {
         let search = merged.web.unwrap().search.unwrap();
         assert_eq!(search.timeout_secs, Some(3));
         assert_eq!(search.api_key_secret.as_deref(), Some("web/brave/lower"));
+    }
+
+    #[test]
+    fn partial_manifest_rejects_removed_permissions_in_all_input_formats() {
+        for policy in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({
+                "default_action": "deny", "rule": [{"tool":"Read", "pattern":"*", "action":"allow"}]
+            }),
+        ] {
+            let error = serde_json::from_value::<WorkerManifestConfig>(
+                serde_json::json!({"permissions": policy}),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("unknown field `permissions`"),
+                "{error}"
+            );
+        }
+        for source in [
+            "[permissions]\n",
+            "[permissions]\ndefault_action = \"deny\"\n",
+        ] {
+            let error = WorkerManifestConfig::from_toml(source).unwrap_err();
+            assert!(error.to_string().contains("permissions"), "{error}");
+            assert!(toml::from_str::<WorkerManifestConfig>(source).is_err());
+        }
+    }
+
+    #[test]
+    fn filesystem_and_bash_features_preserve_defaults_merge_and_serialization() {
+        for key in ["filesystem", "filesystem_write", "bash"] {
+            assert!(
+                serde_json::to_value(FeatureConfig::default()).unwrap()[key]["enabled"]
+                    .as_bool()
+                    .unwrap()
+            );
+            for enabled in [false, true] {
+                let lower = WorkerManifestConfig::from_toml(&format!(
+                    "[feature.{key}]\nenabled = {enabled}\n"
+                ))
+                .unwrap();
+                for upper in [String::new(), format!("[feature.{key}]\n")] {
+                    let manifest: WorkerManifest = minimal_valid()
+                        .merge(lower.clone())
+                        .merge(WorkerManifestConfig::from_toml(&upper).unwrap())
+                        .try_into()
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_value(&manifest.feature).unwrap()[key]["enabled"],
+                        enabled
+                    );
+                    let partial = FeatureConfigPartial::from(manifest.feature.clone());
+                    let serialized = toml::to_string(&partial).unwrap();
+                    let restored: FeatureConfigPartial = toml::from_str(&serialized).unwrap();
+                    assert_eq!(FeatureConfig::from(restored), manifest.feature);
+                    assert!(
+                        serde_json::to_value(&manifest)
+                            .unwrap()
+                            .get("permissions")
+                            .is_none()
+                    );
+                }
+                let override_layer = WorkerManifestConfig::from_toml(&format!(
+                    "[feature.{key}]\nenabled = {}\n",
+                    !enabled
+                ))
+                .unwrap();
+                let manifest: WorkerManifest = minimal_valid()
+                    .merge(lower)
+                    .merge(override_layer)
+                    .try_into()
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(manifest.feature).unwrap()[key]["enabled"],
+                    !enabled
+                );
+            }
+            let empty_section =
+                WorkerManifestConfig::from_toml(&format!("[feature.{key}]\n")).unwrap();
+            let manifest: WorkerManifest = minimal_valid().merge(empty_section).try_into().unwrap();
+            assert_eq!(
+                serde_json::to_value(manifest.feature).unwrap()[key]["enabled"],
+                true
+            );
+        }
     }
 
     #[test]
@@ -2313,7 +2316,7 @@ worker_max_turns = 7
     }
 
     #[test]
-    fn tool_feature_flags_default_disabled_except_read_only_workdir_catalog() {
+    fn opt_in_tool_features_default_disabled_except_read_only_workdir_catalog() {
         let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
         assert!(!manifest.feature.task.enabled);
         assert!(!manifest.feature.memory.profile.enabled);

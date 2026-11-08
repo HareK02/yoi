@@ -20,6 +20,7 @@ pub mod external_workdir_connection_observations;
 pub mod feature_storage;
 pub mod grant_cleanup_operation;
 pub mod hosts;
+pub mod launch_policy;
 pub mod memory_backend;
 pub mod memory_staging;
 pub mod observation;

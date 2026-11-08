@@ -125,6 +125,7 @@ pub struct PermissionHost {
 struct RegistryState {
     features: BTreeMap<FeatureIdentity, FeatureRecord>,
     namespaces: BTreeMap<NamespaceId, NamespaceRecord>,
+    workspace_sets: Vec<SetContribution>,
 }
 
 impl PermissionHost {
@@ -272,8 +273,28 @@ impl PermissionHost {
             .get_mut(&handle.namespace)
             .expect("checked namespace")
             .declaration = declaration;
-        validate_graph(&candidate)?;
+        validate_graph(&candidate, &self.catalog.workspace_sets)?;
         Arc::make_mut(&mut self.catalog).namespaces = candidate;
+        Ok(())
+    }
+
+    /// Replace only the trusted Workspace configuration's Set contributions.
+    /// These references do not declare keys or acquire Feature ownership. The
+    /// config owner authenticates the edit; this Host validates the combined graph
+    /// before publication. Feature disablement and exclusions still apply through
+    /// the same resolver. The editable source remains the configuration authority.
+    pub fn replace_workspace_sets(
+        &mut self,
+        contributions: Vec<SetContribution>,
+    ) -> Result<(), PermissionError> {
+        let mut unique = BTreeSet::new();
+        for contribution in &contributions {
+            if !unique.insert(&contribution.set) {
+                return Err(PermissionError::Duplicate(contribution.set.to_string()));
+            }
+        }
+        validate_graph(&self.catalog.namespaces, &contributions)?;
+        Arc::make_mut(&mut self.catalog).workspace_sets = contributions;
         Ok(())
     }
 
@@ -523,7 +544,17 @@ enum Node {
 
 fn graph(
     namespaces: &BTreeMap<NamespaceId, NamespaceRecord>,
+    workspace_sets: &[SetContribution],
 ) -> Result<BTreeMap<Node, Vec<Node>>, PermissionError> {
+    let feature_sets: BTreeSet<_> = namespaces
+        .values()
+        .flat_map(|record| record.declaration.sets.iter().map(|set| &set.set))
+        .collect();
+    for configured in workspace_sets {
+        if feature_sets.contains(&configured.set) {
+            return Err(PermissionError::Duplicate(configured.set.to_string()));
+        }
+    }
     let mut nodes = BTreeMap::new();
     for r in namespaces.values() {
         for d in &r.declaration.permissions {
@@ -532,20 +563,24 @@ fn graph(
                 d.children.iter().cloned().map(Node::Key).collect(),
             );
         }
-        for s in &r.declaration.sets {
-            let edges = nodes
-                .entry(Node::Set(s.set.clone()))
-                .or_insert_with(Vec::new);
-            for reference in &s.children {
-                match reference {
-                    PermissionReference::Set(set) => edges.push(Node::Set(set.clone())),
-                    PermissionReference::Namespace(ns) => {
-                        for key in &ns.keys {
-                            if key.namespace() != ns.namespace {
-                                return Err(PermissionError::Ownership(key.clone()));
-                            }
-                            edges.push(Node::Key(key.clone()));
+    }
+    for s in namespaces
+        .values()
+        .flat_map(|r| &r.declaration.sets)
+        .chain(workspace_sets)
+    {
+        let edges = nodes
+            .entry(Node::Set(s.set.clone()))
+            .or_insert_with(Vec::new);
+        for reference in &s.children {
+            match reference {
+                PermissionReference::Set(set) => edges.push(Node::Set(set.clone())),
+                PermissionReference::Namespace(ns) => {
+                    for key in &ns.keys {
+                        if key.namespace() != ns.namespace {
+                            return Err(PermissionError::Ownership(key.clone()));
                         }
+                        edges.push(Node::Key(key.clone()));
                     }
                 }
             }
@@ -556,6 +591,7 @@ fn graph(
 
 fn validate_graph(
     namespaces: &BTreeMap<NamespaceId, NamespaceRecord>,
+    workspace_sets: &[SetContribution],
 ) -> Result<(), PermissionError> {
     fn visit(
         node: &Node,
@@ -580,7 +616,7 @@ fn validate_graph(
         done.insert(node.clone());
         Ok(())
     }
-    let nodes = graph(namespaces)?;
+    let nodes = graph(namespaces, workspace_sets)?;
     let mut done = BTreeSet::new();
     for node in nodes.keys() {
         visit(node, &nodes, &mut BTreeSet::new(), &mut done)?;
@@ -635,6 +671,16 @@ impl<'a> Expansion<'a> {
                     return;
                 }
                 let mut found = false;
+                for contribution in &self.host.catalog.workspace_sets {
+                    if &contribution.set == set {
+                        found = true;
+                        let mut next = path.clone();
+                        next.push(OriginStep::Set(set.clone()));
+                        for child in &contribution.children {
+                            self.reference(child, next.clone());
+                        }
+                    }
+                }
                 for record in self.host.catalog.namespaces.values() {
                     for contribution in &record.declaration.sets {
                         if &contribution.set != set {

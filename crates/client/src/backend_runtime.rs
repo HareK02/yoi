@@ -909,8 +909,10 @@ mod tests {
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some("test-human-create".into()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         };
 
         let response = create_backend_worker_with_client(&target, &create, &api)

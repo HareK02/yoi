@@ -487,8 +487,10 @@ impl RemovalFixture {
                         subject_id: subject_id.into(),
                     }),
                 },
-                control_operation_id: None,
-                execution_grant: None,
+                control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
             }),
         )
         .await
@@ -2183,8 +2185,10 @@ async fn nonjournal_stopped_real_worker_removes_without_journal_scope_or_recordi
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await

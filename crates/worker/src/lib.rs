@@ -43,7 +43,6 @@ pub mod wip;
 mod internal_worker;
 mod interrupt_prep;
 mod peer;
-mod permission;
 mod worker;
 
 pub use bootstrap::{

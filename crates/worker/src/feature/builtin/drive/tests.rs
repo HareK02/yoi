@@ -765,7 +765,7 @@ async fn drive_common_text_reads_use_bounded_complete_source_and_literal_window_
             .contains(&Contract::SearchText.reference())
     );
     assert!(
-        !projection
+        projection
             .object
             .interfaces
             .contains(&Contract::Write.reference())
@@ -922,31 +922,6 @@ async fn drive_common_text_rejects_oversized_source_before_read_and_remount_chan
 }
 
 #[tokio::test]
-async fn drive_common_text_reads_keep_tool_permission_denial_before_backend_read() {
-    use crate::wip::WipSubtreeProvider;
-    let entry = entry("2", "3");
-    let client = Client::new(vec![response(entry.clone())]);
-    let feature = feature(client.clone()).with_permissions(Some(manifest::ToolPermissionConfig {
-        default_action: manifest::ToolPermissionAction::Deny,
-        rules: Vec::new(),
-    }));
-    let projection = wip::DriveProvider::new(feature)
-        .publication(&entry_path(&entry.entry))
-        .await
-        .unwrap()
-        .unwrap()
-        .projection;
-    let result = projection
-        .handler
-        .call("read_lines", &native_args(json!({})), native_context())
-        .await;
-    assert!(
-        matches!(result, Err(crate::wip::WipOperationError::Protocol(error)) if error.code == wip_protocol::ProtocolErrorCode::PermissionDenied)
-    );
-    assert_eq!(client.requests.lock().unwrap().len(), 2);
-}
-
-#[tokio::test]
 async fn drive_read_only_capability_omits_file_and_folder_mutation_contracts() {
     use crate::file_operation::Contract;
     use crate::wip::WipSubtreeProvider;
@@ -1041,20 +1016,13 @@ async fn drive_capability_failure_never_publishes_an_assumed_write_ceiling() {
 }
 
 #[tokio::test]
-async fn drive_common_mutation_publication_intersects_tool_permission_ceiling() {
+async fn drive_common_mutation_publication_uses_provider_capability() {
     use crate::file_operation::Contract;
     use crate::wip::WipSubtreeProvider;
     let entry = entry("2", "3");
     let client = Client::new(vec![response(entry.clone())]);
     *client.capabilities.lock().unwrap() = response(DriveCapabilities { write: true });
-    let feature = feature(client).with_permissions(Some(manifest::ToolPermissionConfig {
-        default_action: manifest::ToolPermissionAction::Allow,
-        rules: vec![manifest::ToolPermissionRule {
-            tool: "DriveWrite".into(),
-            pattern: "*".into(),
-            action: manifest::ToolPermissionAction::Deny,
-        }],
-    }));
+    let feature = feature(client);
     let projection = wip::DriveProvider::new(feature)
         .publication(&entry_path(&entry.entry))
         .await
@@ -1201,73 +1169,11 @@ async fn drive_common_edit_then_write_reuses_exact_post_operation_object_validat
     assert_eq!(state.2.len(), 2);
 }
 
-#[tokio::test]
-async fn drive_argument_dependent_write_policy_is_rechecked_and_ask_is_not_published() {
-    use crate::file_operation::Contract;
-    use crate::wip::WipSubtreeProvider;
-    for (default_action, pattern, action, published, code) in [
-        (
-            manifest::ToolPermissionAction::Deny,
-            "*permitted*",
-            manifest::ToolPermissionAction::Allow,
-            true,
-            wip_protocol::ProtocolErrorCode::PermissionDenied,
-        ),
-        (
-            manifest::ToolPermissionAction::Allow,
-            "*",
-            manifest::ToolPermissionAction::Ask,
-            false,
-            wip_protocol::ProtocolErrorCode::OperationNotFound,
-        ),
-    ] {
-        let entry = entry("2", "3");
-        let client = Client::new(vec![response(entry.clone())]);
-        *client.capabilities.lock().unwrap() = response(DriveCapabilities { write: true });
-        let feature =
-            feature(client.clone()).with_permissions(Some(manifest::ToolPermissionConfig {
-                default_action,
-                rules: vec![manifest::ToolPermissionRule {
-                    tool: "DriveWrite".into(),
-                    pattern: pattern.into(),
-                    action,
-                }],
-            }));
-        let projection = wip::DriveProvider::new(feature)
-            .publication(&entry_path(&entry.entry))
-            .await
-            .unwrap()
-            .unwrap()
-            .projection;
-        assert_eq!(
-            projection
-                .object
-                .interfaces
-                .contains(&Contract::Write.reference()),
-            published
-        );
-        let result = projection
-            .handler
-            .call(
-                "write",
-                &native_args(json!({"content":"denied"})),
-                native_context(),
-            )
-            .await;
-        assert!(
-            matches!(result, Err(crate::wip::WipOperationError::Protocol(error)) if error.code == code)
-        );
-        assert_eq!(client.requests.lock().unwrap().len(), 2);
-    }
-}
-
-// A single retained Object observation models a restored Client cache. All later
-// publication and execution use the real new-mount provider; the new Host supplies
-// the common contract's root scope independently, without replaying its old ref.
 struct RetainedObjectOnce {
     current: wip::DriveProvider,
     retained: Mutex<Option<wip_protocol::Object>>,
 }
+
 #[async_trait]
 impl crate::wip::WipSubtreeProvider for RetainedObjectOnce {
     async fn publication(

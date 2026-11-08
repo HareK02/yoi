@@ -98,7 +98,7 @@ fn objective_enablement_requires_live_workspace_binding_not_operation_grants() {
                             available,
                             identity,
                         }),
-                        native.then_some((route, None)),
+                        native.then_some(route),
                     );
                     assert_eq!(result.is_ok(), !enabled || (available && identity));
                     if result.is_err() {
@@ -182,7 +182,7 @@ fn missing_control_dependency_prevents_objective_and_spawn_publication() {
             available: true,
             identity: true,
         }),
-        Some((route, None)),
+        Some(route),
     )
     .unwrap();
     compose_sub_worker(&mut registry, true, false);
@@ -208,14 +208,14 @@ fn late_install_failure_rolls_back_migrated_tools_instructions_services_and_wip_
     let existing = mounts
         .allocate_namespace("objective", "existing-objectives")
         .unwrap();
-    objective::mount_workspace_http_objective_wip(&mut mounts, client.clone(), None, &existing)
+    objective::mount_workspace_http_objective_wip(&mut mounts, client.clone(), &existing)
         .unwrap();
     let before = mounts.routes().map(str::to_owned).collect::<Vec<_>>();
     let mut registry = FeatureRegistryBuilder::new();
     let route = mounts
         .allocate_namespace("objective", "objectives")
         .unwrap();
-    objective::composition::compose(&mut registry, true, client, Some((route, None))).unwrap();
+    objective::composition::compose(&mut registry, true, client, Some(route)).unwrap();
     compose_sub_worker(&mut registry, true, true);
     registry.add_module(ToolFeature {
         descriptor: FeatureDescriptor::builtin("duplicate", "Duplicate")
@@ -272,11 +272,10 @@ impl FeatureModule for PartialWipFailure {
             objective::mount_workspace_http_objective_wip(
                 mounts,
                 client.clone(),
-                None,
                 &self.route,
             )?;
             // Deterministic failure after the first mount changed publication metadata.
-            objective::mount_workspace_http_objective_wip(mounts, client, None, &self.route)
+            objective::mount_workspace_http_objective_wip(mounts, client, &self.route)
         })
     }
 }

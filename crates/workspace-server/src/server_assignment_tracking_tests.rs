@@ -58,8 +58,8 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
                 initial_submit: Vec::new(),
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
-                control_operation_id: None,
-                execution_grant: None,
+                control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
             }),
         )
         .await

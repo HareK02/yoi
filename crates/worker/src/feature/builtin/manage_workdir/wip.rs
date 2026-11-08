@@ -16,7 +16,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
 use wip_protocol::{
@@ -25,7 +24,6 @@ use wip_protocol::{
 };
 
 use super::*;
-use crate::permission::permission_action_for;
 use crate::wip::{
     WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount,
     WipDynamicOperationContribution, WipDynamicOperationResolver, WipMountError, WipMountRegistry,
@@ -59,20 +57,6 @@ impl Domain {
             Self::Attachment => "workdir-attachment",
         }
     }
-    fn list_permission(self) -> &'static str {
-        match self {
-            Self::Repository => "RepositoryList",
-            Self::Workdir => LIST_TOOL,
-            Self::Attachment => "WorkdirAttachmentList",
-        }
-    }
-    fn read_permission(self) -> &'static str {
-        match self {
-            Self::Repository => "RepositoryRead",
-            Self::Workdir => "WorkdirRead",
-            Self::Attachment => "WorkdirAttachmentRead",
-        }
-    }
     fn identity_field(self) -> &'static str {
         match self {
             Self::Repository => "repository_key",
@@ -85,7 +69,6 @@ impl Domain {
 #[derive(Clone)]
 struct Provider {
     backend: WorkspaceHttpWorkdirBackend,
-    permissions: Option<ToolPermissionConfig>,
     catalog: bool,
     manage: bool,
     config_content: bool,
@@ -99,11 +82,12 @@ pub fn mount_workspace_workdir_wip(
     feature: &ManageWorkdirFeature,
     catalog: bool,
     manage: bool,
-    permissions: Option<ToolPermissionConfig>,
 ) -> Result<(), WipMountError> {
+    if !catalog && !manage {
+        return Ok(());
+    }
     let provider = Provider {
         backend: feature.backend(),
-        permissions,
         catalog,
         manage,
         checkout_content: registry.has_subtree("/checkouts"),
@@ -175,37 +159,6 @@ pub fn mount_workspace_workdir_wip(
 }
 
 impl Provider {
-    fn allowed(&self, name: &str, input: &Json) -> bool {
-        self.permissions
-            .as_ref()
-            .is_none_or(|p| permission_action_for(p, name, input) == ToolPermissionAction::Allow)
-    }
-    // An argument-dependent permission cannot be decided until call. Advertise only
-    // if the policy can allow this tool, then recheck the exact route-bound input.
-    fn may_allow(&self, name: &str) -> bool {
-        let Some(p) = &self.permissions else {
-            return true;
-        };
-        for rule in p.rules.iter().filter(|r| r.tool.eq_ignore_ascii_case(name)) {
-            if rule.action == ToolPermissionAction::Allow {
-                return true;
-            }
-            if rule.pattern == "*" {
-                return false;
-            }
-        }
-        p.default_action == ToolPermissionAction::Allow
-    }
-    fn authorize(&self, name: &str, input: &Json) -> Result<(), WipOperationError> {
-        if self.allowed(name, input) {
-            Ok(())
-        } else {
-            Err(failure(
-                ProtocolErrorCode::PermissionDenied,
-                format!("permission denied for `{name}`; approval-required policies fail closed"),
-            ))
-        }
-    }
     fn list_operation(domain: Domain) -> &'static str {
         match domain {
             Domain::Repository => "repository.list",
@@ -347,9 +300,7 @@ impl Provider {
             }
         }
     }
-    fn read_input(&self, domain: Domain, id: &str) -> Json {
-        json!({domain.identity_field(): id})
-    }
+
     fn projected(&self, domain: Domain, raw: &Json) -> Result<Json, WipOperationError> {
         let id = raw
             .get(domain.identity_field())
@@ -518,11 +469,6 @@ impl Provider {
             .client
             .authorize_workdir_attachment_operation("workdir.attachment.read", alias, None)
             .ok()?;
-        self.authorize(
-            "WorkdirAttachmentRead",
-            &self.read_input(Domain::Attachment, &connection),
-        )
-        .ok()?;
         let raw = self.raw_item(Domain::Attachment, &connection).ok()?;
         if raw.get("alias").and_then(Json::as_str) != Some(alias)
             || raw.get("working_directory_id").and_then(Json::as_str) != Some(workdir)
@@ -545,6 +491,9 @@ impl WipOperationHandler for CollectionHandler {
     fn object_validator(&self) -> Option<Vec<u8>> {
         let mut digest = Sha256::new();
         digest.update(self.domain.route());
+        if !self.provider.catalog {
+            return Some(digest.finalize().to_vec());
+        }
         if matches!(self.domain, Domain::Workdir | Domain::Attachment) {
             // The complete-set digest is computed by the existing Backend
             // registry/ledger in the same snapshot as a bounded page. Never infer
@@ -572,10 +521,6 @@ impl WipOperationHandler for CollectionHandler {
             Ok(items) => {
                 for raw in items {
                     if let Some(id) = raw.get(self.domain.identity_field()).and_then(Json::as_str)
-                        && self.provider.allowed(
-                            self.domain.read_permission(),
-                            &self.provider.read_input(self.domain, id),
-                        )
                         && let Ok(value) = self.provider.projected(self.domain, &raw)
                     {
                         digest.update(value.to_string());
@@ -588,23 +533,12 @@ impl WipOperationHandler for CollectionHandler {
         Some(digest.finalize().to_vec())
     }
     fn is_visible(&self) -> bool {
-        (self.provider.catalog
-            && (self.provider.may_allow(self.domain.list_permission())
-                || self.provider.may_allow(self.domain.read_permission())))
-            || (self.provider.manage
-                && matches!(self.domain, Domain::Workdir)
-                && self.provider.may_allow(CREATE_TOOL))
+        self.provider.catalog || (self.provider.manage && matches!(self.domain, Domain::Workdir))
     }
     fn operation_available(&self, operation: &str) -> bool {
         match operation {
-            "list" => {
-                self.provider.catalog && self.provider.may_allow(self.domain.list_permission())
-            }
-            "create" => {
-                self.provider.manage
-                    && matches!(self.domain, Domain::Workdir)
-                    && self.provider.may_allow(CREATE_TOOL)
-            }
+            "list" => self.provider.catalog,
+            "create" => self.provider.manage && matches!(self.domain, Domain::Workdir),
             _ => false,
         }
     }
@@ -623,8 +557,6 @@ impl WipOperationHandler for CollectionHandler {
         }
         let value = match operation {
             "list" => {
-                self.provider
-                    .authorize(self.domain.list_permission(), &input)?;
                 let limit = page_limit(&input)?;
                 let cursor = input.get("cursor").and_then(Json::as_str);
                 if matches!(self.domain, Domain::Workdir | Domain::Attachment) {
@@ -675,12 +607,7 @@ impl WipOperationHandler for CollectionHandler {
                                     "inventory identity missing".into(),
                                 )
                             })?;
-                        if self.provider.allowed(
-                            self.domain.read_permission(),
-                            &self.provider.read_input(self.domain, id),
-                        ) {
-                            items.push(self.provider.projected(self.domain, raw)?);
-                        }
+                        items.push(self.provider.projected(self.domain, raw)?);
                     }
                     let next = if attachment {
                         match page.get("next_offset") {
@@ -707,7 +634,7 @@ impl WipOperationHandler for CollectionHandler {
                             }
                         }
                     };
-                    // Empty describes this permission-filtered page, not the
+                    // Empty describes this bounded page, not the
                     // entire catalog. A sparse page still advances the Backend cursor.
                     return native(
                         json!({"empty":items.is_empty(), "items":items, "has_more":next.is_some(), "next_cursor":next, "limit":limit}),
@@ -721,12 +648,7 @@ impl WipOperationHandler for CollectionHandler {
                         .ok_or_else(|| {
                             WipOperationError::OutcomeUnknown("inventory identity missing".into())
                         })?;
-                    if self.provider.allowed(
-                        self.domain.read_permission(),
-                        &self.provider.read_input(self.domain, id),
-                    ) {
-                        items.push(self.provider.projected(self.domain, &raw)?);
-                    }
+                    items.push(self.provider.projected(self.domain, &raw)?);
                 }
                 items.sort_by(|a, b| {
                     a[self.domain.identity_field()]
@@ -756,7 +678,6 @@ impl WipOperationHandler for CollectionHandler {
                 json!({"items": items, "empty": total_visible == 0, "has_more": has_more, "next_cursor": next_cursor, "limit": limit})
             }
             "create" => {
-                self.provider.authorize(CREATE_TOOL, &input)?;
                 let tool = WorkspaceHttpWorkdirTool {
                     backend: self.provider.backend.clone(),
                     operation: WorkdirOperation::Create,
@@ -786,12 +707,7 @@ struct ItemResolver {
 impl WipDynamicItemResolver for ItemResolver {
     fn resolve(&self, reference: &str) -> Option<WipDynamicItem> {
         let id = decode_identity(reference)?;
-        if !self.provider.catalog
-            || !self.provider.allowed(
-                self.domain.read_permission(),
-                &self.provider.read_input(self.domain, &id),
-            )
-        {
+        if !self.provider.catalog {
             return None;
         }
         let raw = self.provider.raw_item(self.domain, &id).ok()?;
@@ -867,14 +783,12 @@ impl WipOperationHandler for ItemHandler {
         true
     }
     fn operation_available(&self, operation: &str) -> bool {
-        let (enabled, permission) = match operation {
-            "read" => (self.provider.catalog, self.domain.read_permission()),
-            "attach" => (self.provider.manage, ATTACH_TOOL),
-            "delete" => (self.provider.manage, DELETE_TOOL),
-            "detach" => (self.provider.manage, DETACH_TOOL),
-            _ => return false,
+        let enabled = match operation {
+            "read" => self.provider.catalog,
+            "attach" | "delete" | "detach" => self.provider.manage,
+            _ => false,
         };
-        enabled && self.provider.may_allow(permission) && self.supports(operation)
+        enabled && self.supports(operation)
     }
     async fn call(
         &self,
@@ -883,11 +797,7 @@ impl WipOperationHandler for ItemHandler {
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
         let mut input = self.input(arguments)?;
-        // Recheck reference permission as well as mutation permission on every call.
-        self.provider.authorize(
-            self.domain.read_permission(),
-            &self.provider.read_input(self.domain, &self.id),
-        )?;
+        // Recheck Feature availability and current provider state on every call.
         if !self.operation_available(operation) {
             return Err(failure(
                 ProtocolErrorCode::OperationNotFound,
@@ -899,12 +809,11 @@ impl WipOperationHandler for ItemHandler {
                 .provider
                 .projected(self.domain, &self.provider.raw_item(self.domain, &self.id)?)?,
             "attach" | "delete" => {
-                let (permission, op) = if operation == "attach" {
-                    (ATTACH_TOOL, WorkdirOperation::Attach)
+                let op = if operation == "attach" {
+                    WorkdirOperation::Attach
                 } else {
-                    (DELETE_TOOL, WorkdirOperation::Delete)
+                    WorkdirOperation::Delete
                 };
-                self.provider.authorize(permission, &input)?;
                 let output = WorkspaceHttpWorkdirTool {
                     backend: self.provider.backend.clone(),
                     operation: op,
@@ -938,7 +847,6 @@ impl WipOperationHandler for ItemHandler {
                     .expect("route input is an object")
                     .remove("connection_id");
                 input["alias"] = json!(alias);
-                self.provider.authorize(DETACH_TOOL, &input)?;
                 output_json(
                     self.provider
                         .backend
@@ -1215,7 +1123,6 @@ fn item_descriptor(domain: Domain, management: bool) -> InterfaceDescriptor {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use manifest::ToolPermissionRule;
     use std::sync::Mutex;
 
     #[derive(Debug)]
@@ -1504,7 +1411,7 @@ pub(crate) mod tests {
         let current = json!({"workspace_id":"test-workspace", "alias":"workspace-config", "connection_id":"config-lifetime", "working_directory_id":"config-workdir", "access":"read_only", "name":"Workspace configuration", "purpose":"Configuration editing", "content_path":"/workspace-config", "already_attached":true});
         client.state.lock().unwrap().config_current = Some(current);
         let raw = json!({"alias":"workspace-config", "connection_id":"config-lifetime", "working_directory_id":"config-workdir", "capabilities":{"bits":25}, "host_path":"/SECRET"});
-        let mut p = provider(client.clone(), true, true, None);
+        let mut p = provider(client.clone(), true, true);
         assert!(
             p.projected(Domain::Attachment, &raw)
                 .ok()
@@ -1547,7 +1454,7 @@ pub(crate) mod tests {
 
     #[test]
     fn config_workdir_source_preserves_safe_mapping_not_private_management_data() {
-        let p = provider(Arc::new(CatalogClient::default()), true, false, None);
+        let p = provider(Arc::new(CatalogClient::default()), true, false);
         let raw = json!({"working_directory_id":"config-workdir", "source":{"kind":"workspace_config", "access":"read_write", "content_path":"/workspace-config", "purpose":"Configuration editing", "grant_id":"PRIVATE", "host_path":"/SECRET"}});
         let projected = p.projected(Domain::Workdir, &raw).ok().unwrap();
         assert_eq!(
@@ -1563,7 +1470,7 @@ pub(crate) mod tests {
         let client = Arc::new(CatalogClient::default());
         let raw = json!({"alias":"checkout", "connection_id":"current", "working_directory_id":"wd", "capabilities":{"bits":63}});
         client.state.lock().unwrap().attachments.push(raw.clone());
-        let mut p = provider(client.clone(), true, true, None);
+        let mut p = provider(client.clone(), true, true);
         let project = |p: &Provider, raw: &Json| p.projected(Domain::Attachment, raw).ok().unwrap();
         assert_eq!(project(&p, &raw)["content_state"], "unpublished");
         p.checkout_content = true;
@@ -1600,7 +1507,7 @@ pub(crate) mod tests {
 
     #[test]
     fn result_contract_validates_entry_coordinates_without_guessing_plain_strings() {
-        let p = provider(Arc::new(CatalogClient::default()), true, true, None);
+        let p = provider(Arc::new(CatalogClient::default()), true, true);
         let descriptor = item_descriptor(Domain::Repository, false);
         let mut raw = json!({"repository_key":"key", "display_name":"not an Entry /?", "default_selector":"refs/heads/feature"});
         let projected = p.projected(Domain::Repository, &raw).ok().unwrap();
@@ -1621,19 +1528,13 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    fn provider(
-        client: Arc<CatalogClient>,
-        catalog: bool,
-        manage: bool,
-        permissions: Option<ToolPermissionConfig>,
-    ) -> Provider {
+    fn provider(client: Arc<CatalogClient>, catalog: bool, manage: bool) -> Provider {
         Provider {
             backend: ManageWorkdirFeature::new(client).backend(),
             catalog,
             manage,
             config_content: false,
             checkout_content: false,
-            permissions,
         }
     }
     fn arguments(input: Json) -> BTreeMap<String, Value> {
@@ -1658,20 +1559,6 @@ pub(crate) mod tests {
             .unwrap_or_else(|_| panic!("{operation} failed"));
         wip_to_json(&output.value).unwrap()
     }
-    fn policy(allowed: &[&str]) -> ToolPermissionConfig {
-        ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: allowed
-                .iter()
-                .map(|name| ToolPermissionRule {
-                    tool: (*name).into(),
-                    pattern: "*".into(),
-                    action: ToolPermissionAction::Allow,
-                })
-                .collect(),
-        }
-    }
-
     #[test]
     fn catalog_route_encoding_is_injective_and_canonical_for_existing_keys() {
         let keys = [
@@ -1727,7 +1614,7 @@ pub(crate) mod tests {
             body: body.to_string(),
         });
         let handler = CollectionHandler {
-            provider: provider(client.clone(), true, true, None),
+            provider: provider(client.clone(), true, true),
             domain: Domain::Workdir,
         };
         let result = handler
@@ -1792,7 +1679,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn catalog_fresh_workspace_find_key_create_attach_read_detach_preserves_workdir() {
         let client = Arc::new(CatalogClient::default());
-        let p = provider(client.clone(), true, true, None);
+        let p = provider(client.clone(), true, true);
         let repositories = CollectionHandler {
             provider: p.clone(),
             domain: Domain::Repository,
@@ -1857,7 +1744,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn catalog_feature_permission_and_target_capability_are_independent() {
+    async fn catalog_feature_and_target_capability_are_independent() {
         let client = Arc::new(CatalogClient::default());
         client
             .state
@@ -1866,37 +1753,29 @@ pub(crate) mod tests {
             .workdirs
             .push(directory("wd", "registered-key"));
         for manage in [false, true] {
-            let p = provider(
-                client.clone(),
-                true,
-                manage,
-                Some(policy(&[
-                    "RepositoryList",
-                    "RepositoryRead",
-                    LIST_TOOL,
-                    "WorkdirRead",
-                ])),
-            );
+            let p = provider(client.clone(), true, manage);
             let handler = ItemHandler {
                 provider: p.clone(),
                 domain: Domain::Workdir,
                 id: "wd".into(),
             };
             assert!(handler.operation_available("read"));
-            assert!(!handler.operation_available("attach"));
-            assert!(matches!(
-                handler
-                    .call("attach", &arguments(json!({"alias":"x"})), context())
-                    .await,
-                Err(WipOperationError::Protocol(_))
-            ));
+            assert_eq!(handler.operation_available("attach"), manage);
+            if !manage {
+                assert!(
+                    handler
+                        .call("attach", &arguments(json!({"alias":"x"})), context())
+                        .await
+                        .is_err()
+                );
+            }
             let resolver = ItemResolver {
                 provider: p,
                 domain: Domain::Workdir,
             };
             assert!(resolver.resolve("wd").is_some());
         }
-        let denied = provider(client.clone(), true, true, Some(policy(&[])));
+        let denied = provider(client.clone(), false, false);
         assert!(
             ItemResolver {
                 provider: denied.clone(),
@@ -1912,7 +1791,7 @@ pub(crate) mod tests {
             }
             .is_visible()
         );
-        let p = provider(client.clone(), true, true, None);
+        let p = provider(client.clone(), true, true);
         client.state.lock().unwrap().workdirs.push(json!({"working_directory_id":"external", "status":"active", "source":{"kind":"external_grant", "grant_id":"opaque", "grant_permissions":{"read":true}}}));
         let external = ItemHandler {
             provider: p.clone(),
@@ -1947,7 +1826,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn catalog_empty_paging_route_bound_identity_and_failure_classification() {
         let client = Arc::new(CatalogClient::default());
-        let p = provider(client.clone(), true, true, None);
+        let p = provider(client.clone(), true, true);
         let handler = CollectionHandler {
             provider: p.clone(),
             domain: Domain::Repository,
@@ -2012,13 +1891,13 @@ pub(crate) mod tests {
     fn catalog_registration_uses_host_namespace_and_rejects_conflicts() {
         let feature = ManageWorkdirFeature::new(Arc::new(CatalogClient::default()));
         let mut registry = WipMountRegistry::new();
-        mount_workspace_workdir_wip(&mut registry, &feature, true, true, None).unwrap();
+        mount_workspace_workdir_wip(&mut registry, &feature, true, true).unwrap();
         assert_eq!(
             registry.routes().collect::<Vec<_>>(),
             [REPOSITORIES, ATTACHMENTS, WORKDIRS]
         );
         assert!(matches!(
-            mount_workspace_workdir_wip(&mut registry, &feature, true, true, None),
+            mount_workspace_workdir_wip(&mut registry, &feature, true, true,),
             Err(WipMountError::RouteCollision { .. })
         ));
         assert!(matches!(
@@ -2028,7 +1907,7 @@ pub(crate) mod tests {
                 interface: crate::wip::root_reference("yoi.workdir/collection/v1"),
                 descriptor: collection_descriptor(Domain::Workdir, true),
                 handler: Arc::new(CollectionHandler {
-                    provider: provider(Arc::new(CatalogClient::default()), true, true, None),
+                    provider: provider(Arc::new(CatalogClient::default()), true, true),
                     domain: Domain::Workdir
                 })
             }),
@@ -2038,7 +1917,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn wip_inventory_and_dynamic_items_recheck_authority_before_reads() {
         let client = Arc::new(CatalogClient::default());
-        let p = provider(client.clone(), true, true, None);
+        let p = provider(client.clone(), true, true);
         client.state.lock().unwrap().authorization_denied = true;
         for domain in [Domain::Repository, Domain::Workdir, Domain::Attachment] {
             assert!(p.inventory(domain).is_err());
@@ -2095,7 +1974,6 @@ mod lifetime_tests {
         client.state.lock().unwrap().attachments = (0..65).map(|n| json!({"connection_id":format!("lifetime-{n:03}"), "alias":format!("alias-{n:03}"), "working_directory_id":"wd", "capabilities":{"bits":25}})).collect();
         let p = Provider {
             backend: ManageWorkdirFeature::new(client).backend(),
-            permissions: None,
             catalog: true,
             manage: true,
             config_content: false,
@@ -2198,7 +2076,6 @@ mod logical_capability_tests {
             manage: true,
             config_content: false,
             checkout_content: false,
-            permissions: None,
         };
         let item = ItemHandler {
             provider,

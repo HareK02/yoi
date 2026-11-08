@@ -102,7 +102,7 @@ pub fn glob_tool(session: WorkdirSessionHandle) -> ToolDefinition {
     routed_glob_tool(crate::routing::singleton_router(session))
 }
 
-pub(crate) fn routed_glob_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinition {
+pub fn routed_glob_tool(router: Arc<WorkdirSessionRouter>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(GlobParams);
         let meta = ToolMeta::new("Glob")

@@ -14,11 +14,10 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use fs_operation::FsPath;
 use manifest::{
-    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
-    PermissionConfigPartial, ProfileDiscovery, ProfileError, ProfileRegistry,
-    ProfileRegistrySource, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig,
-    ScopeRule, SessionConfigPartial, SymlinkPolicy, ToolOutputLimitsPartial, WorkerManifest,
-    WorkerManifestConfig, WorkerMetaConfig,
+    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial, ProfileDiscovery,
+    ProfileError, ProfileRegistry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
+    ProfileSelector, ScopeConfig, ScopeRule, SessionConfigPartial, SymlinkPolicy,
+    ToolOutputLimitsPartial, WorkerManifest, WorkerManifestConfig, WorkerMetaConfig,
 };
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -1008,13 +1007,6 @@ fn manifest_to_reusable_config(manifest: &WorkerManifest) -> WorkerManifestConfi
         session: Some(SessionConfigPartial {
             record_event_trace: Some(manifest.session.record_event_trace),
         }),
-        permissions: manifest
-            .permissions
-            .as_ref()
-            .map(|p| PermissionConfigPartial {
-                default_action: Some(p.default_action),
-                rules: p.rules.clone(),
-            }),
         feature: manifest.feature.clone().into(),
         mcp: manifest.mcp.clone(),
         // Reusable selection is not a plan or delegation authority. Backend launch
@@ -1559,11 +1551,17 @@ enabled = false
         let record = registry
             .get_internal("reviewer-child")
             .expect("Internal reviewer registry record");
-        for required in ["Read", "Write", "Edit", "Glob", "Grep", "Bash"] {
+        for required in ["Read", "Glob", "Grep", "Bash"] {
             assert!(
                 record.installed_tools.iter().any(|name| name == required),
-                "write-scoped child is missing {required}: {:?}",
+                "Reviewer child is missing {required}: {:?}",
                 record.installed_tools
+            );
+        }
+        for excluded in ["Write", "Edit"] {
+            assert!(
+                !record.installed_tools.iter().any(|name| name == excluded),
+                "writable provider scope must not enable Reviewer filesystem_write tools"
             );
         }
         assert!(
@@ -2365,6 +2363,7 @@ scope = "workspace_write"
 [model]
 scheme = "anthropic"
 model_id = "coder-model"
+auth = { kind = "none" }
 
 [engine]
 instruction = "role.coder"

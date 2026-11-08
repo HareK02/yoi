@@ -150,8 +150,10 @@ impl Fixture {
                         subject_id: subject.clone(),
                     }),
                 },
-                control_operation_id: None,
-                execution_grant: None,
+                control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
             }),
         )
         .await
@@ -1129,8 +1131,10 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -2652,13 +2656,11 @@ async fn native_wip_ticket_create_uses_same_signed_authorization_before_real_bac
         &mut mounts,
         client.clone(),
         TicketFeatureAccess::workspace_authoring(),
-        None,
         &route,
     )
     .unwrap();
     worker::wip::install_wip_mode_with_mounts(
         host.engine_mut(),
-        None,
         "subject-authorization-wip".into(),
         mounts,
     )
@@ -2915,8 +2917,10 @@ async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source(
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -3844,8 +3848,10 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
                     subject_id: subject.clone(),
                 }),
             },
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -3901,10 +3907,10 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
         }],
         feature_connections: Default::default(),
         control_operation_id: Some("connected-authorization-child-once".into()),
-        execution_grant: Some(server_api::authorization::WorkerDelegationRequest {
-            permissions: child_permissions.clone(),
-            redelegation: vec![],
-        }),
+        authorization: server_api::launch_policy::WorkerCreationAuthorization::Policy {
+            policy_id: "authority-editor".into(),
+            policy_revision: 1,
+        },
     };
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
     authorizations.lock().unwrap().clear();
@@ -4649,8 +4655,10 @@ async fn legacy_bound_attachment_returns_concrete_resource_and_rejects_replaced_
             initial_submit: vec![],
             workdir_attachments: vec![],
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -4941,8 +4949,10 @@ async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_r
                     subject_id: f.subject.clone(),
                 }),
             },
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await

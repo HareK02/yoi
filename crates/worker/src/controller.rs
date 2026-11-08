@@ -1537,23 +1537,45 @@ where
         // Keep the alias-routed schemas installed for the Worker lifetime. The
         // attachment set may be empty or mutate after registration, so target
         // resolution and provider capability checks happen per invocation.
-        let mut workdir_tools = if restrict_workdir_tools_to_current_capabilities {
-            tools::routed_builtin_tools_for_current_capabilities(
-                workdir_sessions.clone(),
-                tracker.clone(),
-                bash_output.clone(),
-            )
-        } else {
-            tools::routed_builtin_tools(
-                workdir_sessions.clone(),
-                tracker.clone(),
-                bash_output.clone(),
-            )
+        let capabilities = workdir_sessions.capabilities();
+        let supplied = |capability| {
+            !restrict_workdir_tools_to_current_capabilities || capabilities.supports(capability)
         };
-        if let Some(policy) = &spawner_manifest.permissions {
-            workdir_tools.retain(|definition| {
-                !crate::permission::tool_is_unconditionally_denied(policy, &definition().0.name)
-            });
+        use workdir::WorkdirSessionCapability as Capability;
+        let mut workdir_tools = Vec::new();
+        if feature_config.filesystem.enabled {
+            if supplied(Capability::Read) {
+                workdir_tools.push(tools::routed_read_tool(
+                    workdir_sessions.clone(),
+                    tracker.clone(),
+                ));
+            }
+            if feature_config.filesystem_write.enabled {
+                if supplied(Capability::Write) {
+                    workdir_tools.push(tools::routed_write_tool(
+                        workdir_sessions.clone(),
+                        tracker.clone(),
+                    ));
+                }
+                if supplied(Capability::Edit) {
+                    workdir_tools.push(tools::routed_edit_tool(
+                        workdir_sessions.clone(),
+                        tracker.clone(),
+                    ));
+                }
+            }
+            if supplied(Capability::Glob) {
+                workdir_tools.push(tools::routed_glob_tool(workdir_sessions.clone()));
+            }
+            if supplied(Capability::Grep) {
+                workdir_tools.push(tools::routed_grep_tool(workdir_sessions.clone()));
+            }
+        }
+        if feature_config.bash.enabled && supplied(Capability::Command) {
+            workdir_tools.push(tools::routed_bash_tool(
+                workdir_sessions.clone(),
+                bash_output.clone(),
+            ));
         }
         worker.engine_mut().register_tools(workdir_tools);
     }
@@ -1855,8 +1877,7 @@ where
         drive_client,
         feature_config.drive.enabled,
         worker.workdir_sessions(),
-    )
-    .map(|feature| feature.with_permissions(worker.manifest().permissions.clone()));
+    );
     if let Some(module) = &drive_feature {
         feature_registry.add_module(module.clone());
     }
@@ -1962,7 +1983,6 @@ where
     }
 
     let host_worker_observation_provider = worker.worker_observation_provider();
-    let wip_permissions = worker.manifest().permissions.clone();
     let mut wip_mount_registry = crate::wip::WipMountRegistry::new();
     if wip_mode && let Some(feature) = &drive_feature {
         crate::feature::builtin::drive::wip::mount_drive_wip(&mut wip_mount_registry, feature)
@@ -1990,7 +2010,8 @@ where
             &mut wip_mount_registry,
             worker.workdir_sessions(),
             tracker.clone(),
-            wip_permissions.clone(),
+            feature_config.filesystem.enabled,
+            !feature_config.filesystem_write.enabled,
         )
         .map_err(|error| {
             std::io::Error::new(
@@ -2004,7 +2025,7 @@ where
             &mut wip_mount_registry,
             worker.workdir_sessions(),
             bash_output.clone(),
-            wip_permissions.clone(),
+            feature_config.bash.enabled,
         )
         .map_err(|error| {
             std::io::Error::new(
@@ -2019,7 +2040,6 @@ where
             feature,
             feature_config.workdir_catalog.enabled,
             feature_config.manage_workdir.enabled,
-            wip_permissions.clone(),
         )
         .map_err(|error| {
             std::io::Error::new(
@@ -2071,7 +2091,6 @@ where
                 &mut wip_mount_registry,
                 workspace_client.clone(),
                 feature_config.merge_request,
-                wip_permissions.clone(),
                 &namespace_route,
             )
             .map_err(|error| {
@@ -2095,7 +2114,6 @@ where
                 &mut wip_mount_registry,
                 workspace_client.clone(),
                 ticket_access,
-                wip_permissions.clone(),
                 &namespace_route,
             )
             .map_err(|error| {
@@ -2110,7 +2128,7 @@ where
             &mut feature_registry,
             feature_config.objective.enabled,
             workspace_client.clone(),
-            objective_namespace.map(|route| (route, wip_permissions.clone())),
+            objective_namespace,
         )?;
 
         let mut observation_providers: Vec<
@@ -2177,7 +2195,6 @@ where
         );
         crate::wip::install_wip_mode_with_mounts(
             worker.engine_mut(),
-            wip_permissions,
             security_context,
             wip_mount_registry,
         )
@@ -4588,6 +4605,7 @@ mod tests {
         }
 
         include!("controller/native_record_tests.rs");
+        include!("controller/internal_notification_tests.rs");
 
         struct LargeOutputTool;
 

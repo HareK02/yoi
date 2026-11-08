@@ -262,7 +262,8 @@ async fn builtin_journal_profile_installs_only_bound_tools_and_finalizes_saved_s
 
 fn artifact(instruction: &str, tokens: u32, turns: u32) -> Value {
     json!({"model":{"scheme":"anthropic", "model_id":"scripted-model", "auth":{"kind":"none"}},
-        "engine":{"instruction":instruction, "language":"English", "max_tokens":tokens, "max_turns":turns}})
+        "engine":{"instruction":instruction, "language":"English", "max_tokens":tokens, "max_turns":turns},
+        "feature":{"filesystem":{"enabled":false}, "filesystem_write":{"enabled":false}, "bash":{"enabled":false}}})
 }
 fn registry(root: &Path, a: Value, b: Value) -> manifest::ProfileRegistry {
     std::fs::write(root.join("a.json"), a.to_string()).unwrap();
@@ -878,7 +879,7 @@ impl FeatureModule for GrantedTool {
 async fn domain_grant_is_explicit_not_profile_derived_and_preserves_selected_policy() {
     let root = tempfile::tempdir().unwrap();
     let mut profile = artifact("internal.flow_verifier_system", 100000, 1000);
-    profile["feature"] = json!({"task":{"enabled":true}});
+    profile["feature"]["task"] = json!({"enabled":true});
     let registry = registry(root.path(), profile.clone(), profile);
     let marker = GrantedTool::default();
     for selector in ["user:a", "user:b", "default"] {

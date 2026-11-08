@@ -21,7 +21,7 @@ use crate::feature::{
 
 const FEATURE_ID: &str = "orchestration";
 const TOOL_NAME: &str = "SpawnTicketWorker";
-const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. Profile is optional (defaults to builtin:ticket-worker); repository/Workdir attachments are optional. For builtin:coder (or coder), omitted flow defaults to builtin:coder-review so the Coder owns the Reviewer SubWorker cycle and MR verdict. Explicit flow: null disables Flow; a string selects another Flow. Other profiles get no default Flow. Results and return choices follow user intent, not a universal approval or MR gate. Assigned Subject starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
+const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. policy_id, policy_revision and a source-qualified profile selector are required; repository/Workdir attachments are optional. For builtin:coder, omitted flow defaults to builtin:coder-review so the Coder owns the Reviewer SubWorker cycle and MR verdict. Explicit flow: null disables Flow; a string selects another Flow. Other profiles get no default Flow. Results and return choices follow user intent, not a universal approval or MR gate. Assigned Subject starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -88,14 +88,16 @@ struct SpawnTicketWorkerInput {
     #[serde(default)]
     orchestrator_assignment_id: Option<String>,
     runtime_id: String,
-    /// Optional registered profile selector; omitted/null selects builtin:ticket-worker.
-    /// Backend resolves the profile and validates claims, not natural-language satisfaction.
-    #[serde(default)]
-    profile: Option<String>,
+    /// Source-qualified registered selector allowed by the selected launch policy.
+    profile: String,
+    policy_id: String,
+    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
+    #[serde(deserialize_with = "server_api::launch_policy::deserialize_authorization_revision")]
+    policy_revision: u64,
     /// Initial user request delivered through the normal typed submission path.
     initial_request: String,
     /// Flow selector, delivered before the request. Omission defaults to
-    /// builtin:coder-review for builtin:coder (or coder); other profiles get no Flow.
+    /// builtin:coder-review for builtin:coder; other profiles get no Flow.
     /// Explicit null disables Flow; an explicit string selects that Flow instead.
     #[serde(default, deserialize_with = "deserialize_present_flow")]
     flow: Option<Option<String>>,
@@ -103,10 +105,6 @@ struct SpawnTicketWorkerInput {
     /// Workdirs. Backend derives effective capabilities; callers cannot request them.
     #[serde(default)]
     workdir_attachments: Vec<SpawnTicketWorkerWorkdirInput>,
-    /// Existing general delegation contract. Backend validates the live Subject
-    /// ceiling and requested Profile; Ticket assignment grants no capabilities.
-    #[serde(default)]
-    execution_grant: Option<server_api::authorization::WorkerDelegationRequest>,
 }
 
 // Serde's ordinary Option would collapse explicit null and an absent field.
@@ -140,17 +138,18 @@ impl Tool for SpawnTicketWorkerTool {
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         let call_id = non_empty(ctx.call_id, "tool call_id")?;
         let runtime_id = authority_id(input.runtime_id, "runtime_id")?;
-        let profile = input
-            .profile
-            .map(|profile| non_empty(profile, "profile"))
-            .transpose()?
-            .unwrap_or_else(|| "builtin:ticket-worker".into());
+        let profile = super::manage_worker::canonical_launch_profile(input.profile)?;
+        let policy_id = authority_id(input.policy_id, "policy_id")?;
+        super::manage_worker::validate_launch_selection(
+            &policy_id,
+            input.policy_revision,
+            &profile,
+        )
+        .map_err(ToolError::InvalidArgument)?;
         let initial_request = non_empty(input.initial_request, "initial_request")?;
         let flow = match input.flow {
             Some(flow) => flow.map(|flow| non_empty(flow, "flow")).transpose()?,
-            None if matches!(profile.as_str(), "builtin:coder" | "coder") => {
-                Some("builtin:coder-review".to_string())
-            }
+            None if profile == "builtin:coder" => Some("builtin:coder-review".to_string()),
             None => None,
         };
         let workdir_attachments = validate_workdir_attachments(input.workdir_attachments)?;
@@ -174,7 +173,8 @@ impl Tool for SpawnTicketWorkerTool {
                 operation_id: Some(format!("spawn-ticket-worker:{}:{call_id}", ticket.id)),
                 display_name: format!("Worker · {}", ticket.resource_key),
                 initial_submit,
-                execution_grant: input.execution_grant,
+                policy_id,
+                policy_revision: input.policy_revision,
             })
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -327,6 +327,8 @@ mod tests {
             "ticket_id": "T-719",
             "runtime_id": "runtime-1",
             "profile": "project:ticket-worker",
+            "policy_id": "policy-1",
+            "policy_revision": 3,
             "initial_request": "Investigate Ticket T-719."
         })
     }
@@ -344,12 +346,6 @@ mod tests {
         let mut input = input();
         input["flow"] = serde_json::json!("project:investigation");
         input["orchestrator_assignment_id"] = serde_json::json!("delegation-742");
-        input["execution_grant"] = serde_json::json!({
-            "permissions": [{"operation":"ticket.read","resource":{"kind":"ticket","workspace_id":"workspace-1","ticket_id":"T-719"}}],
-            "redelegation": []
-        });
-        let expected_grant: server_api::authorization::WorkerDelegationRequest =
-            serde_json::from_value(input["execution_grant"].clone()).unwrap();
         input["workdir_attachments"] = serde_json::json!([
             {
                 "alias": "checkout",
@@ -370,7 +366,8 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.runtime_id, "runtime-1");
-        assert_eq!(request.execution_grant.as_ref(), Some(&expected_grant));
+        assert_eq!(request.policy_id, "policy-1");
+        assert_eq!(request.policy_revision, 3);
         assert_eq!(
             request.orchestrator_assignment_id.as_deref(),
             Some("delegation-742")
@@ -440,45 +437,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_ticket_worker_omitted_profile_uses_general_worker_without_flow_or_repository() {
+    async fn spawn_ticket_worker_requires_explicit_policy_revision_and_canonical_profile() {
         let service = Arc::new(RecordingService::default());
-        let definition = definition(
-            Arc::new(FixedTicketService(TicketState::Open)),
-            service.clone(),
-        );
-        let (meta, tool) = definition();
-        let required = meta.input_schema["required"].as_array().unwrap();
-        assert!(!required.iter().any(|field| field == "profile"));
-        assert!(
-            meta.description
-                .contains("neither trusted review nor merge authority")
-        );
-        for profile in [None, Some(serde_json::Value::Null)] {
-            let mut input = input();
-            input.as_object_mut().unwrap().remove("profile");
-            if let Some(profile) = profile {
-                input["profile"] = profile;
+        let tool = tool(service.clone(), TicketState::Open);
+        for field in ["profile", "policy_id", "policy_revision"] {
+            for value in [None, Some(serde_json::Value::Null)] {
+                let mut input = input();
+                input.as_object_mut().unwrap().remove(field);
+                if let Some(value) = value {
+                    input[field] = value;
+                }
+                assert!(
+                    tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                        .await
+                        .is_err()
+                );
             }
-            input["initial_request"] = serde_json::json!(
-                "Research the question; review is not required. Return without concluding the Ticket."
-            );
-            tool.execute(
-                &input.to_string(),
-                ToolExecutionContext::new("call-default", "batch-1", 0),
-            )
-            .await
-            .unwrap();
         }
-        for request in service.requests.lock().unwrap().iter() {
-            assert_eq!(request.profile, "builtin:ticket-worker");
-            assert!(request.workdir_attachments.is_empty());
-            assert_eq!(
-                request.initial_submit,
-                vec![Segment::text(
-                    "Research the question; review is not required. Return without concluding the Ticket."
-                )]
+        for profile in [
+            "default",
+            "inherit",
+            "coder",
+            " builtin:coder ",
+            "path:coder.toml",
+            "builtin:",
+            "builtin:../coder",
+        ] {
+            let mut input = input();
+            input["profile"] = profile.into();
+            assert!(
+                tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .is_err()
             );
         }
+        for field in ["execution_grant", "redelegation"] {
+            let mut input = input();
+            input[field] = serde_json::json!([]);
+            assert!(
+                tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(service.requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -487,10 +489,7 @@ mod tests {
         // Lifecycle/network execution is recorded, not launched by this test.
         let cases = [
             ("builtin:coder", None, Some("builtin:coder-review")),
-            ("coder", None, Some("builtin:coder-review")),
-            (" builtin:coder ", None, Some("builtin:coder-review")),
             ("builtin:coder", Some(serde_json::Value::Null), None),
-            ("coder", Some(serde_json::Value::Null), None),
             (
                 "builtin:coder",
                 Some(serde_json::json!(" project:investigation ")),
@@ -617,7 +616,7 @@ mod tests {
             (
                 "profile",
                 serde_json::json!("  "),
-                "profile must not be empty",
+                "Profile must have a canonical builtin: or project: selector",
             ),
             (
                 "initial_request",
@@ -690,6 +689,16 @@ mod tests {
                 "unknown field `access`",
             ),
             (
+                "execution_grant",
+                serde_json::json!({"permissions":[], "redelegation":[]}),
+                "unknown field `execution_grant`",
+            ),
+            (
+                "redelegation",
+                serde_json::json!([]),
+                "unknown field `redelegation`",
+            ),
+            (
                 "review",
                 serde_json::json!({"ticket_id": "T-719", "merge_request_id": "MR-1"}),
                 "unknown field `review`",
@@ -725,7 +734,14 @@ mod tests {
                 "unexpected error for {field}: {error}"
             );
         }
-        for field in ["ticket_id", "runtime_id", "initial_request"] {
+        for field in [
+            "ticket_id",
+            "runtime_id",
+            "initial_request",
+            "profile",
+            "policy_id",
+            "policy_revision",
+        ] {
             let mut input = input();
             input.as_object_mut().unwrap().remove(field);
             let error = tool
@@ -779,7 +795,7 @@ mod tests {
                 "missing required field {field}"
             );
         }
-        for field in ["profile", "flow", "workdir_attachments"] {
+        for field in ["flow", "workdir_attachments"] {
             assert!(schema["properties"].get(field).is_some());
             assert!(!required.contains(&serde_json::json!(field)));
         }

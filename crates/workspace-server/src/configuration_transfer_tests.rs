@@ -1222,6 +1222,25 @@ fn enrollment_host() -> PermissionHost {
         )
         .unwrap();
     }
+    let subject = host
+        .register_feature(FeatureIdentity::parse("fixture:subject").unwrap())
+        .unwrap();
+    let handle = host
+        .bind_namespace(&subject, NamespaceId::parse("subject").unwrap())
+        .unwrap();
+    host.declare(
+        &handle,
+        NamespaceDeclaration {
+            permissions: vec![PermissionDefinition {
+                key: PermissionKey::parse(server_api::authorization::SUBJECT_DELEGATE_PERMISSION)
+                    .unwrap(),
+                description: String::new(),
+                children: vec![PermissionKey::parse("ticket.read").unwrap()],
+            }],
+            sets: vec![],
+        },
+    )
+    .unwrap();
     host
 }
 
@@ -1328,11 +1347,22 @@ fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed
                 .contains_key(&PermissionKey::parse(key).unwrap())
         );
     }
-    assert!(
-        host.resolve(Some(&policy.delegation))
+    assert_eq!(
+        policy.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
+    let delegated = host.resolve(Some(&policy.delegation));
+    assert_eq!(
+        delegated
             .projection()
             .allowed
-            .is_empty()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            PermissionKey::parse("subject.delegate").unwrap(),
+            PermissionKey::parse("ticket.read").unwrap(),
+        ]
     );
     assert_eq!(
         enroll(&server, &features, &host, &created.id).unwrap(),

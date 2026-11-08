@@ -6,6 +6,7 @@ import "./base.dcdl" // {
     engine = { reasoning = "medium"; };
 
     feature = {
+        filesystem_write = { enabled = false; };
         task = { enabled = false; };
         memory = {
             enabled = true;

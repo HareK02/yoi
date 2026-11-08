@@ -30,37 +30,24 @@ struct Model {
 
 impl Model {
     // allocated and mounted are deliberately independent; Objective never enables Ticket itself.
-    fn new(
-        client: Arc<MockWorkspaceClient>,
-        allocated: bool,
-        mounted: bool,
-        objective_permissions: Option<ToolPermissionConfig>,
-    ) -> Self {
+    fn new(client: Arc<MockWorkspaceClient>, allocated: bool, mounted: bool) -> Self {
         let mut registry = WipMountRegistry::new();
         let ticket = allocated.then(|| registry.allocate_namespace("ticket", "cases").unwrap());
         let objective = registry.allocate_namespace("objective", "goals").unwrap();
-        mount_workspace_http_objective_wip(
-            &mut registry,
-            client.clone(),
-            objective_permissions,
-            &objective,
-        )
-        .unwrap();
+        mount_workspace_http_objective_wip(&mut registry, client.clone(), &objective).unwrap();
         // Mount after Objective: final Host publication, not mount-time allocation, supplies links.
         if mounted {
             super::super::ticket::mount_workspace_http_ticket_wip(
                 &mut registry,
                 client,
                 super::super::ticket::TicketFeatureAccess::workspace_authoring(),
-                None,
                 ticket.as_ref().unwrap(),
             )
             .unwrap();
         }
         let mut engine = Engine::new_annotated(NoLlm);
         let runtime =
-            install_wip_mode_with_mounts(&mut engine, None, "objective-model".into(), registry)
-                .unwrap();
+            install_wip_mode_with_mounts(&mut engine, "objective-model".into(), registry).unwrap();
         engine.tool_server_handle().flush_pending();
         Self { engine, runtime }
     }
@@ -174,7 +161,7 @@ async fn model_query_selected_entry_read_paging_and_empty_are_lazy_nonindexable(
         detail(linked_ticket()),
         query(json!([]), Json::Null, false),
     ]));
-    let model = Model::new(client.clone(), true, true, None);
+    let model = Model::new(client.clone(), true, true);
     let collection = model.inspect(&json!("/goals")).await.unwrap();
     let contract = model.contract(&collection).await;
     let signature = contract["interface_signature"].as_str().unwrap();
@@ -288,7 +275,7 @@ async fn model_query_omits_ticket_entries_for_unallocated_or_unpublished_namespa
             Json::Null,
             false,
         )]));
-        let model = Model::new(client.clone(), allocated, false, None);
+        let model = Model::new(client.clone(), allocated, false);
         let collection = model.inspect(&json!("/goals")).await.unwrap();
         model.contract(&collection).await;
         let found = model.invoke(&collection, "query", json!({})).await.unwrap();
@@ -307,7 +294,7 @@ async fn model_create_subject_and_related_ticket_entries_are_inspected_then_read
         detail(linked_ticket()),
         ticket_detail(),
     ]));
-    let model = Model::new(client.clone(), true, true, None);
+    let model = Model::new(client.clone(), true, true);
     let collection = model.inspect(&json!("/goals")).await.unwrap();
     model.contract(&collection).await;
     let created = model
@@ -359,7 +346,7 @@ async fn model_allocation_is_not_publication_and_followup_failure_never_replays_
         detail(linked_ticket()),
         error_response(404),
     ]));
-    let model = Model::new(client.clone(), true, false, None);
+    let model = Model::new(client.clone(), true, false);
     let collection = model.inspect(&json!("/goals")).await.unwrap();
     model.contract(&collection).await;
     let created = model
@@ -402,7 +389,7 @@ async fn model_unallocated_ticket_retains_id_and_backend_read_denial_is_not_empt
         detail(linked_ticket()),
         error_response(403),
     ]));
-    let model = Model::new(client.clone(), false, false, None);
+    let model = Model::new(client.clone(), false, false);
     let collection = model.inspect(&json!("/goals")).await.unwrap();
     let created = model
         .invoke(&collection, "create", json!({"title":"Intent"}))
@@ -427,7 +414,7 @@ async fn model_selected_related_ticket_denied_or_deleted_does_not_repeat_objecti
             detail(linked_ticket()),
             error_response(status),
         ]));
-        let model = Model::new(client.clone(), true, true, None);
+        let model = Model::new(client.clone(), true, true);
         let collection = model.inspect(&json!("/goals")).await.unwrap();
         let created = model
             .invoke(&collection, "create", json!({"title":"Intent"}))
@@ -456,7 +443,7 @@ async fn model_selected_related_ticket_denied_or_deleted_does_not_repeat_objecti
 #[tokio::test]
 async fn model_permissions_remain_call_time_and_pre_dispatch() {
     let client = Arc::new(MockWorkspaceClient::new([detail(linked_ticket())]));
-    let model = Model::new(client.clone(), true, false, None);
+    let model = Model::new(client.clone(), true, false);
     let collection = model.inspect(&json!("/goals")).await.unwrap();
     let created = model
         .invoke(&collection, "create", json!({"title":"Intent"}))
@@ -473,22 +460,6 @@ async fn model_permissions_remain_call_time_and_pre_dispatch() {
     let checked = client.authorizations.lock().unwrap();
     assert_eq!(checked.last().unwrap().operation, "objective.read");
     drop(checked);
-    let denied_model = Model::new(
-        client.clone(),
-        true,
-        false,
-        Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: vec![],
-        }),
-    );
-    let target = denied_model.inspect(&created["entry"]).await.unwrap();
-    let error = denied_model
-        .invoke(&target, "read", json!({}))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("PermissionDenied"), "{error}");
-    assert_eq!(client.requests().len(), 1);
 }
 
 #[tokio::test]
@@ -502,7 +473,7 @@ async fn model_item_mutations_share_descriptor_value_parity_and_preserve_domain_
         lookup(),
         detail(json!([])),
     ]));
-    let model = Model::new(client.clone(), true, false, None);
+    let model = Model::new(client.clone(), true, false);
     let selected = model.inspect(&json!("/goals/O-3")).await.unwrap();
     model.contract(&selected).await;
     for (operation, arguments) in [

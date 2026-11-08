@@ -1407,6 +1407,8 @@ impl WorkspaceApi {
                 input_fingerprint: job.intent_fingerprint.clone(),
             }),
             resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
         })
     }
 

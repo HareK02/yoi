@@ -125,7 +125,6 @@ fn handler(client: Arc<Client>) -> TicketItemWipHandler {
                 .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
                 .collect(),
         ),
-        permissions: None,
         ticket_reference: "internalchild".into(),
         collection_route: "/cases".into(),
         merge_request_route: String::new(),

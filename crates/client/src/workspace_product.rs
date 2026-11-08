@@ -596,8 +596,10 @@ impl BackendWorkspaceProductClient {
             }],
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         };
         let workspace_id = self.workspace_id.clone();
         let response: BrowserCreateWorkerResponse = self.generated_normalized(move |client| async move {
@@ -1675,6 +1677,14 @@ mod tests {
         assert!(create_request.starts_with("POST /api/w/workspace-a/workers "));
         assert!(create_request.contains("\"profile\":\"builtin:intake\""));
         assert!(create_request.contains("Ticket T-1"));
+        let body: serde_json::Value =
+            serde_json::from_str(create_request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["authorization"],
+            serde_json::json!({"kind":"human", "assignment":null})
+        );
+        assert!(uuid::Uuid::parse_str(body["control_operation_id"].as_str().unwrap()).is_ok());
+        assert!(body.get("execution_grant").is_none());
         handle.join().unwrap();
     }
 

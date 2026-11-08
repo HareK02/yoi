@@ -56,7 +56,6 @@ async fn native_backend_conflict_is_a_domain_rejection_not_a_type_rejection_or_r
     );
     let rejected = execute_native_merge_request_tool(
         &tool,
-        &None,
         &input,
         Some("MR-1"),
         WipCallContext {

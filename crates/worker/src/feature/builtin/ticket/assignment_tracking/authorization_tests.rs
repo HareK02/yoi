@@ -150,7 +150,6 @@ async fn tracking_operations_authorize_exact_ticket_before_dispatch_and_recheck_
                     .filter(|tool| tool.projection.surface == NativeTicketSurface::Item)
                     .collect(),
             ),
-            permissions: None,
             ticket_reference: "T-1".into(),
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),

@@ -235,7 +235,10 @@ fn deletion_identity_conflicts_are_scope_wide_but_do_not_cross_workspaces() {
         fresh_source.execution,
         server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(fresh_source.delegation.grants.is_empty());
+    assert_eq!(
+        fresh_source.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
     assert!(fresh_source.legacy_constraints.is_none());
 }
 

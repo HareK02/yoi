@@ -326,8 +326,10 @@ async fn workers(api: &WorkspaceApi) -> (WorkdirlessFixtureRuntime, Vec<RuntimeW
                 initial_submit: vec![],
                 workdir_attachments: vec![],
                 feature_connections: Default::default(),
-                control_operation_id: None,
-                execution_grant: None,
+                control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
             }),
         )
         .await

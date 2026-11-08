@@ -293,7 +293,6 @@ mod authorization_tests {
                     .filter(|tool| tool.projection.surface == NativeTicketSurface::Collection)
                     .collect(),
             ),
-            permissions: None,
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),
@@ -366,7 +365,6 @@ mod authorization_tests {
                     .filter(|tool| tool.projection.surface == NativeTicketSurface::Collection)
                     .collect(),
             ),
-            permissions: None,
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
             objective_route: "/objectives".into(),

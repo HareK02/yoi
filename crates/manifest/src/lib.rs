@@ -17,9 +17,8 @@ pub use builtin_profile::{
     BuiltinProfileResource, builtin_profile_catalog_snapshot, builtin_profile_entrypoints,
 };
 pub use config::{
-    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
-    PermissionConfigPartial, ResolveError, SessionConfigPartial, ToolOutputLimitsPartial,
-    WorkerManifestConfig, WorkerMetaConfig,
+    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial, ResolveError,
+    SessionConfigPartial, ToolOutputLimitsPartial, WorkerManifestConfig, WorkerMetaConfig,
 };
 pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
@@ -47,7 +46,7 @@ use serde::{Deserialize, Serialize};
 /// Resolved execution contract for creating and restoring a Worker.
 ///
 /// Separate from reusable Profiles and partial configuration, this includes
-/// launch-time identity, paths, permissions, and prompt references. Persisting
+/// launch-time identity, paths, feature composition, and prompt references. Persisting
 /// resolved values lets restoration reuse the original contract without resolving
 /// current configuration or Profiles again. Workdir attachments and their operation
 /// authority belong to a separate execution boundary; this value does not pin the
@@ -67,13 +66,9 @@ pub struct WorkerManifest {
     /// Session/debug persistence settings. Defaults keep extra traces off.
     #[serde(default)]
     pub session: SessionConfig,
-    /// Optional manifest-level tool permission policy. Absent means the
-    /// permission layer is disabled and tool calls run as before.
-    #[serde(default)]
-    pub permissions: Option<ToolPermissionConfig>,
     /// Built-in feature/tool-surface enablement. Omitted tool features resolve
-    /// disabled; the read-only WIP workdir catalog defaults enabled without
-    /// granting authority or registering normal Tools.
+    /// disabled except filesystem/Bash; the read-only WIP workdir catalog defaults
+    /// enabled without granting authority or registering normal Tools.
     #[serde(default)]
     pub feature: FeatureConfig,
     /// Explicit external Model Context Protocol provider configuration. This
@@ -116,6 +111,26 @@ pub struct WorkerManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureConfig {
+    /// Filesystem feature supply, independent of Host/provider path authority.
+    /// Defaults on to preserve the formerly unconditional built-in feature.
+    #[serde(
+        default = "FeatureFlagConfig::enabled",
+        deserialize_with = "deserialize_default_enabled_feature"
+    )]
+    pub filesystem: FeatureFlagConfig,
+    /// Write-side filesystem supply requires both this and `filesystem` enabled.
+    /// Read-only Profiles can suppress writes without losing file inspection.
+    #[serde(
+        default = "FeatureFlagConfig::enabled",
+        deserialize_with = "deserialize_default_enabled_feature"
+    )]
+    pub filesystem_write: FeatureFlagConfig,
+    /// Command feature supply, not an OS sandbox or a command execution grant.
+    #[serde(
+        default = "FeatureFlagConfig::enabled",
+        deserialize_with = "deserialize_default_enabled_feature"
+    )]
+    pub bash: FeatureFlagConfig,
     #[serde(default)]
     pub task: FeatureFlagConfig,
     #[serde(default)]
@@ -168,6 +183,18 @@ pub struct FeatureConfig {
     pub orchestration: FeatureFlagConfig,
 }
 
+fn deserialize_default_enabled_feature<'de, D>(
+    deserializer: D,
+) -> Result<FeatureFlagConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let flag = config::FeatureFlagConfigPartial::deserialize(deserializer)?;
+    Ok(FeatureFlagConfig {
+        enabled: flag.enabled.unwrap_or(true),
+    })
+}
+
 fn default_workdir_catalog() -> FeatureFlagConfig {
     FeatureFlagConfig {
         enabled: defaults::WORKDIR_CATALOG_ENABLED,
@@ -194,6 +221,9 @@ where
 impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
+            filesystem: FeatureFlagConfig::enabled(),
+            filesystem_write: FeatureFlagConfig::enabled(),
+            bash: FeatureFlagConfig::enabled(),
             task: FeatureFlagConfig::disabled(),
             memory: ResolvedMemoryFeatureConfig::default(),
             subjektiv: ResolvedSubjektivFeatureConfig::default(),
@@ -904,41 +934,6 @@ pub struct SessionConfig {
     pub record_event_trace: bool,
 }
 
-/// Pattern-based permission policy for tool calls.
-///
-/// Evaluates rules in declaration order, using [`Self::default_action`] if none
-/// match. This is separate from [`Scope`] path authority: allowing a tool does not
-/// guarantee access to its target path. `Ask` defers permission; current callers
-/// fail closed because there is no approval/resume protocol. The Worker owns
-/// enforcement.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolPermissionConfig {
-    pub default_action: ToolPermissionAction,
-    #[serde(default, rename = "rule")]
-    pub rules: Vec<ToolPermissionRule>,
-}
-
-/// One `[[permissions.rule]]` entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolPermissionRule {
-    /// Tool registration name. Matching is case-insensitive at runtime so
-    /// manifests may use either `Bash` or `bash`.
-    pub tool: String,
-    /// Glob-like pattern matched against the tool's permission target
-    /// (for built-in tools, commonly `command`, `file_path`, or `pattern`).
-    pub pattern: String,
-    pub action: ToolPermissionAction,
-}
-
-/// Tool permission decision.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolPermissionAction {
-    Allow,
-    Deny,
-    Ask,
-}
-
 /// Context compaction configuration.
 ///
 /// Controls Prune (content removal from old tool results) and Compact
@@ -1187,14 +1182,38 @@ pub fn write_persisted_worker_manifest_snapshot(
 /// Read a durable resolved Worker Manifest through the versioned compatibility
 /// boundary. Runtime code must not deserialize persisted snapshots directly.
 pub fn read_persisted_worker_manifest_snapshot(
-    snapshot: serde_json::Value,
+    mut snapshot: serde_json::Value,
 ) -> Result<WorkerManifest, serde_json::Error> {
-    let object = snapshot.as_object().ok_or_else(|| {
+    let object = snapshot.as_object_mut().ok_or_else(|| {
         serde_json::Error::io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "resolved Worker manifest snapshot must be an object",
         ))
     })?;
+    // Old serializers wrote Option::None as null: it carried no Tool restrictions.
+    // Only the durable reader accepts that representation. Non-null values still
+    // require explicit migration; even an empty object may encode a default deny.
+    let manifest_object = if object.contains_key("schema_version") {
+        object
+            .get_mut("manifest")
+            .and_then(serde_json::Value::as_object_mut)
+    } else {
+        Some(&mut *object)
+    };
+    if let Some(manifest) = manifest_object {
+        match manifest.get("permissions") {
+            Some(serde_json::Value::Null) => {
+                manifest.remove("permissions");
+            }
+            Some(_) => {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "resolved Worker manifest contains removed permissions; migrate to Feature composition without discarding restrictions",
+                )));
+            }
+            None => {}
+        }
+    }
     if let Some(version) = object.get("schema_version") {
         let version = version.as_u64().ok_or_else(|| {
             serde_json::Error::io(std::io::Error::new(
@@ -1456,6 +1475,137 @@ model_id = "claude-sonnet-4-20250514"
 target = "/abs/scope"
 permission = "write"
 "#;
+
+    #[test]
+    fn manifest_and_persisted_snapshots_reject_removed_permissions() {
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        for policy in [
+            serde_json::json!({}),
+            serde_json::json!({"default_action":"deny"}),
+            serde_json::json!({"default_action":"ask"}),
+            serde_json::json!({"default_action":"allow", "rules":[{"tool":"Bash", "pattern":"rm *", "action":"deny"}]}),
+        ] {
+            let mut value = serde_json::to_value(&manifest).unwrap();
+            value["permissions"] = policy;
+            let error = serde_json::from_value::<WorkerManifest>(value.clone()).unwrap_err();
+            assert!(error.to_string().contains("permissions"), "{error}");
+            for version in [None, Some(2), Some(3), Some(4)] {
+                let snapshot = match version {
+                    None => value.clone(),
+                    Some(version) => {
+                        serde_json::json!({"schema_version": version, "manifest": value})
+                    }
+                };
+                let error = read_persisted_worker_manifest_snapshot(snapshot).unwrap_err();
+                assert!(error.to_string().contains("permissions"), "{error}");
+            }
+        }
+        let error = WorkerManifest::from_toml(&format!(
+            "{MINIMAL_REQUIRED}\n[permissions]\ndefault_action = \"deny\"\n"
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("permissions"), "{error}");
+    }
+
+    #[test]
+    fn saved_null_tool_policy_preserves_scope_and_feature_supply_without_reintroducing_config() {
+        let mut manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        manifest.feature.filesystem_write.enabled = false;
+        manifest.feature.bash.enabled = false;
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        value["permissions"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<WorkerManifest>(value.clone()).is_err());
+        for version in [None, Some(2), Some(3), Some(4)] {
+            let mut saved = value.clone();
+            if version.is_none() {
+                saved["feature"]["memory"] = serde_json::json!({"enabled":false, "staging":false});
+            }
+            let snapshot = match version {
+                None => saved,
+                Some(version) => serde_json::json!({"schema_version":version, "manifest":saved}),
+            };
+            let mut without_policy = snapshot.clone();
+            let object = if version.is_some() {
+                &mut without_policy["manifest"]
+            } else {
+                &mut without_policy
+            };
+            object.as_object_mut().unwrap().remove("permissions");
+            let expected = read_persisted_worker_manifest_snapshot(without_policy).unwrap();
+            let restored = read_persisted_worker_manifest_snapshot(snapshot).unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored.scope).unwrap(),
+                serde_json::to_value(&manifest.scope).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&restored.delegation_scope).unwrap(),
+                serde_json::to_value(&manifest.delegation_scope).unwrap()
+            );
+            assert_eq!(restored.feature, expected.feature);
+            assert!(!restored.feature.filesystem_write.enabled);
+            assert!(!restored.feature.bash.enabled);
+            if version.is_none() {
+                // The raw legacy reader reconstructs Memory from legacy thresholds,
+                // not from today's resolved Feature defaults. Null Tool policy
+                // must not change that pre-existing normalization.
+                assert!(!restored.feature.memory.profile.enabled);
+                assert!(!restored.feature.memory.profile.extraction.enabled);
+                assert!(
+                    !restored
+                        .feature
+                        .memory
+                        .profile
+                        .consolidation
+                        .request_enabled
+                );
+                assert!(restored.feature.memory.workspace_settings.is_none());
+            } else {
+                assert_eq!(restored.feature, manifest.feature);
+            }
+            let rewritten = write_persisted_worker_manifest_snapshot(&restored).unwrap();
+            assert!(rewritten["manifest"].get("permissions").is_none());
+        }
+        assert!(
+            read_persisted_worker_manifest_snapshot(
+                serde_json::json!({"schema_version":999, "manifest":value})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn filesystem_and_bash_supply_survives_persisted_manifest_roundtrip() {
+        for filesystem in [false, true] {
+            for filesystem_write in [false, true] {
+                for bash in [false, true] {
+                    let mut manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+                    manifest.feature.filesystem.enabled = filesystem;
+                    manifest.feature.filesystem_write.enabled = filesystem_write;
+                    manifest.feature.bash.enabled = bash;
+                    let snapshot = write_persisted_worker_manifest_snapshot(&manifest).unwrap();
+                    assert!(snapshot["manifest"].get("permissions").is_none());
+                    let restored = read_persisted_worker_manifest_snapshot(snapshot).unwrap();
+                    assert_eq!(restored.feature, manifest.feature);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filesystem_and_bash_supply_defaults_agree_for_resolved_deserialization() {
+        for key in ["filesystem", "filesystem_write", "bash"] {
+            for section in [serde_json::json!({}), serde_json::json!({key: {}})] {
+                let feature: FeatureConfig = serde_json::from_value(section).unwrap();
+                assert_eq!(serde_json::to_value(feature).unwrap()[key]["enabled"], true);
+            }
+            assert!(
+                serde_json::from_value::<FeatureConfig>(
+                    serde_json::json!({key:{"tools":["Read"]}})
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn parse_minimal_manifest() {

@@ -1149,6 +1149,8 @@ async fn read_only_ticket_targets_allow_extra_external_grants_without_widening_c
         resolved_subjektiv_attached: false,
         resolved_control_operation: None,
         resolved_execution_grant: None,
+        authorization: None,
+        resolved_core_execution_grant: None,
     };
     api.validate_worker_spawn_repository_scope(EMBEDDED_WORKER_RUNTIME_ID, &mut request)
         .unwrap();
@@ -1784,8 +1786,10 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
                 relative_cwd: None,
             }],
             feature_connections: Default::default(),
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await

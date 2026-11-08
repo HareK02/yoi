@@ -220,7 +220,8 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits multiple aliased attachments"
       },
     ],
     feature_connections: {},
-    control_operation_id: null,
+    authorization: { kind: "human", assignment: null },
+    control_operation_id: request.control_operation_id,
   });
 });
 
@@ -310,7 +311,8 @@ Deno.test("buildCreateWorkspaceWorkerRequest emits an empty attachment list for 
     initial_submit: [{ kind: "text", content: "chat" }],
     workdir_attachments: [],
     feature_connections: {},
-    control_operation_id: null,
+    authorization: { kind: "human", assignment: null },
+    control_operation_id: request.control_operation_id,
   });
 });
 

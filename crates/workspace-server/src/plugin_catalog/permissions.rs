@@ -204,6 +204,7 @@ impl SqliteWorkspaceStore {
             declarations.insert(id, manifest.permission_namespaces.clone());
         }
         reconcile(registry, workspace, declarations)?;
+        crate::server::sync_launch_policy_permissions(conn, workspace, registry)?;
         Ok(())
     }
 }

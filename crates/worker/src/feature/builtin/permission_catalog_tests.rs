@@ -5,7 +5,9 @@ use crate::feature::permissions::FeaturePermissionRegistrar;
 use crate::feature::{FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureModule};
 use feature_permissions::*;
 use server_api::authorization::{
-    COMPANION_PERMISSION_SET, IMPLEMENTER_PERMISSION_SET, subject_default_permission_assignment,
+    COMPANION_PERMISSION_SET, IMPLEMENTER_PERMISSION_SET, SUBJECT_DEFAULT_PERMISSION_SET,
+    SUBJECT_DELEGATE_PERMISSION, subject_default_delegation_assignment,
+    subject_default_permission_assignment,
 };
 use std::collections::BTreeSet;
 
@@ -50,7 +52,9 @@ fn builtin_declarations_preserve_legacy_exact_keys_without_using_legacy_resource
                 .is_some()
         );
         for definition in namespace.declaration.permissions {
-            assert!(definition.children.is_empty());
+            if namespace.namespace.as_str() != "subject" {
+                assert!(definition.children.is_empty());
+            }
             assert!(keys.insert(definition.key.as_str().to_owned()));
         }
     }
@@ -65,57 +69,344 @@ fn builtin_declarations_preserve_legacy_exact_keys_without_using_legacy_resource
     assert!(legacy.is_subset(&keys));
 }
 
+// Independent exact expectations: every other catalog key is denied. Do not
+// derive these from declarations or the legacy resource-operation table.
+const SUBJECT_BODY_KEYS: &[&str] = &[
+    "subject.orchestrate",
+    "chat.read",
+    "chat.send",
+    "session.record",
+    "session.list",
+    "session.search",
+    "session.read",
+    "memory.query",
+    "memory.read",
+    "memory.changes.list",
+    "memory.resident.read",
+    "memory.resident.supply",
+    "memory.staging.write",
+    "memory.staging.list",
+    "memory.staging.read",
+    "memory.candidate.decide",
+    "memory.proposal.validate",
+    "memory.receipt.read",
+    "memory.surface.prepare",
+    "memory.surface.supply",
+    "memory.surface.publish",
+    "memory.surface.fail",
+    "memory.extract.read",
+    "memory.extract.supply",
+    "memory.extract.commit",
+    "memory.consolidation.request",
+    "memory.consolidation.supply",
+    "journal.startup.read",
+    "journal.startup.supply",
+    "journal.compaction.read",
+    "journal.compaction.supply",
+    "journal.recording.request",
+    "journal.job.input.read",
+    "journal.job.input.supply",
+    "journal.memory.links.reconcile",
+    "journal.memory.links.read",
+    "journal.memory.read",
+    "journal.memory.related.read",
+    "journal.state.read",
+    "journal.text.read",
+    "journal.operation.query",
+    "journal.operation.list",
+    "journal.operation.coverage.read",
+    "journal.entry.create",
+    "journal.entry.fix",
+    "journal.entry.rewrite",
+    "journal.position.update",
+    "journal.unchanged.confirm",
+    "journal.checkpoint",
+    "journal.finish",
+    "notification.diagnostics.read",
+    "objective.query",
+    "objective.create",
+    "objective.read",
+    "objective.edit",
+    "objective.set_state",
+    "objective.link_ticket",
+    "objective.unlink_ticket",
+    "worker.list",
+    "worker.discover",
+    "worker.observe.list",
+    "worker.observe",
+    "worker.create",
+    "worker.messaging",
+    "worker.send_input",
+    "worker.cancel",
+    "worker.stop",
+    "worker.restore",
+    "worker.remove",
+    "workdir.read",
+    "workdir.list",
+    "workdir.attachment.list",
+    "workdir.attachment.read",
+    "workdir.create",
+    "workdir.delete",
+    "repository.list",
+    "repository.read",
+    "merge_request.read",
+    "merge_request.readiness",
+    "merge_request.complete",
+    "ticket.create",
+    "ticket.query",
+    "ticket.list",
+    "ticket.read",
+    "ticket.edit_item",
+    "ticket.edit_post",
+    "ticket.event.add",
+    "ticket.case.update",
+    "ticket.dependency.check",
+    "ticket.tag.list",
+    "ticket.tag.create",
+    "ticket.tag.rename",
+    "ticket.tag.delete",
+    "ticket.tags.set",
+    "ticket.relation.query",
+    "ticket.relation.read",
+    "ticket.relation.record",
+    "ticket.relation.remove",
+    "ticket.assignment.assign",
+    "ticket.assignment.clear",
+    "ticket.assignment.update",
+    "ticket.assignment.answer",
+    "ticket.assignment.query",
+    "ticket.assignment.history",
+    "ticket.assignment.diagnostics",
+    "ticket.implementation_result.write",
+    "ticket.implementation_result.read",
+];
+
+const SUBJECT_DELEGATION_KEYS: &[&str] = &[
+    "subject.delegate",
+    "filesystem.read",
+    "filesystem.write",
+    "bash.execute",
+    "web.fetch",
+    "web.search",
+    "objective.query",
+    "objective.read",
+    "repository.list",
+    "repository.read",
+    "workdir.read",
+    "workdir.attachment.read",
+    "worker.list",
+    "worker.messaging",
+    "subworker.spawn",
+    "subworker.send_input",
+    "subworker.observe",
+    "subworker.stop",
+    "ticket.query",
+    "ticket.read",
+    "ticket.relation.read",
+    "ticket.event.add",
+    "ticket.implementation_result.write",
+    "ticket.implementation_result.read",
+    "merge_request.open",
+    "merge_request.read",
+    "merge_request.readiness",
+    "merge_request.review",
+];
+
+fn assert_exact_policy(
+    registry: &FeaturePermissionRegistry,
+    policy: &PermissionAssignment,
+    expected: &[&str],
+) {
+    let expected: BTreeSet<_> = expected
+        .iter()
+        .map(|key| PermissionKey::parse(*key).unwrap())
+        .collect();
+    let resolved = registry.host().resolve(Some(policy));
+    assert_eq!(
+        resolved
+            .projection()
+            .allowed
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    // Check positives and negatives through each actual owner's handle, not just
+    // the management projection. No namespace/prefix wildcard is implied.
+    for namespace in registry.host().catalog().namespaces {
+        let handle = registry
+            .namespace_handle(
+                &FeatureId::new(namespace.feature.as_str()).unwrap(),
+                &namespace.namespace,
+            )
+            .unwrap();
+        for definition in namespace.declaration.permissions {
+            assert_eq!(
+                registry
+                    .host()
+                    .allows(handle, &resolved, &definition.key)
+                    .unwrap(),
+                expected.contains(&definition.key),
+                "{}",
+                definition.key.as_str()
+            );
+            let unrelated =
+                PermissionKey::parse(format!("{}.unrelated", definition.key.as_str())).unwrap();
+            assert!(
+                !registry
+                    .host()
+                    .allows(handle, &resolved, &unrelated)
+                    .unwrap()
+            );
+        }
+    }
+}
+
 #[test]
-fn subject_default_reference_resolves_conversation_and_ticket_acceptance_not_provider_or_control_authority()
- {
+fn subject_defaults_are_live_references_with_distinct_body_and_delegation_authority() {
     let registry = registry();
-    let policy = subject_default_permission_assignment();
-    for (feature, key) in [
-        ("subjektiv-chat", "chat.read"),
-        ("subjektiv-chat", "chat.send"),
-        ("session-explore", "session.record"),
-        ("memory", "memory.resident.supply"),
-        ("journal-recording", "journal.job.input.read"),
-        ("ticket", "ticket.read"),
-        ("ticket", "ticket.assignment.query"),
-        ("ticket", "ticket.assignment.update"),
-        ("notification", "notification.diagnostics.read"),
+    assert_eq!(
+        subject_default_permission_assignment(),
+        assignment(SUBJECT_DEFAULT_PERMISSION_SET)
+    );
+    assert_eq!(
+        subject_default_delegation_assignment(),
+        PermissionAssignment {
+            grants: vec![PermissionReference::Namespace(NamespacePermissions {
+                namespace: NamespaceId::parse("subject").unwrap(),
+                keys: vec![PermissionKey::parse(SUBJECT_DELEGATE_PERMISSION).unwrap()],
+            })],
+            ..Default::default()
+        }
+    );
+    for (policy, expected) in [
+        (subject_default_permission_assignment(), SUBJECT_BODY_KEYS),
+        (
+            subject_default_delegation_assignment(),
+            SUBJECT_DELEGATION_KEYS,
+        ),
     ] {
-        assert!(allows(&registry, &policy, feature, key), "{key}");
+        assert_exact_policy(&registry, &policy, expected);
     }
-    for (feature, key) in [
-        ("workdir", "filesystem.write"),
-        ("bash", "bash.execute"),
-        ("worker", "worker.stop"),
-        ("ticket", "ticket.assignment.assign"),
-        ("workspace-config", "workspace_config.commit"),
-    ] {
-        assert!(!allows(&registry, &policy, feature, key), "{key}");
-    }
-    assert_eq!(policy.grants.len(), 1);
-    let empty = PermissionAssignment::default();
-    assert!(!allows(&registry, &empty, "subjektiv-chat", "chat.send"));
-    let mut excluded = policy.clone();
-    excluded
-        .exclusions
-        .push(PermissionReference::Namespace(NamespacePermissions {
-            namespace: NamespaceId::parse("ticket").unwrap(),
-            keys: vec![PermissionKey::parse("ticket.read").unwrap()],
-        }));
-    assert!(!allows(&registry, &excluded, "ticket", "ticket.read"));
-    assert!(allows(
-        &registry,
-        &excluded,
-        "ticket",
-        "ticket.assignment.query"
+    assert!(
+        registry
+            .host()
+            .catalog()
+            .namespaces
+            .iter()
+            .flat_map(|n| &n.declaration.sets)
+            .all(|s| s.set.as_str() != "subject-delegation")
+    );
+}
+
+#[test]
+fn subject_semantic_children_keep_ownership_and_exclusions_separate() {
+    let registry = registry();
+    let reference = PermissionReference::Namespace(NamespacePermissions {
+        namespace: NamespaceId::parse("subject").unwrap(),
+        keys: vec![PermissionKey::parse("subject.orchestrate").unwrap()],
+    });
+    let policy = PermissionAssignment {
+        grants: vec![reference.clone()],
+        ..Default::default()
+    };
+    assert!(allows(&registry, &policy, "worker", "worker.create"));
+    assert!(allows(&registry, &policy, "objective", "objective.read"));
+    assert!(!allows(&registry, &policy, "subject", "subject.delegate"));
+    assert!(!allows(&registry, &policy, "bash", "bash.execute"));
+    let subject = registry
+        .namespace_handle(
+            &FeatureId::builtin("subject"),
+            &NamespaceId::parse("subject").unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(
+        registry.host().allows(
+            subject,
+            &registry.host().resolve(Some(&policy)),
+            &PermissionKey::parse("ticket.read").unwrap()
+        ),
+        Err(PermissionError::Ownership(_))
     ));
-    excluded.revoked = true;
+    let mut excluded = subject_default_permission_assignment();
+    excluded.exclusions.push(reference);
+    assert!(!allows(&registry, &excluded, "worker", "worker.create"));
+    assert!(!allows(&registry, &excluded, "ticket", "ticket.read"));
     assert!(!allows(
         &registry,
         &excluded,
-        "ticket",
-        "ticket.assignment.query"
+        "subject",
+        "subject.orchestrate"
     ));
+}
+
+#[test]
+fn subject_delegation_children_updates_do_not_expand_an_issued_grant() {
+    let mut registry = registry();
+    let policy = subject_default_delegation_assignment();
+    let before = registry.host().resolve(Some(&policy));
+    let read = PermissionKey::parse("ticket.read").unwrap();
+    let child = registry
+        .host()
+        .issue_delegation(&before, &[read.clone()])
+        .unwrap();
+    let subject = registry
+        .namespace_handle(
+            &FeatureId::builtin("subject"),
+            &NamespaceId::parse("subject").unwrap(),
+        )
+        .unwrap()
+        .clone();
+    let mut declaration = registry
+        .host()
+        .catalog()
+        .namespaces
+        .into_iter()
+        .find(|n| n.namespace.as_str() == "subject")
+        .unwrap()
+        .declaration;
+    declaration
+        .permissions
+        .iter_mut()
+        .find(|p| p.key.as_str() == "subject.delegate")
+        .unwrap()
+        .children
+        .push(PermissionKey::parse("worker.observe").unwrap());
+    registry.update(&subject, declaration.clone()).unwrap();
+    assert!(allows(&registry, &policy, "worker", "worker.observe"));
+    let current = registry.host().resolve(Some(&policy));
+    let limited = registry
+        .host()
+        .resolve_limited(&current, &current, &child)
+        .unwrap();
+    assert_eq!(
+        limited
+            .projection()
+            .allowed
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![read.clone()]
+    );
+    declaration
+        .permissions
+        .iter_mut()
+        .find(|p| p.key.as_str() == "subject.delegate")
+        .unwrap()
+        .children
+        .retain(|key| key != &read);
+    registry.update(&subject, declaration).unwrap();
+    let current = registry.host().resolve(Some(&policy));
+    let limited = registry
+        .host()
+        .resolve_limited(&current, &current, &child)
+        .unwrap();
+    assert!(limited.projection().allowed.is_empty());
+}
+
+#[test]
+fn subject_defaults_do_not_override_unset_empty_individual_excluded_or_revoked_policies() {
+    let registry = registry();
     assert!(
         registry
             .host()
@@ -124,6 +415,41 @@ fn subject_default_reference_resolves_conversation_and_ticket_acceptance_not_pro
             .allowed
             .is_empty()
     );
+    assert_exact_policy(&registry, &PermissionAssignment::default(), &[]);
+    let ticket_read = PermissionReference::Namespace(NamespacePermissions {
+        namespace: NamespaceId::parse("ticket").unwrap(),
+        keys: vec![PermissionKey::parse("ticket.read").unwrap()],
+    });
+    assert_exact_policy(
+        &registry,
+        &PermissionAssignment {
+            grants: vec![ticket_read.clone()],
+            ..Default::default()
+        },
+        &["ticket.read"],
+    );
+    for (policy, expected) in [
+        (subject_default_permission_assignment(), SUBJECT_BODY_KEYS),
+        (
+            subject_default_delegation_assignment(),
+            SUBJECT_DELEGATION_KEYS,
+        ),
+    ] {
+        let mut excluded = policy.clone();
+        excluded.exclusions.push(ticket_read.clone());
+        let remaining: Vec<_> = expected
+            .iter()
+            .copied()
+            .filter(|key| *key != "ticket.read")
+            .collect();
+        assert_exact_policy(&registry, &excluded, &remaining);
+        let mut excluded_set = policy.clone();
+        excluded_set.exclusions = policy.grants.clone();
+        assert_exact_policy(&registry, &excluded_set, &[]);
+        let mut revoked = policy;
+        revoked.revoked = true;
+        assert_exact_policy(&registry, &revoked, &[]);
+    }
 }
 
 #[test]
@@ -436,7 +762,7 @@ fn plugin_declaration(children: bool) -> NamespaceDeclaration {
             },
         })
         .collect(),
-        sets: [COMPANION_PERMISSION_SET, "subject-default"]
+        sets: [COMPANION_PERMISSION_SET, SUBJECT_DEFAULT_PERMISSION_SET]
             .into_iter()
             .map(|set| SetContribution {
                 set: PermissionSetId::parse(set).unwrap(),

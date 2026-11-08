@@ -789,7 +789,6 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
                 .filter(|t| t.projection.surface == NativeTicketSurface::Item)
                 .collect(),
         ),
-        permissions: None,
         ticket_reference: "T-743".into(),
         collection_route: "/tickets".into(),
         merge_request_route: "/merge-requests".into(),
@@ -869,7 +868,7 @@ async fn implementation_result_wip_and_native_dispatch_preserve_trusted_call_con
 }
 
 #[tokio::test]
-async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inputs() {
+async fn assignment_wip_binds_ticket_preserves_cas_and_respects_feature_access() {
     for (kind, mut input, response) in cases() {
         let client = transport(200, response);
         let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
@@ -880,7 +879,6 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
                     .filter(|t| t.projection.surface == NativeTicketSurface::Item)
                     .collect(),
             ),
-            permissions: None,
             ticket_reference: "T-743".into(),
             collection_route: "/tickets".into(),
             merge_request_route: "/merge-requests".into(),
@@ -923,7 +921,7 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
     }
     let (_, input, response) = cases().pop().unwrap();
     let client = transport(200, response);
-    let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::workflow()).unwrap();
+    let tools = native_ticket_tools(client.clone(), TicketFeatureAccess::read_only()).unwrap();
     let denied = TicketItemWipHandler {
         tools: operation_map(
             tools
@@ -931,10 +929,6 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
                 .filter(|t| t.projection.surface == NativeTicketSurface::Item)
                 .collect(),
         ),
-        permissions: Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Deny,
-            rules: vec![],
-        }),
         ticket_reference: "T-743".into(),
         collection_route: "/tickets".into(),
         merge_request_route: "/merge-requests".into(),
@@ -955,7 +949,7 @@ async fn assignment_wip_binds_ticket_and_preserves_normal_permission_and_cas_inp
             )
             .await,
         Err(WipOperationError::Protocol(ProtocolError {
-            code: ProtocolErrorCode::PermissionDenied,
+            code: ProtocolErrorCode::OperationNotFound,
             ..
         }))
     ));

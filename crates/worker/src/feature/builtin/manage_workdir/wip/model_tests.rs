@@ -205,15 +205,10 @@ struct Fixture {
     tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 impl Fixture {
-    fn new(checkout: bool, config: bool, permissions: Option<ToolPermissionConfig>) -> Self {
-        Self::with_config_content(checkout, config, true, permissions)
+    fn new(checkout: bool, config: bool) -> Self {
+        Self::with_config_content(checkout, config, true)
     }
-    fn with_config_content(
-        checkout: bool,
-        config: bool,
-        content: bool,
-        permissions: Option<ToolPermissionConfig>,
-    ) -> Self {
+    fn with_config_content(checkout: bool, config: bool, content: bool) -> Self {
         let directory = TempDir::new().unwrap();
         std::fs::write(directory.path().join("sample.txt"), "isolated content\n").unwrap();
         let client = Arc::new(ContentClient {
@@ -241,7 +236,8 @@ impl Fixture {
                 &mut registry,
                 router,
                 tools::Tracker::new(),
-                permissions.clone(),
+                true,
+                true,
             )
             .unwrap();
         }
@@ -266,7 +262,6 @@ impl Fixture {
             &feature,
             true,
             true,
-            permissions,
         )
         .unwrap();
         let runtime =
@@ -388,7 +383,7 @@ fn selected(entries: &[String], root: &str) -> String {
 
 #[tokio::test]
 async fn model_repository_create_attach_selected_entries_read_and_detach_preserve_workdir() {
-    let f = Fixture::new(true, false, None);
+    let f = Fixture::new(true, false);
     let (listed, entries) = f.invoke("/repositories", "list", json!({})).await;
     assert_eq!(entries.len(), 1);
     let repository = entries[0].clone();
@@ -463,7 +458,7 @@ async fn model_repository_create_attach_selected_entries_read_and_detach_preserv
 
 #[tokio::test]
 async fn model_config_attachment_entry_reaches_logical_content_without_physical_session() {
-    let f = Fixture::new(false, true, None);
+    let f = Fixture::new(false, true);
     let current = json!({"workspace_id":"test-workspace", "alias":"workspace-config", "connection_id":"logical-connection", "working_directory_id":"logical-workdir", "access":"read_only", "name":"Config", "purpose":"Configuration", "content_path":"/workspace-config", "already_attached":true});
     {
         let mut state = f.client.catalog.state.lock().unwrap();
@@ -535,7 +530,7 @@ async fn create_and_attach(f: &Fixture) -> (String, Json, Vec<String>) {
 
 #[tokio::test]
 async fn model_successful_mutations_survive_unavailable_references_without_reexecution() {
-    let f = Fixture::new(true, false, None);
+    let f = Fixture::new(true, false);
     f.client.reference_unavailable.store(true, Ordering::SeqCst);
     let (workdir, attached, entries) = create_and_attach(&f).await;
     assert_eq!(attached["attached"], true);
@@ -574,7 +569,7 @@ async fn model_successful_mutations_survive_unavailable_references_without_reexe
 
 #[tokio::test]
 async fn model_alias_reuse_rejects_old_attachment_and_content_observations() {
-    let f = Fixture::new(true, false, None);
+    let f = Fixture::new(true, false);
     let (workdir, _, entries) = create_and_attach(&f).await;
     let old_attachment = selected(&entries, "/workdir-attachments");
     let checkout = selected(&entries, "/checkouts");
@@ -620,7 +615,7 @@ async fn model_alias_reuse_rejects_old_attachment_and_content_observations() {
 
 #[tokio::test]
 async fn model_content_entry_never_grants_read_or_write_authority() {
-    let f = Fixture::new(true, false, None);
+    let f = Fixture::new(true, false);
     let (_, _, entries) = create_and_attach(&f).await;
     let checkout = selected(&entries, "/checkouts");
     f.client.content_denied.store(true, Ordering::SeqCst);
@@ -664,7 +659,7 @@ async fn model_content_entry_never_grants_read_or_write_authority() {
 
 #[tokio::test]
 async fn model_plain_path_strings_stay_data_and_pages_expose_only_selected_entries() {
-    let f = Fixture::new(false, false, None);
+    let f = Fixture::new(false, false);
     {
         let mut state = f.client.catalog.state.lock().unwrap();
         state.repositories[0]["display_name"] = json!("/workdirs/not-an-entry");
@@ -697,7 +692,7 @@ async fn model_plain_path_strings_stay_data_and_pages_expose_only_selected_entri
 
 #[tokio::test]
 async fn model_self_attach_only_root_does_not_publish_a_config_content_entry() {
-    let f = Fixture::with_config_content(false, true, false, None);
+    let f = Fixture::with_config_content(false, true, false);
     let current = json!({"workspace_id":"test-workspace", "alias":"workspace-config", "connection_id":"logical-connection", "working_directory_id":"logical-workdir", "access":"read_only", "name":"Config", "purpose":"Configuration", "content_path":"/workspace-config", "already_attached":true});
     {
         let mut state = f.client.catalog.state.lock().unwrap();

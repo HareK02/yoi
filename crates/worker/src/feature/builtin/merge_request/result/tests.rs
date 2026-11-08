@@ -30,8 +30,7 @@ impl Model {
     fn new(registry: WipMountRegistry) -> Self {
         let mut engine = Engine::new_annotated(NoLlm);
         let runtime =
-            install_wip_mode_with_mounts(&mut engine, None, "mr-model-tools".into(), registry)
-                .unwrap();
+            install_wip_mode_with_mounts(&mut engine, "mr-model-tools".into(), registry).unwrap();
         engine.tool_server_handle().flush_pending();
         Self { engine, runtime }
     }
@@ -154,7 +153,6 @@ fn registry_with_order(
             registry,
             client.clone(),
             crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-            None,
             &ticket,
         )
         .unwrap();
@@ -171,7 +169,6 @@ fn registry_with_order(
             readiness_check: true,
             ..Default::default()
         },
-        None,
         &mr,
     )
     .unwrap();

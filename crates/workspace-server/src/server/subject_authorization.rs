@@ -20,6 +20,11 @@ use server_api::authorization::{
 };
 use std::collections::BTreeSet;
 
+mod core_grants;
+pub(super) use core_grants::{
+    prepare_core_policy_grant, revalidate_core_grant, validate_bound_worker,
+};
+
 /// Policy representation is chosen by the adopted authority, never by whether a
 /// legacy read happens to succeed. An empty/missing canonical policy stays empty.
 enum CurrentSubjectPolicy {
@@ -541,6 +546,14 @@ impl WorkerAuthorityView {
                 workspace_id: self.workspace_id.clone(),
             },
         };
+        if let Some(grant) = self.live_core_grant(controller)? {
+            if self.core_key_allowed(&grant, &operation)? {
+                return Ok(());
+            }
+            return Err(denied(format!(
+                "Worker operation {operation} is not granted"
+            )));
+        }
         let permissions = if let Some(grant) = self.live_child_grant(controller)? {
             grant.permissions
         } else if let Some(subject) = self.current_body_subject(controller)? {
@@ -566,7 +579,7 @@ impl WorkerAuthorityView {
                 "Worker operation {operation} is not granted for this target"
             )));
         } else {
-            return Ok(()); // Preserve ordinary Workers' existing Backend contract.
+            return Err(denied("Worker execution authority is unbound"));
         };
         if permissions.iter().any(|granted| granted.covers(&requested)) {
             return Ok(());
@@ -845,14 +858,7 @@ pub(super) fn worker_permissions(
 }
 
 fn validate_worker(api: &WorkspaceApi, worker: &RuntimeWorkerRef) -> ApiResult<()> {
-    let authority = WorkerAuthorityView::from(api);
-    authority.require_not_deleted(worker)?;
-    if job_permissions(api, worker)?.is_none() && authority.live_child_grant(worker)?.is_none() {
-        if let Some(subject) = authority.current_body_subject(worker)? {
-            authority.policy(&subject)?;
-        }
-    }
-    Ok(())
+    validate_bound_worker(api, worker)
 }
 
 /// Host-only identity shared by plan creation and live Plugin operations. The
@@ -1091,6 +1097,14 @@ pub(super) fn authorize_scope(
     authority.require_not_deleted(worker)?;
     let permissions = if let Some(permissions) = job_permissions(api, worker)? {
         permissions
+    } else if let Some(grant) = authority.live_core_grant(worker)? {
+        if authority.core_key_allowed(&grant, &needed.operation)? {
+            return Ok(Some(needed.resource));
+        }
+        return Err(denied(format!(
+            "operation `{}` is not granted by the current execution binding",
+            needed.operation
+        )));
     } else if let Some(grant) = authority.live_child_grant(worker)? {
         grant.permissions
     } else if let Some(subject) = authority.current_body_subject(worker)? {
@@ -1125,7 +1139,9 @@ pub(super) fn authorize_scope(
         }
         policy.legacy_read(&authority)?.execution
     } else {
-        return Ok(None);
+        return Err(denied(
+            "Worker execution authority is unbound; no ordinary-Worker compatibility allow",
+        ));
     };
     // Read-only migration of saved target-scoped permissions. Do not mutate the
     // assignment/grant or use this projection for delegation; Backend separately

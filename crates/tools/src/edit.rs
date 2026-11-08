@@ -145,10 +145,7 @@ pub fn edit_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinit
     routed_edit_tool(crate::routing::singleton_router(session), tracker)
 }
 
-pub(crate) fn routed_edit_tool(
-    router: Arc<WorkdirSessionRouter>,
-    tracker: Tracker,
-) -> ToolDefinition {
+pub fn routed_edit_tool(router: Arc<WorkdirSessionRouter>, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(EditParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));

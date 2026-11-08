@@ -233,7 +233,7 @@ async fn consumers_install_and_execute_with_contract_only_test_provider() {
         .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
     assert!(!report.has_errors(), "{report:?}");
     let result = tool(&tools, "SpawnTicketWorker").execute(
-        r#"{"ticket_id":"T-788","runtime_id":"runtime-test","profile":"builtin:coder","initial_request":"implement","orchestrator_assignment_id":"delegation-test"}"#,
+        r#"{"ticket_id":"T-788","runtime_id":"runtime-test","profile":"builtin:coder","policy_id":"policy-1","policy_revision":1,"initial_request":"implement","orchestrator_assignment_id":"delegation-test"}"#,
         ToolExecutionContext::new("spawn-call", "batch", 0),
     ).await.unwrap();
     assert_eq!(result.summary, "Spawned Worker for Ticket T-788");

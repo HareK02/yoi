@@ -82,8 +82,10 @@ pub(super) async fn attach_memory_job_source(
                     subject_id: subject.into(),
                 }),
             },
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -727,6 +729,8 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
                 resolved_worker_observation_grants: vec![],
                 resolved_control_operation: None,
                 resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
             },
         )
         .unwrap()

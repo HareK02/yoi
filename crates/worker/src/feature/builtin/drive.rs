@@ -94,7 +94,6 @@ pub struct DriveFeature {
     pub(super) router: Arc<WorkdirSessionRouter>,
     observations: Arc<Mutex<Observations>>,
     nonce: Arc<str>,
-    pub(super) permissions: Option<manifest::ToolPermissionConfig>,
 }
 impl DriveFeature {
     pub fn configured(
@@ -115,12 +114,7 @@ impl DriveFeature {
             router,
             observations: Arc::new(Mutex::new(Observations::default())),
             nonce: uuid::Uuid::now_v7().to_string().into(),
-            permissions: None,
         }
-    }
-    pub fn with_permissions(mut self, permissions: Option<manifest::ToolPermissionConfig>) -> Self {
-        self.permissions = permissions;
-        self
     }
     pub fn tools(&self) -> Vec<(&'static str, ToolDefinition)> {
         SPECS

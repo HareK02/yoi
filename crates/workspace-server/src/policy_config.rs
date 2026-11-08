@@ -28,11 +28,20 @@
 //! } as WorkspaceConfigSchema
 //! ```
 //!
-//! `sets` and `exclude_sets` reference Feature-owned shared definitions;
-//! `namespaces` and `exclude_namespaces` reference exact keys in their declared
-//! Namespace. This source does not redeclare Sets, infer children from dot
-//! prefixes, attach payloads/arguments to keys or issue provider capabilities.
-//! Multi-segment keys remain exact. Only catalog-declared children expand them.
+//! `permissions.sets` defines Workspace-owned reusable reference groups, using the
+//! same graph resolver as Feature-owned shared Sets. Assignment `sets` and
+//! `exclude_sets` may select either; Namespace references still name exact declared
+//! keys. Workspace definitions cannot replace Feature-owned Sets or declare keys.
+//! No dot-prefix inference, payloads or provider capabilities are introduced.
+//!
+//! `human_worker_default` supplies the selection only for a new human-created
+//! ordinary Worker whose input omits an assignment. An explicit assignment,
+//! including empty, replaces it without merging. Missing configuration is empty,
+//! never a standard all-permission Set. Worker-origin launches, Subject bodies,
+//! Jobs, internal children, retries and restores must not select this default.
+//! Persist the chosen references, not an expanded copy: ordinary human grants
+//! retain dynamic Set resolution. Policy-limited grants separately retain their
+//! issuance ceiling in the core grant record.
 //! Unknown references are rejected even in revoked assignments, so reactivation
 //! cannot conceal invalid configuration.
 
@@ -68,6 +77,18 @@ const SCHEMA: &str = r#"{
                 revoked = Bool default false;
             } default {};
         }] default [];
+        sets = [...{
+            id = String;
+            sets = [...String] default [];
+            namespaces = [...{ namespace = String; keys = [...String]; }] default [];
+        }] default [];
+        human_worker_default = {
+            sets = [...String] default [];
+            namespaces = [...{ namespace = String; keys = [...String]; }] default [];
+            exclude_sets = [...String] default [];
+            exclude_namespaces = [...{ namespace = String; keys = [...String]; }] default [];
+            revoked = Bool default false;
+        } default {};
         remove_subjects = [...String] default [];
     };
 }"#;
@@ -77,7 +98,7 @@ pub struct PermissionConfigSchemaProvider;
 
 impl WorkspaceConfigSchemaProvider for PermissionConfigSchemaProvider {
     fn contribution(&self) -> Result<ConfigSchemaContribution> {
-        ConfigSchemaContribution::new("builtin:permissions", "permissions", "1", SCHEMA)
+        ConfigSchemaContribution::new("builtin:permissions", "permissions", "2", SCHEMA)
             .map_err(|e| Error::Config(e.to_string()))
     }
 }
@@ -153,6 +174,31 @@ pub struct SubjectAssignmentSource {
     pub delegation: AssignmentSource,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspacePermissionSetSource {
+    pub id: PermissionSetId,
+    #[serde(default)]
+    pub sets: Vec<PermissionSetId>,
+    #[serde(default)]
+    pub namespaces: Vec<NamespacePermissions>,
+}
+
+impl WorkspacePermissionSetSource {
+    fn contribution(&self) -> feature_permissions::SetContribution {
+        feature_permissions::SetContribution {
+            set: self.id.clone(),
+            children: AssignmentSource {
+                sets: self.sets.clone(),
+                namespaces: self.namespaces.clone(),
+                ..Default::default()
+            }
+            .assignment()
+            .grants,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionSource {
@@ -160,6 +206,10 @@ pub struct PermissionSource {
     pub subjects: Vec<SubjectAssignmentSource>,
     #[serde(default)]
     pub remove_subjects: Vec<String>,
+    #[serde(default)]
+    pub sets: Vec<WorkspacePermissionSetSource>,
+    #[serde(default)]
+    pub human_worker_default: AssignmentSource,
 }
 
 /// Retained exact legacy restrictions belong to the domain, not the editable source.
@@ -198,10 +248,10 @@ pub fn source(evaluation: &EvaluationResult) -> Result<PermissionSource> {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     serde_json::from_value(value)
-        .map_err(|e| Error::InvalidInput(format!("invalid Subject assignments: {e}")))
+        .map_err(|e| Error::InvalidInput(format!("invalid permission configuration: {e}")))
 }
 
-fn validate_assignment(host: &PermissionHost, source: &AssignmentSource) -> Result<()> {
+pub fn validate_assignment(host: &PermissionHost, source: &AssignmentSource) -> Result<()> {
     // Validate even revoked assignments. A revocation must not hide a misspelled
     // reference which would become active on a later edit.
     let mut assignment = source.assignment();
@@ -223,11 +273,33 @@ fn validate_assignment(host: &PermissionHost, source: &AssignmentSource) -> Resu
     Ok(())
 }
 
+/// Construct a candidate catalog without mutating the current Host. Installation
+/// is all-or-nothing, and both adoption and runtime reads use this same path.
+/// No expanded permissions are persisted as a second source of truth.
+pub fn configured_host(host: &PermissionHost, source: &PermissionSource) -> Result<PermissionHost> {
+    let mut configured = host.clone();
+    configured
+        .replace_workspace_sets(
+            source
+                .sets
+                .iter()
+                .map(WorkspacePermissionSetSource::contribution)
+                .collect(),
+        )
+        .map_err(|error| {
+            Error::InvalidInput(format!("invalid Workspace permission sets: {error}"))
+        })?;
+    validate_assignment(&configured, &source.human_worker_default)?;
+    Ok(configured)
+}
+
 pub fn validate_source(
     host: &PermissionHost,
     source: &PermissionSource,
     mut require_subject: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
+    let configured = configured_host(host, source)?;
+    let host = &configured;
     let mut subjects = BTreeSet::new();
     for item in &source.subjects {
         server_api::authorization::validate_authorization_identifier(&item.subject_id)

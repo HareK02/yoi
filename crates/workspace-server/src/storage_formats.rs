@@ -82,6 +82,7 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
     if current >= 128 {
         ticket::verify_sqlite_ticket_schema(conn).map_err(invalid)?;
     }
+    verify_launch_policy_shape(conn, current)?;
     verify_publication_shape(conn, current)?;
     verify_connection_observation_shape(conn, current)?;
     let tail = failure_tail(conn, current, &rows)?;
@@ -365,6 +366,7 @@ impl FailureTail {
         tail.push((128, super::TICKET_PLAN_RETIREMENT_MIGRATION_NAME));
         tail.push((129, super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME));
         tail.push((130, super::backend_job_current::MIGRATION_NAME));
+        tail.push((131, crate::launch_policy::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -2433,3 +2435,28 @@ CREATE TABLE content_history_references (
 );
 CREATE INDEX content_history_object_owners ON content_history_references(workspace, kind, hash);
 "####;
+
+fn verify_launch_policy_shape(conn: &Connection, current: i64) -> Result<()> {
+    let select = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(_, object)| {
+                object.1.starts_with("worker_launch_polic") || object.1.starts_with("core_worker_")
+            })
+            .collect()
+    };
+    let actual = select(snapshot(conn)?);
+    if current < 131 {
+        if actual.is_empty() {
+            return Ok(());
+        }
+        return Err(invalid("launch policy schema before its migration receipt"));
+    }
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(crate::launch_policy::SCHEMA)?;
+    reference.execute_batch(include_str!("core_worker_launch.sql"))?;
+    if actual != select(snapshot(&reference)?) {
+        return Err(invalid("launch policy physical schema mismatch"));
+    }
+    Ok(())
+}

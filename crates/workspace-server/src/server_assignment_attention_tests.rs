@@ -133,8 +133,8 @@ async fn create_test_assignment_body(
                     subject_id: subject_id.into(),
                 }),
             },
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
         }),
     )
     .await
@@ -199,8 +199,8 @@ async fn start_attention_test_orchestrator(
                                         subject_id,
                                     }),
                                 },
-                            control_operation_id: None,
-                            execution_grant: None,
+                            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+                            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
                         },
                         None,
                         None,

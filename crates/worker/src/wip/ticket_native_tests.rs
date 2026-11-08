@@ -54,12 +54,11 @@ async fn ticket_inspect_contract_drives_query_read_and_comment_without_tool_sche
         &mut registry,
         client.clone(),
         crate::feature::builtin::ticket::TicketFeatureAccess::workspace_authoring(),
-        None,
         &namespace,
     )
     .unwrap();
     let runtime =
-        install_wip_mode_with_mounts(&mut engine, None, "model".into(), registry).unwrap();
+        install_wip_mode_with_mounts(&mut engine, "model".into(), registry).unwrap();
     async fn inspect(runtime: &WipRuntime, path: &str) -> Json {
         serde_json::from_str(
             &runtime
@@ -195,7 +194,6 @@ async fn large_ticket_interface_is_explicitly_bounded_and_selected_operation_rem
             intake: true,
             workflow: true,
         },
-        None,
         &namespace,
     )
     .unwrap();
@@ -315,7 +313,6 @@ async fn ticket_inspect_explains_unpublished_objective_and_mr_input_roots() {
         &mut registry,
         client.clone(),
         crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-        None,
         &namespace,
     )
     .unwrap();
@@ -521,14 +518,12 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
                     &mut registry,
                     client.clone(),
                     crate::feature::builtin::ticket::TicketFeatureAccess::workspace_authoring(),
-                    None,
                     &tickets,
                 )
                 .unwrap(),
                 1 => crate::feature::builtin::objective::mount_workspace_http_objective_wip(
                     &mut registry,
                     client.clone(),
-                    None,
                     &objectives,
                 )
                 .unwrap(),
@@ -540,7 +535,6 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
                             show: true,
                             ..Default::default()
                         },
-                        None,
                         &mrs,
                     )
                     .unwrap()
@@ -551,7 +545,6 @@ async fn ticket_typed_results_drive_model_query_create_read_and_all_related_doma
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         let runtime = install_wip_mode_with_mounts(
             &mut engine,
-            None,
             "ticket-model-results".into(),
             registry,
         )
@@ -680,14 +673,12 @@ async fn ticket_successful_create_is_never_replayed_after_selected_deleted_or_de
         &mut registry,
         client.clone(),
         crate::feature::builtin::ticket::TicketFeatureAccess::workspace_authoring(),
-        None,
         &route,
     )
     .unwrap();
     let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
     install_wip_mode_with_mounts(
         &mut engine,
-        None,
         "ticket-negative-results".into(),
         registry,
     )
@@ -738,7 +729,6 @@ fn result_namespaces_follow_committed_registry_rollback_and_independent_host_bui
         &mut registry,
         client.clone(),
         crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-        None,
         &ticket,
     )
     .unwrap();
@@ -748,7 +738,6 @@ fn result_namespaces_follow_committed_registry_rollback_and_independent_host_bui
     crate::feature::builtin::objective::mount_workspace_http_objective_wip(
         &mut registry,
         client,
-        None,
         &objective,
     )
     .unwrap();
@@ -808,7 +797,6 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
             &mut mounts,
             client.clone(),
             crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-            None,
             &ticket,
         )
         .unwrap();
@@ -819,7 +807,7 @@ fn feature_install_publication_snapshot_preserves_host_roots_and_rolls_back_new_
             &mut features,
             true,
             client.clone(),
-            Some((objective, None)),
+            Some(objective),
         )
         .unwrap();
         if fail {
@@ -879,7 +867,6 @@ async fn host_overwrites_forged_result_context_and_omits_unpublished_cross_domai
         &mut registry,
         client.clone(),
         crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-        None,
         &route,
     )
     .unwrap();
@@ -966,7 +953,6 @@ fn result_namespace_registration_rejects_failed_partial_mounts_and_final_hidden_
         &mut registry,
         client.clone(),
         crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-        None,
         &route,
     );
     assert!(matches!(
@@ -987,7 +973,6 @@ fn result_namespace_registration_rejects_failed_partial_mounts_and_final_hidden_
         &mut registry,
         client,
         crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-        None,
         &route,
     )
     .unwrap();
@@ -1044,7 +1029,6 @@ async fn retained_ticket_result_mr_reference_is_model_navigation_not_body_or_sna
         &mut registry,
         client.clone(),
         crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-        None,
         &tickets,
     )
     .unwrap();
@@ -1055,14 +1039,12 @@ async fn retained_ticket_result_mr_reference_is_model_navigation_not_body_or_sna
             show: true,
             ..Default::default()
         },
-        None,
         &changes,
     )
     .unwrap();
     let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
     let runtime = install_wip_mode_with_mounts(
         &mut engine,
-        None,
         "retained-result-entries".into(),
         registry,
     )
@@ -1148,7 +1130,6 @@ async fn diagnostics_uncaptured_mr_origin_is_typed_lazy_model_navigation_even_on
             &mut registry,
             client.clone(),
             crate::feature::builtin::ticket::TicketFeatureAccess::read_only(),
-            None,
             &tickets,
         )
         .unwrap();
@@ -1160,7 +1141,6 @@ async fn diagnostics_uncaptured_mr_origin_is_typed_lazy_model_navigation_even_on
                     show: true,
                     ..Default::default()
                 },
-                None,
                 &changes,
             )
             .unwrap();
@@ -1168,7 +1148,6 @@ async fn diagnostics_uncaptured_mr_origin_is_typed_lazy_model_navigation_even_on
         let mut engine = Engine::<_, Mutable, ()>::new_annotated(DummyClient);
         let runtime = install_wip_mode_with_mounts(
             &mut engine,
-            None,
             "diagnostics-origin-model".into(),
             registry,
         )

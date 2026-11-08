@@ -19,13 +19,16 @@ fn session(dir: &TempDir, read_only: bool) -> WorkdirSessionHandle {
         caps,
     ))
 }
-fn runtime(
-    router: Arc<WorkdirSessionRouter>,
-    permissions: Option<ToolPermissionConfig>,
-) -> WipRuntime {
+fn runtime(router: Arc<WorkdirSessionRouter>, enabled: bool, read_only: bool) -> WipRuntime {
     let mut registry = WipMountRegistry::new();
-    crate::checkout::mount_checkouts(&mut registry, router, tools::Tracker::new(), permissions)
-        .unwrap();
+    crate::checkout::mount_checkouts(
+        &mut registry,
+        router,
+        tools::Tracker::new(),
+        enabled,
+        read_only,
+    )
+    .unwrap();
     WipRuntime::new(
         WipHost::new(registry),
         SecurityContext::new("checkout-test-worker"),
@@ -96,7 +99,7 @@ async fn checkout_wip_search_preserves_root_and_nested_ignore_rules_and_links() 
     router
         .attach(WorkdirAttachmentAlias::new("main").unwrap(), source.clone())
         .unwrap();
-    let r = runtime(router, None);
+    let r = runtime(router, true, false);
     for base in ["", "nested"] {
         let ordinary = source
             .glob(workdir::GlobRequest {
@@ -159,7 +162,7 @@ async fn checkout_wip_native_roundtrip_search_read_edit_write_create() {
             session(&dir, false),
         )
         .unwrap();
-    let r = runtime(router, None);
+    let r = runtime(router, true, false);
     let root = r.host.observe_live("/", 2).await.unwrap();
     assert_eq!(root.children.unwrap()[0].object.name, "checkouts");
     let file = "/checkouts/main/src/deep/a.txt";
@@ -263,7 +266,7 @@ async fn checkout_wip_multiple_aliases_read_only_and_escape_rejection() {
     router
         .attach(WorkdirAttachmentAlias::new("b").unwrap(), session(&b, true))
         .unwrap();
-    let r = runtime(router, None);
+    let r = runtime(router, true, false);
     let observed = r.host.observe_live("/checkouts", 2).await.unwrap();
     assert_eq!(observed.children.unwrap().len(), 2);
     let bfile = r
@@ -345,7 +348,7 @@ async fn checkout_wip_detach_alias_reuse_and_restore_fence_old_references() {
     let router = Arc::new(WorkdirSessionRouter::new());
     let alias = WorkdirAttachmentAlias::new("main").unwrap();
     router.attach(alias.clone(), session(&a, false)).unwrap();
-    let r = runtime(router.clone(), None);
+    let r = runtime(router.clone(), true, false);
     let path = "/checkouts/main/file.txt";
     call(&r, path, "read", json!({})).await.unwrap();
     let old = r.host.projection_live(path).await.unwrap().unwrap();
@@ -381,7 +384,7 @@ async fn checkout_wip_detach_alias_reuse_and_restore_fence_old_references() {
         .await
         .is_err()
     );
-    let restored = runtime(router, None);
+    let restored = runtime(router, true, false);
     let next = restored.host.projection_live(path).await.unwrap().unwrap();
     assert_eq!(new.interface, next.interface);
     assert_ne!(new.object.validator, next.object.validator);
@@ -411,7 +414,7 @@ async fn checkout_wip_provider_validator_rejects_same_content_inode_substitution
             session(&dir, false),
         )
         .unwrap();
-    let r = runtime(router, None);
+    let r = runtime(router, true, false);
     let path = "/checkouts/main/file.txt";
     call(&r, path, "read", json!({})).await.unwrap();
     let p = r.host.projection_live(path).await.unwrap().unwrap();
@@ -446,7 +449,80 @@ async fn checkout_wip_provider_validator_rejects_same_content_inode_substitution
 }
 
 #[tokio::test]
-async fn checkout_wip_policy_is_not_feature_authority_and_compatibility_is_replaced() {
+async fn checkout_read_only_feature_hides_and_rejects_mutations_on_writable_provider() {
+    use crate::file_operation::Contract;
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("file.txt"), "original").unwrap();
+    let router = Arc::new(WorkdirSessionRouter::new());
+    router
+        .attach(
+            WorkdirAttachmentAlias::new("main").unwrap(),
+            session(&dir, false),
+        )
+        .unwrap();
+    let r = runtime(router, true, true);
+    let file = r
+        .host
+        .projection_live("/checkouts/main/file.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        file.object
+            .interfaces
+            .contains(&Contract::ReadLines.reference())
+    );
+    assert!(
+        !file
+            .object
+            .interfaces
+            .contains(&Contract::Write.reference())
+    );
+    assert!(!file.object.interfaces.contains(&Contract::Edit.reference()));
+    let directory = r
+        .host
+        .projection_live("/checkouts/main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !directory
+            .object
+            .interfaces
+            .contains(&Contract::CreateFile.reference())
+    );
+    for (handler, operation) in [
+        (&file.handler, "write"),
+        (&file.handler, "edit"),
+        (&directory.handler, "create_file"),
+    ] {
+        let denied = handler
+            .call(
+                operation,
+                &BTreeMap::new(),
+                WipCallContext {
+                    result_namespaces: Default::default(),
+                    execution: Default::default(),
+                    security_context: "fixture".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::PermissionDenied)
+        );
+    }
+    let read = call(&r, "/checkouts/main/file.txt", "read", json!({}))
+        .await
+        .unwrap();
+    assert!(read.content.unwrap().contains("original"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "original"
+    );
+}
+
+#[tokio::test]
+async fn checkout_wip_feature_off_is_unpublished_and_enabled_compatibility_is_replaced() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("file.txt"), "secret").unwrap();
     let router = Arc::new(WorkdirSessionRouter::new());
@@ -456,11 +532,7 @@ async fn checkout_wip_policy_is_not_feature_authority_and_compatibility_is_repla
             session(&dir, false),
         )
         .unwrap();
-    let permissions = ToolPermissionConfig {
-        default_action: ToolPermissionAction::Deny,
-        rules: Vec::new(),
-    };
-    let r = runtime(router.clone(), Some(permissions));
+    let r = runtime(router.clone(), false, false);
     assert!(
         r.host
             .projection_live("/checkouts/main/file.txt")
@@ -468,25 +540,23 @@ async fn checkout_wip_policy_is_not_feature_authority_and_compatibility_is_repla
             .unwrap()
             .is_none()
     );
-    assert!(
-        r.host
-            .observe_live("/checkouts", 1)
-            .await
-            .unwrap()
-            .children
-            .unwrap()
-            .is_empty()
-    );
+    assert!(r.host.observe_live("/checkouts", 1).await.is_err());
     let mut registry = WipMountRegistry::new();
-    crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), None)
-        .unwrap();
+    crate::checkout::mount_checkouts(
+        &mut registry,
+        router.clone(),
+        tools::Tracker::new(),
+        true,
+        false,
+    )
+    .unwrap();
     for def in tools::routed_builtin_tools(
         router,
         tools::Tracker::new(),
         tools::bash_output::BashOutputView::new(),
     ) {
         let (meta, tool) = def();
-        let p = compatibility_projection(meta, tool, None).unwrap();
+        let p = compatibility_projection(meta, tool).unwrap();
         registry.mount(p).unwrap();
     }
     for tool in ["Read", "Edit", "Write", "Glob", "Grep"] {
@@ -506,7 +576,8 @@ async fn checkout_wip_bounded_observation_and_deep_subtree_collision() {
         )
         .unwrap();
     let mut registry = WipMountRegistry::new();
-    crate::checkout::mount_checkouts(&mut registry, router, tools::Tracker::new(), None).unwrap();
+    crate::checkout::mount_checkouts(&mut registry, router, tools::Tracker::new(), true, false)
+        .unwrap();
     let placeholder = registry.mounts["/checkouts"].resolved();
     let mut collision = placeholder.clone();
     collision.route = "/checkouts/main/a".into();
@@ -533,7 +604,7 @@ async fn checkout_wip_post_operation_validators_support_cached_chains() {
             session(&dir, false),
         )
         .unwrap();
-    let r = runtime(router, None);
+    let r = runtime(router, true, false);
     let path = "/checkouts/main/file.txt";
     interface(&r, path).await;
     // No rediscovery or Interface refresh between any of these operations.
@@ -608,7 +679,7 @@ async fn checkout_wip_scoped_child_search_and_revoke_cannot_expose_siblings() {
             broker.tool_session(),
         )
         .unwrap();
-    let parent = runtime(parent_router, None);
+    let parent = runtime(parent_router, true, false);
     let parent_file = parent
         .host
         .projection_live("/checkouts/parent/child/a.txt")
@@ -629,7 +700,7 @@ async fn checkout_wip_scoped_child_search_and_revoke_cannot_expose_siblings() {
             lease.tool_session(),
         )
         .unwrap();
-    let child = runtime(child_router, None);
+    let child = runtime(child_router, true, false);
     let observed = child
         .host
         .observe_live("/checkouts/child", 2)
@@ -764,7 +835,7 @@ async fn checkout_depth_boundaries_are_independent_of_empty_small_or_large_conte
                 session(&dir, true),
             )
             .unwrap();
-        let r = runtime(router, None);
+        let r = runtime(router, true, false);
         let one = r.host.observe_live("/checkouts", 1).await.unwrap();
         assert!(one.children.unwrap()[0].children.is_none());
         for depth in [2, 32] {
@@ -809,7 +880,7 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
             session(&dir, true),
         )
         .unwrap();
-    let r = Arc::new(runtime(router, None));
+    let r = Arc::new(runtime(router, true, false));
     let entrance = model_inspect(r.clone(), "/checkouts/main").await;
     assert_eq!(entrance["path"], "/checkouts/main");
     assert_eq!(entrance["interfaces"][0]["reference"]["scope"], "/");
@@ -934,53 +1005,6 @@ async fn checkout_model_list_glob_grep_entries_are_lazy_and_never_become_tree_ed
 }
 
 #[tokio::test]
-async fn checkout_list_permission_cannot_be_bypassed_with_glob_or_command_identity() {
-    let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("a.txt"), "fixture").unwrap();
-    let router = Arc::new(WorkdirSessionRouter::new());
-    router
-        .attach(
-            WorkdirAttachmentAlias::new("main").unwrap(),
-            session(&dir, true),
-        )
-        .unwrap();
-    let r = runtime(
-        router,
-        Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Allow,
-            rules: vec![manifest::ToolPermissionRule {
-                tool: "List".into(),
-                pattern: "*".into(),
-                action: ToolPermissionAction::Deny,
-            }],
-        }),
-    );
-    let p = r
-        .host
-        .projection_live("/checkouts/main")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!p.descriptor.operations.iter().any(|op| op.name == "list"));
-    assert!(p.descriptor.operations.iter().any(|op| op.name == "glob"));
-    let denied = p
-        .handler
-        .call(
-            "list",
-            &BTreeMap::new(),
-            WipCallContext {
-                result_namespaces: Default::default(),
-                execution: Default::default(),
-                security_context: "fixture".into(),
-            },
-        )
-        .await;
-    assert!(
-        matches!(denied, Err(WipOperationError::Protocol(e)) if e.code == ProtocolErrorCode::PermissionDenied)
-    );
-}
-
-#[tokio::test]
 async fn common_scope_rejects_wrong_namespace_scope_ref_and_old_target_authority() {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("a.txt"), "same\n").unwrap();
@@ -993,7 +1017,7 @@ async fn common_scope_rejects_wrong_namespace_scope_ref_and_old_target_authority
             session(&dir, true),
         )
         .unwrap();
-    let r = runtime(router.clone(), None);
+    let r = runtime(router.clone(), true, false);
     let path = "/checkouts/main/a.txt";
     let p = r.host.projection_live(path).await.unwrap().unwrap();
     let fetched = r.host.fetch_interface_live(&p.interface).await.unwrap();
@@ -1101,7 +1125,7 @@ async fn shared_contract_survives_one_attachment_update_but_old_object_authority
             session(&right, true),
         )
         .unwrap();
-    let r = runtime(router.clone(), None);
+    let r = runtime(router.clone(), true, false);
     let path = "/checkouts/left/a.txt";
     let other = "/checkouts/right/a.txt";
     let first = r.host.projection_live(path).await.unwrap().unwrap();
@@ -1164,7 +1188,7 @@ async fn shared_contract_survives_one_attachment_update_but_old_object_authority
     );
     call(&r, path, "read", json!({})).await.unwrap();
     let before_restore = r.host.projection_live(path).await.unwrap().unwrap();
-    let restored = runtime(router, None);
+    let restored = runtime(router, true, false);
     let restored_definition = restored
         .host
         .fetch_interface_live(&first.interface)
@@ -1189,7 +1213,7 @@ async fn shared_readonly_contract_rejects_wrong_membership_operation_and_interfa
             session(&dir, true),
         )
         .unwrap();
-    let r = Arc::new(runtime(router, None));
+    let r = Arc::new(runtime(router, true, false));
     let path = "/checkouts/main/a.txt";
     let observed = model_inspect(r.clone(), path).await;
     let read = json_content(
@@ -1362,7 +1386,8 @@ async fn common_bytes_read_long_lines_invalid_utf8_arbitrary_boundaries_and_eof_
         captured: 1,
     });
     let mut registry = WipMountRegistry::new();
-    crate::checkout::mount_checkouts(&mut registry, router, tools::Tracker::new(), None).unwrap();
+    crate::checkout::mount_checkouts(&mut registry, router, tools::Tracker::new(), true, false)
+        .unwrap();
     registry.allocate_namespace("virtual", "virtual").unwrap();
     registry.mount(source.projection()).unwrap();
     registry
@@ -1448,7 +1473,7 @@ async fn scope_downgrade_changes_object_membership_not_common_contract_and_read_
     router
         .attach(WorkdirAttachmentAlias::new("main").unwrap(), session)
         .unwrap();
-    let r = Arc::new(runtime(router, None));
+    let r = Arc::new(runtime(router, true, false));
     let path = "/checkouts/main/a";
     let old = model_inspect(r.clone(), path).await;
     let current = r.host.projection_live(path).await.unwrap().unwrap();
@@ -1559,7 +1584,7 @@ pub(super) async fn failed_text_read_cannot_authorize_mutation(
     router
         .attach(WorkdirAttachmentAlias::new("main").unwrap(), source)
         .unwrap();
-    let r = Arc::new(runtime(router, None));
+    let r = Arc::new(runtime(router, true, false));
     let inspected = model_inspect(r.clone(), "/checkouts/main/text").await;
     let arguments = if operation == "write" {
         json!({"content":"changed"})
@@ -1642,7 +1667,7 @@ pub(super) async fn assert_long_utf8_search_refuses_incomplete_line(
     router
         .attach(WorkdirAttachmentAlias::new("main").unwrap(), source)
         .unwrap();
-    let r = Arc::new(runtime(router, None));
+    let r = Arc::new(runtime(router, true, false));
     let inspected = model_inspect(r.clone(), "/checkouts/main/text").await;
     let result = model_invoke(
         r.clone(),

@@ -133,10 +133,7 @@ pub fn read_tool(session: WorkdirSessionHandle, tracker: Tracker) -> ToolDefinit
     routed_read_tool(crate::routing::singleton_router(session), tracker)
 }
 
-pub(crate) fn routed_read_tool(
-    router: Arc<WorkdirSessionRouter>,
-    tracker: Tracker,
-) -> ToolDefinition {
+pub fn routed_read_tool(router: Arc<WorkdirSessionRouter>, tracker: Tracker) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));

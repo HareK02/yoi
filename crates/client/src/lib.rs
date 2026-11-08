@@ -42,6 +42,7 @@ pub use client::{Client, ClientError};
 pub use runtime_api::{
     RetainedSessionIdentity, WorkerSessionAvailability, WorkerSessionUnavailableReason,
 };
+pub use server_api::launch_policy::WorkerCreationAuthorization as BackendWorkerCreationAuthorization;
 pub use server_api::{
     CompanionCancelRequest, CompanionLifecycleState, CompanionMessageDisposition,
     CompanionMessageRequest, CompanionMessageResponse, CompanionStatusResponse,

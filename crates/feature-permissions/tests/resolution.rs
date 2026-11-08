@@ -94,6 +94,110 @@ fn has_origin(resolved: &ResolvedPermissions, operation: &str, feature: &str, se
 }
 
 #[test]
+fn workspace_sets_share_current_graph_validation_and_do_not_replace_feature_authority() {
+    let mut host = host("workspace-a");
+    let (owner, ticket) = register(&mut host, "builtin:ticket", "ticket");
+    host.declare(
+        &ticket,
+        declaration(
+            &[("ticket.read", &[]), ("ticket.write", &[])],
+            &[("reader", vec![keys("ticket", &["ticket.read"])])],
+        ),
+    )
+    .unwrap();
+    let source = vec![SetContribution {
+        set: PermissionSetId::parse("configured").unwrap(),
+        children: vec![set("reader")],
+    }];
+    host.replace_workspace_sets(source.clone()).unwrap();
+    let assigned = assignment(vec![set("configured")]);
+    let old = host.resolve(Some(&assigned));
+    assert_keys(&old, &["ticket.read"]);
+    for invalid in [
+        vec![SetContribution {
+            set: PermissionSetId::parse("configured").unwrap(),
+            children: vec![set("missing")],
+        }],
+        vec![SetContribution {
+            set: PermissionSetId::parse("configured").unwrap(),
+            children: vec![set("configured")],
+        }],
+        vec![SetContribution {
+            set: PermissionSetId::parse("configured").unwrap(),
+            children: vec![keys("ticket", &["other.read"])],
+        }],
+        vec![SetContribution {
+            set: PermissionSetId::parse("reader").unwrap(),
+            children: vec![keys("ticket", &["ticket.write"])],
+        }],
+        vec![source[0].clone(), source[0].clone()],
+    ] {
+        assert!(host.replace_workspace_sets(invalid).is_err());
+        assert_keys(&host.resolve(Some(&assigned)), &["ticket.read"]);
+        assert_eq!(host.allows(&ticket, &old, &key("ticket.read")), Ok(true));
+    }
+    assert!(
+        host.declare(
+            &ticket,
+            declaration(
+                &[("ticket.read", &[]), ("ticket.write", &[])],
+                &[
+                    ("reader", vec![keys("ticket", &["ticket.read"])]),
+                    ("configured", vec![keys("ticket", &["ticket.write"])]),
+                ],
+            ),
+        )
+        .is_err()
+    );
+    assert_eq!(host.allows(&ticket, &old, &key("ticket.read")), Ok(true));
+    host.replace_workspace_sets(vec![SetContribution {
+        set: PermissionSetId::parse("configured").unwrap(),
+        children: vec![keys("ticket", &["ticket.write"])],
+    }])
+    .unwrap();
+    assert_eq!(
+        host.allows(&ticket, &old, &key("ticket.read")),
+        Err(PermissionError::StaleResolution)
+    );
+    assert_keys(&host.resolve(Some(&assigned)), &["ticket.write"]);
+    host.replace_workspace_sets(source).unwrap();
+    assert_eq!(
+        host.allows(&ticket, &old, &key("ticket.read")),
+        Err(PermissionError::StaleResolution),
+        "restoring the same Set content cannot revive an old authorization result"
+    );
+    host.declare(
+        &ticket,
+        declaration(
+            &[("ticket.read", &[]), ("ticket.write", &[])],
+            &[(
+                "reader",
+                vec![keys("ticket", &["ticket.read", "ticket.write"])],
+            )],
+        ),
+    )
+    .unwrap();
+    assert_keys(
+        &host.resolve(Some(&assigned)),
+        &["ticket.read", "ticket.write"],
+    );
+    let excluded = PermissionAssignment {
+        exclusions: vec![set("reader")],
+        ..assigned.clone()
+    };
+    assert_keys(&host.resolve(Some(&excluded)), &[]);
+    host.set_enabled(&owner, false).unwrap();
+    assert_keys(&host.resolve(Some(&assigned)), &[]);
+    host.set_enabled(&owner, true).unwrap();
+    host.replace_workspace_sets(vec![]).unwrap();
+    assert_keys(&host.resolve(Some(&assigned)), &[]);
+    assert_keys(
+        &host.resolve(Some(&assignment(vec![set("reader")]))),
+        &["ticket.read", "ticket.write"],
+    );
+}
+
+#[test]
 fn existing_set_holder_tracks_two_builtins_and_trusted_plugin_without_redistribution() {
     let mut host = host("workspace-a");
     let (_, ticket) = register(&mut host, "builtin:ticket", "ticket");

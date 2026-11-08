@@ -4,7 +4,7 @@
 //! resolution, state, audit, and linked Ticket validation. The native projection accepts `/objectives`
 //! and immediate canonical `O-*` or internal IDs, binding the subject `id` from the route.
 //! Linked Tickets remain separate reference inputs, requiring neither Ticket projection nor its
-//! permissions. [`crate::wip`] owns shared reference, permission, Client-lifetime, and unknown-outcome
+//! authorization. [`crate::wip`] owns shared reference, Client-lifetime, and unknown-outcome
 //! contracts.
 //!
 //! # Fixed contracts and current content
@@ -31,7 +31,6 @@ use std::sync::Mutex;
 
 use agen::tool::{Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput};
 use async_trait::async_trait;
-use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
@@ -40,7 +39,6 @@ use wip_protocol::{
     ParameterDeclaration, ProtocolError, ProtocolErrorCode, ReturnDeclaration, TypeExpr, Value,
 };
 
-use crate::permission::permission_action_for;
 use crate::wip::{
     WipCallContext, WipDynamicItem, WipDynamicItemResolver, WipDynamicMount, WipMountError,
     WipMountRegistry, WipNamespaceRoute, WipOperationError, WipOperationHandler,
@@ -634,7 +632,6 @@ const OBJECTIVE_TOOL_NAMES: [&str; 7] = [
 pub fn mount_workspace_http_objective_wip(
     registry: &mut WipMountRegistry,
     client: Arc<dyn WorkspaceClient>,
-    permissions: Option<ToolPermissionConfig>,
     namespace_route: &WipNamespaceRoute,
 ) -> Result<(), WipMountError> {
     let collection_route = namespace_route.root().to_string();
@@ -647,7 +644,6 @@ pub fn mount_workspace_http_objective_wip(
     let collection_validator = descriptor_validator(&collection_descriptor);
     let collection_handler = Arc::new(ObjectiveCollectionWipHandler {
         backend: backend.clone(),
-        permissions: permissions.clone(),
         result_routes: result_routes.clone(),
     });
     registry.mount(WipProjection {
@@ -684,7 +680,6 @@ pub fn mount_workspace_http_objective_wip(
         interface_validator: Some(item_validator),
         resolver: Arc::new(ObjectiveItemResolver {
             backend,
-            permissions,
             collection_route: collection_route.clone(),
             result_routes,
         }),
@@ -696,7 +691,6 @@ pub fn mount_workspace_http_objective_wip(
 
 struct ObjectiveCollectionWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
-    permissions: Option<ToolPermissionConfig>,
     result_routes: results::Routes,
 }
 
@@ -734,8 +728,6 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
                     limit,
                     cursor: optional_string_argument(arguments, "cursor")?,
                 };
-                let permission_input = native_permission_input(arguments, None)?;
-                authorize_native(&self.permissions, "QueryObjective", &permission_input)?;
                 let response = self
                     .backend
                     .query_value(&input)
@@ -753,8 +745,6 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
                     linked_tickets: string_list_argument(arguments, "linked_tickets")?
                         .unwrap_or_default(),
                 };
-                let permission_input = native_permission_input(arguments, None)?;
-                authorize_native(&self.permissions, "ObjectiveCreate", &permission_input)?;
                 let response = self
                     .backend
                     .create_value(&input)
@@ -771,7 +761,6 @@ impl WipOperationHandler for ObjectiveCollectionWipHandler {
 
 struct ObjectiveItemResolver {
     backend: WorkspaceHttpObjectiveBackend,
-    permissions: Option<ToolPermissionConfig>,
     collection_route: String,
     result_routes: results::Routes,
 }
@@ -794,7 +783,6 @@ impl WipDynamicItemResolver for ObjectiveItemResolver {
             },
             handler: Arc::new(ObjectiveItemWipHandler {
                 backend: self.backend.clone(),
-                permissions: self.permissions.clone(),
                 objective_reference: item_reference.to_string(),
                 result_routes: self.result_routes.clone(),
             }),
@@ -804,7 +792,6 @@ impl WipDynamicItemResolver for ObjectiveItemResolver {
 
 struct ObjectiveItemWipHandler {
     backend: WorkspaceHttpObjectiveBackend,
-    permissions: Option<ToolPermissionConfig>,
     objective_reference: String,
     result_routes: results::Routes,
 }
@@ -817,13 +804,11 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
         arguments: &BTreeMap<String, Value>,
         context: WipCallContext,
     ) -> Result<WipOperationOutput, WipOperationError> {
-        let permission_input = native_permission_input(arguments, Some(&self.objective_reference))?;
         let response = match operation {
             "read" => {
                 let event_limit = optional_usize_argument(arguments, "event_limit")?;
                 ensure_optional_range("event_limit", event_limit, 1, 50)?;
                 let event_cursor = optional_string_argument(arguments, "event_cursor")?;
-                authorize_native(&self.permissions, "ShowObjective", &permission_input)?;
                 self.backend
                     .read_value(&self.objective_reference, event_limit, event_cursor)
                     .await
@@ -836,7 +821,6 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
                     new_string: optional_string_argument(arguments, "new_string")?,
                     replace_all: optional_bool_argument(arguments, "replace_all")?.unwrap_or(false),
                 };
-                authorize_native(&self.permissions, "ObjectiveEdit", &permission_input)?;
                 self.backend
                     .edit_value(&self.objective_reference, &input)
                     .await
@@ -844,7 +828,6 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
             }
             "set_state" => {
                 let state = required_string_argument(arguments, "state")?;
-                authorize_native(&self.permissions, "ObjectiveSetState", &permission_input)?;
                 self.backend
                     .set_state_value(&self.objective_reference, &state)
                     .await
@@ -852,7 +835,6 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
             }
             "link_ticket" => {
                 let ticket_id = required_string_argument(arguments, "ticket_id")?;
-                authorize_native(&self.permissions, "ObjectiveLinkTicket", &permission_input)?;
                 let (_, response) = self
                     .backend
                     .link_ticket_value(&self.objective_reference, &ticket_id)
@@ -862,11 +844,6 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
             }
             "unlink_ticket" => {
                 let ticket_id = required_string_argument(arguments, "ticket_id")?;
-                authorize_native(
-                    &self.permissions,
-                    "ObjectiveUnlinkTicket",
-                    &permission_input,
-                )?;
                 let (_, response) = self
                     .backend
                     .unlink_ticket_value(&self.objective_reference, &ticket_id)
@@ -881,51 +858,6 @@ impl WipOperationHandler for ObjectiveItemWipHandler {
             &response,
             context.result_namespaces.root("ticket"),
         )?))
-    }
-}
-
-fn native_permission_input(
-    arguments: &BTreeMap<String, Value>,
-    bound_objective: Option<&str>,
-) -> Result<Json, WipOperationError> {
-    let mut projected = serde_json::Map::new();
-    if let Some(objective) = bound_objective {
-        projected.insert("id".into(), Json::String(objective.to_string()));
-    }
-    for (name, value) in arguments {
-        if matches!(value, Value::Unit) {
-            continue;
-        }
-        projected.insert(
-            name.clone(),
-            wip_to_json(value).map_err(|message| {
-                protocol_failure(ProtocolErrorCode::InvalidArguments, message)
-            })?,
-        );
-    }
-    Ok(Json::Object(projected))
-}
-
-fn authorize_native(
-    permissions: &Option<ToolPermissionConfig>,
-    tool_name: &str,
-    arguments: &Json,
-) -> Result<(), WipOperationError> {
-    let Some(permissions) = permissions else {
-        return Ok(());
-    };
-    match permission_action_for(permissions, tool_name, arguments) {
-        ToolPermissionAction::Allow => Ok(()),
-        ToolPermissionAction::Deny => Err(protocol_failure(
-            ProtocolErrorCode::PermissionDenied,
-            format!("permission denied for projected tool `{tool_name}`"),
-        )),
-        ToolPermissionAction::Ask => Err(protocol_failure(
-            ProtocolErrorCode::PermissionDenied,
-            format!(
-                "permission approval is unavailable for projected tool `{tool_name}`; denied fail-closed"
-            ),
-        )),
     }
 }
 
@@ -1856,7 +1788,6 @@ mod tests {
                 "workspace",
                 "http://backend",
             )),
-            None,
             &namespace_route,
         )
         .unwrap();
@@ -1875,7 +1806,6 @@ mod tests {
             backend: WorkspaceHttpObjectiveBackend::new(Arc::new(
                 crate::worker::TestWorkspaceHttpClient::new("workspace", "http://backend"),
             )),
-            permissions: None,
             collection_route: "/objectives".into(),
             result_routes: results::Routes {
                 objective: "/objectives".into(),
@@ -1944,97 +1874,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn native_permission_inputs_preserve_presence_and_route_bound_identity() {
-        let create_arguments =
-            BTreeMap::from([("title".into(), Value::String("Objective".into()))]);
-        let create = native_permission_input(&create_arguments, None)
-            .unwrap_or_else(|_| panic!("create permission input"));
-        assert_eq!(create, json!({"title": "Objective"}));
-        let read = native_permission_input(&BTreeMap::new(), Some("O-3"))
-            .unwrap_or_else(|_| panic!("read permission input"));
-        assert_eq!(read, json!({"id": "O-3"}));
-
-        let permissions = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Allow,
-            rules: vec![
-                manifest::ToolPermissionRule {
-                    tool: "ObjectiveCreate".into(),
-                    pattern: serde_json::to_string(&create).unwrap(),
-                    action: ToolPermissionAction::Deny,
-                },
-                manifest::ToolPermissionRule {
-                    tool: "ShowObjective".into(),
-                    pattern: serde_json::to_string(&read).unwrap(),
-                    action: ToolPermissionAction::Deny,
-                },
-            ],
-        });
-        assert!(matches!(
-            authorize_native(&permissions, "ObjectiveCreate", &create),
-            Err(WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
-                ..
-            }))
-        ));
-        assert!(matches!(
-            authorize_native(&permissions, "ShowObjective", &read),
-            Err(WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
-                ..
-            }))
-        ));
-        let ask = Some(ToolPermissionConfig {
-            default_action: ToolPermissionAction::Ask,
-            rules: Vec::new(),
-        });
-        assert!(matches!(
-            authorize_native(&ask, "ShowObjective", &read),
-            Err(WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
-                ..
-            }))
-        ));
-    }
-
     #[tokio::test]
-    async fn native_permissions_and_bounds_fail_before_backend_dispatch() {
+    async fn native_bounds_fail_before_backend_dispatch() {
         let backend = WorkspaceHttpObjectiveBackend::new(Arc::new(
             crate::worker::TestWorkspaceHttpClient::new("workspace", "http://unreachable.invalid"),
         ));
-        let denied = ObjectiveItemWipHandler {
-            backend: backend.clone(),
-            permissions: Some(ToolPermissionConfig {
-                default_action: ToolPermissionAction::Deny,
-                rules: Vec::new(),
-            }),
-            objective_reference: "O-3".into(),
-            result_routes: results::Routes {
-                objective: "/objectives".into(),
-            },
-        };
-        let result = denied
-            .call(
-                "read",
-                &BTreeMap::new(),
-                WipCallContext {
-                    execution: ToolExecutionContext::direct(),
-                    security_context: "test".into(),
-                    result_namespaces: Default::default(),
-                },
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(WipOperationError::Protocol(ProtocolError {
-                code: ProtocolErrorCode::PermissionDenied,
-                ..
-            }))
-        ));
-
         let collection = ObjectiveCollectionWipHandler {
             backend,
-            permissions: None,
             result_routes: results::Routes {
                 objective: "/objectives".into(),
             },
@@ -2079,7 +1925,6 @@ mod tests {
 
         let collection = ObjectiveCollectionWipHandler {
             backend: backend.clone(),
-            permissions: None,
             result_routes: results::Routes {
                 objective: "/objectives".into(),
             },
@@ -2102,7 +1947,6 @@ mod tests {
 
         let item = ObjectiveItemWipHandler {
             backend,
-            permissions: None,
             objective_reference: "O-3".into(),
             result_routes: results::Routes {
                 objective: "/objectives".into(),
@@ -2170,7 +2014,6 @@ mod tests {
         let client = Arc::new(MockWorkspaceClient::new([missing(), missing()]));
         let item = ObjectiveItemWipHandler {
             backend: WorkspaceHttpObjectiveBackend::new(client),
-            permissions: None,
             objective_reference: "O-404".into(),
             result_routes: results::Routes {
                 objective: "/objectives".into(),
@@ -2241,7 +2084,6 @@ mod tests {
             backend: WorkspaceHttpObjectiveBackend::new(Arc::new(
                 crate::worker::TestWorkspaceHttpClient::new("workspace", base_url),
             )),
-            permissions: None,
             result_routes: results::Routes {
                 objective: "/objectives".into(),
             },
@@ -2314,7 +2156,6 @@ mod tests {
         ));
         let resolver = ObjectiveItemResolver {
             backend: backend.clone(),
-            permissions: None,
             collection_route: "/objectives".into(),
             result_routes: results::Routes {
                 objective: "/objectives".into(),
@@ -2323,7 +2164,6 @@ mod tests {
         let before = resolver.resolve("O-3").unwrap().object.validator;
         let handler = ObjectiveItemWipHandler {
             backend,
-            permissions: None,
             objective_reference: "O-3".into(),
             result_routes: results::Routes {
                 objective: "/objectives".into(),
@@ -2409,7 +2249,6 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let item = ObjectiveItemWipHandler {
             backend,
-            permissions: None,
             objective_reference: "O-3".into(),
             result_routes: results::Routes {
                 objective: "/objectives".into(),

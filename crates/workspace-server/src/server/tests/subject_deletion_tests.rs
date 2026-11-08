@@ -137,7 +137,10 @@ async fn deletion_owner_scope_exact_retry_and_subject_isolation() {
         source.execution,
         server_api::authorization::subject_default_permission_assignment()
     );
-    assert!(source.delegation.grants.is_empty());
+    assert_eq!(
+        source.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
     assert!(source.legacy_constraints.is_none());
     assert_eq!(
         store
@@ -224,8 +227,10 @@ async fn unconfirmed_worker_shutdown_is_not_completion_and_exact_retry_converges
                     subject_id: subject.id.clone(),
                 }),
             },
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -1137,8 +1142,10 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
                     subject_id: subject.id.clone(),
                 }),
             },
-            control_operation_id: None,
-            execution_grant: None,
+            control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await

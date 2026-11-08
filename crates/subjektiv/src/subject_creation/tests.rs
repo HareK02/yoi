@@ -2,10 +2,15 @@
 //! Authentication/Runtime connections are covered by the Backend connected chat suite.
 use super::*;
 use crate::tests::{open_store, role};
-use server_api::authorization::SubjectPermissionsUpdate;
+use feature_permissions::{
+    NamespaceId, NamespacePermissions, PermissionKey, PermissionReference, PermissionSetId,
+};
+use server_api::authorization::{
+    SUBJECT_DEFAULT_PERMISSION_SET, SUBJECT_DELEGATE_PERMISSION, SubjectPermissionsUpdate,
+};
 
 #[test]
-fn creation_persists_real_shared_set_reference_and_no_delegation() {
+fn creation_persists_execution_set_and_semantic_delegation_reference() {
     let dir = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(dir.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap();
@@ -18,7 +23,15 @@ fn creation_persists_real_shared_set_reference_and_no_delegation() {
     );
     assert!(source.execution.exclusions.is_empty());
     assert!(!source.execution.revoked);
-    assert!(source.delegation.grants.is_empty());
+    assert_eq!(
+        source.delegation.grants,
+        vec![PermissionReference::Namespace(NamespacePermissions {
+            namespace: NamespaceId::parse("subject").unwrap(),
+            keys: vec![PermissionKey::parse(SUBJECT_DELEGATE_PERMISSION).unwrap()],
+        })]
+    );
+    assert!(source.delegation.exclusions.is_empty());
+    assert!(!source.delegation.revoked);
     assert!(source.legacy_constraints.is_none());
     assert!(matches!(
         store.subject_policy_source(&subject.id).unwrap(),
@@ -72,6 +85,70 @@ fn creation_replay_after_reopen_never_duplicates_or_restores_revoked_source() {
     );
     assert_eq!(store.subject_permissions(&id).unwrap(), Some(revoked));
     assert_eq!(store.list_subjects_after(100, None).unwrap().items.len(), 1);
+}
+
+#[test]
+fn existing_feature_restrictions_survive_reopen_and_creation_replay() {
+    // Seed persisted feature policies representing an older empty delegation or
+    // explicit restrictions. This fixture is not a production policy writer.
+    for restriction in ["empty-delegation", "empty-execution", "excluded", "revoked"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (subject, expected) = {
+            let (_manager, _scope, store) = open_store(dir.path(), "workspace-a");
+            let subject = store
+                .create_subject_idempotent(role(), String::new(), "existing")
+                .unwrap();
+            let mut source = store.current_subject_policy(&subject.id).unwrap().unwrap();
+            match restriction {
+                "empty-delegation" => source.delegation = Default::default(),
+                "empty-execution" => source.execution = Default::default(),
+                "excluded" => source.execution.exclusions = source.execution.grants.clone(),
+                "revoked" => {
+                    source.execution.revoked = true;
+                    source.delegation.revoked = true;
+                }
+                _ => unreachable!(),
+            }
+            source.change_id = issued_id("permissions");
+            store.database.try_transaction::<_, SubjektivError>(|tx| {
+                tx.execute(
+                    "INSERT INTO subject_permission_changes(subject_id,change_id,record_json) VALUES(?1,?2,?3)",
+                    params![subject.id, source.change_id, serde_json::to_string(&source)?],
+                )?;
+                tx.execute("UPDATE subject_permissions SET change_id=?2 WHERE subject_id=?1",
+                    params![subject.id, source.change_id])?;
+                Ok(())
+            }).unwrap();
+            (subject, source)
+        };
+        let (_manager, _scope, store) = open_store(dir.path(), "workspace-a");
+        assert_eq!(
+            store.current_subject_policy(&subject.id).unwrap(),
+            Some(expected.clone()),
+            "{restriction}"
+        );
+        assert_eq!(
+            store
+                .create_subject_idempotent(role(), String::new(), "existing")
+                .unwrap()
+                .id,
+            subject.id
+        );
+        assert_eq!(
+            store.current_subject_policy(&subject.id).unwrap(),
+            Some(expected),
+            "{restriction}"
+        );
+        let fresh = store.create_subject(role()).unwrap();
+        assert_eq!(
+            store
+                .current_subject_policy(&fresh.id)
+                .unwrap()
+                .unwrap()
+                .delegation,
+            subject_default_delegation_assignment()
+        );
+    }
 }
 
 #[test]

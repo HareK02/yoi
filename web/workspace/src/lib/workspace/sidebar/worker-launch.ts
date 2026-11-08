@@ -128,6 +128,7 @@ function validatedAttachments(
 
 export function buildCreateWorkspaceWorkerRequest(
   form: WorkerLaunchFormState,
+  operationId: string = crypto.randomUUID(),
 ): CreateWorkspaceWorkerRequest {
   if (["builtin:reviewer", "reviewer"].includes(form.profile.trim())) {
     throw new Error("Trusted Reviewer launch requires a bound review request.");
@@ -148,7 +149,8 @@ export function buildCreateWorkspaceWorkerRequest(
     feature_connections: form.subjektiv_subject_id.trim()
       ? { subjektiv: { subject_id: form.subjektiv_subject_id.trim() } }
       : {},
-    control_operation_id: null,
+    authorization: { kind: "human", assignment: null },
+    control_operation_id: operationId,
   });
 }
 

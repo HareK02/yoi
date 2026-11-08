@@ -1,9 +1,9 @@
-//! Normal profile publication does not change creation enrollment or enable work.
+//! Normal profile publication does not override an explicitly reduced conversation policy.
 //! Reuses the ordinary connected model and signed public API harness, not SQL policy.
 use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn conversation_default_exposes_but_refuses_coder_delegation_without_owner_configuration() {
+async fn conversation_only_policy_exposes_but_refuses_coder_delegation() {
     crate::restore_test_environment::require_restore_test_environment();
     let (edited, _edits) = tokio::sync::mpsc::channel(1);
     let (evaluated, mut evaluations) = tokio::sync::mpsc::channel(1);
@@ -29,8 +29,22 @@ async fn conversation_default_exposes_but_refuses_coder_delegation_without_owner
         policy.execution,
         server_api::authorization::subject_default_permission_assignment()
     );
+    assert_eq!(
+        policy.delegation,
+        server_api::authorization::subject_default_delegation_assignment()
+    );
+    // Conversation-only is an explicit reduced policy, not the creation default.
+    // Keep the reads used below, but deny orchestration even with visible Tools.
+    super::super::super::chat_tests::adopt_subject_policy(
+        &h.api,
+        &h.owner,
+        subject,
+        r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }, { namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,
+        "{}",
+    )
+    .await;
+    let policy = subjects.current_subject_policy(subject).unwrap().unwrap();
     assert!(policy.delegation.grants.is_empty());
-    super::super::super::chat_tests::adopt_chat_defaults(&h.api, &h.owner).await;
     let body = start(&h, subject, "conversation-only-start").await;
     assert_eq!(
         body["observation"]["worker"]["profile"],

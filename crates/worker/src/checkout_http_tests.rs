@@ -396,8 +396,14 @@ fn native_runtime(remote: Arc<RemoteWorkdirSession>) -> (WipRuntime, Arc<Workdir
         .attach(WorkdirAttachmentAlias::new("main").unwrap(), remote)
         .unwrap();
     let mut registry = WipMountRegistry::new();
-    crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), None)
-        .unwrap();
+    crate::checkout::mount_checkouts(
+        &mut registry,
+        router.clone(),
+        tools::Tracker::new(),
+        true,
+        false,
+    )
+    .unwrap();
     let runtime = WipRuntime::new(
         WipHost::new(registry),
         SecurityContext::new("http-checkout-worker"),
@@ -898,9 +904,9 @@ async fn remote_native_bash_retains_streams_quota_and_replays_lost_terminal_thro
         let router = Arc::new(WorkdirSessionRouter::new());
         router.attach(WorkdirAttachmentAlias::new("main").unwrap(), remote.clone()).unwrap();
         let mut registry = WipMountRegistry::new();
-        crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), None).unwrap();
+        crate::checkout::mount_checkouts(&mut registry, router.clone(), tools::Tracker::new(), true, false).unwrap();
         let view = tools::bash_output::BashOutputView::new();
-        crate::feature::builtin::bash::mount(&mut registry, router.clone(), view, None).unwrap();
+        crate::feature::builtin::bash::mount(&mut registry, router.clone(), view, true).unwrap();
         let runtime = WipRuntime::new(WipHost::new(registry), SecurityContext::new("remote-bash"), 0).unwrap();
         *f.state.command_fault.lock().unwrap() = Some(CommandResponseFault::LostTerminal);
         let run = runtime.invoke("/bash-output".into(), contextual_reference("yoi.bash/command/v1", "/bash-output"), "run".into(), json!({"input":{"command":r"printf 'first\nneedle\n'; printf '%200000s' ''; printf '\377€' >&2; exit 7","cwd":"."}}), Default::default()).await.unwrap();

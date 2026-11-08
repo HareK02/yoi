@@ -1978,6 +1978,10 @@
       "CreateWorkspaceWorkerRequest": {
         "additionalProperties": false,
         "properties": {
+          "authorization": {
+            "$ref": "#/components/schemas/WorkerCreationAuthorization",
+            "description": "Host authenticates the policy caller or human initial issuer separately."
+          },
           "control_operation_id": {
             "default": null,
             "description": "Backend idempotency key used only for authenticated Worker-owned spawn/control.",
@@ -1988,18 +1992,6 @@
           },
           "display_name": {
             "type": "string"
-          },
-          "execution_grant": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/WorkerDelegationRequest"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "description": "Requested least-authority child permissions. Host derives the origin; this\ninput cannot assert Subject identity or create a body/singleton attachment."
           },
           "feature_connections": {
             "$ref": "#/components/schemas/WorkspaceWorkerFeatureConnectionsRequest",
@@ -2052,7 +2044,8 @@
         "required": [
           "runtime_id",
           "display_name",
-          "feature_connections"
+          "feature_connections",
+          "authorization"
         ],
         "type": "object"
       },
@@ -6652,6 +6645,25 @@
         },
         "type": "object"
       },
+      "NamespacePermissions": {
+        "additionalProperties": false,
+        "properties": {
+          "keys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "keys"
+        ],
+        "type": "object"
+      },
       "NewTicket": {
         "properties": {
           "assignee": {
@@ -7998,6 +8010,33 @@
         ],
         "type": "object"
       },
+      "PermissionAssignment": {
+        "additionalProperties": false,
+        "description": "`None` at the consuming policy boundary means unset. An empty assignment is\nexplicit deny-all; this crate never chooses or reinstates a default.",
+        "properties": {
+          "exclusions": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionReference"
+            },
+            "type": "array"
+          },
+          "grants": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionReference"
+            },
+            "type": "array"
+          },
+          "revoked": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "grants",
+          "exclusions",
+          "revoked"
+        ],
+        "type": "object"
+      },
       "PermissionOperationAvailability": {
         "oneOf": [
           {
@@ -8063,6 +8102,45 @@
           "availability"
         ],
         "type": "object"
+      },
+      "PermissionReference": {
+        "description": "The discriminant, not an identifier's spelling, selects a reference kind.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "set",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "namespace",
+                "type": "string"
+              },
+              "value": {
+                "$ref": "#/components/schemas/NamespacePermissions"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "PermissionResource": {
         "oneOf": [
@@ -22934,27 +23012,57 @@
           }
         ]
       },
-      "WorkerDelegationRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "permissions": {
-            "items": {
-              "$ref": "#/components/schemas/ScopedPermission"
+      "WorkerCreationAuthorization": {
+        "description": "Policy selection is mandatory on Worker-originated creation. Human initial\nassignment is a separate authenticated path: omission and explicit empty have\ndifferent meanings there, never on the policy path.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "policy",
+                "type": "string"
+              },
+              "policy_id": {
+                "type": "string"
+              },
+              "policy_revision": {
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 1,
+                "type": "integer"
+              }
             },
-            "type": "array"
+            "required": [
+              "kind",
+              "policy_id",
+              "policy_revision"
+            ],
+            "type": "object"
           },
-          "redelegation": {
-            "items": {
-              "$ref": "#/components/schemas/ScopedPermission"
+          {
+            "additionalProperties": false,
+            "properties": {
+              "assignment": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/PermissionAssignment"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "kind": {
+                "const": "human",
+                "type": "string"
+              }
             },
-            "type": "array"
+            "required": [
+              "kind"
+            ],
+            "type": "object"
           }
-        },
-        "required": [
-          "permissions",
-          "redelegation"
-        ],
-        "type": "object"
+        ]
       },
       "WorkerFileDeleteResponse": {
         "additionalProperties": false,
@@ -26075,7 +26183,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:1e05fe52b165fad9cf2104f715d9da9d12de5a5f6f2510f075793d983c570f48"
+    "x-yoi-source-digest": "sha256:b13d4399ea9b65d11f7869c9476745106b50e1326ad2ab7c382c3be4ab996849"
   },
   "openapi": "3.1.0",
   "paths": {
