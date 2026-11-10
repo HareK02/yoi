@@ -34,12 +34,13 @@ async fn conversation_only_policy_exposes_but_refuses_coder_delegation() {
         server_api::authorization::subject_default_delegation_assignment()
     );
     // Conversation-only is an explicit reduced policy, not the creation default.
-    // Keep the reads used below, but deny orchestration even with visible Tools.
+    // Keep only the Ticket reads used below alongside conversation, but deny
+    // orchestration even with visible Tools and no coordination set.
     super::super::super::chat_tests::adopt_subject_policy(
         &h.api,
         &h.owner,
         subject,
-        r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }, { namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,
+        r#"{ sets = ["conversation"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.read", "ticket.assignment.query"]; }]; exclude_namespaces = [{ namespace = "worker"; keys = ["worker.create"]; }, { namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,
         "{}",
     )
     .await;

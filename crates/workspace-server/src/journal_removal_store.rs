@@ -571,21 +571,69 @@ mod tests {
             INSERT INTO workspaces(workspace_id,display_name,state,created_at,updated_at,owner_account_id) VALUES('w','W','active','t','t','a');
             INSERT INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,failure_category,created_at,updated_at)
             VALUES('op','plan','fp','w','r','worker','observed','policy','digest','archive','tombstone','forever','purge','[]','failed','cleanup','execution_unconfirmed','t','t');").unwrap();
+        let receipts = |conn: &Connection| {
+            conn.prepare(
+                "SELECT version,name,applied_at FROM __yoi_schema_migrations ORDER BY version",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let old_receipts = receipts(&conn);
         let plan = SqliteWorkspaceStore::migration_plan(&path).unwrap();
         assert_eq!(plan.current_schema_version, 123);
+        assert_eq!(plan.target_schema_version, LATEST_SCHEMA_VERSION);
         assert_eq!(
             plan.migrations
                 .iter()
-                .map(|step| step.version)
+                .map(|step| (step.version, step.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![124, 125, 126, 127, 128, 129, 130]
+            MIGRATIONS
+                .iter()
+                .filter(|step| step.version > 123)
+                .map(|step| (step.version, step.name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            receipts(&conn),
+            old_receipts,
+            "preflight must retain receipt bytes"
         );
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             123,
             "preflight must not change source"
         );
-        SqliteWorkspaceStore::migrate_database(&path).unwrap();
+        assert_eq!(SqliteWorkspaceStore::migrate_database(&path).unwrap(), plan);
+        let final_receipts = receipts(&conn);
+        assert_eq!(&final_receipts[..old_receipts.len()], old_receipts);
+        assert_eq!(
+            final_receipts.len(),
+            old_receipts.len() + plan.migrations.len()
+        );
+        assert_eq!(
+            final_receipts[old_receipts.len()..]
+                .iter()
+                .map(|(version, name, _)| (*version, name.as_str()))
+                .collect::<Vec<_>>(),
+            plan.migrations
+                .iter()
+                .map(|step| (step.version, step.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            final_receipts[old_receipts.len()..]
+                .iter()
+                .all(|(_, _, at)| !at.is_empty())
+        );
         assert_eq!(
             current_schema_version(&conn).unwrap(),
             super::LATEST_SCHEMA_VERSION
@@ -622,6 +670,17 @@ mod tests {
         );
         drop(conn);
         let reopened = SqliteWorkspaceStore::open_for_test(&path).unwrap();
+        reopened
+            .with_conn(|conn| {
+                assert_eq!(
+                    receipts(conn),
+                    final_receipts,
+                    "reopen must not append or rewrite receipts"
+                );
+                assert_eq!(shape(conn)?, expected);
+                Ok(())
+            })
+            .unwrap();
         assert!(
             reopened
                 .list_pending_journal_removals("w", None, 100)

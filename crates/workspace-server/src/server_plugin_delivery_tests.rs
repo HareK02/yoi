@@ -9,7 +9,7 @@ use crate::plugin_plan::{HostExecutionIdentity, PlanPinState, PluginPlanCreateRe
 use server_api::{
     PluginArtifactDeliveryMetadata, PluginArtifactDeliveryRequest, PluginInstallRequest,
     PluginOperationResponse, PluginRevokeRequest,
-    authorization::{PermissionResource, ScopedPermission, SubjectPermissionsUpdate},
+    authorization::{PermissionResource, ScopedPermission},
 };
 use std::sync::Mutex;
 use tokio::io::AsyncReadExt;
@@ -90,7 +90,7 @@ async fn delivery_worker_profile(
     subject: Option<&str>,
     profile: &str,
 ) -> RuntimeWorkerRef {
-    let Json(worker) = create_workspace_worker(
+    let Json(worker) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(delivery_create_request(subject, profile)),
@@ -115,7 +115,20 @@ fn delivery_create_request(subject: Option<&str>, profile: &str) -> CreateWorksp
             }),
         },
         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-        authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+        authorization: if subject.is_some() {
+            server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None }
+        } else {
+            test_worker_operation_authorization(&[(
+                "plugin",
+                &[
+                    "plugin.admit",
+                    "plugin.artifact.read",
+                    "plugin.publish",
+                    "plugin.connection.open",
+                    "plugin.http.send",
+                ],
+            )])
+        },
     }
 }
 
@@ -145,29 +158,44 @@ fn configure_delivery_plan(
         }}]}
     });
     let path = VirtualPath::parse("main.dcdl").unwrap();
-    let candidate = api
+    let owner = test_owner_actor();
+    let current = api
         .config_store
-        .evaluate_workspace_config_candidate_with_schema(
-            TEST_WORKSPACE_ID,
-            &ConfigCommitRequest {
-                base_digest: state.snapshot.digest.clone(),
-                entrypoints: vec![path.clone()],
-                changes: vec![ConfigTreeChange::Update {
-                    path: path.clone(),
-                    expected_digest: state.snapshot.get(&path).unwrap().content_digest.clone(),
-                    content: format!(
-                        "{} as WorkspaceConfigSchema",
-                        crate::plugin_settings::render_value(&value).unwrap()
-                    ),
-                }],
-            },
-            bundle,
-        )
+        .configuration_current(TEST_WORKSPACE_ID, &owner.account_id)
         .unwrap();
+    let registry = api.permission_registry.read().unwrap();
     let committed = api
         .config_store
-        .commit_evaluated_workspace_config(TEST_WORKSPACE_ID, &candidate)
-        .unwrap();
+        .adopt_configuration(
+            TEST_WORKSPACE_ID,
+            &owner.account_id,
+            &crate::config_adoption::ConfigurationAdoptionRequest {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_head: current.history_head,
+                expected_catalog_digest: crate::config_adoption::catalog_digest(registry.host())
+                    .unwrap(),
+                expected_legacy_export: None,
+                source: ConfigCommitRequest {
+                    base_digest: state.snapshot.digest.clone(),
+                    entrypoints: vec![path.clone()],
+                    changes: vec![ConfigTreeChange::Update {
+                        path: path.clone(),
+                        expected_digest: state.snapshot.get(&path).unwrap().content_digest.clone(),
+                        content: format!(
+                            "{} as WorkspaceConfigSchema",
+                            crate::plugin_settings::render_value(&value).unwrap()
+                        ),
+                    }],
+                },
+            },
+            bundle,
+            registry.host(),
+            None,
+            |_| panic!("delivery-only config has no Subject policy references"),
+            |_| panic!("ordinary config adoption must not transfer legacy authority"),
+        )
+        .unwrap()
+        .state;
     let plan = api
         .config_store
         .with_conn(|conn| {
@@ -394,27 +422,18 @@ impl DeliveryFixture {
             },
         }
     }
-    fn policy(&self, execution: Vec<ScopedPermission>, delegation: Vec<ScopedPermission>) {
+    async fn policy(&self, execution: Vec<ScopedPermission>, delegation: Vec<ScopedPermission>) {
         let subject = self.subject.as_ref().unwrap();
-        let store = open_subjektiv_store(&self.api).unwrap();
-        let previous = store
-            .subject_policy_source(subject)
-            .unwrap()
-            .map(|policy| match policy {
-                server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
-                server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
-            });
-        store
-            .set_subject_permissions(
-                subject,
-                &SubjectPermissionsUpdate {
-                    operation_id: uuid::Uuid::now_v7().to_string(),
-                    expected_change_id: previous,
-                    execution,
-                    delegation,
-                },
-            )
-            .unwrap();
+        let selected =
+            seed_test_subject_legacy_constraints(&self.api, subject, execution, delegation);
+        let saved = replace_test_subject_policy_as_owner(
+            &self.api,
+            subject,
+            selected.execution,
+            selected.delegation,
+        )
+        .await;
+        assert_eq!(saved.legacy_constraints, selected.legacy_constraints);
     }
     fn assert_pending_pin(&self) {
         let stored = self
@@ -1008,14 +1027,42 @@ async fn revoked_server_runtime_binding_denies_both_adapters_even_on_cache_hit()
 async fn subject_delegation_replacement_denies_child_warm_cache_and_preserves_saved_plan() {
     let f = DeliveryFixture::new(true).await;
     let permission = f.artifact_permission();
-    f.policy(vec![], vec![permission.clone()]);
+    let child_permissions = server_api::authorization::CurrentSubjectPolicy::from_legacy(
+        server_api::authorization::SubjectPermissions {
+            change_id: "artifact-child-selection".into(),
+            execution: vec![permission.clone()],
+            delegation: vec![],
+        },
+    )
+    .unwrap()
+    .execution;
+    let (_, authorization) = test_worker_policy_authorizations(
+        &f.api,
+        "artifact-child",
+        "builtin:coder",
+        child_permissions,
+    );
+    let usage = server_api::launch_policy::launch_policy_usage_key("artifact-child").unwrap();
+    f.policy(
+        ["worker.create", usage.as_str()]
+            .into_iter()
+            .map(|operation| ScopedPermission {
+                operation: operation.into(),
+                resource: PermissionResource::Workspace {
+                    workspace_id: TEST_WORKSPACE_ID.into(),
+                },
+            })
+            .collect(),
+        vec![permission.clone()],
+    )
+    .await;
     // Use the signed, replay-safe Worker control route to issue the child grant.
     let path = format!("/api/w/{TEST_WORKSPACE_ID}/worker-control/workers");
     let body = serde_json::to_vec(&json!({
         "runtime_id": f.worker.runtime_id, "display_name":"Artifact delegated consumer",
         "profile":"builtin:coder", "initial_submit":[], "workdir_attachments":[], "feature_connections":{},
         "control_operation_id":"delivery-delegated-child",
-        "execution_grant":{"permissions":[permission], "redelegation":[]}
+        "authorization": authorization
     })).unwrap();
     let proof = f.proof(TEST_WORKSPACE_ID, &f.worker.worker_id, "POST", &path, &body);
     let response = f.post(&path, body, Some(&proof)).await;
@@ -1029,9 +1076,20 @@ async fn subject_delegation_replacement_denies_child_warm_cache_and_preserves_sa
     let execution = f.api.plugin_execution_identity(&child).await.unwrap();
     assert_eq!(
         execution.principal_id,
-        format!("subject:{}", f.subject.as_ref().unwrap())
+        format!("worker:{}/{}", child.runtime_id, child.worker_id)
     );
-    assert!(execution.delegation_id.is_some());
+    assert!(execution.delegation_id.is_none());
+    let grant = f
+        .api
+        .config_store
+        .core_worker_execution_grant(TEST_WORKSPACE_ID, &child.runtime_id, &child.worker_id)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(grant.source,
+        server_api::authorization::CoreWorkerGrantSource::LaunchPolicy {
+            parent: server_api::authorization::CoreWorkerGrantParent::SubjectBody { ref subject_id, .. }, ..
+        } if Some(subject_id) == f.subject.as_ref()
+    ));
     let saved = configure_delivery_plan(&f.api, &f.installed, execution, "delegated-launch");
     let request = PluginArtifactDeliveryRequest {
         plan_id: saved.plan_id.clone(),
@@ -1061,7 +1119,7 @@ async fn subject_delegation_replacement_denies_child_warm_cache_and_preserves_sa
         );
     }
     // Replacement fences the saved source_change_id, even with the same resource.
-    f.policy(vec![], vec![]);
+    f.policy(vec![], vec![]).await;
     assert!(f.api.plugin_execution_identity(&child).await.is_err());
     for source in [&remote as &dyn ArtifactSource, &local] {
         assert!(matches!(
@@ -1137,14 +1195,14 @@ async fn subject_exact_artifact_permission_is_live_and_does_not_grant_https() {
         installation_id: "other-installation".into(),
     };
     for wrong in [wrong_operation, wrong_resource, wrong_installation] {
-        f.policy(vec![wrong], vec![]);
+        f.policy(vec![wrong], vec![]).await;
         assert!(matches!(
             f.remote.authorize(&f.request).await,
             Err(DeliveryError::Denied)
         ));
         assert!(local.fetch(&f.request).await.is_err());
     }
-    f.policy(vec![permission], vec![]);
+    f.policy(vec![permission], vec![]).await;
     for source in [&f.remote as &dyn ArtifactSource, &local] {
         assert_eq!(
             cache
@@ -1163,7 +1221,7 @@ async fn subject_exact_artifact_permission_is_live_and_does_not_grant_https() {
     let proof = f.proof(TEST_WORKSPACE_ID, &f.worker.worker_id, "POST", &path, &body);
     let response = f.post(&path, body, Some(&proof)).await;
     assert_eq!(response.status().as_u16(), 403);
-    f.policy(vec![], vec![]);
+    f.policy(vec![], vec![]).await;
     for source in [&f.remote as &dyn ArtifactSource, &local] {
         assert!(matches!(
             cache

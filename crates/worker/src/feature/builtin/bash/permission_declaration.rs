@@ -8,6 +8,6 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
     operations: &[BuiltinPermissionOperation {
         key: "bash.execute",
         description: "Requires the whole Workdir: path '.' and recursive true. A shell is not confined to a subdirectory. Explicit provider command authority is also required.",
-        sets: &["implementer"],
+        sets: &["implementer", "work-execution"],
     }],
 };

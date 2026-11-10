@@ -9,12 +9,22 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         BuiltinPermissionOperation {
             key: "repository.list",
             description: "List repository metadata, not checkout or credential access.",
-            sets: &["implementer", "companion"],
+            sets: &[
+                "implementer",
+                "companion",
+                "work-coordination",
+                "work-execution",
+            ],
         },
         BuiltinPermissionOperation {
             key: "repository.read",
             description: "Read selected repository metadata without exposing secrets.",
-            sets: &["implementer", "companion"],
+            sets: &[
+                "implementer",
+                "companion",
+                "work-coordination",
+                "work-execution",
+            ],
         },
     ],
 };

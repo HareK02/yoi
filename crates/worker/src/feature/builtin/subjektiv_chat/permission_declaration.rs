@@ -9,12 +9,12 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         BuiltinPermissionOperation {
             key: "chat.read",
             description: "Read conversations belonging to the current Subject body; membership and current ownership remain required.",
-            sets: &["implementer", "companion", "subject-default"],
+            sets: &["implementer", "companion", "conversation"],
         },
         BuiltinPermissionOperation {
             key: "chat.send",
             description: "Explicitly publish to a permitted conversation as the current Subject body. Background Worker messaging does not grant publication.",
-            sets: &["implementer", "companion", "subject-default"],
+            sets: &["implementer", "companion", "conversation"],
         },
     ],
 };

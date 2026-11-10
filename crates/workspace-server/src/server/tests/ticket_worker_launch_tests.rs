@@ -244,6 +244,7 @@ impl WorkerExecutionBackend for LaunchExecutionBackend {
 pub(super) struct LaunchFixture {
     _temp: tempfile::TempDir,
     pub(super) api: WorkspaceApi,
+    owner_token: String,
     backend: Arc<LaunchExecutionBackend>,
     runtime_id: String,
     runtime_server: Option<tokio::task::JoinHandle<()>>,
@@ -341,9 +342,12 @@ impl LaunchFixture {
             WorkspaceApi::new_with_execution_backend(config, Arc::new(store), backend.clone())
                 .await
                 .unwrap();
+        let owner_token =
+            seed_test_workspace_owner_token(api.store.as_ref(), "ticket-launch-owner").await;
         let mut fixture = Self {
             _temp: temp,
             api,
+            owner_token,
             backend,
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             runtime_server: None,
@@ -520,15 +524,18 @@ impl LaunchFixture {
             "runtime_id": self.runtime_id, "display_name": "Explicit Ticket Worker", "profile": profile,
             "ticket_assignment": {"ticket_id": ticket_id, "operation_id": operation_id},
             "initial_submit": segments, "workdir_attachments": [], "feature_connections": {},
+            "authorization": { "kind": "human", "assignment": null },
+            "control_operation_id": format!("launch-{operation_id}"),
         })
     }
 
     async fn post(&self, workspace_id: &str, payload: Value) -> (StatusCode, Value) {
-        let response = build_inner_router(self.api.clone())
+        let response = build_router(self.api.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/w/{workspace_id}/workers"))
+                    .header("authorization", format!("Bearer {}", self.owner_token))
                     .header("content-type", "application/json")
                     .body(Body::from(payload.to_string()))
                     .unwrap(),
@@ -725,20 +732,7 @@ async fn worker_launch_uses_published_project_profile_and_workspace_default_on_r
             .into(),
         }],
     };
-    let candidate = fixture
-        .api
-        .config_store
-        .evaluate_workspace_config_candidate_with_schema(
-            TEST_WORKSPACE_ID,
-            &request,
-            fixture.api.config_schema_registry.compose().unwrap(),
-        )
-        .unwrap();
-    fixture
-        .api
-        .config_store
-        .commit_evaluated_workspace_config(TEST_WORKSPACE_ID, &candidate)
-        .unwrap();
+    adopt_test_config_as_owner(&fixture.api, &request).unwrap();
     for explicit in [true, false] {
         let ticket_id = fixture.ticket();
         let operation_id = format!("project-profile-{explicit}");
@@ -1487,10 +1481,12 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
         "workdir_attachments": [
             {"alias":"checkout", "working_directory_id":fixture.main_workdir_id},
             {"alias":"docs", "working_directory_id":fixture.docs_workdir_id}
-        ], "feature_connections": {}
+        ], "feature_connections": {},
+        "authorization": { "kind": "human", "assignment": null },
+        "control_operation_id": "uncertain-ticket-worker-launch"
     });
     let launch = |body: Value| {
-        create_workspace_worker(
+        create_workspace_worker_as_owner(
             State(fixture.api.clone()),
             HeaderMap::new(),
             Json(serde_json::from_value(body).unwrap()),
@@ -1554,6 +1550,7 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
     assert!(retained.failure_reason.is_none());
     let mut competing = payload;
     competing["ticket_assignment"]["operation_id"] = json!("competing-spawn");
+    competing["control_operation_id"] = json!("competing-ticket-worker-launch");
     let conflict = launch(competing).await.unwrap_err();
     assert!(
         conflict.error.to_string().contains("pending"),
@@ -1770,7 +1767,7 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
         checkout.root(),
         &["checkout", "-B", "work/open-observation"],
     );
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -1787,9 +1784,13 @@ async fn mr_open_retains_source_before_first_review_and_observed_result() {
             }],
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                assignment: None,
-            },
+            authorization: test_worker_operation_authorization(&[
+                ("ticket", &["ticket.implementation_result.write"]),
+                (
+                    "merge_request",
+                    &["merge_request.open", "merge_request.read"],
+                ),
+            ]),
         }),
     )
     .await

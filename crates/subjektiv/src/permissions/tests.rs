@@ -800,13 +800,8 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
     let fresh = store.create_subject(role()).unwrap().id;
     let fresh_source = store.current_subject_policy(&fresh).unwrap().unwrap();
     assert_eq!(
-        fresh_source.execution.grants,
-        vec![feature_permissions::PermissionReference::Set(
-            feature_permissions::PermissionSetId::parse(
-                server_api::authorization::SUBJECT_DEFAULT_PERMISSION_SET
-            )
-            .unwrap()
-        )]
+        fresh_source.execution,
+        server_api::authorization::subject_default_permission_assignment()
     );
     assert_eq!(
         fresh_source.delegation,
@@ -824,6 +819,160 @@ fn deletion_fences_source_and_child_grant_replays_and_never_falls_back_after_pur
             .claim_journal_writer(&fresh, "runtime", "body")
             .is_err()
     );
+}
+
+fn set_reference(set: &str) -> feature_permissions::PermissionReference {
+    feature_permissions::PermissionReference::Set(
+        feature_permissions::PermissionSetId::parse(set).unwrap(),
+    )
+}
+
+fn namespace_reference(namespace: &str, keys: &[&str]) -> feature_permissions::PermissionReference {
+    feature_permissions::PermissionReference::Namespace(feature_permissions::NamespacePermissions {
+        namespace: feature_permissions::NamespaceId::parse(namespace).unwrap(),
+        keys: keys
+            .iter()
+            .map(|key| feature_permissions::PermissionKey::parse(*key).unwrap())
+            .collect(),
+    })
+}
+
+#[test]
+fn native_legacy_references_normalize_current_reads_but_keep_raw_export_and_seal_evidence() {
+    use feature_permissions::PermissionAssignment;
+    use server_api::authorization::{
+        CONVERSATION_PERMISSION_SET, PermissionReferenceEncoding, WORK_COORDINATION_PERMISSION_SET,
+        WORK_EXECUTION_PERMISSION_SET,
+    };
+    for restriction in [
+        "none",
+        "empty-delegation",
+        "empty-execution",
+        "excluded",
+        "revoked",
+        "individual",
+        "limited",
+        "current-encoding",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (subject, raw, expected, snapshot) = {
+            let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+            let subject = store.create_subject(role()).unwrap().id;
+            let mut raw = store.current_subject_policy(&subject).unwrap().unwrap();
+            raw.change_id = issued_id("permissions");
+            raw.reference_encoding = PermissionReferenceEncoding::LegacySubjectV1;
+            raw.execution.grants = vec![set_reference("subject-default")];
+            raw.delegation.grants = vec![namespace_reference("subject", &["subject.delegate"])];
+            let mut expected = raw.clone();
+            expected.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
+            expected.execution.grants = vec![
+                set_reference(CONVERSATION_PERMISSION_SET),
+                set_reference(WORK_COORDINATION_PERMISSION_SET),
+            ];
+            expected.delegation.grants = vec![set_reference(WORK_EXECUTION_PERMISSION_SET)];
+            match restriction {
+                "none" => {}
+                "empty-delegation" => {
+                    raw.delegation = PermissionAssignment::default();
+                    expected.delegation = PermissionAssignment::default();
+                }
+                "empty-execution" => {
+                    raw.execution = PermissionAssignment::default();
+                    expected.execution = PermissionAssignment::default();
+                }
+                "excluded" => {
+                    raw.execution.exclusions =
+                        vec![namespace_reference("subject", &["subject.orchestrate"])];
+                    expected.execution.exclusions =
+                        vec![set_reference(WORK_COORDINATION_PERMISSION_SET)];
+                    raw.delegation.exclusions = raw.delegation.grants.clone();
+                    expected.delegation.exclusions = expected.delegation.grants.clone();
+                }
+                "revoked" => {
+                    raw.execution.revoked = true;
+                    raw.delegation.revoked = true;
+                    expected.execution.revoked = true;
+                    expected.delegation.revoked = true;
+                }
+                "individual" => {
+                    raw.execution.grants = vec![namespace_reference("ticket", &["ticket.read"])];
+                    raw.delegation.grants = raw.execution.grants.clone();
+                    expected.execution = raw.execution.clone();
+                    expected.delegation = raw.delegation.clone();
+                }
+                "current-encoding" => {
+                    // Current input is not a storage migration request, even with old spellings.
+                    raw.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
+                    expected = raw.clone();
+                }
+                "limited" => {
+                    let constraints = SubjectPermissions {
+                        change_id: raw.change_id.clone(),
+                        execution: vec![permission("file.read", "src", false)],
+                        delegation: vec![permission("file.read", "src", false)],
+                    };
+                    raw.legacy_constraints = Some(constraints.clone());
+                    expected.legacy_constraints = Some(constraints);
+                }
+                _ => unreachable!(),
+            }
+            store.database.try_transaction::<_, SubjektivError>(|tx| {
+                tx.execute(
+                    "INSERT INTO subject_permission_changes(subject_id,change_id,record_json) VALUES(?1,?2,?3)",
+                    params![subject, raw.change_id, serde_json::to_string(&raw)?],
+                )?;
+                tx.execute(
+                    "UPDATE subject_permissions SET change_id=?2 WHERE subject_id=?1",
+                    params![subject, raw.change_id],
+                )?;
+                Ok(())
+            }).unwrap();
+            let identity = store.database_identity().unwrap();
+            let snapshot = store.preview_permission_transfer(&identity).unwrap();
+            assert_eq!(snapshot.sources[0].feature_policy, Some(raw.clone()));
+            assert_eq!(
+                store.current_subject_policy(&subject).unwrap(),
+                Some(expected.clone()),
+                "{restriction}"
+            );
+            assert_eq!(
+                store.subject_policy_source(&subject).unwrap(),
+                Some(SubjectPolicySource::Feature(expected.clone()))
+            );
+            assert_eq!(
+                store.preview_permission_transfer(&identity).unwrap(),
+                snapshot
+            );
+            (subject, raw, expected, snapshot)
+        };
+        let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+        assert_eq!(
+            store.current_subject_policy(&subject).unwrap(),
+            Some(expected),
+            "{restriction}"
+        );
+        assert_eq!(
+            store
+                .preview_permission_transfer(&snapshot.identity)
+                .unwrap(),
+            snapshot
+        );
+        let receipt = store
+            .seal_permission_sources(
+                &snapshot.identity,
+                "legacy-semantic-set-transfer",
+                &snapshot.export_digest,
+            )
+            .unwrap();
+        assert_eq!(receipt.snapshot, snapshot);
+        assert_eq!(receipt.snapshot.sources[0].feature_policy, Some(raw));
+        assert_eq!(
+            store
+                .preview_permission_transfer(&snapshot.identity)
+                .unwrap(),
+            snapshot
+        );
+    }
 }
 
 #[test]

@@ -21,33 +21,34 @@ fn change_receipt_authority(f: &mut Fixture, change: ReceiptChange, boundary: &s
         ReceiptChange::Unchanged => {}
         ReceiptChange::Policy | ReceiptChange::Parent => {
             let store = open_subjektiv_store(&f.api).unwrap();
-            let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
-            let forbidden = if boundary == "begin" {
+            let previous = store.current_subject_policy(&f.subject).unwrap().unwrap();
+            let forbidden = feature_permissions::PermissionKey::parse(if boundary == "begin" {
                 "plugin.admit"
             } else {
                 "plugin.http.send"
-            };
-            let execution = if matches!(change, ReceiptChange::Policy) {
-                assert!(previous.execution.iter().any(|p| p.operation == forbidden));
-                previous
-                    .execution
-                    .into_iter()
-                    .filter(|p| p.operation != forbidden)
-                    .collect()
-            } else {
-                previous.execution
-            };
-            store
-                .set_subject_permissions(
-                    &f.subject,
-                    &SubjectPermissionsUpdate {
-                        operation_id: "change-queued-receipt-authority".into(),
-                        expected_change_id: Some(previous.change_id),
-                        execution,
-                        delegation: previous.delegation,
-                    },
-                )
-                .unwrap();
+            })
+            .unwrap();
+            let mut execution = previous.execution;
+            if matches!(change, ReceiptChange::Policy) {
+                assert!(execution.grants.iter().any(|reference| matches!(
+                    reference,
+                    feature_permissions::PermissionReference::Namespace(namespace)
+                        if namespace.keys.contains(&forbidden)
+                )));
+                for reference in &mut execution.grants {
+                    if let feature_permissions::PermissionReference::Namespace(namespace) =
+                        reference
+                    {
+                        namespace.keys.retain(|key| key != &forbidden);
+                    }
+                }
+            }
+            replace_config_plugin_subject_policy_as_owner(
+                &f.api,
+                &f.subject,
+                execution,
+                previous.delegation,
+            );
         }
         ReceiptChange::Feature => {
             f.api

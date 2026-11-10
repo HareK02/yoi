@@ -1,6 +1,8 @@
 // Generated from server-api. Do not edit by hand.
 // Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts
 
+import type { PermissionAssignment, PermissionCatalog, PermissionResolution } from "./feature-permissions.generated.ts";
+
 export const MEMORY_API_LIMITS = {
   maxResponseBytes: 8388608,
   maxDocumentBytes: 4194304,
@@ -66,6 +68,22 @@ interruptions: Array<SubjectPermissionInterruption>, };
 
 export type SubjectPermissionInterruption = { runtime_id: string, worker_id: string, cancellation_accepted: boolean, backend_command_sessions_closed: boolean, diagnostics: Array<string>, };
 
+export type PermissionReferenceEncoding = "legacy_subject_v1" | "feature_sets_v2";
+
+export type CurrentSubjectPolicy = { change_id: string, execution: PermissionAssignment, delegation: PermissionAssignment, legacy_constraints: SubjectPermissions | null, reference_encoding?: PermissionReferenceEncoding, };
+
+export type SubjectPermissionPolicyMutation = { operation_id: string,
+/**
+ * Compare with the observed response state identity, including removal tombstones.
+ */
+expected_change_id: string | null, action: SubjectPermissionPolicyAction, };
+
+export type SubjectPermissionPolicyAction = { "kind": "replace", execution: PermissionAssignment, delegation: PermissionAssignment, } | { "kind": "remove" };
+
+export type SubjectPermissionPolicyResponse = { change_id: string | null, policy: CurrentSubjectPolicy | null, can_manage: boolean, catalog: PermissionCatalog, execution_resolution: PermissionResolution, delegation_resolution: PermissionResolution, };
+
+export type SubjectPermissionPolicyMutationResponse = { change_id: string | null, policy: CurrentSubjectPolicy | null, };
+
 export type SubjektivSubjectState = "active" | "retired";
 
 export type SubjektivSubjectCreateRequest = { operation_id: string, role: string, behavior_md?: string, };
@@ -76,7 +94,7 @@ export type SubjektivSubjectDeleteResponse = { subject_id: string, operation_id:
 
 export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_md: string, behavior_md: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_body?: import("./subject-body-api").SubjectBodyRef | null, current_worker_diagnostics?: Array<Diagnostic>, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_body?: import("./subject-body-api.ts").SubjectBodyRef | null, current_worker_diagnostics?: Array<Diagnostic>, current_worker?: | import("./worker-launch-api.ts").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 

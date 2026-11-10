@@ -183,7 +183,7 @@ impl SqliteWorkspaceStore {
         schema_bundle: WorkspaceConfigSchemaBundle,
     ) -> Result<WorkspaceConfigState> {
         let desired_schema = schema_bundle.clone();
-        let (state, requires_toolchain_refresh, base_identity, canonical) =
+        let (state, requires_toolchain_refresh, base_identity, frozen) =
             self.with_conn_mut(|conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let workspace_exists: bool = tx.query_row(
@@ -224,13 +224,14 @@ impl SqliteWorkspaceStore {
                     }
                 };
                 let base_identity = load_evaluation_identity(&tx, workspace_id)?;
-                let canonical = crate::config_adoption::canonical(&tx, workspace_id)?;
+                let frozen = crate::config_adoption::canonical(&tx, workspace_id)?
+                    || crate::config_adoption::automatic::pending(&tx, workspace_id)?;
                 tx.commit()?;
-                Ok((state, requires_toolchain_refresh, base_identity, canonical))
+                Ok((state, requires_toolchain_refresh, base_identity, frozen))
             })?;
-        // Once adopted, schema changes must be previewed/adopted by the owner,
-        // not persisted as a second startup writer outside the policy/history tx.
-        if canonical {
+        // Neither an adopted authority nor a frozen cross-store migration plan
+        // permits a second startup writer outside its policy/history transaction.
+        if frozen {
             return Ok(state);
         }
         let desired_schema = crate::plugin_settings::materialization_schema(

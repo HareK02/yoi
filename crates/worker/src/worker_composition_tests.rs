@@ -191,15 +191,16 @@ async fn ordinary_subject_profile_exposes_coordination_without_execution_or_poli
     assert!(prompt.contains("TicketAssignmentTrackingUpdate"));
     assert!(prompt.contains("## Ticket workflow"));
     for required in [
-        "`subject-default` execution reference",
-        "`subject.delegate` delegation-ceiling reference",
+        server_api::authorization::CONVERSATION_PERMISSION_SET,
+        server_api::authorization::WORK_COORDINATION_PERMISSION_SET,
+        server_api::authorization::WORK_EXECUTION_PERMISSION_SET,
         "Profile activation does not enroll or expand them",
         "Preserve configured references and exclusions, explicit-empty policies",
         "revoked grants",
         "bounded, explicitly scoped `execution_grant`",
         "Reviewer redelegation authority within that actual grant",
         "Runtime/domain checks independent",
-        "prefer `SpawnTicketWorker` for Ticket-bound work",
+        "For bounded Ticket implementation use `SpawnTicketWorker`",
         "General `WorkerSpawn` remains available for non-Ticket work",
         "Assignment tools do not authorize self-assignment or automatic Worker starts",
         "Preserve explicit user approval and closing conditions",

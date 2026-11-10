@@ -236,7 +236,7 @@ impl SignedChat {
             }
         };
         policy
-            .adopt_policy(r#"{ sets = ["subject-default"]; }"#, "{}")
+            .adopt_policy(r#"{ sets = ["conversation", "work-coordination"]; }"#, "{}")
             .await;
         assert_eq!(
             policy.source.runtime_id == EMBEDDED_WORKER_RUNTIME_ID,

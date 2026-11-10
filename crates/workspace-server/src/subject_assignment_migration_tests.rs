@@ -987,8 +987,9 @@ mod subject_assignment_migration_tests {
         }
 
         // Save the exact source columns, including rowids and original JSON bytes.
-        // Only the owning diagnostic enrichment and two append-only ledgers are
-        // excluded from the success oracle; failures compare ALL data and schema.
+        // Only the owning diagnostic enrichment, append-only ledgers and empty
+        // tables intentionally retired by later migrations are excluded from the
+        // success oracle; failures compare ALL data and schema.
         fn data(conn: &Connection, preserved: bool) -> Vec<(String, Rows)> {
             let tables = conn
                 .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
@@ -1004,6 +1005,11 @@ mod subject_assignment_migration_tests {
                     if preserved && table == "typed_ticket_orchestration_plans" {
                         assert_eq!(conn.query_row("SELECT count(*) FROM typed_ticket_orchestration_plans", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
                         return false; // Ticket17 retires this empty fixture table.
+                    }
+                    if preserved && backend_job_current::OBSOLETE_TABLES.contains(&table.as_str()) {
+                        assert_eq!(conn.query_row(&format!("SELECT count(*) FROM \"{table}\""), [], |r| r.get::<_, i64>(0)).unwrap(), 0,
+                            "only empty obsolete Job tables may leave the preservation oracle: {table}");
+                        return false; // Schema130 explicitly retires these tables.
                     }
                     true
                 })
@@ -1090,6 +1096,12 @@ mod subject_assignment_migration_tests {
                 expected
             );
             assert_eq!(history.len(), host.len() + expected.len());
+            for table in backend_job_current::OBSOLETE_TABLES {
+                assert!(
+                    !table_exists(conn, table).unwrap(),
+                    "obsolete Job table remains: {table}"
+                );
+            }
             let history = component_history(conn);
             assert_eq!(&history[..component.len()], component, "owner receipt prefix is preserved");
             assert_eq!(history.len(), component.len() + 4);

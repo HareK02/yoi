@@ -152,6 +152,8 @@ fn fixture(path: &Path, tail: Tail, current: i64, origin: Origin) {
     seed_rows(&conn);
 }
 
+// This is a current-contract Job with erased input, so schema130 must preserve
+// its result/failure bytes rather than intentionally retiring an old descriptor.
 fn seed_rows(conn: &Connection) {
     conn.execute_batch(r#"
 INSERT INTO accounts(account_id,kind,handle,display_name,created_at,updated_at)
@@ -161,7 +163,7 @@ INSERT INTO workspaces(workspace_id,owner_account_id,display_name,state,created_
 INSERT INTO worker_create_reservations(workspace_id,allocation_key,worker_id,runtime_id,create_fingerprint,state,created_at,updated_at)
     VALUES('combined-workspace','saved-allocation','01900000-0000-7000-8000-000000000001','saved-runtime','saved-fingerprint','reserved','created','updated');
 INSERT INTO backend_jobs(workspace_id,job_id,purpose,input_digest,input_ref,request_json,intent_fingerprint,state,current_attempt,result_json,result_digest,failure_category,failure_detail,created_at,updated_at,completed_at,input_disposition)
-    VALUES('combined-workspace','saved-job','journal','digest','saved://input','{ "input": null }','fingerprint','completed',1,'{ "saved": true }','result-digest','old-job-cause','old job detail','created','updated','completed','erased');
+    VALUES('combined-workspace','saved-job','journal','digest','saved://input','{ "job_id": "saved-job", "purpose": "journal", "input_ref": "saved://input", "input": null, "instruction": "saved instruction", "profile": "builtin:backend-job", "limits": { "max_concurrent_jobs": 1, "timeout_seconds": 60, "max_result_bytes": 4096, "max_attempts": 3 } }','fingerprint','completed',1,'{ "saved": true }','result-digest','old-job-cause','old job detail','created','updated','completed','erased');
 INSERT INTO backend_job_attempts(workspace_id,job_id,attempt_id,attempt,input_digest,state,deadline_at,result_json,result_digest,failure_category,failure_detail,created_at,updated_at,completed_at)
     VALUES('combined-workspace','saved-job','saved-attempt',1,'digest','completed','deadline','{ "saved_attempt": true }','attempt-result-digest','old-attempt-cause','old attempt detail','created','updated','completed');
 INSERT INTO plugin_installations VALUES('combined-workspace','installation','alias','package','installed',0);
@@ -254,6 +256,55 @@ fn assert_old_receipts(conn: &Connection, saved: &[Vec<Value>]) {
         saved,
         "existing receipts, including applied_at, must not change"
     );
+}
+
+fn assert_appended_receipts(
+    conn: &Connection,
+    saved: &[Vec<Value>],
+    plan: &WorkspaceSchemaMigrationPlan,
+) {
+    assert_old_receipts(conn, saved);
+    let actual = receipts(conn);
+    assert_eq!(actual.len(), saved.len() + plan.migrations.len());
+    assert_eq!(
+        actual[saved.len()..]
+            .iter()
+            .map(|row| (row[0].clone(), row[1].clone()))
+            .collect::<Vec<_>>(),
+        plan.migrations
+            .iter()
+            .map(|step| (Value::Integer(step.version), Value::Text(step.name.clone())))
+            .collect::<Vec<_>>(),
+        "apply must append exactly the planned identities"
+    );
+    assert!(
+        actual[saved.len()..]
+            .iter()
+            .all(|row| matches!(&row[2], Value::Text(at) if !at.is_empty()))
+    );
+}
+
+// Schema130 intentionally drops these obsolete tables. Only empty tables can
+// leave this suite's exact preservation oracle; populated retirement is covered
+// by backend_job_current's boundary tests.
+fn exclude_empty_obsolete_job_tables(conn: &Connection, columns: &mut Columns) {
+    for table in backend_job_current::OBSOLETE_TABLES {
+        if columns.remove(*table).is_some() {
+            assert!(
+                rows(conn, &format!("SELECT * FROM {table}")).is_empty(),
+                "{table}"
+            );
+        }
+    }
+}
+
+fn assert_obsolete_job_tables_removed(conn: &Connection) {
+    for table in backend_job_current::OBSOLETE_TABLES {
+        assert!(
+            !table_exists(conn, table).unwrap(),
+            "obsolete Job table remains: {table}"
+        );
+    }
 }
 
 // SQLite retains source indentation and may quote identifiers after ALTER.
@@ -367,6 +418,12 @@ fn assert_plan(plan: &WorkspaceSchemaMigrationPlan, tail: Tail, current: i64) {
                 backend_job_current::MIGRATION_NAME,
                 ""
             )))
+            .chain(
+                MIGRATIONS
+                    .iter()
+                    .filter(|step| step.version > 130)
+                    .map(|step| (step.version, step.name, "")),
+            )
             .filter(|(version, _, _)| *version > current)
             .map(|(version, name, _)| (version, name))
             .collect::<Vec<_>>()
@@ -412,6 +469,7 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
                 assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
                 old_columns.remove("typed_ticket_orchestration_plans");
                 old_columns.remove("ticket_schema_migrations");
+                exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
                 let retained = values(&conn, &old_columns);
                 drop(conn);
 
@@ -425,7 +483,8 @@ fn combined_failure_fresh_and_ordered_published_histories_plan_apply_and_reopen(
                                 current_schema_version(conn).unwrap(),
                                 LATEST_SCHEMA_VERSION
                             );
-                            assert_old_receipts(conn, &old_receipts);
+                            assert_appended_receipts(conn, &old_receipts, &plan);
+                            assert_obsolete_job_tables_removed(conn);
                             assert_eq!(
                                 values(conn, &old_columns),
                                 retained,
@@ -515,15 +574,16 @@ fn combined_failure_receipt_126_abort_rolls_back_ddl_and_data_then_retries_once(
             assert_eq!(values(&conn, &columns), before);
             conn.execute_batch("DROP TRIGGER interrupt_combined_126")
                 .unwrap();
+            let plan = workspace_schema_migration_plan(&conn).unwrap();
+            assert_plan(&plan, tail, 125);
             apply_migrations(&conn).unwrap();
             assert_eq!(
                 current_schema_version(&conn).unwrap(),
                 LATEST_SCHEMA_VERSION
             );
             assert!(column_exists(&conn, missing.0, missing.1).unwrap());
-            assert_old_receipts(&conn, &saved_receipts);
+            assert_appended_receipts(&conn, &saved_receipts, &plan);
             let after = receipts(&conn);
-            assert_eq!(after.len(), saved_receipts.len() + 4);
             assert_eq!(
                 after[saved_receipts.len()][1],
                 Value::Text(tail.steps()[2].1.into())
@@ -720,12 +780,15 @@ fn assert_journal_bridge_plan(plan: &WorkspaceSchemaMigrationPlan) {
             .iter()
             .map(|step| (step.version, step.name.as_str()))
             .collect::<Vec<_>>(),
-        [
-            (127, journal_removal_store::RETAINED_BRIDGE_NAME),
-            (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME),
-            (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME),
-            (130, backend_job_current::MIGRATION_NAME)
-        ]
+        [(127, journal_removal_store::RETAINED_BRIDGE_NAME)]
+            .into_iter()
+            .chain(
+                MIGRATIONS
+                    .iter()
+                    .filter(|step| step.version > 127)
+                    .map(|step| (step.version, step.name)),
+            )
+            .collect::<Vec<_>>()
     );
 }
 
@@ -760,13 +823,7 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
         assert!(rows(&conn, "SELECT * FROM typed_ticket_orchestration_plans").is_empty());
         old_columns.remove("typed_ticket_orchestration_plans");
         old_columns.remove("ticket_schema_migrations");
-        // Schema130 removes obsolete Job history tables, not their current
-        // counterparts or the independently retained Journal removal metadata.
-        for table in backend_job_current::OBSOLETE_TABLES {
-            if old_columns.remove(*table).is_some() {
-                assert!(rows(&conn, &format!("SELECT * FROM {table}")).is_empty());
-            }
-        }
+        exclude_empty_obsolete_job_tables(&conn, &mut old_columns);
         let retained = values(&conn, &old_columns);
         drop(conn);
         let applied = SqliteWorkspaceStore::migrate_database(&path).unwrap();
@@ -775,11 +832,8 @@ fn journal_bridge_preserves_both_published_histories_and_matches_fresh_through_o
             let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
             store.with_conn(|conn| {
                 assert_eq!(current_schema_version(conn)?, LATEST_SCHEMA_VERSION);
-                assert_old_receipts(conn, &old_receipts);
-                assert_eq!(receipts(conn).len(), old_receipts.len()+4, "no empty intermediate receipts");
-                for table in backend_job_current::OBSOLETE_TABLES {
-                    assert!(!table_exists(conn, table)?, "obsolete Job table remains: {table}");
-                }
+                assert_appended_receipts(conn, &old_receipts, &plan);
+                assert_obsolete_job_tables_removed(conn);
                 assert_eq!(values(conn, &old_columns), retained, "all old columns and values must remain exact");
                 assert_eq!(failure_signature(conn), expected, "all changed tables, keys and programs match fresh composition");
                 storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
@@ -904,19 +958,22 @@ fn domain_observation_receipt_abort_rolls_back_both_schemas_and_retries_without_
             assert_eq!(values(&conn, &columns), before);
             conn.execute_batch("DROP TRIGGER interrupt_publication_receipt")
                 .unwrap();
+            let plan = workspace_schema_migration_plan(&conn).unwrap();
+            assert_plan(&plan, tail, 128);
+            let mut retained_columns = columns.clone();
+            retained_columns.remove("__yoi_schema_migrations");
+            exclude_empty_obsolete_job_tables(&conn, &mut retained_columns);
             apply_migrations(&conn).unwrap();
             assert_eq!(
                 current_schema_version(&conn).unwrap(),
                 LATEST_SCHEMA_VERSION
             );
-            let mut retained_columns = columns.clone();
-            retained_columns.remove("__yoi_schema_migrations");
             assert_eq!(
                 values(&conn, &retained_columns),
                 values_from_before(&before, &retained_columns)
             );
-            assert_old_receipts(&conn, &retained_receipts);
-            assert_eq!(receipts(&conn).len(), retained_receipts.len() + 1);
+            assert_appended_receipts(&conn, &retained_receipts, &plan);
+            assert_obsolete_job_tables_removed(&conn);
             assert!(
                 rows(
                     &conn,

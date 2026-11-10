@@ -8,6 +8,6 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
     operations: &[BuiltinPermissionOperation {
         key: "notification.diagnostics.read",
         description: "Read saved delivery evidence; acceptance is not processing or execution authority.",
-        sets: &["implementer", "companion", "subject-default"],
+        sets: &["implementer", "companion", "work-coordination"],
     }],
 };

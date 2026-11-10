@@ -351,7 +351,7 @@ async fn retained106_explicit_transfer_to_normal_subject_evaluates_saved_result_
     let subject = subject["id"].as_str().unwrap().to_owned();
     // Operation keys/sets only; no per-Ticket IDs and no post-start authority patch.
     super::chat_tests::adopt_subject_policy(&h.api, &h.owner, &subject,
-        r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.read", "ticket.assignment.update"]; }]; }"#,
+        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.read", "ticket.assignment.update"]; }]; }"#,
         "{}").await;
     let body_path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/body");
     let start = json!({"request_id":"ordinary-migration-start","expected_current":null,"expected_observation_token":null});

@@ -4,6 +4,7 @@ use super::*;
 use feature_permissions::PermissionKey;
 use server_api::authorization::{
     CoreWorkerExecutionGrant, CoreWorkerGrantParent, CoreWorkerGrantSource,
+    PermissionReferenceEncoding,
 };
 use server_api::launch_policy::{WorkerLaunchPolicyState, launch_policy_usage_key};
 
@@ -21,7 +22,7 @@ impl WorkerAuthorityView {
     ) -> ApiResult<bool> {
         let key = PermissionKey::parse(operation).map_err(denied)?;
         Ok(grant.bounds_operation(&key)
-            && current_key_allowed(self, operation, Some(&grant.assignment))?)
+            && current_key_allowed(self, operation, Some(&grant.effective_assignment()))?)
     }
 
     fn validate_core_lineage(&self, grant: &CoreWorkerExecutionGrant) -> ApiResult<()> {
@@ -65,7 +66,7 @@ impl WorkerAuthorityView {
                     {
                         return Err(denied("launch policy authorization revision is revoked"));
                     }
-                    if current.assignment != policy.child_permissions
+                    if current.effective_assignment() != policy.effective_child_permissions()
                         || !policy.allowed_profiles.contains(&current.profile)
                     {
                         return Err(denied(
@@ -273,7 +274,11 @@ pub(in crate::server) fn prepare_core_policy_grant(
         .permission_registry
         .read()
         .map_err(|_| denied("permission registry unavailable"))?;
-    let resolved = registry.host().resolve(Some(&policy.child_permissions));
+    let assignment = policy.effective_child_permissions();
+    let host = authority
+        .config_store
+        .configured_permission_host(&authority.workspace_id, registry.host())?;
+    let resolved = host.resolve(Some(&assignment));
     if resolved.projection().diagnostics.iter().any(|d| {
         matches!(
             d,
@@ -295,7 +300,8 @@ pub(in crate::server) fn prepare_core_policy_grant(
         worker_id: String::new(),
         profile: profile.into(),
         profile_digest: profile_digest.into(),
-        assignment: policy.child_permissions,
+        assignment,
+        reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
         issuance_ceiling: Some(ceiling),
         source: CoreWorkerGrantSource::LaunchPolicy {
             policy_id: policy_id.into(),

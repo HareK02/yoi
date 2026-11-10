@@ -7,7 +7,8 @@ use super::*;
 struct StartSource {
     identity: RuntimeIdentityMaterial,
     worker: RuntimeWorkerRef,
-    delegation: Vec<server_api::authorization::ScopedPermission>,
+    authorization: server_api::launch_policy::WorkerCreationAuthorization,
+    resource_free_authorization: server_api::launch_policy::WorkerCreationAuthorization,
 }
 
 async fn start_source(api: &mut WorkspaceApi, _runtime: &WorkdirlessFixtureRuntime) -> StartSource {
@@ -22,40 +23,49 @@ async fn start_body_source(api: &mut WorkspaceApi, runtime_id: &str) -> StartSou
     for ticket in api.authority.list_tickets(100).unwrap().items {
         grant_test_assignment_ticket(api, &subject_id, &ticket.id);
     }
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-    };
-    let delegation: Vec<_> = api
-        .store
-        .list_workdir_registry(TEST_WORKSPACE_ID, 100)
-        .unwrap()
-        .into_iter()
-        .map(|workdir| ScopedPermission {
-            operation: "filesystem.read".into(),
-            resource: PermissionResource::Workdir {
-                working_directory_id: workdir.workdir_id,
-                path: ".".into(),
-                recursive: true,
-            },
-        })
-        .collect();
-    let store = open_subjektiv_store(api).unwrap();
-    let previous = store.subject_permissions(&subject_id).unwrap();
-    store
-        .set_subject_permissions(
-            &subject_id,
-            &SubjectPermissionsUpdate {
-                operation_id: "start-source-delegation".into(),
-                expected_change_id: previous.as_ref().map(|policy| policy.change_id.clone()),
-                execution: previous.map(|policy| policy.execution).unwrap_or_default(),
-                delegation: delegation.clone(),
-            },
+    let child_permissions = test_operation_assignment(api, &["filesystem.read"]);
+    let (_, authorization) = test_worker_policy_authorizations(
+        api,
+        "assignment-read-only-start",
+        "builtin:intake",
+        child_permissions.clone(),
+    );
+    let (_, resource_free_authorization) = test_worker_policy_authorizations(
+        api,
+        "assignment-resource-free-start",
+        "builtin:intake",
+        Default::default(),
+    );
+    // Publish the dynamic usage key before assigning it through the owner domain.
+    let root =
+        ServerConfig::server_data_root_for_data_dir(&api.config.data_root).join("plugin-artifacts");
+    api.config_store
+        .sync_plugin_permission_registry(
+            &root,
+            TEST_WORKSPACE_ID,
+            &mut api.permission_registry.write().unwrap(),
         )
         .unwrap();
+    extend_test_assignment_operations(
+        api,
+        &subject_id,
+        &[
+            "worker.create",
+            "worker.launch.assignment-read-only-start",
+            "worker.launch.assignment-resource-free-start",
+        ],
+    );
+    let previous = api
+        .config_store
+        .current_subject_permission_policy(TEST_WORKSPACE_ID, &subject_id)
+        .unwrap()
+        .unwrap();
+    set_test_subject_policy_as_owner(api, &subject_id, previous.execution, child_permissions);
     StartSource {
         identity,
         worker,
-        delegation,
+        authorization,
+        resource_free_authorization,
     }
 }
 
@@ -88,31 +98,12 @@ fn start_http_request(
     if let Some(source) =
         source.filter(|_| method == "POST" && path.ends_with("/worker-control/workers"))
     {
-        // Supply the normal explicit least-authority child request. Only the
-        // selected reference Workdirs receive read; no write/command is issued.
-        let attachments = body["workdir_attachments"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let permissions: Vec<_> = source
-            .delegation
-            .iter()
-            .filter(|permission| {
-                let server_api::authorization::PermissionResource::Workdir {
-                    working_directory_id,
-                    ..
-                } = &permission.resource
-                else {
-                    return false;
-                };
-                attachments.iter().any(|attachment| {
-                    attachment["working_directory_id"].as_str()
-                        == Some(working_directory_id.as_str())
-                })
-            })
-            .cloned()
-            .collect();
-        body["execution_grant"] = serde_json::json!({"permissions":permissions, "redelegation":[]});
+        let authorization = if body["workdir_attachments"].as_array().unwrap().is_empty() {
+            &source.resource_free_authorization
+        } else {
+            &source.authorization
+        };
+        body["authorization"] = serde_json::to_value(authorization).unwrap();
     }
     let body = serde_json::to_vec(&body).unwrap();
     match source {
@@ -169,6 +160,11 @@ fn start_worker_body(
     attachments: Value,
     delegation: Option<&str>,
 ) -> Value {
+    let authorization = if attachments.as_array().unwrap().is_empty() {
+        test_worker_operation_authorization(&[])
+    } else {
+        test_worker_operation_authorization(&[("filesystem", &["filesystem.read"])])
+    };
     let mut body = serde_json::json!({
         "runtime_id": WorkdirlessFixtureRuntime::RUNTIME_ID,
         "display_name": "Partial investigation",
@@ -176,7 +172,8 @@ fn start_worker_body(
         "initial_submit": [],
         "workdir_attachments": attachments,
         "feature_connections": {},
-        "control_operation_id": "partial-control-start"
+        "control_operation_id": "partial-control-start",
+        "authorization": authorization
     });
     if let Some(ticket_id) = ticket_id {
         body["ticket_assignment"] = serde_json::json!({

@@ -11,21 +11,24 @@ use config_source::{
     ConfigContentType, ConfigTreeChange, VirtualPath, WorkspaceConfigSchemaBundle,
 };
 use feature_permissions::{
-    FeatureIdentity, NamespaceDeclaration, NamespaceId, PermissionDefinition, PermissionHost,
-    PermissionKey, WorkspaceId,
+    FeatureIdentity, NamespaceDeclaration, NamespaceId, PermissionAssignment, PermissionDefinition,
+    PermissionHost, PermissionKey, WorkspaceId,
 };
 use feature_storage::{FeatureDatabase, FeatureStorage, ScopedFeatureStorage};
 use rusqlite::Connection;
 use server_api::authorization::{
-    PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,
-    WorkerExecutionGrant,
+    CurrentSubjectPolicy, PermissionResource, ScopedPermission, SubjectPermissions,
+    SubjectPermissionsUpdate, WorkerExecutionGrant,
+};
+use server_api::subject_policy::{
+    SubjectPermissionPolicyAction, SubjectPermissionPolicyMutation,
+    SubjectPermissionPolicyMutationResponse,
 };
 use subjektiv::{SubjectRole, SubjektivError, SubjektivStore};
 
 use crate::config_adoption::{
-    CanonicalConfigurationSource, ConfigurationAdoptionRequest, ConfigurationAdoptionResult,
-    ConfigurationMigrationBaseline, ConfigurationPolicyTransfer, catalog_digest,
-    request_fingerprint,
+    ConfigurationAdoptionRequest, ConfigurationAdoptionResult, ConfigurationMigrationBaseline,
+    ConfigurationPolicyTransfer, catalog_digest, request_fingerprint,
 };
 use crate::config_source::{
     ConfigCommitRequest, MAIN_CONFIG_ENTRYPOINT, WorkspaceConfigSchemaProvider,
@@ -33,6 +36,7 @@ use crate::config_source::{
 };
 use crate::configuration_migration::{MigrationSeed, preview_migration};
 use crate::policy_config::{AssignmentSource, MigrationDiagnostic, PermissionConfigSchemaProvider};
+use crate::subject_policy_source::CanonicalSubjectPolicySource;
 use crate::{Error, Result, SqliteWorkspaceStore};
 
 const WORKSPACE: &str = "configuration-transfer-workspace";
@@ -401,10 +405,36 @@ fn table_rows(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
 
 fn server_records(server: &SqliteWorkspaceStore) -> Vec<(String, Vec<String>)> {
     server.with_conn(|conn| {
-        let tables = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND (name LIKE 'workspace_config%' OR name LIKE 'content_%') ORDER BY name")?
+        let tables = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND (name LIKE 'workspace_config%' OR name LIKE 'content_%' OR name LIKE 'subject_permission_%') ORDER BY name")?
             .query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         tables.into_iter().map(|table| Ok((table.clone(), table_rows(conn, &table)?))).collect()
     }).unwrap()
+}
+
+fn source_records(server: &SqliteWorkspaceStore) -> Vec<(String, Vec<String>)> {
+    server_records(server)
+        .into_iter()
+        .filter(|(table, _)| {
+            table != "workspace_configuration_policies" && !table.starts_with("subject_permission_")
+        })
+        .collect()
+}
+
+fn mutate_policy(
+    server: &SqliteWorkspaceStore,
+    features: &FeatureFixture,
+    host: &PermissionHost,
+    subject: &str,
+    request: &SubjectPermissionPolicyMutation,
+) -> Result<SubjectPermissionPolicyMutationResponse> {
+    let identity = features.store.database_identity().unwrap();
+    features
+        .store
+        .with_permission_authority_guard(&identity, |authority| {
+            authority.require_subject(subject)?;
+            Ok(server.mutate_subject_permission_policy(WORKSPACE, OWNER, subject, request, host))
+        })
+        .map_err(|error| Error::Store(error.to_string()))?
 }
 
 fn legacy_records(features: &FeatureFixture) -> Vec<Vec<String>> {
@@ -454,13 +484,10 @@ fn assert_existing_data_preserved(before: &WorkspaceConfigState, after: &Workspa
         .unwrap()
         .content;
     assert!(main.contains("# Keep this owner's explanation, including the word permissions."));
-    assert!(main.contains("permissions = import \"./permissions/migrated-1.dcdl\";"));
-    assert!(
-        after
-            .snapshot
-            .get(&path("permissions/migrated-1.dcdl"))
-            .is_some()
-    );
+    assert_eq!(after.snapshot, before.snapshot);
+    assert!(!after.snapshot.entries.values().any(|entry| {
+        entry.content.contains("subject_id") || entry.content.contains("remove_subjects")
+    }));
 }
 
 #[test]
@@ -855,7 +882,7 @@ fn workspace_purge_removes_adopted_authority_without_reopening_sealed_legacy_wri
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: db.clone(),
             host: self::host(),
         }));
@@ -1019,7 +1046,7 @@ fn adopted_source_remains_editable_and_canonical_reads_cannot_widen_or_revive_ol
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: server.clone(),
             host: self::host(),
         }));
@@ -1085,28 +1112,40 @@ fn adopted_source_remains_editable_and_canonical_reads_cannot_widen_or_revive_ol
         Err(SubjektivError::AuthorizationDenied(_))
     ));
 
-    let generated = path("permissions/migrated-1.dcdl");
-    let state = server.load_workspace_config(WORKSPACE).unwrap().unwrap();
-    let entry = state.snapshot.get(&generated).unwrap();
-    let revoked_source = format!(
-        "{{ subjects = [{{ subject_id = {}; execution = {{ revoked = true; }}; delegation = {{ revoked = true; }}; }}]; }}\n",
-        serde_json::to_string(&subjects.limited).unwrap(),
-    );
-    // A client-chosen operation ID equal to the old change identity must not
-    // make its retained child grants current again.
-    let revoke = edit_request(
+    let edit = edit_request(
         &server,
         &host,
-        &subjects.limited_source.change_id,
-        vec![ConfigTreeChange::Update {
-            path: generated.clone(),
-            expected_digest: entry.content_digest.clone(),
-            content: revoked_source,
+        "edit-unrelated-source",
+        vec![ConfigTreeChange::Create {
+            path: path("owner-note.txt"),
+            content_type: ConfigContentType::Text,
+            content: "source remains editable after transfer".into(),
         }],
     );
-    let revoked = adopt_edit(&server, &features, &host, &revoke);
-    assert_ne!(revoked.history_head, initial.history_head);
-    assert_existing_data_preserved(&seed.original, &revoked.state);
+    let edited = adopt_edit(&server, &features, &host, &edit);
+    assert_ne!(edited.history_head, initial.history_head);
+    assert_eq!(
+        canonical.subject_permissions(&subjects.limited).unwrap(),
+        Some(subjects.limited_source.clone())
+    );
+    let source_before = source_records(&server);
+    // An operation ID equal to an old change identity cannot revive its grants.
+    let revoke = SubjectPermissionPolicyMutation {
+        operation_id: subjects.limited_source.change_id.clone(),
+        expected_change_id: Some(subjects.limited_source.change_id.clone()),
+        action: SubjectPermissionPolicyAction::Replace {
+            execution: PermissionAssignment {
+                revoked: true,
+                ..Default::default()
+            },
+            delegation: PermissionAssignment {
+                revoked: true,
+                ..Default::default()
+            },
+        },
+    };
+    let revoked = mutate_policy(&server, &features, &host, &subjects.limited, &revoke).unwrap();
+    assert_eq!(source_records(&server), source_before);
     let current = canonical
         .subject_permissions(&subjects.limited)
         .unwrap()
@@ -1116,14 +1155,14 @@ fn adopted_source_remains_editable_and_canonical_reads_cannot_widen_or_revive_ol
     assert!(current.execution.is_empty());
     assert!(current.delegation.is_empty());
     let policy = server
-        .adopted_subject_policy(WORKSPACE, &subjects.limited)
+        .current_subject_permission_policy(WORKSPACE, &subjects.limited)
         .unwrap()
         .unwrap();
     assert_eq!(
         policy.legacy_constraints,
         Some(subjects.limited_source.clone())
     );
-    assert!(policy.source.execution.revoked && policy.source.delegation.revoked);
+    assert!(policy.execution.revoked && policy.delegation.revoked);
     // Binding replays are history only; neither replay can restore current policy.
     canonical.bind_worker_execution_grant(&child).unwrap();
     canonical
@@ -1161,8 +1200,13 @@ fn adopted_source_remains_editable_and_canonical_reads_cannot_widen_or_revive_ol
     );
     assert_eq!(
         server.configuration_head(WORKSPACE, OWNER).unwrap(),
-        Some(revoked.history_head)
+        Some(edited.history_head)
     );
+    assert_eq!(
+        mutate_policy(&server, &features, &host, &subjects.limited, &revoke).unwrap(),
+        revoked
+    );
+    assert_eq!(source_records(&server), source_before);
     assert_eq!(
         canonical.subject_permissions(&subjects.empty).unwrap(),
         Some(subjects.empty_source)
@@ -1174,17 +1218,24 @@ fn adopted_source_remains_editable_and_canonical_reads_cannot_widen_or_revive_ol
     assert_eq!(legacy_records(&features), legacy_before);
 }
 
-/// This registered component path uses real creation receipts -> virtual source
-/// -> the production single adoption writer -> the canonical provider -> current
-/// Feature resolution. It is not an HTTP/Runtime acceptance test.
+/// Connect native creation evidence, the dedicated policy writer and canonical
+/// Feature resolution without an HTTP/Runtime acceptance boundary.
 fn enrollment_host() -> PermissionHost {
     use feature_permissions::{
         NamespacePermissions, PermissionReference, PermissionSetId, SetContribution,
     };
     let mut host = host();
-    for (namespace, keys) in [
-        ("chat", vec!["chat.send", "chat.read"]),
-        ("ticket", vec!["ticket.assignment.read", "ticket.read"]),
+    for (namespace, keys, sets) in [
+        (
+            "chat",
+            vec!["chat.send", "chat.read"],
+            vec![server_api::authorization::CONVERSATION_PERMISSION_SET],
+        ),
+        (
+            "ticket",
+            vec!["ticket.assignment.read", "ticket.read"],
+            vec![server_api::authorization::WORK_COORDINATION_PERMISSION_SET],
+        ),
     ] {
         let feature = host
             .register_feature(FeatureIdentity::parse(format!("fixture:{namespace}")).unwrap())
@@ -1208,39 +1259,32 @@ fn enrollment_host() -> PermissionHost {
                         children: vec![],
                     })
                     .collect(),
-                sets: vec![SetContribution {
-                    set: PermissionSetId::parse(
-                        server_api::authorization::SUBJECT_DEFAULT_PERMISSION_SET,
-                    )
-                    .unwrap(),
-                    children: vec![PermissionReference::Namespace(NamespacePermissions {
-                        namespace: NamespaceId::parse(namespace).unwrap(),
-                        keys,
-                    })],
-                }],
+                sets: sets
+                    .into_iter()
+                    .map(|set| SetContribution {
+                        set: PermissionSetId::parse(set).unwrap(),
+                        children: vec![PermissionReference::Namespace(NamespacePermissions {
+                            namespace: NamespaceId::parse(namespace).unwrap(),
+                            keys: keys.clone(),
+                        })],
+                    })
+                    .chain((namespace == "ticket").then(|| {
+                        SetContribution {
+                            set: PermissionSetId::parse(
+                                server_api::authorization::WORK_EXECUTION_PERMISSION_SET,
+                            )
+                            .unwrap(),
+                            children: vec![PermissionReference::Namespace(NamespacePermissions {
+                                namespace: NamespaceId::parse(namespace).unwrap(),
+                                keys: vec![PermissionKey::parse("ticket.read").unwrap()],
+                            })],
+                        }
+                    }))
+                    .collect(),
             },
         )
         .unwrap();
     }
-    let subject = host
-        .register_feature(FeatureIdentity::parse("fixture:subject").unwrap())
-        .unwrap();
-    let handle = host
-        .bind_namespace(&subject, NamespaceId::parse("subject").unwrap())
-        .unwrap();
-    host.declare(
-        &handle,
-        NamespaceDeclaration {
-            permissions: vec![PermissionDefinition {
-                key: PermissionKey::parse(server_api::authorization::SUBJECT_DELEGATE_PERMISSION)
-                    .unwrap(),
-                description: String::new(),
-                children: vec![PermissionKey::parse("ticket.read").unwrap()],
-            }],
-            sets: vec![],
-        },
-    )
-    .unwrap();
     host
 }
 
@@ -1249,16 +1293,14 @@ fn enroll(
     features: &FeatureFixture,
     host: &PermissionHost,
     subject: &str,
-) -> Result<ConfigurationAdoptionResult> {
-    server
-        .enroll_created_subject(WORKSPACE, OWNER, &features.store, subject, schema(), || {
-            Ok(((), host.clone()))
-        })
-        .map(|result| result.expect("post-seal creation evidence"))
+) -> Result<Option<CurrentSubjectPolicy>> {
+    server.enroll_created_subject_policy(WORKSPACE, OWNER, &features.store, subject, || {
+        Ok(((), host.clone()))
+    })
 }
 
 #[test]
-fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed_policy() {
+fn postseal_enrollment_preserves_source_and_reopen_replays_never_restore_removed_policy() {
     let (root, server, features, _subjects) = fixture();
     let host = enrollment_host();
     let seed = migration(&server, &features, &host);
@@ -1274,53 +1316,30 @@ fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed
         .unwrap();
     assert!(
         server
-            .adopted_subject_policy(WORKSPACE, &created.id)
+            .current_subject_permission_policy(WORKSPACE, &created.id)
             .unwrap()
             .is_none()
     );
-    let before = server.configuration_current(WORKSPACE, OWNER).unwrap();
+    let before = source_records(&server);
     assert!(
         server
-            .enroll_created_subject(
+            .enroll_created_subject_policy(
                 WORKSPACE,
                 "not-owner",
                 &features.store,
                 &created.id,
-                schema(),
                 || Ok(((), host.clone()))
             )
             .is_err()
     );
-    let adopted = enroll(&server, &features, &host, &created.id).unwrap();
-    assert!(adopted.source_stored && adopted.policy_committed);
-    let old_main = before
-        .state
-        .snapshot
-        .get(&path(MAIN_CONFIG_ENTRYPOINT))
+    let enrolled = enroll(&server, &features, &host, &created.id)
+        .unwrap()
         .unwrap();
-    let new_main = adopted
-        .state
-        .snapshot
-        .get(&path(MAIN_CONFIG_ENTRYPOINT))
-        .unwrap();
-    assert_eq!(
-        adopted
-            .state
-            .snapshot
-            .get(&path("subject-enrollment-base.dcdl"))
-            .unwrap()
-            .content,
-        old_main.content
-    ); // comments/imports remain at the same virtual directory
-    for (path, entry) in &before.state.snapshot.entries {
-        if path.as_str() != MAIN_CONFIG_ENTRYPOINT {
-            assert_eq!(adopted.state.snapshot.get(path), Some(entry));
-        }
-    }
+    assert_eq!(source_records(&server), before);
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: server.clone(),
             host: host.clone(),
         }));
@@ -1328,6 +1347,7 @@ fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed
         .current_subject_policy(&created.id)
         .unwrap()
         .unwrap();
+    assert_eq!(policy, enrolled);
     assert!(policy.legacy_constraints.is_none());
     assert_eq!(
         policy.execution,
@@ -1359,68 +1379,58 @@ fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed
             .keys()
             .cloned()
             .collect::<Vec<_>>(),
-        vec![
-            PermissionKey::parse("subject.delegate").unwrap(),
-            PermissionKey::parse("ticket.read").unwrap(),
-        ]
+        vec![PermissionKey::parse("ticket.read").unwrap()]
     );
     assert_eq!(
         enroll(&server, &features, &host, &created.id).unwrap(),
-        adopted
+        Some(enrolled.clone())
     );
 
-    let empty_edit = edit_request(
-        &server,
-        &host,
-        "empty-new",
-        vec![ConfigTreeChange::Update {
-            path: path(MAIN_CONFIG_ENTRYPOINT),
-            expected_digest: new_main.content_digest.clone(),
-            content: format!(
-                "{{ permissions = {{ subjects = [{{ subject_id = {}; execution = {{}}; delegation = {{}}; }}]; }}; }} as WorkspaceConfigSchema",
-                serde_json::to_string(&created.id).unwrap()
-            ),
-        }],
-    );
-    let empty_adoption = adopt_edit(&server, &features, &host, &empty_edit);
-    let empty_policy = canonical
-        .current_subject_policy(&created.id)
-        .unwrap()
-        .unwrap();
+    let empty_request = SubjectPermissionPolicyMutation {
+        operation_id: "empty-new".into(),
+        expected_change_id: Some(enrolled.change_id.clone()),
+        action: SubjectPermissionPolicyAction::Replace {
+            execution: PermissionAssignment::default(),
+            delegation: PermissionAssignment::default(),
+        },
+    };
+    let empty = mutate_policy(&server, &features, &host, &created.id, &empty_request).unwrap();
+    let empty_policy = empty.policy.clone().unwrap();
     assert!(empty_policy.execution.grants.is_empty());
+    assert_ne!(empty_policy.change_id, enrolled.change_id);
+    let mut stale = empty_request.clone();
+    stale.operation_id = "stale-empty".into();
+    assert!(matches!(
+        mutate_policy(&server, &features, &host, &created.id, &stale),
+        Err(Error::WorkspaceConfigConflict(_))
+    ));
     assert_eq!(
         enroll(&server, &features, &host, &created.id).unwrap(),
-        adopted
+        Some(empty_policy.clone())
     );
     assert_eq!(
         canonical.current_subject_policy(&created.id).unwrap(),
-        Some(empty_policy)
+        Some(empty_policy.clone())
     );
 
-    // Remove explicitly using normal source editing/adoption, not an enrollment flag.
-    let removed_main = format!(
-        "{{ permissions = {{ remove_subjects = [{}]; }}; }} as WorkspaceConfigSchema",
-        serde_json::to_string(&created.id).unwrap()
-    );
-    let remove = edit_request(
-        &server,
-        &host,
-        "remove-new",
-        vec![ConfigTreeChange::Update {
-            path: path(MAIN_CONFIG_ENTRYPOINT),
-            expected_digest: empty_adoption
-                .state
-                .snapshot
-                .get(&path(MAIN_CONFIG_ENTRYPOINT))
-                .unwrap()
-                .content_digest
-                .clone(),
-            content: removed_main,
-        }],
-    );
-    adopt_edit(&server, &features, &host, &remove);
+    let remove = SubjectPermissionPolicyMutation {
+        operation_id: "remove-new".into(),
+        expected_change_id: Some(empty_policy.change_id),
+        action: SubjectPermissionPolicyAction::Remove,
+    };
+    let removed = mutate_policy(&server, &features, &host, &created.id, &remove).unwrap();
+    assert!(removed.policy.is_none());
+    assert!(removed.change_id.is_some());
     assert_eq!(canonical.current_subject_policy(&created.id).unwrap(), None);
-    let removed_head = server.configuration_head(WORKSPACE, OWNER).unwrap();
+    assert_eq!(
+        mutate_policy(&server, &features, &host, &created.id, &empty_request).unwrap(),
+        empty
+    );
+    assert_eq!(
+        enroll(&server, &features, &host, &created.id).unwrap(),
+        None
+    );
+    assert_eq!(source_records(&server), before);
     drop(canonical);
     let identity = features.database.identity().clone();
     features.close();
@@ -1438,18 +1448,29 @@ fn postseal_creation_adopts_source_once_and_reopen_replays_never_restore_removed
     assert_eq!(retried.id, created.id);
     assert_eq!(
         enroll(&server, &features, &host, &created.id).unwrap(),
-        adopted
-    ); // evidence only
-    assert!(
-        server
-            .adopted_subject_policy(WORKSPACE, &created.id)
-            .unwrap()
-            .is_none()
+        None
     );
     assert_eq!(
-        server.configuration_head(WORKSPACE, OWNER).unwrap(),
-        removed_head
+        mutate_policy(&server, &features, &host, &created.id, &remove).unwrap(),
+        removed
     );
+    assert_eq!(
+        mutate_policy(&server, &features, &host, &created.id, &empty_request).unwrap(),
+        empty
+    );
+    assert_eq!(
+        server
+            .current_subject_permission_policy(WORKSPACE, &created.id)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        server
+            .subject_permission_policy_change_id(WORKSPACE, &created.id)
+            .unwrap(),
+        removed.change_id
+    );
+    assert_eq!(source_records(&server), before);
 }
 
 #[test]
@@ -1464,8 +1485,26 @@ fn enrollment_failure_is_retryable_and_explicit_empty_or_removal_before_enrollme
         .create_subject(SubjectRole::new("new").unwrap())
         .unwrap();
     let before = server_records(&server);
-    server.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER fail_enrollment BEFORE INSERT ON workspace_configuration_receipts BEGIN SELECT RAISE(ABORT,'injected enrollment receipt failure'); END;")?; Ok(()) }).unwrap();
-    assert!(enroll(&server, &features, &host, &created.id).is_err());
+    assert!(matches!(
+        enroll(&server, &features, &self::host(), &created.id),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(server_records(&server), before);
+    server
+        .with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_enrollment BEFORE INSERT ON subject_permission_enrollments
+                 BEGIN SELECT RAISE(ABORT,'injected enrollment receipt failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let error = enroll(&server, &features, &host, &created.id).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected enrollment receipt failure")
+    );
     assert_eq!(server_records(&server), before);
     assert!(
         features
@@ -1480,64 +1519,140 @@ fn enrollment_failure_is_retryable_and_explicit_empty_or_removal_before_enrollme
             Ok(())
         })
         .unwrap();
-    enroll(&server, &features, &host, &created.id).unwrap();
+    let before = source_records(&server);
+    enroll(&server, &features, &host, &created.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_records(&server), before);
 
     for remove in [false, true] {
         let subject = features
             .store
             .create_subject(SubjectRole::new("explicit").unwrap())
             .unwrap();
-        let current = server.configuration_current(WORKSPACE, OWNER).unwrap();
-        let main = current
-            .state
-            .snapshot
-            .get(&path(MAIN_CONFIG_ENTRYPOINT))
-            .unwrap();
-        let source = if remove {
-            format!(
-                "remove_subjects = [{}];",
-                serde_json::to_string(&subject.id).unwrap()
-            )
-        } else {
-            format!(
-                "subjects = [{{ subject_id = {}; execution = {{}}; delegation = {{}}; }}];",
-                serde_json::to_string(&subject.id).unwrap()
-            )
+        let before = source_records(&server);
+        let request = SubjectPermissionPolicyMutation {
+            operation_id: format!("explicit-{remove}"),
+            expected_change_id: None,
+            action: if remove {
+                SubjectPermissionPolicyAction::Remove
+            } else {
+                SubjectPermissionPolicyAction::Replace {
+                    execution: PermissionAssignment::default(),
+                    delegation: PermissionAssignment::default(),
+                }
+            },
         };
-        let edit = edit_request(
-            &server,
-            &host,
-            &format!("explicit-{remove}"),
-            vec![ConfigTreeChange::Update {
-                path: path(MAIN_CONFIG_ENTRYPOINT),
-                expected_digest: main.content_digest.clone(),
-                content: format!("{{ permissions = {{ {source} }}; }} as WorkspaceConfigSchema"),
-            }],
-        );
-        adopt_edit(&server, &features, &host, &edit);
-        let explicit = server
-            .adopted_subject_policy(WORKSPACE, &subject.id)
-            .unwrap();
+        let explicit = mutate_policy(&server, &features, &host, &subject.id, &request).unwrap();
         let result = enroll(&server, &features, &host, &subject.id).unwrap();
+        assert_eq!(result, explicit.policy);
         assert_eq!(
             server
-                .adopted_subject_policy(WORKSPACE, &subject.id)
+                .subject_permission_policy_state(WORKSPACE, &subject.id)
                 .unwrap(),
-            explicit
+            (explicit.change_id, explicit.policy.clone())
         );
-        assert_eq!(
-            result.state,
-            server.load_workspace_config(WORKSPACE).unwrap().unwrap()
-        );
-        if let Some(policy) = explicit {
+        assert_eq!(source_records(&server), before);
+        if let Some(policy) = explicit.policy {
             assert!(
-                host.resolve(Some(&policy.current().execution))
+                host.resolve(Some(&policy.execution))
                     .projection()
                     .allowed
                     .is_empty()
             );
         }
     }
+}
+
+#[test]
+fn current_source_rejects_individual_subject_decisions_without_changing_policy_or_history() {
+    let (_root, server, features, subjects) = fixture();
+    let host = enrollment_host();
+    let seed = migration(&server, &features, &host);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let before = server_records(&server);
+    let native_before = legacy_records(&features);
+    for (index, individual) in [
+        format!(
+            "subjects = [{{ subject_id = {}; execution = {{}}; delegation = {{}}; }}];",
+            serde_json::to_string(&subjects.limited).unwrap()
+        ),
+        format!(
+            "remove_subjects = [{}];",
+            serde_json::to_string(&subjects.limited).unwrap()
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let state = server.load_workspace_config(WORKSPACE).unwrap().unwrap();
+        let main = state.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
+        let request = edit_request(
+            &server,
+            &host,
+            &format!("reject-individual-source-{index}"),
+            vec![ConfigTreeChange::Update {
+                path: path(MAIN_CONFIG_ENTRYPOINT),
+                expected_digest: main.content_digest.clone(),
+                content: format!(
+                    "{{ permissions = {{ {individual} }}; }} as WorkspaceConfigSchema"
+                ),
+            }],
+        );
+        assert!(
+            server
+                .adopt_configuration(
+                    WORKSPACE,
+                    OWNER,
+                    &request,
+                    schema(),
+                    &host,
+                    None,
+                    |subject| require_subject(&features.store, subject),
+                    |_| panic!("invalid current source must not initiate a transfer"),
+                )
+                .is_err()
+        );
+        assert_eq!(server_records(&server), before);
+        assert_eq!(legacy_records(&features), native_before);
+    }
+}
+
+#[test]
+fn native_deletion_fences_enrollment_and_owner_replays_without_server_mutation() {
+    let (_root, server, features, _subjects) = fixture();
+    let host = enrollment_host();
+    let seed = migration(&server, &features, &host);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let subject = features
+        .store
+        .create_subject(SubjectRole::new("deletion fence").unwrap())
+        .unwrap();
+    let policy = enroll(&server, &features, &host, &subject.id)
+        .unwrap()
+        .unwrap();
+    let remove = SubjectPermissionPolicyMutation {
+        operation_id: "remove-before-deletion".into(),
+        expected_change_id: Some(policy.change_id),
+        action: SubjectPermissionPolicyAction::Remove,
+    };
+    mutate_policy(&server, &features, &host, &subject.id, &remove).unwrap();
+    features
+        .store
+        .begin_subject_deletion(&subject.id, "delete-enrolled-subject")
+        .unwrap();
+    let before = server_records(&server);
+    assert!(enroll(&server, &features, &host, &subject.id).is_err());
+    assert!(mutate_policy(&server, &features, &host, &subject.id, &remove).is_err());
+    assert_eq!(server_records(&server), before);
+    assert_eq!(
+        server
+            .current_subject_permission_policy(WORKSPACE, &subject.id)
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -1555,14 +1670,10 @@ fn preseal_feature_defaults_transfer_as_live_sets_not_legacy_copies() {
         .unwrap();
     assert!(
         server
-            .enroll_created_subject(
-                WORKSPACE,
-                OWNER,
-                &features.store,
-                &subject.id,
-                schema(),
-                || Ok(((), host.clone()))
-            )
+            .enroll_created_subject_policy(WORKSPACE, OWNER, &features.store, &subject.id, || Ok((
+                (),
+                host.clone()
+            )))
             .unwrap()
             .is_none()
     );
@@ -1573,7 +1684,7 @@ fn preseal_feature_defaults_transfer_as_live_sets_not_legacy_copies() {
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: server,
             host,
         }));
@@ -1582,6 +1693,78 @@ fn preseal_feature_defaults_transfer_as_live_sets_not_legacy_copies() {
         Some(original)
     );
     assert!(canonical.subject_permissions(&subject.id).is_err()); // no all-target legacy projection
+}
+
+#[test]
+fn retired_feature_references_transfer_as_semantic_sets_without_rewriting_sealed_evidence() {
+    use feature_permissions::{NamespacePermissions, PermissionReference, PermissionSetId};
+    use server_api::authorization::PermissionReferenceEncoding;
+
+    let (_root, server, features, _subjects) = fixture();
+    let host = enrollment_host();
+    let subject = features
+        .store
+        .create_subject(SubjectRole::new("historical Feature policy").unwrap())
+        .unwrap();
+    let mut expected = features
+        .store
+        .current_subject_policy(&subject.id)
+        .unwrap()
+        .unwrap();
+    let mut historical = expected.clone();
+    historical.reference_encoding = PermissionReferenceEncoding::LegacySubjectV1;
+    historical.execution.grants = vec![PermissionReference::Set(
+        PermissionSetId::parse("subject-default").unwrap(),
+    )];
+    historical.delegation.grants = vec![PermissionReference::Namespace(NamespacePermissions {
+        namespace: NamespaceId::parse("subject").unwrap(),
+        keys: vec![PermissionKey::parse("subject.delegate").unwrap()],
+    })];
+    // Insert the historical source shape rather than relabeling a current write.
+    historical.change_id = "historical-semantic-reference-source".into();
+    expected.change_id = historical.change_id.clone();
+    features.database.try_transaction::<_, SubjektivError>(|tx| {
+        tx.execute(
+            "INSERT INTO subject_permission_changes(subject_id,change_id,record_json) VALUES(?1,?2,?3)",
+            rusqlite::params![subject.id, historical.change_id, serde_json::to_string(&historical)?],
+        )?;
+        tx.execute(
+            "UPDATE subject_permissions SET change_id=?2 WHERE subject_id=?1",
+            rusqlite::params![subject.id, historical.change_id],
+        )?;
+        Ok(())
+    }).unwrap();
+    let before = legacy_records(&features);
+    let seed = migration(&server, &features, &host);
+    let exported = seed
+        .snapshot
+        .sources
+        .iter()
+        .find(|source| source.subject_id == subject.id)
+        .unwrap();
+    assert_eq!(exported.feature_policy, Some(historical));
+    assert_eq!(seed.policies[&subject.id].current(), expected);
+    assert_eq!(legacy_records(&features), before);
+    let request = migration_request(&seed, &host);
+    adopt_migration(&server, &features, &host, &seed, &request).unwrap();
+    let receipt = features
+        .store
+        .permission_transfer_receipt(&seed.snapshot.identity)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.snapshot, seed.snapshot);
+    let canonical = features
+        .store
+        .clone()
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
+            store: server,
+            host,
+        }));
+    assert_eq!(
+        canonical.current_subject_policy(&subject.id).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(legacy_records(&features), before);
 }
 
 #[test]
@@ -1595,32 +1778,33 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
         .store
         .create_subject(SubjectRole::new("Feature-grant fixture").unwrap())
         .unwrap();
-    enroll(&server, &features, &host, &created.id).unwrap();
-    let state = server.configuration_current(WORKSPACE, OWNER).unwrap();
-    let main = state
-        .state
-        .snapshot
-        .get(&path(MAIN_CONFIG_ENTRYPOINT))
+    let source_before = source_records(&server);
+    let enrolled = enroll(&server, &features, &host, &created.id)
+        .unwrap()
         .unwrap();
-    let source = format!(
-        "{{ permissions = {{ subjects = [{{ subject_id = {}; execution = {{ namespaces = [{{ namespace = \"file\"; keys = [\"file.read.text\"]; }}]; }}; delegation = {{ namespaces = [{{ namespace = \"file\"; keys = [\"file.read.text\"]; }}]; }}; }}]; }}; }} as WorkspaceConfigSchema",
-        serde_json::to_string(&created.id).unwrap()
-    );
-    let edit = edit_request(
-        &server,
-        &host,
-        "grant-feature-delegation",
-        vec![ConfigTreeChange::Update {
-            path: path(MAIN_CONFIG_ENTRYPOINT),
-            expected_digest: main.content_digest.clone(),
-            content: source,
-        }],
-    );
-    adopt_edit(&server, &features, &host, &edit);
+    let assignment = PermissionAssignment {
+        grants: vec![feature_permissions::PermissionReference::Namespace(
+            feature_permissions::NamespacePermissions {
+                namespace: NamespaceId::parse("file").unwrap(),
+                keys: vec![PermissionKey::parse("file.read.text").unwrap()],
+            },
+        )],
+        ..Default::default()
+    };
+    let replace = SubjectPermissionPolicyMutation {
+        operation_id: "grant-feature-delegation".into(),
+        expected_change_id: Some(enrolled.change_id),
+        action: SubjectPermissionPolicyAction::Replace {
+            execution: assignment.clone(),
+            delegation: assignment,
+        },
+    };
+    mutate_policy(&server, &features, &host, &created.id, &replace).unwrap();
+    assert_eq!(source_records(&server), source_before);
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: server.clone(),
             host: host.clone(),
         }));
@@ -1661,26 +1845,13 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
             .bind_worker_execution_grant_with_host_lease(&wider, || Ok(((), host.clone())))
             .is_err()
     );
-    let current = server.configuration_current(WORKSPACE, OWNER).unwrap();
-    let main = current
-        .state
-        .snapshot
-        .get(&path(MAIN_CONFIG_ENTRYPOINT))
-        .unwrap();
-    let revoke = edit_request(
-        &server,
-        &host,
-        "revoke-feature-delegation",
-        vec![ConfigTreeChange::Update {
-            path: path(MAIN_CONFIG_ENTRYPOINT),
-            expected_digest: main.content_digest.clone(),
-            content: format!(
-                "{{ permissions = {{ remove_subjects = [{}]; }}; }} as WorkspaceConfigSchema",
-                serde_json::to_string(&created.id).unwrap()
-            ),
-        }],
-    );
-    adopt_edit(&server, &features, &host, &revoke);
+    let revoke = SubjectPermissionPolicyMutation {
+        operation_id: "revoke-feature-delegation".into(),
+        expected_change_id: Some(current.change_id),
+        action: SubjectPermissionPolicyAction::Remove,
+    };
+    mutate_policy(&server, &features, &host, &created.id, &revoke).unwrap();
+    assert_eq!(source_records(&server), source_before);
     let mut late = bound.clone();
     late.worker_id = "removed-source-child".into();
     assert!(
@@ -1706,7 +1877,7 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: server,
             host: host.clone(),
         }));
@@ -1727,7 +1898,7 @@ fn canonical_feature_grants_bind_without_legacy_projection_and_keep_current_scop
 }
 
 #[test]
-fn legacy_unicode_subject_identity_migrates_through_virtual_source_and_reopen_without_corruption() {
+fn legacy_unicode_subject_identity_migrates_directly_and_reopens_without_corruption() {
     let (root, server, features, _subjects) = fixture();
     let host = enrollment_host();
     let subject = "legacy-日本語😀";
@@ -1747,12 +1918,14 @@ fn legacy_unicode_subject_identity_migrates_through_virtual_source_and_reopen_wi
     );
     let seed = migration(&server, &features, &host);
     assert_eq!(seed.policies[subject].source.subject_id, subject);
+    assert_eq!(seed.state.snapshot, seed.original.snapshot);
     assert!(
-        seed.state
+        !seed
+            .state
             .snapshot
             .entries
             .values()
-            .any(|entry| entry.content_type == ConfigContentType::Text && entry.content == subject)
+            .any(|entry| entry.content.contains(subject))
     );
     let request = migration_request(&seed, &host);
     adopt_migration(&server, &features, &host, &seed, &request).unwrap();
@@ -1773,7 +1946,7 @@ fn legacy_unicode_subject_identity_migrates_through_virtual_source_and_reopen_wi
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: server.clone(),
             host: host.clone(),
         }));
@@ -1809,7 +1982,7 @@ fn deferred_binding_catalog_lease_outlives_native_commit() {
     let canonical = features
         .store
         .clone()
-        .with_canonical_permission_source(Arc::new(CanonicalConfigurationSource {
+        .with_canonical_permission_source(Arc::new(CanonicalSubjectPolicySource {
             store: server,
             host: host.clone(),
         }));
@@ -1851,7 +2024,7 @@ fn deferred_binding_catalog_lease_outlives_native_commit() {
 }
 
 #[test]
-fn deferred_enrollment_catalog_lease_outlives_adoption_commit() {
+fn deferred_enrollment_catalog_lease_outlives_policy_commit() {
     let (_root, server, features, _subjects) = fixture();
     let host = enrollment_host();
     let seed = migration(&server, &features, &host);
@@ -1865,15 +2038,16 @@ fn deferred_enrollment_catalog_lease_outlives_adoption_commit() {
             "leased-enrollment",
         )
         .unwrap();
+    let source_before = source_records(&server);
+    let observer = self::server(_root.path());
     let catalog = std::sync::RwLock::new(host);
     let released = std::cell::Cell::new(false);
     let result = server
-        .enroll_created_subject(
+        .enroll_created_subject_policy(
             WORKSPACE,
             OWNER,
             &features.store,
             &subject.id,
-            schema(),
             || {
                 let registry = catalog.read().unwrap();
                 let host = registry.clone();
@@ -1882,21 +2056,22 @@ fn deferred_enrollment_catalog_lease_outlives_adoption_commit() {
                         catalog.try_write().is_err(),
                         "catalog still fenced at commit observation"
                     );
-                    let receipt = server
-                        .configuration_adoption_result(
-                            WORKSPACE,
-                            OWNER,
-                            &format!("subject-enrollment:{}", subject.id),
-                        )
-                        .unwrap()
-                        .expect("adoption receipt committed before catalog release");
-                    assert!(receipt.source_stored && receipt.policy_committed);
                     assert!(
-                        server
-                            .adopted_subject_policy(WORKSPACE, &subject.id)
+                        observer
+                            .current_subject_permission_policy(WORKSPACE, &subject.id)
                             .unwrap()
                             .is_some()
                     );
+                    observer.with_conn(|connection| {
+                        let consumed: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM subject_permission_enrollments WHERE workspace_id=?1 AND subject_id=?2)",
+                            rusqlite::params![WORKSPACE, subject.id],
+                            |row| row.get(0),
+                        )?;
+                        assert!(consumed, "creation evidence committed before catalog release");
+                        Ok(())
+                    }).unwrap();
+                    assert_eq!(source_records(&observer), source_before);
                     released.set(true);
                 });
                 Ok(((committed, registry), host))
@@ -1904,7 +2079,16 @@ fn deferred_enrollment_catalog_lease_outlives_adoption_commit() {
         )
         .unwrap()
         .unwrap();
-    assert!(result.policy_committed);
+    assert_eq!(
+        observer
+            .current_subject_permission_policy(WORKSPACE, &subject.id)
+            .unwrap(),
+        Some(result)
+    );
+    assert_eq!(source_records(&observer), source_before);
     assert!(released.get(), "owner released catalog after Server COMMIT");
     assert!(catalog.try_write().is_ok());
 }
+
+#[path = "config_adoption/automatic_tests.rs"]
+mod automatic_migration;

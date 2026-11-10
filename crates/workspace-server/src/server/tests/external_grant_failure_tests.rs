@@ -33,7 +33,7 @@ async fn grant_cleanup_fixture() -> GrantCleanupFixture {
     let workdir_id = binding.working_directory.id.clone();
     drop(binding);
     source.publish_profile("builtin:companion");
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(source.api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -46,9 +46,10 @@ async fn grant_cleanup_fixture() -> GrantCleanupFixture {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                assignment: None,
-            },
+            authorization: test_worker_operation_authorization(&[
+                ("filesystem", &["filesystem.read", "filesystem.write"]),
+                ("bash", &["bash.execute"]),
+            ]),
         }),
     )
     .await
@@ -83,7 +84,7 @@ async fn client(
     String,
     reqwest::Client,
 ) {
-    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let token = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = build_router(api.clone());

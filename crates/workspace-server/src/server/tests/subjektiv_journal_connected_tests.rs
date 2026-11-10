@@ -340,9 +340,8 @@ impl LlmClient for ConnectedJournalModel {
 }
 
 async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> RuntimeWorkerRef {
-    let Json(created) = scoped_create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
-        AxumPath(ScopedWorkspacePath { workspace_id: TEST_WORKSPACE_ID.into() }),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(), display_name: name.into(),
@@ -533,9 +532,7 @@ async fn backend_real_runtime_journal_release_and_next_body_persisted_startup() 
     ));
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let store = open_subjektiv_store(&api).unwrap();
-    let subject = store
-        .create_subject(crate::subjektiv::SubjectRole::new("connected-handoff").unwrap())
-        .unwrap();
+    let subject = create_journal_subject_as_owner(&api, "connected-handoff").await;
     // Exercise creation-time authority through real recording and startup callbacks,
     // without a management grant or an execution/delegation policy replacement.
     let initial_policy = store.current_subject_policy(&subject.id).unwrap().unwrap();
@@ -913,7 +910,7 @@ async fn signed_compaction_read_does_not_contact_runtime_or_wait_for_active_gene
             .unwrap(),
         )
         .unwrap();
-    let host = bind_fixture_session(&store, attr);
+    let host = bind_fixture_session(&api, &store, attr);
     let range = JournalSourceRange {
         source: JournalSource {
             session_id: "committed-session".into(),
@@ -1786,24 +1783,28 @@ async fn connected_restore_fixture_with_pending_head(
         .unwrap();
     let owner =
         seed_test_workspace_owner_token(api.store.as_ref(), "restore-host-auth-owner").await;
-    let update = server_api::authorization::SubjectPermissionsUpdate {
+    let permissions = connected_subject_permissions(&subject.id);
+    let operations = permissions
+        .iter()
+        .map(|permission| permission.operation.as_str())
+        .collect::<Vec<_>>();
+    let update = server_api::subject_policy::SubjectPermissionPolicyMutation {
         operation_id: "restore-host-auth-permissions".into(),
-        expected_change_id: Some(
-            store
-                .current_subject_policy(&subject.id)
-                .unwrap()
-                .unwrap()
-                .change_id,
-        ),
-        execution: connected_subject_permissions(&subject.id),
-        delegation: vec![],
+        expected_change_id: store
+            .current_subject_policy(&subject.id)
+            .unwrap()
+            .map(|policy| policy.change_id),
+        action: server_api::subject_policy::SubjectPermissionPolicyAction::Replace {
+            execution: test_operation_assignment(&api, &operations),
+            delegation: Default::default(),
+        },
     };
     let response = build_router(api.clone())
         .oneshot(
             axum::http::Request::builder()
-                .method("POST")
+                .method("PUT")
                 .uri(format!(
-                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permissions",
+                    "/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{}/permission-policy",
                     subject.id
                 ))
                 .header("authorization", format!("Bearer {owner}"))
@@ -1930,11 +1931,8 @@ async fn connected_restore_fixture_with_pending_head(
         assert!(probe.stops.lock().unwrap().is_empty());
         worker
     } else {
-        let Json(created) = scoped_create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-            }),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
@@ -2957,18 +2955,16 @@ fn replace_recording_fixture_policy(
         .as_ref()
         .unwrap()
         .subject_id;
-    let previous = f.store.subject_permissions(subject).unwrap().unwrap();
-    f.store
-        .set_subject_permissions(
-            subject,
-            &server_api::authorization::SubjectPermissionsUpdate {
-                operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: Some(previous.change_id),
-                execution,
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    let operations = execution
+        .iter()
+        .map(|permission| permission.operation.as_str())
+        .collect::<Vec<_>>();
+    set_test_subject_policy_as_owner(
+        &f.api,
+        subject,
+        test_operation_assignment(&f.api, &operations),
+        Default::default(),
+    );
 }
 
 #[tokio::test]

@@ -1212,8 +1212,13 @@ impl ConnectedChat {
             .await
             .unwrap();
         let status = response.status();
-        let body: Value = response.json().await.unwrap();
-        assert!(status.is_success(), "{path}: {status} {body}");
+        let bytes = response.bytes().await.unwrap();
+        assert!(
+            status.is_success(),
+            "{path}: {status} {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
         body
     }
 }
@@ -1364,11 +1369,11 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         server_api::authorization::subject_default_delegation_assignment()
     );
     assert!(created_policy.legacy_constraints.is_none());
-    // Adopt that same shared default through T-838's only writer. No individual
-    // conversation/Ticket ID grant is appended before the real Controller runs.
+    // Shared adoption cannot rewrite the Subject's creation assignment or identity.
+    // No individual conversation/Ticket ID grant is appended before Controller launch.
     adopt_chat_defaults(&f.api, &f.owner).await;
     let initial = store.current_subject_policy(&subject).unwrap().unwrap();
-    assert_eq!(initial.execution, created_policy.execution);
+    assert_eq!(initial, created_policy);
     assert!(initial.legacy_constraints.is_none());
     let conversation = f
         .post(
@@ -1378,7 +1383,7 @@ async fn chat_public_receive_busy_messages_commit_before_next_model_input_and_id
         .await;
     let c = conversation["id"].as_str().unwrap();
     *conversation_id.lock().unwrap() = c.into();
-    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Connected async chat","profile":"builtin:async-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Connected async chat","profile":"builtin:async-chat","authorization":{"kind":"human","assignment":null},"control_operation_id":Uuid::now_v7().to_string(),"initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
     let worker = created["worker_id"].as_str().unwrap();
     let mut events = f.runtime.subscribe_worker_observation().unwrap();
     let first_wire = json!({"operation_id":"connected-first","text":"CHAT_FIRST_USER_CONTENT"});
@@ -1740,7 +1745,7 @@ async fn browser_notify_preserves_ack_id_limits_retry_and_console_next_draft() {
         )
         .await;
     let c = conversation["id"].as_str().unwrap();
-    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Notify Console","profile":"builtin:async-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
+    let created = f.post(&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),json!({"runtime_id":"connected-chat","display_name":"Notify Console","profile":"builtin:async-chat","authorization":{"kind":"human","assignment":null},"control_operation_id":Uuid::now_v7().to_string(),"initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}})).await;
     let worker = created["worker_id"].as_str().unwrap();
     let chat = f
         .post(
@@ -1926,15 +1931,14 @@ async fn console_notify_ack(
     .expect("Console Notify ACK deadline")
 }
 
-/// Use the existing single configuration writer. This is deliberately not a
-/// subject_permissions SQL seed or a second policy store. Conversation operations
-/// still cross the real signed HTTP/Controller boundary in ConnectedChat.
+/// Replace individual policy through the owner Subject domain, independently
+/// of shared configuration adoption. ConnectedChat retains signed HTTP checks.
 pub(super) async fn adopt_chat_policy(
     api: &WorkspaceApi,
     owner: &str,
     subject: &str,
     execution: &str,
-) -> server_api::ConfigurationAdoptionReceipt {
+) -> server_api::authorization::CurrentSubjectPolicy {
     adopt_subject_policy(api, owner, subject, execution, "{}").await
 }
 
@@ -1944,23 +1948,80 @@ pub(super) async fn adopt_subject_policy(
     subject: &str,
     execution: &str,
     delegation: &str,
-) -> server_api::ConfigurationAdoptionReceipt {
-    adopt_chat_configuration(api, owner, Some((subject, execution, delegation))).await
+) -> server_api::authorization::CurrentSubjectPolicy {
+    replace_subject_policy(
+        api,
+        owner,
+        subject,
+        standalone_assignment(execution),
+        standalone_assignment(delegation),
+    )
+    .await
+}
+
+pub(super) async fn replace_subject_policy(
+    api: &WorkspaceApi,
+    owner: &str,
+    subject: &str,
+    execution: feature_permissions::PermissionAssignment,
+    delegation: feature_permissions::PermissionAssignment,
+) -> server_api::authorization::CurrentSubjectPolicy {
+    let workspace = api
+        .store
+        .get_workspace(TEST_WORKSPACE_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let configuration_before = api
+        .config_store
+        .configuration_current(TEST_WORKSPACE_ID, &workspace.owner_account_id)
+        .unwrap();
+    let path = format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permission-policy");
+    let (status, before) = account(api, owner, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    let (status, saved) = account(
+        api,
+        owner,
+        "PUT",
+        &path,
+        Some(json!({
+            "operation_id": Uuid::now_v7().to_string(),
+            "expected_change_id": before["change_id"],
+            "action": { "kind": "replace", "execution": execution,
+                "delegation": delegation }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let configuration_after = api
+        .config_store
+        .configuration_current(TEST_WORKSPACE_ID, &workspace.owner_account_id)
+        .unwrap();
+    assert_eq!(configuration_after.state, configuration_before.state);
+    assert_eq!(
+        configuration_after.history_head,
+        configuration_before.history_head
+    );
+    serde_json::from_value::<server_api::subject_policy::SubjectPermissionPolicyMutationResponse>(
+        saved,
+    )
+    .unwrap()
+    .policy
+    .unwrap()
 }
 
 pub(super) async fn adopt_chat_defaults(
     api: &WorkspaceApi,
     owner: &str,
 ) -> server_api::ConfigurationAdoptionReceipt {
-    // No assignment edit: carry the persisted creation default through the
-    // normal migration, rather than granting anything after Subject creation.
-    adopt_chat_configuration(api, owner, None).await
+    // Adopt shared configuration only; existing Subject policy is not a
+    // configuration projection and must remain unchanged.
+    adopt_chat_configuration(api, owner).await
 }
 
 async fn adopt_chat_configuration(
     api: &WorkspaceApi,
     owner: &str,
-    replacement: Option<(&str, &str, &str)>,
 ) -> server_api::ConfigurationAdoptionReceipt {
     let catalog = WorkspaceServerApi::new(api.config.clone(), api.store.clone());
     catalog
@@ -1991,69 +2052,6 @@ async fn adopt_chat_configuration(
         String::from_utf8_lossy(&bytes)
     );
     let source: server_api::ConfigurationSourceResponse = serde_json::from_slice(&bytes).unwrap();
-    let changes = replacement
-        .map(|(subject, execution, delegation)| {
-            let needle = format!("subject_id = {}", serde_json::to_string(subject).unwrap());
-            let matches: Vec<_> = source
-                .state
-                .snapshot
-                .entries
-                .iter()
-                .filter(|(path, entry)| {
-                    path.starts_with("permissions/") && entry.content.contains(&needle)
-                })
-                .collect();
-            assert_eq!(
-                matches.len(),
-                1,
-                "fixture Subject has one defining generated policy record"
-            );
-            let (policy_path, policy_file) = matches[0];
-            let position = policy_file.content.find(&needle).unwrap();
-            let start = policy_file.content[..position].rfind('{').unwrap();
-            let mut depth = 0usize;
-            let mut quoted = false;
-            let mut escaped = false;
-            let end = policy_file.content[start..]
-                .char_indices()
-                .find_map(|(offset, ch)| {
-                    if quoted {
-                        if escaped {
-                            escaped = false;
-                        } else if ch == '\\' {
-                            escaped = true;
-                        } else if ch == '"' {
-                            quoted = false;
-                        }
-                    } else {
-                        match ch {
-                            '"' => quoted = true,
-                            '{' => depth += 1,
-                            '}' => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    return Some(start + offset + 1);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    None
-                })
-                .expect("generated fixture policy record is balanced");
-            let mut content = policy_file.content.clone();
-            content.replace_range(
-                start..end,
-                &format!("{{ {needle}; execution = {execution}; delegation = {delegation}; }}"),
-            );
-            server_api::ConfigTreeChange::Update {
-                path: policy_path.clone(),
-                expected_digest: policy_file.content_digest.clone(),
-                content,
-            }
-        })
-        .into_iter()
-        .collect();
     let request = server_api::ConfigurationAdoptionRequest {
         operation_id: Uuid::now_v7().to_string(),
         expected_head: source.history_head,
@@ -2062,7 +2060,7 @@ async fn adopt_chat_configuration(
         source: server_api::ConfigCommitRequest {
             base_digest: source.state.snapshot.digest.clone(),
             entrypoints: source.state.contract.entrypoints,
-            changes,
+            changes: vec![],
         },
     };
     let response = app
@@ -2092,7 +2090,7 @@ async fn adopt_chat_configuration(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chat_canonical_shared_set_persists_read_send_and_revocation_denies_saved_replay() {
     let f = Fixture::new().await;
-    f.adopt_policy(r#"{ sets = ["subject-default"]; }"#, "{}")
+    f.adopt_policy(r#"{ sets = ["conversation", "work-coordination"]; }"#, "{}")
         .await;
     let c = conversation(&f, &f.subject, "canonical-chat").await;
     let input = user(&f, &c.id, "canonical-user", "normal input").await;
@@ -2103,17 +2101,17 @@ async fn chat_canonical_shared_set_persists_read_send_and_revocation_denies_save
         worker_chat(&f, &f.source, read(&c.id)).await.0,
         StatusCode::OK
     );
-    let store = open_subjektiv_store(&f.api).unwrap();
-    assert!(
-        store
-            .current_subject_policy(&f.subject)
+    assert_eq!(
+        f.api
+            .config_store
+            .current_subject_permission_policy(TEST_WORKSPACE_ID, &f.subject)
             .unwrap()
             .unwrap()
-            .change_id
-            .starts_with("configuration:")
+            .execution,
+        standalone_assignment(r#"{ sets = ["conversation", "work-coordination"]; }"#)
     );
     assert_eq!(page(&f, &c.id).await.messages.len(), 2);
-    f.adopt_policy(r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "chat"; keys = ["chat.send"]; }]; }"#, "{}").await;
+    f.adopt_policy(r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "chat"; keys = ["chat.send"]; }]; }"#, "{}").await;
     assert_eq!(
         worker_chat(&f, &f.source, sent.clone()).await.0,
         StatusCode::FORBIDDEN
@@ -2137,7 +2135,7 @@ async fn chat_waiting_admission_rechecks_canonical_revocation_body_release_and_f
     for boundary in ["policy", "body", "feature"] {
         for is_read in [false, true] {
             let f = Arc::new(Fixture::new().await);
-            f.adopt_policy(r#"{ sets = ["subject-default"]; }"#, "{}")
+            f.adopt_policy(r#"{ sets = ["conversation", "work-coordination"]; }"#, "{}")
                 .await;
             let c = conversation(&f, &f.subject, "waiting-chat").await;
             let saved = send(&c.id, "saved-before-wait", None);

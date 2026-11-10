@@ -1,22 +1,20 @@
-//! Read-only preparation of an editable Workspace permission migration draft.
+//! Read-only preparation of a Workspace permission migration draft.
 //!
-//! The authenticated owner boundary lives in Server/core. This helper checks the
-//! guarded stores and exact Workspace attribution, but neither saves the draft nor
-//! seals the legacy writer. Adoption must check `original`, the actual editing
-//! head and export identity/digest again, and reject blocking diagnostics before
-//! sealing. A successful preview alone is not permission authority.
+//! Native exports supply Subject policies; configuration supplies only shared
+//! sets and the human Worker default. Preview neither saves the draft nor seals
+//! the legacy writer. Adoption must recheck source, head and export identity.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use config_source::{
-    ConfigContentType, ConfigTreeChange, ConfigTreeSnapshot, SnapshotEnvironment,
-    ToolchainContract, VirtualPath, WorkspaceConfigSchemaBundle,
+    ConfigContentType, ConfigTreeChange, EvaluationResult, SnapshotEnvironment, ToolchainContract,
+    VirtualPath, WorkspaceConfigSchemaBundle,
 };
 use feature_permissions::{NamespacePermissions, PermissionHost};
 use subjektiv::{PermissionTransferSnapshot, SubjektivStore};
 
 use crate::config_source::{
-    ConfigCommitRequest, MAIN_CONFIG_ENTRYPOINT, WorkspaceConfigState,
+    EvaluatedConfigCandidate, MAIN_CONFIG_ENTRYPOINT, WorkspaceConfigState,
     validate_workspace_config_candidate_projections,
 };
 use crate::policy_config::{
@@ -42,14 +40,11 @@ pub(crate) fn preview_migration(
     if legacy.scope_id() != workspace || host.catalog().workspace.as_str() != workspace {
         return Err(Error::WorkspaceIdMismatch);
     }
-    // This API validates native physical identity under the FeatureDatabase guard.
-    // Do not replace it with path inspection or SQL against the legacy database.
     let identity = legacy.database_identity().map_err(legacy_error)?;
     if identity.scope_id != workspace || identity.feature_id != subjektiv::SUBJEKTIV_FEATURE_ID {
         return Err(Error::WorkspaceIdMismatch);
     }
     let original = store.with_conn(|conn| {
-        // with_conn also owns the managed Server catalog identity/retention guard.
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM workspaces WHERE workspace_id=?1 AND state='active')",
             [workspace],
@@ -70,46 +65,40 @@ pub(crate) fn preview_migration(
             "legacy export identity changed".into(),
         ));
     }
-    let (policies, diagnostics) = migrate_policies(host, &snapshot)?;
-    let source = PermissionSource {
-        subjects: policies
-            .values()
-            .map(|policy| policy.source.clone())
-            .collect(),
-        remove_subjects: vec![],
-        ..Default::default()
+    let before = SnapshotEnvironment::new(original.snapshot.clone())
+        .evaluate_contract(&original.contract)
+        .map_err(|error| {
+            Error::InvalidInput(format!(
+                "cannot inspect current migration source: {error:?}"
+            ))
+        })?;
+    // Explicit old individual source is never an instruction to grant or revoke.
+    // Until source-range removal is available, block instead of publishing a copy
+    // of it in a new active wrapper. Schema-injected empty defaults are not source.
+    let mut source = shared_source_for_migration(&original, &before)?;
+    let references_changed = policy_config::migrate_source_references(&mut source);
+    let changes = if references_changed {
+        reference_migration_changes(&original, &source)?
+    } else {
+        vec![]
     };
-    let changes = draft_changes(&original, &source)?;
-    // Caller's real application provider bundle (including PromptSchema) is
-    // required: a migration-specific substitute cannot validate other settings.
-    let candidate = store.evaluate_workspace_config_candidate_with_schema(
-        workspace,
-        &ConfigCommitRequest {
-            base_digest: original.snapshot.digest.clone(),
-            changes,
-            entrypoints: vec![path(MAIN_CONFIG_ENTRYPOINT)?],
-        },
-        schema,
+    let candidate = store.with_conn(|conn| {
+        let tx = conn.unchecked_transaction()?;
+        evaluate_migration_candidate(&tx, workspace, &original, &changes, schema)
+    })?;
+    crate::config_adoption::semantic_references::prove_reference_only(
+        &before,
+        &candidate.evaluation,
     )?;
     validate_workspace_config_candidate_projections(workspace, &candidate)?;
     let evaluated_source = policy_config::source(&candidate.evaluation)?;
     if evaluated_source != source {
         return Err(Error::InvalidInput(
-            "migration import did not produce the exact generated Subject assignments".into(),
+            "migration changed shared permission configuration beyond the exact mapping".into(),
         ));
     }
-    let subjects: BTreeSet<_> = snapshot
-        .sources
-        .iter()
-        .map(|item| item.subject_id.as_str())
-        .collect();
-    policy_config::validate_source(host, &evaluated_source, |subject| {
-        if subjects.contains(subject) {
-            Ok(())
-        } else {
-            Err(Error::SubjektivSubjectNotFound(subject.into()))
-        }
-    })?;
+    let configured = policy_config::configured_host(host, &evaluated_source)?;
+    let (policies, diagnostics) = migrate_policies(&configured, &snapshot)?;
     let state = WorkspaceConfigState {
         snapshot: candidate.snapshot,
         contract: candidate.contract,
@@ -130,6 +119,155 @@ fn legacy_error(error: subjektiv::SubjektivError) -> Error {
 
 fn path(value: &str) -> Result<VirtualPath> {
     VirtualPath::parse(value).map_err(|error| Error::InvalidInput(error.to_string()))
+}
+
+/// The stored toolchain, never a failed current decode, selects legacy decoding.
+pub(crate) fn shared_source_for_migration(
+    current: &WorkspaceConfigState,
+    before: &EvaluationResult,
+) -> Result<PermissionSource> {
+    let old_schema = current
+        .contract
+        .schema_bundle
+        .contributions
+        .iter()
+        .any(|provider| {
+            provider.provider_id == "builtin:permissions"
+                && provider
+                    .version
+                    .parse::<u32>()
+                    .is_ok_and(|version| version <= 3)
+        });
+    let source = if old_schema {
+        let old = policy_config::legacy_source(before)?;
+        if !old.remove_subjects.is_empty() {
+            return Err(Error::WorkspaceConfigConflict(
+                "legacy remove_subjects requires a durable Subject-domain removal fence before source migration; no policy was recreated".into(),
+            ));
+        }
+        if !old.subjects.is_empty() {
+            return Err(individual_source_conflict());
+        }
+        ensure_no_individual_source(current)?;
+        old.shared_source()
+    } else {
+        policy_config::source(before)?
+    };
+    Ok(source)
+}
+
+fn individual_source_conflict() -> Error {
+    Error::WorkspaceConfigConflict(
+        "legacy individual Subject source requires typed source-range removal; configuration bytes and current domain policies were not changed".into(),
+    )
+}
+
+fn ensure_no_individual_source(current: &WorkspaceConfigState) -> Result<()> {
+    let open = ToolchainContract::with_schema_bundle(
+        current.contract.schema_version,
+        current.contract.entrypoints.clone(),
+        current.contract.import_policy_version,
+        WorkspaceConfigSchemaBundle::empty(),
+    );
+    let raw = SnapshotEnvironment::new(current.snapshot.clone())
+        .evaluate_contract(&open)
+        .map_err(|error| Error::WorkspaceConfigConflict(format!(
+            "cannot prove absence of individual Subject source without schema defaults: {error:?}; source was not changed"
+        )))?;
+    if raw.projections.iter().any(|projection| {
+        projection
+            .data_json
+            .get("permissions")
+            .is_some_and(|permissions| {
+                permissions.get("subjects").is_some()
+                    || permissions.get("remove_subjects").is_some()
+            })
+    }) {
+        return Err(individual_source_conflict());
+    }
+    Ok(())
+}
+
+/// Reevaluate unchanged authored expressions without passing through the owner
+/// writer's object normalizer. Changed wrappers use normal candidate validation.
+pub(crate) fn evaluate_migration_candidate(
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    original: &WorkspaceConfigState,
+    changes: &[ConfigTreeChange],
+    schema: WorkspaceConfigSchemaBundle,
+) -> Result<EvaluatedConfigCandidate> {
+    let permissions = schema
+        .contributions
+        .into_iter()
+        .find(|provider| provider.provider_id == "builtin:permissions" && provider.version == "4")
+        .ok_or_else(|| Error::WorkspaceConfigConflict(
+            "permission migration requires the current shared-only schema; legacy frozen targets require explicit recovery".into(),
+        ))?;
+    // A permission representation change must not adopt unrelated live defaults
+    // (for example a rebuilt bundled prompt) into the saved configuration.
+    let providers = original
+        .contract
+        .schema_bundle
+        .contributions
+        .iter()
+        .filter(|provider| provider.provider_id != "builtin:permissions")
+        .cloned()
+        .chain(std::iter::once(permissions));
+    let schema = WorkspaceConfigSchemaBundle::compose(providers)
+        .map_err(|error| Error::InvalidInput(error.to_string()))?;
+    let base_identity = crate::config_source::load_evaluation_identity(tx, workspace)?;
+    if !changes.is_empty() {
+        let staged = WorkspaceConfigState {
+            snapshot: original
+                .snapshot
+                .apply(changes)
+                .map_err(|error| Error::InvalidInput(error.to_string()))?,
+            ..original.clone()
+        };
+        return crate::config_source::evaluate_candidate_in_transaction(
+            tx,
+            workspace,
+            staged,
+            base_identity,
+            &[],
+            schema,
+        );
+    }
+    let (contract, evaluation) = if schema
+        .contributions
+        .iter()
+        .any(|provider| provider.provider_id == "builtin:plugins")
+    {
+        let (contract, evaluation, _) = crate::plugin_settings::evaluate_catalog_config(
+            tx,
+            workspace,
+            &original.snapshot,
+            schema,
+        )?;
+        (contract, evaluation)
+    } else {
+        let contract = ToolchainContract::with_schema_bundle(
+            original.contract.schema_version,
+            original.contract.entrypoints.clone(),
+            original.contract.import_policy_version,
+            schema,
+        );
+        let evaluation = SnapshotEnvironment::new(original.snapshot.clone())
+            .evaluate_contract(&contract)
+            .map_err(|error| {
+                Error::InvalidInput(format!("cannot reevaluate migration source: {error:?}"))
+            })?;
+        (contract, evaluation)
+    };
+    Ok(EvaluatedConfigCandidate {
+        base_digest: original.snapshot.digest.clone(),
+        base_toolchain_fingerprint: base_identity.0,
+        base_projection_digest: base_identity.1,
+        snapshot: original.snapshot.clone(),
+        contract,
+        evaluation,
+    })
 }
 
 fn migrate_policies(
@@ -155,42 +293,41 @@ fn migrate_policies(
                 ));
             }
             let policy = AdoptedSubjectPolicy::from_current(&item.subject_id, current);
-            policy_config::validate_source(
-                host,
-                &PermissionSource {
-                    subjects: vec![policy.source.clone()],
-                    remove_subjects: vec![],
-                    ..Default::default()
-                },
-                |_| Ok(()),
-            )?;
+            policy_config::validate_assignment(host, &policy.source.execution)?;
+            policy_config::validate_assignment(host, &policy.source.delegation)?;
             policies.insert(item.subject_id.clone(), policy);
             continue;
         }
-        // None stays unset. In particular, never enroll it in a default Set.
+        // Unset stays unset, including on retries. Creation defaults are not migration.
         let Some(legacy) = &item.permissions else {
             continue;
         };
         let (policy, mut converted) =
             policy_config::migrate_subject(host, &item.subject_id, legacy)?;
         policies.insert(item.subject_id.clone(), policy);
-        // ExplicitConfigurationRequired must survive preview, even though the
-        // unsupported operation is absent from the editable assignment. Core must
-        // block adoption on it; this is not a silently successful conversion.
         diagnostics.append(&mut converted);
     }
     Ok((policies, diagnostics))
 }
 
-/// Creation-only additive virtual-source edit. Keep the original main text at
-/// the same virtual directory (so relative imports retain meaning), and leave all
-/// other existing entries unchanged. Decodal performs patch/array composition;
-/// ordinary adoption applies its existing formatter and whole-source validation.
-/// No evaluated configuration values are rendered back over user-authored source.
-pub(crate) fn enrollment_changes(
+/// Only shared references may be rendered. Original individual records must stay
+/// in content history, not in any newly published active source file.
+pub(crate) fn reference_migration_changes(
     current: &WorkspaceConfigState,
-    subject: &policy_config::SubjectAssignmentSource,
+    source: &PermissionSource,
 ) -> Result<Vec<ConfigTreeChange>> {
+    ensure_no_individual_source(current)?;
+    // Evaluation alone cannot prove that a dead branch, imported array or unused
+    // binding contains no individual records. Without an AST removal API, a
+    // conservative textual guard may reject harmless comments, but must never
+    // copy potentially individual source into a newly active wrapper.
+    if current.snapshot.entries.values().any(|entry| {
+        ["subject_id", "subjects", "remove_subjects"]
+            .iter()
+            .any(|field| entry.content.contains(field))
+    }) {
+        return Err(individual_source_conflict());
+    }
     let main_path = path(MAIN_CONFIG_ENTRYPOINT)?;
     let main = current.snapshot.get(&main_path).ok_or_else(|| {
         Error::RegistryInconsistency("workspace config tree has no main.dcdl".into())
@@ -203,267 +340,49 @@ pub(crate) fn enrollment_changes(
     let before = SnapshotEnvironment::new(current.snapshot.clone())
         .evaluate_contract(&current.contract)
         .map_err(|error| {
-            Error::InvalidInput(format!("cannot inspect enrollment source: {error:?}"))
-        })?;
-    let addition = format!(
-        "{{ subject_id = {}; execution = {}; delegation = {}; }}",
-        quote(&subject.subject_id),
-        render_assignment(&subject.execution),
-        render_assignment(&subject.delegation)
-    );
-    // Source-only locator, never authority. It names an ordinary editable virtual
-    // array source imported by main.dcdl. The whole-source additive proof below
-    // prevents stale/unreferenced/owner-modified markers from changing policy.
-    const MARKER: &str = "# Subject creation additions source: ";
-    let locator = main
-        .content
-        .lines()
-        .map(str::trim)
-        .nth(1)
-        .and_then(|line| line.strip_prefix(MARKER))
-        .map(|raw| {
-            serde_json::from_str::<String>(raw)
-                .map_err(|error| Error::InvalidInput(error.to_string()))
-        })
-        .transpose()?;
-    let changes = if let Some(locator) = locator {
-        let additions_path = path(&locator)?;
-        let additions = current.snapshot.get(&additions_path).ok_or_else(|| {
-            Error::InvalidInput(
-                "enrollment source locator no longer exists; reconcile source explicitly".into(),
-            )
-        })?;
-        if additions.content_type != ConfigContentType::Decodal {
-            return Err(Error::InvalidInput(
-                "enrollment source is not Decodal".into(),
-            ));
-        }
-        // Concatenate in the same source, without nested imports/let environments
-        // per creation. Existing text/comments are not parsed or rewritten here.
-        vec![ConfigTreeChange::Update {
-            path: additions_path,
-            expected_digest: additions.content_digest.clone(),
-            content: format!("{}\n++ [{addition}]\n", additions.content),
-        }]
-    } else {
-        let unused = |stem: &str| -> Result<VirtualPath> {
-            for suffix in 0..=current.snapshot.entries.len() {
-                let name = if suffix == 0 {
-                    format!("{stem}.dcdl")
-                } else {
-                    format!("{stem}-{suffix}.dcdl")
-                };
-                let candidate = path(&name)?;
-                if current.snapshot.get(&candidate).is_none() {
-                    return Ok(candidate);
-                }
-            }
-            unreachable!("N entries cannot occupy N+1 distinct paths")
-        };
-        // Keep the old entrypoint text in the SAME virtual directory so all its
-        // relative imports retain meaning. No host paths, values-only JSON copy,
-        // alternate policy storage or per-Subject import chain is introduced.
-        let base_path = unused("subject-enrollment-base")?;
-        let additions_path = unused("permissions/subject-enrollment")?;
-        let base_import = format!("(import {})", quote(&format!("./{}", base_path.as_str())));
-        let additions_import = format!(
-            "(import {})",
-            quote(&format!("./{}", additions_path.as_str()))
-        );
-        let root = before
-            .projections
-            .first()
-            .and_then(|p| p.data_json.as_object())
-            .ok_or_else(|| Error::InvalidInput("Workspace projection is not an object".into()))?;
-        let empty = root
-            .get("permissions")
-            .and_then(|p| p.get("subjects"))
-            .and_then(|value| value.as_array())
-            .is_some_and(Vec::is_empty);
-        let previous = if empty {
-            "[]".to_owned()
-        } else {
-            format!("{base_import}.permissions.subjects")
-        };
-        let mut content = format!("{{\n    {MARKER}{}\n", quote(additions_path.as_str()));
-        for key in root.keys() {
-            // Registered application schema supplies root field names. Existing
-            // Decodal evaluation validates these references, not a Feature table.
-            if key == "permissions" {
-                content.push_str(&format!("    permissions = ({base_import}.permissions // {{ subjects = {previous} ++ {additions_import}; }});\n"));
-            } else {
-                content.push_str(&format!("    {key} = {base_import}.{key};\n"));
-            }
-        }
-        content.push_str("} as WorkspaceConfigSchema\n");
-        vec![
-            ConfigTreeChange::Create {
-                path: base_path,
-                content_type: ConfigContentType::Decodal,
-                content: main.content.clone(),
-            },
-            ConfigTreeChange::Create {
-                path: additions_path,
-                content_type: ConfigContentType::Decodal,
-                content: format!("[{addition}]\n"),
-            },
-            ConfigTreeChange::Update {
-                path: main_path,
-                expected_digest: main.content_digest.clone(),
-                content,
-            },
-        ]
-    };
-    let candidate = current
-        .snapshot
-        .apply(&changes)
-        .map_err(|error| Error::InvalidInput(error.to_string()))?;
-    let mut evaluated = SnapshotEnvironment::new(candidate)
-        .evaluate_contract(&current.contract)
-        .map_err(|error| {
-            Error::InvalidInput(format!("cannot compose enrollment source: {error:?}"))
-        })?;
-    for projection in &mut evaluated.projections {
-        let appended = projection
-            .data_json
-            .get_mut("permissions")
-            .and_then(|p| p.get_mut("subjects"))
-            .and_then(|value| value.as_array_mut())
-            .and_then(Vec::pop);
-        if appended
-            .as_ref()
-            .and_then(|p| p.get("subject_id"))
-            .and_then(|value| value.as_str())
-            != Some(subject.subject_id.as_str())
-        {
-            return Err(Error::InvalidInput(
-                "enrollment did not append the exact new Subject; source was not changed".into(),
-            ));
-        }
-    }
-    if evaluated
-        .projections
-        .iter()
-        .map(|p| (&p.entrypoint, &p.data_json))
-        .collect::<Vec<_>>()
-        != before
-            .projections
-            .iter()
-            .map(|p| (&p.entrypoint, &p.data_json))
-            .collect::<Vec<_>>()
-    {
-        return Err(Error::InvalidInput(
-            "enrollment changed existing configuration; source was not changed".into(),
-        ));
-    }
-    Ok(changes)
-}
-
-fn draft_changes(
-    original: &WorkspaceConfigState,
-    source: &PermissionSource,
-) -> Result<Vec<ConfigTreeChange>> {
-    // Evaluate with the existing open schema, not application defaults. This
-    // distinguishes an explicit `permissions = {}` (including imports/dotted
-    // fields) from an omitted field without introducing another Decodal parser.
-    let open_contract = ToolchainContract::with_schema_bundle(
-        original.contract.schema_version,
-        original.contract.entrypoints.clone(),
-        original.contract.import_policy_version,
-        WorkspaceConfigSchemaBundle::empty(),
-    );
-    let raw = SnapshotEnvironment::new(original.snapshot.clone())
-        .evaluate_contract(&open_contract)
-        .map_err(|diagnostics| {
             Error::InvalidInput(format!(
-                "cannot inspect current configuration before permission migration: {diagnostics:?}"
+                "cannot inspect reference migration source: {error:?}"
             ))
         })?;
-    if raw
+    let root = before
         .projections
-        .iter()
-        .any(|projection| projection.data_json.get("permissions").is_some())
-    {
-        return Err(Error::InvalidInput(
-            "current source explicitly defines permissions; automatic migration cannot merge or replace it; preserve and reconcile that source explicitly".into(),
-        ));
+        .first()
+        .and_then(|projection| projection.data_json.as_object())
+        .ok_or_else(|| Error::InvalidInput("Workspace projection is not an object".into()))?;
+    let mut base = None;
+    for suffix in 0..=current.snapshot.entries.len() {
+        let candidate = path(&format!("permission-references-base-{suffix}.dcdl"))?;
+        if current.snapshot.get(&candidate).is_none() {
+            base = Some(candidate);
+            break;
+        }
     }
-    let generated_path = unused_source_path(&original.snapshot)?;
-    let main_path = path(MAIN_CONFIG_ENTRYPOINT)?;
-    let main = original.snapshot.get(&main_path).ok_or_else(|| {
-        Error::RegistryInconsistency("workspace config tree has no main.dcdl".into())
-    })?;
-    if main.content_type != ConfigContentType::Decodal {
-        return Err(Error::InvalidInput(
-            "main.dcdl is not Decodal source".into(),
-        ));
+    let base = base.expect("N entries cannot occupy N+1 distinct paths");
+    let inherited = format!("(import {})", quote(&format!("./{}", base.as_str())));
+    let mut wrapper = String::from("{\n");
+    for key in root.keys() {
+        if key != "permissions" {
+            wrapper.push_str(&format!("    {key} = {inherited}.{key};\n"));
+        }
     }
-    // Use the existing syntax formatter to supply a final field separator when
-    // needed. It preserves comments; no local lexer or alternate language rules.
-    let formatted_main = SnapshotEnvironment::new(original.snapshot.clone())
-        .format(&main.content)
-        .map_err(|error| {
-            Error::InvalidInput(format!("cannot format migration entrypoint: {error}"))
-        })?;
-    let (rendered, mut changes) =
-        render_permission_source(source, &original.snapshot, &generated_path)?;
-    changes.extend([
+    wrapper.push_str(&format!(
+        "    permissions = {};\n}} as WorkspaceConfigSchema\n",
+        render_permission_source(source),
+    ));
+    Ok(vec![
         ConfigTreeChange::Create {
-            path: generated_path.clone(),
+            path: base,
             content_type: ConfigContentType::Decodal,
-            content: rendered,
+            content: main.content.clone(),
         },
         ConfigTreeChange::Update {
             path: main_path,
             expected_digest: main.content_digest.clone(),
-            content: append_import(&formatted_main, &generated_path)?,
+            content: wrapper,
         },
-    ]);
-    Ok(changes)
+    ])
 }
 
-fn unused_source_path(snapshot: &ConfigTreeSnapshot) -> Result<VirtualPath> {
-    // With N entries, one of these N+1 names is unused. Never overwrite even an
-    // unreferenced preexisting migration file.
-    for suffix in 0..=snapshot.entries.len() {
-        let name = if suffix == 0 {
-            "permissions/migrated.dcdl".to_owned()
-        } else {
-            format!("permissions/migrated-{suffix}.dcdl")
-        };
-        let candidate = path(&name)?;
-        if snapshot.get(&candidate).is_none() {
-            return Ok(candidate);
-        }
-    }
-    unreachable!("N entries cannot occupy N+1 distinct migration paths")
-}
-
-fn append_import(source: &str, imported: &VirtualPath) -> Result<String> {
-    // Materialized main.dcdl is a literal outer object with a trailing schema
-    // assertion. Limit this edit to that existing representation: no rewrites of
-    // arbitrary expressions, no JSON round-trip, no replacement of other fields.
-    let trimmed = source.trim_end();
-    let object = trimmed
-        .strip_suffix("as WorkspaceConfigSchema")
-        .map(str::trim_end)
-        .unwrap_or(trimmed);
-    if !object.starts_with('{') || !object.ends_with('}') {
-        return Err(Error::InvalidInput(
-            "permission migration requires main.dcdl's outer object before its WorkspaceConfigSchema assertion; existing source was not changed".into(),
-        ));
-    }
-    let close = object.len() - 1;
-    let import = quote(&format!("./{}", imported.as_str()));
-    Ok(format!(
-        "{}\n    permissions = import {import};\n{}",
-        &source[..close],
-        &source[close..]
-    ))
-}
-
-// A deliberately specific, payload-free renderer. JSON quoting is used only for
-// string literals, never as a renderer for the configuration/assignment objects.
 fn quote(value: &str) -> String {
     serde_json::to_string(value).expect("a string serializes")
 }
@@ -500,89 +419,31 @@ fn render_assignment(source: &AssignmentSource) -> String {
     )
 }
 
-/// Render identifiers without the Decodal 0.4 string lexer's non-ASCII byte
-/// corruption. The existing virtual Markdown value-import route supplies exact
-/// UTF-8 content; it is ordinary editable configuration source, not a policy DB
-/// or a host-file lookup. Never use unsupported JSON Unicode escapes (which that
-/// lexer accepts but changes into literal `uXXXX`). ASCII catalog keys stay typed
-/// string literals. All generated files participate in the same adoption request.
-fn render_permission_source(
-    source: &PermissionSource,
-    snapshot: &ConfigTreeSnapshot,
-    containing: &VirtualPath,
-) -> Result<(String, Vec<ConfigTreeChange>)> {
-    let mut changes = Vec::new();
-    let mut strings = BTreeMap::<String, VirtualPath>::new();
-    let mut literal = |value: &str| -> Result<String> {
-        server_api::authorization::validate_authorization_identifier(value)
-            .map_err(Error::InvalidInput)?;
-        if value.is_ascii() {
-            return Ok(quote(value));
-        }
-        let imported = if let Some(path) = strings.get(value) {
-            path.clone()
-        } else {
-            let mut free = None;
-            for suffix in 0..=snapshot.entries.len() + strings.len() {
-                let candidate = path(&format!("{}.string-{suffix}.md", containing.as_str()))?;
-                if snapshot.get(&candidate).is_none()
-                    && !strings.values().any(|path| *path == candidate)
-                {
-                    free = Some(candidate);
-                    break;
-                }
-            }
-            let imported = free.expect("N entries cannot occupy N+1 distinct literal paths");
-            changes.push(ConfigTreeChange::Create {
-                path: imported.clone(),
-                content_type: ConfigContentType::Text,
-                content: value.to_owned(),
-            });
-            strings.insert(value.to_owned(), imported.clone());
-            imported
-        };
-        // This is a sibling of the containing virtual Decodal source. Input IDs
-        // are content only, never path components or import authority.
-        let sibling = imported
-            .as_str()
-            .rsplit('/')
-            .next()
-            .expect("validated virtual path");
-        Ok(format!(
-            "(import {}).content",
-            quote(&format!("./{sibling}"))
-        ))
-    };
-    let subjects = source
-        .subjects
+fn render_permission_source(source: &PermissionSource) -> String {
+    let sets = source
+        .sets
         .iter()
-        .map(|item| {
-            Ok(format!(
-                "        {{ subject_id = {}; execution = {}; delegation = {}; }}",
-                literal(&item.subject_id)?,
-                render_assignment(&item.execution),
-                render_assignment(&item.delegation)
-            ))
+        .map(|set| {
+            format!(
+                "{{ id = {}; sets = {}; namespaces = {}; }}",
+                quote(set.id.as_str()),
+                render_strings(set.sets.iter().map(|set| set.as_str())),
+                render_namespaces(&set.namespaces),
+            )
         })
-        .collect::<Result<Vec<_>>>()?
-        .join(",\n");
-    let removals = source
-        .remove_subjects
-        .iter()
-        .map(|id| literal(id))
-        .collect::<Result<Vec<_>>>()?
+        .collect::<Vec<_>>()
         .join(", ");
-    let rendered = format!(
-        "{{\n    subjects = [\n{subjects}\n    ];\n    remove_subjects = [{removals}];\n}}\n"
-    );
-    Ok((rendered, changes))
+    format!(
+        "{{ sets = [{sets}]; human_worker_default = {}; }}",
+        render_assignment(&source.human_worker_default)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config_source::WorkspaceConfigSchemaProvider;
-    use config_source::{ConfigEntry, EvaluationResult};
+    use config_source::{ConfigEntry, ConfigTreeSnapshot};
     use feature_permissions::{
         FeatureIdentity, NamespaceDeclaration, NamespaceId, PermissionDefinition, PermissionKey,
         PermissionSetId, WorkspaceId,
@@ -649,30 +510,20 @@ mod tests {
         }
     }
 
-    fn current(main: &str, extra: Vec<ConfigEntry>) -> WorkspaceConfigState {
+    fn current(main: &str) -> WorkspaceConfigState {
         let mut current = crate::config_source::initial_state().unwrap();
-        let mut entries = vec![
-            ConfigEntry::new(
-                path(MAIN_CONFIG_ENTRYPOINT).unwrap(),
-                ConfigContentType::Decodal,
-                main,
-            )
-            .unwrap(),
-        ];
-        entries.extend(extra);
-        current.snapshot = ConfigTreeSnapshot::from_entries(entries).unwrap();
+        current.snapshot = ConfigTreeSnapshot::from_entries([ConfigEntry::new(
+            path(MAIN_CONFIG_ENTRYPOINT).unwrap(),
+            ConfigContentType::Decodal,
+            main,
+        )
+        .unwrap()])
+        .unwrap();
         current
     }
 
-    fn evaluate(snapshot: ConfigTreeSnapshot) -> EvaluationResult {
-        let contract = crate::config_source::initial_state().unwrap().contract;
-        SnapshotEnvironment::new(snapshot)
-            .evaluate_contract(&contract)
-            .unwrap()
-    }
-
     #[test]
-    fn unset_empty_and_limited_policies_keep_change_identity_and_constraints() {
+    fn native_unset_empty_and_limited_policies_keep_identity_and_constraints_without_config_ids() {
         let empty = SubjectPermissions {
             change_id: "explicit-empty".into(),
             execution: vec![],
@@ -701,6 +552,8 @@ mod tests {
             },
         ]);
         let host = host(false);
+        let original = current("{ } as WorkspaceConfigSchema");
+        let before = original.clone();
         let (policies, diagnostics) = migrate_policies(&host, &snapshot).unwrap();
         assert!(!policies.contains_key("unset"));
         assert_eq!(policies["empty"].change_id, empty.change_id);
@@ -719,6 +572,117 @@ mod tests {
                 .iter()
                 .all(|d| matches!(d, MigrationDiagnostic::DomainConstraint { .. }))
         );
+        let evaluation = SnapshotEnvironment::new(original.snapshot.clone())
+            .evaluate_contract(&original.contract)
+            .unwrap();
+        assert_eq!(
+            shared_source_for_migration(&original, &evaluation).unwrap(),
+            PermissionSource::default()
+        );
+        assert_eq!(original, before);
+        let rendered = render_permission_source(&PermissionSource::default());
+        assert!(!rendered.contains("subject"));
+        for subject in ["unset", "empty", "limited"] {
+            assert!(!rendered.contains(subject));
+        }
+    }
+
+    #[test]
+    fn native_feature_export_maps_old_references_without_mutating_the_snapshot() {
+        use feature_permissions::{PermissionAssignment, PermissionReference, SetContribution};
+        use server_api::authorization::{CurrentSubjectPolicy, PermissionReferenceEncoding};
+
+        let mut host = PermissionHost::new(WorkspaceId::parse(WORKSPACE).unwrap());
+        let feature = host
+            .register_feature(FeatureIdentity::parse("fixture:current").unwrap())
+            .unwrap();
+        let namespace = host
+            .bind_namespace(&feature, NamespaceId::parse("file").unwrap())
+            .unwrap();
+        host.declare(
+            &namespace,
+            NamespaceDeclaration {
+                permissions: vec![PermissionDefinition {
+                    key: PermissionKey::parse("file.read").unwrap(),
+                    description: String::new(),
+                    children: vec![],
+                }],
+                sets: ["conversation", "work-coordination", "work-execution"]
+                    .into_iter()
+                    .map(|set| SetContribution {
+                        set: PermissionSetId::parse(set).unwrap(),
+                        children: vec![PermissionReference::Namespace(NamespacePermissions {
+                            namespace: NamespaceId::parse("file").unwrap(),
+                            keys: vec![PermissionKey::parse("file.read").unwrap()],
+                        })],
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let constraints = SubjectPermissions {
+            change_id: "keep-feature-change".into(),
+            execution: vec![limited("file.read")],
+            delegation: vec![],
+        };
+        let original = CurrentSubjectPolicy {
+            change_id: constraints.change_id.clone(),
+            execution: PermissionAssignment {
+                grants: vec![PermissionReference::Set(
+                    PermissionSetId::parse("subject-default").unwrap(),
+                )],
+                exclusions: vec![],
+                revoked: false,
+            },
+            delegation: PermissionAssignment {
+                grants: vec![PermissionReference::Namespace(NamespacePermissions {
+                    namespace: NamespaceId::parse("subject").unwrap(),
+                    keys: vec![PermissionKey::parse("subject.delegate").unwrap()],
+                })],
+                exclusions: vec![],
+                revoked: true,
+            },
+            legacy_constraints: Some(constraints.clone()),
+            reference_encoding: Default::default(),
+        };
+        let snapshot = export(vec![PermissionSourceExport {
+            subject_id: "feature-private-id".into(),
+            permissions: None,
+            feature_policy: Some(original.clone()),
+        }]);
+        let frozen = serde_json::to_value(&snapshot).unwrap();
+        let (policies, diagnostics) = migrate_policies(&host, &snapshot).unwrap();
+        assert!(diagnostics.is_empty());
+        let policy = &policies["feature-private-id"];
+        assert_eq!(policy.change_id, "keep-feature-change");
+        assert_eq!(policy.legacy_constraints, Some(constraints));
+        assert_eq!(
+            policy.reference_encoding,
+            PermissionReferenceEncoding::FeatureSetsV2
+        );
+        assert_eq!(
+            policy
+                .source
+                .execution
+                .sets
+                .iter()
+                .map(|set| set.as_str())
+                .collect::<Vec<_>>(),
+            vec!["conversation", "work-coordination"]
+        );
+        assert_eq!(
+            policy
+                .source
+                .delegation
+                .sets
+                .iter()
+                .map(|set| set.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work-execution"]
+        );
+        assert!(policy.source.delegation.revoked);
+        assert_eq!(policy.current(), original.into_current_reference_encoding());
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), frozen);
     }
 
     #[test]
@@ -742,214 +706,79 @@ mod tests {
                 diagnostics,
                 vec![MigrationDiagnostic::ExplicitConfigurationRequired {
                     subject_id: "blocked".into(),
-                    permission,
+                    permission
                 }]
             );
             assert_eq!(policies["blocked"].legacy_constraints, Some(legacy));
             assert!(policies["blocked"].source.execution.namespaces.is_empty());
-            assert!(policies["blocked"].source.execution.sets.is_empty());
         }
     }
 
     #[test]
-    fn renderer_round_trips_sets_namespaces_exclusions_revocation_and_quoted_strings() {
-        let assignment = AssignmentSource {
-            sets: vec![PermissionSetId::parse("shared").unwrap()],
-            namespaces: vec![NamespacePermissions {
-                namespace: NamespaceId::parse("file").unwrap(),
-                keys: vec![PermissionKey::parse("file.read.text").unwrap()],
-            }],
-            exclude_sets: vec![PermissionSetId::parse("excluded").unwrap()],
-            exclude_namespaces: vec![NamespacePermissions {
-                namespace: NamespaceId::parse("file").unwrap(),
-                keys: vec![PermissionKey::parse("file.read").unwrap()],
-            }],
-            revoked: true,
-        };
+    fn shared_renderer_round_trips_exclusions_and_revocation_without_individual_fields() {
         let source = PermissionSource {
-            subjects: vec![policy_config::SubjectAssignmentSource {
-                subject_id: "subject-\"quoted\\日本語".into(),
-                execution: assignment,
-                delegation: AssignmentSource::default(),
+            sets: vec![policy_config::WorkspacePermissionSetSource {
+                id: PermissionSetId::parse("local").unwrap(),
+                sets: vec![],
+                namespaces: vec![],
             }],
-            remove_subjects: vec!["removed".into()],
-            sets: vec![],
-            human_worker_default: AssignmentSource::default(),
+            human_worker_default: AssignmentSource {
+                sets: vec![PermissionSetId::parse("local").unwrap()],
+                exclude_sets: vec![PermissionSetId::parse("excluded").unwrap()],
+                revoked: true,
+                ..Default::default()
+            },
         };
-        let main_path = path(MAIN_CONFIG_ENTRYPOINT).unwrap();
-        let (rendered, mut changes) =
-            render_permission_source(&source, &ConfigTreeSnapshot::empty(), &main_path).unwrap();
-        assert!(rendered.contains("sets = [\"shared\"]"));
-        assert!(rendered.contains("keys = [\"file.read.text\"]"));
-        assert!(!rendered.contains("legacy_constraints"));
-        assert!(rendered.contains(".content"));
-        assert!(
-            matches!(&changes[0], ConfigTreeChange::Create { content, content_type: ConfigContentType::Text, .. } if content == &source.subjects[0].subject_id)
-        );
-        changes.push(ConfigTreeChange::Create {
-            path: main_path,
-            content_type: ConfigContentType::Decodal,
-            content: format!("{{ permissions = {rendered}; }} as WorkspaceConfigSchema"),
-        });
-        let snapshot = ConfigTreeSnapshot::empty().apply(&changes).unwrap();
-        assert_eq!(policy_config::source(&evaluate(snapshot)).unwrap(), source);
-    }
-
-    #[test]
-    fn draft_preserves_main_comments_other_settings_and_existing_migration_files() {
-        let main = "{\n    # permissions in a comment are not a field\n    other = { text = \"brace } and permissions\"; };\n} as WorkspaceConfigSchema\n";
-        let occupied = ConfigEntry::new(
-            path("permissions/migrated.dcdl").unwrap(),
-            ConfigContentType::Decodal,
-            "{ keep = true; }\n",
-        )
-        .unwrap();
-        let original = current(main, vec![occupied.clone()]);
-        let source = PermissionSource::default();
-        let changes = draft_changes(&original, &source).unwrap();
-        let draft = original.snapshot.apply(&changes).unwrap();
-        assert_eq!(draft.get(&occupied.path), Some(&occupied));
-        assert!(
-            draft
-                .get(&path("permissions/migrated-1.dcdl").unwrap())
-                .is_some()
-        );
-        let updated_main = &draft
-            .get(&path(MAIN_CONFIG_ENTRYPOINT).unwrap())
-            .unwrap()
-            .content;
-        assert!(updated_main.contains("# permissions in a comment are not a field"));
-        assert!(updated_main.contains("brace } and permissions"));
-        assert!(updated_main.contains("permissions = import \"./permissions/migrated-1.dcdl\";"));
-        assert!(updated_main.ends_with("} as WorkspaceConfigSchema\n"));
-        let before = evaluate(original.snapshot.clone());
-        let after = evaluate(draft);
-        assert_eq!(
-            after.projections[0].data_json["other"],
-            before.projections[0].data_json["other"]
-        );
-        assert_eq!(policy_config::source(&after).unwrap(), source);
-        assert_eq!(
-            original
-                .snapshot
-                .get(&path(MAIN_CONFIG_ENTRYPOINT).unwrap())
-                .unwrap()
-                .content,
-            main
-        );
-    }
-
-    #[test]
-    fn existing_explicit_permissions_are_not_merged_or_discarded_even_when_empty() {
-        for main in [
-            "{ permissions = {}; } as WorkspaceConfigSchema",
-            "{ permissions.subjects = []; } as WorkspaceConfigSchema",
-            "{ permissions = import \"./permissions/existing.dcdl\"; } as WorkspaceConfigSchema",
-        ] {
-            let existing = ConfigEntry::new(
-                path("permissions/existing.dcdl").unwrap(),
-                ConfigContentType::Decodal,
-                "{ subjects = []; }",
-            )
+        let rendered = render_permission_source(&source);
+        assert!(!rendered.contains("subjects"));
+        assert!(!rendered.contains("subject_id"));
+        let state = current(&format!(
+            "{{ permissions = {rendered}; }} as WorkspaceConfigSchema"
+        ));
+        let evaluation = SnapshotEnvironment::new(state.snapshot)
+            .evaluate_contract(&state.contract)
             .unwrap();
-            let original = current(main, vec![existing]);
-            let before = original.clone();
-            let error = draft_changes(&original, &PermissionSource::default()).unwrap_err();
-            assert!(
-                error.to_string().contains("explicitly defines permissions"),
-                "{error}"
-            );
-            assert_eq!(original, before);
-        }
+        assert_eq!(policy_config::source(&evaluation).unwrap(), source);
     }
 
     #[test]
-    fn enrollment_composes_expression_and_field_sources_without_changing_existing_text() {
-        let bundle = WorkspaceConfigSchemaBundle::compose([
-            policy_config::PermissionConfigSchemaProvider
-                .contribution()
-                .unwrap(),
-            config_source::ConfigSchemaContribution::new(
-                "fixture:other",
-                "other",
-                "1",
-                "{ other = { text = String; }; }",
-            )
-            .unwrap(),
-        ])
+    fn computed_individual_source_blocks_without_copying_or_modifying_bytes() {
+        let state = current(
+            "let old = [{ subject_id = \"private-id\"; }]; in { permissions = { subjects = old; }; } as WorkspaceConfigSchema",
+        );
+        let before = state.clone();
+        let error = reference_migration_changes(&state, &PermissionSource::default()).unwrap_err();
+        assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn current_shared_validation_does_not_look_up_subjects() {
+        policy_config::validate_source(&host(false), &PermissionSource::default(), |_| {
+            panic!("shared configuration must not consult Subject existence")
+        })
         .unwrap();
-        for main in [
-            "# before\n{ other = { text = \"brace }\"; }; permissions = {}; } as WorkspaceConfigSchema\n# after",
-            "# before\nother.text = \"brace }\"; permissions = {}; # after",
-            "let prior = { other.text = \"brace }\"; permissions = {}; }; in prior",
+    }
+
+    #[test]
+    fn provider_schema_and_strict_decoder_exclude_even_empty_individual_fields() {
+        let provider = policy_config::PermissionConfigSchemaProvider
+            .contribution()
+            .unwrap();
+        assert_eq!(provider.version, "4");
+        assert!(!provider.source.contains("subjects"));
+        assert!(!provider.source.contains("subject_id"));
+        for value in [
+            serde_json::json!({"subjects":[]}),
+            serde_json::json!({"remove_subjects":[]}),
         ] {
-            let mut original = current(main, vec![]);
-            original.contract = ToolchainContract::with_schema_bundle(
-                original.contract.schema_version,
-                original.contract.entrypoints.clone(),
-                original.contract.import_policy_version,
-                bundle.clone(),
-            );
-            let subject = policy_config::SubjectAssignmentSource {
-                subject_id: "fresh".into(),
-                execution: AssignmentSource::default(),
-                delegation: AssignmentSource::default(),
-            };
-            let changes = enrollment_changes(&original, &subject).unwrap();
-            let edited = original.snapshot.apply(&changes).unwrap();
-            assert!(
-                edited
-                    .get(&path("subject-enrollment-base.dcdl").unwrap())
+            assert!(serde_json::from_value::<PermissionSource>(value.clone()).is_err());
+            assert_eq!(
+                serde_json::from_value::<policy_config::LegacyPermissionSource>(value)
                     .unwrap()
-                    .content
-                    == main
+                    .shared_source(),
+                PermissionSource::default()
             );
-            let before = SnapshotEnvironment::new(original.snapshot.clone())
-                .evaluate_contract(&original.contract)
-                .unwrap();
-            let after = SnapshotEnvironment::new(edited.clone())
-                .evaluate_contract(&original.contract)
-                .unwrap();
-            assert_eq!(
-                before.projections[0].data_json["other"],
-                after.projections[0].data_json["other"]
-            );
-            assert_eq!(
-                policy_config::source(&after).unwrap().subjects,
-                vec![subject]
-            );
-            original.snapshot = edited;
-            for index in 1..35 {
-                let subject = policy_config::SubjectAssignmentSource {
-                    subject_id: format!("fresh-{index}"),
-                    execution: AssignmentSource::default(),
-                    delegation: AssignmentSource::default(),
-                };
-                original.snapshot = original
-                    .snapshot
-                    .apply(&enrollment_changes(&original, &subject).unwrap())
-                    .unwrap();
-                let environment = SnapshotEnvironment::new(original.snapshot.clone());
-                original.snapshot = ConfigTreeSnapshot::from_entries(
-                    original.snapshot.entries.values().map(|entry| {
-                        ConfigEntry::new(
-                            entry.path.clone(),
-                            entry.content_type,
-                            environment.format(&entry.content).unwrap(),
-                        )
-                        .unwrap()
-                    }),
-                )
-                .unwrap();
-                let evaluated = SnapshotEnvironment::new(original.snapshot.clone())
-                    .evaluate_contract(&original.contract)
-                    .unwrap();
-                assert_eq!(
-                    policy_config::source(&evaluated).unwrap().subjects.len(),
-                    index + 1
-                );
-                assert_eq!(original.snapshot.entries.len(), 3); // no per-Subject import chain
-            }
         }
     }
 }

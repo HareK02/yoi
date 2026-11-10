@@ -523,6 +523,43 @@ fn explicit_multilevel_children_keep_distinct_paths_but_never_infer_a_prefix_gra
 }
 
 #[test]
+fn foreign_children_reject_atomically_even_with_the_same_feature_or_a_namespace_prefix() {
+    let mut host = host("workspace-a");
+    let (builtin, ticket) = register(&mut host, "builtin:ticket", "ticket");
+    let (_, search) = register(&mut host, "plugin:search", "search");
+    let ticketish = host
+        .bind_namespace(&builtin, namespace("ticketish"))
+        .unwrap();
+    host.declare(&ticket, diamond()).unwrap();
+    host.declare(&search, declaration(&[("search.query", &[])], &[]))
+        .unwrap();
+    host.declare(&ticketish, declaration(&[("ticketish.read", &[])], &[]))
+        .unwrap();
+    let baseline = host.catalog();
+    let policy = assignment(vec![set("companion")]);
+    let valid = host.resolve(Some(&policy));
+
+    for child in ["search.query", "ticketish.read", "missing.read"] {
+        let mut candidate = diamond();
+        candidate.permissions[0].children.push(key(child));
+        candidate.sets.push(SetContribution {
+            set: PermissionSetId::parse("new-set").unwrap(),
+            children: vec![keys("ticket", &["ticket.branch"])],
+        });
+        assert_eq!(
+            host.declare(&ticket, candidate),
+            Err(PermissionError::Ownership(key(child)))
+        );
+        assert_eq!(host.catalog(), baseline);
+        assert_eq!(
+            host.allows(&ticket, &valid, &key("ticket.hoge.fuga.deep")),
+            Ok(true)
+        );
+        assert_eq!(host.resolve(Some(&policy)).projection(), valid.projection());
+    }
+}
+
+#[test]
 fn invalid_graph_updates_reject_atomically_without_retiring_a_valid_result() {
     let mut host = host("workspace-a");
     let (_, ticket) = register(&mut host, "builtin:ticket", "ticket");
@@ -719,18 +756,30 @@ fn invalid_assignment_references_deny_the_whole_assignment_with_deterministic_di
 }
 
 #[test]
-fn removed_feature_leaves_dangling_children_diagnostic_instead_of_using_cached_permissions() {
+fn removed_feature_leaves_dangling_set_reference_diagnostic_instead_of_using_cached_permissions() {
     let mut host = host("workspace-a");
     let (_, ticket) = register(&mut host, "builtin:ticket", "ticket");
     let (plugin, search) = register(&mut host, "plugin:search", "search");
-    host.declare(&search, declaration(&[("search.query", &[])], &[]))
-        .unwrap();
     host.declare(
-        &ticket,
-        declaration(&[("ticket.read", &["search.query"])], &[]),
+        &search,
+        declaration(
+            &[("search.query", &[])],
+            &[("search-operations", vec![keys("search", &["search.query"])])],
+        ),
     )
     .unwrap();
-    let policy = assignment(vec![keys("ticket", &["ticket.read"])]);
+    host.declare(
+        &ticket,
+        declaration(
+            &[("ticket.read", &[])],
+            &[(
+                "companion",
+                vec![keys("ticket", &["ticket.read"]), set("search-operations")],
+            )],
+        ),
+    )
+    .unwrap();
+    let policy = assignment(vec![set("companion")]);
     let old = host.resolve(Some(&policy));
     assert_keys(&old, &["ticket.read", "search.query"]);
     host.remove_feature(&plugin).unwrap();
@@ -742,7 +791,9 @@ fn removed_feature_leaves_dangling_children_diagnostic_instead_of_using_cached_p
     assert_keys(&fresh, &[]);
     assert_eq!(
         fresh.projection().diagnostics,
-        vec![PermissionDiagnostic::UnknownKey(key("search.query"))]
+        vec![PermissionDiagnostic::UnknownSet(
+            PermissionSetId::parse("search-operations").unwrap()
+        )]
     );
 }
 
@@ -1022,10 +1073,13 @@ fn assert_exclusion_survives_feature_disable(exclusion: PermissionReference) {
         &ticket,
         declaration(
             &[("ticket.read", &[]), ("ticket.keep", &[])],
-            &[(
-                "companion",
-                vec![keys("ticket", &["ticket.read", "ticket.keep"])],
-            )],
+            &[
+                (
+                    "companion",
+                    vec![keys("ticket", &["ticket.read", "ticket.keep"])],
+                ),
+                ("blocked", vec![keys("ticket", &["ticket.read"])]),
+            ],
         ),
     )
     .unwrap();
@@ -1034,14 +1088,19 @@ fn assert_exclusion_survives_feature_disable(exclusion: PermissionReference) {
         &bundle,
         declaration(
             &[
-                ("bundle.block", &["ticket.read"]),
+                ("bundle.block", &["bundle.read"]),
                 ("bundle.block.nested", &["bundle.block"]),
+                ("bundle.read", &[]),
                 ("bundle.query", &[]),
             ],
             &[
-                ("companion", vec![keys("bundle", &["bundle.query"])]),
+                (
+                    "companion",
+                    vec![keys("bundle", &["bundle.query", "bundle.read"])],
+                ),
                 ("blocked", vec![keys("bundle", &["bundle.block.nested"])]),
-                ("blocked-alias", vec![set("blocked")]),
+                ("blocked-nested", vec![set("blocked")]),
+                ("blocked-alias", vec![set("blocked-nested")]),
             ],
         ),
     )
@@ -1071,6 +1130,11 @@ fn assert_exclusion_survives_feature_disable(exclusion: PermissionReference) {
         assert!(
             host.allows(&ticket, &restricted, &key("ticket.keep"))
                 .unwrap()
+        );
+        assert_eq!(
+            host.allows(&bundle, &restricted, &key("bundle.read")),
+            Ok(false),
+            "the shared exclusion must also expand the Plugin's own children"
         );
         assert_eq!(
             host.allows(&bundle, &restricted, &key("bundle.query"))
@@ -1123,16 +1187,48 @@ fn assert_exclusion_survives_feature_disable(exclusion: PermissionReference) {
 }
 
 #[test]
-fn disabled_feature_cannot_erase_direct_cross_feature_exclusion() {
-    assert_exclusion_survives_feature_disable(keys("bundle", &["bundle.block"]));
+fn disabled_feature_cannot_erase_shared_set_cross_feature_exclusion() {
+    assert_exclusion_survives_feature_disable(set("blocked"));
 }
 
 #[test]
-fn disabled_feature_cannot_erase_multilevel_cross_feature_exclusion() {
-    assert_exclusion_survives_feature_disable(keys("bundle", &["bundle.block.nested"]));
+fn disabled_feature_cannot_erase_multilevel_set_cross_feature_exclusion() {
+    assert_exclusion_survives_feature_disable(set("blocked-nested"));
 }
 
 #[test]
-fn disabled_feature_cannot_erase_set_cross_feature_exclusion() {
+fn disabled_feature_cannot_erase_aliased_set_cross_feature_exclusion() {
     assert_exclusion_survives_feature_disable(set("blocked-alias"));
+}
+
+#[test]
+fn same_namespace_exclusions_expand_direct_and_multilevel_children_across_disable() {
+    let mut host = host("workspace-a");
+    let (feature, ticket) = register(&mut host, "builtin:ticket", "ticket");
+    host.declare(&ticket, diamond()).unwrap();
+    for excluded in ["ticket.hoge.fuga", "ticket.hoge"] {
+        let policy = PermissionAssignment {
+            exclusions: vec![keys("ticket", &[excluded])],
+            ..assignment(vec![keys(
+                "ticket",
+                &["ticket.hoge.fuga.deep", "ticket.hoge.unrelated"],
+            )])
+        };
+        for enabled in [true, false, true] {
+            host.set_enabled(&feature, enabled).unwrap();
+            let resolved = host.resolve(Some(&policy));
+            assert_keys(
+                &resolved,
+                if enabled {
+                    &["ticket.hoge.unrelated"]
+                } else {
+                    &[]
+                },
+            );
+            assert_eq!(
+                host.allows(&ticket, &resolved, &key("ticket.hoge.fuga.deep")),
+                Ok(false)
+            );
+        }
+    }
 }

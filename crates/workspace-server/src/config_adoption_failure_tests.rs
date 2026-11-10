@@ -13,7 +13,10 @@ fn deciding_branch_causes_keep_original_state_policy_head_and_receipts() {
     let host = host(false);
     let initial = request(&db, &host, "initial", Some(A));
     let committed = adopt(&db, &host, &initial).unwrap();
-    let policy = db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap();
+    let policy = db
+        .current_subject_permission_policy(WORKSPACE, "subject-a")
+        .unwrap();
+    assert_native_policy(&db);
     for (kind, reason) in [
         ("catalog", FailureReason::CatalogChanged),
         ("head", FailureReason::EditingHeadChanged),
@@ -82,7 +85,8 @@ fn deciding_branch_causes_keep_original_state_policy_head_and_receipts() {
             Some(committed.history_head.clone())
         );
         assert_eq!(
-            db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap(),
+            db.current_subject_permission_policy(WORKSPACE, "subject-a")
+                .unwrap(),
             policy
         );
         assert!(
@@ -91,6 +95,7 @@ fn deciding_branch_causes_keep_original_state_policy_head_and_receipts() {
                 .is_none()
         );
         assert_eq!(adopt(&db, &host, &initial).unwrap(), committed);
+        assert_native_policy(&db);
     }
 }
 
@@ -137,7 +142,9 @@ fn request_identity_conflict_and_owner_denial_stay_typed_without_a_second_update
     };
     assert_eq!(cause.details().reason, FailureReason::OwnerRequired);
     assert_eq!(cause.details().operation, FailureOperation::Adopt);
+    assert_native_policy(&db);
     assert_eq!(adopt(&db, &host, &original).unwrap(), committed);
+    assert_native_policy(&db);
     assert_eq!(
         db.load_workspace_config(WORKSPACE).unwrap(),
         Some(committed.state)

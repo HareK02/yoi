@@ -102,26 +102,24 @@ pub(super) mod plugin_runtime_tests {
         // Preserve the shared Host policy and grant the exact additional
         // operation that real artifact delivery checks; no broad Feature grant.
         let store = open_subjektiv_store(&f.api).unwrap();
-        let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
+        let previous = store.current_subject_policy(&f.subject).unwrap().unwrap();
         let mut execution = previous.execution;
-        execution.push(ScopedPermission {
-            operation: "plugin.artifact.read".into(),
-            resource: PermissionResource::PluginInstallation {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                installation_id: f.installed.installation.installation_id.clone(),
-            },
-        });
-        store
-            .set_subject_permissions(
-                &f.subject,
-                &SubjectPermissionsUpdate {
-                    operation_id: Uuid::now_v7().to_string(),
-                    expected_change_id: Some(previous.change_id),
-                    execution,
-                    delegation: previous.delegation,
+        execution
+            .grants
+            .push(feature_permissions::PermissionReference::Namespace(
+                feature_permissions::NamespacePermissions {
+                    namespace: feature_permissions::NamespaceId::parse("plugin").unwrap(),
+                    keys: vec![
+                        feature_permissions::PermissionKey::parse("plugin.artifact.read").unwrap(),
+                    ],
                 },
-            )
-            .unwrap();
+            ));
+        replace_config_plugin_subject_policy_as_owner(
+            &f.api,
+            &f.subject,
+            execution,
+            previous.delegation,
+        );
     }
 
     #[derive(Clone)]

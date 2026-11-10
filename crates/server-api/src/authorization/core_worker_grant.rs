@@ -1,6 +1,7 @@
 //! Host-issued ordinary Worker grants do not depend on a Subject foreign key.
 //! Legacy Subject grants retain their original type and containment validation.
 
+use super::{PermissionReferenceEncoding, migrate_legacy_subject_assignment};
 use feature_permissions::{PermissionAssignment, PermissionKey};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,11 @@ pub struct CoreWorkerExecutionGrant {
     pub profile: String,
     pub profile_digest: String,
     pub assignment: PermissionAssignment,
+    #[serde(
+        default,
+        skip_serializing_if = "PermissionReferenceEncoding::is_legacy"
+    )]
+    pub reference_encoding: PermissionReferenceEncoding,
     /// Policy children always carry a finite ceiling (including explicit empty).
     /// Human initial assignments may remain dynamic; None is not an allow-all
     /// resolution and never applies to policy-derived grants.
@@ -67,6 +73,15 @@ pub struct CoreWorkerExecutionGrant {
 }
 
 impl CoreWorkerExecutionGrant {
+    /// Current authorization projection only; immutable binding/replay uses the raw grant.
+    pub fn effective_assignment(&self) -> PermissionAssignment {
+        let mut assignment = self.assignment.clone();
+        if self.reference_encoding.is_legacy() {
+            migrate_legacy_subject_assignment(&mut assignment);
+        }
+        assignment
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for value in [
             &self.grant_id,
@@ -155,6 +170,47 @@ impl CoreWorkerExecutionGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_grant_projection_maps_both_vectors_without_changing_bytes_or_ceiling() {
+        let raw = concat!(
+            r#"{"grant_id":"g","workspace_id":"w","creation_operation_id":"op","runtime_id":"r","worker_id":"child","profile":"builtin:coder","profile_digest":"digest","assignment":{"grants":["#,
+            r#"{"kind":"set","value":"subject-default"},{"kind":"namespace","value":{"namespace":"subject","keys":["subject.orchestrate","subject.delegate"]}}],"exclusions":["#,
+            r#"{"kind":"set","value":"subject-default"},{"kind":"namespace","value":{"namespace":"subject","keys":["subject.orchestrate","subject.delegate"]}}],"revoked":true},"#,
+            r#""issuance_ceiling":["worker.create"],"source":{"kind":"human","account_id":"owner"}}"#,
+        );
+        let mut grant: CoreWorkerExecutionGrant = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            grant.reference_encoding,
+            PermissionReferenceEncoding::LegacySubjectV1
+        );
+        let effective = grant.effective_assignment();
+        let expected = serde_json::json!([
+            {"kind":"set", "value":"conversation"},
+            {"kind":"set", "value":"work-coordination"},
+            {"kind":"set", "value":"work-coordination"},
+            {"kind":"set", "value":"work-execution"}
+        ]);
+        assert_eq!(serde_json::to_value(&effective.grants).unwrap(), expected);
+        assert_eq!(effective.grants, effective.exclusions);
+        assert!(effective.revoked);
+        assert_eq!(serde_json::to_string(&grant).unwrap(), raw);
+        let stop = PermissionKey::parse("worker.stop").unwrap();
+        assert!(!grant.bounds_operation(&stop));
+        grant.issuance_ceiling = Some(vec![]);
+        grant.effective_assignment();
+        assert_eq!(grant.issuance_ceiling, Some(vec![]));
+        assert!(!grant.bounds_operation(&stop));
+        grant.issuance_ceiling = None;
+        grant.effective_assignment();
+        assert_eq!(grant.issuance_ceiling, None);
+        grant.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
+        assert_eq!(grant.effective_assignment(), grant.assignment);
+        assert_eq!(
+            serde_json::to_value(&grant).unwrap()["reference_encoding"],
+            "feature_sets_v2"
+        );
+    }
+
     #[test]
     fn stored_policy_grant_requires_finite_ceiling_on_decode_validation() {
         let raw = serde_json::json!({"grant_id":"g", "workspace_id":"w", "creation_operation_id":"op", "runtime_id":"r", "worker_id":"child", "profile":"builtin:coder", "profile_digest":"digest", "assignment":{"grants":[], "exclusions":[], "revoked":false}, "issuance_ceiling":null, "source":{"kind":"launch_policy", "policy_id":"coder", "policy_revision":1,"parent":{"kind":"subject_body", "subject_id":"s", "source_change_id":"v1", "runtime_id":"r", "worker_id":"body"}}});

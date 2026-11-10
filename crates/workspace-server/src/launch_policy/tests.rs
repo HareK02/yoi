@@ -87,7 +87,8 @@ fn grant(p: &WorkerLaunchPolicy, id: &str) -> CoreWorkerExecutionGrant {
         worker_id: id.into(),
         profile: "builtin:coder".into(),
         profile_digest: "bound-digest".into(),
-        assignment: p.child_permissions.clone(),
+        assignment: p.effective_child_permissions(),
+        reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
         issuance_ceiling: Some(vec![PermissionKey::parse("worker.create").unwrap()]),
         source: CoreWorkerGrantSource::LaunchPolicy {
             policy_id: p.policy_id.clone(),
@@ -102,12 +103,275 @@ fn grant(p: &WorkerLaunchPolicy, id: &str) -> CoreWorkerExecutionGrant {
     }
 }
 
+// Historical rows are seeded directly, not admitted as new current-catalog input.
+fn seed_legacy_rows(
+    f: &mut Fixture,
+) -> (
+    WorkerLaunchPolicyMutation,
+    WorkerLaunchPolicyReceipt,
+    CoreWorkerExecutionGrant,
+) {
+    let policy_raw = concat!(
+        r#"{"policy_id":"coder","name":"Coder","authorization_revision":1,"state":"active","allowed_profiles":["builtin:coder"],"child_permissions":{"grants":["#,
+        r#"{"kind":"set","value":"subject-default"}],"exclusions":[{"kind":"namespace","value":{"namespace":"subject","keys":["subject.delegate"]}}],"revoked":false},"#,
+        r#""last_operation_key":"create"}"#,
+    );
+    let p: WorkerLaunchPolicy = decode(policy_raw).unwrap();
+    let mut request = create();
+    if let WorkerLaunchPolicyAction::Create {
+        child_permissions, ..
+    } = &mut request.action
+    {
+        *child_permissions = p.child_permissions.clone();
+    }
+    let receipt_raw = format!(r#"{{"policy":{policy_raw},"operation_key":"create"}}"#);
+    let receipt: WorkerLaunchPolicyReceipt = decode(&receipt_raw).unwrap();
+    let mut child = grant(&p, "child");
+    child.assignment = p.child_permissions.clone();
+    child.reference_encoding = PermissionReferenceEncoding::LegacySubjectV1;
+    f.conn
+        .execute(
+            "INSERT INTO worker_launch_policies VALUES('w','coder',1,'active',?1,'create')",
+            [policy_raw],
+        )
+        .unwrap();
+    f.conn
+        .execute(
+            "INSERT INTO worker_launch_policy_history VALUES('w','coder','create',1,?1)",
+            [policy_raw],
+        )
+        .unwrap();
+    f.conn
+        .execute(
+            "INSERT INTO worker_launch_policy_operations VALUES('w','create','owner',?1,?2)",
+            params![encode(&request).unwrap(), receipt_raw],
+        )
+        .unwrap();
+    f.conn.execute(
+        "INSERT INTO core_worker_execution_grants(workspace_id,grant_id,creation_operation_id,runtime_id,worker_id,grant_json,policy_id,policy_revision) VALUES('w','child','creation-child','r','child',?1,'coder',1)",
+        [encode(&child).unwrap()],
+    ).unwrap();
+    (request, receipt, child)
+}
+
+fn legacy_row_bytes(conn: &Connection) -> [String; 5] {
+    conn.query_row(
+        "SELECT p.policy_json,g.grant_json,o.request_json,o.receipt_json,h.policy_json FROM worker_launch_policies p JOIN core_worker_execution_grants g ON g.workspace_id=p.workspace_id JOIN worker_launch_policy_operations o ON o.workspace_id=p.workspace_id JOIN worker_launch_policy_history h ON h.workspace_id=p.workspace_id WHERE p.workspace_id='w' AND p.policy_id='coder' AND g.grant_id='child' AND o.operation_key='create' AND h.operation_key='create'",
+        [],
+        |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?]),
+    ).unwrap()
+}
+
+#[test]
+fn legacy_sqlite_reads_and_exact_replay_preserve_raw_rows_without_new_grants() {
+    let mut f = Fixture::new();
+    let (request, receipt, child) = seed_legacy_rows(&mut f);
+    let original = legacy_row_bytes(&f.conn);
+    assert!(
+        original
+            .iter()
+            .all(|raw| !raw.contains("reference_encoding"))
+    );
+    assert_eq!(encode(&receipt.policy).unwrap(), original[0]);
+    assert_eq!(encode(&child).unwrap(), original[1]);
+    assert_eq!(encode(&receipt).unwrap(), original[3]);
+    f.reopen();
+    let current = policy(&f.conn, "w", "coder").unwrap().unwrap();
+    assert_eq!(
+        current.reference_encoding,
+        PermissionReferenceEncoding::FeatureSetsV2
+    );
+    assert_eq!(
+        current.child_permissions,
+        receipt.policy.effective_child_permissions()
+    );
+    assert_eq!(current.observation(), receipt.policy.observation());
+    assert_eq!(current.state, receipt.policy.state);
+    assert_eq!(current.allowed_profiles, receipt.policy.allowed_profiles);
+    assert_eq!(policies(&f.conn, "w").unwrap(), vec![current.clone()]);
+    let saved = core_grant(&f.conn, "w", "r", "child").unwrap().unwrap();
+    assert_eq!(saved, child);
+    assert_eq!(saved.effective_assignment(), current.child_permissions);
+    assert_eq!(saved.issuance_ceiling, child.issuance_ceiling);
+    assert_eq!(f.change(&request), receipt);
+    assert_eq!(bind_core_grant(&f.conn, &saved).unwrap(), child);
+    let mut projected = saved.clone();
+    projected.assignment = saved.effective_assignment();
+    projected.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
+    assert!(bind_core_grant(&f.conn, &projected).is_err());
+    let mut changed_request = request.clone();
+    if let WorkerLaunchPolicyAction::Create {
+        child_permissions, ..
+    } = &mut changed_request.action
+    {
+        *child_permissions = current.child_permissions;
+    }
+    assert!(mutate(&f.conn, "w", "owner", &changed_request).is_err());
+    f.reopen();
+    assert_eq!(legacy_row_bytes(&f.conn), original);
+    let count: i64 = f
+        .conn
+        .query_row(
+            "SELECT count(*) FROM core_worker_execution_grants",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn legacy_grant_matches_v2_current_policy_at_same_revision_but_not_replacement_or_revocation() {
+    let mut f = Fixture::new();
+    let (request, receipt, child) = seed_legacy_rows(&mut f);
+    let original = legacy_row_bytes(&f.conn);
+    let renamed = f
+        .change(&change(
+            &receipt.policy,
+            "rename-legacy",
+            WorkerLaunchPolicyAction::Rename {
+                name: "Current".into(),
+            },
+        ))
+        .policy;
+    assert_eq!(
+        renamed.reference_encoding,
+        PermissionReferenceEncoding::FeatureSetsV2
+    );
+    assert_eq!(
+        renamed.authorization_revision,
+        receipt.policy.authorization_revision
+    );
+    assert_eq!(renamed.child_permissions, child.effective_assignment());
+    f.reopen();
+    assert_eq!(validate_policy_lineage(&f.conn, &child).unwrap().len(), 1);
+    assert_eq!(
+        core_grant(&f.conn, "w", "r", "child").unwrap().unwrap(),
+        child
+    );
+    let stop = PermissionKey::parse("worker.stop").unwrap();
+    let create = PermissionKey::parse("worker.create").unwrap();
+    assert_eq!(
+        bounded_current_keys(&child, [create.clone(), stop]),
+        vec![create]
+    );
+    let replaced = f
+        .change(&change(
+            &renamed,
+            "replace-legacy",
+            WorkerLaunchPolicyAction::ReplaceAuthorization {
+                allowed_profiles: renamed.allowed_profiles.clone(),
+                child_permissions: renamed.child_permissions.clone(),
+            },
+        ))
+        .policy;
+    assert!(validate_policy_lineage(&f.conn, &child).is_err());
+    assert_eq!(bind_core_grant(&f.conn, &child).unwrap(), child);
+    let mut new_child = grant(&replaced, "new-child");
+    new_child.issuance_ceiling = Some(vec![]);
+    f.bind(&new_child);
+    validate_policy_lineage(&f.conn, &new_child).unwrap();
+    assert!(
+        bounded_current_keys(&new_child, [PermissionKey::parse("worker.create").unwrap()])
+            .is_empty()
+    );
+    f.change(&change(
+        &replaced,
+        "revoke-legacy",
+        WorkerLaunchPolicyAction::Revoke,
+    ));
+    f.reopen();
+    assert!(validate_policy_lineage(&f.conn, &new_child).is_err());
+    assert_eq!(bind_core_grant(&f.conn, &new_child).unwrap(), new_child);
+    assert_eq!(
+        core_grant(&f.conn, "w", "r", "new-child")
+            .unwrap()
+            .unwrap()
+            .issuance_ceiling,
+        Some(vec![])
+    );
+    assert_eq!(
+        core_grant(&f.conn, "w", "r", "child")
+            .unwrap()
+            .unwrap()
+            .issuance_ceiling,
+        child.issuance_ceiling
+    );
+    assert_eq!(f.change(&request), receipt);
+    assert_eq!(legacy_row_bytes(&f.conn)[1..], original[1..]);
+}
+
+#[test]
+fn legacy_current_policy_reads_preserve_state_profiles_revision_and_last_operation() {
+    let mut f = Fixture::new();
+    let (_, receipt, _) = seed_legacy_rows(&mut f);
+    for (state, state_name) in [
+        (WorkerLaunchPolicyState::Active, "active"),
+        (WorkerLaunchPolicyState::Revoked, "revoked"),
+        (WorkerLaunchPolicyState::Deleted, "deleted"),
+    ] {
+        let mut saved = receipt.policy.clone();
+        saved.state = state;
+        saved.authorization_revision = 7;
+        saved.last_operation_key = "retained-operation".into();
+        saved.allowed_profiles.push("project:reviewer".into());
+        saved.child_permissions.revoked = true;
+        let raw = encode(&saved).unwrap();
+        f.conn.execute(
+            "UPDATE worker_launch_policies SET policy_json=?1,state=?2,authorization_revision=7,last_operation_key='retained-operation' WHERE workspace_id='w' AND policy_id='coder'",
+            params![raw, state_name],
+        ).unwrap();
+        f.reopen();
+        let current = policy(&f.conn, "w", "coder").unwrap().unwrap();
+        assert_eq!(current.observation(), saved.observation());
+        assert_eq!(current.allowed_profiles, saved.allowed_profiles);
+        assert_eq!(current.state, state);
+        assert!(current.child_permissions.revoked);
+        assert_eq!(
+            current.child_permissions,
+            saved.effective_child_permissions()
+        );
+        assert_eq!(policies(&f.conn, "w").unwrap(), vec![current]);
+        assert_eq!(legacy_row_bytes(&f.conn)[0], raw);
+    }
+}
+
+#[test]
+fn legacy_human_grant_projection_preserves_dynamic_and_explicit_empty_sqlite_ceilings() {
+    let mut f = Fixture::new();
+    let (_, _, template) = seed_legacy_rows(&mut f);
+    for (id, ceiling) in [("dynamic", None), ("empty", Some(vec![]))] {
+        let mut human = template.clone();
+        human.grant_id = id.into();
+        human.worker_id = id.into();
+        human.creation_operation_id = format!("creation-{id}");
+        human.source = CoreWorkerGrantSource::Human {
+            account_id: "owner".into(),
+        };
+        human.issuance_ceiling = ceiling.clone();
+        f.bind(&human);
+        f.reopen();
+        let saved = core_grant(&f.conn, "w", "r", id).unwrap().unwrap();
+        assert_eq!(
+            saved.effective_assignment(),
+            template.effective_assignment()
+        );
+        assert_eq!(saved.issuance_ceiling, ceiling);
+        assert_eq!(encode(&saved).unwrap(), encode(&human).unwrap());
+        assert_eq!(bind_core_grant(&f.conn, &saved).unwrap(), human);
+    }
+}
+
 #[test]
 fn owner_cas_replay_and_rename_history_survive_reopen_without_reauthorization() {
     let mut f = Fixture::new();
     assert!(mutate(&f.conn, "w", "not-owner", &create()).is_err());
     assert!(policies(&f.conn, "w").unwrap().is_empty());
     let initial = f.change(&create());
+    assert_eq!(
+        initial.policy.reference_encoding,
+        PermissionReferenceEncoding::FeatureSetsV2
+    );
     let rename = change(
         &initial.policy,
         "rename",

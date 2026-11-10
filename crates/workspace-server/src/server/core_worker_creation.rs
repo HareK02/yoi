@@ -1,6 +1,8 @@
 //! Creation authority is selected by authenticated caller kind, never by Profile.
 use super::*;
-use server_api::authorization::{CoreWorkerExecutionGrant, CoreWorkerGrantSource};
+use server_api::authorization::{
+    CoreWorkerExecutionGrant, CoreWorkerGrantSource, PermissionReferenceEncoding,
+};
 use server_api::launch_policy::WorkerCreationAuthorization;
 
 pub(super) fn resolve_core_creation_grant(
@@ -71,6 +73,7 @@ pub(super) fn resolve_core_creation_grant(
                 profile: profile.into(),
                 profile_digest: digest,
                 assignment,
+                reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
                 issuance_ceiling: None,
                 source: CoreWorkerGrantSource::Human {
                     account_id: account.into(),
@@ -92,14 +95,30 @@ pub(super) fn resolve_creation_profile(
     profile: Option<String>,
     resolved_control_operation: Option<&WorkerControlOperation>,
     subject_connection: bool,
-) -> ApiResult<(String, ProfileSelector, Option<worker_runtime::config_bundle::ConfigBundle>, Option<CoreWorkerExecutionGrant>)> {
+) -> ApiResult<(
+    String,
+    ProfileSelector,
+    Option<worker_runtime::config_bundle::ConfigBundle>,
+    Option<CoreWorkerExecutionGrant>,
+)> {
     match (source, authorization) {
         (None, WorkerCreationAuthorization::Human { .. }) => {
-            let account = account.ok_or_else(|| Error::WorkspacePermissionDenied("Worker creation requires authenticated owner context".into()))?;
-            api.config_store.with_conn(|conn| crate::launch_policy::require_owner(conn, api.workspace_id(), account))?;
+            let account = account.ok_or_else(|| {
+                Error::WorkspacePermissionDenied(
+                    "Worker creation requires authenticated owner context".into(),
+                )
+            })?;
+            api.config_store.with_conn(|conn| {
+                crate::launch_policy::require_owner(conn, api.workspace_id(), account)
+            })?;
         }
         (Some(_), WorkerCreationAuthorization::Policy { .. }) => {}
-        _ => return Err(Error::WorkspacePermissionDenied("creation authorization does not match authenticated caller kind".into()).into()),
+        _ => {
+            return Err(Error::WorkspacePermissionDenied(
+                "creation authorization does not match authenticated caller kind".into(),
+            )
+            .into());
+        }
     }
     let saved = resolved_control_operation
         .as_ref()
@@ -154,9 +173,15 @@ pub(super) fn resolve_creation_profile(
                     })?
             };
             let profile_selector = if source.is_some() {
-                crate::profile_settings::selector_for_registered_profile(&profile_projection, &profile)
+                crate::profile_settings::selector_for_registered_profile(
+                    &profile_projection,
+                    &profile,
+                )
             } else {
-                crate::profile_settings::selector_for_workspace_candidate(&profile_projection, &profile)
+                crate::profile_settings::selector_for_workspace_candidate(
+                    &profile_projection,
+                    &profile,
+                )
             }
             .ok_or_else(|| {
                 settings_bad_request(
@@ -195,7 +220,12 @@ pub(super) fn resolve_creation_profile(
             };
             (canonical_profile, profile_selector, Some(bundle), grant)
         };
-    Ok((profile, profile_selector, resolved_config_bundle, resolved_core_execution_grant))
+    Ok((
+        profile,
+        profile_selector,
+        resolved_config_bundle,
+        resolved_core_execution_grant,
+    ))
 }
 
 /// Directional control is a separate Feature record, repaired on exact replay
@@ -209,17 +239,29 @@ pub(super) fn persist_spawn_control(
     assigned: bool,
 ) -> ApiResult<()> {
     subject_authorization::persist_reply_grant(api, controller, child, allocation_key)?;
-    api.store.create_worker_control_grant(&WorkerControlGrantRecord {
-        workspace_id: api.workspace_id().into(),
-        grant_id: new_id("wcg"),
-        controller: controller.clone(),
-        subject: child.clone(),
-        relation: if assigned { "assigned" } else { "spawned" }.into(),
-        origin: "worker_spawn".into(),
-        permissions: ["send_input", "notify", "cancel", "stop", "restore", "remove", "observe"].into_iter().map(str::to_string).collect(),
-        operation_id: operation_key.into(),
-        created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        revoked_at: None,
-    })?;
+    api.store
+        .create_worker_control_grant(&WorkerControlGrantRecord {
+            workspace_id: api.workspace_id().into(),
+            grant_id: new_id("wcg"),
+            controller: controller.clone(),
+            subject: child.clone(),
+            relation: if assigned { "assigned" } else { "spawned" }.into(),
+            origin: "worker_spawn".into(),
+            permissions: [
+                "send_input",
+                "notify",
+                "cancel",
+                "stop",
+                "restore",
+                "remove",
+                "observe",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            operation_id: operation_key.into(),
+            created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            revoked_at: None,
+        })?;
     Ok(())
 }

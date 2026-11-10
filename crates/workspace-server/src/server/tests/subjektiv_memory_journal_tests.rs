@@ -39,38 +39,21 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn grant_permissions(store: &crate::subjektiv::SubjektivStore, subject_id: &str) {
-        store
-            .set_subject_permissions(
-                subject_id,
-                &server_api::authorization::SubjectPermissionsUpdate {
-                    operation_id: format!("memory-journal-fixture-grant-{subject_id}"),
-                    expected_change_id: Some(
-                        store
-                            .current_subject_policy(subject_id)
-                            .unwrap()
-                            .unwrap()
-                            .change_id,
-                    ),
-                    execution: [
-                        "journal.memory.links.reconcile",
-                        "journal.memory.links.read",
-                        "journal.memory.read",
-                        "journal.memory.related.read",
-                    ]
-                    .into_iter()
-                    .map(|operation| server_api::authorization::ScopedPermission {
-                        operation: operation.into(),
-                        resource: server_api::authorization::PermissionResource::Subject {
-                            workspace_id: TEST_WORKSPACE_ID.into(),
-                            subject_id: subject_id.into(),
-                        },
-                    })
-                    .collect(),
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+    fn grant_permissions(api: &WorkspaceApi, subject_id: &str) {
+        set_test_subject_policy_as_owner(
+            api,
+            subject_id,
+            test_operation_assignment(
+                api,
+                &[
+                    "journal.memory.links.reconcile",
+                    "journal.memory.links.read",
+                    "journal.memory.read",
+                    "journal.memory.related.read",
+                ],
+            ),
+            Default::default(),
+        );
     }
 
     async fn new() -> Self {
@@ -88,20 +71,14 @@ impl Fixture {
             .create_subject(crate::subjektiv::SubjectRole::new("memory-journal").unwrap())
             .unwrap();
         if granted {
-            Self::grant_permissions(&store, &subject.id);
+            Self::grant_permissions(&api, &subject.id);
         } else {
-            // Model an existing Subject with unset policy, retaining creation history.
-            api.feature_storage
-                .open(&api.subjektiv_registration)
-                .unwrap()
-                .with_connection(|connection| {
-                    connection.execute(
-                        "DELETE FROM subject_permissions WHERE subject_id = ?1",
-                        [&subject.id],
-                    )?;
-                    Ok(())
-                })
-                .unwrap();
+            assert!(
+                api.config_store
+                    .current_subject_permission_policy(api.workspace_id(), &subject.id)
+                    .unwrap()
+                    .is_none()
+            );
         }
         let worker = Self::body_worker(&api, &subject.id);
         let source_worker = RuntimeWorkerRef::new(RUNTIME, Uuid::new_v4().to_string());
@@ -702,26 +679,10 @@ async fn memory_journal_router_ids_do_not_grant_cross_subject_reads_or_reconcili
         .create_subject(crate::subjektiv::SubjectRole::new("other").unwrap())
         .unwrap();
     let other_worker = Fixture::body_worker(&f.api, &other.id);
-    f.store
-        .set_subject_permissions(
-            &other.id,
-            &server_api::authorization::SubjectPermissionsUpdate {
-                operation_id: "other-subject-explicit-empty".into(),
-                expected_change_id: Some(
-                    f.store
-                        .current_subject_policy(&other.id)
-                        .unwrap()
-                        .unwrap()
-                        .change_id,
-                ),
-                execution: vec![],
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    set_test_subject_policy_as_owner(&f.api, &other.id, Default::default(), Default::default());
     for granted in [false, true] {
         if granted {
-            Fixture::grant_permissions(&f.store, &other.id);
+            Fixture::grant_permissions(&f.api, &other.id);
         }
         for request in [
             MemoryJournalRequest::Reconcile {
@@ -826,20 +787,14 @@ async fn memory_journal_unset_or_revoked_permissions_deny_every_route_without_li
             .unwrap();
         let (subject, _) = subjektiv_scope_from_singleton_key(&lease.key).unwrap();
         if revoked {
-            let policy = f.store.subject_permissions(&subject).unwrap().unwrap();
-            f.store
-                .set_subject_permissions(
-                    &subject,
-                    &server_api::authorization::SubjectPermissionsUpdate {
-                        operation_id: "revoke-memory-journal".into(),
-                        expected_change_id: Some(policy.change_id),
-                        execution: vec![],
-                        delegation: vec![],
-                    },
-                )
-                .unwrap();
+            set_test_subject_policy_as_owner(
+                &f.api,
+                &subject,
+                Default::default(),
+                Default::default(),
+            );
         } else {
-            assert!(f.store.subject_permissions(&subject).unwrap().is_none());
+            assert!(f.store.current_subject_policy(&subject).unwrap().is_none());
         }
         let count_links = || {
             f.api

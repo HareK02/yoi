@@ -1226,34 +1226,38 @@ mod service_connection {
         f.shutdown().await;
     }
 
+    fn without_operation(
+        mut assignment: ::feature_permissions::PermissionAssignment,
+        operation: &str,
+    ) -> ::feature_permissions::PermissionAssignment {
+        use ::feature_permissions::{PermissionKey, PermissionReference};
+        let forbidden = PermissionKey::parse(operation).unwrap();
+        assert!(assignment.grants.iter().any(|reference| matches!(
+            reference,
+            PermissionReference::Namespace(namespace) if namespace.keys.contains(&forbidden)
+        )));
+        for reference in &mut assignment.grants {
+            if let PermissionReference::Namespace(namespace) = reference {
+                namespace.keys.retain(|key| key != &forbidden);
+            }
+        }
+        assignment
+    }
+
     #[tokio::test]
     async fn service_lifecycle_requires_exact_live_publish_and_log_operations_without_receipts() {
         let peer = Peer::new(HOST, vec![]).await;
         let f = fixture(&peer).await;
         let (owners, server) = owners(&f).await;
         let store = open_subjektiv_store(&f.api).unwrap();
-        let permissions = store
-            .subject_permissions(&f.subject)
-            .unwrap()
-            .unwrap()
-            .execution;
+        let policy = store.current_subject_policy(&f.subject).unwrap().unwrap();
         for forbidden in ["plugin.publish", "plugin.log"] {
-            let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
-            store
-                .set_subject_permissions(
-                    &f.subject,
-                    &SubjectPermissionsUpdate {
-                        operation_id: format!("deny-{forbidden}"),
-                        expected_change_id: Some(previous.change_id),
-                        execution: permissions
-                            .iter()
-                            .filter(|p| p.operation != forbidden)
-                            .cloned()
-                            .collect(),
-                        delegation: vec![],
-                    },
-                )
-                .unwrap();
+            replace_config_plugin_subject_policy_as_owner(
+                &f.api,
+                &f.subject,
+                without_operation(policy.execution.clone(), forbidden),
+                policy.delegation.clone(),
+            );
             for owner in &owners {
                 for operation in [
                     PluginServiceLifecycleOperation::Admit,
@@ -1323,28 +1327,20 @@ mod service_connection {
             QueueChange::RuntimeTrust(change) => replace_runtime_trust(f, change),
             QueueChange::ServiceGrant => {
                 let store = open_subjektiv_store(&f.api).unwrap();
-                let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
-                assert!(
-                    previous
-                        .execution
-                        .iter()
-                        .any(|p| p.operation == "ticket.read")
+                let previous = store.current_subject_policy(&f.subject).unwrap().unwrap();
+                let ticket_read =
+                    ::feature_permissions::PermissionKey::parse("ticket.read").unwrap();
+                assert!(previous.execution.grants.iter().any(|reference| matches!(
+                    reference,
+                    ::feature_permissions::PermissionReference::Namespace(namespace)
+                        if namespace.keys.contains(&ticket_read)
+                )));
+                replace_config_plugin_subject_policy_as_owner(
+                    &f.api,
+                    &f.subject,
+                    without_operation(previous.execution, "plugin.service.consume"),
+                    previous.delegation,
                 );
-                store
-                    .set_subject_permissions(
-                        &f.subject,
-                        &SubjectPermissionsUpdate {
-                            operation_id: "revoke-only-service-consume".into(),
-                            expected_change_id: Some(previous.change_id),
-                            execution: previous
-                                .execution
-                                .into_iter()
-                                .filter(|p| p.operation != "plugin.service.consume")
-                                .collect(),
-                            delegation: previous.delegation,
-                        },
-                    )
-                    .unwrap();
             }
             QueueChange::BodyOwnership => {
                 let lease = f
@@ -1378,18 +1374,14 @@ mod service_connection {
             }
             QueueChange::DelegationSource => {
                 let store = open_subjektiv_store(&f.api).unwrap();
-                let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
-                store
-                    .set_subject_permissions(
-                        &f.subject,
-                        &SubjectPermissionsUpdate {
-                            operation_id: "replace-queued-delegation-source".into(),
-                            expected_change_id: Some(previous.change_id),
-                            execution: previous.execution,
-                            delegation: previous.delegation,
-                        },
-                    )
-                    .unwrap();
+                let previous = store.current_subject_policy(&f.subject).unwrap().unwrap();
+                let replacement = replace_config_plugin_subject_policy_as_owner(
+                    &f.api,
+                    &f.subject,
+                    previous.execution,
+                    previous.delegation,
+                );
+                assert_ne!(replacement.change_id, previous.change_id);
             }
             QueueChange::Feature => {
                 f.api
@@ -1411,7 +1403,20 @@ mod service_connection {
                 let mut f = fixture(&peer).await;
                 let ticket = create_ticket(&f);
                 if matches!(change, QueueChange::DelegationSource) {
-                    delegate_plugin_fixture(&mut f).await;
+                    delegate_plugin_fixture_with_permissions(
+                        &mut f,
+                        ["ticket.read", "ticket.extension.write"]
+                            .into_iter()
+                            .map(|operation| ScopedPermission {
+                                operation: operation.into(),
+                                resource: PermissionResource::Ticket {
+                                    workspace_id: TEST_WORKSPACE_ID.into(),
+                                    ticket_id: ticket.clone(),
+                                },
+                            })
+                            .collect(),
+                    )
+                    .await;
                 }
                 let (owner, server) = if remote {
                     let (owner, server) =
@@ -1426,54 +1431,59 @@ mod service_connection {
                     let lease = acquire(owner.as_ref(), &f).await;
                     let cursor = state(&f).unwrap().1;
                     comment(&f, &ticket);
-                    let operation = if matches!(boundary, "complete" | "consumer" | "data" | "mutate") {
-                        let (event, invocation) = delivery(owner.as_ref(), &lease).await;
-                        if boundary == "complete" {
-                            PluginServiceRequest::Complete {
-                                lease,
-                                event_id: event.event_id,
-                                result: PluginServiceEventResult::Ack,
-                                failure: None,
-                            }
-                        } else if boundary == "mutate" {
-                            host_request(
-                                &lease,
-                                PluginInvocationRequest::DataMutate {
-                                    invocation_id: invocation,
-                                    ticket_id: ticket.clone(),
-                                    address: PluginDataAddress {
-                                        collection: PluginDataCollection {
-                                            collection: "notes".into(),
-                                            schema_id: "note".into(),
-                                            schema_version: "1".into(),
+                    let operation =
+                        if matches!(boundary, "complete" | "consumer" | "data" | "mutate") {
+                            let (event, invocation) = delivery(owner.as_ref(), &lease).await;
+                            if boundary == "complete" {
+                                PluginServiceRequest::Complete {
+                                    lease,
+                                    event_id: event.event_id,
+                                    result: PluginServiceEventResult::Ack,
+                                    failure: None,
+                                }
+                            } else if boundary == "mutate" {
+                                host_request(
+                                    &lease,
+                                    PluginInvocationRequest::DataMutate {
+                                        invocation_id: invocation,
+                                        ticket_id: ticket.clone(),
+                                        address: PluginDataAddress {
+                                            collection: PluginDataCollection {
+                                                collection: "notes".into(),
+                                                schema_id: "note".into(),
+                                                schema_version: "1".into(),
+                                            },
+                                            key: "queued".into(),
                                         },
-                                        key: "queued".into(),
+                                        operation_key: "queued-write".into(),
+                                        mutation: PluginDataMutation::Put {
+                                            expected: PluginDataExpectation::NeverWritten,
+                                            value_json: r#""queued""#.into(),
+                                        },
                                     },
-                                    operation_key: "queued-write".into(),
-                                    mutation: PluginDataMutation::Put {
-                                        expected: PluginDataExpectation::NeverWritten,
-                                        value_json: r#""queued""#.into(),
+                                )
+                            } else {
+                                host_request(
+                                    &lease,
+                                    PluginInvocationRequest::ReadTicket {
+                                        invocation_id: invocation,
+                                        ticket_id: ticket.clone(),
                                     },
-                                },
-                            )
+                                )
+                            }
                         } else {
-                            host_request(
-                                &lease,
-                                PluginInvocationRequest::ReadTicket {
-                                    invocation_id: invocation,
-                                    ticket_id: ticket.clone(),
-                                },
-                            )
-                        }
-                    } else {
-                        PluginServiceRequest::Poll { lease }
-                    };
+                            PluginServiceRequest::Poll { lease }
+                        };
                     (operation, Some(cursor))
                 };
                 let (entered, reached) = tokio::sync::oneshot::channel();
                 let (resume, resumed) = std::sync::mpsc::channel();
                 let gate = Mutex::new(Some((entered, resumed)));
-                let boundary_observed = if boundary == "mutate" { "data" } else { boundary };
+                let boundary_observed = if boundary == "mutate" {
+                    "data"
+                } else {
+                    boundary
+                };
                 let _registration = WorkspaceApi::observe_service_boundary(
                     f.plan.plan_id.clone(),
                     Arc::new(move |stage| {
@@ -1577,9 +1587,8 @@ mod service_connection {
                         }).unwrap();
                     }
                     let (current, current_server) = if remote {
-                        let (owner, server) = remote_owner_for(
-                            &f, &f.source.worker_id, TEST_WORKSPACE_ID,
-                        ).await;
+                        let (owner, server) =
+                            remote_owner_for(&f, &f.source.worker_id, TEST_WORKSPACE_ID).await;
                         (owner, Some(server))
                     } else {
                         (f.owner(None).await, None)
@@ -1588,15 +1597,19 @@ mod service_connection {
                         .unwrap_or_else(|error| panic!(
                             "current binding at {boundary}, remote={remote}, {change:?}: {error:?}"
                         ));
-                    assert!(match boundary {
-                        "acquire" => matches!(response, PluginServiceResponse::Acquired { .. }),
-                        "complete" => matches!(response, PluginServiceResponse::Completed),
-                        "mutate" => matches!(response, PluginServiceResponse::Host { response }
+                    assert!(
+                        match boundary {
+                            "acquire" => matches!(response, PluginServiceResponse::Acquired { .. }),
+                            "complete" => matches!(response, PluginServiceResponse::Completed),
+                            "mutate" => matches!(response, PluginServiceResponse::Host { response }
                             if matches!(*response, PluginInvocationResponse::DataMutated { .. })),
-                        "consumer" | "data" => matches!(response, PluginServiceResponse::Host { response }
+                            "consumer" | "data" =>
+                                matches!(response, PluginServiceResponse::Host { response }
                             if matches!(*response, PluginInvocationResponse::TicketRead { .. })),
-                        _ => matches!(response, PluginServiceResponse::Delivery { .. }),
-                    }, "current binding response at {boundary}, remote={remote}");
+                            _ => matches!(response, PluginServiceResponse::Delivery { .. }),
+                        },
+                        "current binding response at {boundary}, remote={remote}"
+                    );
                     if boundary == "mutate" {
                         assert_eq!(f.count("plugin_data_receipts"), 1);
                         assert_eq!(f.count("plugin_data_cells"), 1);
@@ -1637,13 +1650,18 @@ mod service_connection {
     }
 
     #[tokio::test]
-    async fn service_runtime_key_replaced_in_queue_denies_old_request_and_preserves_current_binding() {
+    async fn service_runtime_key_replaced_in_queue_denies_old_request_and_preserves_current_binding()
+     {
         queued_authority_change(QueueChange::RuntimeTrust(RuntimeTrustChange::KeyRotation)).await;
     }
 
     #[tokio::test]
-    async fn service_runtime_same_key_reactivated_in_queue_denies_old_binding_not_current_request() {
-        queued_authority_change(QueueChange::RuntimeTrust(RuntimeTrustChange::ReactivateSameKey)).await;
+    async fn service_runtime_same_key_reactivated_in_queue_denies_old_binding_not_current_request()
+    {
+        queued_authority_change(QueueChange::RuntimeTrust(
+            RuntimeTrustChange::ReactivateSameKey,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -1743,7 +1761,20 @@ mod service_connection {
         let ticket = create_ticket(&f);
         let parent = f.owner(None).await;
         let parent_lease = acquire(parent.as_ref(), &f).await;
-        let source = delegate_plugin_fixture(&mut f).await;
+        let source = delegate_plugin_fixture_with_permissions(
+            &mut f,
+            ["ticket.read", "ticket.extension.write"]
+                .into_iter()
+                .map(|operation| ScopedPermission {
+                    operation: operation.into(),
+                    resource: PermissionResource::Ticket {
+                        workspace_id: TEST_WORKSPACE_ID.into(),
+                        ticket_id: ticket.clone(),
+                    },
+                })
+                .collect(),
+        )
+        .await;
         let (owners, server) = owners(&f).await;
         let lease = acquire(owners[0].as_ref(), &f).await;
         let cursor = state(&f).unwrap().1;
@@ -1769,17 +1800,22 @@ mod service_connection {
         crate::server::plugin_host::with_authority_database(&f.api, || {
             subject_authorization::plugin_execution_identity(&f.api, &f.source).unwrap();
             let (_manager, independent) = authority_storage::independent_store(&f.api);
-            independent
-                .set_subject_permissions(
-                    &f.subject,
-                    &SubjectPermissionsUpdate {
-                        operation_id: "expire-service-source".into(),
-                        expected_change_id: Some(source.change_id),
-                        execution: source.execution,
-                        delegation: source.delegation,
-                    },
-                )
+            let current = independent
+                .current_subject_policy(&f.subject)
+                .unwrap()
                 .unwrap();
+            assert_eq!(current.change_id, source.change_id);
+            let mut independent_api = f.api.clone();
+            independent_api.config_store =
+                Arc::new(crate::SqliteWorkspaceStore::open(&f.api.config.database_path).unwrap());
+            independent_api.subject_authority_store = Some(independent);
+            let replacement = replace_config_plugin_subject_policy_as_owner(
+                &independent_api,
+                &f.subject,
+                current.execution,
+                current.delegation,
+            );
+            assert_ne!(replacement.change_id, source.change_id);
             assert!(subject_authorization::plugin_execution_identity(&f.api, &f.source).is_err());
             Ok(())
         })

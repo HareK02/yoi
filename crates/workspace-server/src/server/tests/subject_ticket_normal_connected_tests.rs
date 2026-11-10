@@ -449,8 +449,8 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
                 &h.api,
                 &h.owner,
                 &subject,
-                r#"{ sets = ["subject-default"]; }"#,
-                r#"{ namespaces = [{ namespace = "subject"; keys = ["subject.delegate"]; }, { namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,
+                r#"{ sets = ["conversation", "work-coordination"]; }"#,
+                r#"{ sets = ["work-execution"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,
             )
             .await;
         } else {
@@ -766,7 +766,7 @@ async fn ordinary_subject_scenario(background_handling_control: bool) {
     assert_eq!(persisted_tracking(&h, ticket), current);
     let next_subject = cases[1].0["subject"].as_str().unwrap();
     super::super::chat_tests::adopt_subject_policy(&h.api,&h.owner,next_subject,
-        r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,"{}").await;
+        r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.update"]; }]; }"#,"{}").await;
     let tracking_path =
         format!("/workspaces/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-tracking");
     let before = persisted_tracking(&h, ticket);

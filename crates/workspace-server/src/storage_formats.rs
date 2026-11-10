@@ -83,6 +83,8 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
         ticket::verify_sqlite_ticket_schema(conn).map_err(invalid)?;
     }
     verify_launch_policy_shape(conn, current)?;
+    verify_permission_migration_shape(conn, current)?;
+    verify_subject_permission_domain_shape(conn, current)?;
     verify_publication_shape(conn, current)?;
     verify_connection_observation_shape(conn, current)?;
     let tail = failure_tail(conn, current, &rows)?;
@@ -367,6 +369,8 @@ impl FailureTail {
         tail.push((129, super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME));
         tail.push((130, super::backend_job_current::MIGRATION_NAME));
         tail.push((131, crate::launch_policy::MIGRATION_NAME));
+        tail.push((132, crate::config_adoption::automatic::MIGRATION_NAME));
+        tail.push((133, crate::subject_policy::MIGRATION_NAME));
         tail
     }
     fn startup(self, current: i64) -> bool {
@@ -1591,9 +1595,13 @@ mod failure_format_tests {
         assert_eq!(
             plan.migrations
                 .iter()
-                .map(|step| step.version)
+                .map(|step| (step.version, step.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![127, 128, 129, 130]
+            store::MIGRATIONS
+                .iter()
+                .filter(|step| step.version > 126)
+                .map(|step| (step.version, step.name))
+                .collect::<Vec<_>>()
         );
         apply(&conn, 127).unwrap();
         apply(&conn, 128).unwrap();
@@ -1864,11 +1872,14 @@ mod failure_format_tests {
         assert_eq!(
             plan.migrations
                 .iter()
-                .rev()
-                .take(5)
-                .map(|step| step.version)
+                .filter(|step| step.version >= 126)
+                .map(|step| (step.version, step.name.as_str()))
                 .collect::<Vec<_>>(),
-            vec![130, 129, 128, 127, 126]
+            store::MIGRATIONS
+                .iter()
+                .filter(|step| step.version >= 126)
+                .map(|step| (step.version, step.name))
+                .collect::<Vec<_>>()
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(snapshot(&conn).unwrap(), shape, "dry-run changed DDL");
@@ -1891,14 +1902,12 @@ mod failure_format_tests {
             Some(&(50, store::SCHEMA_BASELINE_NAME.to_owned()))
         );
         assert_eq!(
-            &history[history.len() - 5..],
-            &[
-                (126, tail_migration_name(126).unwrap().to_owned()),
-                (127, tail_migration_name(127).unwrap().to_owned()),
-                (128, tail_migration_name(128).unwrap().to_owned()),
-                (129, tail_migration_name(129).unwrap().to_owned()),
-                (130, tail_migration_name(130).unwrap().to_owned()),
-            ]
+            &history[1..],
+            &plan
+                .migrations
+                .iter()
+                .map(|step| (step.version, step.name.clone()))
+                .collect::<Vec<_>>()
         );
         let upgraded_shape = snapshot(&conn).unwrap();
         let reopened_columns = columns(&conn);
@@ -2435,6 +2444,56 @@ CREATE TABLE content_history_references (
 );
 CREATE INDEX content_history_object_owners ON content_history_references(workspace, kind, hash);
 "####;
+
+fn verify_permission_migration_shape(conn: &Connection, current: i64) -> Result<()> {
+    let select = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(_, object)| object.1 == "workspace_permission_migration_plans")
+            .collect()
+    };
+    let actual = select(snapshot(conn)?);
+    if current < 132 {
+        return if actual.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid("permission migration schema before its receipt"))
+        };
+    }
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(crate::config_adoption::automatic::SCHEMA)?;
+    if actual != select(snapshot(&reference)?) {
+        return Err(invalid("permission migration physical schema mismatch"));
+    }
+    Ok(())
+}
+
+fn verify_subject_permission_domain_shape(conn: &Connection, current: i64) -> Result<()> {
+    let select = |shape: Shape| -> Shape {
+        shape
+            .into_iter()
+            .filter(|(_, object)| object.1.starts_with("subject_permission_"))
+            .collect()
+    };
+    let actual = select(snapshot(conn)?);
+    if current < 133 {
+        return if actual.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid(
+                "Subject permission domain schema before its receipt",
+            ))
+        };
+    }
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(crate::subject_policy::SCHEMA)?;
+    if actual != select(snapshot(&reference)?) {
+        return Err(invalid(
+            "Subject permission domain physical schema mismatch",
+        ));
+    }
+    Ok(())
+}
 
 fn verify_launch_policy_shape(conn: &Connection, current: i64) -> Result<()> {
     let select = |shape: Shape| -> Shape {

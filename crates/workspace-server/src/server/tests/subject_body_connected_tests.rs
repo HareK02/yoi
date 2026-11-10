@@ -648,7 +648,7 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
     let f = ConnectedBody::new().await;
     let subject = f.subject("body-revoked-subject").await;
     super::chat_tests::adopt_chat_policy(&f.connected.api, &f.connected.owner, &subject,
-        r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#).await;
+        r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#).await;
     let revoked = open_subjektiv_store(&f.connected.api)
         .unwrap()
         .current_subject_policy(&subject)
@@ -696,7 +696,7 @@ async fn body_start_and_restore_do_not_repair_missing_session_record_permission(
     assert_eq!(started["disposition"], "accepted", "{started}");
     f.stop(&subject, "body-before-revoked-restore").await;
     super::chat_tests::adopt_chat_policy(&f.connected.api, &f.connected.owner, &subject,
-        r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#).await;
+        r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#).await;
     let revoked = open_subjektiv_store(&f.connected.api)
         .unwrap()
         .current_subject_policy(&subject)
@@ -881,7 +881,7 @@ async fn denied_session_registration_releases_failed_body_and_allows_a_new_start
         &f.connected.api,
         &f.connected.owner,
         &subject,
-        r#"{ sets = ["subject-default"]; }"#,
+        r#"{ sets = ["conversation", "work-coordination"]; }"#,
     )
     .await;
     let started = f

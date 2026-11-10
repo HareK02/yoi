@@ -328,7 +328,7 @@ impl Fixture {
 
     async fn create_worker(&self) -> RuntimeWorkerRef {
         self.source.publish_profile("builtin:companion");
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(self.api().clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -341,9 +341,10 @@ impl Fixture {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                    assignment: None,
-                },
+                authorization: test_worker_operation_authorization(&[
+                    ("filesystem", &["filesystem.read", "filesystem.write"]),
+                    ("bash", &["bash.execute"]),
+                ]),
             }),
         )
         .await
@@ -1214,7 +1215,7 @@ async fn accepted_stop_http_keeps_cleanup_failure_separate_and_does_not_retry_st
     let fixture = Fixture::new().await;
     let api = fixture.api();
     let worker = fixture.create_worker().await;
-    let owner = seed_test_workspace_owner_token(api.store.as_ref(), "stop-cleanup-owner").await;
+    let owner = seed_test_owner_api_token(&api, "stop-cleanup-owner");
     let session = fixture.open().await;
     api.workdir_sessions
         .lock()

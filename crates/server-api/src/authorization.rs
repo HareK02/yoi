@@ -62,6 +62,8 @@ mod catalog;
 pub use catalog::*;
 mod current_policy;
 pub use current_policy::*;
+mod permission_references;
+pub use permission_references::*;
 mod subject_defaults;
 pub use subject_defaults::*;
 

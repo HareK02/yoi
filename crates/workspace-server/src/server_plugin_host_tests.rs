@@ -74,17 +74,27 @@ fn replace_runtime_trust(f: &mut Fixture, change: RuntimeTrustChange) {
             replacement.public_key_fingerprint.clear();
         }
         RuntimeTrustChange::ReactivateSameKey => {
-            assert!(store.revoke_workspace_runtime_binding(
-                TEST_WORKSPACE_ID, &f.source.runtime_id, TEST_CREATED_AT,
-            ).unwrap());
+            assert!(
+                store
+                    .revoke_workspace_runtime_binding(
+                        TEST_WORKSPACE_ID,
+                        &f.source.runtime_id,
+                        TEST_CREATED_AT,
+                    )
+                    .unwrap()
+            );
         }
         RuntimeTrustChange::SameKeyAba => {
             replacement.display_name.push_str("-replacement");
-            store.upsert_workspace_runtime_binding(replacement, true).unwrap();
+            store
+                .upsert_workspace_runtime_binding(replacement, true)
+                .unwrap();
             replacement = original.clone();
         }
     }
-    store.upsert_workspace_runtime_binding(replacement, true).unwrap();
+    store
+        .upsert_workspace_runtime_binding(replacement, true)
+        .unwrap();
     let current = store
         .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &f.source.runtime_id)
         .unwrap()
@@ -94,23 +104,30 @@ fn replace_runtime_trust(f: &mut Fixture, change: RuntimeTrustChange) {
     assert_eq!(current.public_key, f.identity.public_key);
 }
 
-async fn delegate_plugin_fixture(
+async fn delegate_plugin_fixture(f: &mut Fixture) -> server_api::authorization::SubjectPermissions {
+    delegate_plugin_fixture_with_permissions(f, vec![]).await
+}
+
+async fn delegate_plugin_fixture_with_permissions(
     f: &mut Fixture,
+    additional_permissions: Vec<server_api::authorization::ScopedPermission>,
 ) -> server_api::authorization::SubjectPermissions {
     use server_api::authorization::WorkerDelegationRequest;
     let store = open_subjektiv_store(&f.api).unwrap();
-    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
-    let source = store
-        .set_subject_permissions(
-            &f.subject,
-            &SubjectPermissionsUpdate {
-                operation_id: "delegate-plugin".into(),
-                expected_change_id: Some(previous.change_id),
-                execution: previous.execution.clone(),
-                delegation: previous.execution.clone(),
-            },
-        )
-        .unwrap();
+    let current = store.current_subject_policy(&f.subject).unwrap().unwrap();
+    let policy = replace_config_plugin_subject_policy_as_owner(
+        &f.api,
+        &f.subject,
+        current.execution.clone(),
+        current.execution,
+    );
+    let mut permissions = plugin_permissions(&f.installed.installation.installation_id);
+    permissions.extend(additional_permissions);
+    let source = server_api::authorization::SubjectPermissions {
+        change_id: policy.change_id,
+        execution: permissions.clone(),
+        delegation: permissions,
+    };
     let grant = subject_authorization::prepare_delegation(
         &f.api,
         &f.source,
@@ -272,10 +289,17 @@ impl Fixture {
             binding.as_ref(),
             ticket_grants.as_ref(),
         );
-        let Json(created) = create_workspace_worker(
-            State(api.clone()),
+        let context = server_request_context(
+            Some(test_owner_actor()),
+            None,
+            None,
+            None,
+            &HeaderMap::new(),
+        );
+        let Json(created) = create_workspace_worker_authenticated(
+            api.clone(),
             HeaderMap::new(),
-            Json(CreateWorkspaceWorkerRequest {
+            CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.into(),
                 display_name: "Plugin Subject body".into(),
                 singleton_key: None,
@@ -289,8 +313,12 @@ impl Fixture {
                     }),
                 },
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
-            }),
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
+            },
+            None,
+            Some(&context),
         )
         .await
         .unwrap();
@@ -526,47 +554,52 @@ impl Fixture {
     }
 }
 
-fn set_policy(api: &WorkspaceApi, subject: &str, installation: &str, granted: bool) {
-    let store = open_subjektiv_store(api).unwrap();
-    let previous = store
-        .subject_policy_source(subject)
-        .unwrap()
-        .map(|policy| match policy {
-            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
-            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
-        });
-    let execution = if granted {
-        [
-            "plugin.admit",
-            "plugin.publish",
-            "plugin.connection.open",
-            "plugin.http.send",
-            "plugin.log",
-            "plugin.service.consume",
-        ]
-        .into_iter()
-        .map(|operation| ScopedPermission {
-            operation: operation.into(),
-            resource: PermissionResource::PluginInstallation {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                installation_id: installation.into(),
+fn plugin_permissions(installation: &str) -> Vec<ScopedPermission> {
+    [
+        "plugin.admit",
+        "plugin.publish",
+        "plugin.connection.open",
+        "plugin.http.send",
+        "plugin.log",
+        "plugin.service.consume",
+    ]
+    .into_iter()
+    .map(|operation| ScopedPermission {
+        operation: operation.into(),
+        resource: PermissionResource::PluginInstallation {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+            installation_id: installation.into(),
+        },
+    })
+    .collect()
+}
+
+fn plugin_assignment() -> feature_permissions::PermissionAssignment {
+    feature_permissions::PermissionAssignment {
+        grants: vec![feature_permissions::PermissionReference::Namespace(
+            feature_permissions::NamespacePermissions {
+                namespace: feature_permissions::NamespaceId::parse("plugin").unwrap(),
+                keys: plugin_permissions("unused-resource-projection")
+                    .into_iter()
+                    .map(|p| feature_permissions::PermissionKey::parse(p.operation).unwrap())
+                    .collect(),
             },
-        })
-        .collect()
-    } else {
-        vec![]
-    };
-    store
-        .set_subject_permissions(
-            subject,
-            &SubjectPermissionsUpdate {
-                operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: previous,
-                execution,
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+        )],
+        ..Default::default()
+    }
+}
+
+fn set_policy(api: &WorkspaceApi, subject: &str, _installation: &str, granted: bool) {
+    replace_config_plugin_subject_policy_as_owner(
+        api,
+        subject,
+        if granted {
+            plugin_assignment()
+        } else {
+            Default::default()
+        },
+        Default::default(),
+    );
 }
 
 fn commit_config(
@@ -638,9 +671,8 @@ fn commit_config_for_artifact(
         .unwrap()
         .unwrap();
     let path = config_source::VirtualPath::parse("main.dcdl").unwrap();
-    commit_workspace_config_tree(
+    adopt_test_config_as_owner(
         api,
-        TEST_WORKSPACE_ID,
         &ConfigCommitRequest {
             base_digest: state.snapshot.digest.clone(),
             entrypoints: state.contract.entrypoints.clone(),
@@ -1682,20 +1714,15 @@ async fn canonical_reserved_child_identity_and_prepare_match_live_owner_and_fenc
     use server_api::authorization::WorkerDelegationRequest;
     let f = Fixture::new(None).await;
     let store = open_subjektiv_store(&f.api).unwrap();
-    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
-    store
-        .set_subject_permissions(
-            &f.subject,
-            &SubjectPermissionsUpdate {
-                operation_id: "delegate-plugin".into(),
-                expected_change_id: Some(previous.change_id),
-                execution: previous.execution.clone(),
-                delegation: previous.execution.clone(),
-            },
-        )
-        .unwrap();
+    let previous = store.current_subject_policy(&f.subject).unwrap().unwrap();
+    replace_config_plugin_subject_policy_as_owner(
+        &f.api,
+        &f.subject,
+        previous.execution.clone(),
+        previous.execution,
+    );
     let request = WorkerDelegationRequest {
-        permissions: previous.execution,
+        permissions: plugin_permissions(&f.installed.installation.installation_id),
         redelegation: vec![],
     };
     let grant = subject_authorization::prepare_delegation(

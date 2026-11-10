@@ -70,7 +70,7 @@ struct Context {
     a: String,
     b: String,
     workdir: Option<String>,
-    permissions: Vec<ScopedPermission>,
+    policy: Option<server_api::launch_policy::WorkerLaunchPolicy>,
     spawned: Option<RuntimeWorkerRef>,
     ticket: Option<String>,
     denials: Vec<(String, Value, String)>,
@@ -97,7 +97,7 @@ impl DelegationModel {
             "operation_id":format!("chat:{}:{message}", c.a),
             "display_name":"Bounded background chat work",
             "initial_submit":[{"kind":"text","content":format!("{CHILD}; conversation={}; message={message}", c.a)}],
-            "execution_grant":{"permissions":c.permissions,"redelegation":[]}});
+            "policy_id":c.policy.as_ref().unwrap().policy_id,"policy_revision":c.policy.as_ref().unwrap().authorization_revision});
         if let Some(id) = &c.workdir {
             input["working_directory_id"] = json!(id);
         }
@@ -516,30 +516,45 @@ fn publish_profiles(api: &WorkspaceApi) {
         { selector = "project:chat-background"; label = "Background work"; description = "Bounded file or domain work";
           profile = (import "$builtin/profiles/companion.dcdl") // { slug = "chat-background"; scope = "workspace_write";
             feature = { subjektiv = { enabled = false; }; worker = { enabled = true; direct_spawn = false; }; };
-            permissions = { default_action = "deny"; rule = [
-              { tool = "Read"; pattern = "*"; action = "allow"; },
-              { tool = "Write"; pattern = "*"; action = "allow"; },
-              { tool = "QueryObjective"; pattern = "*"; action = "allow"; },
-              { tool = "WorkerList"; pattern = "*"; action = "allow"; },
-              { tool = "WorkerNotify"; pattern = "*"; action = "allow"; },
-              { tool = "TicketImplementationResult"; pattern = "*"; action = "allow"; }
-            ]; };
           }; }
     ]; }; }"#;
-    commit_workspace_config_tree(
-        api,
-        TEST_WORKSPACE_ID,
-        &ConfigCommitRequest {
-            base_digest: state.snapshot.digest.clone(),
-            entrypoints: state.contract.entrypoints.clone(),
-            changes: vec![config_source::ConfigTreeChange::Update {
-                path: main.path.clone(),
-                expected_digest: main.content_digest.clone(),
-                content: content.into(),
-            }],
-        },
-    )
-    .unwrap();
+    let source = ConfigCommitRequest {
+        base_digest: state.snapshot.digest.clone(),
+        entrypoints: state.contract.entrypoints.clone(),
+        changes: vec![config_source::ConfigTreeChange::Update {
+            path: main.path.clone(),
+            expected_digest: main.content_digest.clone(),
+            content: content.into(),
+        }],
+    };
+    let owner = test_owner_actor().account_id;
+    let registry = api.permission_registry.read().unwrap();
+    api.config_store
+        .adopt_configuration(
+            TEST_WORKSPACE_ID,
+            &owner,
+            &crate::config_adoption::ConfigurationAdoptionRequest {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_head: api
+                    .config_store
+                    .configuration_head(TEST_WORKSPACE_ID, &owner)
+                    .unwrap(),
+                expected_catalog_digest: crate::config_adoption::catalog_digest(registry.host())
+                    .unwrap(),
+                expected_legacy_export: None,
+                source,
+            },
+            api.config_schema_registry.compose().unwrap(),
+            registry.host(),
+            None,
+            |_| Ok(()),
+            |_| {
+                Err(Error::RegistryInconsistency(
+                    "fixture cannot transfer sealed authority".into(),
+                ))
+            },
+        )
+        .unwrap();
 }
 async fn account_request(
     h: &ConnectedWorkerHarness,
@@ -671,7 +686,6 @@ async fn connected_chat_delegation(scenario: Scenario) {
     } else {
         child_permissions.push(operation("objective.query", true));
     }
-    context.lock().unwrap().permissions = child_permissions.clone();
     let store = open_subjektiv_store(&h.api).unwrap();
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("async-chat-delegation").unwrap())
@@ -694,7 +708,6 @@ async fn connected_chat_delegation(scenario: Scenario) {
         operation("worker.messaging", false),
     ]);
     let mut foreign = None;
-    let mut delegation = child_permissions.clone();
     if ticket_mode {
         let mut input = NewTicket::new("Chat requested Ticket work");
         set_test_ticket_target(&mut input, "test-repository", selector);
@@ -744,27 +757,8 @@ async fn connected_chat_delegation(scenario: Scenario) {
                 },
             });
         }
-        delegation = child_permissions.clone();
         let wrong = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/working-directories"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"repository_key":"test-repository","selector":"HEAD","operation_id":"wrong-chat-workdir"}))).await;
         let wrong = wrong["item"]["working_directory_id"].as_str().unwrap();
-        let mut wrong_permissions = child_permissions
-            .iter()
-            .filter(|p| !p.operation.starts_with("filesystem."))
-            .cloned()
-            .collect::<Vec<_>>();
-        for name in ["filesystem.read", "filesystem.write"] {
-            let p = ScopedPermission {
-                operation: name.into(),
-                resource: PermissionResource::Workdir {
-                    working_directory_id: wrong.into(),
-                    path: ".".into(),
-                    recursive: true,
-                },
-            };
-            delegation.push(p.clone());
-            wrong_permissions.push(p);
-        }
-        context.lock().unwrap().permissions = child_permissions.clone();
         context.lock().unwrap().ticket = Some(ticket);
         context.lock().unwrap().denials = vec![
             (
@@ -774,30 +768,41 @@ async fn connected_chat_delegation(scenario: Scenario) {
             ),
             (
                 "chat-denied-wrong-target".into(),
-                json!({"working_directory_id":wrong,"execution_grant":{"permissions":wrong_permissions,"redelegation":[]}}),
+                json!({"working_directory_id":wrong}),
                 "selector".into(),
             ),
         ];
         foreign = Some((other_subject, other_ticket));
     }
-    // Keep the scoped Ticket/Workdir and child ceilings this legacy suite tests.
-    // The explicit fixture source is separate from new Subject shared-set defaults.
-    store
-        .set_subject_permissions(
-            &subject,
-            &SubjectPermissionsUpdate {
-                operation_id: "legacy-chat-delegation-fixture".into(),
-                expected_change_id: store
-                    .current_subject_policy(&subject)
-                    .unwrap()
-                    .map(|policy| policy.change_id),
-                execution: vec![],
-                delegation: vec![],
-            },
-        )
-        .unwrap();
-    account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"chat-policy","expected_change_id":store.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":delegation}))).await;
-    let original_policy = store.subject_permissions(&subject).unwrap().unwrap();
+    let child_assignment = key_assignment(
+        &child_permissions
+            .iter()
+            .map(|p| p.operation.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let policy = seed_owner_launch_policy(
+        &h.api,
+        &h.owner,
+        "chat-background",
+        &["project:chat-background"],
+        child_assignment.clone(),
+    )
+    .await;
+    execution.push(operation(policy.usage_key().unwrap().as_str(), true));
+    let original_policy = super::chat_tests::replace_subject_policy(
+        &h.api,
+        &h.owner,
+        &subject,
+        key_assignment(
+            &execution
+                .iter()
+                .map(|p| p.operation.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        child_assignment.clone(),
+    )
+    .await;
+    context.lock().unwrap().policy = Some(policy);
     for (name, target) in [("conversation-a", true), ("conversation-b", false)] {
         let c = account_request(
             &h,
@@ -817,7 +822,7 @@ async fn connected_chat_delegation(scenario: Scenario) {
         let c = context.lock().unwrap();
         (c.a.clone(), c.b.clone())
     };
-    let source = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"display_name":"Restricted async chat","profile":"project:async-chat","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}}))).await;
+    let source = account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/workers"),Some(json!({"runtime_id":CONNECTED_RUNTIME,"display_name":"Restricted async chat","profile":"project:async-chat","authorization":{"kind":"human","assignment":null},"control_operation_id":"chat-subject-body","initial_submit":[],"workdir_attachments":[],"feature_connections":{"subjektiv":{"subject_id":subject}}}))).await;
     let source = RuntimeWorkerRef::new(
         source["runtime_id"].as_str().unwrap(),
         source["worker_id"].as_str().unwrap(),
@@ -934,7 +939,11 @@ async fn connected_chat_delegation(scenario: Scenario) {
         );
     }
     assert_eq!(
-        store.subject_permissions(&subject).unwrap().unwrap(),
+        h.api
+            .config_store
+            .current_subject_permission_policy(TEST_WORKSPACE_ID, &subject)
+            .unwrap()
+            .unwrap(),
         original_policy,
         "no per-target Subject policy copy"
     );
@@ -959,11 +968,34 @@ async fn connected_chat_delegation(scenario: Scenario) {
             .unwrap()
             .is_none()
     );
-    let grant = store
-        .worker_execution_grant(&child.runtime_id, &child.worker_id)
+    let grant = h
+        .api
+        .config_store
+        .core_worker_execution_grant(TEST_WORKSPACE_ID, &child.runtime_id, &child.worker_id)
         .unwrap()
         .unwrap();
-    assert_eq!(grant.permissions, context.lock().unwrap().permissions);
+    assert_eq!(grant.assignment, child_assignment);
+    let mut expected_ceiling = child_permissions
+        .iter()
+        .map(|permission| feature_permissions::PermissionKey::parse(&permission.operation).unwrap())
+        .collect::<Vec<_>>();
+    expected_ceiling.sort();
+    expected_ceiling.dedup();
+    assert_eq!(grant.issuance_ceiling, Some(expected_ceiling));
+    let policy = context.lock().unwrap().policy.clone().unwrap();
+    assert_eq!(
+        grant.source,
+        server_api::authorization::CoreWorkerGrantSource::LaunchPolicy {
+            policy_id: policy.policy_id,
+            policy_revision: policy.authorization_revision,
+            parent: server_api::authorization::CoreWorkerGrantParent::SubjectBody {
+                subject_id: subject.clone(),
+                source_change_id: original_policy.change_id.clone(),
+                runtime_id: source.runtime_id.clone(),
+                worker_id: source.worker_id.clone(),
+            },
+        }
+    );
     if ticket_mode {
         let ticket = context.lock().unwrap().ticket.clone().unwrap();
         assert_eq!(
@@ -1023,10 +1055,7 @@ async fn connected_chat_delegation(scenario: Scenario) {
         );
     }
     assert!(
-        !grant
-            .permissions
-            .iter()
-            .any(|permission| permission.operation == "chat.send")
+        !grant.bounds_operation(&feature_permissions::PermissionKey::parse("chat.send").unwrap())
     );
     assert!(
         h.api
@@ -1049,7 +1078,19 @@ async fn connected_chat_delegation(scenario: Scenario) {
             .into_iter()
             .filter(|permission| permission.operation != "worker.messaging")
             .collect::<Vec<_>>();
-        account_request(&h,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"revoke-messaging","expected_change_id":original_policy.change_id,"execution":narrowed,"delegation":context.lock().unwrap().permissions}))).await;
+        super::chat_tests::replace_subject_policy(
+            &h.api,
+            &h.owner,
+            &subject,
+            key_assignment(
+                &narrowed
+                    .iter()
+                    .map(|p| p.operation.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+            child_assignment.clone(),
+        )
+        .await;
     }
     account_request(&h,"POST",&messages(&a),Some(json!({"operation_id":"request-denied","text":"Attempt follow-up after authorization is revoked"}))).await;
     tokio::time::timeout(std::time::Duration::from_secs(60), completion.recv())

@@ -101,7 +101,7 @@ async fn mutate(
 async fn drive_http_receipts_cas_stable_url_and_workspace_refs_follow_storage_authority() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let token = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let root = root_id(&api, &token).await;
     let create = json!({"operation":"create_text","parent":reference(&root),"name":"日本語.md","text":"# Shared\n","content_type":"text/markdown"});
     let first = mutate(&api, &token, "create", create.clone(), StatusCode::OK).await;
@@ -192,7 +192,7 @@ async fn drive_http_receipts_cas_stable_url_and_workspace_refs_follow_storage_au
 async fn drive_binary_upload_download_enforce_digest_size_and_safe_active_media_headers() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let token = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let root = root_id(&api, &token).await;
     for (i, bytes, media) in [
         (0, b"<script>alert(1)</script>".as_slice(), "text/html"),
@@ -314,7 +314,7 @@ async fn workers(api: &WorkspaceApi) -> (WorkdirlessFixtureRuntime, Vec<RuntimeW
     api.runtime.register_or_replace(runtime.clone());
     let mut workers = vec![];
     for name in ["Drive reader", "Drive writer"] {
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -327,9 +327,28 @@ async fn workers(api: &WorkspaceApi) -> (WorkdirlessFixtureRuntime, Vec<RuntimeW
                 workdir_attachments: vec![],
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                    assignment: None,
-                },
+                authorization: test_worker_operation_authorization(&[
+                    (
+                        "drive",
+                        &[
+                            "drive.capabilities",
+                            "drive.root",
+                            "drive.search",
+                            "drive.metadata",
+                            "drive.list",
+                            "drive.read_text",
+                            "drive.read_chunk",
+                            "drive.create_folder",
+                            "drive.create_text",
+                            "drive.update_text",
+                            "drive.delete",
+                            "drive.relocate",
+                            "drive.upload",
+                            "drive.request_status",
+                        ],
+                    ),
+                    ("filesystem", &["filesystem.read", "filesystem.write"]),
+                ]),
             }),
         )
         .await
@@ -365,7 +384,7 @@ async fn signed(
 async fn drive_two_workers_and_non_owner_use_grants_without_workdir_or_profile_authority() {
     let temp = tempfile::tempdir().unwrap();
     let mut api = test_api(temp.path()).await;
-    let owner = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let owner = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let member = seed_test_api_token(api.store.as_ref(), "member");
     let (_runtime, workers) = workers(&api).await;
     let identity = RuntimeIdentityMaterial::generate(&workers[0].runtime_id).unwrap();
@@ -526,7 +545,7 @@ fn public_drive_error(
 async fn drive_http_client_preserves_limit_rejection_and_unknown_without_reexecution() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    seed_test_workspace_owner_token(api.store.as_ref(), "drive-errors").await;
+    seed_test_owner_api_token(&api, "drive-errors");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = build_router(api.clone());
@@ -781,7 +800,7 @@ impl Drop for AbortServer {
 async fn drive_generated_client_roundtrips_binary_and_declared_headers_over_real_http() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    seed_test_workspace_owner_token(api.store.as_ref(), "drive-client").await;
+    seed_test_owner_api_token(&api, "drive-client");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = build_router(api);
@@ -864,7 +883,7 @@ async fn drive_generated_client_roundtrips_binary_and_declared_headers_over_real
 async fn drive_stream_abort_invalid_query_and_storage_loss_never_publish_or_leak_paths() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let token = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let root = root_id(&api, &token).await;
     let chunks = futures::stream::iter([
         Ok(axum::body::Bytes::from_static(b"a")),
@@ -986,7 +1005,7 @@ async fn drive_stream_abort_invalid_query_and_storage_loss_never_publish_or_leak
 async fn drive_verified_upload_revoked_during_reception_cannot_commit_or_replay() {
     let temp = tempfile::tempdir().unwrap();
     let mut api = test_api(temp.path()).await;
-    let owner = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let owner = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let root = root_id(&api, &owner).await;
     let (_runtime, workers) = workers(&api).await;
     let identity = RuntimeIdentityMaterial::generate(&workers[0].runtime_id).unwrap();
@@ -1064,7 +1083,7 @@ async fn drive_verified_upload_revoked_during_reception_cannot_commit_or_replay(
 async fn drive_read_entrypoints_use_current_grants_and_cannot_fallback_to_browser_actor() {
     let temp = tempfile::tempdir().unwrap();
     let mut api = test_api(temp.path()).await;
-    let owner = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let owner = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let root = root_id(&api, &owner).await;
     let saved=mutate(&api,&owner,"matrix-file",json!({"operation":"create_text","parent":reference(&root),"name":"matrix","text":"bytes","content_type":"text/plain"}),StatusCode::OK).await;
     let id = saved["entry"]["entry"]["node_id"].as_str().unwrap();
@@ -1181,7 +1200,7 @@ async fn drive_read_entrypoints_use_current_grants_and_cannot_fallback_to_browse
 async fn drive_concurrent_http_cas_has_one_winner_and_name_search_pages_are_scoped() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let token = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let root = root_id(&api, &token).await;
     let saved=mutate(&api,&token,"concurrent-file",json!({"operation":"create_text","parent":reference(&root),"name":"candidate","text":"find me","content_type":"text/plain"}),StatusCode::OK).await;
     let id = &saved["entry"]["entry"]["node_id"];
@@ -1258,7 +1277,7 @@ async fn drive_concurrent_http_cas_has_one_winner_and_name_search_pages_are_scop
 async fn drive_download_stream_expires_instead_of_mixing_last_mutation_ids() {
     let temp = tempfile::tempdir().unwrap();
     let api = test_api(temp.path()).await;
-    let token = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let token = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let root = root_id(&api, &token).await;
     let bytes = vec![b'a'; 128 * 1024];
     let path = upload_url(
@@ -1310,7 +1329,7 @@ async fn drive_download_stream_expires_instead_of_mixing_last_mutation_ids() {
 async fn drive_capabilities_expose_only_authenticated_current_caller_ceiling() {
     let temp = tempfile::tempdir().unwrap();
     let mut api = test_api(temp.path()).await;
-    let owner = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+    let owner = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
     let (_runtime, workers) = workers(&api).await;
     let identity = RuntimeIdentityMaterial::generate(&workers[0].runtime_id).unwrap();
     configure_runtime_request_auth(&mut api, &identity, &workers[0].runtime_id);

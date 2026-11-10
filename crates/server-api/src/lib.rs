@@ -28,6 +28,8 @@ pub use chat::*;
 pub use configuration_adoption::*;
 mod subject_body;
 pub use subject_body::*;
+pub mod subject_policy;
+pub use subject_policy::*;
 mod chat_transport;
 pub use chat_transport::*;
 mod drive;
@@ -447,6 +449,9 @@ impl_openapi_schema!(
     SubjectPermissionsResponse,
     SubjectPermissionsMutationResponse,
     SubjectPermissionInterruption,
+    SubjectPermissionPolicyMutation,
+    SubjectPermissionPolicyResponse,
+    SubjectPermissionPolicyMutationResponse,
     authorization::SubjectPermissions,
     authorization::SubjectPermissionsUpdate,
     AuthBootstrapUserRequest,
@@ -1721,6 +1726,37 @@ pub trait ServerApi {
         #[body] request: authorization::SubjectPermissionsUpdate,
     ) -> Result<SubjectPermissionsMutationResponse, RepositoryApiError>;
 
+    #[get(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permission-policy",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_policy_get(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+    ) -> Result<SubjectPermissionPolicyResponse, RepositoryApiError>;
+
+    #[put(
+        "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permission-policy",
+        status = 200,
+        error_status = 400,
+        additional_error_statuses = [401, 403, 404, 409, 500],
+        bearer_auth = true,
+        browser_auth = true,
+    )]
+    async fn subjektiv_subject_policy_set(
+        &self,
+        #[extension] context: ServerRequestContext,
+        #[path] workspace_id: String,
+        #[path] subject_id: String,
+        #[body] request: SubjectPermissionPolicyMutation,
+    ) -> Result<SubjectPermissionPolicyMutationResponse, RepositoryApiError>;
+
     #[post(
         "/api/w/{workspace_id}/subjektiv/subjects",
         status = 201,
@@ -2127,6 +2163,7 @@ pub trait ServerApi {
     )]
     async fn workspace_orchestrator_start(
         &self,
+        #[extension] context: ServerRequestContext,
         #[path] workspace_id: String,
     ) -> Result<BrowserWorkspaceOrchestratorResponse, RepositoryApiError>;
     #[get(
@@ -11771,6 +11808,12 @@ pub fn memory_api_typescript() -> String {
         SubjectPermissionsResponse::decl(&config),
         SubjectPermissionsMutationResponse::decl(&config),
         SubjectPermissionInterruption::decl(&config),
+        authorization::PermissionReferenceEncoding::decl(&config),
+        authorization::CurrentSubjectPolicy::decl(&config),
+        subject_policy::SubjectPermissionPolicyMutation::decl(&config),
+        subject_policy::SubjectPermissionPolicyAction::decl(&config),
+        subject_policy::SubjectPermissionPolicyResponse::decl(&config),
+        subject_policy::SubjectPermissionPolicyMutationResponse::decl(&config),
     ];
     // These browser DTOs include nested types owned by `memory` and the Worker
     // launch API. Keep their exported names explicit so the generated Web
@@ -11786,7 +11829,7 @@ export type SubjektivSubjectDeleteResponse = { subject_id: string, operation_id:
 
 export type SubjektivSubjectBehaviorUpdateRequest = { expected_behavior_md: string, behavior_md: string, };
 
-export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_body?: import("./subject-body-api").SubjectBodyRef | null, current_worker_diagnostics?: Array<Diagnostic>, current_worker?: | import("./worker-launch-api").WorkerLaunchWorkerSummary | null, };
+export type SubjektivSubjectResponse = { id: string, role: string, behavior_md: string, state: SubjektivSubjectState, memory_fingerprint: string, created_at: string, updated_at: string, current_body?: import("./subject-body-api.ts").SubjectBodyRef | null, current_worker_diagnostics?: Array<Diagnostic>, current_worker?: | import("./worker-launch-api.ts").WorkerLaunchWorkerSummary | null, };
 
 export type SubjektivSubjectListResponse = { limit: number, items: Array<SubjektivSubjectResponse>, next_cursor?: string | null, has_more: boolean, };
 
@@ -11823,7 +11866,7 @@ export type SubjektivMemoryListChangesResponse = { memory_id: string, current_ch
         "export const SUBJEKTIV_API_LIMITS = {{\n  maxBehaviorBytes: {SUBJEKTIV_MAX_BEHAVIOR_BYTES},\n}} as const;"
     );
     format!(
-        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\n{limits}\n\n{subjektiv_limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
+        "// Generated from server-api. Do not edit by hand.\n// Regenerate: cargo run -q -p server-api --features typescript --example generate_memory_api_types > web/workspace/src/lib/generated/memory-api.ts\n\nimport type {{ PermissionAssignment, PermissionCatalog, PermissionResolution }} from \"./feature-permissions.generated.ts\";\n\n{limits}\n\n{subjektiv_limits}\n\n{}\n\n{subjektiv_browser_declarations}\n",
         declarations
             .into_iter()
             .map(|declaration| format!("export {declaration}"))
@@ -12729,6 +12772,54 @@ mod skill_typescript_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subject_policy_operations_use_individual_subject_routes_and_typed_mutations() {
+        for (name, method, request_kind) in [
+            (
+                "subjektiv_subject_policy_get",
+                HttpMethod::Get,
+                api_macros::WireKind::Empty,
+            ),
+            (
+                "subjektiv_subject_policy_set",
+                HttpMethod::Put,
+                api_macros::WireKind::Json,
+            ),
+        ] {
+            let operation = ServerApiMetadata::OPERATIONS
+                .iter()
+                .find(|operation| operation.operation_id == name)
+                .unwrap();
+            assert_eq!(operation.method, method);
+            assert_eq!(
+                operation.path,
+                "/api/w/{workspace_id}/subjektiv/subjects/{subject_id}/permission-policy"
+            );
+            assert_eq!(operation.request_body.wire_kind, request_kind);
+            let parameters: Vec<_> = operation
+                .parameters
+                .iter()
+                .map(|parameter| (parameter.rust_name, parameter.location, parameter.rust_type))
+                .collect();
+            let mut expected = vec![
+                (
+                    "workspace_id",
+                    api_macros::ParameterLocation::Path,
+                    "String",
+                ),
+                ("subject_id", api_macros::ParameterLocation::Path, "String"),
+            ];
+            if method == HttpMethod::Put {
+                expected.push((
+                    "request",
+                    api_macros::ParameterLocation::Body,
+                    "SubjectPermissionPolicyMutation",
+                ));
+            }
+            assert_eq!(parameters, expected);
+        }
+    }
 
     #[test]
     fn ticket_tag_query_filters_default_empty_and_roundtrip() {

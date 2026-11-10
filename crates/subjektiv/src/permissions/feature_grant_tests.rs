@@ -61,6 +61,7 @@ fn policy(change: &str) -> CurrentSubjectPolicy {
         execution: lane.clone(),
         delegation: lane,
         legacy_constraints: None,
+        reference_encoding: server_api::authorization::PermissionReferenceEncoding::FeatureSetsV2,
     }
 }
 
@@ -120,6 +121,164 @@ impl CanonicalPermissionSource for Canonical {
         self.legacy_calls.fetch_add(1, Ordering::SeqCst);
         Err(denied("Feature source has no legacy all-target projection"))
     }
+}
+
+#[test]
+fn effective_native_reads_normalize_without_changing_raw_transfer_or_history() {
+    use server_api::authorization::PermissionReferenceEncoding;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let subject = store.create_subject(role()).unwrap().id;
+    let mut raw = policy("stored-v1");
+    raw.reference_encoding = PermissionReferenceEncoding::LegacySubjectV1;
+    raw.execution = PermissionAssignment {
+        grants: vec![PermissionReference::Set(
+            feature_permissions::PermissionSetId::parse("subject-default").unwrap(),
+        )],
+        exclusions: vec![reference("subject", "subject.orchestrate")],
+        revoked: true,
+    };
+    raw.delegation = PermissionAssignment::default();
+    install_feature_fixture(&store, &subject, &raw);
+    let stored_bytes = serde_json::to_string(&raw).unwrap();
+    assert!(!stored_bytes.contains("reference_encoding"));
+    let identity = store.database_identity().unwrap();
+    let before = store.preview_permission_transfer(&identity).unwrap();
+    assert_eq!(before.sources[0].feature_policy, Some(raw.clone()));
+
+    let expected = raw.clone().into_current_reference_encoding();
+    assert_eq!(
+        store.current_subject_policy(&subject).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        store.subject_policy_source(&subject).unwrap(),
+        Some(SubjectPolicySource::Feature(expected))
+    );
+    let persisted: String = store
+        .database
+        .try_with_connection::<_, SubjektivError>(|connection| {
+            Ok(connection.query_row(
+                "SELECT record_json FROM subject_permission_changes WHERE subject_id=?1 AND change_id=?2",
+                params![subject, raw.change_id],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(persisted, stored_bytes);
+    assert_eq!(
+        store.preview_permission_transfer(&identity).unwrap(),
+        before
+    );
+    let receipt = store
+        .seal_permission_sources(&identity, "raw-v1-seal", &before.export_digest)
+        .unwrap();
+    assert_eq!(receipt.snapshot, before);
+    assert_eq!(
+        store.permission_transfer_receipt(&identity).unwrap(),
+        Some(receipt.clone())
+    );
+    assert_eq!(
+        store
+            .seal_permission_sources(&identity, "raw-v1-seal", &before.export_digest)
+            .unwrap(),
+        receipt
+    );
+}
+
+#[test]
+fn canonical_effective_reads_normalize_without_replacing_provider_evidence() {
+    use server_api::authorization::PermissionReferenceEncoding;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let subject = store.create_subject(role()).unwrap().id;
+    let identity = store.database_identity().unwrap();
+    let snapshot = store.preview_permission_transfer(&identity).unwrap();
+    store
+        .seal_permission_sources(&identity, "v1-provider-seal", &snapshot.export_digest)
+        .unwrap();
+    let mut raw = policy("canonical-v1");
+    raw.reference_encoding = PermissionReferenceEncoding::LegacySubjectV1;
+    raw.delegation.grants = vec![reference("subject", "subject.delegate")];
+    let provider = Arc::new(Canonical {
+        subject: subject.clone(),
+        source: Mutex::new(Some(SubjectPolicySource::Feature(raw.clone()))),
+        legacy_calls: AtomicUsize::new(0),
+    });
+    let store = store.with_canonical_permission_source(provider.clone());
+    let expected = raw.clone().into_current_reference_encoding();
+    assert_eq!(
+        store.current_subject_policy(&subject).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        store.subject_policy_source(&subject).unwrap(),
+        Some(SubjectPolicySource::Feature(expected))
+    );
+    assert_eq!(
+        *provider.source.lock().unwrap(),
+        Some(SubjectPolicySource::Feature(raw))
+    );
+    assert_eq!(provider.legacy_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn pending_creation_enrollment_readers_retain_raw_reference_evidence() {
+    use server_api::authorization::PermissionReferenceEncoding;
+
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let identity = store.database_identity().unwrap();
+    // Pre-seal non-idempotent creation leaves no receipt. Seed the historical
+    // enrollment in a fresh row instead of rewriting immutable creation evidence.
+    let subject = store.create_subject(role()).unwrap().id;
+    let snapshot = store.preview_permission_transfer(&identity).unwrap();
+    store
+        .seal_permission_sources(&identity, "enrollment-seal", &snapshot.export_digest)
+        .unwrap();
+    let mut raw = policy("pending-v1");
+    raw.reference_encoding = PermissionReferenceEncoding::LegacySubjectV1;
+    raw.delegation.grants = vec![reference("subject", "subject.delegate")];
+    let stored_bytes = serde_json::to_string(&raw).unwrap();
+    store
+        .database
+        .try_transaction::<_, SubjektivError>(|tx| {
+            tx.execute(
+                "INSERT INTO subject_creation_receipts(operation_id,subject_id,request_fingerprint,permission_enrollment_json) VALUES(?1,?2,?3,?4)",
+                params![
+                    "pending-v1-enrollment",
+                    subject,
+                    "fixture-fingerprint",
+                    stored_bytes
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let expected = Some(SubjectPolicySource::Feature(raw));
+    assert_eq!(
+        store.subject_permission_enrollment(&subject).unwrap(),
+        expected
+    );
+    store
+        .with_permission_authority_guard(&identity, |authority| {
+            assert_eq!(authority.subject_permission_enrollment(&subject)?, expected);
+            Ok(())
+        })
+        .unwrap();
+    let persisted: String = store
+        .database
+        .try_with_connection::<_, SubjektivError>(|connection| {
+            Ok(connection.query_row(
+                "SELECT permission_enrollment_json FROM subject_creation_receipts WHERE subject_id=?1",
+                [&subject],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(persisted, stored_bytes);
 }
 
 #[test]

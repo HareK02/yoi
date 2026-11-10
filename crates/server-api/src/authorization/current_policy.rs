@@ -2,10 +2,14 @@
 //!
 //! This is a policy value, not an authorization receipt. Hosts resolve its lanes
 //! against their current registered Feature declarations at every protected access.
-use super::{ScopedPermission, SubjectPermissions};
+use super::{
+    PermissionReferenceEncoding, ScopedPermission, SubjectPermissions,
+    migrate_legacy_subject_assignment,
+};
 use feature_permissions::{
     NamespacePermissions, PermissionAssignment, PermissionKey, PermissionReference,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -18,16 +22,33 @@ pub enum SubjectPolicySource {
     Legacy(SubjectPermissions),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct CurrentSubjectPolicy {
     pub change_id: String,
     pub execution: PermissionAssignment,
     pub delegation: PermissionAssignment,
     pub legacy_constraints: Option<SubjectPermissions>,
+    #[serde(
+        default,
+        skip_serializing_if = "PermissionReferenceEncoding::is_legacy"
+    )]
+    pub reference_encoding: PermissionReferenceEncoding,
 }
 
 impl CurrentSubjectPolicy {
+    /// Interpret stored references only at an effective-policy boundary. Raw history,
+    /// exports and receipts must retain their original encoding and serialized bytes.
+    pub fn into_current_reference_encoding(mut self) -> Self {
+        if self.reference_encoding.is_legacy() {
+            migrate_legacy_subject_assignment(&mut self.execution);
+            migrate_legacy_subject_assignment(&mut self.delegation);
+            self.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
+        }
+        self
+    }
+
     /// Representation-only projection. Exact old resource conditions remain a
     /// separate conjunct; unrepresentable names are diagnosed, never discarded.
     pub fn from_legacy(source: SubjectPermissions) -> Result<Self, String> {
@@ -55,6 +76,7 @@ impl CurrentSubjectPolicy {
             execution: lane(&source.execution)?,
             delegation: lane(&source.delegation)?,
             legacy_constraints: Some(source),
+            reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
         })
     }
 }

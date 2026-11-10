@@ -9,57 +9,57 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         BuiltinPermissionOperation {
             key: "worker.list",
             description: "List known Workers. Discovery does not grant control.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "worker.discover",
             description: "Search bounded Worker metadata. Discovery does not grant control or observation.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.observe.list",
             description: "List observation subjects; does not grant access to individual sessions.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.create",
             description: "Use Profile-resolved Worker creation with explicit execution grants. Directional Backend grants separately control the created Worker and its message-only reply.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.messaging",
             description: "Operation capability only; directional control grants and current lifecycle constraints remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "worker.send_input",
             description: "Operation capability only; directional control grants and current lifecycle constraints remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.cancel",
             description: "Operation capability only; directional control grants and current lifecycle constraints remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.stop",
             description: "Operation capability only; directional control grants and current lifecycle constraints remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.restore",
             description: "Operation capability only; directional control grants and current lifecycle constraints remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.remove",
             description: "Operation capability only; directional control grants and current lifecycle constraints remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "worker.observe",
             description: "Operation capability only; directional control grants and current lifecycle constraints remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
     ],
 };
@@ -71,22 +71,22 @@ pub(crate) const SUBWORKER: BuiltinPermissionDeclaration = BuiltinPermissionDecl
         BuiltinPermissionOperation {
             key: "subworker.spawn",
             description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "subworker.send_input",
             description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "subworker.stop",
             description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "subworker.observe",
             description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-execution"],
         },
     ],
 };

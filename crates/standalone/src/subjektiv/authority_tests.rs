@@ -418,7 +418,11 @@ fn new_subject_shared_assignment_and_normal_read_survive_reopen_and_same_body_re
         .unwrap()
         .unwrap();
     assert!(
-        matches!(policy.execution.grants.as_slice(), [PermissionReference::Set(set)] if set.as_str() == "subject-default")
+        matches!(policy.execution.grants.as_slice(), [PermissionReference::Set(conversation), PermissionReference::Set(coordination)]
+            if conversation.as_str() == "conversation" && coordination.as_str() == "work-coordination")
+    );
+    assert!(
+        matches!(policy.delegation.grants.as_slice(), [PermissionReference::Set(set)] if set.as_str() == "work-execution")
     );
     let id = protocol::WorkerId::now_v7();
     let mut first = catalog.connect(&subject.id, id).unwrap();

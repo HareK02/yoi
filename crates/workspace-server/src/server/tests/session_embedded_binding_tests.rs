@@ -198,20 +198,16 @@ impl SignedEmbeddedSession {
                 }
             }),
         );
-        store
-            .set_subject_permissions(
-                &subject.id,
-                &server_api::authorization::SubjectPermissionsUpdate {
-                    operation_id: "signed-embedded-session-grants".into(),
-                    expected_change_id: store
-                        .current_subject_policy(&subject.id)
-                        .unwrap()
-                        .map(|policy| policy.change_id),
-                    execution,
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        let operations = execution
+            .iter()
+            .map(|permission| permission.operation.as_str())
+            .collect::<Vec<_>>();
+        set_test_subject_policy_as_owner(
+            &api,
+            &subject.id,
+            test_operation_assignment(&api, &operations),
+            Default::default(),
+        );
         let app = build_router(api.clone());
         let server = ConnectedRestoreServer {
             server: tokio::spawn(async move {
@@ -221,11 +217,8 @@ impl SignedEmbeddedSession {
         };
         // Real connected creation performs signed Session registration. No fake
         // Runtime endpoint, synthetic attribution, or seeded protected DTO is used.
-        let Json(created) = scoped_create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-            }),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),

@@ -38,80 +38,77 @@ const JOURNAL_OPERATIONS: &[&str] = &[
     "journal.finish",
 ];
 
-fn grant_journal_operations(store: &crate::subjektiv::SubjektivStore, subject: &str) {
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-    };
-    let previous = store.current_subject_policy(subject).unwrap();
-    store
-        .set_subject_permissions(
-            subject,
-            &SubjectPermissionsUpdate {
-                operation_id: format!("journal-fixture-grant-{subject}"),
-                expected_change_id: previous.map(|policy| policy.change_id),
-                execution: JOURNAL_OPERATIONS
-                    .iter()
-                    .map(|operation| ScopedPermission {
-                        operation: (*operation).into(),
-                        resource: PermissionResource::Subject {
-                            workspace_id: TEST_WORKSPACE_ID.into(),
-                            subject_id: subject.into(),
-                        },
-                    })
-                    .collect(),
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+fn grant_journal_operations(api: &WorkspaceApi, subject: &str) {
+    set_test_subject_policy_as_owner(
+        api,
+        subject,
+        test_operation_assignment(api, JOURNAL_OPERATIONS),
+        Default::default(),
+    );
 }
 
-fn spawn_journal_source(api: &WorkspaceApi, subject: &str, name: &str) -> RuntimeWorkerRef {
+async fn create_journal_subject_as_owner(
+    api: &WorkspaceApi,
+    role: &str,
+) -> server_api::SubjektivSubjectResponse {
+    let (_, Json(subject)) = scoped_create_subjektiv_subject(
+        State(api.clone()),
+        AxumPath(ScopedWorkspacePath {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        }),
+        Extension(test_owner_actor()),
+        Json(server_api::SubjektivSubjectCreateRequest {
+            operation_id: Uuid::now_v7().to_string(),
+            role: role.into(),
+            behavior_md: String::new(),
+        }),
+    )
+    .await
+    .unwrap();
+    subject
+}
+
+async fn spawn_journal_source(api: &WorkspaceApi, subject: &str, name: &str) -> RuntimeWorkerRef {
     seed_test_delivery_binding(api);
-    api.spawn_workspace_worker(
-        EMBEDDED_WORKER_RUNTIME_ID,
-        WorkerSpawnRequest {
-            requested_worker_name: Some(name.into()),
-            intent: WorkerSpawnIntent::WorkspaceCompanion,
-            singleton_key: Some(crate::subjektiv::subject_worker_singleton_key(subject).unwrap()),
-            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                expected_segments: 0,
-            },
-            profile: ProfileSelector::Builtin("builtin:companion".into()),
+    grant_journal_operations(api, subject);
+    let Json(created) = create_workspace_worker_as_owner(
+        State(api.clone()),
+        HeaderMap::new(),
+        Json(CreateWorkspaceWorkerRequest {
+            runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
+            display_name: name.into(),
+            singleton_key: None,
+            profile: Some("builtin:companion".into()),
             ticket_assignment: None,
             initial_submit: vec![],
-            workdir_attachment_requests: vec![],
-            resolved_workdir_attachment_requests: vec![],
-            resolved_workdir_attachments: vec![],
-            resolved_config_bundle: None,
-            resolved_worker_observation_enabled: false,
-            resolved_worker_observation_grants: vec![],
-            resolved_workspace_api: None,
-            resolved_memory_settings: None,
-            resolved_subjektiv_attached: false,
-            resolved_control_operation: None,
-            resolved_execution_grant: None,
-            authorization: None,
-            resolved_core_execution_grant: None,
-        },
+            workdir_attachments: vec![],
+            feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
+                subjektiv: Some(server_api::SubjektivWorkerConnectionRequest {
+                    subject_id: subject.into(),
+                }),
+            },
+            control_operation_id: Some(Uuid::now_v7().to_string()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
+        }),
     )
-    .unwrap()
-    .worker
-    .unwrap()
-    .worker
+    .await
+    .unwrap();
+    RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
 }
 
 fn bind_fixture_session(
+    api: &WorkspaceApi,
     store: &crate::subjektiv::SubjektivStore,
     attr: crate::subjektiv::SubjectSessionAttribution,
 ) -> JournalHostContext {
-    // This suite uses an explicit exact-Subject legacy fixture, not a scoped
-    // projection of the shared default. Preserve already configured legacy
-    // policies, including empty sources used by denial tests.
-    if !matches!(
-        store.subject_policy_source(&attr.subject_id).unwrap(),
-        Some(server_api::authorization::SubjectPolicySource::Legacy(_))
-    ) {
-        grant_journal_operations(store, &attr.subject_id);
+    if store
+        .current_subject_policy(&attr.subject_id)
+        .unwrap()
+        .is_none()
+    {
+        grant_journal_operations(api, &attr.subject_id);
     }
     let binding = store
         .claim_journal_writer(&attr.subject_id, &attr.runtime_id, &attr.worker_id)
@@ -336,7 +333,7 @@ async fn journal_host_capacity_rejection_keeps_same_reservation_autonomously_own
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("capacity-recording").unwrap())
         .unwrap();
-    let source = spawn_journal_source(&api, &subject.id, "capacity-source");
+    let source = spawn_journal_source(&api, &subject.id, "capacity-source").await;
     let session = session_store::new_session_id();
     seed_session(
         &session_root(dir.path(), &source),
@@ -355,7 +352,7 @@ async fn journal_host_capacity_rejection_keeps_same_reservation_autonomously_own
             .unwrap(),
         )
         .unwrap();
-    bind_fixture_session(&store, attr);
+    bind_fixture_session(&api, &store, attr);
     let binding = api
         .config_store
         .get_workspace_runtime_binding(TEST_WORKSPACE_ID, &source.runtime_id)
@@ -515,7 +512,7 @@ impl Fixture {
         let subject = store
             .create_subject(crate::subjektiv::SubjectRole::new("journal-test").unwrap())
             .unwrap();
-        let source = spawn_journal_source(&api, &subject.id, "journal-source");
+        let source = spawn_journal_source(&api, &subject.id, "journal-source").await;
         let attr = store
             .record_session_attribution(
                 crate::subjektiv::SubjectSessionAttribution::new(
@@ -527,7 +524,7 @@ impl Fixture {
                 .unwrap(),
             )
             .unwrap();
-        let host = bind_fixture_session(&store, attr.clone());
+        let host = bind_fixture_session(&api, &store, attr.clone());
         let text = "original public input";
         let range = JournalSourceRange {
             source: JournalSource {
@@ -937,7 +934,7 @@ impl RuntimeFixture {
         let subject = store
             .create_subject(crate::subjektiv::SubjectRole::new("source-reader-test").unwrap())
             .unwrap();
-        let source = spawn_journal_source(&api, &subject.id, "original-source");
+        let source = spawn_journal_source(&api, &subject.id, "original-source").await;
         let session = session_store::new_session_id();
         seed_session_history(&session_root(dir.path(), &source), session, history);
         let attr = store
@@ -951,7 +948,7 @@ impl RuntimeFixture {
                 .unwrap(),
             )
             .unwrap();
-        let host = bind_fixture_session(&store, attr.clone());
+        let host = bind_fixture_session(&api, &store, attr.clone());
         let src = runtime_api::SessionPublicSource::Retained {
             worker_id: worker_runtime::identity::WorkerId::parse(&source.worker_id).unwrap(),
         };
@@ -3090,7 +3087,7 @@ async fn explicit_erasure_interrupts_completed_journal_cleanup_waiting_for_run_t
 
 /// Removal uses the production embedded WorkerRemove forwarder, target-bound proof,
 /// common reception, catalog/retention planner, Runtime and SQLite. Source creation
-/// calls the create handler directly (no HTTP auth); canonical Session contents,
+/// calls the authenticated owner helper (no HTTP transport); canonical Session contents,
 /// attribution and profile disablement are fixtures, not model execution or proofs
 /// of the normal publication/attribution connection.
 struct SubjectRemovalFixture {
@@ -3132,25 +3129,13 @@ impl SubjectRemovalFixture {
         )
         .await
         .unwrap();
-        let Json(orchestrator) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-            }),
-        )
-        .await
-        .unwrap();
+        let orchestrator = seed_test_orchestrator_as_owner(&api, &[("worker", &["worker.remove"])]);
         let controller = orchestrator.worker.unwrap();
         let controller = RuntimeWorkerRef::new(controller.runtime_id, controller.worker_id);
         let store = open_subjektiv_store(&api).unwrap();
-        let subject = store
-            .create_subject(crate::subjektiv::SubjectRole::new("removal-source").unwrap())
-            .unwrap();
-        let Json(created) = scoped_create_workspace_worker(
+        let subject = create_journal_subject_as_owner(&api, "removal-source").await;
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-            }),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
@@ -3226,7 +3211,7 @@ impl SubjectRemovalFixture {
                 .unwrap(),
             )
             .unwrap();
-        let host = bind_fixture_session(&store, attr.clone());
+        let host = bind_fixture_session(&api, &store, attr.clone());
         seed_worker_control_grant(&api, &controller, &target, "subject-removal-fixture");
         api.runtime
             .stop_worker(

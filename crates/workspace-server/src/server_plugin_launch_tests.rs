@@ -112,7 +112,7 @@ async fn rejected_worker_create_releases_sealed_plugin_pins_without_registry_pub
     runtime.reject_next_spawn();
     f.api.runtime.register_or_replace(runtime);
     assert!(
-        create_workspace_worker(
+        create_workspace_worker_as_owner(
             State(f.api.clone()),
             HeaderMap::new(),
             Json(delivery_create_request(None, "project:delivery"))

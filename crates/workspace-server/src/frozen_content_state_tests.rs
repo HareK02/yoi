@@ -426,27 +426,8 @@ fn content_cutover_keeps_each_evaluation_provenance_and_deduplicates_only_identi
 }
 
 #[test]
-fn content_cutover_version_abort_retains_prior_cleanup_and_uncertain_resource_owners() {
-    for (state, expected_job, expected_attempt, expected_cleanup) in [
-        (
-            "reserved",
-            BackendJobState::Failed,
-            BackendJobAttemptState::Failed,
-            None,
-        ),
-        (
-            "dispatching",
-            BackendJobState::Failed,
-            BackendJobAttemptState::Failed,
-            None,
-        ),
-        (
-            "dispatched",
-            BackendJobState::Failed,
-            BackendJobAttemptState::Failed,
-            None,
-        ),
-    ] {
+fn content_cutover_fences_uncertain_resources_until_obsolete_job_retirement() {
+    for state in ["reserved", "dispatching", "dispatched"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("content.db");
         let conn = legacy_content_job_database(&path);
@@ -471,35 +452,41 @@ fn content_cutover_version_abort_retains_prior_cleanup_and_uncertain_resource_ow
                 ("unknown".into(), "unknown".into(), Some("pending".into()))
             }
         );
+        let owner: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT runtime_id,worker_id FROM backend_job_attempts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            owner,
+            if state == "reserved" {
+                (None, None)
+            } else {
+                (Some("runtime".into()), Some("worker".into()))
+            },
+            "the content cutover is not termination evidence"
+        );
         apply_migrations(&conn).unwrap();
         drop(conn);
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
-        let job = store
-            .get_backend_job("space", "legacy-job")
-            .unwrap()
-            .unwrap();
-        assert_eq!(job.state, expected_job, "{state}");
-        let replay = store
-            .reserve_backend_job("space", &job.request, "2026-08-15T00:00:00Z")
-            .unwrap();
-        assert!(replay.replayed);
-        assert_eq!(replay.attempt.state, expected_attempt);
-        assert_eq!(replay.attempt.worker_cleanup_state, expected_cleanup);
-        let mut next = job.request.clone();
-        next.job_id = "next-job".into();
-        let next = store
-            .reserve_backend_job("space", &next, "2026-08-15T00:00:00Z")
-            .unwrap();
         assert!(
-            next.resource_reused,
-            "migration failure is not termination evidence"
+            store
+                .get_backend_job("space", "legacy-job")
+                .unwrap()
+                .is_none()
         );
-        assert_eq!(next.job.request.job_id, "legacy-job");
+        store.with_conn(|conn| {
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM backend_job_attempts WHERE workspace_id='space' AND job_id='legacy-job'", [], |row| row.get::<_, i64>(0))?, 0);
+            storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
+            Ok(())
+        }).unwrap();
     }
 }
 
 #[test]
-fn content_cutover_completed_result_cleanup_and_replay_remain_unchanged() {
+fn content_cutover_preserves_completed_result_until_obsolete_job_retirement() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("content.db");
     let conn = legacy_content_job_database(&path);
@@ -523,48 +510,58 @@ fn content_cutover_completed_result_cleanup_and_replay_remain_unchanged() {
         cutover,
         (
             "completed".into(),
-            encoded,
+            encoded.clone(),
             "completed".into(),
             "cleaned".into()
         )
     );
+    for table in ["backend_jobs", "backend_job_attempts"] {
+        let saved: (String, String, String, String) = conn
+            .query_row(
+                &format!("SELECT state,result_json,result_digest,completed_at FROM {table}"),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            saved,
+            (
+                "completed".into(),
+                encoded.clone(),
+                digest.clone(),
+                "finished".into()
+            ),
+            "{table}"
+        );
+    }
+    let delivery: (String, String) = conn
+        .query_row(
+            "SELECT state,delivered_at FROM backend_job_deliveries",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(delivery, ("completed".into(), "delivered".into()));
+
+    // A legacy delivery owner is intentionally retired by the later Job boundary,
+    // even when the content cutover preserved its completed result exactly.
     apply_migrations(&conn).unwrap();
     drop(conn);
     let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
-    let job = store
-        .get_backend_job("space", "legacy-job")
-        .unwrap()
-        .unwrap();
-    let replay = store
-        .reserve_backend_job("space", &job.request, "2026-08-15T00:00:00Z")
-        .unwrap();
-    assert!(replay.replayed);
-    assert_eq!(replay.job.state, BackendJobState::Completed);
-    assert_eq!(replay.job.result, Some(result.clone()));
-    assert_eq!(replay.job.result_digest, Some(digest.clone()));
-    assert_eq!(replay.job.completed_at.as_deref(), Some("finished"));
-    assert_eq!(replay.attempt.state, BackendJobAttemptState::Completed);
-    assert_eq!(replay.attempt.result, Some(result));
-    assert_eq!(replay.attempt.result_digest, Some(digest));
-    assert_eq!(
-        replay.attempt.worker_cleanup_state,
-        Some(BackendJobWorkerCleanupState::Completed)
+    assert!(
+        store
+            .get_backend_job("space", "legacy-job")
+            .unwrap()
+            .is_none()
     );
-    assert_eq!(
-        replay.attempt.worker_cleanup_completed_at.as_deref(),
-        Some("cleaned")
-    );
-    let delivery: (String, String) = store
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT state,delivered_at FROM backend_job_deliveries",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map_err(Error::from)
-        })
-        .unwrap();
-    assert_eq!(delivery, ("completed".into(), "delivered".into()));
+    store.with_conn(|conn| {
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM backend_job_attempts WHERE workspace_id='space' AND job_id='legacy-job'", [], |row| row.get::<_, i64>(0))?, 0);
+        for table in backend_job_current::OBSOLETE_TABLES {
+            assert!(!table_exists(conn, table)?);
+        }
+        storage_formats::verify_history(conn, LATEST_SCHEMA_VERSION)?;
+        Ok(())
+    }).unwrap();
 }
 
 #[test]

@@ -439,9 +439,7 @@ impl RemovalFixture {
         let model = RemovalModel::new();
         let (api, server) = Self::open(config, listener, model.clone()).await;
         let store = open_subjektiv_store(&api).unwrap();
-        let subject = store
-            .create_subject(crate::subjektiv::SubjectRole::new("remove-full-history").unwrap())
-            .unwrap();
+        let subject = create_journal_subject_as_owner(&api, "remove-full-history").await;
         let source = Self::create_body(&api, &subject.id, live).await;
         if !live {
             Self::stop_body(&api, &source).await;
@@ -462,11 +460,8 @@ impl RemovalFixture {
         }
     }
     async fn create_body(api: &WorkspaceApi, subject_id: &str, live: bool) -> RuntimeWorkerRef {
-        let Json(created) = scoped_create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-            }),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
@@ -823,9 +818,7 @@ async fn recovery_holds_stale_or_ambiguous_intents_without_blocking_independent_
             "saved before notification",
         )]);
         let subjects = open_subjektiv_store(f.api()).unwrap();
-        let subject_a = subjects
-            .create_subject(crate::subjektiv::SubjectRole::new("held-independent-body").unwrap())
-            .unwrap();
+        let subject_a = create_journal_subject_as_owner(f.api(), "held-independent-body").await;
         let a = RemovalFixture::create_body(f.api(), &subject_a.id, false).await;
         RemovalFixture::stop_body(f.api(), &a).await;
         let plan = |worker: &RuntimeWorkerRef| {
@@ -2170,11 +2163,8 @@ async fn explicit_source_erasure_uses_permanent_purge_without_a_recording_wait_o
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn nonjournal_stopped_real_worker_removes_without_journal_scope_or_recording_wait() {
     let f = RemovalFixture::new().await;
-    let Json(created) = scoped_create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(f.api().clone()),
-        AxumPath(ScopedWorkspacePath {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        }),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),

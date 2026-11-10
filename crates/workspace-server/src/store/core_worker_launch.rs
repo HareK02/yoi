@@ -20,7 +20,7 @@ impl SqliteWorkspaceStore {
                 params![workspace, operation], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             ).optional()?;
             let Some((fingerprint, runtime, worker, bundle)) = row else { return Ok(None); };
-            if fingerprint != caller_fingerprint { return Err(Error::InvalidInput("creation operation reused with different full input".into())); }
+            if fingerprint != caller_fingerprint { return Err(Error::RepositoryConflict("creation operation reused with different full input".into())); }
             let grant = crate::launch_policy::core_grant(conn, workspace, &runtime, &worker)?.ok_or_else(|| Error::Store("saved launch has no execution grant".into()))?;
             let bundle: worker_runtime::config_bundle::ConfigBundle = serde_json::from_str(&bundle).map_err(|e| Error::Store(format!("saved launch Profile bundle: {e}")))?;
             if grant.creation_operation_id != operation || grant.profile_digest != bundle.computed_digest()
@@ -45,11 +45,15 @@ impl SqliteWorkspaceStore {
         draft: &CoreWorkerExecutionGrant,
         bundle: &worker_runtime::config_bundle::ConfigBundle,
     ) -> Result<WorkerCreateReservation> {
-        if draft.workspace_id != workspace || draft.runtime_id != runtime
-            || draft.creation_operation_id != operation || draft.profile_digest != bundle.computed_digest()
+        if draft.workspace_id != workspace
+            || draft.runtime_id != runtime
+            || draft.creation_operation_id != operation
+            || draft.profile_digest != bundle.computed_digest()
             || bundle.metadata.workspace_id != workspace
         {
-            return Err(Error::InvalidInput("resolved launch identity or Profile bundle mismatch".into()));
+            return Err(Error::InvalidInput(
+                "resolved launch identity or Profile bundle mismatch".into(),
+            ));
         }
         self.reserve_worker_create_with(workspace, runtime, operation, request_fingerprint, singleton, memory,
             |tx| {
@@ -61,6 +65,8 @@ impl SqliteWorkspaceStore {
                     let saved_grant = crate::launch_policy::core_grant(tx, workspace, runtime, &worker)?;
                     let mut expected = draft.clone();
                     expected.worker_id = worker;
+                    // Reservation replay compares raw saved authority, not its
+                    // current effective permission projection.
                     if fingerprint.as_deref() != Some(caller_fingerprint)
                         || saved_bundle.as_deref() != Some(serde_json::to_string(bundle).map_err(|e| Error::Store(e.to_string()))?.as_str())
                         || saved_grant.as_ref() != Some(&expected)

@@ -7,8 +7,9 @@
 //! The backend records execution, not an external model or Runtime network call.
 //! The remote body uses the shared workspace_read profile; the Embedded body
 //! uses the maintained builtin:companion creation helper. Canonical execution is
-//! subject-default + memory, with empty delegation. The unused Runtime field in
-//! the Embedded policy-helper wrapper is not registered as its execution Runtime.
+//! conversation + work-coordination + memory, with empty delegation. The unused
+//! Runtime field in the Embedded policy-helper wrapper is not registered as its
+//! execution Runtime.
 //! Neither fixture claims filesystem/OS isolation or exercises Workdir resources.
 //! Evidence anchors reuse the maintained staging fixture shape; Session registration
 //! and attribution are real, but these tests do not prove retained Session bytes.
@@ -447,7 +448,10 @@ impl SignedMemory {
             }
         };
         policy
-            .adopt_policy(r#"{ sets = ["subject-default", "memory"]; }"#, "{}")
+            .adopt_policy(
+                r#"{ sets = ["conversation", "work-coordination", "memory"]; }"#,
+                "{}",
+            )
             .await;
         let attributions = open_subjektiv_store(&policy.api)
             .unwrap()

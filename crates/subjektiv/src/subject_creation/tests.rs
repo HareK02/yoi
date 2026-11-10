@@ -2,33 +2,35 @@
 //! Authentication/Runtime connections are covered by the Backend connected chat suite.
 use super::*;
 use crate::tests::{open_store, role};
-use feature_permissions::{
-    NamespaceId, NamespacePermissions, PermissionKey, PermissionReference, PermissionSetId,
-};
+use feature_permissions::{PermissionReference, PermissionSetId};
 use server_api::authorization::{
-    SUBJECT_DEFAULT_PERMISSION_SET, SUBJECT_DELEGATE_PERMISSION, SubjectPermissionsUpdate,
+    CONVERSATION_PERMISSION_SET, SubjectPermissionsUpdate, WORK_COORDINATION_PERMISSION_SET,
+    WORK_EXECUTION_PERMISSION_SET,
 };
 
 #[test]
-fn creation_persists_execution_set_and_semantic_delegation_reference() {
+fn creation_persists_semantic_execution_and_delegation_set_references() {
     let dir = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(dir.path(), "workspace-a");
     let subject = store.create_subject(role()).unwrap();
     let source = store.current_subject_policy(&subject.id).unwrap().unwrap();
     assert_eq!(
         source.execution.grants,
-        vec![PermissionReference::Set(
-            PermissionSetId::parse(SUBJECT_DEFAULT_PERMISSION_SET).unwrap()
-        )]
+        [
+            CONVERSATION_PERMISSION_SET,
+            WORK_COORDINATION_PERMISSION_SET
+        ]
+        .into_iter()
+        .map(|set| PermissionReference::Set(PermissionSetId::parse(set).unwrap()))
+        .collect::<Vec<_>>()
     );
     assert!(source.execution.exclusions.is_empty());
     assert!(!source.execution.revoked);
     assert_eq!(
         source.delegation.grants,
-        vec![PermissionReference::Namespace(NamespacePermissions {
-            namespace: NamespaceId::parse("subject").unwrap(),
-            keys: vec![PermissionKey::parse(SUBJECT_DELEGATE_PERMISSION).unwrap()],
-        })]
+        vec![PermissionReference::Set(
+            PermissionSetId::parse(WORK_EXECUTION_PERMISSION_SET).unwrap()
+        )]
     );
     assert!(source.delegation.exclusions.is_empty());
     assert!(!source.delegation.revoked);

@@ -160,7 +160,7 @@ impl RegistrationFixture {
                         let metadata_fault_root = pin_root.clone().filter(|_| {
                             matches!(fault, RegistrationFault::DenyWithMetadataReadFailure)
                         });
-                        if let Some((api, subject, _, owner)) = armed {
+                        if let Some((api, subject, _, _owner)) = armed {
                             let store = open_subjektiv_store(&api).unwrap();
                             let policy = store.current_subject_policy(&subject).unwrap().unwrap();
                             assert_eq!(
@@ -184,14 +184,16 @@ impl RegistrationFixture {
                                 assert_eq!(api.store.current_worker_singleton_owner(TEST_WORKSPACE_ID, &key).unwrap(), Some(lease.clone()));
                                 *reserved.lock().unwrap() = Some((lease, writer));
                             } else if !matches!(fault, RegistrationFault::CommittedResponseLost) {
-                                // Change the current Feature assignment through its sole
-                                // adoption writer at the real signed callback boundary.
-                                // Retain the default set and exclude only session.record.
-                                super::chat_tests::adopt_chat_policy(
+                                let mut execution = policy.execution;
+                                execution.exclusions = test_operation_assignment(
                                     &api,
-                                    &owner,
+                                    &["session.record"],
+                                ).grants;
+                                replace_test_subject_policy_as_owner(
+                                    &api,
                                     &subject,
-                                    r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "session"; keys = ["session.record"]; }]; }"#,
+                                    execution,
+                                    policy.delegation,
                                 )
                                 .await;
                             }
@@ -252,13 +254,21 @@ impl RegistrationFixture {
             ))
         })
         .await;
-        let subject = open_subjektiv_store(&connected.api)
-            .unwrap()
-            .create_subject(
-                crate::subjektiv::SubjectRole::new("session-registration-connected").unwrap(),
-            )
-            .unwrap()
-            .id;
+        let (_, Json(subject)) = scoped_create_subjektiv_subject(
+            State(connected.api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.into(),
+            }),
+            Extension(test_owner_actor()),
+            Json(server_api::SubjektivSubjectCreateRequest {
+                operation_id: Uuid::now_v7().to_string(),
+                role: "session-registration-connected".into(),
+                behavior_md: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let subject = subject.id;
         let initial = open_subjektiv_store(&connected.api)
             .unwrap()
             .current_subject_policy(&subject)
@@ -808,11 +818,8 @@ async fn real_session_record_denial_survives_runtime_host_and_metadata_reopen() 
     let fixture = RegistrationFixture::new(RegistrationFault::Deny).await;
     // The real create preflight sees normal defaults. Revocation happens only
     // after the actual factory has issued its signed Session-registration POST.
-    let error = scoped_create_workspace_worker(
+    let error = create_workspace_worker_as_owner(
         State(fixture.connected.api.clone()),
-        AxumPath(ScopedWorkspacePath {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        }),
         HeaderMap::new(),
         Json(fixture.request()),
     )
@@ -925,11 +932,8 @@ async fn real_session_record_denial_and_metadata_save_failure_remain_separate() 
         StartupFailurePhase, StartupPersistenceOutcome, StartupSecondaryFailure,
     };
     let fixture = RegistrationFixture::new(RegistrationFault::DenyWithMetadataReadFailure).await;
-    let error = scoped_create_workspace_worker(
+    let error = create_workspace_worker_as_owner(
         State(fixture.connected.api.clone()),
-        AxumPath(ScopedWorkspacePath {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        }),
         HeaderMap::new(),
         Json(fixture.request()),
     )
@@ -1060,11 +1064,8 @@ async fn release_fence_refusal_survives_signed_registration_and_metadata_reopen(
         .current_subject_policy(&fixture.subject)
         .unwrap()
         .unwrap();
-    let error = scoped_create_workspace_worker(
+    let error = create_workspace_worker_as_owner(
         State(api.clone()),
-        AxumPath(ScopedWorkspacePath {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        }),
         HeaderMap::new(),
         Json(fixture.request()),
     )
@@ -1150,11 +1151,8 @@ async fn permitted_session_registration_reaches_real_factory_and_saved_confirmat
         .current_subject_policy(&fixture.subject)
         .unwrap()
         .unwrap();
-    let Json(created) = scoped_create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(fixture.connected.api.clone()),
-        AxumPath(ScopedWorkspacePath {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-        }),
         HeaderMap::new(),
         Json(fixture.request()),
     )

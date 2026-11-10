@@ -227,8 +227,9 @@ impl PermissionHost {
         })
     }
 
-    /// Replace atomically. All keys and set contributions must belong to this
-    /// namespace. References to existing other namespaces do not transfer ownership.
+    /// Replace atomically. Definitions and their children must belong to this
+    /// namespace. Cross-namespace composition uses shared sets; each namespace's
+    /// contributions may reference only its own keys or other sets.
     pub fn declare(
         &mut self,
         handle: &NamespaceHandle,
@@ -245,6 +246,9 @@ impl PermissionHost {
             }
             let mut children = BTreeSet::new();
             for child in &definition.children {
+                if child.namespace() != handle.namespace {
+                    return Err(PermissionError::Ownership(child.clone()));
+                }
                 if !children.insert(child) {
                     return Err(PermissionError::Duplicate(child.to_string()));
                 }

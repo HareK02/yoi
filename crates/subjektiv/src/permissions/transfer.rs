@@ -24,7 +24,9 @@ pub trait CanonicalPermissionSource: Send + Sync {
     ) -> Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
         self.subject_policy_source(workspace_id, subject_id)?
             .map(|source| match source {
-                server_api::authorization::SubjectPolicySource::Feature(source) => Ok(source),
+                server_api::authorization::SubjectPolicySource::Feature(source) => {
+                    Ok(source.into_current_reference_encoding())
+                }
                 server_api::authorization::SubjectPolicySource::Legacy(source) => {
                     server_api::authorization::CurrentSubjectPolicy::from_legacy(source)
                 }
@@ -80,7 +82,9 @@ pub struct PermissionSourceExport {
     pub feature_policy: Option<server_api::authorization::CurrentSubjectPolicy>,
 }
 
-/// Complete, Subject-ID-sorted policy snapshot. History and grants stay in the old database.
+/// Complete, Subject-ID-sorted policy snapshot of Subjects not fenced for deletion.
+/// History, fenced source rows and grants stay in the old database; a saved seal
+/// retains its exact snapshot even if a Subject is subsequently deleted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionTransferSnapshot {
@@ -136,6 +140,7 @@ impl PermissionAuthorityGuard<'_> {
 
     /// Read creation-only enrollment in this already-held transaction. This is
     /// retained evidence, never a current policy or a read-time default issuance.
+    /// References stay raw until the Host consumes a pending enrollment as policy.
     pub fn subject_permission_enrollment(
         &self,
         subject: &str,
@@ -426,6 +431,7 @@ fn export_in_connection(
         "SELECT s.subject_id,p.change_id,c.record_json FROM subjects s
          LEFT JOIN subject_permissions p ON p.subject_id=s.subject_id
          LEFT JOIN subject_permission_changes c ON c.subject_id=p.subject_id AND c.change_id=p.change_id
+         WHERE NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=s.subject_id)
          ORDER BY s.subject_id",
     )?;
     let mut rows = statement.query([])?;

@@ -1,8 +1,94 @@
 // Included inside server::tests to reuse its catalog, identity and storage fixtures.
+fn adopt_test_config_as_owner(
+    api: &WorkspaceApi,
+    source: &crate::config_source::ConfigCommitRequest,
+) -> crate::Result<crate::config_source::WorkspaceConfigState> {
+    let owner = test_owner_actor();
+    api.refresh_plugin_permission_registry()?;
+    let host = api.permission_registry.read().unwrap().host().clone();
+    let current = api
+        .config_store
+        .configuration_current(api.workspace_id(), &owner.account_id)?;
+    assert!(
+        current.canonical,
+        "ordinary config fixtures use the current owner writer"
+    );
+    let request = crate::config_adoption::ConfigurationAdoptionRequest {
+        operation_id: Uuid::now_v7().to_string(),
+        expected_head: current.history_head,
+        expected_catalog_digest: crate::config_adoption::catalog_digest(&host)?,
+        expected_legacy_export: None,
+        source: source.clone(),
+    };
+    api.config_store
+        .adopt_configuration(
+            api.workspace_id(),
+            &owner.account_id,
+            &request,
+            api.config_schema_registry.compose()?,
+            &host,
+            None,
+            |_| panic!("shared config must not enumerate individual Subject assignments"),
+            |_| panic!("current config fixture must not replay native permission transfer"),
+        )
+        .map(|result| result.state)
+}
+
+fn replace_config_plugin_subject_policy_as_owner(
+    api: &WorkspaceApi,
+    subject: &str,
+    execution: feature_permissions::PermissionAssignment,
+    delegation: feature_permissions::PermissionAssignment,
+) -> server_api::authorization::CurrentSubjectPolicy {
+    let native = open_subjektiv_store(api).unwrap();
+    let identity = native.database_identity().unwrap();
+    native
+        .with_permission_authority_guard(&identity, |authority| {
+            authority.require_subject(subject)?;
+            let registry = api.permission_registry.read().unwrap();
+            let request = server_api::subject_policy::SubjectPermissionPolicyMutation {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_change_id: api
+                    .config_store
+                    .subject_permission_policy_change_id(api.workspace_id(), subject)
+                    .unwrap(),
+                action: server_api::subject_policy::SubjectPermissionPolicyAction::Replace {
+                    execution,
+                    delegation,
+                },
+            };
+            let response = api
+                .config_store
+                .mutate_subject_permission_policy(
+                    api.workspace_id(),
+                    &test_owner_actor().account_id,
+                    subject,
+                    &request,
+                    registry.host(),
+                )
+                .unwrap();
+            assert_eq!(
+                api.config_store
+                    .mutate_subject_permission_policy(
+                        api.workspace_id(),
+                        &test_owner_actor().account_id,
+                        subject,
+                        &request,
+                        registry.host(),
+                    )
+                    .unwrap(),
+                response,
+                "owner policy replay returns its receipt"
+            );
+            Ok(response.policy.unwrap())
+        })
+        .unwrap()
+}
+
 mod configuration_adoption_http_integration {
     //! Ordinary Server library integration tests: real catalog router (including
     //! cookie-origin middleware), owner/session lookup, builtin permission catalog,
-    //! migration, guarded Feature storage and Server SQLite adoption. Only unused
+    //! automatic migration, guarded Feature storage and Server SQLite adoption. Only unused
     //! Runtime execution is the existing deterministic fixture. Existing route tests
     //! use Router oneshot; cli_tcp tests connect the production CLI library and
     //! generated client over loopback TCP to this same Server and real SQLite.
@@ -11,7 +97,7 @@ mod configuration_adoption_http_integration {
     //! configuration_transfer/config_adoption suites own store faults.
     use super::*;
     use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissions, SubjectPermissionsUpdate,
+        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
     };
     use server_api::{
         ConfigCommitRequest as SourceRequest, ConfigTreeChange as Change,
@@ -35,7 +121,7 @@ mod configuration_adoption_http_integration {
         subject: String,
         legacy: crate::subjektiv::SubjektivStore,
         legacy_update: SubjectPermissionsUpdate,
-        legacy_policy: SubjectPermissions,
+        subject_policy: server_api::authorization::CurrentSubjectPolicy,
         runtime_identity: RuntimeIdentityMaterial,
         _dir: tempfile::TempDir,
     }
@@ -76,25 +162,48 @@ mod configuration_adoption_http_integration {
             let origin = origin.clone();
             let cookie = format!("{cookie_name}={COOKIE_TOKEN}");
 
-            // Open the real raw Feature store before adoption, retaining a handle
-            // to verify that cutover fences already-open legacy writers too.
+            // Startup has already transferred native authority. Seed the current
+            // Subject domain through its owner/CAS operation, not the sealed writer.
             let legacy = open_legacy_subjektiv_store(&api).unwrap();
-            let subject = legacy
+            let subject = open_subjektiv_store(&api)
+                .unwrap()
                 .create_subject(crate::subjektiv::SubjectRole::new("adoption-http").unwrap())
                 .unwrap()
                 .id;
             let legacy_update = SubjectPermissionsUpdate {
-                operation_id: "adoption-http-existing-policy".into(),
-                expected_change_id: legacy
-                    .current_subject_policy(&subject)
-                    .unwrap()
-                    .map(|policy| policy.change_id),
+                operation_id: "adoption-http-rejected-native-write".into(),
+                expected_change_id: None,
                 execution: vec![workspace_permission("ticket.query")],
                 delegation: vec![workspace_permission("ticket.create")],
             };
-            let legacy_policy = legacy
-                .set_subject_permissions(&subject, &legacy_update)
+            let subject_policy = replace_config_plugin_subject_policy_as_owner(
+                &api,
+                &subject,
+                assignment("ticket.query"),
+                assignment("ticket.create"),
+            );
+            let state = api
+                .config_store
+                .load_workspace_config(TEST_WORKSPACE_ID)
+                .unwrap()
                 .unwrap();
+            let main = config_source::VirtualPath::parse("main.dcdl").unwrap();
+            adopt_test_config_as_owner(&api, &crate::config_source::ConfigCommitRequest {
+                base_digest: state.snapshot.digest.clone(),
+                entrypoints: state.contract.entrypoints.clone(),
+                changes: vec![
+                    config_source::ConfigTreeChange::Create {
+                        path: config_source::VirtualPath::parse("permissions/owner.dcdl").unwrap(),
+                        content_type: config_source::ConfigContentType::Decodal,
+                        content: permission_source("ticket.query", "ticket.create"),
+                    },
+                    config_source::ConfigTreeChange::Update {
+                        path: main.clone(),
+                        expected_digest: state.snapshot.get(&main).unwrap().content_digest.clone(),
+                        content: "{ permissions = import \"permissions/owner.dcdl\"; } as WorkspaceConfigSchema\n".into(),
+                    },
+                ],
+            }).unwrap();
 
             let runtime_identity =
                 RuntimeIdentityMaterial::generate("adoption-http-runtime").unwrap();
@@ -124,7 +233,7 @@ mod configuration_adoption_http_integration {
                 subject,
                 legacy,
                 legacy_update,
-                legacy_policy,
+                subject_policy,
                 runtime_identity,
                 _dir: dir,
             }
@@ -251,19 +360,50 @@ mod configuration_adoption_http_integration {
                 "canonical": current.canonical,
                 "policies": current.policies,
                 "receipts": receipts,
+                "subject_policy": self.api.config_store.current_subject_permission_policy(TEST_WORKSPACE_ID, &self.subject).unwrap(),
                 "legacy_export": self.legacy.preview_permission_transfer(&identity).unwrap(),
                 "legacy_receipt": self.legacy.permission_transfer_receipt(&identity).unwrap(),
             })
         }
 
-        fn assert_legacy_writable(&self) {
-            // Exact replay is accepted by an unsealed writer, but rejected after
-            // cutover even on an already-open handle. It does not create a change.
+        fn assert_subject_policy_unchanged(&self) {
+            self.assert_legacy_sealed();
             assert_eq!(
-                self.legacy
-                    .set_subject_permissions(&self.subject, &self.legacy_update)
+                self.api
+                    .config_store
+                    .current_subject_permission_policy(TEST_WORKSPACE_ID, &self.subject)
                     .unwrap(),
-                self.legacy_policy
+                Some(self.subject_policy.clone()),
+                "shared configuration never replaces individual Subject policy",
+            );
+        }
+
+        fn assert_source_policy_unchanged(&self, source: &Source) {
+            self.assert_subject_policy_unchanged();
+            assert_eq!(source.policies.len(), 1);
+            let policy = &source.policies[0];
+            assert_eq!(policy.subject_id, self.subject);
+            assert_eq!(policy.change_id, self.subject_policy.change_id);
+            assert_eq!(policy.execution, self.subject_policy.execution);
+            assert_eq!(policy.delegation, self.subject_policy.delegation);
+            assert_eq!(
+                policy.legacy_constraints,
+                self.subject_policy.legacy_constraints
+            );
+            let registry = self.api.permission_registry.read().unwrap();
+            assert_eq!(
+                policy.execution_resolution,
+                *registry
+                    .host()
+                    .resolve(Some(&policy.execution))
+                    .projection()
+            );
+            assert_eq!(
+                policy.delegation_resolution,
+                *registry
+                    .host()
+                    .resolve(Some(&policy.delegation))
+                    .projection()
             );
         }
 
@@ -306,31 +446,8 @@ mod configuration_adoption_http_integration {
             source.catalog_digest,
             crate::config_adoption::catalog_digest(registry.host()).unwrap()
         );
-        for policy in source.policies {
-            let current = f
-                .api
-                .config_store
-                .adopted_subject_policy(TEST_WORKSPACE_ID, &policy.subject_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(policy.change_id, current.change_id);
-            assert_eq!(policy.execution, current.source.execution.assignment());
-            assert_eq!(
-                policy.execution_resolution,
-                *registry
-                    .host()
-                    .resolve(Some(&policy.execution))
-                    .projection()
-            );
-            assert_eq!(
-                policy.delegation_resolution,
-                *registry
-                    .host()
-                    .resolve(Some(&policy.delegation))
-                    .projection()
-            );
-        }
         drop(registry);
+        f.assert_source_policy_unchanged(&source);
         let assignment = assignment("ticket.read");
         let body = json!({"assignment": assignment});
         let request = Request::builder()
@@ -501,7 +618,7 @@ mod configuration_adoption_http_integration {
             let draft = f.source().await;
             let path = permission_path(&draft);
             let local = checkout.join("source").join(&path);
-            let sent_text = permission_source(&f.subject, "ticket.create", "ticket.query");
+            let sent_text = permission_source("ticket.create", "ticket.query");
             std::fs::write(&local, &sent_text).unwrap();
 
             let error = server.run(&f.owner, &checkout, Push).await.unwrap_err();
@@ -511,7 +628,7 @@ mod configuration_adoption_http_integration {
             let unknown: Value =
                 serde_json::from_slice(&std::fs::read(&metadata).unwrap()).unwrap();
             let pending: Adoption = serde_json::from_value(unknown["pending"].clone()).unwrap();
-            assert_eq!(unknown["base"]["history_head"], Value::Null);
+            assert_eq!(unknown["base"]["history_head"], json!(draft.history_head));
             let (receipt, original_wire) = {
                 let captured = evidence.lock().unwrap();
                 assert_eq!(
@@ -550,25 +667,28 @@ mod configuration_adoption_http_integration {
                 committed.history_head.as_deref(),
                 Some(receipt.history_head.as_str())
             );
-            assert_eq!(committed.policies[0].execution, assignment("ticket.create"));
-            assert_eq!(committed.policies[0].delegation, assignment("ticket.query"));
-            assert_eq!(f.durable()["receipts"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                shared_permissions(&committed)
+                    .human_worker_default
+                    .assignment(),
+                assignment("ticket.create")
+            );
+            f.assert_source_policy_unchanged(&committed);
+            f.assert_subject_policy_unchanged();
+            assert_eq!(f.durable()["receipts"].as_array().unwrap().len(), 2);
             f.assert_legacy_sealed();
 
             // The editor moves on while the original request is still unresolved.
-            let later_text = permission_source(&f.subject, "ticket.query", "ticket.create");
+            let later_text = permission_source("ticket.query", "ticket.create");
             std::fs::write(&local, &later_text).unwrap();
             let marker = checkout.join("source").join(MARKER);
             std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
             std::fs::write(&marker, "local edit after the lost response").unwrap();
             assert_eq!(std::fs::read_to_string(&local).unwrap(), later_text);
 
-            // A real Web owner then removes the adopted policy. Historical receipt
+            // A real Web owner then clears shared defaults. Historical receipt
             // recovery must not resurrect it, rewind the head, or send later edits.
-            let removal = format!(
-                "{{ subjects = []; remove_subjects = [{:?}]; }}\n",
-                f.subject
-            );
+            let removal = "{ sets = []; human_worker_default = {}; }\n";
             let web = request(
                 &committed,
                 "response-loss-later-web-removal",
@@ -589,14 +709,15 @@ mod configuration_adoption_http_integration {
             assert_eq!(response.status(), reqwest::StatusCode::OK);
             let web_receipt: Receipt = response.json().await.unwrap();
             assert_ne!(web_receipt.history_head, receipt.history_head);
-            assert!(f.source().await.policies.is_empty());
-            assert!(
-                f.api
-                    .config_store
-                    .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
-                    .unwrap()
-                    .is_none()
+            let cleared = f.source().await;
+            f.assert_source_policy_unchanged(&cleared);
+            assert_eq!(
+                shared_permissions(&cleared)
+                    .human_worker_default
+                    .assignment(),
+                Default::default()
             );
+            f.assert_subject_policy_unchanged();
             let current = f.durable();
 
             let recovered = server.run(&f.owner, &checkout, recovery).await.unwrap();
@@ -670,7 +791,8 @@ mod configuration_adoption_http_integration {
     }
 
     #[tokio::test]
-    async fn cli_tcp_unmodified_push_persists_migration_and_repulls_identical_source_and_policy() {
+    async fn cli_tcp_unmodified_push_repulls_identical_shared_source_without_changing_subject_policy()
+     {
         use yoi::config_cli::Command::*;
         let f = Fixture::new().await;
         let server = CliServer::start(&f).await;
@@ -679,7 +801,7 @@ mod configuration_adoption_http_integration {
         let before = f.durable();
         let draft = f.source().await;
         let pulled = server.run(&f.owner, &checkout, Pull).await.unwrap();
-        assert!(pulled.contains("source_stored=false"), "{pulled}");
+        assert!(pulled.contains("source_stored=true"), "{pulled}");
         let diff = server.run(&f.owner, &checkout, Diff).await.unwrap();
         assert!(
             !diff.contains("\ncreate ")
@@ -730,7 +852,7 @@ mod configuration_adoption_http_integration {
     }
 
     #[tokio::test]
-    async fn cli_tcp_permission_text_preserves_sets_namespaces_exact_keys_and_independent_lanes() {
+    async fn cli_tcp_shared_permission_text_preserves_sets_exact_keys_and_exclusions() {
         use feature_permissions::{
             PermissionKey, PermissionReference, PermissionSetId, WorkspaceId,
         };
@@ -742,161 +864,93 @@ mod configuration_adoption_http_integration {
         server.run(&f.owner, &checkout, Pull).await.unwrap();
         let draft = f.source().await;
         let path = permission_path(&draft);
-        let text = format!(
-            r#"{{
-    subjects = [{{
-        subject_id = {:?};
-        execution = {{ namespaces = [{{ namespace = "worker"; keys = ["worker.observe"]; }}]; }};
-        delegation = {{
-            sets = ["ticket"];
-            namespaces = [{{ namespace = "worker"; keys = ["worker.observe.list"]; }}];
-            exclude_namespaces = [{{ namespace = "ticket"; keys = ["ticket.create"]; }}];
-        }};
-    }}];
-    remove_subjects = [];
-}}
-"#,
-            f.subject
-        );
-        std::fs::write(checkout.join("source").join(&path), &text).unwrap();
+        let text = r#"{
+    sets = [{ id = "owner-tools"; sets = ["ticket"];
+        namespaces = [{ namespace = "worker"; keys = ["worker.observe"]; }]; }];
+    human_worker_default = {
+        sets = ["owner-tools"];
+        exclude_namespaces = [{ namespace = "ticket"; keys = ["ticket.create"]; }];
+    };
+}
+"#;
+        std::fs::write(checkout.join("source").join(&path), text).unwrap();
         let before = f.durable();
         server.run(&f.owner, &checkout, Validate).await.unwrap();
         let preview = server.run(&f.owner, &checkout, Preview).await.unwrap();
         assert!(
-            preview.contains(&path) && preview.contains(&f.subject),
+            preview.contains(&path) && preview.contains("changed_subjects=[]"),
             "{preview}"
         );
         assert_eq!(f.durable(), before);
         server.run(&f.owner, &checkout, Push).await.unwrap();
         let source = f.source().await;
-        let policy = source
-            .policies
-            .iter()
-            .find(|p| p.subject_id == f.subject)
-            .unwrap();
-        let key = |value| PermissionKey::parse(value).unwrap();
+        let shared = shared_permissions(&source);
+        let assignment = shared.human_worker_default.assignment();
         assert_eq!(
-            policy.delegation.grants[0],
-            PermissionReference::Set(PermissionSetId::parse("ticket").unwrap())
+            assignment.grants,
+            vec![PermissionReference::Set(
+                PermissionSetId::parse("owner-tools").unwrap()
+            )]
         );
-        assert_eq!(policy.execution.grants.len(), 1);
-        let wire = serde_json::to_value(&policy.execution).unwrap();
-        assert_eq!(
-            wire["grants"][0]["value"]["keys"],
-            json!(["worker.observe"])
-        );
-        assert_eq!(policy.legacy_constraints, Some(f.legacy_policy.clone()));
-
-        let host = worker::feature::permissions::builtin_permission_host(
+        let builtin = worker::feature::permissions::builtin_permission_host(
             WorkspaceId::parse(TEST_WORKSPACE_ID).unwrap(),
         )
         .unwrap();
         assert_eq!(
             source.catalog,
-            host.catalog(),
-            "the CLI must not replace Feature-owned catalog metadata"
+            builtin.catalog(),
+            "source cannot replace Feature-owned catalog"
         );
-        let worker_catalog = source
-            .catalog
-            .namespaces
-            .iter()
-            .find(|n| n.namespace.as_str() == "worker")
-            .unwrap();
-        assert_eq!(worker_catalog.feature.as_str(), "builtin:worker");
-        for spelling in ["worker.observe", "worker.observe.list"] {
-            let definition = worker_catalog
-                .declaration
-                .permissions
-                .iter()
-                .find(|p| p.key.as_str() == spelling)
-                .unwrap();
-            assert!(
-                definition.children.is_empty(),
-                "actual builtin keys have no declared children"
-            );
-        }
-        let ticket = source
-            .catalog
-            .namespaces
-            .iter()
-            .find(|n| n.namespace.as_str() == "ticket")
-            .unwrap();
-        assert_eq!(ticket.feature.as_str(), "builtin:ticket");
-        let set = ticket
-            .declaration
-            .sets
-            .iter()
-            .find(|s| s.set.as_str() == "ticket")
-            .unwrap();
-        assert!(set.children.iter().any(|child| matches!(child, PermissionReference::Namespace(n) if n.namespace.as_str() == "ticket" && n.keys.contains(&key("ticket.query")))));
-        let execution = host.resolve(Some(&policy.execution));
-        assert_eq!(
-            execution
+        let host = crate::policy_config::configured_host(&builtin, &shared).unwrap();
+        let resolved = host.resolve(Some(&assignment));
+        let key = |value| PermissionKey::parse(value).unwrap();
+        assert!(
+            resolved
                 .projection()
                 .allowed
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![key("worker.observe")]
+                .contains_key(&key("ticket.query"))
         );
         assert!(
-            !execution
+            resolved
+                .projection()
+                .allowed
+                .contains_key(&key("worker.observe"))
+        );
+        assert!(
+            !resolved
+                .projection()
+                .allowed
+                .contains_key(&key("ticket.create")),
+            "exclusions remain effective"
+        );
+        assert!(
+            !resolved
                 .projection()
                 .allowed
                 .contains_key(&key("worker.observe.list")),
             "dot prefixes are not children"
         );
-        let delegation = host.resolve(Some(&policy.delegation));
-        assert!(
-            delegation
-                .projection()
-                .allowed
-                .contains_key(&key("worker.observe.list"))
-        );
-        assert!(
-            delegation
-                .projection()
-                .allowed
-                .contains_key(&key("ticket.query")),
-            "explicit Set children expand"
-        );
-        assert!(
-            !delegation
-                .projection()
-                .allowed
-                .contains_key(&key("ticket.create")),
-            "exclusion remains effective"
-        );
-        let adopted = f
-            .api
-            .config_store
-            .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
-            .unwrap()
-            .unwrap();
-        assert_eq!(adopted.source.execution.assignment(), policy.execution);
-        assert_eq!(adopted.source.delegation.assignment(), policy.delegation);
-
+        f.assert_source_policy_unchanged(&source);
+        f.assert_subject_policy_unchanged();
         let repull = dir.path().join("repull");
         server.run(&f.owner, &repull, Pull).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(checkout.join("source").join(&path)).unwrap(),
-            text,
-            "push does not rewrite the owner's local text"
+            text
         );
         assert_eq!(
             std::fs::read_to_string(repull.join("source").join(&path)).unwrap(),
-            source.state.snapshot.entries[&path].content,
-            "repull returns the Server-formatted editable source"
+            source.state.snapshot.entries[&path].content
         );
         server.run(&f.owner, &repull, Push).await.unwrap();
         let unchanged = f.source().await;
-        assert_eq!(unchanged.policies, source.policies);
-        assert_eq!(unchanged.catalog, source.catalog);
         assert_eq!(unchanged.state, source.state);
+        assert_eq!(unchanged.catalog, source.catalog);
+        f.assert_subject_policy_unchanged();
     }
 
     #[tokio::test]
-    async fn cli_tcp_file_add_delete_and_omission_preserve_policy_until_explicit_removal() {
+    async fn cli_tcp_file_add_delete_and_shared_default_removal_preserve_subject_policy() {
         use yoi::config_cli::Command::*;
         let f = Fixture::new().await;
         let server = CliServer::start(&f).await;
@@ -961,23 +1015,20 @@ mod configuration_adoption_http_integration {
             "source deletion is not implicit policy deletion"
         );
 
-        let main = format!(
-            "{{ permissions = {{ subjects = []; remove_subjects = [{:?}]; }}; }} as WorkspaceConfigSchema\n",
-            f.subject
-        );
+        let main = "{ permissions = { sets = []; human_worker_default = {}; }; } as WorkspaceConfigSchema\n";
         std::fs::write(checkout.join("source/main.dcdl"), &main).unwrap();
         let preview = server.run(&f.owner, &checkout, Preview).await.unwrap();
-        assert!(preview.contains(&f.subject), "{preview}");
+        assert!(preview.contains("main.dcdl"), "{preview}");
         server.run(&f.owner, &checkout, Push).await.unwrap();
         let removed = f.source().await;
-        assert!(removed.policies.is_empty());
-        assert!(
-            f.api
-                .config_store
-                .adopted_subject_policy(TEST_WORKSPACE_ID, &f.subject)
-                .unwrap()
-                .is_none()
+        f.assert_source_policy_unchanged(&removed);
+        assert_eq!(
+            shared_permissions(&removed)
+                .human_worker_default
+                .assignment(),
+            Default::default()
         );
+        f.assert_subject_policy_unchanged();
         let repull = dir.path().join("repull");
         server.run(&f.owner, &repull, Pull).await.unwrap();
         assert_eq!(
@@ -1106,29 +1157,11 @@ mod configuration_adoption_http_integration {
             ("syntax", "{ subjects = [".to_owned()),
             (
                 "unknown-key",
-                permission_source(&f.subject, "ticket.not_a_builtin_operation", "ticket.query"),
+                permission_source("ticket.not_a_builtin_operation", "ticket.query"),
             ),
-            (
-                "unknown-set",
-                format!(
-                    "{{ subjects = [{{ subject_id = {:?}; execution = {{ sets = [\"not-a-builtin-set\"]; }}; }}]; }}",
-                    f.subject
-                ),
-            ),
-            (
-                "key-payload",
-                format!(
-                    "{{ subjects = [{{ subject_id = {:?}; execution = {{ namespaces = [{{ namespace = \"ticket\"; keys = [{{ key = \"ticket.query\"; arguments = {{}}; }}]; }}]; }}; }}]; }}",
-                    f.subject
-                ),
-            ),
-            (
-                "wrong-namespace",
-                format!(
-                    "{{ subjects = [{{ subject_id = {:?}; execution = {{ namespaces = [{{ namespace = \"ticket\"; keys = [\"worker.observe\"]; }}]; }}; }}]; }}",
-                    f.subject
-                ),
-            ),
+            ("unknown-set", "{ human_worker_default = { sets = [\"not-a-builtin-set\"]; }; }".to_owned()),
+            ("key-payload", r#"{ human_worker_default = { namespaces = [{ namespace = "ticket"; keys = [{ key = "ticket.query"; arguments = {}; }]; }]; }; }"#.to_owned()),
+            ("wrong-namespace", r#"{ human_worker_default = { namespaces = [{ namespace = "ticket"; keys = ["worker.observe"]; }]; }; }"#.to_owned()),
         ] {
             std::fs::write(&local, &content).unwrap();
             for command in [Validate, Preview, Push] {
@@ -1137,11 +1170,11 @@ mod configuration_adoption_http_integration {
                 assert_eq!(
                     f.durable(),
                     before,
-                    "{case} {command:?} must not adopt or seal"
+                    "{case} {command:?} must not modify source, policy or seal"
                 );
                 assert_eq!(std::fs::read_to_string(&local).unwrap(), content);
                 assert_eq!(std::fs::read(&metadata).unwrap(), metadata_before);
-                f.assert_legacy_writable();
+                f.assert_subject_policy_unchanged();
             }
         }
         std::fs::write(&local, original).unwrap();
@@ -1156,13 +1189,13 @@ mod configuration_adoption_http_integration {
         let f = Fixture::new().await;
         let server = CliServer::start(&f).await;
         let dir = tempfile::tempdir().unwrap();
-        for canonical in [false, true] {
-            let checkout = dir.path().join(format!("owner-{canonical}"));
+        for edited in [false, true] {
+            let checkout = dir.path().join(format!("owner-{edited}"));
             server.run(&f.owner, &checkout, Pull).await.unwrap();
             let source = f.source().await;
-            assert_eq!(source.source_stored, canonical);
+            assert!(source.source_stored);
             let before = f.durable();
-            let denied_checkout = dir.path().join(format!("foreign-{canonical}"));
+            let denied_checkout = dir.path().join(format!("foreign-{edited}"));
             let error = server
                 .run(&f.foreign, &denied_checkout, Pull)
                 .await
@@ -1186,7 +1219,7 @@ mod configuration_adoption_http_integration {
             // boundaries refuse this same authenticated nonowner independently.
             let adoption = request(
                 &source,
-                &format!("cli-denied-{canonical}"),
+                &format!("cli-denied-{edited}"),
                 vec![create_marker("forbidden")],
             );
             let foreign = server.client(&f.foreign);
@@ -1206,11 +1239,7 @@ mod configuration_adoption_http_integration {
                 }
                 assert_eq!(f.durable(), before);
             }
-            if canonical {
-                f.assert_legacy_sealed();
-            } else {
-                f.assert_legacy_writable();
-            }
+            f.assert_subject_policy_unchanged();
             server.run(&f.owner, &checkout, Push).await.unwrap();
             f.assert_legacy_sealed();
         }
@@ -1279,25 +1308,33 @@ mod configuration_adoption_http_integration {
     }
 
     fn permission_path(source: &Source) -> String {
-        source
-            .state
-            .snapshot
-            .entries
-            .keys()
-            .find(|path| path.starts_with("permissions/migrated") && path.ends_with(".dcdl"))
-            .expect("migration generated editable permission source")
-            .clone()
+        assert!(
+            source
+                .state
+                .snapshot
+                .entries
+                .contains_key("permissions/owner.dcdl")
+        );
+        "permissions/owner.dcdl".into()
     }
 
-    fn permission_source(subject: &str, execution: &str, delegation: &str) -> String {
+    fn shared_permissions(source: &Source) -> crate::policy_config::PermissionSource {
+        let snapshot =
+            serde_json::from_value(serde_json::to_value(&source.state.snapshot).unwrap()).unwrap();
+        let contract =
+            serde_json::from_value(serde_json::to_value(&source.state.contract).unwrap()).unwrap();
+        let evaluated = config_source::SnapshotEnvironment::new(snapshot)
+            .evaluate_contract(&contract)
+            .unwrap();
+        assert_eq!(evaluated.projection_digest, source.state.projection_digest);
+        crate::policy_config::source(&evaluated).unwrap()
+    }
+
+    fn permission_source(default: &str, set_key: &str) -> String {
         format!(
             r#"{{
-    subjects = [{{
-        subject_id = {subject:?};
-        execution = {{ namespaces = [{{ namespace = "ticket"; keys = [{execution:?}]; }}]; }};
-        delegation = {{ namespaces = [{{ namespace = "ticket"; keys = [{delegation:?}]; }}]; }};
-    }}];
-    remove_subjects = [];
+    sets = [{{ id = "owner-tools"; namespaces = [{{ namespace = "ticket"; keys = [{set_key:?}]; }}]; }}];
+    human_worker_default = {{ namespaces = [{{ namespace = "ticket"; keys = [{default:?}]; }}]; }};
 }}
 "#
         )
@@ -1318,49 +1355,108 @@ mod configuration_adoption_http_integration {
         }
     }
     impl Drop for AdoptionLoopback {
-        fn drop(&mut self) { self.task.abort(); }
+        fn drop(&mut self) {
+            self.task.abort();
+        }
     }
 
     #[tokio::test]
-    async fn configuration_http_problem_preserves_catalog_conflict_owner_visibility_and_durable_state() {
+    async fn configuration_http_problem_preserves_catalog_conflict_owner_visibility_and_durable_state()
+     {
         let f = Fixture::new().await;
         let draft = f.source().await;
         let before = f.durable();
-        let mut adoption = request(&draft, "private-config-catalog-request", vec![create_marker("private-source-body")]);
+        let mut adoption = request(
+            &draft,
+            "private-config-catalog-request",
+            vec![create_marker("private-source-body")],
+        );
         adoption.expected_catalog_digest.push_str("-private-stale");
-        let request = f.bearer(&f.owner, "POST", "/commit", Some(serde_json::to_value(&adoption).unwrap()));
+        let request = f.bearer(
+            &f.owner,
+            "POST",
+            "/commit",
+            Some(serde_json::to_value(&adoption).unwrap()),
+        );
         let response = f.app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(response.headers()[CONTENT_TYPE], "application/problem+json");
         let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
         let problem: Value = serde_json::from_slice(&bytes).unwrap();
-        let fixture: Value = serde_json::from_str(include_str!("../../../web/workspace/test/config-source/fixtures/catalog-changed.json")).unwrap();
-        assert_eq!(problem, fixture, "Web must consume the exact production HTTP fixture");
-        for private in ["private-config-catalog-request", "private-source-body", "private-stale", MARKER, f.subject.as_str()] {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../web/workspace/test/config-source/fixtures/catalog-changed.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            problem, fixture,
+            "Web must consume the exact production HTTP fixture"
+        );
+        for private in [
+            "private-config-catalog-request",
+            "private-source-body",
+            "private-stale",
+            MARKER,
+            f.subject.as_str(),
+        ] {
             assert!(!String::from_utf8_lossy(&bytes).contains(private));
         }
         assert_eq!(f.durable(), before);
-        f.assert_legacy_writable();
-        let (status, denied) = f.call(f.bearer(&f.foreign, "POST", "/commit", Some(serde_json::to_value(&adoption).unwrap()))).await;
+        f.assert_subject_policy_unchanged();
+        let (status, denied) = f
+            .call(f.bearer(
+                &f.foreign,
+                "POST",
+                "/commit",
+                Some(serde_json::to_value(&adoption).unwrap()),
+            ))
+            .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(denied.get("yoi_failure").is_none(), "owner denial is not cause visibility");
+        assert!(
+            denied.get("yoi_failure").is_none(),
+            "owner denial is not cause visibility"
+        );
         assert_eq!(f.durable(), before);
 
         let server = AdoptionLoopback::start(f.app.clone()).await;
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(reqwest::header::AUTHORIZATION, format!("Bearer {}", f.owner).parse().unwrap());
-        let client = reqwest::Client::builder().default_headers(headers).timeout(std::time::Duration::from_secs(10)).build().unwrap();
-        let generated = server_api::ConfigurationAdoptionApiClient::builder(&server.origin).unwrap().client(client).build().unwrap();
-        let received = tokio::time::timeout(std::time::Duration::from_secs(15), generated.configuration_adopt(TEST_WORKSPACE_ID.to_owned(), adoption)).await.unwrap().unwrap_err();
-        let server_api::client_support::ClientError::Public { status, error } = received else { panic!("generated client lost the real Problem response: {received:?}") };
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", f.owner).parse().unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let generated = server_api::ConfigurationAdoptionApiClient::builder(&server.origin)
+            .unwrap()
+            .client(client)
+            .build()
+            .unwrap();
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            generated.configuration_adopt(TEST_WORKSPACE_ID.to_owned(), adoption),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let server_api::client_support::ClientError::Public { status, error } = received else {
+            panic!("generated client lost the real Problem response: {received:?}")
+        };
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(error.details().unwrap().reason, server_api::configuration_failure::ConfigurationFailureReason::CatalogChanged);
-        assert!(api_macros::HttpError::custom_response(&error).is_none(), "received facts cannot encode a new disclosure");
+        assert_eq!(
+            error.details().unwrap().reason,
+            server_api::configuration_failure::ConfigurationFailureReason::CatalogChanged
+        );
+        assert!(
+            api_macros::HttpError::custom_response(&error).is_none(),
+            "received facts cannot encode a new disclosure"
+        );
         assert_eq!(f.durable(), before);
     }
 
     #[tokio::test]
-    async fn owner_http_repository_validation_is_read_only_and_precedes_seal() {
+    async fn owner_http_repository_validation_is_read_only_before_and_after_source_edit() {
         let f = Fixture::new().await;
         let source = server_api::RepositorySource {
             kind: server_api::RepositorySourceKind::Ssh,
@@ -1476,9 +1572,9 @@ mod configuration_adoption_http_integration {
                 "{{ repository_access = {{ {repo} = {{ ssh = {{ credential = {credential:?}; host_trust = {trust:?}; access = {access:?}; }}; }}; }}; }}"
             )
         };
-        for canonical in [false, true] {
+        for edited in [false, true] {
             let current = f.source().await;
-            assert_eq!(current.source_stored, canonical);
+            assert!(current.source_stored);
             let before = f.durable();
             for (case, repo, credential, trust, access, diagnostic) in [
                 (
@@ -1548,7 +1644,7 @@ mod configuration_adoption_http_integration {
             ] {
                 let adoption = request(
                     &current,
-                    &format!("repository-{canonical}-{case}"),
+                    &format!("repository-{edited}-{case}"),
                     vec![update(
                         &current,
                         "main.dcdl",
@@ -1573,16 +1669,12 @@ mod configuration_adoption_http_integration {
                         secrets_before,
                         "validation must not generate keys or secret receipts"
                     );
-                    if canonical {
-                        f.assert_legacy_sealed();
-                    } else {
-                        f.assert_legacy_writable();
-                    }
+                    f.assert_subject_policy_unchanged();
                 }
             }
             let valid = request(
                 &current,
-                &format!("valid-repository-{canonical}"),
+                &format!("valid-repository-{edited}"),
                 vec![update(
                     &current,
                     "main.dcdl",
@@ -1590,7 +1682,7 @@ mod configuration_adoption_http_integration {
                         "remote",
                         "deploy",
                         "matching",
-                        if canonical { "read_write" } else { "read_only" },
+                        if edited { "read_write" } else { "read_only" },
                     ),
                 )],
             );
@@ -1598,7 +1690,7 @@ mod configuration_adoption_http_integration {
             assert_eq!(
                 f.durable(),
                 before,
-                "valid preview must remain a read, before and after cutover"
+                "valid preview must remain a read, before and after an owner source edit"
             );
             assert_eq!(secret_counts(), secrets_before);
             let saved = f.commit(&valid).await;
@@ -1624,43 +1716,27 @@ mod configuration_adoption_http_integration {
     }
 
     #[tokio::test]
-    async fn owner_http_edits_migration_draft_and_adopts_source_policy_head_and_receipt() {
+    async fn owner_http_shared_source_edit_commits_head_and_receipt_without_changing_subject_policy()
+     {
         let fixture = Fixture::new().await;
         let before = fixture.durable();
-        let draft = fixture.source().await;
-        assert!(!draft.source_stored);
-        assert_eq!(draft.history_head, None);
-        assert!(draft.expected_legacy_export.is_some());
-        assert_ne!(
-            draft.state.snapshot.digest,
+        let source = fixture.source().await;
+        assert!(source.source_stored);
+        assert!(source.history_head.is_some());
+        assert!(source.expected_legacy_export.is_none());
+        fixture.assert_source_policy_unchanged(&source);
+        assert_eq!(
+            source.state.snapshot.digest,
             before["state"]["snapshot"]["digest"]
         );
-        assert_eq!(draft.catalog.workspace.as_str(), TEST_WORKSPACE_ID);
-        assert!(draft.catalog.namespaces.iter().any(|namespace| {
-            namespace
-                .declaration
-                .permissions
-                .iter()
-                .any(|permission| permission.key.as_str() == "ticket.query")
-        }));
-        assert_eq!(draft.policies.len(), 1);
-        assert_eq!(draft.policies[0].change_id, fixture.legacy_policy.change_id);
-        assert_eq!(
-            fixture.durable(),
-            before,
-            "GET is a read, not a save or seal"
-        );
-        fixture.assert_legacy_writable();
-
-        let path = permission_path(&draft);
-        let edited = format!(
-            "{}\n# Owner edited the migration draft before first adoption.\n",
-            draft.state.snapshot.entries[&path].content
-        );
+        assert_eq!(source.catalog.workspace.as_str(), TEST_WORKSPACE_ID);
+        fixture.assert_subject_policy_unchanged();
+        let path = permission_path(&source);
+        let changed = permission_source("ticket.create", "ticket.query");
         let adoption = request(
-            &draft,
-            "edited-migration-draft",
-            vec![update(&draft, &path, &edited)],
+            &source,
+            "owner-shared-source-edit",
+            vec![update(&source, &path, &changed)],
         );
         let preview: Preview = serde_json::from_value(
             fixture
@@ -1668,21 +1744,14 @@ mod configuration_adoption_http_integration {
                 .await,
         )
         .unwrap();
-        assert_eq!(preview.expected_head, draft.history_head);
-        assert!(preview.changed_paths.contains(&path));
-        assert!(
-            preview.state.snapshot.entries[&path]
-                .content
-                .contains("# Owner edited the migration draft before first adoption.")
-        );
+        assert_eq!(preview.expected_head, source.history_head);
+        assert_eq!(preview.changed_paths, vec![path.clone()]);
+        assert!(preview.changed_subjects.is_empty());
         assert_eq!(
             fixture.durable(),
             before,
-            "preview must not seal or persist the draft"
+            "preview does not publish source or mutate Subject policy"
         );
-        fixture.assert_legacy_writable();
-
-        // Exercise the real Browser session and configured Origin on commit.
         let (status, wire) = fixture
             .call(fixture.browser(
                 "POST",
@@ -1692,7 +1761,6 @@ mod configuration_adoption_http_integration {
             ))
             .await;
         assert_eq!(status, StatusCode::OK, "{wire}");
-        assert_eq!(wire["runtime_application"], "next_current_policy_check");
         let receipt: Receipt = serde_json::from_value(wire).unwrap();
         assert_eq!(
             receipt.runtime_application,
@@ -1703,42 +1771,25 @@ mod configuration_adoption_http_integration {
         assert_eq!(receipt.operation_id, adoption.operation_id);
         assert_eq!(receipt.state, preview.state);
         let stored = fixture.source().await;
-        assert!(stored.source_stored);
-        assert_eq!(stored.expected_legacy_export, None);
         assert_eq!(stored.state, receipt.state);
         assert_eq!(
             stored.history_head.as_deref(),
             Some(receipt.history_head.as_str())
         );
+        assert_ne!(stored.history_head, source.history_head);
         assert_eq!(
-            stored.policies, draft.policies,
-            "source-only edit preserves policy and change IDs"
+            shared_permissions(&stored)
+                .human_worker_default
+                .assignment(),
+            assignment("ticket.create")
         );
-        let current = fixture
-            .api
-            .config_store
-            .configuration_current(TEST_WORKSPACE_ID, &fixture.owner_account)
-            .unwrap();
-        assert!(current.canonical);
-        assert_eq!(workspace_config_state_to_api(current.state), receipt.state);
+        fixture.assert_source_policy_unchanged(&stored);
+        fixture.assert_subject_policy_unchanged();
+        let after = fixture.durable();
         assert_eq!(
-            open_subjektiv_store(&fixture.api)
-                .unwrap()
-                .subject_permissions(&fixture.subject)
-                .unwrap(),
-            Some(fixture.legacy_policy.clone())
+            after["legacy_receipt"], before["legacy_receipt"],
+            "ordinary owner edits never reseal native transfer"
         );
-        let identity = fixture.legacy.database_identity().unwrap();
-        let transfer = fixture
-            .legacy
-            .permission_transfer_receipt(&identity)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            Some(transfer.snapshot.export_digest),
-            draft.expected_legacy_export
-        );
-        assert_eq!(transfer.snapshot.identity, identity);
         let saved = fixture
             .api
             .config_store
@@ -1751,63 +1802,12 @@ mod configuration_adoption_http_integration {
             .unwrap();
         assert_eq!(saved.history_head, receipt.history_head);
         assert_eq!(workspace_config_state_to_api(saved.state), receipt.state);
+        assert_eq!(fixture.commit(&adoption).await, receipt);
         assert_eq!(
-            saved.runtime_application,
-            crate::config_adoption::RuntimePolicyApplication::NextCurrentPolicyCheck
+            fixture.durable(),
+            after,
+            "exact replay does not write a new receipt or policy identity"
         );
-        assert_eq!(
-            transfer.transfer_id,
-            crate::config_adoption::request_fingerprint(
-                TEST_WORKSPACE_ID,
-                &fixture.owner_account,
-                &core_request(&adoption),
-            )
-            .unwrap()
-        );
-        fixture.assert_legacy_sealed();
-
-        // Then edit actual builtin operation assignments through the same routes.
-        let changed = permission_source(&fixture.subject, "ticket.create", "ticket.query");
-        let policy_edit = request(
-            &stored,
-            "owner-policy-edit",
-            vec![update(&stored, &path, &changed)],
-        );
-        let preview: Preview = serde_json::from_value(
-            fixture
-                .owner_call("/preview", &policy_edit, StatusCode::OK)
-                .await,
-        )
-        .unwrap();
-        assert_eq!(preview.changed_subjects, vec![fixture.subject.clone()]);
-        let next = fixture.commit(&policy_edit).await;
-        assert_eq!(next.state, preview.state);
-        assert_ne!(next.history_head, receipt.history_head);
-        let stored = fixture.source().await;
-        assert_eq!(stored.state, next.state);
-        let policy = stored
-            .policies
-            .iter()
-            .find(|policy| policy.subject_id == fixture.subject)
-            .unwrap();
-        assert_eq!(policy.execution, assignment("ticket.create"));
-        assert_eq!(policy.delegation, assignment("ticket.query"));
-        assert_ne!(policy.change_id, fixture.legacy_policy.change_id);
-        let adopted = fixture
-            .api
-            .config_store
-            .adopted_subject_policy(TEST_WORKSPACE_ID, &fixture.subject)
-            .unwrap()
-            .unwrap();
-        assert_eq!(adopted.source.execution.assignment(), policy.execution);
-        assert_eq!(adopted.source.delegation.assignment(), policy.delegation);
-        assert_eq!(adopted.change_id, policy.change_id);
-        // New payload-free keys cannot fabricate broader legacy resource scopes.
-        assert_eq!(
-            policy.legacy_constraints,
-            Some(fixture.legacy_policy.clone())
-        );
-        fixture.assert_legacy_sealed();
     }
 
     #[tokio::test]
@@ -1879,7 +1879,7 @@ mod configuration_adoption_http_integration {
         .unwrap();
         assert_eq!(missing, Reconciliation::NotObserved);
         assert_eq!(fixture.durable(), before);
-        fixture.assert_legacy_writable();
+        fixture.assert_subject_policy_unchanged();
 
         // Receive a committed HTTP result, then model the consumer losing it.
         // Reconciliation uses the retained original request, not result-derived input.
@@ -1909,11 +1909,8 @@ mod configuration_adoption_http_integration {
 
         let current = fixture.source().await;
         let path = permission_path(&current);
-        // Explicit removal makes old-receipt resurrection observable.
-        let removal = format!(
-            "{{ subjects = []; remove_subjects = [{:?}]; }}\n",
-            fixture.subject
-        );
+        // Clearing shared defaults makes old-source resurrection observable.
+        let removal = "{ sets = []; human_worker_default = {}; }\n";
         fixture
             .commit(&request(
                 &current,
@@ -1921,14 +1918,15 @@ mod configuration_adoption_http_integration {
                 vec![update(&current, &path, &removal)],
             ))
             .await;
-        assert!(
-            fixture
-                .api
-                .config_store
-                .adopted_subject_policy(TEST_WORKSPACE_ID, &fixture.subject)
-                .unwrap()
-                .is_none()
+        fixture.assert_subject_policy_unchanged();
+        let cleared = fixture.source().await;
+        assert_eq!(
+            shared_permissions(&cleared)
+                .human_worker_default
+                .assignment(),
+            Default::default()
         );
+        fixture.assert_source_policy_unchanged(&cleared);
         let latest = fixture.durable();
         let reconciled: Reconciliation = serde_json::from_value(
             fixture
@@ -1948,13 +1946,7 @@ mod configuration_adoption_http_integration {
             latest,
             "historical receipt must not resurrect removed policy or head"
         );
-        assert!(
-            open_subjektiv_store(&fixture.api)
-                .unwrap()
-                .subject_permissions(&fixture.subject)
-                .unwrap()
-                .is_none()
-        );
+        fixture.assert_subject_policy_unchanged();
         fixture.assert_legacy_sealed();
     }
 
@@ -1973,7 +1965,7 @@ mod configuration_adoption_http_integration {
         changed.expected_catalog_digest.push_str("-different");
         variants.push(("catalog", changed));
         let mut changed = adoption.clone();
-        changed.expected_legacy_export = None;
+        changed.expected_legacy_export = Some("unexpected-legacy-export".into());
         variants.push(("legacy export", changed));
         let mut changed = adoption.clone();
         changed.source.base_digest.push_str("-different");
@@ -2011,21 +2003,17 @@ mod configuration_adoption_http_integration {
     }
 
     #[tokio::test]
-    async fn http_owner_and_cookie_origin_denials_leave_all_authorities_and_legacy_writer_intact() {
+    async fn http_owner_and_cookie_origin_denials_leave_source_subject_policy_and_seal_intact() {
         let fixture = Fixture::new().await;
-        for canonical in [false, true] {
+        for edited in [false, true] {
             let source = fixture.source().await;
-            assert_eq!(source.source_stored, canonical);
-            let change = if canonical {
+            assert!(source.source_stored);
+            let change = if edited {
                 update(&source, MARKER, "second authorized value")
             } else {
                 create_marker("first authorized value")
             };
-            let adoption = request(
-                &source,
-                &format!("denied-cutover-{canonical}"),
-                vec![change],
-            );
+            let adoption = request(&source, &format!("denied-cutover-{edited}"), vec![change]);
             let wire = serde_json::to_value(&adoption).unwrap();
             let before = fixture.durable();
             for (method, suffix) in [
@@ -2082,11 +2070,7 @@ mod configuration_adoption_http_integration {
                         "{principal} {method} {suffix}: {response}"
                     );
                     assert_eq!(fixture.durable(), before, "{principal} {suffix}");
-                    if canonical {
-                        fixture.assert_legacy_sealed();
-                    } else {
-                        fixture.assert_legacy_writable();
-                    }
+                    fixture.assert_subject_policy_unchanged();
                 }
                 if method == "POST" {
                     for origin in [None, Some("https://attacker.invalid")] {
@@ -2099,11 +2083,7 @@ mod configuration_adoption_http_integration {
                             "cookie {origin:?} {suffix}: {response}"
                         );
                         assert_eq!(fixture.durable(), before);
-                        if canonical {
-                            fixture.assert_legacy_sealed();
-                        } else {
-                            fixture.assert_legacy_writable();
-                        }
+                        fixture.assert_subject_policy_unchanged();
                     }
                 }
             }
@@ -2127,26 +2107,22 @@ mod configuration_adoption_http_integration {
             ("syntax", "{ subjects = [".to_owned()),
             (
                 "unknown-key",
-                permission_source(
-                    &fixture.subject,
-                    "ticket.not_a_builtin_operation",
-                    "ticket.query",
+                permission_source("ticket.not_a_builtin_operation", "ticket.query"),
+            ),
+            (
+                "retired-subject-input",
+                format!(
+                    "{{ subjects = [{{ subject_id = {:?}; execution = {{}}; }}]; }}",
+                    fixture.subject
                 ),
             ),
             (
-                "missing-subject",
-                permission_source(
-                    "nonexistent-adoption-subject",
-                    "ticket.create",
-                    "ticket.query",
-                ),
+                "retired-removal-input",
+                format!("{{ remove_subjects = [{:?}]; }}", fixture.subject),
             ),
             (
                 "unknown-set",
-                format!(
-                    "{{ subjects = [{{ subject_id = {:?}; execution = {{ sets = [\"unknown-adoption-set\"]; }}; delegation = {{}}; }}]; remove_subjects = []; }}",
-                    fixture.subject
-                ),
+                r#"{ human_worker_default = { sets = ["unknown-adoption-set"]; }; }"#.to_owned(),
             ),
         ];
         for (name, content) in invalid {
@@ -2171,13 +2147,13 @@ mod configuration_adoption_http_integration {
                 assert_eq!(
                     fixture.durable(),
                     before,
-                    "invalid {name} leaves no source, policy, head, receipt or seal"
+                    "invalid {name} leaves source, policy, head, receipts and seal unchanged"
                 );
-                fixture.assert_legacy_writable();
+                fixture.assert_subject_policy_unchanged();
             }
         }
-        for canonical in [false, true] {
-            if canonical {
+        for edited in [false, true] {
+            if edited {
                 fixture.adopt_draft("old-writer-cutover").await;
             }
             let current = fixture.source().await;
@@ -2200,14 +2176,10 @@ mod configuration_adoption_http_integration {
             assert_eq!(
                 status,
                 StatusCode::CONFLICT,
-                "old writer canonical={canonical}: {response}"
+                "old writer canonical={edited}: {response}"
             );
             assert_eq!(fixture.durable(), before);
-            if canonical {
-                fixture.assert_legacy_sealed();
-            } else {
-                fixture.assert_legacy_writable();
-            }
+            fixture.assert_subject_policy_unchanged();
         }
     }
     #[tokio::test]
@@ -2217,9 +2189,14 @@ mod configuration_adoption_http_integration {
         let adoption = request(&draft, "publication-http-success", vec![]);
         let receipt = fixture.commit(&adoption).await;
         let host = fixture.api.host_executors.host().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(15), host.drain()).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), host.drain())
+            .await
+            .unwrap()
+            .unwrap();
         let suffix = format!("/publication/{}", adoption.operation_id);
-        let (status, before) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        let (status, before) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::OK, "{before}");
         let publication = &before["publication"];
         assert_eq!(publication["workspace_id"], TEST_WORKSPACE_ID);
@@ -2231,30 +2208,55 @@ mod configuration_adoption_http_integration {
         assert_eq!(observations[0]["outcome"], "observed");
         assert_eq!(observations[1]["stage"], "projection");
         assert_eq!(observations[1]["outcome"], "observed");
-        assert!(observations.len() >= 3, "real fixture Runtime must be observed");
+        assert!(
+            observations.len() >= 3,
+            "real fixture Runtime must be observed"
+        );
         for observation in &observations[2..] {
             assert_eq!(observation["stage"], "runtime");
             assert!(observation["runtime_id"].is_string());
-            assert_eq!(observation["projection_digest"], observations[1]["projection_digest"]);
+            assert_eq!(
+                observation["projection_digest"],
+                observations[1]["projection_digest"]
+            );
         }
         let durable = fixture.durable();
         assert_eq!(fixture.commit(&adoption).await, receipt);
-        fixture.owner_call("/reconcile", &adoption, StatusCode::OK).await;
-        tokio::time::timeout(std::time::Duration::from_secs(15), host.drain()).await.unwrap().unwrap();
-        let (status, after) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        fixture
+            .owner_call("/reconcile", &adoption, StatusCode::OK)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(15), host.drain())
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, after) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(after, before, "lookup, reconcile and replay do not republish or amend observations");
-        assert_eq!(fixture.durable(), durable, "independent evidence must not rewrite source/policy/receipt");
-        let (status, missing) = fixture.call(fixture.bearer(&fixture.owner, "GET", "/publication/not-observed", None)).await;
+        assert_eq!(
+            after, before,
+            "lookup, reconcile and replay do not republish or amend observations"
+        );
+        assert_eq!(
+            fixture.durable(),
+            durable,
+            "independent evidence must not rewrite source/policy/receipt"
+        );
+        let (status, missing) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", "/publication/not-observed", None))
+            .await;
         assert_eq!(status, StatusCode::OK);
         assert!(missing["publication"].is_null());
-        let (status, denied) = fixture.call(fixture.bearer(&fixture.foreign, "GET", &suffix, None)).await;
+        let (status, denied) = fixture
+            .call(fixture.bearer(&fixture.foreign, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(!denied.to_string().contains("request_fingerprint"));
     }
 
     #[tokio::test]
-    async fn publication_dispatch_refusal_preserves_adoption_and_reprojects_safe_cause_for_browser_and_tool() {
+    async fn publication_dispatch_refusal_preserves_adoption_and_reprojects_safe_cause_for_browser_and_tool()
+     {
         let host = HostExecutors::default();
         host.host.set(None).ok().unwrap();
         let fixture = Fixture::with_publication_host(host).await;
@@ -2263,22 +2265,47 @@ mod configuration_adoption_http_integration {
         let receipt = fixture.commit(&adoption).await;
         assert!(receipt.source_stored && receipt.policy_committed);
         let suffix = format!("/publication/{}", adoption.operation_id);
-        let (status, body) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        let (status, body) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let observations = body["publication"]["observations"].as_array().unwrap();
-        assert_eq!(observations.len(), 1, "projection and Runtime were not dispatched");
+        assert_eq!(
+            observations.len(),
+            1,
+            "projection and Runtime were not dispatched"
+        );
         assert_eq!(observations[0]["outcome"], "unconfirmed");
         let browser_cause = &observations[0]["failure"]["failure"];
         assert_eq!(browser_cause["reason"], "publication_dispatch_unavailable");
-        assert!(browser_cause["explanation"].as_str().unwrap().contains("adopted"));
-        let retained = fixture.api.config_store.configuration_publication(TEST_WORKSPACE_ID, &fixture.owner_account, &adoption.operation_id).unwrap().unwrap();
+        assert!(
+            browser_cause["explanation"]
+                .as_str()
+                .unwrap()
+                .contains("adopted")
+        );
+        let retained = fixture
+            .api
+            .config_store
+            .configuration_publication(
+                TEST_WORKSPACE_ID,
+                &fixture.owner_account,
+                &adoption.operation_id,
+            )
+            .unwrap()
+            .unwrap();
         let tool = retained.observations[0].failure.as_ref().unwrap()
             .project_for::<error_contract::Tool, server_api::configuration_failure::ConfigurationFailureDetails>(
                 &server_api::configuration_failure::ConfigurationFailureVisibility { can_view_cause: true }).unwrap();
-        assert_eq!(tool.explanation(), browser_cause["explanation"].as_str().unwrap());
+        assert_eq!(
+            tool.explanation(),
+            browser_cause["explanation"].as_str().unwrap()
+        );
         assert_eq!(tool.details().reason, server_api::configuration_failure::ConfigurationFailureReason::PublicationDispatchUnavailable);
         assert_eq!(fixture.commit(&adoption).await, receipt);
-        let (_, replayed) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        let (_, replayed) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(replayed, body);
     }
 
@@ -2288,24 +2315,42 @@ mod configuration_adoption_http_integration {
         host.host.set(None).ok().unwrap();
         let fixture = Fixture::with_publication_host(host).await;
         let receipt = fixture.adopt_draft("publication-untrusted-evidence").await;
-        let facts = error_contract::FailureFacts::new(protocol::control_failure::RuntimeControlCause::TimedOut).unwrap();
-        let projected = error_contract::project_failure::<error_contract::Storage, _>(&facts, &()).unwrap();
-        let original = protocol::background_failure::BackgroundFailure::from_projected(&projected).unwrap();
+        let facts = error_contract::FailureFacts::new(
+            protocol::control_failure::RuntimeControlCause::TimedOut,
+        )
+        .unwrap();
+        let projected =
+            error_contract::project_failure::<error_contract::Storage, _>(&facts, &()).unwrap();
+        let original =
+            protocol::background_failure::BackgroundFailure::from_projected(&projected).unwrap();
         let mut known: Value = serde_json::from_str(original.as_storage_str()).unwrap();
         known["explanation"] = json!("TEST_ONLY_SECRET /private/path body; safe to resend");
         let mut future = known.clone();
         future["version"] = json!(999);
-        for (runtime, evidence) in [("known", known.to_string()), ("future", future.to_string()), ("corrupt", "{ TEST_ONLY_SECRET raw_provider_body".into())] {
+        for (runtime, evidence) in [
+            ("known", known.to_string()),
+            ("future", future.to_string()),
+            ("corrupt", "{ TEST_ONLY_SECRET raw_provider_body".into()),
+        ] {
             fixture.api.config_store.with_conn(|conn| {
                 conn.execute("INSERT INTO workspace_configuration_publication_observations(workspace_id,operation_id,stage,runtime_id,projection_digest,outcome,failure_cause) VALUES(?1,?2,'runtime',?3,'observed-projection','unconfirmed',?4)", rusqlite::params![TEST_WORKSPACE_ID, receipt.operation_id, runtime, evidence])?;
                 Ok(())
             }).unwrap();
         }
         let suffix = format!("/publication/{}", receipt.operation_id);
-        let (status, body) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        let (status, body) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let text = body.to_string();
-        for private in ["TEST_ONLY_SECRET", "/private/path", "raw_provider_body", "safe to resend"] { assert!(!text.contains(private), "{text}"); }
+        for private in [
+            "TEST_ONLY_SECRET",
+            "/private/path",
+            "raw_provider_body",
+            "safe to resend",
+        ] {
+            assert!(!text.contains(private), "{text}");
+        }
         let observations = body["publication"]["observations"].as_array().unwrap();
         for observation in &observations[1..] {
             assert_eq!(observation["outcome"], "unconfirmed");
@@ -2316,84 +2361,146 @@ mod configuration_adoption_http_integration {
             }
         }
         let durable = fixture.durable();
-        fixture.api.config_store.with_conn(|conn| {
-            conn.execute("UPDATE workspaces SET state='deleting' WHERE workspace_id=?1", [TEST_WORKSPACE_ID])?;
-            Ok(())
-        }).unwrap();
-        let (status, denied) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        fixture
+            .api
+            .config_store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE workspaces SET state='deleting' WHERE workspace_id=?1",
+                    [TEST_WORKSPACE_ID],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let (status, denied) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(!denied.to_string().contains("request_fingerprint"));
-        assert!(durable["receipts"].as_array().unwrap().len() == 1);
+        assert_eq!(durable["receipts"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn queued_publication_rechecks_current_head_before_resolving_or_notifying_old_source() {
         let host = HostExecutors::default();
-        host.host.set(Some(crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
-            workers: std::num::NonZeroUsize::new(1).unwrap(),
-            queued: std::num::NonZeroUsize::new(4).unwrap(),
-        }).unwrap())).ok().unwrap();
+        host.host
+            .set(Some(
+                crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
+                    workers: std::num::NonZeroUsize::new(1).unwrap(),
+                    queued: std::num::NonZeroUsize::new(4).unwrap(),
+                })
+                .unwrap(),
+            ))
+            .ok()
+            .unwrap();
         let fixture = Fixture::with_publication_host(host).await;
         let executor = fixture.api.host_executors.host().unwrap();
         let (ready, started) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
-        executor.dispatch(move || {
-            let _ = ready.send(());
-            let _ = blocked.recv_timeout(std::time::Duration::from_secs(15));
-        }).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(15), started).await.unwrap().unwrap();
+        executor
+            .dispatch(move || {
+                let _ = ready.send(());
+                let _ = blocked.recv_timeout(std::time::Duration::from_secs(15));
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), started)
+            .await
+            .unwrap()
+            .unwrap();
         let first = fixture.adopt_draft("publication-queued-first").await;
         let second = fixture.adopt_draft("publication-queued-second").await;
         assert_ne!(first.history_head, second.history_head);
         release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain()).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain())
+            .await
+            .unwrap()
+            .unwrap();
         let suffix = format!("/publication/{}", first.operation_id);
-        let (status, body) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        let (status, body) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let observations = body["publication"]["observations"].as_array().unwrap();
-        assert_eq!(observations.len(), 2, "historical source must not be sent to any Runtime");
+        assert_eq!(
+            observations.len(),
+            2,
+            "historical source must not be sent to any Runtime"
+        );
         assert_eq!(observations[0]["outcome"], "observed");
         assert_eq!(observations[1]["stage"], "projection");
         assert_eq!(observations[1]["outcome"], "unconfirmed");
         assert!(observations[1]["projection_digest"].is_null());
-        assert_eq!(observations[1]["failure"]["failure"]["reason"], "editing_head_changed");
+        assert_eq!(
+            observations[1]["failure"]["failure"]["reason"],
+            "editing_head_changed"
+        );
         assert_eq!(body["publication"]["history_head"], first.history_head);
-        assert_eq!(fixture.source().await.history_head, Some(second.history_head));
+        assert_eq!(
+            fixture.source().await.history_head,
+            Some(second.history_head)
+        );
     }
 
     #[tokio::test]
-    async fn publication_registry_failure_preserves_committed_receipt_and_never_resends_on_lookup_or_replay() {
+    async fn publication_registry_failure_preserves_committed_receipt_and_never_resends_on_lookup_or_replay()
+     {
         let host = HostExecutors::default();
-        host.host.set(Some(crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
-            workers: std::num::NonZeroUsize::new(1).unwrap(),
-            queued: std::num::NonZeroUsize::new(4).unwrap(),
-        }).unwrap())).ok().unwrap();
+        host.host
+            .set(Some(
+                crate::db_executor::DbExecutor::new(crate::db_executor::DbExecutorLimits {
+                    workers: std::num::NonZeroUsize::new(1).unwrap(),
+                    queued: std::num::NonZeroUsize::new(4).unwrap(),
+                })
+                .unwrap(),
+            ))
+            .ok()
+            .unwrap();
         let fixture = Fixture::with_publication_host(host).await;
         let executor = fixture.api.host_executors.host().unwrap();
         let (ready, started) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
-        executor.dispatch(move || {
-            let _ = ready.send(());
-            blocked.recv_timeout(std::time::Duration::from_secs(15)).unwrap();
-        }).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(15), started).await.unwrap().unwrap();
+        executor
+            .dispatch(move || {
+                let _ = ready.send(());
+                blocked
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .unwrap();
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), started)
+            .await
+            .unwrap()
+            .unwrap();
         let draft = fixture.source().await;
         let adoption = request(&draft, "publication-registry-unavailable", vec![]);
         let receipt = fixture.commit(&adoption).await;
         assert!(receipt.source_stored && receipt.policy_committed);
         let durable = fixture.durable();
         let registry = fixture.api.permission_registry.clone();
-        assert!(std::thread::spawn(move || {
-            let _guard = registry.write().unwrap();
-            panic!("TEST_ONLY_SECRET /private/registry-path");
-        }).join().is_err());
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = registry.write().unwrap();
+                panic!("TEST_ONLY_SECRET /private/registry-path");
+            })
+            .join()
+            .is_err()
+        );
         release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain()).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain())
+            .await
+            .unwrap()
+            .unwrap();
         let suffix = format!("/publication/{}", adoption.operation_id);
-        let (status, before) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        let (status, before) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::OK, "{before}");
         let observations = before["publication"]["observations"].as_array().unwrap();
-        assert_eq!(observations.len(), 2, "a failed registry refresh must not notify Runtime");
+        assert_eq!(
+            observations.len(),
+            2,
+            "a failed registry refresh must not notify Runtime"
+        );
         assert_eq!(observations[0]["stage"], "dispatch");
         assert_eq!(observations[0]["outcome"], "observed");
         assert_eq!(observations[1]["stage"], "projection");
@@ -2403,18 +2510,33 @@ mod configuration_adoption_http_integration {
         assert!(browser["explanation"].as_str().unwrap().contains("adopted"));
         assert!(!before.to_string().contains("TEST_ONLY_SECRET"));
         assert!(!before.to_string().contains("/private/registry-path"));
-        let retained = fixture.api.config_store.configuration_publication(TEST_WORKSPACE_ID, &fixture.owner_account, &adoption.operation_id).unwrap().unwrap();
+        let retained = fixture
+            .api
+            .config_store
+            .configuration_publication(
+                TEST_WORKSPACE_ID,
+                &fixture.owner_account,
+                &adoption.operation_id,
+            )
+            .unwrap()
+            .unwrap();
         let tool = retained.observations[1].failure.as_ref().unwrap()
             .project_for::<error_contract::Tool, server_api::configuration_failure::ConfigurationFailureDetails>(
                 &server_api::configuration_failure::ConfigurationFailureVisibility { can_view_cause: true }).unwrap();
         assert_eq!(tool.explanation(), browser["explanation"].as_str().unwrap());
         assert_eq!(fixture.commit(&adoption).await, receipt);
-        fixture.owner_call("/reconcile", &adoption, StatusCode::OK).await;
-        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain()).await.unwrap().unwrap();
-        let (status, after) = fixture.call(fixture.bearer(&fixture.owner, "GET", &suffix, None)).await;
+        fixture
+            .owner_call("/reconcile", &adoption, StatusCode::OK)
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(15), executor.drain())
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, after) = fixture
+            .call(fixture.bearer(&fixture.owner, "GET", &suffix, None))
+            .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(after, before);
         assert_eq!(fixture.durable(), durable);
     }
-
 }

@@ -188,7 +188,6 @@ fn job_graph(conn: &Connection) -> Vec<(String, Vec<Vec<Value>>)> {
                 || table.starts_with("notification_")
                 || table.starts_with("subject_deletion")
                 || table == "workspace_memory_documents"
-                || table == "__yoi_schema_migrations"
         })
         .collect()
 }
@@ -519,17 +518,46 @@ fn migration_rejects_wrong_boundary_and_current_reopen_does_not_sweep_new_jobs()
     migrate(&conn).unwrap();
     job(&conn, "w", "new-after-upgrade", "pending");
     let saved = job_graph(&conn);
+    let history_query =
+        "SELECT version,name,applied_at FROM __yoi_schema_migrations ORDER BY version";
+    let old_history = rows(&conn, history_query);
     assert!(migrate(&conn).is_err());
     assert_eq!(saved, job_graph(&conn));
+    assert_eq!(old_history, rows(&conn, history_query));
     drop(conn);
     drop(store::SqliteWorkspaceStore::open_for_test(&path).unwrap());
     let conn = Connection::open(&path).unwrap();
     assert_eq!(saved, job_graph(&conn));
-    store::storage_formats::verify_history(&conn, 130).unwrap();
+    let current_history = rows(&conn, history_query);
+    assert_eq!(&current_history[..old_history.len()], old_history);
+    let additions = &current_history[old_history.len()..];
+    assert_eq!(
+        additions
+            .iter()
+            .map(|row| row[..2].to_vec())
+            .collect::<Vec<_>>(),
+        store::MIGRATIONS
+            .iter()
+            .filter(|step| step.version > 130)
+            .map(|step| vec![Value::Integer(step.version), Value::Text(step.name.into())])
+            .collect::<Vec<_>>(),
+        "owner open appends only the later schema receipts, without rewriting Job history"
+    );
+    assert!(
+        additions
+            .iter()
+            .all(|row| matches!(&row[2], Value::Text(at) if !at.is_empty()))
+    );
+    assert_eq!(
+        store::current_schema_version(&conn).unwrap(),
+        store::LATEST_SCHEMA_VERSION
+    );
+    store::storage_formats::verify_history(&conn, store::LATEST_SCHEMA_VERSION).unwrap();
     drop(conn);
     drop(store::SqliteWorkspaceStore::open_for_test(&path).unwrap());
     let conn = Connection::open(path).unwrap();
     assert_eq!(saved, job_graph(&conn));
+    assert_eq!(current_history, rows(&conn, history_query));
 }
 
 #[test]
@@ -597,7 +625,8 @@ fn fresh_and_upgraded_current_job_schema_have_same_columns_constraints_and_progr
         result.extend(rows(conn,"SELECT type,name,replace(replace(replace(sql,char(10),''),char(13),''),' ','') FROM sqlite_schema WHERE name LIKE 'backend_job%' AND type IN ('trigger','index') AND sql IS NOT NULL ORDER BY type,name"));
         // Full tokenized CHECK/trigger comparison is also required by the actual
         // recognizer, not just this pragma signature.
-        store::storage_formats::verify_history(conn, 130).unwrap();
+        store::storage_formats::verify_history(conn, store::current_schema_version(conn).unwrap())
+            .unwrap();
         result
     }
     assert_eq!(signature(&upgraded), signature(&fresh));
@@ -615,8 +644,15 @@ fn current_receipt_does_not_accept_reintroduced_legacy_objects_or_weakened_guard
         "ALTER TABLE backend_job_reference_migration_targets ADD COLUMN unexpected TEXT",
         "UPDATE __yoi_schema_migrations SET name='counterfeit' WHERE version=130",
     ] {
-        let conn = Connection::open_in_memory().unwrap();
-        store::prepare_connection(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.sqlite");
+        store::tests::prepare_retained_schema(&path, 129);
+        let conn = Connection::open(path).unwrap();
+        store::configure_sqlite(&conn).unwrap();
+        migrate(&conn).unwrap();
+        // Exercise the real schema130 receipt, not a fresh latest baseline
+        // without that row (where the counterfeit UPDATE would do nothing).
+        store::storage_formats::verify_history(&conn, 130).unwrap();
         conn.execute_batch(damage).unwrap();
         let before = schema(&conn);
         assert!(

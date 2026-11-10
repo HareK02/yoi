@@ -16,19 +16,19 @@
 
 Featureの有効化、Tool・service・hookの登録、セッション内状態の初期化は権限を発行せず、それ自体に一律の起動認可を要求しない。外部への作用、保護データの読取り・モデルへの供給、購読・背景処理の開始は、起動中でも通常操作と同じ操作名と実対象資源で認可する。認可の要否をFeature単位のboolや起動専用の許可一覧へ置き換えない。
 
-操作能力はFeatureが所有する完全なキーと、宣言に明示されたchildren関係から解決する。ドットの接頭辞やnamespace所有だけで配下の許可を推定しない。共有セットの参照は現行の信頼済みFeature寄与を反映するが、限定子やJobへ渡した操作範囲を自動的に増やさない。操作キーに付随する対象別データは持たせず、個別ID、担当、パスの再帰範囲等はdomain・実行context・providerの条件として別に照合する。保存済み旧grantの限定条件は、この別の上限として保持するか、意味を保てない場合は診断し、読取りや移行を包括許可の発行へ読み替えない。
+操作能力はFeatureが所有する完全なキーと、同じNamespace内に宣言されたchildren関係から解決する。ドットの接頭辞やnamespace所有だけで配下の許可を推定しない。Featureをまたぐ能力は、各Featureが自身の操作を意味的な共有セットへ寄与し、合成層が集約する。共有セットの参照は現行の信頼済みFeature寄与を反映するが、限定子やJobへ渡した操作範囲を自動的に増やさない。操作キーに付随する対象別データは持たせず、個別ID、担当、パスの再帰範囲等はdomain・実行context・providerの条件として別に照合する。保存済み旧grantの限定条件は、この別の上限として保持するか、意味を保てない場合は診断し、読取りや移行を包括許可の発行へ読み替えない。
 
 MCPはT-787の移行対象外とする暫定例外であり、既存の `mcp` 起動認可と `PermissionResource::Feature` を保持する。discoveryは外部プロセスを起動するため、既存の拒否を共通コード整理で失わせない。この例外を他のFeatureへ拡張せず、MCPの各呼出し・restoreに新しい操作認可が整備されたとも扱わない。
 
 ### Subjectの標準権限セット
 
-新規Subjectは、直接実行の`execution`に既存の共有セット`subject-default`、委譲上限の`delegation`にNamespace `subject`の権限キー`subject.delegate`への参照を保存する。Subject Featureは`subject.orchestrate`と`subject.delegate`の意味と明示的なchildrenを所有する。childrenが参照する操作キーの所有者や実認可は各Featureに残り、Subjectごとに固定操作一覧をコピーしない。意味的な権限の束を新しいトップレベルセットとして増やさない。
+新規Subjectの初期割当は、直接実行の`execution`に会話・保持contextの`conversation`と作業調整の`work-coordination`、委譲上限の`delegation`に実装・調査・レビューの`work-execution`への参照を保存する。これらはSubject専用の権限ではなく、各Featureが自身の操作だけを寄与する共有セットである。Subjectは初期割当方針を選ぶが、他Featureの操作一覧を所有しない。
 
-- `subject-default`は会話・Memory/Journalの既存寄与を保持し、`subject.orchestrate`への寄与を通じてObjective/Ticketの読取り・整理・判断、Workerの探索・委譲制御・観測、Workdirの一覧・作成・削除、MRの確認・統合記録を提供する。担当・現在本体・control grant・CAS・独立承認・retention等のdomain条件を免除しない。Subject本体にfilesystem/Bash、MRの作成・レビュー、設定管理権限は与えない。
-- `subject.delegate`の明示childrenは背景Workerの実装・調査・独立レビューに必要な能力の上限とする。`subject.orchestrate`や`subject-default`には含めず、直接実行と委譲上限を分離する。各起動では必要な操作とTicket・Workdir等の対象を明示し、限定された実効grantを固定する。Reviewerへの再委譲もその明示範囲内とする。本体の発言/Memory/Journal identity、担当変更・handling判断、案件終了、MR統合記録、権限管理を委譲しない。
+- 直接実行と委譲上限を分離し、各起動では必要な操作とTicket・Workdir等の対象を明示して、限定された実効grantを固定する。Reviewerへの再委譲もその明示範囲内とする。セットの解決は担当・現在本体・control grant・CAS・独立承認・retention等のdomain条件を免除しない。
+- 本体の発言/Memory/Journal identity、担当変更・handling判断、案件終了、MR統合記録、権限管理を委譲しない。Subject本体にfilesystem/Bash、MRの作成・レビュー、設定管理権限を初期付与しない。
 - ProfileのFeatureとTool許可は利用面の構成であり、セット参照や対象grantの代わりではない。長時間の実装・検証・Git操作は背景Workerへ渡す。
 
-既存の共有セット保持主体は現行寄与の変更を反映する。一方、既存の未設定・空・除外・失効policyやID限定の旧制約を、新規作成defaultで置換しない。特に以前の空の`delegation`へ`subject.delegate`を自動追加しない。採用する場合は通常の認可済み設定変更として行い、既存委譲の失効への影響も確認する。起動・restore・migration・作成要求の再送は初期割当の再実行ではない。
+既存の共有セット保持主体は現行寄与の変更を反映する。一方、既存の未設定・空・除外・失効policyやID限定の旧制約を、新規作成defaultで置換しない。個体別の現在権限はSubject domainが所有し、共有設定sourceの編集で付与・失効・再作成しない。表現の移行は付与と除外をそれぞれ同じ意味へ変換し、実行と委譲のlane、変更identity、発行済みgrantの上限を保つ。保存済み旧表現の解釈は明示的な保存形式の境界に限定し、新規入力のaliasにしない。特に以前の空の`delegation`へ新しい参照を自動追加しない。既存主体の割当変更は専用の認可済み権限管理操作として行い、既存委譲の失効への影響も確認する。起動・restore・migration・作成要求の再送は初期割当の再実行ではない。
 
 ### 認可境界と継続実行
 

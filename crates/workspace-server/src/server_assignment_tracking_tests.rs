@@ -46,7 +46,7 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
             StatusCode::OK,
         )
         .await;
-        let Json(candidate) = create_workspace_worker(
+        let Json(candidate) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -59,7 +59,7 @@ async fn runtime_and_account_assign_retries_return_saved_result_after_clear_and_
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+                authorization: test_worker_operation_authorization(&[]),
             }),
         )
         .await
@@ -366,22 +366,12 @@ async fn runtime_orchestrator_tags_without_operation_policy_do_not_grant_assignm
             crate::subjektiv::SubjectRole::new("unprivileged-assignment-source").unwrap(),
         )
         .unwrap();
-    let subjects = open_subjektiv_store(&api).unwrap();
-    let initial = subjects
-        .current_subject_policy(&unprivileged.id)
-        .unwrap()
-        .unwrap();
-    subjects
-        .set_subject_permissions(
-            &unprivileged.id,
-            &server_api::authorization::SubjectPermissionsUpdate {
-                operation_id: "empty-unprivileged-assignment-source".into(),
-                expected_change_id: Some(initial.change_id),
-                execution: vec![],
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    set_test_subject_policy_as_owner(
+        &api,
+        &unprivileged.id,
+        Default::default(),
+        Default::default(),
+    );
     let forged = create_test_assignment_body(&api, &source.runtime_id, &unprivileged.id).await;
     // Runtime display metadata cannot mint operation policy. Backend ownership
     // remains this real, unprivileged Subject, even if the adapter advertises tags.
@@ -2307,7 +2297,6 @@ async fn two_subjects_signed_assignment_isolates_current_subjects_and_stale_rece
 #[tokio::test]
 async fn subject_operation_policy_revocation_rejects_saved_mutation_receipts_without_releasing_assignment()
  {
-    use server_api::authorization::SubjectPermissionsUpdate;
     let dir = tempfile::tempdir().unwrap();
     let (api, _, identity, source, ticket) = tracking_fixture(dir.path()).await;
     let current = assign_tracking(&api, &identity, &source, &ticket).await;
@@ -2325,19 +2314,7 @@ async fn subject_operation_policy_revocation_rejects_saved_mutation_receipts_wit
         .unwrap()
         .unwrap();
     let subject_id = ensure_test_assignment_subject(&api);
-    let store = open_subjektiv_store(&api).unwrap();
-    let policy = store.subject_permissions(&subject_id).unwrap().unwrap();
-    store
-        .set_subject_permissions(
-            &subject_id,
-            &SubjectPermissionsUpdate {
-                operation_id: "revoke-assignment-operations".into(),
-                expected_change_id: Some(policy.change_id),
-                execution: vec![],
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    set_test_subject_policy_as_owner(&api, &subject_id, Default::default(), Default::default());
     let answer = json!({"assignment_id":current.assignment_id,
         "expected_last_event_id":saved["last_event_id"], "operation_key":"answer-after-revoke", "body":"No authority"});
     let answer_path = format!("/workspaces/{TEST_WORKSPACE_ID}/tickets/{ticket}/assignment-answer");
@@ -2395,40 +2372,45 @@ async fn subject_operation_policy_revocation_rejects_saved_mutation_receipts_wit
 #[tokio::test]
 async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_report_subject_handling()
  {
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-    };
     let dir = tempfile::tempdir().unwrap();
     let (api, _, identity, body, ticket) = tracking_fixture(dir.path()).await;
     let subject_id = ensure_test_assignment_subject(&api);
-    let store = open_subjektiv_store(&api).unwrap();
-    let policy = store.subject_permissions(&subject_id).unwrap().unwrap();
-    let permissions: Vec<_> = [
-        "ticket.assignment.assign",
-        "ticket.assignment.clear",
-        "ticket.assignment.answer",
-        "ticket.assignment.update",
-    ]
-    .into_iter()
-    .map(|operation| ScopedPermission {
-        operation: operation.into(),
-        resource: PermissionResource::Ticket {
-            workspace_id: TEST_WORKSPACE_ID.into(),
-            ticket_id: ticket.clone(),
-        },
-    })
-    .collect();
-    let policy = store
-        .set_subject_permissions(
-            &subject_id,
-            &SubjectPermissionsUpdate {
-                operation_id: "allow-generic-assignment-author".into(),
-                expected_change_id: Some(policy.change_id),
-                execution: policy.execution,
-                delegation: permissions.clone(),
-            },
+    let permissions = test_operation_assignment(
+        &api,
+        &[
+            "ticket.assignment.assign",
+            "ticket.assignment.clear",
+            "ticket.assignment.answer",
+            "ticket.assignment.update",
+        ],
+    );
+    let (_, authorization) = test_worker_policy_authorizations(
+        &api,
+        "generic-assignment-author",
+        "builtin:intake",
+        permissions.clone(),
+    );
+    let root =
+        ServerConfig::server_data_root_for_data_dir(&api.config.data_root).join("plugin-artifacts");
+    api.config_store
+        .sync_plugin_permission_registry(
+            &root,
+            TEST_WORKSPACE_ID,
+            &mut api.permission_registry.write().unwrap(),
         )
         .unwrap();
+    extend_test_assignment_operations(
+        &api,
+        &subject_id,
+        &["worker.create", "worker.launch.generic-assignment-author"],
+    );
+    let previous = api
+        .config_store
+        .current_subject_permission_policy(TEST_WORKSPACE_ID, &subject_id)
+        .unwrap()
+        .unwrap();
+    let policy =
+        set_test_subject_policy_as_owner(&api, &subject_id, previous.execution, permissions);
     let app = build_router(api.clone());
     // Existing Worker control/FeatureStorage grant path, not a Ticket executor
     // or a role fixture. No implementation start or T-803 integration is claimed.
@@ -2437,7 +2419,7 @@ async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_
         serde_json::to_vec(&json!({"runtime_id":body.runtime_id, "display_name":"Generic assignment author",
             "profile":"builtin:intake", "initial_submit":[], "workdir_attachments":[], "feature_connections":{},
             "control_operation_id":"spawn-generic-author",
-            "execution_grant":{"permissions":permissions, "redelegation":[]}})).unwrap()), StatusCode::OK).await;
+            "authorization":authorization})).unwrap()), StatusCode::OK).await;
     let worker_id = child["worker_id"].as_str().unwrap();
     assert!(child["worker"]["singleton_key"].is_null());
     assert_eq!(child["worker"]["profile"], "builtin:intake");
@@ -2509,17 +2491,7 @@ async fn generic_delegated_worker_authors_with_operation_grants_but_cannot_self_
         StatusCode::OK,
     )
     .await;
-    store
-        .set_subject_permissions(
-            &subject_id,
-            &SubjectPermissionsUpdate {
-                operation_id: "revoke-generic-author".into(),
-                expected_change_id: Some(policy.change_id),
-                execution: policy.execution,
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    set_test_subject_policy_as_owner(&api, &subject_id, policy.execution, Default::default());
     for request in [
         assignment_request(&api, &identity, worker_id, &ticket, "generic-assign"),
         runtime_source_request(&identity, Some(worker_id), "DELETE", &clear, Vec::new()),

@@ -7,22 +7,28 @@ import type {
   PermissionResolution,
 } from "#lib/generated/feature-permissions.generated.ts";
 import type {
-  ConfigurationMigrationDiagnostic,
-  ConfigurationSourceResponse,
-  ConfigurationSubjectPolicy,
-} from "#lib/generated/configuration-adoption.generated.ts";
-import type {
+  CurrentSubjectPolicy,
   ScopedPermission,
+  SubjectPermissionPolicyAction,
+  SubjectPermissionPolicyMutation,
+  SubjectPermissionPolicyMutationResponse,
+  SubjectPermissionPolicyResponse,
   SubjectPermissions,
 } from "#lib/generated/memory-api.ts";
 import { readBoundedJson, workspaceApiPath } from "#lib/workspace/api/http.ts";
-import { parseConfigurationSourceResponse } from "#lib/workspace/config-source/api.ts";
+
+export type {
+  CurrentSubjectPolicy,
+  SubjectPermissionPolicyAction,
+  SubjectPermissionPolicyMutation,
+  SubjectPermissionPolicyMutationResponse,
+  SubjectPermissionPolicyResponse,
+};
 
 export type Lane = "execution" | "delegation";
-export type Policy = ConfigurationSubjectPolicy;
-export type PermissionView = {
-  source: ConfigurationSourceResponse;
-  policy: Policy | null;
+export type Policy = CurrentSubjectPolicy;
+export type PermissionView = SubjectPermissionPolicyResponse & {
+  readOnly: boolean;
 };
 const MAX_BYTES = 8 * 1024 * 1024;
 function invalid(): never {
@@ -141,73 +147,79 @@ function parseLegacy(value: unknown): SubjectPermissions | null {
     delegation: list(policy.delegation, parseLegacyPermission),
   };
 }
-export function parsePolicy(value: unknown, workspaceId: string): Policy {
+export function parsePolicy(value: unknown): Policy {
+  const raw = object(value);
+  const hasEncoding = "reference_encoding" in raw;
   const policy = record(value, [
-    "subject_id",
     "change_id",
     "execution",
     "delegation",
-    "execution_resolution",
-    "delegation_resolution",
     "legacy_constraints",
+    ...(hasEncoding ? ["reference_encoding"] : []),
   ]);
-  return {
-    subject_id: text(policy.subject_id),
+  const encoding = policy.reference_encoding;
+  const result: Policy = {
     change_id: text(policy.change_id),
     execution: parseAssignment(policy.execution),
     delegation: parseAssignment(policy.delegation),
+    legacy_constraints: parseLegacy(policy.legacy_constraints),
+  };
+  if (hasEncoding) {
+    if (encoding !== "legacy_subject_v1" && encoding !== "feature_sets_v2") {
+      return invalid();
+    }
+    result.reference_encoding = encoding;
+  }
+  return result;
+}
+function parsePolicyState(
+  response: Record<string, unknown>,
+): SubjectPermissionPolicyMutationResponse {
+  const change_id = response.change_id === null ? null : text(response.change_id);
+  const policy = response.policy === null ? null : parsePolicy(response.policy);
+  if (policy !== null && policy.change_id !== change_id) return invalid();
+  return { change_id, policy };
+}
+export function parsePermissionMutationResponse(
+  value: unknown,
+): SubjectPermissionPolicyMutationResponse {
+  return parsePolicyState(record(value, ["change_id", "policy"]));
+}
+export function parsePermissionResponse(
+  value: unknown,
+  workspaceId: string,
+): PermissionView {
+  const response = record(value, [
+    "change_id",
+    "policy",
+    "can_manage",
+    "catalog",
+    "execution_resolution",
+    "delegation_resolution",
+  ]);
+  const { change_id, policy } = parsePolicyState(response);
+  const can_manage = bool(response.can_manage);
+  const catalog = parseCatalog(response.catalog);
+  if (catalog.workspace !== workspaceId) return invalid();
+  return {
+    change_id,
+    policy,
+    can_manage,
+    catalog,
     execution_resolution: parseResolution(
-      policy.execution_resolution,
+      response.execution_resolution,
       workspaceId,
     ),
     delegation_resolution: parseResolution(
-      policy.delegation_resolution,
+      response.delegation_resolution,
       workspaceId,
     ),
-    legacy_constraints: parseLegacy(policy.legacy_constraints),
+    // Unset is not a default assignment. Owners may explicitly create one using
+    // the response change_id, which may identify a removal tombstone.
+    // Legacy stored references remain read-only; the client never migrates them.
+    readOnly: !can_manage ||
+      (policy !== null && policy.reference_encoding !== "feature_sets_v2"),
   };
-}
-export function parseSource(
-  value: unknown,
-  workspaceId: string,
-): ConfigurationSourceResponse {
-  const editing = parseConfigurationSourceResponse(value);
-  const raw = object(value);
-  const catalog = parseCatalog(raw.catalog);
-  if (catalog.workspace !== workspaceId) return invalid();
-  const policies = list(
-    raw.policies,
-    (policy) => parsePolicy(policy, workspaceId),
-  );
-  if (
-    new Set(policies.map((policy) => policy.subject_id)).size !==
-      policies.length
-  ) return invalid();
-  const migration_diagnostics = list(
-    raw.migration_diagnostics,
-    (value): ConfigurationMigrationDiagnostic => {
-      const item = object(value);
-      if (item.kind === "converted") {
-        record(value, ["kind", "subject_id", "operation"]);
-        return {
-          kind: "converted" as const,
-          subject_id: text(item.subject_id),
-          operation: text(item.operation),
-        };
-      }
-      if (
-        item.kind !== "domain_constraint" &&
-        item.kind !== "explicit_configuration_required"
-      ) return invalid();
-      record(value, ["kind", "subject_id", "permission"]);
-      return {
-        kind: item.kind,
-        subject_id: text(item.subject_id),
-        permission: parseLegacyPermission(item.permission),
-      };
-    },
-  );
-  return { ...editing, catalog, policies, migration_diagnostics };
 }
 export function parseResolution(
   value: unknown,
@@ -267,13 +279,13 @@ async function request(
   }
   return await readBoundedJson(response, MAX_BYTES);
 }
-export async function readPolicySource(
-  fetchFn: typeof fetch,
+export function permissionPolicyPath(
   workspaceId: string,
-): Promise<ConfigurationSourceResponse> {
-  return parseSource(
-    await request(fetchFn, workspaceApiPath(workspaceId, "/config/adoption")),
+  subjectId: string,
+): string {
+  return workspaceApiPath(
     workspaceId,
+    `/subjektiv/subjects/${encodeURIComponent(subjectId)}/permission-policy`,
   );
 }
 export async function readPermissions(
@@ -281,12 +293,96 @@ export async function readPermissions(
   workspaceId: string,
   subjectId: string,
 ): Promise<PermissionView> {
-  const source = await readPolicySource(fetchFn, workspaceId);
-  const policy =
-    source.policies.find((policy) => policy.subject_id === subjectId) ?? null;
-  // The Server binds policy, catalog and both resolutions to this one source
-  // response. Arbitrary-assignment validation is not a saved-policy observation.
-  return { source, policy };
+  return parsePermissionResponse(
+    await request(fetchFn, permissionPolicyPath(workspaceId, subjectId)),
+    workspaceId,
+  );
+}
+function parseMutation(value: unknown): SubjectPermissionPolicyMutation {
+  const mutation = record(value, [
+    "operation_id",
+    "expected_change_id",
+    "action",
+  ]);
+  const operation_id = text(mutation.operation_id);
+  if (!operation_id.trim()) return invalid();
+  const expected_change_id = mutation.expected_change_id === null
+    ? null
+    : text(mutation.expected_change_id);
+  const action = object(mutation.action);
+  if (action.kind === "remove") {
+    record(action, ["kind"]);
+    return { operation_id, expected_change_id, action: { kind: "remove" } };
+  }
+  if (action.kind !== "replace") return invalid();
+  record(action, ["kind", "execution", "delegation"]);
+  return {
+    operation_id,
+    expected_change_id,
+    action: {
+      kind: "replace",
+      execution: parseAssignment(action.execution),
+      delegation: parseAssignment(action.delegation),
+    },
+  };
+}
+export class PermissionMutationUnknownError extends Error {
+  constructor(
+    public readonly retry: (
+      fetchFn?: typeof fetch,
+    ) => Promise<SubjectPermissionPolicyMutationResponse>,
+  ) {
+    super(
+      "Subject policy save outcome unknown. Retain and retry the same request; do not create a new operation.",
+    );
+  }
+}
+/**
+ * CAS uses the observed response.change_id, including removal tombstones.
+ * Never derive null solely from policy === null; only an observed null change_id
+ * represents a state with no change identity.
+ * On conflict, reread and let the caller review a NEW explicit mutation. Never
+ * rebase automatically. On unknown outcome, error.retry() retains the exact URL,
+ * operation ID and serialized request, even if the caller later edits its draft.
+ */
+export async function savePermissions(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+  subjectId: string,
+  mutation: SubjectPermissionPolicyMutation,
+): Promise<SubjectPermissionPolicyMutationResponse> {
+  const path = permissionPolicyPath(workspaceId, subjectId);
+  const body = JSON.stringify(parseMutation(mutation));
+  async function send(
+    transport: typeof fetch,
+    retrying: boolean,
+  ): Promise<SubjectPermissionPolicyMutationResponse> {
+    try {
+      const response = await transport(path, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      if (!response.ok) {
+        // Body cancellation cannot turn an authoritative first refusal into an
+        // unknown result. A refusal on a retry never resolves the earlier send.
+        await response.body?.cancel().catch(() => {});
+        throw new PermissionHttpError(response.status);
+      }
+      return parsePermissionMutationResponse(
+        await readBoundedJson(response, MAX_BYTES),
+      );
+    } catch (error) {
+      if (
+        !retrying && error instanceof PermissionHttpError &&
+        [400, 401, 403, 404, 409, 422].includes(error.status)
+      ) throw error;
+      throw new PermissionMutationUnknownError((nextFetch = transport) =>
+        send(nextFetch, true)
+      );
+    }
+  }
+  return await send(fetchFn, false);
 }
 export function referenceLabel(reference: PermissionReference): string {
   return reference.kind === "set"

@@ -69,7 +69,7 @@ struct RepairSignals {
 }
 #[derive(Clone)]
 struct MessagingModel {
-    child_permissions: Arc<Mutex<Vec<ScopedPermission>>>,
+    policy: Arc<Mutex<Option<server_api::launch_policy::WorkerLaunchPolicy>>>,
     workdir: Arc<Mutex<Option<String>>>,
     completed: tokio::sync::mpsc::Sender<Value>,
     child_replied: Arc<tokio::sync::Notify>,
@@ -185,7 +185,8 @@ impl agen::llm_client::LlmClient for MessagingModel {
                 } else {
                     "roundtrip-spawn"
                 };
-                let mut input = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:messaging-peer","operation_id":"public-roundtrip-spawn","display_name":"Notify-only delegated peer","initial_submit":if self.repair.is_some() {vec![protocol::Segment::Text {content:EARLY.into()}]} else {vec![]},"execution_grant":{"permissions":self.child_permissions.lock().unwrap().clone(),"redelegation":[]}});
+                let policy = self.policy.lock().unwrap().clone().unwrap();
+                let mut input = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:messaging-peer","operation_id":"public-roundtrip-spawn","display_name":"Notify-only delegated peer","initial_submit":if self.repair.is_some() {vec![protocol::Segment::Text {content:EARLY.into()}]} else {vec![]},"policy_id":policy.policy_id,"policy_revision":policy.authorization_revision});
                 if let Some(workdir) = self.workdir.lock().unwrap().as_ref() {
                     input["working_directory_id"] = json!(workdir);
                 }
@@ -302,20 +303,43 @@ fn install_messaging_profiles(api: &WorkspaceApi) {
           profile = (import "$builtin/profiles/companion.dcdl") // { slug = "messaging-peer"; scope = "workspace_read"; feature = { subjektiv = { enabled = false; }; worker = { enabled = true; direct_spawn = false; }; }; };
         }
     ]; }; }"#;
-    commit_workspace_config_tree(
-        api,
-        TEST_WORKSPACE_ID,
-        &ConfigCommitRequest {
-            base_digest: state.snapshot.digest.clone(),
-            entrypoints: state.contract.entrypoints.clone(),
-            changes: vec![config_source::ConfigTreeChange::Update {
-                path: main.path.clone(),
-                expected_digest: main.content_digest.clone(),
-                content: content.into(),
-            }],
-        },
-    )
-    .unwrap();
+    let source = ConfigCommitRequest {
+        base_digest: state.snapshot.digest.clone(),
+        entrypoints: state.contract.entrypoints.clone(),
+        changes: vec![config_source::ConfigTreeChange::Update {
+            path: main.path.clone(),
+            expected_digest: main.content_digest.clone(),
+            content: content.into(),
+        }],
+    };
+    let owner = test_owner_actor().account_id;
+    let registry = api.permission_registry.read().unwrap();
+    api.config_store
+        .adopt_configuration(
+            TEST_WORKSPACE_ID,
+            &owner,
+            &crate::config_adoption::ConfigurationAdoptionRequest {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_head: api
+                    .config_store
+                    .configuration_head(TEST_WORKSPACE_ID, &owner)
+                    .unwrap(),
+                expected_catalog_digest: crate::config_adoption::catalog_digest(registry.host())
+                    .unwrap(),
+                expected_legacy_export: None,
+                source,
+            },
+            api.config_schema_registry.compose().unwrap(),
+            registry.host(),
+            None,
+            |_| Ok(()),
+            |_| {
+                Err(Error::RegistryInconsistency(
+                    "fixture cannot transfer sealed authority".into(),
+                ))
+            },
+        )
+        .unwrap();
 }
 
 async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
@@ -337,8 +361,9 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
             origin_ready: tokio::sync::Notify::new(),
         })
     });
+    let policy = Arc::new(Mutex::new(None));
     let harness = ConnectedWorkerHarness::start(MessagingModel {
-        child_permissions: permissions.clone(),
+        policy: policy.clone(),
         workdir: workdir.clone(),
         completed,
         child_replied: Arc::new(tokio::sync::Notify::new()),
@@ -385,33 +410,44 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
         operation("worker.stop"),
         operation("worker.observe"),
     ]);
-    // This suite retains exact scoped delegation/provider limits. Explicitly
-    // select the pre-cutover source before exercising its public management API;
-    // never project the new shared-set default into all-target scoped grants.
-    store
-        .set_subject_permissions(
-            &subject,
-            &SubjectPermissionsUpdate {
-                operation_id: "legacy-public-messaging-fixture".into(),
-                expected_change_id: store
-                    .current_subject_policy(&subject)
-                    .unwrap()
-                    .map(|policy| policy.change_id),
-                execution: vec![],
-                delegation: vec![],
-            },
-        )
-        .unwrap();
-    let (status, assigned) = response(api, human_request(&harness.owner,"POST",&format!("/api/w/{TEST_WORKSPACE_ID}/subjektiv/subjects/{subject}/permissions"),Some(json!({"operation_id":"public-messaging-policy","expected_change_id":store.subject_permissions(&subject).unwrap().unwrap().change_id,"execution":execution,"delegation":permissions.lock().unwrap().clone()})))).await;
-    assert_eq!(status, StatusCode::OK, "{assigned}");
-    let before = store.subject_permissions(&subject).unwrap().unwrap();
+    let child_assignment = key_assignment(
+        &permissions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.operation.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let launch = seed_owner_launch_policy(
+        api,
+        &harness.owner,
+        "public-messaging",
+        &["project:messaging-peer"],
+        child_assignment.clone(),
+    )
+    .await;
+    execution.push(collection(launch.usage_key().unwrap().as_str()));
+    let before = super::chat_tests::replace_subject_policy(
+        api,
+        &harness.owner,
+        &subject,
+        key_assignment(
+            &execution
+                .iter()
+                .map(|p| p.operation.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        child_assignment,
+    )
+    .await;
+    *policy.lock().unwrap() = Some(launch);
     if repair {
         api.config_store.with_conn(|connection| {
             connection.execute_batch("CREATE TRIGGER t803_reply_save_fault BEFORE INSERT ON worker_control_grants WHEN NEW.relation='reply' BEGIN SELECT RAISE(ABORT,'injected reply grant save failure'); END;")?;
             Ok(())
         }).unwrap();
     }
-    let Json(source) = create_workspace_worker(
+    let Json(source) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -480,7 +516,10 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
     let origin = RuntimeWorkerRef::new(source.runtime_id, source.worker_id);
     assert!(observed["messages"].as_str().unwrap().contains(REPLY));
     assert_eq!(
-        store.subject_permissions(&subject).unwrap().unwrap(),
+        api.config_store
+            .current_subject_permission_policy(TEST_WORKSPACE_ID, &subject)
+            .unwrap()
+            .unwrap(),
         before,
         "allocated ID was never appended to Subject policy"
     );

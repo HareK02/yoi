@@ -8,7 +8,14 @@ pub(super) fn independent_store(
     let manager = crate::FeatureStorage::for_server_database(&api.config.database_path).unwrap();
     let scope = manager.workspace(TEST_WORKSPACE_ID).unwrap();
     let registration = crate::subjektiv::SubjektivStore::register(&scope).unwrap();
-    let store = crate::subjektiv::SubjektivStore::open(&scope, &registration).unwrap();
+    let store = crate::subjektiv::SubjektivStore::open(&scope, &registration)
+        .unwrap()
+        .with_canonical_permission_source(Arc::new(
+            crate::subject_policy_source::CanonicalSubjectPolicySource {
+                store: crate::SqliteWorkspaceStore::open(&api.config.database_path).unwrap(),
+                host: api.permission_registry.read().unwrap().host().clone(),
+            },
+        ));
     // Handles do not own manager lifetime: dropping it intentionally fences them.
     (manager, store)
 }
@@ -23,19 +30,17 @@ fn permission(f: &Fixture) -> server_api::authorization::OperationAuthorizationR
     }
 }
 
-fn revoke(store: &crate::subjektiv::SubjektivStore, subject: &str) {
-    let previous = store.subject_permissions(subject).unwrap().unwrap();
-    store
-        .set_subject_permissions(
-            subject,
-            &SubjectPermissionsUpdate {
-                operation_id: "external-revoke".into(),
-                expected_change_id: Some(previous.change_id),
-                execution: vec![],
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+fn revoke(api: &WorkspaceApi, store: &crate::subjektiv::SubjektivStore, subject: &str) {
+    let mut independent = api.clone();
+    independent.config_store =
+        Arc::new(crate::SqliteWorkspaceStore::open(&api.config.database_path).unwrap());
+    independent.subject_authority_store = Some(store.clone());
+    replace_config_plugin_subject_policy_as_owner(
+        &independent,
+        subject,
+        Default::default(),
+        Default::default(),
+    );
 }
 
 #[tokio::test]
@@ -91,7 +96,7 @@ async fn scoped_subject_database_rereads_policy_changed_on_independent_connectio
     let before = f.api.subjektiv_registration.open_observation();
     plugin_host::with_authority_database(&f.api, || {
         subject_authorization::authorize_scope(&f.api, &f.source, &request).unwrap();
-        revoke(&other, &f.subject);
+        revoke(&f.api, &other, &f.subject);
         let error =
             subject_authorization::authorize_scope(&f.api, &f.source, &request).unwrap_err();
         assert!(matches!(error.error, Error::WorkspacePermissionDenied(_)));
@@ -113,7 +118,8 @@ async fn scoped_subject_database_observes_irreversible_erasure_after_check_finis
     plugin_host::with_authority_database(&f.api, || {
         subject_authorization::authorize_scope(&f.api, &f.source, &request).unwrap();
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     // The short check's lifecycle guard is released before destructive maintenance.
     f.api.feature_storage.delete().unwrap();
     assert!(subject_authorization::authorize_scope(&f.api, &f.source, &request).is_err());
@@ -122,8 +128,13 @@ async fn scoped_subject_database_observes_irreversible_erasure_after_check_finis
     let scope = fresh.workspace(TEST_WORKSPACE_ID).unwrap();
     assert!(scope.restore(&snapshot).is_err());
     let another = crate::FeatureStorage::new(snapshot_dir.path().join("another-owner"));
-    assert!(another.workspace(TEST_WORKSPACE_ID).unwrap()
-        .restore_from(&snapshot, &scope).is_err());
+    assert!(
+        another
+            .workspace(TEST_WORKSPACE_ID)
+            .unwrap()
+            .restore_from(&snapshot, &scope)
+            .is_err()
+    );
     assert!(subject_authorization::authorize_scope(&f.api, &f.source, &request).is_err());
     f.shutdown().await;
 }
@@ -171,7 +182,7 @@ async fn cancelled_authority_waiter_keeps_physical_database_until_accepted_check
             .unwrap(),
     );
     assert_check_physical_initializations(&f, before, 1);
-    revoke(&other, &f.subject);
+    revoke(&f.api, &other, &f.subject);
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), executor.drain())
         .await

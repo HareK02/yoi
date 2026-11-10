@@ -186,7 +186,7 @@ impl Fixture {
         access: [&str; 2],
         embedded: bool,
     ) -> Self {
-        let owner = seed_test_api_token(api.store.as_ref(), TEST_WORKSPACE_ID);
+        let owner = seed_test_owner_api_token(&api, TEST_WORKSPACE_ID);
         let runtime_id = if embedded {
             EMBEDDED_RUNTIME_ID
         } else {
@@ -197,7 +197,7 @@ impl Fixture {
         };
         let mut workers = Vec::new();
         for name in ["Drive first", "Drive second"] {
-            let Json(created) = create_workspace_worker(
+            let Json(created) = create_workspace_worker_as_owner(
                 State(api.clone()),
                 HeaderMap::new(),
                 Json(CreateWorkspaceWorkerRequest {
@@ -210,9 +210,28 @@ impl Fixture {
                     workdir_attachments: vec![],
                     feature_connections: Default::default(),
                     control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                    authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                        assignment: None,
-                    },
+                    authorization: test_worker_operation_authorization(&[
+                        (
+                            "drive",
+                            &[
+                                "drive.capabilities",
+                                "drive.root",
+                                "drive.search",
+                                "drive.metadata",
+                                "drive.list",
+                                "drive.read_text",
+                                "drive.read_chunk",
+                                "drive.create_folder",
+                                "drive.create_text",
+                                "drive.update_text",
+                                "drive.delete",
+                                "drive.relocate",
+                                "drive.upload",
+                                "drive.request_status",
+                            ],
+                        ),
+                        ("filesystem", &["filesystem.read", "filesystem.write"]),
+                    ]),
                 }),
             )
             .await
@@ -793,7 +812,7 @@ async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replace
             .is_none()
     );
     denied(tool(&f.features[0], "DriveRead", json!({"entry":id})).await);
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(f.api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -806,9 +825,28 @@ async fn worker_removal_preserves_drive_reference_for_explicitly_granted_replace
             workdir_attachments: vec![],
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                assignment: None,
-            },
+            authorization: test_worker_operation_authorization(&[
+                (
+                    "drive",
+                    &[
+                        "drive.capabilities",
+                        "drive.root",
+                        "drive.search",
+                        "drive.metadata",
+                        "drive.list",
+                        "drive.read_text",
+                        "drive.read_chunk",
+                        "drive.create_folder",
+                        "drive.create_text",
+                        "drive.update_text",
+                        "drive.delete",
+                        "drive.relocate",
+                        "drive.upload",
+                        "drive.request_status",
+                    ],
+                ),
+                ("filesystem", &["filesystem.read", "filesystem.write"]),
+            ]),
         }),
     )
     .await

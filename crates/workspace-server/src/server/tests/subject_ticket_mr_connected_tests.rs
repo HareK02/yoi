@@ -666,7 +666,7 @@ async fn ordinary_subject_default_coder_review_publishes_mr_and_preserves_unrevi
 
     // Even the NEW assignee/current body must recheck canonical key exclusion.
     super::super::chat_tests::adopt_subject_policy(&h.api, &h.owner, other,
-        r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#, "{}").await;
+        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#, "{}").await;
     let (status, error) = connected_authorization_post(
         &h.backend_url,
         &h.identity,
@@ -732,9 +732,8 @@ const REVIEWER_NAME: &str = "full-r2-independent-reviewer";
 const FULL_SOURCE: &str = "work/full-r2-source";
 const FULL_TARGET: &str = "full-r2-temp-target";
 const FULL_CONTENT: &str = "full R2 independently reviewed candidate\n";
-const FULL_EXECUTION: &str = r#"{ sets = ["subject-default"]; }"#;
-const FULL_DELEGATION: &str =
-    r#"{ namespaces = [{ namespace = "subject"; keys = ["subject.delegate"]; }]; }"#;
+const FULL_EXECUTION: &str = r#"{ sets = ["conversation", "work-coordination"]; }"#;
+const FULL_DELEGATION: &str = r#"{ sets = ["work-execution"]; }"#;
 
 fn summary_ok(request: &agen::llm_client::Request, id: &str) -> bool {
     tool_result(request, id).is_some_and(|(error, output)| {
@@ -1787,7 +1786,7 @@ async fn full_mr_scenario(replace_body: bool) {
     let (subject, body) =
         normal_subject(&h, "full-r2-owner", FULL_EXECUTION, FULL_DELEGATION).await;
     let (other,other_body) = normal_subject(&h,"full-r2-other",
-        r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,"{}").await;
+        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,"{}").await;
     let owner_worker = RuntimeWorkerRef::new(
         CONNECTED_RUNTIME,
         body["current"]["worker_id"].as_str().unwrap(),
@@ -2052,7 +2051,7 @@ async fn full_mr_scenario(replace_body: bool) {
         old_row["assignment_id"]
     );
     super::super::chat_tests::adopt_subject_policy(&h.api,&h.owner,&subject,
-        r#"{ sets = ["subject-default"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "worker"; keys = ["worker.create", "worker.observe", "worker.messaging"]; }, { namespace = "merge_request"; keys = ["merge_request.read", "merge_request.readiness", "merge_request.complete"]; }]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,FULL_DELEGATION).await;
+        r#"{ sets = ["conversation", "work-coordination"]; namespaces = [{ namespace = "ticket"; keys = ["ticket.assignment.assign"]; }, { namespace = "worker"; keys = ["worker.create", "worker.observe", "worker.messaging"]; }, { namespace = "merge_request"; keys = ["merge_request.read", "merge_request.readiness", "merge_request.complete"]; }]; exclude_namespaces = [{ namespace = "merge_request"; keys = ["merge_request.complete"]; }]; }"#,FULL_DELEGATION).await;
     completion_denied(
         &h,
         &owner_worker,

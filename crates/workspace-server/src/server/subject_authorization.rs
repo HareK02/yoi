@@ -155,10 +155,13 @@ impl CurrentSubjectPolicy {
                 let registry = authority.permission_registry.read().map_err(|_| {
                     Error::Config("current Feature permission registry is unavailable".into())
                 })?;
+                let host = authority
+                    .config_store
+                    .configured_permission_host(&authority.workspace_id, registry.host())?;
                 let filter = |assignment: &feature_permissions::PermissionAssignment,
                               constraints: &[ScopedPermission]|
                  -> ApiResult<Vec<ScopedPermission>> {
-                    let resolved = registry.host().resolve(Some(assignment));
+                    let resolved = host.resolve(Some(assignment));
                     let mut represented = BTreeSet::new();
                     let mut output = Vec::new();
                     for permission in constraints {
@@ -235,7 +238,10 @@ fn key_allowed_in_registry(
         return Ok(assignment.is_none());
     }
     let key = feature_permissions::PermissionKey::parse(operation).map_err(Error::InvalidInput)?;
-    let catalog = registry.host().catalog();
+    let host = authority
+        .config_store
+        .configured_permission_host(&authority.workspace_id, registry.host())?;
+    let catalog = host.catalog();
     if catalog.workspace.as_str() != authority.workspace_id {
         return Err(denied(
             "Feature permission registry belongs to another Workspace",
@@ -264,10 +270,8 @@ fn key_allowed_in_registry(
         )],
         ..Default::default()
     };
-    let resolved = registry.host().resolve(Some(assignment.unwrap_or(&exact)));
-    registry
-        .host()
-        .allows(namespace, &resolved, &key)
+    let resolved = host.resolve(Some(assignment.unwrap_or(&exact)));
+    host.allows(namespace, &resolved, &key)
         .map_err(|error| Error::Config(error.to_string()).into())
 }
 
@@ -364,17 +368,8 @@ impl WorkerAuthorityView {
         if canonical {
             return Ok(self
                 .config_store
-                .adopted_subject_policy(&self.workspace_id, subject_id)?
-                .map(|policy| {
-                    CurrentSubjectPolicy::Canonical(
-                        server_api::authorization::CurrentSubjectPolicy {
-                            change_id: policy.change_id,
-                            execution: policy.source.execution.assignment(),
-                            delegation: policy.source.delegation.assignment(),
-                            legacy_constraints: policy.legacy_constraints,
-                        },
-                    )
-                }));
+                .current_subject_permission_policy(&self.workspace_id, subject_id)?
+                .map(CurrentSubjectPolicy::Canonical));
         }
         Ok(store
             .subject_policy_source(subject_id)
@@ -835,6 +830,39 @@ pub(super) fn has_subject_authority(
 ) -> ApiResult<bool> {
     validate_worker(api, worker)?;
     let authority = WorkerAuthorityView::from(api);
+    let mut core = authority.live_core_grant(worker)?;
+    // Launch-policy children are ordinary Workers, but their immutable Subject
+    // provenance must not turn a Subject-initiated Ticket start into a manual
+    // one. This is a domain restriction, not an inherited operation grant.
+    for _ in 0..64 {
+        let Some(grant) = core else { break };
+        use server_api::authorization::{CoreWorkerGrantParent, CoreWorkerGrantSource};
+        match grant.source {
+            CoreWorkerGrantSource::Human { .. } => break,
+            CoreWorkerGrantSource::LaunchPolicy { parent, .. } => match parent {
+                CoreWorkerGrantParent::SubjectBody { .. }
+                | CoreWorkerGrantParent::LegacySubjectGrant { .. } => return Ok(true),
+                CoreWorkerGrantParent::WorkerGrant {
+                    grant_id,
+                    runtime_id,
+                    worker_id,
+                } => {
+                    core = Some(
+                        api.config_store
+                            .core_worker_execution_grant(
+                                api.workspace_id(),
+                                &runtime_id,
+                                &worker_id,
+                            )?
+                            .filter(|parent| parent.grant_id == grant_id)
+                            .ok_or_else(|| {
+                                denied("Subject provenance parent grant is unavailable")
+                            })?,
+                    );
+                }
+            },
+        }
+    }
     Ok(api
         .store
         .worker_registry_projection(api.workspace_id(), worker)?
@@ -1715,7 +1743,7 @@ impl subjektiv::effect_admission::SubjectEffectAuthority for SubjectEffectAuthor
         let source = admission
             .current_policy_with_canonical_source(
                 &self.subject,
-                Arc::new(crate::config_adoption::CanonicalConfigurationSource {
+                Arc::new(crate::subject_policy_source::CanonicalSubjectPolicySource {
                     store: catalog.as_ref().clone(),
                     host: registry.host().clone(),
                 }),

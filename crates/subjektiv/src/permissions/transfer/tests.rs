@@ -88,6 +88,56 @@ fn seal(store: &SubjektivStore) -> PermissionTransferReceipt {
 }
 
 #[test]
+fn unsealed_export_omits_deletion_fenced_subjects_without_erasing_retained_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");
+    let live = store.create_subject(role()).unwrap().id;
+    let deleting = store.create_subject(role()).unwrap().id;
+    replace(
+        &store,
+        &deleting,
+        "retained-before-deletion",
+        vec![read_permission()],
+    );
+    let identity = store.database_identity().unwrap();
+    let original = store.preview_permission_transfer(&identity).unwrap();
+    store
+        .begin_subject_deletion(&deleting, "deletion-before-transfer")
+        .unwrap();
+    let before = counts(&store);
+    let preview = store.preview_permission_transfer(&identity).unwrap();
+    assert_eq!(
+        preview
+            .sources
+            .iter()
+            .map(|source| source.subject_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![live.as_str()]
+    );
+    assert_ne!(preview.export_digest, original.export_digest);
+    store
+        .with_permission_authority_guard(&identity, |guard| {
+            for source in &preview.sources {
+                guard.require_subject(&source.subject_id)?;
+            }
+            let sealed = guard
+                .seal_permission_sources("transfer-with-deletion-fence", &preview.export_digest)?;
+            assert_eq!(sealed.snapshot, preview);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(counts(&store), before);
+    assert!(matches!(
+        store.current_subject_policy(&deleting),
+        Err(SubjektivError::SubjectNotFound(_))
+    ));
+    assert_eq!(
+        store.preview_permission_transfer(&identity).unwrap(),
+        preview
+    );
+}
+
+#[test]
 fn identity_dto_round_trips_the_native_contract_and_checks_every_expected_component() {
     let temp = tempfile::tempdir().unwrap();
     let (_manager, _scope, store) = open_store(temp.path(), "workspace-a");

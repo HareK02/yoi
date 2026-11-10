@@ -31,8 +31,11 @@ async fn alternate_staging_body_released_after_precheck_leaves_no_candidate() {
 
 async fn staging_schedule(change: Change) {
     let f = Fixture::new().await;
-    f.adopt_policy(r#"{ sets = ["subject-default", "memory"]; }"#, "{}")
-        .await;
+    f.adopt_policy(
+        r#"{ sets = ["conversation", "work-coordination", "memory"]; }"#,
+        "{}",
+    )
+    .await;
     let store = open_subjektiv_store(&f.api).unwrap();
     let attribution = store
         .subject_session_attributions(&f.subject)
@@ -95,7 +98,7 @@ async fn staging_schedule(change: Change) {
     match change {
         Change::None => {}
         Change::Policy => {
-            f.adopt_policy(r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "memory"; keys = ["memory.staging.write"]; }]; }"#, "{}")
+            f.adopt_policy(r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "memory"; keys = ["memory.staging.write"]; }]; }"#, "{}")
                 .await
         }
         Change::Feature => f

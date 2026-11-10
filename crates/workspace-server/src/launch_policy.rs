@@ -9,6 +9,7 @@ use feature_permissions::{PermissionDefinition, PermissionKey};
 use rusqlite::{Connection, OptionalExtension, params};
 use server_api::authorization::{
     CoreWorkerExecutionGrant, CoreWorkerGrantParent, CoreWorkerGrantSource,
+    PermissionReferenceEncoding,
 };
 use server_api::launch_policy::*;
 
@@ -40,6 +41,15 @@ pub(crate) fn require_owner(conn: &Connection, workspace: &str, account: &str) -
     Ok(())
 }
 
+// Only current-policy readers project to V2. Receipt decoding and core grant
+// readers must retain raw representation for historical replay/binding equality.
+fn decode_current_policy(raw: &str) -> Result<WorkerLaunchPolicy> {
+    let mut policy: WorkerLaunchPolicy = decode(raw)?;
+    policy.child_permissions = policy.effective_child_permissions();
+    policy.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
+    Ok(policy)
+}
+
 pub(crate) fn policy(
     conn: &Connection,
     workspace: &str,
@@ -52,7 +62,7 @@ pub(crate) fn policy(
             |row| row.get(0),
         )
         .optional()?;
-    raw.map(|s| decode(&s)).transpose()
+    raw.map(|s| decode_current_policy(&s)).transpose()
 }
 
 pub(crate) fn policies(conn: &Connection, workspace: &str) -> Result<Vec<WorkerLaunchPolicy>> {
@@ -61,7 +71,7 @@ pub(crate) fn policies(conn: &Connection, workspace: &str) -> Result<Vec<WorkerL
     )?;
     statement
         .query_map([workspace], |row| row.get::<_, String>(0))?
-        .map(|raw| decode(&raw?))
+        .map(|raw| decode_current_policy(&raw?))
         .collect()
 }
 
@@ -115,6 +125,7 @@ pub(crate) fn mutate(
             state: WorkerLaunchPolicyState::Active,
             allowed_profiles: allowed_profiles.clone(),
             child_permissions: child_permissions.clone(),
+            reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
             last_operation_key: request.operation_key.clone(),
         },
         (WorkerLaunchPolicyAction::Create { .. }, Some(_)) => {
@@ -263,7 +274,7 @@ pub(crate) fn bind_core_grant(
                 *policy_revision,
                 &grant.profile,
             )?;
-            if p.child_permissions != grant.assignment {
+            if p.effective_child_permissions() != grant.effective_assignment() {
                 return Err(invalid("Grant assignment differs from launch policy"));
             }
             (Some(policy_id.as_str()), Some(*policy_revision))
@@ -313,7 +324,7 @@ pub(crate) fn validate_policy_lineage(
                     *policy_revision,
                     &cursor.profile,
                 )?;
-                if p.child_permissions != cursor.assignment {
+                if p.effective_child_permissions() != cursor.effective_assignment() {
                     return Err(invalid("Core Worker grant policy assignment mismatch"));
                 }
                 match parent {

@@ -23,37 +23,12 @@ const MEMORY_JOB_OPERATIONS: &[&str] = &[
 ];
 
 pub(super) fn grant_memory_operations(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
-    use server_api::authorization::{
-        PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-    };
-    let store = open_subjektiv_store(api).unwrap();
-    let previous = store
-        .subject_policy_source(subject)
-        .unwrap()
-        .map(|policy| match policy {
-            server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
-            server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,
-        });
-    store
-        .set_subject_permissions(
-            subject,
-            &SubjectPermissionsUpdate {
-                operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: previous,
-                execution: operations
-                    .iter()
-                    .map(|operation| ScopedPermission {
-                        operation: (*operation).into(),
-                        resource: PermissionResource::Subject {
-                            workspace_id: TEST_WORKSPACE_ID.into(),
-                            subject_id: subject.into(),
-                        },
-                    })
-                    .collect(),
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    set_test_subject_policy_as_owner(
+        api,
+        subject,
+        test_operation_assignment(api, operations),
+        Default::default(),
+    );
 }
 
 async fn memory_job_source(api: &WorkspaceApi, subject: &str) -> RuntimeWorkerRef {
@@ -66,7 +41,7 @@ pub(super) async fn attach_memory_job_source(
     subject: &str,
 ) -> RuntimeWorkerRef {
     seed_test_delivery_binding(api);
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -705,38 +680,41 @@ async fn subjektiv_job_legacy_cutover_waits_foreground_then_removes_only_owned_c
     let source = memory_job_source(&api, &subject.id).await;
     let subject_body = source.clone();
     let key = format!("subjektiv-consolidation:{}", subject.id);
-    let legacy = api
-        .spawn_workspace_worker(
-            EMBEDDED_WORKER_RUNTIME_ID,
-            WorkerSpawnRequest {
-                requested_worker_name: Some("not-authority-display".into()),
-                singleton_key: Some(key.clone()),
-                intent: WorkerSpawnIntent::WorkspaceOrchestrator,
-                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                    expected_segments: 0,
-                },
-                profile: ProfileSelector::Builtin(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE.into()),
-                ticket_assignment: None,
-                initial_submit: vec![],
-                workdir_attachment_requests: vec![],
-                resolved_workdir_attachment_requests: vec![],
-                resolved_workdir_attachments: vec![],
-                resolved_config_bundle: None,
-                resolved_workspace_api: None,
-                resolved_memory_settings: None,
-                resolved_subjektiv_attached: false,
-                resolved_worker_observation_enabled: false,
-                resolved_worker_observation_grants: vec![],
-                resolved_control_operation: None,
-                resolved_execution_grant: None,
-                authorization: None,
-                resolved_core_execution_grant: None,
+    let legacy = spawn_workspace_worker_as_owner(
+        &api,
+        EMBEDDED_WORKER_RUNTIME_ID,
+        WorkerSpawnRequest {
+            requested_worker_name: Some("not-authority-display".into()),
+            singleton_key: Some(key.clone()),
+            intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+            acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                expected_segments: 0,
             },
-        )
-        .unwrap()
-        .worker
-        .unwrap()
-        .worker;
+            profile: ProfileSelector::Builtin(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE.into()),
+            ticket_assignment: None,
+            initial_submit: vec![],
+            workdir_attachment_requests: vec![],
+            resolved_workdir_attachment_requests: vec![],
+            resolved_workdir_attachments: vec![],
+            resolved_config_bundle: Some(test_internal_builtin_profile_bundle(
+                &api,
+                SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE,
+            )),
+            resolved_workspace_api: None,
+            resolved_memory_settings: None,
+            resolved_subjektiv_attached: false,
+            resolved_worker_observation_enabled: false,
+            resolved_worker_observation_grants: vec![],
+            resolved_control_operation: None,
+            resolved_execution_grant: None,
+            authorization: None,
+            resolved_core_execution_grant: None,
+        },
+    )
+    .unwrap()
+    .worker
+    .unwrap()
+    .worker;
     seed_worker_session_for_cleanup(dir.path(), &legacy);
     execution.publish_worker_state(
         &legacy,
@@ -1131,19 +1109,7 @@ async fn unset_subject_consolidation_denies_before_job_dispatch() {
         .create_subject(SubjectRole::new("unset-job-policy").unwrap())
         .unwrap();
     let source = attach_memory_job_source(&api, &subject.id).await;
-    // A legacy unset policy has no source pointer; retain the initial history fixture.
-    api.feature_storage
-        .open(&api.subjektiv_registration)
-        .unwrap()
-        .with_connection(|c| {
-            c.execute(
-                "DELETE FROM subject_permissions WHERE subject_id=?1",
-                [&subject.id],
-            )?;
-            Ok(())
-        })
-        .unwrap();
-    assert!(store.subject_permissions(&subject.id).unwrap().is_none());
+    assert!(store.current_subject_policy(&subject.id).unwrap().is_none());
     stage(&store, &subject.id, "untouched");
     let error = start_subjektiv_staging_consolidation(
         api.clone(),

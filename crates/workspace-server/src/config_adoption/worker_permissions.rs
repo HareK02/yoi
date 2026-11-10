@@ -1,4 +1,7 @@
-//! Reconstruct Worker creation selections from the adopted Workspace source.
+//! Reconstruct Worker creation selections from the materialized Workspace source.
+//!
+//! Ordinary human selection is independent of Subject policy adoption. Legacy
+//! Subject reads still require adoption before consulting transferred policy.
 //!
 //! These reads do not issue grants. The caller authenticates a human creator and
 //! binds the chosen references before any protected supply or Runtime dispatch.
@@ -15,11 +18,6 @@ fn current_source(
     connection: &rusqlite::Connection,
     workspace: &str,
 ) -> Result<policy_config::PermissionSource> {
-    if !canonical(connection, workspace)? {
-        return Err(Error::InvalidInput(
-            "Workspace policy transfer is not adopted".into(),
-        ));
-    }
     let state = crate::config_source::load_state(connection, workspace)?
         .ok_or_else(|| Error::RegistryInconsistency("Workspace source not materialized".into()))?;
     let evaluation = config_source::SnapshotEnvironment::new(state.snapshot)
@@ -45,6 +43,22 @@ fn require_workspace(workspace: &str, host: &PermissionHost) -> Result<()> {
 }
 
 impl SqliteWorkspaceStore {
+    // Native effect admission already owns a query-only Host transaction. Reuse
+    // that reservation; ordinary callers still need one coherent read snapshot.
+    fn with_permission_snapshot<T>(
+        &self,
+        read: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+    ) -> Result<T> {
+        self.with_conn(|connection| {
+            if connection.is_autocommit() {
+                let transaction = connection.unchecked_transaction()?;
+                read(&transaction)
+            } else {
+                read(connection)
+            }
+        })
+    }
+
     pub(crate) fn adopted_subject_legacy_permissions(
         &self,
         workspace: &str,
@@ -52,9 +66,13 @@ impl SqliteWorkspaceStore {
         feature_host: &PermissionHost,
     ) -> Result<Option<server_api::authorization::SubjectPermissions>> {
         require_workspace(workspace, feature_host)?;
-        self.with_conn(|connection| {
-            let transaction = connection.unchecked_transaction()?;
-            let source = current_source(&transaction, workspace)?;
+        self.with_permission_snapshot(|transaction| {
+            if !canonical(transaction, workspace)? {
+                return Err(Error::InvalidInput(
+                    "Workspace policy transfer is not adopted".into(),
+                ));
+            }
+            let source = current_source(transaction, workspace)?;
             let host = policy_config::configured_host(feature_host, &source)?;
             let raw: Option<String> = transaction
                 .query_row(
@@ -73,7 +91,7 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    /// Rebuild the catalog overlay from the current adopted source, retaining the
+    /// Rebuild the catalog overlay from the current materialized source, retaining the
     /// supplied Host's current Feature declarations and registration identities.
     /// Use this before current authorization, catalog reads and policy issuance;
     /// do not cache it across source/Feature changes or use an old receipt as input.
@@ -83,9 +101,8 @@ impl SqliteWorkspaceStore {
         feature_host: &PermissionHost,
     ) -> Result<PermissionHost> {
         require_workspace(workspace, feature_host)?;
-        self.with_conn(|connection| {
-            let transaction = connection.unchecked_transaction()?;
-            let source = current_source(&transaction, workspace)?;
+        self.with_permission_snapshot(|transaction| {
+            let source = current_source(transaction, workspace)?;
             policy_config::configured_host(feature_host, &source)
         })
     }
@@ -102,9 +119,8 @@ impl SqliteWorkspaceStore {
         explicit: Option<&PermissionAssignment>,
     ) -> Result<(PermissionHost, PermissionAssignment)> {
         require_workspace(workspace, feature_host)?;
-        self.with_conn(|connection| {
-            let transaction = connection.unchecked_transaction()?;
-            let source = current_source(&transaction, workspace)?;
+        self.with_permission_snapshot(|transaction| {
+            let source = current_source(transaction, workspace)?;
             let host = policy_config::configured_host(feature_host, &source)?;
             let assignment = explicit
                 .cloned()

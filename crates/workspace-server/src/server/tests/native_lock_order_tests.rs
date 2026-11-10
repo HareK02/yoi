@@ -106,8 +106,11 @@ fn native_memory_chat_case(remove_chat: bool) {
 
 async fn memory_chat_schedule(remove_chat: bool) {
     let f = Fixture::new().await;
-    f.adopt_policy(r#"{ sets = ["subject-default", "memory"]; }"#, "{}")
-        .await;
+    f.adopt_policy(
+        r#"{ sets = ["conversation", "work-coordination", "memory"]; }"#,
+        "{}",
+    )
+    .await;
     // Exercise the real dispatch/attempt-derived Memory Job grant rather than a
     // second fake registry-only consumer or an unbound consolidation authority.
     f.api
@@ -404,7 +407,11 @@ async fn memory_authority_schedule(consumer: AuthorityConsumer) {
             "native-enrollment-creation",
         )
         .unwrap();
-    let schema = f.api.config_schema_registry.compose().unwrap();
+    let source_before = f
+        .api
+        .config_store
+        .configuration_current(TEST_WORKSPACE_ID, &owner)
+        .unwrap();
     let grant = subject_authorization::prepare_delegation(
         &f.api,
         &f.source,
@@ -519,12 +526,11 @@ async fn memory_authority_schedule(consumer: AuthorityConsumer) {
             let result = f
                 .api
                 .config_store
-                .enroll_created_subject_observed(
+                .enroll_created_subject_policy_observed(
                     TEST_WORKSPACE_ID,
                     &owner,
                     &store,
                     &enrollment.id,
-                    schema.clone(),
                     || {
                         let registry = f.api.permission_registry.read().unwrap();
                         let host = registry.host().clone();
@@ -534,23 +540,22 @@ async fn memory_authority_schedule(consumer: AuthorityConsumer) {
                 )
                 .unwrap()
                 .expect("post-seal enrollment");
-            assert!(result.source_stored && result.policy_committed);
             let policy = f
                 .api
                 .config_store
-                .adopted_subject_policy(TEST_WORKSPACE_ID, &enrollment.id)
+                .current_subject_permission_policy(TEST_WORKSPACE_ID, &enrollment.id)
                 .unwrap()
                 .expect("enrollment persisted canonical policy");
-            assert!(policy.current().legacy_constraints.is_none());
+            assert_eq!(policy, result);
+            assert!(policy.legacy_constraints.is_none());
             let replay = f
                 .api
                 .config_store
-                .enroll_created_subject(
+                .enroll_created_subject_policy(
                     TEST_WORKSPACE_ID,
                     &owner,
                     &store,
                     &enrollment.id,
-                    schema,
                     || {
                         let registry = f.api.permission_registry.read().unwrap();
                         let host = registry.host().clone();
@@ -561,19 +566,28 @@ async fn memory_authority_schedule(consumer: AuthorityConsumer) {
                 .unwrap();
             assert_eq!(
                 replay, result,
-                "same enrollment returns its adoption receipt"
+                "enrollment replay returns the current policy"
             );
-            assert_eq!(
-                f.api
-                    .config_store
-                    .configuration_adoption_result(
-                        TEST_WORKSPACE_ID,
-                        &owner,
-                        &format!("subject-enrollment:{}", enrollment.id),
-                    )
-                    .unwrap(),
-                Some(result)
-            );
+            let source_after = f
+                .api
+                .config_store
+                .configuration_current(TEST_WORKSPACE_ID, &owner)
+                .unwrap();
+            assert_eq!(source_after.state, source_before.state);
+            assert_eq!(source_after.history_head, source_before.history_head);
+            assert_eq!(source_after.canonical, source_before.canonical);
+            f.api
+                .config_store
+                .with_conn(|connection| {
+                    let consumed: i64 = connection.query_row(
+                        "SELECT COUNT(*) FROM subject_permission_enrollments WHERE workspace_id=?1 AND subject_id=?2",
+                        rusqlite::params![TEST_WORKSPACE_ID, enrollment.id],
+                        |row| row.get(0),
+                    )?;
+                    assert_eq!(consumed, 1, "creation evidence consumed exactly once");
+                    Ok(())
+                })
+                .unwrap();
         }
     }
     let memory_result = memory_result

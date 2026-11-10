@@ -713,6 +713,43 @@ impl SqliteWorkspaceStore {
                     ));
                 }
             }
+            // The native permanent fence precedes finish, preventing late policy
+            // mutation/enrollment. Suspend only delete guards under this writer
+            // transaction; rollback restores data and DDL together, and update
+            // guards remain installed. Restore the exact schema-owned definitions.
+            let mut policy_delete_guards = Vec::new();
+            for (table, trigger) in [
+                (
+                    "subject_permission_operations",
+                    "subject_permission_operations_no_delete",
+                ),
+                (
+                    "subject_permission_enrollments",
+                    "subject_permission_enrollments_no_delete",
+                ),
+            ] {
+                let definition: String = tx.query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name=?2",
+                    params![trigger, table],
+                    |row| row.get(0),
+                )?;
+                tx.execute_batch(&format!("DROP TRIGGER \"{trigger}\";"))?;
+                policy_delete_guards.push(definition);
+            }
+            for table in [
+                "workspace_configuration_policies",
+                "subject_permission_operations",
+                "subject_permission_enrollments",
+                "subject_permission_tombstones",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM \"{table}\" WHERE workspace_id=?1 AND subject_id=?2"),
+                    params![workspace, subject],
+                )?;
+            }
+            for definition in policy_delete_guards {
+                tx.execute_batch(&definition)?;
+            }
             tx.execute(
                 "UPDATE subject_deletions SET completed=1 WHERE workspace_id=?1 AND subject_id=?2",
                 params![workspace, subject],
@@ -834,6 +871,266 @@ mod tests {
             c.execute("INSERT INTO worker_removal_operations(operation_id,plan_id,input_fingerprint,workspace_id,runtime_id,worker_id,worker_updated_at,policy_id,policy_digest,session_disposition,metadata_disposition,archive_retention_kind,diagnostics_disposition,blockers_json,state,reason,created_at,updated_at) VALUES(?1,?1,'fp','w',?2,?3,?4,'test','digest',?5,'tombstone','forever',?6,'[]',?7,'test',?4,?4)",params![format!("receipt-{}-{state}",worker.worker_id),worker.runtime_id,worker.worker_id,NOW,session,diagnostics,state])?;
             Ok(())
         }).unwrap();
+    }
+
+    const POLICY_TABLES: &[&str] = &[
+        "workspace_configuration_policies",
+        "subject_permission_operations",
+        "subject_permission_enrollments",
+        "subject_permission_tombstones",
+    ];
+
+    // Raw rows isolate the deletion transaction from native lifecycle/API setup.
+    // Payloads use the published current wrapper and the saved native source shape.
+    fn seed_policy_data(store: &SqliteWorkspaceStore, target_removed: bool) {
+        use server_api::authorization::{
+            CurrentSubjectPolicy, PermissionReferenceEncoding, SubjectPolicySource,
+        };
+        use server_api::subject_policy::{
+            SubjectPermissionPolicyAction, SubjectPermissionPolicyMutation,
+            SubjectPermissionPolicyMutationResponse,
+        };
+
+        store.with_conn(|conn| {
+            for workspace in ["w", "other"] {
+                conn.execute("INSERT INTO workspace_configuration_authorities(workspace_id,transfer_identity,legacy_physical_identity,legacy_export_digest) VALUES(?1,'policy-erasure-transfer','fixture-native','fixture-export')", [workspace])?;
+                for subject in ["subject", "another"] {
+                    let policy = CurrentSubjectPolicy {
+                        change_id: format!("creation-{subject}"),
+                        execution: Default::default(),
+                        delegation: Default::default(),
+                        legacy_constraints: None,
+                        reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
+                    };
+                    let enrollment = SubjectPolicySource::Feature(policy.clone());
+                    let removed = (subject == "subject") == target_removed;
+                    let request = SubjectPermissionPolicyMutation {
+                        operation_id: format!("operation-{subject}"),
+                        expected_change_id: Some(policy.change_id.clone()),
+                        action: if removed {
+                            SubjectPermissionPolicyAction::Remove
+                        } else {
+                            SubjectPermissionPolicyAction::Replace {
+                                execution: policy.execution.clone(),
+                                delegation: policy.delegation.clone(),
+                            }
+                        },
+                    };
+                    let mut current = policy;
+                    current.change_id = format!("owner-{subject}");
+                    let response = SubjectPermissionPolicyMutationResponse {
+                        change_id: Some(current.change_id.clone()),
+                        policy: (!removed).then_some(current.clone()),
+                    };
+                    if removed {
+                        conn.execute("INSERT INTO subject_permission_tombstones(workspace_id,subject_id,change_id) VALUES(?1,?2,?3)", params![workspace, subject, current.change_id])?;
+                    } else {
+                        let saved = crate::policy_config::AdoptedSubjectPolicy::from_current(subject, &current);
+                        conn.execute("INSERT INTO workspace_configuration_policies(workspace_id,subject_id,policy_json) VALUES(?1,?2,?3)", params![workspace, subject, serde_json::to_string(&saved).unwrap()])?;
+                    }
+                    conn.execute("INSERT INTO subject_permission_operations(workspace_id,operation_id,subject_id,account_id,request_json,result_json) VALUES(?1,?2,?3,'owner',?4,?5)", params![workspace, request.operation_id, subject, serde_json::to_string(&request).unwrap(), serde_json::to_string(&response).unwrap()])?;
+                    conn.execute("INSERT INTO subject_permission_enrollments(workspace_id,subject_id,source_json) VALUES(?1,?2,?3)", params![workspace, subject, serde_json::to_string(&enrollment).unwrap()])?;
+                }
+            }
+            Ok(())
+        }).unwrap();
+    }
+
+    fn policy_rows(store: &SqliteWorkspaceStore) -> Vec<Vec<Vec<String>>> {
+        store
+            .with_conn(|conn| {
+                POLICY_TABLES
+                    .iter()
+                    .map(|table| {
+                        let mut statement = conn.prepare(&format!(
+                            "SELECT * FROM {table} ORDER BY workspace_id,subject_id"
+                        ))?;
+                        let rows = statement
+                            .query_map([], |row| {
+                                (0..row.as_ref().column_count())
+                                    .map(|column| row.get(column))
+                                    .collect::<rusqlite::Result<Vec<String>>>()
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+                        Ok(rows)
+                    })
+                    .collect()
+            })
+            .unwrap()
+    }
+
+    fn policy_guards(store: &SqliteWorkspaceStore) -> Vec<(String, String)> {
+        store.with_conn(|conn| {
+            Ok(conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('subject_permission_operations','subject_permission_enrollments') ORDER BY name")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        }).unwrap()
+    }
+
+    fn assert_policy_immutable(store: &SqliteWorkspaceStore) {
+        store
+            .with_conn(|conn| {
+                for table in [
+                    "subject_permission_operations",
+                    "subject_permission_enrollments",
+                ] {
+                    for sql in [
+                        format!("DELETE FROM {table} WHERE workspace_id='other'"),
+                        format!(
+                            "UPDATE {table} SET subject_id=subject_id WHERE workspace_id='other'"
+                        ),
+                    ] {
+                        let error = conn.execute(&sql, []).unwrap_err();
+                        assert!(error.to_string().contains("Subject permission"), "{error}");
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn finish_subject_deletion_erases_only_target_policy_and_restores_guards_on_rollback_and_retry()
+    {
+        for target_removed in [false, true] {
+            let store = setup();
+            seed_policy_data(&store, target_removed);
+            let before = policy_rows(&store);
+            let guards = policy_guards(&store);
+            assert_eq!(guards.len(), 4);
+            assert_policy_immutable(&store);
+            store
+                .prepare_subject_deletion("w", "subject", "delete", &[])
+                .unwrap();
+            store
+                .erase_subject_deleted_jobs("w", "subject", "delete")
+                .unwrap();
+            let ordinary_worker = worker(901);
+            registry(&store, &ordinary_worker);
+            let mut human_request = request("human-job", "unused");
+            human_request.input_ref = "human:request".into();
+            human_request.grants = Default::default();
+            store.reserve_backend_job("w", &human_request, NOW).unwrap();
+            let human_before = store.get_backend_job("w", "human-job").unwrap();
+            store.with_conn(|conn| {
+                conn.execute_batch("CREATE TRIGGER fail_policy_erasure BEFORE DELETE ON subject_permission_enrollments
+                    WHEN OLD.workspace_id='w' AND OLD.subject_id='subject'
+                    BEGIN
+                        SELECT CASE WHEN (SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('subject_permission_operations_no_update','subject_permission_enrollments_no_update')) != 2
+                            THEN RAISE(ABORT,'policy update guards were suspended') END;
+                        SELECT RAISE(ABORT,'injected policy erasure failure');
+                    END;")?;
+                Ok(())
+            }).unwrap();
+            assert!(
+                store
+                    .finish_subject_deletion_record("w", "subject", "delete")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected policy erasure failure")
+            );
+            assert_eq!(policy_rows(&store), before);
+            let mut failure_guards = policy_guards(&store);
+            failure_guards.retain(|(name, _)| name != "fail_policy_erasure");
+            assert_eq!(failure_guards, guards);
+            assert_policy_immutable(&store);
+            store.with_conn(|conn| {
+                assert!(!conn.query_row("SELECT completed FROM subject_deletions WHERE workspace_id='w' AND subject_id='subject'", [], |row| row.get::<_, bool>(0))?);
+                conn.execute_batch("DROP TRIGGER fail_policy_erasure;")?;
+                Ok(())
+            }).unwrap();
+
+            store
+                .finish_subject_deletion_record("w", "subject", "delete")
+                .unwrap();
+            let retained: Vec<Vec<Vec<String>>> = before
+                .into_iter()
+                .zip(POLICY_TABLES)
+                .map(|(rows, table)| {
+                    let subject_column = if *table == "subject_permission_operations" {
+                        2
+                    } else {
+                        1
+                    };
+                    rows.into_iter()
+                        .filter(|row| row[0] != "w" || row[subject_column] != "subject")
+                        .collect()
+                })
+                .collect();
+            assert_eq!(policy_rows(&store), retained);
+            assert_eq!(policy_guards(&store), guards);
+            assert_policy_immutable(&store);
+            store
+                .finish_subject_deletion_record("w", "subject", "delete")
+                .unwrap();
+            assert_eq!(policy_rows(&store), retained);
+            assert_eq!(policy_guards(&store), guards);
+            assert_eq!(
+                store.get_backend_job("w", "human-job").unwrap(),
+                human_before
+            );
+            store.with_conn(|conn| {
+                assert!(conn.query_row("SELECT completed FROM subject_deletions WHERE workspace_id='w' AND subject_id='subject'", [], |row| row.get::<_, bool>(0))?);
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM worker_registry WHERE workspace_id='w' AND runtime_id=?1 AND worker_id=?2", params![ordinary_worker.runtime_id, ordinary_worker.worker_id], |row| row.get::<_, i64>(0))?, 1);
+                assert_eq!(conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get::<_, i64>(0))?, 0);
+                Ok(())
+            }).unwrap();
+        }
+    }
+
+    #[test]
+    fn finish_subject_policy_erasure_requires_operation_jobs_and_worker_removal_proofs() {
+        let store = setup();
+        seed_policy_data(&store, false);
+        let before = policy_rows(&store);
+        let guards = policy_guards(&store);
+        assert!(
+            store
+                .finish_subject_deletion_record("w", "subject", "delete")
+                .is_err()
+        );
+        store
+            .prepare_subject_deletion("w", "another", "delete-another", &[])
+            .unwrap();
+        assert!(
+            store
+                .finish_subject_deletion_record("w", "another", "delete-another")
+                .unwrap_err()
+                .to_string()
+                .contains("Job erasure is incomplete")
+        );
+        assert_eq!(policy_rows(&store), before);
+        let body = worker(902);
+        registry(&store, &body);
+        store
+            .prepare_subject_deletion("w", "subject", "delete", std::slice::from_ref(&body))
+            .unwrap();
+        assert!(
+            store
+                .finish_subject_deletion_record("w", "subject", "wrong-operation")
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_subject_deletion_record("w", "subject", "delete")
+                .is_err()
+        );
+        assert_eq!(policy_rows(&store), before);
+        store
+            .erase_subject_deleted_jobs("w", "subject", "delete")
+            .unwrap();
+        assert!(
+            store
+                .finish_subject_deletion_record("w", "subject", "delete")
+                .is_err()
+        );
+        assert_eq!(policy_rows(&store), before);
+        assert_eq!(policy_guards(&store), guards);
+        receipt(&store, &body, "succeeded", "archive", "retain");
+        store
+            .finish_subject_deletion_record("w", "subject", "delete")
+            .unwrap();
+        assert_eq!(policy_guards(&store), guards);
     }
 
     #[test]

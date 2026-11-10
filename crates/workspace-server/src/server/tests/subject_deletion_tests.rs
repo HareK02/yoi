@@ -128,11 +128,26 @@ async fn deletion_owner_scope_exact_retry_and_subject_isolation() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(store.subject(&other.id).unwrap().is_some());
-    let fresh = store
-        .create_subject(crate::subjektiv::SubjectRole::new("fresh").unwrap())
-        .unwrap();
+    let (_, Json(fresh)) = scoped_create_subjektiv_subject(
+        State(api.clone()),
+        AxumPath(ScopedWorkspacePath {
+            workspace_id: TEST_WORKSPACE_ID.into(),
+        }),
+        Extension(test_owner_actor()),
+        Json(server_api::SubjektivSubjectCreateRequest {
+            operation_id: "fresh-after-deletion".into(),
+            role: "fresh".into(),
+            behavior_md: String::new(),
+        }),
+    )
+    .await
+    .unwrap();
     assert_ne!(fresh.id, subject.id);
-    let source = store.current_subject_policy(&fresh.id).unwrap().unwrap();
+    let source = api
+        .config_store
+        .current_subject_permission_policy(TEST_WORKSPACE_ID, &fresh.id)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         source.execution,
         server_api::authorization::subject_default_permission_assignment()
@@ -211,7 +226,7 @@ async fn unconfirmed_worker_shutdown_is_not_completion_and_exact_retry_converges
             "private behavior".into(),
         )
         .unwrap();
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -1126,7 +1141,7 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
     let subject = store
         .create_subject(crate::subjektiv::SubjectRole::new("old body archive").unwrap())
         .unwrap();
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {

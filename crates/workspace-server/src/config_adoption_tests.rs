@@ -1,11 +1,14 @@
 //! Adoption component tests use the real Server SQLite transaction and content
-//! store. The legacy transfer callback is empty in this fixture; physical Feature
-//! transfer and authenticated HTTP are separate integration coverage.
+//! store. The legacy transfer callback retains a fixed native policy independently
+//! of authored source; physical Feature transfer and authenticated HTTP are separate
+//! integration coverage.
 use super::*;
 use crate::config_source::{MAIN_CONFIG_ENTRYPOINT, WorkspaceConfigSchemaProvider};
 use crate::policy_config::PermissionConfigSchemaProvider;
 use config_source::{ConfigTreeChange, VirtualPath};
 use feature_permissions::*;
+use server_api::authorization::{CurrentSubjectPolicy, PermissionReferenceEncoding};
+use server_api::subject_policy::{SubjectPermissionPolicyAction, SubjectPermissionPolicyMutation};
 
 const WORKSPACE: &str = "adoption-ws";
 const OWNER: &str = "adoption-owner";
@@ -95,7 +98,7 @@ fn request(
             .configuration_head(WORKSPACE, OWNER)
             .unwrap()
             .is_none()
-            .then(|| "fixture-empty".into()),
+            .then(|| "fixture-native-export".into()),
         expected_head: db.configuration_head(WORKSPACE, OWNER).unwrap(),
         expected_catalog_digest: catalog_digest(host).unwrap(),
         source: ConfigCommitRequest {
@@ -105,6 +108,37 @@ fn request(
         },
     }
 }
+fn native_policy() -> AdoptedSubjectPolicy {
+    AdoptedSubjectPolicy::from_current(
+        "subject-a",
+        &CurrentSubjectPolicy {
+            change_id: "fixture-native-policy".into(),
+            execution: PermissionAssignment {
+                grants: vec![PermissionReference::Namespace(NamespacePermissions {
+                    namespace: NamespaceId::parse("ticket").unwrap(),
+                    keys: vec![PermissionKey::parse("ticket.hoge").unwrap()],
+                })],
+                ..Default::default()
+            },
+            delegation: PermissionAssignment::default(),
+            legacy_constraints: None,
+            reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
+        },
+    )
+}
+
+fn assert_native_policy(db: &SqliteWorkspaceStore) {
+    assert_eq!(
+        db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap(),
+        Some(native_policy())
+    );
+    assert_eq!(
+        db.current_subject_permission_policy(WORKSPACE, "subject-a")
+            .unwrap(),
+        Some(native_policy().current())
+    );
+}
+
 fn adopt(
     db: &SqliteWorkspaceStore,
     host: &PermissionHost,
@@ -128,14 +162,14 @@ fn adopt(
             Ok(ConfigurationPolicyTransfer {
                 transfer_identity: fingerprint.into(),
                 physical_identity: "fixture-physical".into(),
-                export_digest: "fixture-empty".into(),
-                policies: BTreeMap::new(),
+                export_digest: "fixture-native-export".into(),
+                policies: BTreeMap::from([("subject-a".into(), native_policy())]),
             })
         },
     )
 }
-const A: &str = r#"{ permissions = { subjects = [{ subject_id = "subject-a"; execution = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge"]; }]; }; }]; }; } as WorkspaceConfigSchema"#;
-const B: &str = r#"{ permissions = { subjects = [{ subject_id = "subject-a"; execution = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge.fuga"]; }]; }; }]; }; } as WorkspaceConfigSchema"#;
+const A: &str = r#"{ permissions = { human_worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge"]; }]; }; }; } as WorkspaceConfigSchema"#;
+const B: &str = r#"{ permissions = { human_worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge.fuga"]; }]; }; }; } as WorkspaceConfigSchema"#;
 
 #[test]
 fn editing_head_rejects_aba_and_parallel_editors_but_receipts_reconcile_lost_responses() {
@@ -163,6 +197,7 @@ fn editing_head_rejects_aba_and_parallel_editors_but_receipts_reconcile_lost_res
     let mut changed = initial;
     changed.source.changes.clear();
     assert!(adopt(&db, &host, &changed).is_err());
+    assert_native_policy(&db);
 }
 
 #[test]
@@ -170,17 +205,22 @@ fn failure_at_each_storage_boundary_rolls_back_and_reopens_the_previous_adoption
     for (table, event) in [
         ("content_objects", "INSERT"),
         ("workspace_config_entries", "INSERT"),
-        ("workspace_configuration_policies", "INSERT"),
         ("content_scopes", "UPDATE"),
         ("workspace_configuration_receipts", "INSERT"),
     ] {
         let (dir, db) = fixture();
         let host = host(false);
         let before = adopt(&db, &host, &request(&db, &host, "initial", Some(A))).unwrap();
-        let policy = db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap();
+        let policy = db
+            .current_subject_permission_policy(WORKSPACE, "subject-a")
+            .unwrap();
         let candidate = request(&db, &host, "failing", Some(B));
         db.with_conn(|conn| {conn.execute_batch(&format!("CREATE TEMP TRIGGER injected_failure BEFORE {event} ON {table} BEGIN SELECT RAISE(ABORT,'injected {table}'); END;"))?;Ok(())}).unwrap();
-        assert!(adopt(&db, &host, &candidate).is_err(), "{table}");
+        let error = adopt(&db, &host, &candidate).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("injected {table}")),
+            "{table}: {error}"
+        );
         drop(db);
         let reopened = open(&dir.path().join("server.sqlite"));
         assert_eq!(
@@ -195,7 +235,7 @@ fn failure_at_each_storage_boundary_rolls_back_and_reopens_the_previous_adoption
         );
         assert_eq!(
             reopened
-                .adopted_subject_policy(WORKSPACE, "subject-a")
+                .current_subject_permission_policy(WORKSPACE, "subject-a")
                 .unwrap(),
             policy,
             "{table}"
@@ -208,21 +248,61 @@ fn failure_at_each_storage_boundary_rolls_back_and_reopens_the_previous_adoption
             "{table}"
         );
         adopt(&reopened, &host, &candidate).unwrap();
+        assert_native_policy(&reopened);
     }
 }
 
 #[test]
-fn invalid_references_subjects_structure_and_owner_do_not_prepare_a_transfer() {
+fn initial_native_policy_insert_failure_rolls_back_source_authority_head_and_receipt() {
+    let (dir, db) = fixture();
+    let host = host(false);
+    let before = db.load_workspace_config(WORKSPACE).unwrap();
+    let candidate = request(&db, &host, "initial-policy-failure", Some(A));
+    db.with_conn(|conn| {
+        conn.execute_batch("CREATE TEMP TRIGGER injected_failure BEFORE INSERT ON workspace_configuration_policies BEGIN SELECT RAISE(ABORT,'injected policy insert'); END;")?;
+        Ok(())
+    }).unwrap();
+    let error = adopt(&db, &host, &candidate).unwrap_err();
+    assert!(
+        error.to_string().contains("injected policy insert"),
+        "{error}"
+    );
+    drop(db);
+    let reopened = open(&dir.path().join("server.sqlite"));
+    assert_eq!(reopened.load_workspace_config(WORKSPACE).unwrap(), before);
+    assert_eq!(reopened.configuration_head(WORKSPACE, OWNER).unwrap(), None);
+    assert!(
+        !reopened
+            .configuration_policy_is_canonical(WORKSPACE)
+            .unwrap()
+    );
+    assert!(
+        reopened
+            .with_conn(|conn| policies(conn, WORKSPACE))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .configuration_adoption_result(WORKSPACE, OWNER, &candidate.operation_id)
+            .unwrap()
+            .is_none()
+    );
+    adopt(&reopened, &host, &candidate).unwrap();
+    assert_native_policy(&reopened);
+}
+
+#[test]
+fn invalid_references_structure_and_owner_do_not_prepare_a_transfer() {
     let (_dir, db) = fixture();
     let host = host(false);
     let initial = db.load_workspace_config(WORKSPACE).unwrap();
     for source in [
         "not valid Decodal {",
-        r#"{permissions={subjects=[{subject_id="subject-a"; execution={sets=["missing"];};}];};} as WorkspaceConfigSchema"#,
-        r#"{permissions={subjects=[{subject_id="subject-a"; execution={namespaces=[{namespace="ticket";keys=["ticket.unknown"];}];};}];};} as WorkspaceConfigSchema"#,
-        r#"{permissions={subjects=[{subject_id="missing";}];};} as WorkspaceConfigSchema"#,
-        r#"{permissions={subjects=[{subject_id="subject-a";},{subject_id="subject-a";}];};} as WorkspaceConfigSchema"#,
-        r#"{permissions={subjects=[{subject_id="subject-a"; execution={namespaces=[{namespace="ticket";keys=[{key="ticket.hoge"; payload="forbidden";}];}];};}];};} as WorkspaceConfigSchema"#,
+        r#"{permissions={human_worker_default={sets=["missing"];};};} as WorkspaceConfigSchema"#,
+        r#"{permissions={human_worker_default={namespaces=[{namespace="ticket";keys=["ticket.unknown"];}];};};} as WorkspaceConfigSchema"#,
+        r#"{permissions={sets=[{id="duplicate";},{id="duplicate";}];};} as WorkspaceConfigSchema"#,
+        r#"{permissions={human_worker_default={namespaces=[{namespace="ticket";keys=[{key="ticket.hoge"; payload="forbidden";}];}];};};} as WorkspaceConfigSchema"#,
     ] {
         let request = request(&db, &host, "bad", Some(source));
         let result = db.adopt_configuration(
@@ -262,55 +342,120 @@ fn invalid_references_subjects_structure_and_owner_do_not_prepare_a_transfer() {
 }
 
 #[test]
-fn omission_is_unchanged_explicit_remove_unsets_and_noop_does_not_reissue_policy_identity() {
+fn source_edits_omission_and_noop_leave_dedicated_current_policy_identity_unchanged() {
     let (_dir, db) = fixture();
     let host = host(false);
-    adopt(&db, &host, &request(&db, &host, "initial", Some(A))).unwrap();
-    let original = db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap();
-    let preview = db
-        .preview_configuration_adoption(
+    let initial = request(&db, &host, "initial", Some(A));
+    let first = adopt(&db, &host, &initial).unwrap();
+    // An owner policy decision is independent of the source's creation default.
+    let original = db
+        .mutate_subject_permission_policy(
             WORKSPACE,
             OWNER,
-            &request(&db, &host, "noop", None),
-            schema(),
+            "subject-a",
+            &SubjectPermissionPolicyMutation {
+                operation_id: "dedicated-policy".into(),
+                expected_change_id: Some(native_policy().change_id),
+                action: SubjectPermissionPolicyAction::Replace {
+                    execution: PermissionAssignment::default(),
+                    delegation: native_policy().current().execution,
+                },
+            },
             &host,
-            None,
-            |_| Ok(()),
         )
+        .unwrap()
+        .policy
         .unwrap();
-    assert!(preview.changed_paths.is_empty());
-    assert!(preview.changed_subjects.is_empty());
-    adopt(&db, &host, &request(&db, &host, "noop", None)).unwrap();
+    let saved = db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap();
+    for (id, source) in [
+        ("noop", None),
+        ("new-default", Some(B)),
+        ("omit", Some("{} as WorkspaceConfigSchema")),
+    ] {
+        let candidate = request(&db, &host, id, source);
+        let preview = db
+            .preview_configuration_adoption(
+                WORKSPACE,
+                OWNER,
+                &candidate,
+                schema(),
+                &host,
+                None,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(preview.changed_paths.is_empty(), source.is_none());
+        assert!(preview.changed_subjects.is_empty());
+        adopt(&db, &host, &candidate).unwrap();
+        assert_eq!(
+            db.current_subject_permission_policy(WORKSPACE, "subject-a")
+                .unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap(),
+            saved
+        );
+    }
+    let state = db.load_workspace_config(WORKSPACE).unwrap();
+    let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
+    assert_eq!(adopt(&db, &host, &initial).unwrap(), first);
+    assert_eq!(db.load_workspace_config(WORKSPACE).unwrap(), state);
+    assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
+    assert_eq!(
+        db.current_subject_permission_policy(WORKSPACE, "subject-a")
+            .unwrap(),
+        Some(original)
+    );
     assert_eq!(
         db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap(),
-        original
+        saved
     );
-    adopt(
-        &db,
-        &host,
-        &request(&db, &host, "omit", Some("{} as WorkspaceConfigSchema")),
-    )
-    .unwrap();
-    assert_eq!(
-        db.adopted_subject_policy(WORKSPACE, "subject-a").unwrap(),
-        original
-    );
-    adopt(
-        &db,
-        &host,
-        &request(
-            &db,
-            &host,
-            "remove",
-            Some(r#"{permissions={remove_subjects=["subject-a"];};} as WorkspaceConfigSchema"#),
-        ),
-    )
-    .unwrap();
-    assert!(
-        db.adopted_subject_policy(WORKSPACE, "subject-a")
-            .unwrap()
-            .is_none()
-    );
+}
+
+#[test]
+fn individual_config_fields_are_rejected_even_empty_without_changing_current_policy() {
+    let (_dir, db) = fixture();
+    let host = host(false);
+    let committed = adopt(&db, &host, &request(&db, &host, "initial", Some(A))).unwrap();
+    for (index, (field, source)) in [
+        ("subjects", r#"{permissions={subjects=[];};} as WorkspaceConfigSchema"#),
+        ("subjects", r#"{permissions={subjects=[{subject_id="subject-a";execution={};}];};} as WorkspaceConfigSchema"#),
+        ("remove_subjects", r#"{permissions={remove_subjects=[];};} as WorkspaceConfigSchema"#),
+        ("remove_subjects", r#"{permissions={remove_subjects=["subject-a"];};} as WorkspaceConfigSchema"#),
+    ].into_iter().enumerate() {
+        let id = format!("individual-field-{index}");
+        let candidate = request(&db, &host, &id, Some(source));
+        let preview_error = db
+            .preview_configuration_adoption(
+                WORKSPACE, OWNER, &candidate, schema(), &host, None,
+                |_| panic!("current config must not resolve individual Subjects"),
+            )
+            .unwrap_err();
+        assert!(preview_error.to_string().contains(field), "{source}: {preview_error}");
+        let error = db
+            .adopt_configuration(
+                WORKSPACE, OWNER, &candidate, schema(), &host, None,
+                |_| panic!("current config must not resolve individual Subjects"),
+                |_| panic!("invalid source must not prepare a transfer"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(field), "{source}: {error}");
+        assert_eq!(
+            db.load_workspace_config(WORKSPACE).unwrap(),
+            Some(committed.state.clone())
+        );
+        assert_eq!(
+            db.configuration_head(WORKSPACE, OWNER).unwrap(),
+            Some(committed.history_head.clone())
+        );
+        assert!(
+            db.configuration_adoption_result(WORKSPACE, OWNER, &id)
+                .unwrap()
+                .is_none()
+        );
+        assert_native_policy(&db);
+    }
 }
 
 #[test]
@@ -319,11 +464,8 @@ fn feature_children_are_explicit_and_multisegment_keys_are_preserved_in_saved_as
         let (_dir, db) = fixture();
         let host = host(children);
         adopt(&db, &host, &request(&db, &host, "initial", Some(A))).unwrap();
-        let policy = db
-            .adopted_subject_policy(WORKSPACE, "subject-a")
-            .unwrap()
-            .unwrap();
-        let resolution = host.resolve(Some(&policy.source.execution.assignment()));
+        let (configured, assignment) = db.human_worker_permissions(WORKSPACE, &host, None).unwrap();
+        let resolution = configured.resolve(Some(&assignment));
         assert_eq!(
             resolution
                 .projection()
@@ -331,41 +473,38 @@ fn feature_children_are_explicit_and_multisegment_keys_are_preserved_in_saved_as
                 .contains_key(&PermissionKey::parse("ticket.hoge.fuga").unwrap()),
             children
         );
-        assert!(
-            host.resolve(Some(&policy.source.delegation.assignment()))
-                .projection()
-                .allowed
-                .is_empty()
-        );
         adopt(&db, &host, &request(&db, &host, "multi", Some(B))).unwrap();
-        let policy = db
-            .adopted_subject_policy(WORKSPACE, "subject-a")
-            .unwrap()
-            .unwrap();
+        let (_, assignment) = db.human_worker_permissions(WORKSPACE, &host, None).unwrap();
         assert_eq!(
-            policy.source.execution.namespaces[0].keys[0].as_str(),
-            "ticket.hoge.fuga"
+            assignment.grants,
+            vec![PermissionReference::Namespace(NamespacePermissions {
+                namespace: NamespaceId::parse("ticket").unwrap(),
+                keys: vec![PermissionKey::parse("ticket.hoge.fuga").unwrap()],
+            })]
         );
+        assert_native_policy(&db);
     }
 }
 
 #[test]
-fn client_operation_id_cannot_reuse_a_previous_policy_change_identity() {
+fn client_operation_id_matching_current_policy_identity_does_not_change_that_policy() {
     let (_dir, db) = fixture();
     let host = host(false);
     adopt(&db, &host, &request(&db, &host, "initial", Some(A))).unwrap();
     let before = db
-        .adopted_subject_policy(WORKSPACE, "subject-a")
+        .current_subject_permission_policy(WORKSPACE, "subject-a")
         .unwrap()
         .unwrap();
     let change = request(&db, &host, &before.change_id, Some(B));
-    adopt(&db, &host, &change).unwrap();
-    let after = db
-        .adopted_subject_policy(WORKSPACE, "subject-a")
-        .unwrap()
-        .unwrap();
-    assert_ne!(after.change_id, before.change_id);
-    assert_ne!(after.source, before.source);
+    let result = adopt(&db, &host, &change).unwrap();
+    assert_eq!(result.operation_id, before.change_id);
+    assert_eq!(
+        db.current_subject_permission_policy(WORKSPACE, "subject-a")
+            .unwrap(),
+        Some(before)
+    );
+    assert_native_policy(&db);
+    assert_eq!(adopt(&db, &host, &change).unwrap(), result);
 }
 
 #[test]
@@ -416,6 +555,8 @@ fn independent_database_connections_serialize_concurrent_web_and_cli_heads() {
             .history_head,
         db.configuration_head(WORKSPACE, OWNER).unwrap()
     );
+    assert_native_policy(&db);
+    assert_native_policy(&other);
 }
 
 #[path = "config_adoption_failure_tests.rs"]
@@ -505,6 +646,15 @@ mod publication_observations {
             Some(result.clone())
         );
         assert_eq!(adopt(&db, &host, &request).unwrap(), result);
+        assert_eq!(
+            db.load_workspace_config(WORKSPACE).unwrap(),
+            Some(result.state.clone())
+        );
+        assert_eq!(
+            db.configuration_head(WORKSPACE, OWNER).unwrap(),
+            Some(result.history_head.clone())
+        );
+        assert_native_policy(&db);
         assert_eq!(
             db.configuration_publication(WORKSPACE, OWNER, &request.operation_id)
                 .unwrap()
@@ -624,6 +774,7 @@ mod publication_observations {
                 .observations
                 .is_empty()
         );
+        assert_native_policy(&db);
         assert_eq!(
             db.configuration_request_result(WORKSPACE, OWNER, &request)
                 .unwrap(),

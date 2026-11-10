@@ -326,7 +326,7 @@ impl RemoteJournal {
             _dir: dir,
         };
         policy
-            .adopt_policy(r#"{ sets = ["subject-default"]; }"#, "{}")
+            .adopt_policy(r#"{ sets = ["conversation", "work-coordination"]; }"#, "{}")
             .await;
         Self {
             policy,
@@ -538,7 +538,7 @@ async fn schedule(change: Change) {
             // is allowed to acquire it and commits before the request resumes.
             // Keep input.supply and all other set operations; revoke only create.
             tokio::time::timeout(WAIT, f.policy.adopt_policy(
-                r#"{ sets = ["subject-default"]; exclude_namespaces = [{ namespace = "journal"; keys = ["journal.entry.create"]; }]; }"#, "{}"))
+                r#"{ sets = ["conversation", "work-coordination"]; exclude_namespaces = [{ namespace = "journal"; keys = ["journal.entry.create"]; }]; }"#, "{}"))
                 .await.expect("canonical policy adoption before native admission");
         }
         Change::RemoveFeature => {

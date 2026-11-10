@@ -1,0 +1,61 @@
+# 権限設定未採用のWorkspaceでWorker作成が汎用の結果未確認表示になる
+
+2026-11-08の調査で、新しいWorker作成経路は権限設定が未採用のWorkspaceを作成前に拒否する一方、その拒否が画面の対応する失敗契約へ接続されていないことを確認した。利用者指定のtmuxログと読み取り専用の保存状態を照合した。作成要求の再送、設定の採用、DB変更、稼働プロセスの停止は行っていない。
+
+## 観測した事実
+
+- 調査対象sourceはcommit `6c9803017`。tmuxのServer paneで、同日14:22:54 UTCと14:24:20 UTCのWorker作成要求がHTTP 400で拒否されていた。原因分類はWorkspace policy transferの未採用。
+- 既存DBはschema 131へ更新済みだったが、対象Workspaceのconfiguration authority、policy、adoption receiptは存在しなかった。保存済みconfig treeの存在は、権限設定の採用完了を意味しない。
+- 対象Workspaceのcore Worker grantとlaunch bindingは存在しなかった。該当時刻以降の作成予約とWorker登録もなかった。Worker登録の作成時刻はミリ秒数値、予約の作成時刻は日時文字列として読み分けた。
+
+## 原因と作成結果
+
+`server/core_worker_creation.rs` の人間による初期grant解決は、`config_adoption/worker_permissions.rs` の `current_source` を経由し、採用済みauthorityがない場合に `Error::InvalidInput` を返す。この失敗はRuntimeへの作成dispatchより前に発生する。ログと保存状態の照合範囲では、今回の要求でWorkerは作成されていない。
+
+`server.rs` の汎用 `ApiError::into_response` はこのエラーを通常のJSON応答にする。一方、Webの `workers/startup-failure.ts` はWorker作成の失敗契約を読み取り、解釈できない応答を結果未確認として扱う。このため、画面には未採用という理由も確定拒否という結果も表示されず、reconciliationの案内になる。
+
+## 必要な対応と限界
+
+schema migrationの修正だけでは、このWorkspaceの権限設定は採用されない。正規のowner認可・移行診断・採用経路が必要であり、DBへのauthority行の追加や無条件の既定権限発行で迂回してはならない。作成前の拒否は、型付きの理由と副作用のない拒否結果としてWebまで伝え、設定採用への導線を示す必要がある。
+
+この調査では実装修正も設定の採用も行っていない。既存のConfiguration Sources導線で当該Workspaceを正常に採用できるか、移行診断が追加で阻害するかは未確認。同じtmuxログには既存Workerの権限未束縛による403もあるが、その個別の復旧方法は本調査で確定していない。
+
+## 設定更新と権限移管を区別する意図の追加調査
+
+利用者から設計意図の確認を求められ、実装・テスト・Git履歴と保存状態を再照合した。未採用という語は設定ファイルが古いことを意味せず、権限の正本を旧Feature DBからServerの設定へ移す手続きが確定していないことを意味する。
+
+- `config_adoption.rs` の冒頭と `subjektiv/src/permissions/transfer.rs` は、旧権限DBを正確なidentity/exportに束縛して封鎖し、その後にowner認可済みServer transactionで設定・policy・履歴・receiptを確定する意図を明記している。旧writerの復活や二重の正本を防ぎ、片側失敗時は同一操作の再開を要求する。authority行はこの移管の証跡であり、schemaや設定の再評価を済ませたことのフラグではない。
+- Git履歴ではこのcutoverは `f814e808e` と `9f8aad79a` で導入され、`c6756bba2` では採用後の起動時更新を禁止してowner transactionを唯一の設定writerにしていた。
+- `config_source.rs` の `ensure_workspace_config_materialized_with_schema` は、未採用時にtoolchain/schemaの再評価を自動保存できるが、authority移管は行わない。この処理を権限発行・権限移管の承認と読み替えない設計である。
+- 実DBの直近の設定履歴では、11月5日・7日・8日で `main.dcdl` の内容digestは同一だった。7日以降はpermission/schema providerが加わっているが、保存されたDCDL sourceに `permissions` や `human_worker_default` の定義はなかった。対象旧Subject DBには権限レコードが残り、seal tableは存在しなかった。設定評価の更新と権限の正本移管が別であることと整合する。
+- `6c9803017` は人間によるordinary Worker作成も採用済みsourceの読取りへ接続した。`worker_permissions_tests.rs` の `unavailable_source_unadopted_workspace_and_cross_workspace_never_fallback` は、明示的な空assignmentでも未採用状態を拒否することを検証しており、このテストを実行して成功した。条件は偶発的な結合ではなく、意図的なfail-closed契約だった。
+
+したがって、調査途中の「設定が保存されているのでauthority条件は不要かもしれない」という説明は根拠不足だった。設定の自動更新を新しい権限の承認として扱わないという意図は確認できる。一方、ordinary Worker作成までWorkspace全体の権限移管に依存させる製品判断の必要性を、このテストだけで正当化したとは扱わない。確認済みの不具合は、作成前に必要な手続きを案内せず、確定拒否を結果未確認として表示する失敗契約の不整合である。
+
+## 合意後の実装修正と隔離検証
+
+保存先変更を新たな権限承認として扱わない方針で修正した。通常human Workerは現在の設定から明示assignmentまたはhuman defaultを選び、Subject移管の完了を要求しない。設定欠落は空の権限であり、Profileから操作権限を補わない。保護操作では現在のWorkspace Setも再解決する。
+
+Subject権限は既存の限定条件・未設定・空・失効・change IDを維持して内部移行する。移行候補を旧writerの封鎖前に保存し、封鎖後にServer保存が失敗した場合は同じ候補で再開する。変換不能と既存owner操作の未完了は明示診断し、通常Workerの作成条件にはしない。DB破損やI/O異常はこの診断へ握り潰さない。
+
+隔離した実SQLite/Feature DBと認証済み作成境界のテストで、移行不能時にも通常Workerを作成できること、未設定・明示空の操作拒否、Workspace Setによる許可と変更後の拒否、移行前後の限定・失効・change ID・既存grant保持、封鎖後の保存失敗からの再開を確認した。関連の設定採用・移行・作成・schema更新45ケースが成功し、追加した移行planのWorkspace purgeも既存suiteで確認した。Runtime実行は共有fixtureによる代替であり、実Workerプロセスを起動するE2Eの成功ではない。
+
+root `cargo check`、`yoi-server` build、crate文書生成が成功した。doctest対象は0件。crate全体の通常テストは600秒で打ち切られ、途中にも失敗があるため全体成功とはしない。個別再現では、既存の直接作成fixtureが認証contextを渡さないことと、schema末尾を130に固定した期待が失敗している。purge inventory検査も既存の別テーブル群の登録漏れを報告するが、今回追加したplanテーブルはinventoryに含めた。全体format・状態契約命名検査には既存コードの不合格が残る。全失敗を今回と無関係と確定したわけではない。
+
+実DBへの適用、稼働Serverの停止・再起動、失敗要求の再送は行っていない。先の汎用拒否を画面が結果未確認と扱う失敗契約の問題、および既存Workerの未束縛grantの復旧は、この変更では修正していない。
+
+## 再起動時のSubject不存在エラーへの追加修正
+
+利用者が起動時にpermission storage migrationのSubject不存在でServerが終了したと報告した。調査では、未封鎖exportが削除フェンス付きSubjectを含む一方、移行直前のnative metadata確認は同じSubjectを不存在として拒否する不整合を確認した。隔離DBの回帰ケースは修正前に失敗した。報告された実DBの対象行自体は再照合していない。
+
+未封鎖exportは削除フェンス対象を現在の権限源から除外し、旧権限行・履歴・grant・削除フェンスは保持するよう修正した。保存済みsealと移行planは変更しない。封鎖後に対象が削除された場合はSubject不存在をtypedな移行阻害として診断し、候補を黙って変更したり通常Workerの作成を止めたりしない。I/O異常や破損はこの分類へ含めない。
+
+`subjektiv`全209件、Serverのcross-store移行21件、認証済みWorker作成・操作境界3件、設定採用22件が成功した。削除開始済みSubjectが残った状態で共通のWorkspace API起動処理と通常Worker作成を通し、対象の権限が復活しないことを確認した。root `cargo check`、`yoi-server` build、両crateの文書生成も成功した。実Serverプロセスを起動するE2Eと、前節で失敗したServer全suiteの再実行はしていない。実DB変更と稼働プロセスの操作も行っていない。
+
+## 権限参照の移行に組込みプロンプト更新が混入する起動失敗
+
+個体別権限sourceの修復後も、利用者の起動が `cannot prove reference-only source migration` で停止した。tmuxと実DBの読み取り専用評価を照合すると、3つのWorkspaceはいずれも `prompts.role.async_chat` の組込み既定値だけが保存済みschemaと現行schemaで異なっていた。権限移行が全Featureの現行schemaを候補に渡し、権限以外の変更まで採用しようとしていたことが原因だった。前回のDB整合性検査だけでは、この起動時の評価差分を検出できていなかった。
+
+`configuration_migration.rs` の候補評価は、保存済みschema bundleの権限providerだけを現行版へ置き換えるよう修正した。他Featureのschemaと設定評価を保持し、projection全体の同値性・catalog・保存時の検査は省略しない。同versionの組込みprompt差分、別Featureのschema変更・追加、旧権限schemaと修復後schema、参照wrapperの有無、Plugin catalogの本番評価経路、再実行時のno-opを隔離SQLiteで検証した。回帰ケースは修正前に報告と同じエラーで失敗し、修正後の設定採用関連34件は成功した。実DBも読み取り専用で新しいschema選択を評価し、3つのWorkspaceで同値性を確認した。今回の調査・修正では実DB変更、Server／Runtimeの停止・再起動、要求再送はしていない。
+
+root `cargo check`、`yoi-server` build、変更Rustファイルのformat検査は成功した。Server全suiteは600秒で打ち切られ、途中にも失敗があり、個別再現でもSession登録の `outcome_unknown` が残る。移行全般のfilterは119成功・16失敗で、schema末尾の固定期待、旧authority前提のfixture、隔離環境の前提不足などを確認したが、全失敗の切り分けは未完了。全体formatと状態契約命名検査も他の変更箇所で不合格であり、Server全体や実プロセスによる隔離起動の成功は主張しない。

@@ -11,55 +11,39 @@ async fn assignment_test_api_with_recording_backend(
     (api, execution)
 }
 
-// These legacy suites deliberately install exact scoped fixtures by normal CAS.
-// A Feature source supplies only its change ID, never a projection of shared sets.
-// Existing legacy grants remain in their original lanes and retain their resources.
-fn extend_legacy_assignment_fixture_permissions(
-    store: &crate::subjektiv::SubjektivStore,
-    subject: &str,
-    operation_id: String,
-    permissions: Vec<server_api::authorization::ScopedPermission>,
-) {
-    use server_api::authorization::{SubjectPermissionsUpdate, SubjectPolicySource};
-    let (expected_change_id, previous) = match store.subject_policy_source(subject).unwrap() {
-        Some(SubjectPolicySource::Legacy(policy)) => (Some(policy.change_id.clone()), Some(policy)),
-        Some(SubjectPolicySource::Feature(policy)) => (Some(policy.change_id), None),
-        None => (None, None),
-    };
-    let mut execution = previous
-        .as_ref()
-        .map(|p| p.execution.clone())
-        .unwrap_or_default();
-    for permission in permissions {
-        if !execution.contains(&permission) {
-            execution.push(permission);
+// Current Subject fixtures select operation keys through the owner domain.
+// Ticket/Workdir limits belong to their domain grants, not the shared config.
+fn extend_test_assignment_operations(api: &WorkspaceApi, subject: &str, operations: &[&str]) {
+    let previous = api
+        .config_store
+        .current_subject_permission_policy(api.workspace_id(), subject)
+        .unwrap()
+        .expect("assignment fixture has an explicit current policy");
+    assert!(
+        previous.legacy_constraints.is_none(),
+        "legacy migration fixtures require their original scoped authority"
+    );
+    let mut execution = previous.execution.clone();
+    for permission in test_operation_assignment(api, operations).grants {
+        if !execution.grants.contains(&permission) {
+            execution.grants.push(permission);
         }
     }
-    if previous.as_ref().is_some_and(|p| p.execution == execution) {
+    if execution == previous.execution {
         return;
     }
-    let delegation = previous
-        .as_ref()
-        .map(|p| p.delegation.clone())
-        .unwrap_or_default();
-    let saved = store
-        .set_subject_permissions(
-            subject,
-            &SubjectPermissionsUpdate {
-                operation_id,
-                expected_change_id,
-                execution: execution.clone(),
-                delegation: delegation.clone(),
-            },
-        )
-        .unwrap();
+    let saved = set_test_subject_policy_as_owner(
+        api,
+        subject,
+        execution.clone(),
+        previous.delegation.clone(),
+    );
     assert_eq!(saved.execution, execution);
-    assert_eq!(saved.delegation, delegation);
-    assert_eq!(store.subject_permissions(subject).unwrap().unwrap(), saved);
+    assert_eq!(saved.delegation, previous.delegation);
 }
 
 fn bootstrap_test_assignment_session(api: &WorkspaceApi, worker: &RuntimeWorkerRef) {
-    use server_api::authorization::{PermissionResource, ScopedPermission};
+    use server_api::authorization::PermissionResource;
     use session_store::WorkerMetadataStore;
     assert_eq!(worker.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
     let lease = api
@@ -68,21 +52,10 @@ fn bootstrap_test_assignment_session(api: &WorkspaceApi, worker: &RuntimeWorkerR
         .unwrap()
         .unwrap();
     let subject = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX).unwrap();
-    let store = open_subjektiv_store(api).unwrap();
-    extend_legacy_assignment_fixture_permissions(
-        &store,
+    extend_test_assignment_operations(
+        api,
         subject,
-        format!("assignment-session-{}", worker.worker_id),
-        ["session.record", "journal.recording.request"]
-            .into_iter()
-            .map(|operation| ScopedPermission {
-                operation: operation.into(),
-                resource: PermissionResource::Subject {
-                    workspace_id: api.workspace_id().into(),
-                    subject_id: subject.into(),
-                },
-            })
-            .collect(),
+        &["session.record", "journal.recording.request"],
     );
     let name = format!("worker-runtime-{}", worker.worker_id);
     let aggregate = session_store::worker_metadata::WorkerAggregateStore::new(
@@ -142,7 +115,6 @@ async fn reflect_test_assignment_session(
     worker: &RuntimeWorkerRef,
     expected_public_output: &str,
 ) {
-    use server_api::authorization::{PermissionResource, ScopedPermission};
     use subjektiv::journal::transport::{JournalJobRequest, JournalJobResponse};
     use subjektiv::journal::{JournalAction, JournalEntryState, JournalOperation};
 
@@ -153,11 +125,10 @@ async fn reflect_test_assignment_session(
         .unwrap();
     let subject = lease.key.strip_prefix(SUBJEKTIV_SINGLETON_PREFIX).unwrap();
     let store = open_subjektiv_store(api).unwrap();
-    extend_legacy_assignment_fixture_permissions(
-        &store,
+    extend_test_assignment_operations(
+        api,
         subject,
-        format!("assignment-journal-{}", worker.worker_id),
-        [
+        &[
             "journal.job.input.read",
             "journal.job.input.supply",
             "journal.state.read",
@@ -165,16 +136,7 @@ async fn reflect_test_assignment_session(
             "journal.position.update",
             "journal.checkpoint",
             "journal.finish",
-        ]
-        .into_iter()
-        .map(|operation| ScopedPermission {
-            operation: operation.into(),
-            resource: PermissionResource::Subject {
-                workspace_id: api.workspace_id().into(),
-                subject_id: subject.into(),
-            },
-        })
-        .collect(),
+        ],
     );
     let attrs = store
         .subject_session_attributions(subject)
@@ -395,7 +357,11 @@ async fn assignment_disconnect_after_restore_keeps_shutdown_and_old_protocol_fen
         .stop_worker(&worker, WorkerLifecycleRequest::default())
         .unwrap();
     assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
-    let first = api.runtime.backend_job_termination(&worker).unwrap().unwrap();
+    let first = api
+        .runtime
+        .backend_job_termination(&worker)
+        .unwrap()
+        .unwrap();
     assert!(old.validate().is_err());
 
     execution.accept_restores();
@@ -438,7 +404,11 @@ async fn assignment_disconnect_after_restore_keeps_shutdown_and_old_protocol_fen
         "{:?}",
         stopped.diagnostics
     );
-    let second = api.runtime.backend_job_termination(&worker).unwrap().unwrap();
+    let second = api
+        .runtime
+        .backend_job_termination(&worker)
+        .unwrap()
+        .unwrap();
     assert_ne!(first.execution_id, second.execution_id);
     assert!(second.confirms_scope_shutdown(&worker_ref, second.stop_operation_id));
     assert!(current.validate().is_err());

@@ -9,12 +9,12 @@ pub(crate) const FILESYSTEM: BuiltinPermissionDeclaration = BuiltinPermissionDec
         BuiltinPermissionOperation {
             key: "filesystem.read",
             description: "Read files and enumerate directories within the selected path and recursive scope; provider scope still applies.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "filesystem.write",
             description: "Create or edit files within the selected path and recursive scope; does not permit commands.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-execution"],
         },
     ],
 };
@@ -26,7 +26,7 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         BuiltinPermissionOperation {
             key: "workdir.read",
             description: "Read selected Workdir metadata; does not grant file access.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "workdir.attach",
@@ -36,27 +36,27 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         BuiltinPermissionOperation {
             key: "workdir.delete",
             description: "Delete the selected Workdir only if existing occupancy and retention conditions permit it.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "workdir.list",
             description: "List Workdir metadata; does not grant attachment or file access.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "workdir.attachment.list",
             description: "List Workdir attachment metadata.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "workdir.create",
             description: "Materialize selected repository using existing provider grants and explicit selectors.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination"],
         },
         BuiltinPermissionOperation {
             key: "workdir.attachment.read",
             description: "Read metadata for this exact attachment connection.",
-            sets: &["implementer"],
+            sets: &["implementer", "work-coordination", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "workdir.detach",

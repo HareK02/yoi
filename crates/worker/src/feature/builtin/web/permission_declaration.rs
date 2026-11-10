@@ -9,12 +9,12 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         BuiltinPermissionOperation {
             key: "web.fetch",
             description: "Fetch this exact HTTP(S) URL. Each redirect needs its own permission; private/local hosts remain denied.",
-            sets: &["implementer", "companion"],
+            sets: &["implementer", "companion", "work-execution"],
         },
         BuiltinPermissionOperation {
             key: "web.search",
             description: "Contact this exact search provider endpoint; credentials and network restrictions still apply.",
-            sets: &["implementer", "companion"],
+            sets: &["implementer", "companion", "work-execution"],
         },
     ],
 };

@@ -1,70 +1,249 @@
 /**
- * Browser UXだけの合成HTTP状態。実Backend、認証、認可、操作catalog、取消の実装ではない。
+ * Browser UXだけの合成HTTP状態。実Backend、認証、認可、resolver、取消の実装ではない。
  * 実Backendの結合証拠は、このbrowser fixtureと分けて保持する。
  */
+import type {
+  PermissionAssignment,
+  PermissionCatalog,
+  PermissionReference,
+  PermissionResolution,
+} from "../../../web/workspace/src/lib/generated/feature-permissions.generated.ts";
+import type {
+  CurrentSubjectPolicy,
+  SubjectPermissionPolicyResponse,
+} from "../../../web/workspace/src/lib/workspace/memory/permissions.ts";
+
 export const permissionFixtureSubjects = [
-  ["permissions-empty", "New Subject — permissions not configured"],
+  ["permissions-empty", "Subject policy unset"],
   ["permissions-edit", "Release coordination"],
-  ["permissions-legacy", "Subject with preserved legacy permissions"],
-  ["permissions-reader", "Read-only Subject permissions"],
-  ["permissions-unavailable", "Unavailable Subject permissions"],
+  ["permissions-legacy", "Subject with retained domain restrictions"],
+  ["permissions-reader", "Read-only Subject policy"],
+  ["permissions-unavailable", "Unavailable Subject policy"],
+  ["permissions-explicit-empty", "Explicitly empty Subject assignments"],
+  ["permissions-removed", "Removed Subject policy with a tombstone"],
+  ["permissions-revoked", "Revoked Subject assignments"],
+  ["permissions-excluded", "Subject assignments with exclusions"],
+  ["permissions-longnames", "Subject policy with deliberately long set, namespace and operation names"],
+  ["permissions-diagnostics", "Unresolved and disabled permission references"],
+  ["permissions-anonymous", "Subject policy requires authentication"],
+  ["permissions-forbidden", "Subject policy access denied"],
 ] as const;
 
-export type FixturePermission = {
-  operation: string;
-  resource: Record<string, string | boolean> & { kind: string };
-};
-export type FixturePolicy = {
-  change_id: string;
-  execution: FixturePermission[];
-  delegation: FixturePermission[];
-};
-type FixtureUpdate = Omit<FixturePolicy, "change_id"> & {
-  operation_id: string;
-  expected_change_id: string | null;
-};
-
+export type FixturePermission =
+  NonNullable<CurrentSubjectPolicy["legacy_constraints"]>["execution"][number];
+export type FixturePolicy = CurrentSubjectPolicy;
 const workspaceId = "memory-review";
-const resource = { kind: "ticket", workspace_id: workspaceId, ticket_id: "T-802" };
 export const fixtureLegacyPermission: FixturePermission = {
   operation: "worker.notify",
   resource: { kind: "worker", runtime_id: "legacy-runtime", worker_id: "legacy-recipient" },
 };
-// 小さな合成catalogに限定する。製品catalogの複製や第二正本ではない。
-export const fixturePermissionOperations: {
-  operation: string;
-  label: string;
-  description: string;
-  resource_kinds: string[];
-  availability: { kind: "available" } | { kind: "unavailable"; reason: string };
-}[] = [
-  {
-    operation: "ticket.read",
-    label: "Read ticket",
-    description: "Read the selected ticket. Does not allow editing or closing it.",
-    resource_kinds: ["ticket"],
-    availability: { kind: "available" },
-  },
-  {
-    operation: "ticket.comment",
-    label: "Comment on ticket",
-    description: "Append a comment to the selected ticket; no completion or assignment authority.",
-    resource_kinds: ["ticket"],
-    availability: { kind: "available" },
-  },
-  {
-    operation: "worker.messaging",
-    label: "Message a Worker (T-803)",
-    description:
-      "Operation use is separate from Backend directional target control grants and execution conditions.",
-    resource_kinds: [],
-    availability: {
-      kind: "unavailable",
-      reason: "T-803 is not implemented in this synthetic browser fixture.",
-    },
-  },
-];
+export const fixtureLongNames = {
+  set: `work-execution-${"deliberately-long-set-identity-".repeat(5)}`,
+  namespace: `ticket-${"deliberately-long-namespace-identity-".repeat(5)}`,
+  feature: `feature-${"deliberately-long-feature-identity-".repeat(5)}`,
+  key: `ticket.${"deliberately-long-operation-segment.".repeat(8)}read`,
+};
+const namespace = (name: string, keys: string[]): PermissionReference => ({
+  kind: "namespace",
+  value: { namespace: name, keys },
+});
+const set = (value: string): PermissionReference => ({ kind: "set", value });
+const assignment = (
+  grants: PermissionReference[] = [],
+  exclusions: PermissionReference[] = [],
+  revoked = false,
+): PermissionAssignment => ({ grants, exclusions, revoked });
 
+// 小さな合成catalogと明示的な解決結果だけを使い、製品resolverを再実装しない。
+const catalog: PermissionCatalog = {
+  workspace: workspaceId,
+  namespaces: [
+    {
+      namespace: "ticket",
+      feature: "ticket",
+      enabled: true,
+      declaration: {
+        permissions: [
+          {
+            key: "ticket.operations",
+            description: "Explicitly declared ticket operation children.",
+            children: ["ticket.read", "ticket.comment"],
+          },
+          {
+            key: "ticket.read",
+            description: "Read a ticket, subject to its domain restrictions.",
+            children: [],
+          },
+          {
+            key: "ticket.comment",
+            description: "Append a comment; no assignment or completion authority.",
+            children: [],
+          },
+        ],
+        sets: [
+          { set: "conversation", children: [namespace("ticket", ["ticket.read"])] },
+          { set: "work-execution", children: [namespace("ticket", ["ticket.operations"])] },
+        ],
+      },
+    },
+    {
+      namespace: "worker",
+      feature: "worker",
+      enabled: false,
+      declaration: {
+        permissions: [{
+          key: "worker.messaging",
+          description: "Disabled synthetic Feature; no Worker messaging authority is implied.",
+          children: [],
+        }],
+        sets: [],
+      },
+    },
+  ],
+};
+function resolution(
+  allowed: PermissionResolution["allowed"] = {},
+  diagnostics: PermissionResolution["diagnostics"] = [],
+): PermissionResolution {
+  return { workspace: workspaceId, allowed, diagnostics };
+}
+function origin(setId: string, key: string): PermissionResolution["allowed"][string] {
+  return [[
+    { kind: "set", value: setId },
+    { kind: "feature", value: "ticket" },
+    ...(setId === "work-execution" ? [{ kind: "key" as const, value: "ticket.operations" }] : []),
+    { kind: "key", value: key },
+  ]];
+}
+function currentView(id: string): SubjectPermissionPolicyResponse {
+  const policy: FixturePolicy = {
+    change_id: `fixture-initial-${id}`,
+    execution: assignment([set("conversation")]),
+    delegation: assignment([set("work-execution")]),
+    legacy_constraints: null,
+    reference_encoding: "feature_sets_v2",
+  };
+  const view: SubjectPermissionPolicyResponse = {
+    change_id: policy.change_id,
+    policy,
+    can_manage: id !== "permissions-reader",
+    catalog: structuredClone(catalog),
+    execution_resolution: resolution({ "ticket.read": origin("conversation", "ticket.read") }),
+    delegation_resolution: resolution({
+      "ticket.read": origin("work-execution", "ticket.read"),
+      "ticket.comment": origin("work-execution", "ticket.comment"),
+    }),
+  };
+  switch (id) {
+    case "permissions-empty":
+    case "permissions-removed":
+      view.policy = null;
+      view.change_id = id === "permissions-empty" ? null : "fixture-removal-permissions-removed";
+      view.execution_resolution = resolution({}, [{ kind: "unset" }]);
+      view.delegation_resolution = resolution({}, [{ kind: "unset" }]);
+      break;
+    case "permissions-explicit-empty":
+      policy.execution = assignment();
+      policy.delegation = assignment();
+      view.execution_resolution = resolution();
+      view.delegation_resolution = resolution();
+      break;
+    case "permissions-revoked":
+      policy.execution.revoked = true;
+      policy.delegation.revoked = true;
+      view.execution_resolution = resolution({}, [{ kind: "revoked" }]);
+      view.delegation_resolution = resolution({}, [{ kind: "revoked" }]);
+      break;
+    case "permissions-excluded":
+      policy.execution = assignment(
+        [set("work-execution")],
+        [namespace("ticket", ["ticket.comment"])],
+      );
+      policy.delegation = assignment([set("work-execution")], [set("work-execution")]);
+      view.execution_resolution = resolution(
+        { "ticket.read": origin("work-execution", "ticket.read") },
+        [{ kind: "excluded", value: "ticket.comment" }],
+      );
+      view.delegation_resolution = resolution({}, [
+        { kind: "excluded", value: "ticket.read" },
+        { kind: "excluded", value: "ticket.comment" },
+      ]);
+      break;
+    case "permissions-legacy":
+      // 旧参照を新しい包括grantへ読み替えず、限定された対象の証拠を残す。
+      delete policy.reference_encoding;
+      policy.execution = assignment([namespace("ticket", ["ticket.read"])]);
+      policy.delegation = assignment([set("legacy-worker-notify")]);
+      policy.legacy_constraints = {
+        change_id: "fixture-retained-domain-constraints",
+        execution: [{
+          operation: "ticket.read",
+          resource: { kind: "ticket", workspace_id: workspaceId, ticket_id: "T-802" },
+        }],
+        delegation: [structuredClone(fixtureLegacyPermission)],
+      };
+      view.execution_resolution = resolution({
+        "ticket.read": [[
+          { kind: "feature", value: "ticket" },
+          { kind: "key", value: "ticket.read" },
+        ]],
+      });
+      view.delegation_resolution = resolution({}, [
+        { kind: "unknown_set", value: "legacy-worker-notify" },
+      ]);
+      break;
+    case "permissions-longnames":
+      view.catalog.namespaces.push({
+        namespace: fixtureLongNames.namespace,
+        feature: fixtureLongNames.feature,
+        enabled: true,
+        declaration: {
+          permissions: [{
+            key: fixtureLongNames.key,
+            description: "Long identifiers must wrap without hiding the full value.",
+            children: [],
+          }],
+          sets: [{
+            set: fixtureLongNames.set,
+            children: [namespace(fixtureLongNames.namespace, [fixtureLongNames.key])],
+          }],
+        },
+      });
+      policy.execution = assignment([set(fixtureLongNames.set)]);
+      policy.delegation = assignment([namespace(fixtureLongNames.namespace, [fixtureLongNames.key])]);
+      view.execution_resolution = resolution({
+        [fixtureLongNames.key]: [[
+          { kind: "set", value: fixtureLongNames.set },
+          { kind: "feature", value: fixtureLongNames.feature },
+          { kind: "key", value: fixtureLongNames.key },
+        ]],
+      });
+      view.delegation_resolution = resolution({
+        [fixtureLongNames.key]: [[
+          { kind: "feature", value: fixtureLongNames.feature },
+          { kind: "key", value: fixtureLongNames.key },
+        ]],
+      });
+      break;
+    case "permissions-diagnostics":
+      policy.execution = assignment([
+        set("missing-set"),
+        namespace("missing-namespace", ["missing.operation"]),
+        namespace("ticket", ["ticket.unknown"]),
+        namespace("worker", ["worker.messaging"]),
+      ]);
+      policy.delegation = assignment();
+      view.execution_resolution = resolution({}, [
+        { kind: "unknown_set", value: "missing-set" },
+        { kind: "unknown_namespace", value: "missing-namespace" },
+        { kind: "unknown_key", value: "ticket.unknown" },
+        { kind: "disabled_feature", value: "worker" },
+      ]);
+      view.delegation_resolution = resolution();
+      break;
+  }
+  return view;
+}
 function json(value: unknown, status = 200): Response {
   return Response.json(value, {
     status,
@@ -74,33 +253,10 @@ function json(value: unknown, status = 200): Response {
 function error(message: string, status: number): Response {
   return json({ error: "Synthetic fixture response", message }, status);
 }
-function isUpdate(value: unknown): value is FixtureUpdate {
-  if (!value || typeof value !== "object") return false;
-  const v = value as Record<string, unknown>;
-  return typeof v.operation_id === "string" && v.operation_id.length > 0 &&
-    (v.expected_change_id === null || typeof v.expected_change_id === "string") &&
-    Array.isArray(v.execution) && Array.isArray(v.delegation) &&
-    [...v.execution, ...v.delegation].every((p) =>
-      p && typeof p.operation === "string" && p.resource && typeof p.resource.kind === "string"
-    );
-}
 
 export function createSubjectPermissionsFixture() {
-  const policies = new Map<string, FixturePolicy | null>();
-  const receipts = new Map<string, { input: string; permissions: FixturePolicy }>();
-  const requests: { subject_id: string; request: FixtureUpdate; outcome: string }[] = [];
-  let issuedChangeCount = 0;
-  for (const [id] of permissionFixtureSubjects) {
-    policies.set(
-      id,
-      id === "permissions-empty" ? null : {
-        change_id: `fixture-initial-${id}`,
-        execution: [{ operation: "ticket.read", resource: { ...resource } }],
-        delegation: id === "permissions-legacy" ? [structuredClone(fixtureLegacyPermission)] : [],
-      },
-    );
-  }
-
+  const subjects = new Set<string>(permissionFixtureSubjects.map(([id]) => id));
+  const requests: { path: string; method: string }[] = [];
   return async (request: Request): Promise<Response | null> => {
     const url = new URL(request.url);
     if (url.pathname === "/api/auth/whoami") {
@@ -123,64 +279,16 @@ export function createSubjectPermissionsFixture() {
       return json({ authority: "synthetic-http-not-real-backend", requests });
     }
     const match = url.pathname.match(
-      /^\/api\/w\/([^/]+)\/subjektiv\/subjects\/([^/]+)\/permissions$/,
+      /^\/api\/w\/([^/]+)\/subjektiv\/subjects\/([^/]+)\/permission-policy$/,
     );
     if (!match) return null;
+    requests.push({ path: url.pathname, method: request.method });
     const [, workspace, id] = match.map(decodeURIComponent);
-    if (workspace !== workspaceId || !policies.has(id)) return error("Subject unavailable", 404);
+    if (workspace !== workspaceId || !subjects.has(id)) return error("Subject unavailable", 404);
+    if (request.method !== "GET") return error("Read-only fixture; GET required", 405);
+    if (id === "permissions-anonymous") return error("Authentication required", 401);
+    if (id === "permissions-forbidden") return error("Subject policy access denied", 403);
     if (id === "permissions-unavailable") return error("Permission service unavailable", 503);
-    const current = policies.get(id)!;
-    if (request.method === "GET") {
-      return json({
-        permissions: current,
-        can_manage: id !== "permissions-reader",
-        operations: fixturePermissionOperations,
-      });
-    }
-    if (request.method !== "POST") return error("POST required", 405);
-    if (id === "permissions-reader") return error("Actor cannot manage permissions", 403);
-    const payload: unknown = await request.json().catch(() => null);
-    if (!isUpdate(payload)) return error("Invalid synthetic policy update", 400);
-    const input = JSON.stringify(payload);
-    const receiptKey = JSON.stringify([id, payload.operation_id]);
-    const previous = receipts.get(receiptKey);
-    if (previous) {
-      requests.push({ subject_id: id, request: payload, outcome: "replay" });
-      if (previous.input !== input) {
-        return error("Operation identity reused with changed input", 409);
-      }
-      return json({ permissions: previous.permissions, interruptions: [] });
-    }
-    if (payload.expected_change_id !== (current?.change_id ?? null)) {
-      requests.push({ subject_id: id, request: payload, outcome: "conflict" });
-      return error("Policy changed in another browser; reload and review", 409);
-    }
-    // fixtureで使う組合せだけを拒否する。Backend検証の証拠にはしない。
-    for (const p of [...payload.execution, ...payload.delegation]) {
-      const legacy = JSON.stringify(p) === JSON.stringify(fixtureLegacyPermission) &&
-        id === "permissions-legacy";
-      const supported = fixturePermissionOperations.some((o) =>
-        o.availability.kind === "available" && o.operation === p.operation &&
-        o.resource_kinds.includes(p.resource.kind)
-      );
-      if (!legacy && !supported) {
-        return error("Unknown operation or invalid resource combination", 400);
-      }
-      if (
-        p.resource.kind === "ticket" &&
-        (p.resource.workspace_id !== workspaceId || !p.resource.ticket_id)
-      ) {
-        return error("Invalid ticket target", 400);
-      }
-    }
-    const saved: FixturePolicy = {
-      change_id: `fixture-change-${++issuedChangeCount}`,
-      execution: structuredClone(payload.execution),
-      delegation: structuredClone(payload.delegation),
-    };
-    policies.set(id, saved);
-    receipts.set(receiptKey, { input, permissions: structuredClone(saved) });
-    requests.push({ subject_id: id, request: payload, outcome: "saved" });
-    return json({ permissions: saved, interruptions: [] });
+    return json(currentView(id));
   };
 }

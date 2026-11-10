@@ -1,57 +1,21 @@
-//! Owner-only adoption of Workspace source and Subject policy in the Server transaction.
+//! Workspace source publication and retained native permission-transfer evidence.
 //!
-//! The old Feature database is exported and permanently sealed before its immutable
-//! transfer is adopted here. That preparation is not a distributed commit: failure
-//! after seal leaves an explicit, resumable transfer, never a legacy fallback.
-//! Normal saves never touch the old database. Object preparation, source,
-//! projection, policy, editing head and receipt commit in one caller-owned transaction.
+//! Current configuration contains reusable Sets and creation selections, never
+//! individual Subject assignments. Ordinary owner saves do not replace, remove,
+//! enroll or change the identity of any Subject policy. Dedicated Subject operations
+//! own those changes independently of configuration history and source digests.
 //!
-//! # Editing and reconciliation
+//! Initial native permission transfer remains one-way and preserves the exact
+//! saved policy and change identities. The frozen plan precedes its separate
+//! Feature seal; a failed publication resumes that plan rather than issuing new
+//! defaults or treating the migration as owner approval. Ordinary human Worker
+//! creation remains independent of an unavailable native Subject transfer.
 //!
-//! Owner authentication precedes all source, preview, adoption and reconciliation
-//! operations. The public transport contract belongs to
-//! [`server_api::configuration_adoption`]. It extends the existing virtual tree;
-//! imports resolve within one snapshot and no host filesystem path grants access.
-//! Before cutover, retrieval returns an evaluated editable migration draft, not a
-//! saved change. Preview is read-only and reports changed paths and Subjects.
-//!
-//! Content identity and editing history are distinct. Adoption compares the
-//! observed history head as well as the source digest, so A -> B -> A cannot
-//! authorize an old editor. The request fingerprint binds Workspace, authenticated
-//! owner and the entire request (including catalog, export, head and changes).
-//! Reuse of an operation ID with different input is a conflict. Exact replay
-//! returns historical evidence before stale-head checks; it never reapplies policy.
-//!
-//! After a lost response, retain the full request and reconcile it with that same
-//! ID. An adopted receipt proves that request's stored result, not today's head.
-//! A pending transfer proves the immutable legacy seal, not Server adoption.
-//! Absence of either is not evidence of failure or permission to generate a new
-//! ID. Retry the exact request; read current source before a distinct edit.
-//!
-//! # Cutover boundary
-//!
-//! Initial cutover and legacy logical config writes acquire the guarded Feature
-//! authority transaction before Server storage. Sealing commits independently;
-//! the outer Feature connection guard remains held through the Server result.
-//! After seal, both old policy writes and old logical source writes reject,
-//! including when Server persistence rolls back. Reopen/retry uses the same
-//! identity-bound export and request. No in-memory mutex is the durable fence.
-//! Validation (including blocking migration diagnostics) precedes seal. Failure
-//! there retains legacy authority and the previous source/policy/head/receipt.
-//! A failure after seal retains the old Server source but fails closed for runtime
-//! reads until the same transfer is adopted. This is not a distributed atomic
-//! commit or a guarantee for arbitrary machine loss at every instruction.
-//!
-//! Existing explicit permissions are never automatically merged or replaced,
-//! even when empty. Unsupported operations or child-expanding conversions block
-//! adoption rather than dropping entries. Exact limited legacy constraints and
-//! change identities remain in the domain, separate from editable permission keys.
-//! History and child grants are retained, not regenerated as new authorizations.
-//!
-//! A receipt separately confirms source storage and policy commit. Its typed
-//! runtime application means the next current-policy check, not interruption,
-//! reload or termination of an already-running Worker. Legacy consumers cannot
-//! turn a new unrepresented key into an all-target grant.
+//! Source publication compares content and editing history, with owner identity
+//! and full request bound to immutable receipts. Historical replay returns its
+//! saved result without applying current source or Subject policy. A native seal,
+//! adoption receipt and current authority are separate facts; never unseal or
+//! regenerate retained transfer evidence to recover a failed publication.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -121,57 +85,6 @@ pub(crate) struct ConfigurationPolicyTransfer {
     pub physical_identity: String,
     pub export_digest: String,
     pub policies: BTreeMap<String, AdoptedSubjectPolicy>,
-}
-
-pub(crate) struct CanonicalConfigurationSource {
-    pub store: SqliteWorkspaceStore,
-    pub host: PermissionHost,
-}
-
-impl subjektiv::CanonicalPermissionSource for CanonicalConfigurationSource {
-    fn subject_policy_source(
-        &self,
-        workspace: &str,
-        subject: &str,
-    ) -> subjektiv::Result<Option<server_api::authorization::SubjectPolicySource>> {
-        self.current_subject_policy(workspace, subject)
-            .map(|source| source.map(server_api::authorization::SubjectPolicySource::Feature))
-    }
-
-    fn current_subject_policy(
-        &self,
-        workspace: &str,
-        subject: &str,
-    ) -> subjektiv::Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
-        if self.host.catalog().workspace.as_str() != workspace {
-            return Err(subjektiv::SubjektivError::PermissionTransferConflict);
-        }
-        self.store
-            .adopted_subject_policy(workspace, subject)
-            .map(|policy| policy.map(|policy| policy.current()))
-            .map_err(|error| {
-                subjektiv::SubjektivError::InvalidRecord(format!(
-                    "canonical policy unavailable: {error}"
-                ))
-            })
-    }
-
-    fn subject_permissions(
-        &self,
-        workspace: &str,
-        subject: &str,
-    ) -> subjektiv::Result<Option<server_api::authorization::SubjectPermissions>> {
-        if self.host.catalog().workspace.as_str() != workspace {
-            return Err(subjektiv::SubjektivError::PermissionTransferConflict);
-        }
-        self.store
-            .adopted_subject_legacy_permissions(workspace, subject, &self.host)
-            .map_err(|error| {
-                subjektiv::SubjektivError::InvalidRecord(format!(
-                    "canonical configuration policy unavailable: {error}"
-                ))
-            })
-    }
 }
 
 pub(crate) struct ConfigurationCurrent {
@@ -327,139 +240,8 @@ fn changed_paths(before: &ConfigTreeSnapshot, after: &ConfigTreeSnapshot) -> Vec
         .map(|path| path.as_str().to_owned())
         .collect()
 }
-fn changed_subjects(
-    before: &BTreeMap<String, AdoptedSubjectPolicy>,
-    after: &BTreeMap<String, AdoptedSubjectPolicy>,
-) -> Vec<String> {
-    before
-        .keys()
-        .chain(after.keys())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|subject| before.get(*subject) != after.get(*subject))
-        .cloned()
-        .collect()
-}
 
 impl SqliteWorkspaceStore {
-    /// Complete a just-created Subject's post-seal enrollment through the *same*
-    /// source adoption writer used by owner edits. Call only from authenticated
-    /// creation/retry, never from permission reads, launch, restore or migration.
-    /// `account` is the authenticated Workspace owner, `schema` the application's
-    /// composed config_schema_registry. `acquire_host` returns the current catalog
-    /// and its lease after the native Feature connection/IMMEDIATE transaction;
-    /// that lease stays alive through the Server adoption COMMIT.
-    ///
-    /// Feature creation commits independently. A failure leaves durable enrollment
-    /// evidence and no permission: retry creation with its original request, then
-    /// call this again. The stable Server adoption receipt consumes enrollment once;
-    /// historical replay never edits today's source or revives a removed policy.
-    /// No new database, policy mirror, migration writer or path-based authority.
-    pub(crate) fn enroll_created_subject<L>(
-        &self,
-        workspace: &str,
-        account: &str,
-        legacy: &subjektiv::SubjektivStore,
-        subject: &str,
-        schema: WorkspaceConfigSchemaBundle,
-        acquire_host: impl FnOnce() -> Result<(L, PermissionHost)>,
-    ) -> Result<Option<ConfigurationAdoptionResult>> {
-        self.enroll_created_subject_observed(
-            workspace,
-            account,
-            legacy,
-            subject,
-            schema,
-            acquire_host,
-            || {},
-        )
-    }
-
-    pub(crate) fn enroll_created_subject_observed<L>(
-        &self,
-        workspace: &str,
-        account: &str,
-        legacy: &subjektiv::SubjektivStore,
-        subject: &str,
-        schema: WorkspaceConfigSchemaBundle,
-        acquire_host: impl FnOnce() -> Result<(L, PermissionHost)>,
-        before_feature: impl FnOnce(),
-    ) -> Result<Option<ConfigurationAdoptionResult>> {
-        // Authenticate before looking at Feature metadata or enrollment evidence.
-        self.configuration_current(workspace, account)?;
-        if legacy.scope_id() != workspace {
-            return Err(Error::WorkspaceIdMismatch);
-        }
-        let operation = format!("subject-enrollment:{subject}");
-        let identity = legacy
-            .database_identity()
-            .map_err(|error| Error::Store(format!("Subject enrollment identity: {error}")))?;
-        before_feature();
-        legacy.with_permission_authority_guard(&identity, |authority| {
-            // Holds Feature lifecycle/deletion fence before entering Server storage.
-            authority.require_subject(subject)?;
-            let enrollment = authority.subject_permission_enrollment(subject)?;
-            Ok((|| {
-                let (_lease, host) = acquire_host()?;
-                if host.catalog().workspace.as_str() != workspace {
-                    return Err(Error::WorkspaceIdMismatch);
-                }
-                let Some(enrollment) = enrollment else {
-                    return Ok(None);
-                };
-                // Read-only receipt lookup precedes current-source checks. It is
-                // historical evidence, not a request to apply the saved assignment.
-                if let Some(saved) = self.configuration_adoption_result(workspace, account, &operation)? {
-                    return Ok(Some(saved));
-                }
-                let current = self.configuration_current(workspace, account)?;
-                if !current.canonical {
-                    return Err(conflict("Subject creation is sealed but the configuration transfer is not adopted; reconcile that transfer first"));
-                }
-                let contract = config_source::ToolchainContract::with_schema_bundle(
-                    current.state.contract.schema_version,
-                    current.state.contract.entrypoints.clone(),
-                    current.state.contract.import_policy_version,
-                    schema.clone(),
-                );
-                let evaluated = config_source::SnapshotEnvironment::new(current.state.snapshot.clone())
-                    .evaluate_contract(&contract)
-                    .map_err(|error| Error::InvalidInput(format!("Subject enrollment source: {error:?}")))?;
-                let source = policy_config::source(&evaluated)?;
-                // An explicit owner decision always wins. Consume the enrollment
-                // with a no-op ordinary adoption so a later deletion cannot make
-                // this creation receipt an unconsumed default issuance request.
-                let changes = if current.policies.contains_key(subject)
-                    || source.subjects.iter().any(|item| item.subject_id == subject)
-                    || source.remove_subjects.iter().any(|item| item == subject) {
-                    vec![]
-                } else {
-                    let server_api::authorization::SubjectPolicySource::Feature(policy) = &enrollment else {
-                        return Err(Error::InvalidInput("legacy creation enrollment needs explicit source configuration; no default was issued".into()));
-                    };
-                    let assignment = AdoptedSubjectPolicy::from_current(subject, policy);
-                    let editing = WorkspaceConfigState { contract: contract.clone(), ..current.state.clone() };
-                    crate::configuration_migration::enrollment_changes(&editing, &assignment.source)?
-                };
-                let request = ConfigurationAdoptionRequest {
-                    operation_id: operation,
-                    expected_head: current.history_head,
-                    expected_catalog_digest: catalog_digest(&host)?,
-                    expected_legacy_export: None,
-                    source: ConfigCommitRequest {
-                        base_digest: current.state.snapshot.digest,
-                        changes,
-                        entrypoints: contract.entrypoints,
-                    },
-                };
-                self.adopt_configuration(workspace, account, &request, schema, &host, None,
-                    |id| authority.require_subject(id).map_err(|error| Error::Store(format!("Subject enrollment reference: {error}"))),
-                    |_| Err(conflict("Subject enrollment must never migrate permission authority")),
-                ).map(Some)
-            })())
-        }).map_err(|error| Error::Store(format!("Subject enrollment guard: {error}")))?
-    }
-
     pub(crate) fn configuration_policy_is_canonical(&self, workspace: &str) -> Result<bool> {
         self.with_conn(|connection| canonical(connection, workspace))
     }
@@ -537,7 +319,7 @@ impl SqliteWorkspaceStore {
         self.with_conn(|conn| {
             require_owner(conn, workspace, account, FailureOperation::Preview)?;
             let tx = conn.unchecked_transaction()?;
-            let (current, state, source) = prepare(
+            let (current, state, _source) = prepare(
                 &tx,
                 workspace,
                 request,
@@ -547,16 +329,10 @@ impl SqliteWorkspaceStore {
                 &mut require_subject,
                 FailureOperation::Preview,
             )?;
-            let before = match baseline {
-                Some(baseline) => baseline.policies.clone(),
-                None => policies(&tx, workspace)?,
-            };
-            let mut after = before.clone();
-            policy_config::apply(&mut after, &source, "preview");
             Ok(ConfigurationPreview {
                 expected_head: request.expected_head.clone(),
                 changed_paths: changed_paths(&current.snapshot, &state.snapshot),
-                changed_subjects: changed_subjects(&before, &after),
+                changed_subjects: vec![],
                 state,
             })
         })
@@ -583,7 +359,7 @@ impl SqliteWorkspaceStore {
                 if saved != fingerprint { return Err(failure(FailureOperation::Adopt, FailureReason::RequestIdentityConflict)); }
                 return Ok(result);
             }
-            let (_,state,source) = prepare(tx,workspace,request,schema,host,baseline,&mut require_subject,FailureOperation::Adopt)?;
+            let (_,state,_source) = prepare(tx,workspace,request,schema,host,baseline,&mut require_subject,FailureOperation::Adopt)?;
             let authority_exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workspace_configuration_authorities WHERE workspace_id=?1)", [workspace], |r|r.get(0))?;
             if authority_exists && (baseline.is_some() || request.expected_legacy_export.is_some()) {
                 return Err(conflict("legacy transfer is already adopted; reload current source"));
@@ -591,17 +367,14 @@ impl SqliteWorkspaceStore {
             if !authority_exists && request.expected_legacy_export.is_none() {
                 return Err(conflict("legacy export identity must be observed before transfer"));
             }
-            let mut current_policies = if authority_exists { policies(tx,workspace)? } else {
+            let migration_policies = if authority_exists { None } else {
                 let transfer = prepare_transfer(&fingerprint)?;
                 if transfer.transfer_identity != fingerprint || request.expected_legacy_export.as_deref() != Some(transfer.export_digest.as_str()) {
                     return Err(conflict("transfer does not bind the complete adoption request and export"));
                 }
                 tx.execute("INSERT INTO workspace_configuration_authorities VALUES(?1,?2,?3,?4)",params![workspace,transfer.transfer_identity,transfer.physical_identity,transfer.export_digest])?;
-                transfer.policies
+                Some(transfer.policies)
             };
-            // Client-selected operation IDs are not policy change identities: reusing
-            // an old legacy change ID must never make a stale child grant current.
-            policy_config::apply(&mut current_policies,&source,&format!("configuration:{fingerprint}"));
             crate::config_source::sync_adopted_config_references(tx, workspace, &state)?;
             let authority = OwnerScope(workspace);
             let content = ScopedStore::new(tx,scope(workspace),&authority);
@@ -609,9 +382,10 @@ impl SqliteWorkspaceStore {
             for (id,object) in &prepared.objects { content.put(*id,&object.encode()).map_err(content_error)?; }
             tx.execute("DELETE FROM workspace_config_entries WHERE workspace_id=?1",[workspace])?;
             crate::config_source::insert_materialized_state(tx,workspace,&state,&chrono::Utc::now().to_rfc3339())?;
-            tx.execute("DELETE FROM workspace_configuration_policies WHERE workspace_id=?1",[workspace])?;
-            for (subject,policy) in &current_policies {
-                tx.execute("INSERT INTO workspace_configuration_policies VALUES(?1,?2,?3)", params![workspace,subject,json(policy)?])?;
+            if let Some(current_policies) = migration_policies {
+                for (subject,policy) in &current_policies {
+                    tx.execute("INSERT INTO workspace_configuration_policies VALUES(?1,?2,?3)", params![workspace,subject,json(policy)?])?;
+                }
             }
             let new_head = content.adopt(prepared.root,head(tx,workspace)?,account.into(),chrono::Utc::now().timestamp_micros()).map_err(content_error)?;
             let result = ConfigurationAdoptionResult {
@@ -706,6 +480,10 @@ fn prepare(
     Ok((current, state, source))
 }
 
+pub(crate) mod automatic;
+#[cfg(test)]
+mod semantic_reference_tests;
+pub(crate) mod semantic_references;
 mod worker_permissions;
 
 #[cfg(test)]

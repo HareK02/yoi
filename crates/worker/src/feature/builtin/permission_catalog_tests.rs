@@ -5,9 +5,9 @@ use crate::feature::permissions::FeaturePermissionRegistrar;
 use crate::feature::{FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureModule};
 use feature_permissions::*;
 use server_api::authorization::{
-    COMPANION_PERMISSION_SET, IMPLEMENTER_PERMISSION_SET, SUBJECT_DEFAULT_PERMISSION_SET,
-    SUBJECT_DELEGATE_PERMISSION, subject_default_delegation_assignment,
-    subject_default_permission_assignment,
+    COMPANION_PERMISSION_SET, CONVERSATION_PERMISSION_SET, IMPLEMENTER_PERMISSION_SET,
+    WORK_COORDINATION_PERMISSION_SET, WORK_EXECUTION_PERMISSION_SET,
+    subject_default_delegation_assignment, subject_default_permission_assignment,
 };
 use std::collections::BTreeSet;
 
@@ -51,14 +51,35 @@ fn builtin_declarations_preserve_legacy_exact_keys_without_using_legacy_resource
                 )
                 .is_some()
         );
+        assert_ne!(namespace.namespace.as_str(), "subject");
         for definition in namespace.declaration.permissions {
-            if namespace.namespace.as_str() != "subject" {
-                assert!(definition.children.is_empty());
-            }
+            assert!(
+                definition
+                    .children
+                    .iter()
+                    .all(|child| child.namespace() == namespace.namespace)
+            );
             assert!(keys.insert(definition.key.as_str().to_owned()));
+        }
+        for contribution in namespace.declaration.sets {
+            assert_ne!(contribution.set.as_str(), "subject-default");
+            for child in contribution.children {
+                let PermissionReference::Namespace(child) = child else {
+                    panic!("builtin contributions must reference their own namespace");
+                };
+                assert_eq!(child.namespace, namespace.namespace);
+                assert!(
+                    child
+                        .keys
+                        .iter()
+                        .all(|key| key.namespace() == namespace.namespace)
+                );
+            }
         }
     }
     assert!(!keys.contains("mcp"));
+    assert!(!keys.contains("subject.orchestrate"));
+    assert!(!keys.contains("subject.delegate"));
     // Retained legacy keys must resolve, but additions never require a second
     // entry in that editor's resource table.
     let legacy: BTreeSet<_> = server_api::authorization::subject_permission_operations()
@@ -71,8 +92,7 @@ fn builtin_declarations_preserve_legacy_exact_keys_without_using_legacy_resource
 
 // Independent exact expectations: every other catalog key is denied. Do not
 // derive these from declarations or the legacy resource-operation table.
-const SUBJECT_BODY_KEYS: &[&str] = &[
-    "subject.orchestrate",
+const CONVERSATION_KEYS: &[&str] = &[
     "chat.read",
     "chat.send",
     "session.record",
@@ -122,6 +142,9 @@ const SUBJECT_BODY_KEYS: &[&str] = &[
     "journal.unchanged.confirm",
     "journal.checkpoint",
     "journal.finish",
+];
+
+const WORK_COORDINATION_KEYS: &[&str] = &[
     "notification.diagnostics.read",
     "objective.query",
     "objective.create",
@@ -181,8 +204,7 @@ const SUBJECT_BODY_KEYS: &[&str] = &[
     "ticket.implementation_result.read",
 ];
 
-const SUBJECT_DELEGATION_KEYS: &[&str] = &[
-    "subject.delegate",
+const WORK_EXECUTION_KEYS: &[&str] = &[
     "filesystem.read",
     "filesystem.write",
     "bash.execute",
@@ -263,66 +285,92 @@ fn assert_exact_policy(
 }
 
 #[test]
-fn subject_defaults_are_live_references_with_distinct_body_and_delegation_authority() {
+fn subject_defaults_are_live_sets_with_distinct_body_and_delegation_authority() {
     let registry = registry();
     assert_eq!(
         subject_default_permission_assignment(),
-        assignment(SUBJECT_DEFAULT_PERMISSION_SET)
-    );
-    assert_eq!(
-        subject_default_delegation_assignment(),
         PermissionAssignment {
-            grants: vec![PermissionReference::Namespace(NamespacePermissions {
-                namespace: NamespaceId::parse("subject").unwrap(),
-                keys: vec![PermissionKey::parse(SUBJECT_DELEGATE_PERMISSION).unwrap()],
-            })],
+            grants: [
+                CONVERSATION_PERMISSION_SET,
+                WORK_COORDINATION_PERMISSION_SET
+            ]
+            .into_iter()
+            .map(|set| PermissionReference::Set(PermissionSetId::parse(set).unwrap()))
+            .collect(),
             ..Default::default()
         }
     );
-    for (policy, expected) in [
-        (subject_default_permission_assignment(), SUBJECT_BODY_KEYS),
-        (
-            subject_default_delegation_assignment(),
-            SUBJECT_DELEGATION_KEYS,
-        ),
+    assert_eq!(
+        subject_default_delegation_assignment(),
+        assignment(WORK_EXECUTION_PERMISSION_SET)
+    );
+    for (set, expected) in [
+        (CONVERSATION_PERMISSION_SET, CONVERSATION_KEYS),
+        (WORK_COORDINATION_PERMISSION_SET, WORK_COORDINATION_KEYS),
+        (WORK_EXECUTION_PERMISSION_SET, WORK_EXECUTION_KEYS),
     ] {
-        assert_exact_policy(&registry, &policy, expected);
+        assert_exact_policy(&registry, &assignment(set), expected);
     }
-    assert!(
-        registry
-            .host()
-            .catalog()
-            .namespaces
-            .iter()
-            .flat_map(|n| &n.declaration.sets)
-            .all(|s| s.set.as_str() != "subject-delegation")
+    let body: Vec<_> = CONVERSATION_KEYS
+        .iter()
+        .chain(WORK_COORDINATION_KEYS)
+        .copied()
+        .collect();
+    assert_exact_policy(&registry, &subject_default_permission_assignment(), &body);
+    assert_exact_policy(
+        &registry,
+        &subject_default_delegation_assignment(),
+        WORK_EXECUTION_KEYS,
     );
 }
 
 #[test]
-fn subject_semantic_children_keep_ownership_and_exclusions_separate() {
+fn retired_subject_references_are_not_current_catalog_aliases() {
     let registry = registry();
-    let reference = PermissionReference::Namespace(NamespacePermissions {
-        namespace: NamespaceId::parse("subject").unwrap(),
-        keys: vec![PermissionKey::parse("subject.orchestrate").unwrap()],
-    });
-    let policy = PermissionAssignment {
-        grants: vec![reference.clone()],
-        ..Default::default()
-    };
+    for policy in [
+        assignment("subject-default"),
+        PermissionAssignment {
+            grants: vec![PermissionReference::Namespace(NamespacePermissions {
+                namespace: NamespaceId::parse("subject").unwrap(),
+                keys: vec![
+                    PermissionKey::parse("subject.orchestrate").unwrap(),
+                    PermissionKey::parse("subject.delegate").unwrap(),
+                ],
+            })],
+            ..Default::default()
+        },
+    ] {
+        assert_exact_policy(&registry, &policy, &[]);
+    }
+}
+
+#[test]
+fn semantic_sets_keep_ownership_and_exclusions_separate() {
+    let registry = registry();
+    let reference =
+        PermissionReference::Set(PermissionSetId::parse(WORK_COORDINATION_PERMISSION_SET).unwrap());
+    let policy = assignment(WORK_COORDINATION_PERMISSION_SET);
     assert!(allows(&registry, &policy, "worker", "worker.create"));
     assert!(allows(&registry, &policy, "objective", "objective.read"));
-    assert!(!allows(&registry, &policy, "subject", "subject.delegate"));
     assert!(!allows(&registry, &policy, "bash", "bash.execute"));
-    let subject = registry
+    assert!(!allows(&registry, &policy, "subjektiv-chat", "chat.send"));
+    assert!(
+        registry
+            .namespace_handle(
+                &FeatureId::builtin("subject"),
+                &NamespaceId::parse("subject").unwrap(),
+            )
+            .is_none()
+    );
+    let worker = registry
         .namespace_handle(
-            &FeatureId::builtin("subject"),
-            &NamespaceId::parse("subject").unwrap(),
+            &FeatureId::builtin("worker"),
+            &NamespaceId::parse("worker").unwrap(),
         )
         .unwrap();
     assert!(matches!(
         registry.host().allows(
-            subject,
+            worker,
             &registry.host().resolve(Some(&policy)),
             &PermissionKey::parse("ticket.read").unwrap()
         ),
@@ -330,18 +378,15 @@ fn subject_semantic_children_keep_ownership_and_exclusions_separate() {
     ));
     let mut excluded = subject_default_permission_assignment();
     excluded.exclusions.push(reference);
-    assert!(!allows(&registry, &excluded, "worker", "worker.create"));
-    assert!(!allows(&registry, &excluded, "ticket", "ticket.read"));
-    assert!(!allows(
-        &registry,
-        &excluded,
-        "subject",
-        "subject.orchestrate"
-    ));
+    assert_exact_policy(&registry, &excluded, CONVERSATION_KEYS);
+    excluded.exclusions = vec![PermissionReference::Set(
+        PermissionSetId::parse(CONVERSATION_PERMISSION_SET).unwrap(),
+    )];
+    assert_exact_policy(&registry, &excluded, WORK_COORDINATION_KEYS);
 }
 
 #[test]
-fn subject_delegation_children_updates_do_not_expand_an_issued_grant() {
+fn feature_owned_execution_contribution_updates_do_not_expand_an_issued_grant() {
     let mut registry = registry();
     let policy = subject_default_delegation_assignment();
     let before = registry.host().resolve(Some(&policy));
@@ -350,10 +395,10 @@ fn subject_delegation_children_updates_do_not_expand_an_issued_grant() {
         .host()
         .issue_delegation(&before, &[read.clone()])
         .unwrap();
-    let subject = registry
+    let ticket = registry
         .namespace_handle(
-            &FeatureId::builtin("subject"),
-            &NamespaceId::parse("subject").unwrap(),
+            &FeatureId::builtin("ticket"),
+            &NamespaceId::parse("ticket").unwrap(),
         )
         .unwrap()
         .clone();
@@ -362,18 +407,22 @@ fn subject_delegation_children_updates_do_not_expand_an_issued_grant() {
         .catalog()
         .namespaces
         .into_iter()
-        .find(|n| n.namespace.as_str() == "subject")
+        .find(|n| n.namespace.as_str() == "ticket")
         .unwrap()
         .declaration;
-    declaration
-        .permissions
+    let contribution = declaration
+        .sets
         .iter_mut()
-        .find(|p| p.key.as_str() == "subject.delegate")
-        .unwrap()
+        .find(|set| set.set.as_str() == WORK_EXECUTION_PERMISSION_SET)
+        .unwrap();
+    contribution
         .children
-        .push(PermissionKey::parse("worker.observe").unwrap());
-    registry.update(&subject, declaration.clone()).unwrap();
-    assert!(allows(&registry, &policy, "worker", "worker.observe"));
+        .push(PermissionReference::Namespace(NamespacePermissions {
+            namespace: NamespaceId::parse("ticket").unwrap(),
+            keys: vec![PermissionKey::parse("ticket.edit_item").unwrap()],
+        }));
+    registry.update(&ticket, declaration.clone()).unwrap();
+    assert!(allows(&registry, &policy, "ticket", "ticket.edit_item"));
     let current = registry.host().resolve(Some(&policy));
     let limited = registry
         .host()
@@ -388,14 +437,18 @@ fn subject_delegation_children_updates_do_not_expand_an_issued_grant() {
             .collect::<Vec<_>>(),
         vec![read.clone()]
     );
-    declaration
-        .permissions
+    for contribution in declaration
+        .sets
         .iter_mut()
-        .find(|p| p.key.as_str() == "subject.delegate")
-        .unwrap()
-        .children
-        .retain(|key| key != &read);
-    registry.update(&subject, declaration).unwrap();
+        .filter(|set| set.set.as_str() == WORK_EXECUTION_PERMISSION_SET)
+    {
+        for reference in &mut contribution.children {
+            if let PermissionReference::Namespace(namespace) = reference {
+                namespace.keys.retain(|key| key != &read);
+            }
+        }
+    }
+    registry.update(&ticket, declaration).unwrap();
     let current = registry.host().resolve(Some(&policy));
     let limited = registry
         .host()
@@ -428,11 +481,18 @@ fn subject_defaults_do_not_override_unset_empty_individual_excluded_or_revoked_p
         },
         &["ticket.read"],
     );
+    let body: Vec<_> = CONVERSATION_KEYS
+        .iter()
+        .chain(WORK_COORDINATION_KEYS)
+        .copied()
+        .collect();
     for (policy, expected) in [
-        (subject_default_permission_assignment(), SUBJECT_BODY_KEYS),
+        (subject_default_permission_assignment(), body.as_slice()),
+        (subject_default_delegation_assignment(), WORK_EXECUTION_KEYS),
+        (assignment(CONVERSATION_PERMISSION_SET), CONVERSATION_KEYS),
         (
-            subject_default_delegation_assignment(),
-            SUBJECT_DELEGATION_KEYS,
+            assignment(WORK_COORDINATION_PERMISSION_SET),
+            WORK_COORDINATION_KEYS,
         ),
     ] {
         let mut excluded = policy.clone();
@@ -540,6 +600,25 @@ fn runtime_feature_declares_the_same_catalog_independently_of_tool_projection() 
     // Read-only model projection does not define the catalog or issue authority.
     assert!(allows(
         &runtime,
+        &assignment(WORK_COORDINATION_PERMISSION_SET),
+        "ticket",
+        "ticket.assignment.update"
+    ));
+    assert_exact_policy(&runtime, &assignment(CONVERSATION_PERMISSION_SET), &[]);
+    // This isolated Ticket-only composition has no conversation contributor.
+    // An unknown set invalidates the full assignment; coordination cannot bypass it.
+    let defaults = runtime
+        .host()
+        .resolve(Some(&subject_default_permission_assignment()));
+    assert!(defaults.projection().allowed.is_empty());
+    assert_eq!(
+        defaults.projection().diagnostics,
+        vec![PermissionDiagnostic::UnknownSet(
+            PermissionSetId::parse(CONVERSATION_PERMISSION_SET).unwrap()
+        )]
+    );
+    assert!(allows(
+        &registry(),
         &subject_default_permission_assignment(),
         "ticket",
         "ticket.assignment.update"
@@ -702,7 +781,7 @@ fn memory_journal_body_reader_operations_belong_to_journal_not_memory_and_do_not
     ] {
         let key = PermissionKey::parse(operation).unwrap();
         for set in [
-            "subject-default",
+            CONVERSATION_PERMISSION_SET,
             COMPANION_PERMISSION_SET,
             IMPLEMENTER_PERMISSION_SET,
         ] {
@@ -762,16 +841,21 @@ fn plugin_declaration(children: bool) -> NamespaceDeclaration {
             },
         })
         .collect(),
-        sets: [COMPANION_PERMISSION_SET, SUBJECT_DEFAULT_PERMISSION_SET]
-            .into_iter()
-            .map(|set| SetContribution {
-                set: PermissionSetId::parse(set).unwrap(),
-                children: vec![PermissionReference::Namespace(NamespacePermissions {
-                    namespace: NamespaceId::parse("external").unwrap(),
-                    keys: vec![PermissionKey::parse("external.hoge").unwrap()],
-                })],
-            })
-            .collect(),
+        sets: [
+            COMPANION_PERMISSION_SET,
+            CONVERSATION_PERMISSION_SET,
+            WORK_COORDINATION_PERMISSION_SET,
+            WORK_EXECUTION_PERMISSION_SET,
+        ]
+        .into_iter()
+        .map(|set| SetContribution {
+            set: PermissionSetId::parse(set).unwrap(),
+            children: vec![PermissionReference::Namespace(NamespacePermissions {
+                namespace: NamespaceId::parse("external").unwrap(),
+                keys: vec![PermissionKey::parse("external.hoge").unwrap()],
+            })],
+        })
+        .collect(),
     }
 }
 
@@ -792,6 +876,26 @@ fn trusted_plugin_updates_existing_builtin_set_holders_but_not_frozen_children_o
         .unwrap()
         .clone();
     let key = PermissionKey::parse("external.hoge.fuga").unwrap();
+    for set in [
+        CONVERSATION_PERMISSION_SET,
+        WORK_COORDINATION_PERMISSION_SET,
+        WORK_EXECUTION_PERMISSION_SET,
+    ] {
+        let mut policy = assignment(set);
+        assert!(
+            registry
+                .host()
+                .allows(&handle, &registry.host().resolve(Some(&policy)), &key)
+                .unwrap()
+        );
+        policy.exclusions = policy.grants.clone();
+        assert!(
+            !registry
+                .host()
+                .allows(&handle, &registry.host().resolve(Some(&policy)), &key)
+                .unwrap()
+        );
+    }
     assert!(
         registry
             .host()

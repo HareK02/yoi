@@ -151,7 +151,7 @@ pub(crate) use journal_removal_store::{
     record_physical_failure as record_journal_removal_physical_failure,
 };
 
-const LATEST_SCHEMA_VERSION: i64 = 131;
+const LATEST_SCHEMA_VERSION: i64 = 133;
 #[path = "store/core_worker_launch.rs"]
 mod core_worker_launch;
 #[path = "store/launch_policy.rs"]
@@ -587,6 +587,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 131,
         name: crate::launch_policy::MIGRATION_NAME,
         apply: migrate_worker_launch_policies_to_v131,
+    },
+    Migration {
+        version: 132,
+        name: crate::config_adoption::automatic::MIGRATION_NAME,
+        apply: migrate_permission_storage_to_v132,
+    },
+    Migration {
+        version: 133,
+        name: crate::subject_policy::MIGRATION_NAME,
+        apply: migrate_subject_permission_domain_to_v133,
     },
 ];
 
@@ -17229,10 +17239,44 @@ fn migrate_worker_launch_policies_to_v131(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_permission_storage_to_v132(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 131 {
+        return Err(Error::Store(
+            "permission storage migration requires schema 131".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::config_adoption::automatic::SCHEMA)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(132,?1)",
+        [crate::config_adoption::automatic::MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn migrate_subject_permission_domain_to_v133(conn: &Connection) -> Result<()> {
+    if current_schema_version(conn)? != 132 {
+        return Err(Error::Store(
+            "Subject permission domain migration requires schema 132".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(crate::subject_policy::SCHEMA)?;
+    tx.execute(
+        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(133,?1)",
+        [crate::subject_policy::MIGRATION_NAME],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_prefix(conn, include_str!("latest_schema.sql"), true)?;
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
+    conn.execute_batch(crate::config_adoption::automatic::SCHEMA)?;
+    conn.execute_batch(crate::subject_policy::SCHEMA)?;
     conn.execute_batch(crate::launch_policy::SCHEMA)?;
     conn.execute_batch(include_str!("core_worker_launch.sql"))?;
     conn.execute_batch(backend_job_recovery_store::SCHEMA)?;
@@ -20886,8 +20930,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|s| s.version)
                 .collect::<Vec<_>>(),
-            (83..=113)
-                .chain([122, 123, 124, 125, 126, 127, 128, 129, 130])
+            MIGRATIONS
+                .iter()
+                .filter(|step| step.version > 82)
+                .map(|step| step.version)
                 .collect::<Vec<_>>()
         );
         let store = SqliteWorkspaceStore::open_for_test(&path).unwrap();
@@ -21902,6 +21948,18 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 version: 130,
                 name: backend_job_current::MIGRATION_NAME.into(),
             },
+            WorkspaceSchemaMigrationStep {
+                version: 131,
+                name: crate::launch_policy::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 132,
+                name: crate::config_adoption::automatic::MIGRATION_NAME.into(),
+            },
+            WorkspaceSchemaMigrationStep {
+                version: 133,
+                name: crate::subject_policy::MIGRATION_NAME.into(),
+            },
         ]
     }
 
@@ -22045,6 +22103,9 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.to_string()),
 (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
 (130, backend_job_current::MIGRATION_NAME.into()),
+(131, crate::launch_policy::MIGRATION_NAME.into()),
+(132, crate::config_adoption::automatic::MIGRATION_NAME.into()),
+(133, crate::subject_policy::MIGRATION_NAME.into()),
                     ]
                 );
                 assert!(!table_exists(conn, "trusted_runtime_records")?);
@@ -25329,8 +25390,10 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 .iter()
                 .map(|step| step.version)
                 .collect::<Vec<_>>(),
-            ((version + 1)..=113)
-                .chain([122, 123, 124, 125, 126, 127, 128, 129, 130])
+            MIGRATIONS
+                .iter()
+                .filter(|step| step.version > version)
+                .map(|step| step.version)
                 .collect::<Vec<_>>()
         );
         drop(conn);
@@ -25375,7 +25438,7 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                          (127, journal_removal_store::MIGRATION_NAME.into()),
                          (128, TICKET_PLAN_RETIREMENT_MIGRATION_NAME.into()),
                          (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
-(130, backend_job_current::MIGRATION_NAME.into())]);
+(130, backend_job_current::MIGRATION_NAME.into())].into_iter().chain(MIGRATIONS.iter().filter(|step| step.version > 130).map(|step| (step.version, step.name.into()))).collect::<Vec<_>>());
                 for (table, rows) in unchanged.iter().zip(before.iter()) {
                     assert_eq!(&stored_fixture_rows(conn, table), rows, "preserve {table}");
                 }

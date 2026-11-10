@@ -34,7 +34,7 @@ Commands:
   pull       Download editable Decodal source into a NEW directory
   diff       Show base-relative additions, edits, explicit deletions and entrypoints
   validate   Validate against the actual Server snapshot/schema/policy (no adoption)
-  preview    Validate and show Server-authoritative changed paths/Subjects
+  preview    Validate and show Server-authoritative configuration changes
   push       Preview, retain the exact request, then adopt using expected history head
   reconcile  Look up the retained exact request; NotObserved remains unknown
   retry      Explicitly resend ONLY the retained original request, never later edits
@@ -56,29 +56,32 @@ Later edits remain on disk, but retry always sends the retained original payload
 A receipt confirms source/policy storage, not completion of running work; policy
 applies at the next current-policy check. No Git executable/protocol is used.
 
-Configuration example (edit the pulled permissions/*.dcdl, not metadata):
-  { subjects = [{ subject_id = "<existing-subject-id>";
-      execution = { sets = ["ticket"]; };
-      delegation = { namespaces = [{ namespace = "ticket";
-                       keys = ["ticket.query"]; }]; };
-    }]; remove_subjects = []; }
+Shared permission configuration example (edit the actual pulled source path):
+  { sets = [{ id = "workspace-ticket-query";
+      namespaces = [{ namespace = "ticket"; keys = ["ticket.query"]; }];
+    }];
+    human_worker_default = { sets = ["workspace-ticket-query"]; };
+  }
 The imported file is a plain object; main.dcdl keeps its existing schema/import.
-Omitting a Subject retains its policy. Listing one replaces BOTH lanes (an omitted
-lane is empty); {} is explicit deny-all. remove_subjects removes policy, not the
-Subject, and does not restore defaults. Keys carry no payloads; namespace denotes
-Feature ownership, not prefix inclusion. Only catalog-declared children expand.
-Use the catalog in the read-only pull metadata to discover Sets/keys/children.
+Permission configuration defines shared Workspace Sets and the human Worker default.
+The default is selected only for a new ordinary human-created Worker that omits
+an assignment, never for Subject bodies, Jobs, children, retries or restores.
+Individual Subject policies are Server-managed domain data, not config source.
+Keys carry no payloads; namespace denotes Feature ownership, not prefix inclusion.
+Only catalog-declared children expand. Use the catalog in the read-only pull
+metadata to discover Sets/keys/children; shared Sets cannot replace Feature Sets.
 
 Example workflow (substitute the same explicit Backend and Workspace each time):
   yoi --backend <URL> login
   yoi --backend <URL> --workspace-id <ID> config pull --dir config-before
-  $EDITOR config-before/source/permissions/migrated.dcdl
+  $EDITOR config-before/source/<actual-pulled-path>.dcdl
   yoi --backend <URL> --workspace-id <ID> config diff --dir config-before
   yoi --backend <URL> --workspace-id <ID> config validate --dir config-before
   yoi --backend <URL> --workspace-id <ID> config preview --dir config-before
   yoi --backend <URL> --workspace-id <ID> config push --dir config-before
   yoi --backend <URL> --workspace-id <ID> config pull --dir config-after
-The permission filename is generated; use the actual pulled path. To reconcile:
+Use the actual paths returned by pull; the CLI does not generate policy data.
+To reconcile:
   yoi --backend <URL> --workspace-id <ID> config reconcile --dir config-before
 If still unknown, `config retry --dir config-before` uses the saved identity and
 complete payload, NOT source files edited since that send. Keep both checkouts.

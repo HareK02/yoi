@@ -37,6 +37,7 @@ mod launch_policy_registry;
 mod service_authority;
 mod session_registration;
 mod subject_authorization;
+mod subject_permission_policy;
 pub(crate) use launch_policy_registry::sync_launch_policy_permissions;
 mod subject_body;
 mod subjektiv_deletion;
@@ -45,6 +46,7 @@ mod subjektiv_journal;
 mod subjektiv_journal_browser;
 mod subjektiv_memory_journal;
 mod workdir_authorization;
+mod worker_launch_policies;
 mod worker_operations;
 mod worker_protocol;
 mod worker_startup;
@@ -5088,6 +5090,62 @@ impl WorkspaceApi {
             #[cfg(test)]
             subject_effect_admission_observer: None,
         };
+        // Both catalog and single-Workspace startup reach this boundary before
+        // exposure or recovery can attach the canonical permission source.
+        let migration_api = api.clone();
+        api.store
+            .db_executor()
+            .run(move || {
+                migration_api.refresh_plugin_permission_registry()?;
+                // No registry guard may cross native Feature admission. This API
+                // is still private, so the refreshed Host snapshot is stable.
+                let host = migration_api
+                    .permission_registry
+                    .read()
+                    .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?
+                    .host()
+                    .clone();
+                let legacy = crate::subjektiv::SubjektivStore::open(
+                    &migration_api.feature_storage,
+                    &migration_api.subjektiv_registration,
+                )
+                .map_err(|error| {
+                    Error::Store(format!(
+                        "failed to open permission migration storage: {error}"
+                    ))
+                })?;
+                let schema = migration_api.config_schema_registry.compose()?;
+                match crate::config_adoption::automatic::migrate(
+                    &migration_api.config_store,
+                    &legacy,
+                    &migration_api.config.workspace_id,
+                    schema.clone(),
+                    &host,
+                ) {
+                    Ok(_) => {
+                        crate::config_adoption::semantic_references::migrate(
+                            &migration_api.config_store,
+                            &migration_api.config.workspace_id,
+                            schema,
+                            &host,
+                        )?;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        if let Some(reason) = crate::config_adoption::automatic::blocked_reason(&error) {
+                            tracing::warn!(
+                                workspace_id = %migration_api.config.workspace_id,
+                                reason,
+                                "Automatic permission storage migration blocked; ordinary human Worker creation remains available"
+                            );
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    }
+                }
+            })
+            .await?;
         // Restore the domain fence before this API can issue any Drive handle,
         // including blocked/failed deletions not scheduled for automatic recovery.
         if api
@@ -6337,7 +6395,8 @@ impl WorkspaceApi {
         {
             return Err(Error::WorkspacePermissionDenied(
                 "ordinary Worker creation requires resolved core execution authority".into(),
-            ).into());
+            )
+            .into());
         }
         self.validate_worker_spawn_repository_scope(runtime_id, &mut request)?;
         if let Some(grant) = request.resolved_execution_grant.as_ref() {
@@ -6439,20 +6498,36 @@ impl WorkspaceApi {
         if let Some(subject) = body_subject {
             subjektiv_journal::check_start_allowed(self, subject)?;
         }
-        let reservation_result = if let Some(grant) = request.resolved_core_execution_grant.as_ref() {
-            let operation = request.resolved_control_operation.as_ref().ok_or_else(|| Error::Config("core Worker launch operation is missing".into()))?;
-            let bundle = request.resolved_config_bundle.as_ref().ok_or_else(|| Error::Config("core Worker Profile bundle is missing".into()))?;
-            self.config_store.reserve_worker_create_with_core(
-                &self.config.workspace_id, runtime_id, &allocation_key,
-                &operation.input_fingerprint, &operation.input_fingerprint,
-                singleton_key.as_deref(), &current_memory_settings, grant, bundle,
-            )
-        } else {
-            self.config_store.reserve_worker_create(
-                &self.config.workspace_id, runtime_id, &allocation_key,
-                &request_fingerprint, singleton_key.as_deref(), &current_memory_settings,
-            )
-        };
+        let reservation_result =
+            if let Some(grant) = request.resolved_core_execution_grant.as_ref() {
+                let operation = request.resolved_control_operation.as_ref().ok_or_else(|| {
+                    Error::Config("core Worker launch operation is missing".into())
+                })?;
+                let bundle = request
+                    .resolved_config_bundle
+                    .as_ref()
+                    .ok_or_else(|| Error::Config("core Worker Profile bundle is missing".into()))?;
+                self.config_store.reserve_worker_create_with_core(
+                    &self.config.workspace_id,
+                    runtime_id,
+                    &allocation_key,
+                    &operation.input_fingerprint,
+                    &operation.input_fingerprint,
+                    singleton_key.as_deref(),
+                    &current_memory_settings,
+                    grant,
+                    bundle,
+                )
+            } else {
+                self.config_store.reserve_worker_create(
+                    &self.config.workspace_id,
+                    runtime_id,
+                    &allocation_key,
+                    &request_fingerprint,
+                    singleton_key.as_deref(),
+                    &current_memory_settings,
+                )
+            };
         let reservation = match reservation_result {
             Ok(reservation) => reservation,
             Err(error) => {
@@ -6649,8 +6724,14 @@ impl WorkspaceApi {
         if let Some(grant) = request.resolved_core_execution_grant.as_ref() {
             if let Err(error) = subject_authorization::revalidate_core_grant(self, grant) {
                 let diagnostics = compensate_failed_workspace_worker_create(
-                    self, runtime_id, worker_id, &reservation_fingerprint,
-                    "core_execution_authority", None, &compensation_context, &reserved_attachments,
+                    self,
+                    runtime_id,
+                    worker_id,
+                    &reservation_fingerprint,
+                    "core_execution_authority",
+                    None,
+                    &compensation_context,
+                    &reserved_attachments,
                 );
                 return Err(ApiError::with_diagnostics(error.error, diagnostics));
             }
@@ -8137,6 +8218,12 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::bound_operation_authorize(
             service.clone(),
         ))
+        .merge(server_api::server_api_axum::subjektiv_subject_policy_get(
+            service.clone(),
+        ))
+        .merge(server_api::server_api_axum::subjektiv_subject_policy_set(
+            service.clone(),
+        ))
         .merge(server_api::server_api_axum::subjektiv_subject_permissions_get(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_subject_permissions_set(service.clone()))
         .merge(server_api::server_api_axum::subjektiv_subject_create(
@@ -8509,6 +8596,16 @@ fn generated_workspace_contract_router(service: ServerApiContractService) -> Rou
         .merge(server_api::server_api_axum::workspace_worker_detail(
             service.clone(),
         ))
+        .merge(
+            server_api::launch_policy::worker_launch_policies_api_axum::worker_launch_policies(
+                service.clone(),
+            ),
+        )
+        .merge(
+            server_api::launch_policy::worker_launch_policies_api_axum::mutate_worker_launch_policy(
+                service.clone(),
+            ),
+        )
         .merge(server_api::server_api_axum::workspace_worker_launch_options_alias(service.clone()))
         .merge(server_api::server_api_axum::workspace_worker_launch_options(service.clone()))
         .merge(server_api::server_api_axum::runtime_resource_fetch(
@@ -10502,6 +10599,46 @@ impl server_api::ServerApi for ServerApiContractService {
             .map_err(ApiError::into_repository_api_error)
     }
 
+    async fn subjektiv_subject_policy_get(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+    ) -> std::result::Result<
+        server_api::SubjectPermissionPolicyResponse,
+        server_api::RepositoryApiError,
+    > {
+        subject_permission_policy::get(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            subject_id,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
+    async fn subjektiv_subject_policy_set(
+        &self,
+        context: server_api::ServerRequestContext,
+        workspace_id: String,
+        subject_id: String,
+        request: server_api::SubjectPermissionPolicyMutation,
+    ) -> std::result::Result<
+        server_api::SubjectPermissionPolicyMutationResponse,
+        server_api::RepositoryApiError,
+    > {
+        subject_permission_policy::set(
+            self.workspace_api()?.clone(),
+            context,
+            workspace_id,
+            subject_id,
+            request,
+        )
+        .await
+        .map_err(ApiError::into_repository_api_error)
+    }
+
     async fn subjektiv_subject_permissions_get(
         &self,
         context: server_api::ServerRequestContext,
@@ -11265,6 +11402,7 @@ impl server_api::ServerApi for ServerApiContractService {
 
     async fn workspace_orchestrator_start(
         &self,
+        context: server_api::ServerRequestContext,
         workspace_id: String,
     ) -> std::result::Result<
         server_api::BrowserWorkspaceOrchestratorResponse,
@@ -11273,6 +11411,7 @@ impl server_api::ServerApi for ServerApiContractService {
         scoped_start_workspace_orchestrator(
             State(self.workspace_api()?.clone()),
             AxumPath(ScopedWorkspacePath { workspace_id }),
+            context,
         )
         .await
         .map(|Json(response)| response)
@@ -24973,7 +25112,7 @@ fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::Subje
         .clone();
     Ok(
         open_legacy_subjektiv_store(api)?.with_canonical_permission_source(Arc::new(
-            crate::config_adoption::CanonicalConfigurationSource {
+            crate::subject_policy_source::CanonicalSubjectPolicySource {
                 store: api.config_store.as_ref().clone(),
                 host,
             },
@@ -25021,7 +25160,7 @@ fn is_dedicated_subjektiv_consolidation_worker(
         profile.strip_prefix("builtin:").unwrap_or(profile)
             == SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE
     });
-    let profile_tag = format!("profile:{SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE}");
+    let profile_tag = format!("profile:{}", worker.profile.as_deref().unwrap_or_default());
     worker.workspace.workspace_id.as_deref() == Some(workspace_id)
         && worker.singleton_key.as_deref() == Some(singleton_key)
         && singleton_key.starts_with(SUBJEKTIV_CONSOLIDATION_SINGLETON_PREFIX)
@@ -25377,12 +25516,11 @@ async fn scoped_create_subjektiv_subject(
         let subject = subjects
             .create_subject_idempotent(role, request.behavior_md, &request.operation_id)
             .map_err(subjektiv_store_error)?;
-        api.config_store.enroll_created_subject(
+        api.config_store.enroll_created_subject_policy(
             &path.workspace_id,
             &actor.account_id,
             &subjects,
             &subject.id,
-            api.config_schema_registry.compose()?,
             || {
                 let registry = api.permission_registry.read().map_err(|_| {
                     Error::Config("current Feature declarations unavailable".into())
@@ -29104,8 +29242,12 @@ async fn spawn_known_worker_authenticated_on_host(
     // outside spawn compensation so an exact operation replay repairs only the
     // missing grant, without a second Worker or repeated initial Submit.
     core_worker_creation::persist_spawn_control(
-        &api, &controller, &RuntimeWorkerRef::new(&response.0.runtime_id, &response.0.worker_id),
-        &operation_id, &scoped_worker_control_operation_id(&controller, &operation_id), relation == "assigned",
+        &api,
+        &controller,
+        &RuntimeWorkerRef::new(&response.0.runtime_id, &response.0.worker_id),
+        &operation_id,
+        &scoped_worker_control_operation_id(&controller, &operation_id),
+        relation == "assigned",
     )?;
     Ok(response)
 }
@@ -29454,11 +29596,16 @@ fn diagnostics_indicate_unrecoverable_pending_workspace_restore(
 async fn scoped_start_workspace_orchestrator(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    context: server_api::ServerRequestContext,
 ) -> ApiResult<Json<BrowserWorkspaceOrchestratorResponse>> {
+    let actor = subject_authorization::administration_actor(&context)?.clone();
     api.host_executors.host()?.run(move || {
     #[cfg(test)]
     tests::seed_test_delivery_binding(&api);
     validate_workspace_scope(&api, &path.workspace_id)?;
+    api.config_store.with_conn(|connection| {
+        crate::launch_policy::require_owner(connection, api.workspace_id(), &actor.account_id)
+    })?;
     let _guard = api.orchestrator_spawn_lock.lock().map_err(|_| {
         ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
@@ -29535,9 +29682,8 @@ async fn scoped_start_workspace_orchestrator(
         disposition = "recreated";
     }
 
-    let result = api.spawn_workspace_worker(
-        EMBEDDED_WORKER_RUNTIME_ID,
-        WorkerSpawnRequest {
+    let authorization = server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None };
+    let mut request = WorkerSpawnRequest {
             requested_worker_name: Some(
                 crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
             ),
@@ -29560,10 +29706,23 @@ async fn scoped_start_workspace_orchestrator(
             resolved_subjektiv_attached: false,
             resolved_control_operation: None,
             resolved_execution_grant: None,
-            authorization: None,
+            authorization: Some(authorization.clone()),
             resolved_core_execution_grant: None,
-        },
+    };
+    let operation = WorkerControlOperation {
+        operation_id: format!("human-worker:{}:{}", actor.account_id, Uuid::now_v7()),
+        input_fingerprint: worker_spawn_create_fingerprint(&request)
+            .map_err(|message| Error::Config(message.to_string()))?,
+    };
+    let (_, profile, bundle, grant) = core_worker_creation::resolve_creation_profile(
+        &api, None, Some(&actor.account_id), &authorization, EMBEDDED_WORKER_RUNTIME_ID,
+        Some("builtin:orchestrator".into()), Some(&operation), false,
     )?;
+    request.profile = profile;
+    request.resolved_config_bundle = bundle;
+    request.resolved_core_execution_grant = grant;
+    request.resolved_control_operation = Some(operation);
+    let result = api.spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, request)?;
     if result.state != InternalWorkerOperationState::Accepted || result.worker.is_none() {
         return Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
@@ -36000,17 +36159,26 @@ async fn create_workspace_worker_authenticated_on_host(
     };
     // Serialize resolution through dispatch for this exact caller intent. The DB
     // reservation independently fences competing server instances.
-    let creation_lock = resolved_control_operation.as_ref()
+    let creation_lock = resolved_control_operation
+        .as_ref()
         .map(|operation| worker_control_lock(&api, &operation.operation_id));
     let _creation_guard = match creation_lock {
         Some(lock) => Some(lock.lock_owned().await),
         None => None,
     };
-    let source_worker = source.as_ref().map(|source| RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id));
+    let source_worker = source
+        .as_ref()
+        .map(|source| RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id));
     let (profile, profile_selector, resolved_config_bundle, resolved_core_execution_grant) =
         core_worker_creation::resolve_creation_profile(
-            &api, source_worker.as_ref(), account.as_deref(), &authorization,
-            &runtime_id, profile, resolved_control_operation.as_ref(), subject_connection,
+            &api,
+            source_worker.as_ref(),
+            account.as_deref(),
+            &authorization,
+            &runtime_id,
+            profile,
+            resolved_control_operation.as_ref(),
+            subject_connection,
         )?;
     let resolved_subjektiv_attached = match feature_connections.subjektiv {
         None => {
@@ -37399,8 +37567,14 @@ async fn create_runtime_worker_authenticated_on_host(
     let caller_request = request.clone();
     let authorization = request.authorization.clone();
     let operation_key = request.control_operation_id.clone();
-    if operation_key.trim().is_empty() || operation_key.len() > 256 || operation_key.chars().any(char::is_control) {
-        return Err(Error::InvalidInput("control_operation_id must be a nonempty bounded identifier".into()).into());
+    if operation_key.trim().is_empty()
+        || operation_key.len() > 256
+        || operation_key.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidInput(
+            "control_operation_id must be a nonempty bounded identifier".into(),
+        )
+        .into());
     }
     let mut request = worker_spawn_request_from_api(request)?;
     let headers = context
@@ -37408,17 +37582,35 @@ async fn create_runtime_worker_authenticated_on_host(
         .transpose()
         .map_err(|error| Error::InvalidInput(error.message))?
         .unwrap_or_default();
-    let source = context.map(|context| authenticated_ticket_worker_source(&headers, context)).transpose()?.flatten();
-    let controller = source.as_ref().map(|source| RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id));
-    let account = context.and_then(|context| context.actor.as_ref()).map(|actor| actor.account_id.as_str());
+    let source = context
+        .map(|context| authenticated_ticket_worker_source(&headers, context))
+        .transpose()?
+        .flatten();
+    let controller = source
+        .as_ref()
+        .map(|source| RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id));
+    let account = context
+        .and_then(|context| context.actor.as_ref())
+        .map(|actor| actor.account_id.as_str());
     if controller.is_some() && request.singleton_key.is_some() {
-        return Err(Error::WorkspacePermissionDenied("policy-created Workers cannot acquire singleton identity".into()).into());
+        return Err(Error::WorkspacePermissionDenied(
+            "policy-created Workers cannot acquire singleton identity".into(),
+        )
+        .into());
     }
     let operation_id = match controller.as_ref() {
         Some(controller) => scoped_worker_control_operation_id(controller, &operation_key),
-        None => format!("human-worker:{}:{}", account.ok_or_else(|| Error::WorkspacePermissionDenied("Worker creation requires authenticated owner context".into()))?, operation_key),
+        None => format!(
+            "human-worker:{}:{}",
+            account.ok_or_else(|| Error::WorkspacePermissionDenied(
+                "Worker creation requires authenticated owner context".into()
+            ))?,
+            operation_key
+        ),
     };
-    let fingerprint_input = serde_json::to_vec(&(controller.as_ref(), account, &runtime_id, &caller_request)).map_err(|error| Error::Config(error.to_string()))?;
+    let fingerprint_input =
+        serde_json::to_vec(&(controller.as_ref(), account, &runtime_id, &caller_request))
+            .map_err(|error| Error::Config(error.to_string()))?;
     let operation = WorkerControlOperation {
         operation_id,
         input_fingerprint: format!(
@@ -37432,11 +37624,30 @@ async fn create_runtime_worker_authenticated_on_host(
     let creation_lock = worker_control_lock(&api, &operation.operation_id);
     let _creation_guard = creation_lock.lock_owned().await;
     let profile = match &request.profile {
-        ProfileSelector::Builtin(name) => if name.starts_with("builtin:") { name.clone() } else { format!("builtin:{name}") },
-        ProfileSelector::Named(name) => if name.starts_with("project:") { name.clone() } else { format!("project:{name}") },
+        ProfileSelector::Builtin(name) => {
+            if name.starts_with("builtin:") {
+                name.clone()
+            } else {
+                format!("builtin:{name}")
+            }
+        }
+        ProfileSelector::Named(name) => {
+            if name.starts_with("project:") {
+                name.clone()
+            } else {
+                format!("project:{name}")
+            }
+        }
     };
     let (_, profile, bundle, grant) = core_worker_creation::resolve_creation_profile(
-        &api, controller.as_ref(), account, &authorization, &runtime_id, Some(profile), Some(&operation), false,
+        &api,
+        controller.as_ref(),
+        account,
+        &authorization,
+        &runtime_id,
+        Some(profile),
+        Some(&operation),
+        false,
     )?;
     request.profile = profile;
     request.resolved_config_bundle = bundle;
@@ -37631,7 +37842,14 @@ async fn create_runtime_worker_authenticated_on_host(
         }
     }
     if let (Some(controller), Some(worker)) = (controller.as_ref(), result.worker.as_ref()) {
-        core_worker_creation::persist_spawn_control(&api, controller, &worker.worker, &operation_key, &operation.operation_id, lifecycle_assignment.is_some())?;
+        core_worker_creation::persist_spawn_control(
+            &api,
+            controller,
+            &worker.worker,
+            &operation_key,
+            &operation.operation_id,
+            lifecycle_assignment.is_some(),
+        )?;
     }
     Ok(Json(worker_spawn_result_to_api(result)?))
 }
@@ -41807,6 +42025,9 @@ mod db_execution_tests;
 
 #[cfg(test)]
 mod tests {
+    include!("server/core_worker_creation_tests.rs");
+    include!("server/subject_permission_policy_tests.rs");
+
     mod assignment_delivery_tests {
         include!("server_assignment_delivery_tests.rs");
         mod ticket_web_roundtrip_tests {
@@ -42003,7 +42224,7 @@ mod tests {
             assign(&api, &subject, vec![]);
             let mut workers = Vec::new();
             for attached in [true, false] {
-                let Json(created) = create_workspace_worker(
+                let Json(created) = create_workspace_worker_as_owner(
                     State(api.clone()),
                     HeaderMap::new(),
                     Json(CreateWorkspaceWorkerRequest {
@@ -42253,6 +42474,7 @@ mod tests {
     mod workdir_delegation_tests;
     mod workdir_session_close_tests;
     mod worker_drive_tests;
+    mod worker_launch_policy_api_tests;
     mod worker_operations_tests;
     mod worker_protocol_tests;
     mod workspace_admission_tests;
@@ -43341,7 +43563,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let Json(created_worker) = create_workspace_worker(
+        let Json(created_worker) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -43954,7 +44176,7 @@ mod tests {
             ));
         }
 
-        let Json(worker) = create_workspace_worker(
+        let Json(worker) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -44216,7 +44438,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let api = test_api(dir.path()).await;
-        let Json(created_worker) = create_workspace_worker(
+        let Json(created_worker) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -46737,6 +46959,22 @@ mod tests {
         seed_test_api_token_for_account(store, suffix, owner.owner_account_id)
     }
 
+    // A Workspace account has one User, but fixtures may issue several owner
+    // credentials. Reuse that User rather than replacing its identity per token.
+    fn seed_test_owner_api_token(api: &WorkspaceApi, suffix: &str) -> String {
+        let (account_id, user_id): (String, Option<String>) = api.config_store.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT w.owner_account_id,u.user_id FROM workspaces w LEFT JOIN users u ON u.account_id=w.owner_account_id WHERE w.workspace_id=?1",
+                [api.workspace_id()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        }).unwrap();
+        match user_id {
+            Some(user_id) => seed_test_api_token_for_user(api.store.as_ref(), suffix, user_id),
+            None => seed_test_api_token_for_account(api.store.as_ref(), suffix, account_id),
+        }
+    }
+
     fn seed_test_api_token(store: &dyn ControlPlaneStore, suffix: &str) -> String {
         let account_id = format!("account-{suffix}");
         store
@@ -46758,7 +46996,6 @@ mod tests {
         account_id: String,
     ) -> String {
         let user_id = format!("user-{suffix}");
-        let token = format!("api-token-{suffix}");
         store
             .upsert_user(&UserRecord {
                 user_id: user_id.clone(),
@@ -46769,6 +47006,15 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".to_owned(),
             })
             .unwrap();
+        seed_test_api_token_for_user(store, suffix, user_id)
+    }
+
+    fn seed_test_api_token_for_user(
+        store: &dyn ControlPlaneStore,
+        suffix: &str,
+        user_id: String,
+    ) -> String {
+        let token = format!("api-token-{suffix}");
         store
             .create_api_token(&ApiTokenRecord {
                 token_hash: crate::auth::token_hash(&token),
@@ -48096,7 +48342,7 @@ mod tests {
         let ticket = backend.create(input).unwrap();
         assign_test_orchestrator(&api, &ticket.id);
 
-        let result = create_workspace_worker(
+        let result = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -48140,7 +48386,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -48179,7 +48425,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -48270,20 +48516,11 @@ mod tests {
 
     #[tokio::test]
     async fn merge_request_completion_requires_live_resource_grant_not_legacy_role() {
-        use server_api::authorization::{
-            PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-        };
+        use server_api::authorization::{PermissionResource, ScopedPermission};
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let Json(started) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: api.workspace_id().into(),
-            }),
-        )
-        .await
-        .unwrap();
+        let started = seed_test_orchestrator_as_owner(&api, &[]);
         let legacy = started.worker.unwrap();
         let legacy = RuntimeWorkerRef::new(legacy.runtime_id, legacy.worker_id);
         assert!(matches!(
@@ -48293,40 +48530,34 @@ mod tests {
         let subject_id = ensure_test_assignment_subject(&api);
         let body = create_test_assignment_body(&api, EMBEDDED_WORKER_RUNTIME_ID, &subject_id).await;
         assert!(require_merge_request_completion_grant(&api, &body, "mr-completion").is_err());
-        let store = open_subjektiv_store(&api).unwrap();
-        let policy = store
-            .set_subject_permissions(
-                &subject_id,
-                &SubjectPermissionsUpdate {
-                    operation_id: "completion-grant".into(),
-                    expected_change_id: store
-                        .subject_permissions(&subject_id)
-                        .unwrap()
-                        .map(|p| p.change_id),
-                    execution: vec![ScopedPermission {
-                        operation: "merge_request.complete".into(),
-                        resource: PermissionResource::MergeRequest {
-                            workspace_id: api.workspace_id().into(),
-                            merge_request_id: "mr-completion".into(),
-                        },
-                    }],
-                    delegation: vec![],
+        let selected = seed_test_subject_legacy_constraints(
+            &api,
+            &subject_id,
+            vec![ScopedPermission {
+                operation: "merge_request.complete".into(),
+                resource: PermissionResource::MergeRequest {
+                    workspace_id: api.workspace_id().into(),
+                    merge_request_id: "mr-completion".into(),
                 },
-            )
-            .unwrap();
+            }],
+            vec![],
+        );
+        replace_test_subject_policy_as_owner(
+            &api,
+            &subject_id,
+            selected.execution,
+            selected.delegation,
+        )
+        .await;
         require_merge_request_completion_grant(&api, &body, "mr-completion").unwrap();
         assert!(require_merge_request_completion_grant(&api, &body, "other-mr").is_err());
-        store
-            .set_subject_permissions(
-                &subject_id,
-                &SubjectPermissionsUpdate {
-                    operation_id: "completion-revoke".into(),
-                    expected_change_id: Some(policy.change_id),
-                    execution: vec![],
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        replace_test_subject_policy_as_owner(
+            &api,
+            &subject_id,
+            Default::default(),
+            Default::default(),
+        )
+        .await;
         assert!(require_merge_request_completion_grant(&api, &body, "mr-completion").is_err());
     }
 
@@ -48365,20 +48596,19 @@ mod tests {
         let _callback_server =
             AuthorizationCallbackServer::start(listener, build_router(api.clone()));
 
-        let result = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: workspace_id.clone(),
-            }),
-        )
-        .await;
-
-        let Json(started) = result.unwrap_or_else(|error| {
-            panic!(
-                "production Workspace Orchestrator launch failed: error={:?}, diagnostics={:?}",
-                error.error, error.diagnostics
-            )
-        });
+        let seed_api = api.clone();
+        let started = api
+            .host_executors
+            .host()
+            .unwrap()
+            .run(move || -> ApiResult<_> {
+                Ok(seed_test_orchestrator_as_owner(
+                    &seed_api,
+                    &[("session", &["session.record"])],
+                ))
+            })
+            .await
+            .unwrap();
         assert_eq!(started.disposition, "created");
         assert!(started.online);
         let worker = started
@@ -48398,7 +48628,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
-        let Json(restored) = scoped_start_workspace_orchestrator(
+        let Json(restored) = start_workspace_orchestrator_as_owner(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: workspace_id.clone(),
@@ -48430,7 +48660,7 @@ mod tests {
         .unwrap();
         let workspace_id = api.config.workspace_id.clone();
 
-        let error = scoped_start_workspace_orchestrator(
+        let error = start_workspace_orchestrator_as_owner(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: workspace_id.clone(),
@@ -48438,13 +48668,17 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(
-            error.error,
-            Error::RuntimeOperationFailed {
-                ref code,
-                ..
-            } if code == "workspace_orchestrator_spawn_rejected"
-        ));
+        assert!(
+            matches!(
+                error.error,
+                Error::RuntimeOperationFailed {
+                    ref code,
+                    ..
+                } if code == "workspace_orchestrator_spawn_rejected"
+            ),
+            "unexpected Orchestrator startup failure: {:?}",
+            error.error
+        );
         assert!(error.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "embedded_worker_execution_rejected"
                 && diagnostic
@@ -48476,7 +48710,7 @@ mod tests {
         assert_eq!(reserved_creates, 0);
         assert_eq!(worker_resource_keys, 0);
 
-        let Json(retried) = scoped_start_workspace_orchestrator(
+        let Json(retried) = start_workspace_orchestrator_as_owner(
             State(api),
             AxumPath(ScopedWorkspacePath { workspace_id }),
         )
@@ -48494,6 +48728,7 @@ mod tests {
         ticket_id: String,
         workdir_id: String,
         read_only_workdir_id: String,
+        child_authorization: server_api::launch_policy::WorkerCreationAuthorization,
     }
 
     async fn guarded_spawn_fixture() -> GuardedSpawnFixture {
@@ -48538,7 +48773,13 @@ mod tests {
                 })
                 .unwrap();
         }
-        let Json(controller) = create_workspace_worker(
+        let (controller_authorization, child_authorization) = test_worker_policy_authorizations(
+            &api,
+            "guarded-spawn",
+            "builtin:coder",
+            Default::default(),
+        );
+        let Json(controller) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -48551,9 +48792,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                    assignment: None,
-                },
+                authorization: controller_authorization,
             }),
         )
         .await
@@ -48579,6 +48818,7 @@ mod tests {
         assign_test_orchestrator(&api, &ticket_id);
         GuardedSpawnFixture {
             _workspace: workspace,
+            child_authorization,
             api,
             runtime,
             controller,
@@ -48614,6 +48854,7 @@ mod tests {
             ],
             "feature_connections": {},
             "control_operation_id": operation_id,
+            "authorization": fixture.child_authorization,
         })
     }
 
@@ -49036,7 +49277,13 @@ mod tests {
                 })
                 .unwrap();
         }
-        let Json(controller) = create_workspace_worker(
+        let (controller_authorization, child_authorization) = test_worker_policy_authorizations(
+            &api,
+            "strict-remote-spawn",
+            "builtin:coder",
+            Default::default(),
+        );
+        let Json(controller) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -49049,9 +49296,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                    assignment: None,
-                },
+                authorization: controller_authorization,
             }),
         )
         .await
@@ -49094,6 +49339,7 @@ mod tests {
             ],
             "feature_connections": {},
             "control_operation_id": "guarded-strict-remote-success",
+            "authorization": child_authorization,
         });
         assert!(payload.get("working_directory").is_none());
 
@@ -49362,7 +49608,13 @@ mod tests {
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
         let workspace_id = api.config.workspace_id.clone();
-        let Json(controller_worker) = create_workspace_worker(
+        let (controller_authorization, child_authorization) = test_worker_policy_authorizations(
+            &api,
+            "control-spawn",
+            "builtin:default",
+            Default::default(),
+        );
+        let Json(controller_worker) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -49375,9 +49627,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                    assignment: None,
-                },
+                authorization: controller_authorization,
             }),
         )
         .await
@@ -49411,10 +49661,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: Some("control-spawn-retry".to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Policy {
-                policy_id: "control-spawn".into(),
-                policy_revision: 1,
-            },
+            authorization: child_authorization.clone(),
         };
 
         let Json(first) = spawn_known_worker(
@@ -49463,7 +49710,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(conflict.into_response().status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(conflict.into_response().status(), StatusCode::CONFLICT);
         let grants = api
             .store
             .list_active_worker_control_grants(&workspace_id, &controller, 10)
@@ -49497,7 +49744,7 @@ mod tests {
         };
 
         let Json(created) =
-            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+            create_workspace_worker_as_owner(State(api.clone()), HeaderMap::new(), Json(request()))
                 .await
                 .unwrap();
         assert_eq!(
@@ -49505,13 +49752,14 @@ mod tests {
             Some("custom:subject-42")
         );
         let Json(duplicate) =
-            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+            create_workspace_worker_as_owner(State(api.clone()), HeaderMap::new(), Json(request()))
                 .await
                 .unwrap();
         assert_eq!(duplicate.worker_id, created.worker_id);
         let mut competing_request = request();
+        competing_request.control_operation_id = Some("singleton-competing-create".into());
         competing_request.display_name = "Competing Subject Worker".to_string();
-        let competing = create_workspace_worker(
+        let competing = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(competing_request),
@@ -49536,13 +49784,15 @@ mod tests {
             .unwrap();
         assert_eq!(stopped.state, InternalWorkerOperationState::Accepted);
         let Json(stopped_retry) =
-            create_workspace_worker(State(api.clone()), HeaderMap::new(), Json(request()))
+            create_workspace_worker_as_owner(State(api.clone()), HeaderMap::new(), Json(request()))
                 .await
                 .unwrap();
         assert_eq!(stopped_retry.worker_id, created.worker_id);
         let mut stopped_competing_request = request();
+        stopped_competing_request.control_operation_id =
+            Some("singleton-stopped-competing-create".into());
         stopped_competing_request.display_name = "Stopped competing Worker".to_string();
-        let stopped_competing = create_workspace_worker(
+        let stopped_competing = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(stopped_competing_request),
@@ -49646,7 +49896,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -49766,21 +50016,21 @@ mod tests {
                 assignment: None,
             },
         };
-        let Json(controller) = create_workspace_worker(
+        let Json(controller) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(create("Session search controller")),
         )
         .await
         .unwrap();
-        let Json(first_worker) = create_workspace_worker(
+        let Json(first_worker) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(create("Large Session source")),
         )
         .await
         .unwrap();
-        let Json(second_worker) = create_workspace_worker(
+        let Json(second_worker) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(create("Later Session source")),
@@ -49945,47 +50195,49 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let Json(orchestrator) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let orchestrator = seed_test_orchestrator_as_owner(
+            &api,
+            &[
+                (
+                    "session",
+                    &["session.list", "session.search", "session.read"],
+                ),
+                ("worker", &["worker.observe", "worker.remove"]),
+            ],
+        );
         let controller = orchestrator.worker.unwrap();
         let controller = RuntimeWorkerRef::new(&controller.runtime_id, &controller.worker_id);
-        let spawned = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::WorkspaceCompanion,
-                    requested_worker_name: Some("archived Session source".to_string()),
-                    singleton_key: None,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
-                        "builtin:companion".to_string(),
-                    ),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: Some(runtime_test_bundle()),
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let spawned = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                requested_worker_name: Some("archived Session source".to_string()),
+                singleton_key: None,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
                 },
-            )
-            .unwrap();
+                profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                    "builtin:companion".to_string(),
+                ),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
+            },
+        )
+        .unwrap();
         let target = spawned.worker.unwrap().worker;
         let stopped = api
             .runtime
@@ -51025,7 +51277,7 @@ mod tests {
             }
         };
 
-        let Json(ordinary) = create_workspace_worker(
+        let Json(ordinary) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(request(None, "builtin:companion", None)),
@@ -51060,7 +51312,7 @@ mod tests {
                 StatusCode::BAD_REQUEST,
             ),
         ] {
-            let response = create_workspace_worker(
+            let response = create_workspace_worker_as_owner(
                 State(api.clone()),
                 HeaderMap::new(),
                 Json(request(Some(candidate), profile, singleton_key)),
@@ -51071,14 +51323,14 @@ mod tests {
             assert_eq!(response.status(), expected_status, "candidate={candidate}");
         }
 
-        let Json(first) = create_workspace_worker(
+        let Json(first) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(request(Some(&active.id), "builtin:companion", None)),
         )
         .await
         .unwrap();
-        let Json(retried) = create_workspace_worker(
+        let Json(retried) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(request(Some(&active.id), "builtin:companion", None)),
@@ -51107,7 +51359,7 @@ mod tests {
         assert_eq!(api.runtime.worker(&worker).unwrap().state, "stopped");
         execution.accept_restores();
 
-        let Json(restored) = create_workspace_worker(
+        let Json(restored) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(request(Some(&active.id), "builtin:companion", None)),
@@ -51120,9 +51372,7 @@ mod tests {
 
     #[tokio::test]
     async fn bound_authorization_rechecks_host_subject_and_exact_parent_without_target_lookup() {
-        use server_api::authorization::{
-            PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-        };
+        use server_api::authorization::{PermissionResource, ScopedPermission};
 
         // Real signed router, Host binding and permission storage; only Runtime
         // execution is substituted. No child or protected-data fixture is created.
@@ -51138,7 +51388,7 @@ mod tests {
                 "Protected behavior must not appear in authorization responses.".into(),
             )
             .unwrap();
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -51176,18 +51426,13 @@ mod tests {
                 serde_json::to_vec(&body).unwrap(),
             )
         };
-        let initial = store.current_subject_policy(&subject.id).unwrap().unwrap();
-        store
-            .set_subject_permissions(
-                &subject.id,
-                &SubjectPermissionsUpdate {
-                    operation_id: "bound-authorization-revoke".into(),
-                    expected_change_id: Some(initial.change_id),
-                    execution: vec![],
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        replace_test_subject_policy_as_owner(
+            &api,
+            &subject.id,
+            Default::default(),
+            Default::default(),
+        )
+        .await;
         let denied = build_router(api.clone())
             .oneshot(check(subject_request.clone()))
             .await
@@ -51202,29 +51447,28 @@ mod tests {
             worker_id: created.worker_id.clone(),
             name: "not-started-child".into(),
         };
-        let policy = store
-            .set_subject_permissions(
-                &subject.id,
-                &SubjectPermissionsUpdate {
-                    operation_id: Uuid::now_v7().to_string(),
-                    expected_change_id: store
-                        .subject_permissions(&subject.id)
-                        .unwrap()
-                        .map(|p| p.change_id),
-                    execution: vec![
-                        ScopedPermission {
-                            operation: "memory.resident.supply".into(),
-                            resource: subject_resource.clone(),
-                        },
-                        ScopedPermission {
-                            operation: "subworker.observe".into(),
-                            resource: child_resource.clone(),
-                        },
-                    ],
-                    delegation: vec![],
+        let selected = seed_test_subject_legacy_constraints(
+            &api,
+            &subject.id,
+            vec![
+                ScopedPermission {
+                    operation: "memory.resident.supply".into(),
+                    resource: subject_resource.clone(),
                 },
-            )
-            .unwrap();
+                ScopedPermission {
+                    operation: "subworker.observe".into(),
+                    resource: child_resource.clone(),
+                },
+            ],
+            vec![],
+        );
+        replace_test_subject_policy_as_owner(
+            &api,
+            &subject.id,
+            selected.execution,
+            selected.delegation,
+        )
+        .await;
         for (body, expected) in [
             (subject_request.clone(), subject_resource),
             (
@@ -51253,17 +51497,13 @@ mod tests {
                 .unwrap();
             assert!(response.status().is_client_error());
         }
-        store
-            .set_subject_permissions(
-                &subject.id,
-                &SubjectPermissionsUpdate {
-                    operation_id: Uuid::now_v7().to_string(),
-                    expected_change_id: Some(policy.change_id),
-                    execution: vec![],
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        replace_test_subject_policy_as_owner(
+            &api,
+            &subject.id,
+            Default::default(),
+            Default::default(),
+        )
+        .await;
         let revoked = build_router(api.clone())
             .oneshot(check(subject_request))
             .await
@@ -51305,9 +51545,7 @@ mod tests {
                 "Prefer explicit evidence.".to_string(),
             )
             .unwrap();
-        use server_api::authorization::{
-            PermissionResource, ScopedPermission, SubjectPermissionsUpdate,
-        };
+        use server_api::authorization::{PermissionResource, ScopedPermission};
         let resource = PermissionResource::Subject {
             workspace_id: TEST_WORKSPACE_ID.into(),
             subject_id: subject.id.clone(),
@@ -51333,22 +51571,14 @@ mod tests {
                 workspace_id: TEST_WORKSPACE_ID.into(),
             },
         });
-        open_subjektiv_store(&api)
-            .unwrap()
-            .set_subject_permissions(
-                &subject.id,
-                &SubjectPermissionsUpdate {
-                    operation_id: "staging-scope-fixture".into(),
-                    expected_change_id: open_subjektiv_store(&api)
-                        .unwrap()
-                        .current_subject_policy(&subject.id)
-                        .unwrap()
-                        .map(|p| p.change_id),
-                    execution,
-                    delegation: vec![],
-                },
-            )
-            .unwrap();
+        let selected = seed_test_subject_legacy_constraints(&api, &subject.id, execution, vec![]);
+        replace_test_subject_policy_as_owner(
+            &api,
+            &subject.id,
+            selected.execution,
+            selected.delegation,
+        )
+        .await;
         let request = CreateWorkspaceWorkerRequest {
             runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
             display_name: "Subject Worker".to_string(),
@@ -51367,16 +51597,10 @@ mod tests {
                 assignment: None,
             },
         };
-        let Json(created) = scoped_create_workspace_worker(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-            HeaderMap::new(),
-            Json(request),
-        )
-        .await
-        .unwrap();
+        let Json(created) =
+            create_workspace_worker_as_owner(State(api.clone()), HeaderMap::new(), Json(request))
+                .await
+                .unwrap();
         assert_eq!(
             created.worker.singleton_key.as_deref(),
             Some(format!("subjektiv:{}", subject.id).as_str())
@@ -52572,38 +52796,66 @@ mod tests {
         let mut invalid_request = request("singleton-create-invalid");
         invalid_request.singleton_key = Some(String::new());
         assert!(matches!(
-            api.spawn_workspace_worker(WorkdirlessFixtureRuntime::RUNTIME_ID, invalid_request)
-                .unwrap_err()
-                .error,
+            spawn_workspace_worker_as_owner(
+                &api,
+                WorkdirlessFixtureRuntime::RUNTIME_ID,
+                invalid_request
+            )
+            .unwrap_err()
+            .error,
             Error::InvalidInput(_)
         ));
         assert!(runtime.spawn_requests().is_empty());
 
-        // Simulate a Backend crash after the durable singleton reservation commits but before
-        // Runtime dispatch. The restarted request receives a fresh manual allocation key, yet its
-        // identical singleton intent replays the reserved Worker and dispatches that generation.
-        let mut restart_request = request("ignored-manual-operation");
+        // Simulate a crash after the owner operation atomically reserves its
+        // singleton, immutable Profile and core grant, but before Runtime dispatch.
+        // Exact replay must recover that same reservation and authority.
+        let mut restart_request = request("owner-restart-before-dispatch");
         restart_request.singleton_key = Some("fixture:restart-retry".to_string());
-        restart_request.resolved_control_operation = None;
+        restart_request.authorization = Some(
+            server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+        );
         let restart_fingerprint = worker_spawn_create_fingerprint(&restart_request).unwrap();
+        let operation = WorkerControlOperation {
+            operation_id: "owner-restart-before-dispatch".into(),
+            input_fingerprint: restart_fingerprint.clone(),
+        };
+        restart_request.resolved_control_operation = Some(operation.clone());
+        let (_, _, bundle, grant) = core_worker_creation::resolve_creation_profile(
+            &api,
+            None,
+            Some(&test_owner_actor().account_id),
+            restart_request.authorization.as_ref().unwrap(),
+            WorkdirlessFixtureRuntime::RUNTIME_ID,
+            Some("builtin:companion".into()),
+            Some(&operation),
+            false,
+        )
+        .unwrap();
         let memory = api
             .config_store
             .get_workspace_memory_settings(&api.config.workspace_id)
             .unwrap();
         let pre_crash_reservation = api
             .config_store
-            .reserve_worker_create(
+            .reserve_worker_create_with_core(
                 &api.config.workspace_id,
                 WorkdirlessFixtureRuntime::RUNTIME_ID,
-                "manual:lost-before-dispatch",
+                &operation.operation_id,
+                &restart_fingerprint,
                 &restart_fingerprint,
                 restart_request.singleton_key.as_deref(),
                 &memory,
+                grant.as_ref().unwrap(),
+                bundle.as_ref().unwrap(),
             )
             .unwrap();
-        let recovered = api
-            .spawn_workspace_worker(WorkdirlessFixtureRuntime::RUNTIME_ID, restart_request)
-            .unwrap();
+        let recovered = spawn_workspace_worker_as_owner(
+            &api,
+            WorkdirlessFixtureRuntime::RUNTIME_ID,
+            restart_request,
+        )
+        .unwrap();
         assert_eq!(recovered.state, InternalWorkerOperationState::Accepted);
         assert_eq!(
             recovered.worker.unwrap().worker.worker_id,
@@ -52611,9 +52863,13 @@ mod tests {
         );
 
         assert!(matches!(
-            api.spawn_workspace_worker("missing-runtime", request("singleton-create-undispatched"))
-                .unwrap_err()
-                .error,
+            spawn_workspace_worker_as_owner(
+                &api,
+                "missing-runtime",
+                request("singleton-create-undispatched")
+            )
+            .unwrap_err()
+            .error,
             Error::UnknownRuntime(_)
         ));
 
@@ -52621,12 +52877,12 @@ mod tests {
         // Worker is absent. A fresh retry then takes the next generation without leaving the key
         // permanently wedged.
         runtime.reject_next_spawn();
-        let rejected = api
-            .spawn_workspace_worker(
-                WorkdirlessFixtureRuntime::RUNTIME_ID,
-                request("singleton-create-1"),
-            )
-            .unwrap();
+        let rejected = spawn_workspace_worker_as_owner(
+            &api,
+            WorkdirlessFixtureRuntime::RUNTIME_ID,
+            request("singleton-create-1"),
+        )
+        .unwrap();
         assert_eq!(rejected.state, InternalWorkerOperationState::Rejected);
         assert!(
             api.store
@@ -52634,12 +52890,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let created = api
-            .spawn_workspace_worker(
-                WorkdirlessFixtureRuntime::RUNTIME_ID,
-                request("singleton-create-retry"),
-            )
-            .unwrap();
+        let created = spawn_workspace_worker_as_owner(
+            &api,
+            WorkdirlessFixtureRuntime::RUNTIME_ID,
+            request("singleton-create-retry"),
+        )
+        .unwrap();
         assert_eq!(created.state, InternalWorkerOperationState::Accepted);
         let worker = created.worker.unwrap();
         let current_owner = api
@@ -52663,7 +52919,7 @@ mod tests {
             .state = "paused".to_string();
         let spawn_count = runtime.spawn_requests().len();
         assert!(matches!(
-            api.spawn_workspace_worker(
+            spawn_workspace_worker_as_owner(&api,
                 WorkdirlessFixtureRuntime::RUNTIME_ID,
                 request("singleton-create-conflict"),
             )
@@ -52708,7 +52964,8 @@ mod tests {
             worker.worker
         );
         assert!(
-            api.spawn_workspace_worker(
+            spawn_workspace_worker_as_owner(
+                &api,
                 WorkdirlessFixtureRuntime::RUNTIME_ID,
                 request("singleton-create-disconnected"),
             )
@@ -52757,14 +53014,14 @@ mod tests {
             .error,
             Error::UnknownWorker { .. }
         ));
-        let replacement = api
-            .spawn_workspace_worker(
-                WorkdirlessFixtureRuntime::RUNTIME_ID,
-                request("singleton-create-2"),
-            )
-            .unwrap()
-            .worker
-            .unwrap();
+        let replacement = spawn_workspace_worker_as_owner(
+            &api,
+            WorkdirlessFixtureRuntime::RUNTIME_ID,
+            request("singleton-create-2"),
+        )
+        .unwrap()
+        .worker
+        .unwrap();
         assert_ne!(replacement.worker.worker_id, worker.worker.worker_id);
         assert!(matches!(
             restore_internal_observed_worker(
@@ -52793,7 +53050,7 @@ mod tests {
         let api = test_api(workspace.path()).await;
         let workspace_id = api.config.workspace_id.clone();
 
-        let Json(generic) = create_workspace_worker(
+        let Json(generic) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -52806,9 +53063,10 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                    assignment: None,
-                },
+                authorization: test_worker_operation_authorization(&[(
+                    "worker",
+                    &["worker.list", "worker.observe", "worker.observe.list"],
+                )]),
             }),
         )
         .await
@@ -52816,7 +53074,7 @@ mod tests {
         assert_eq!(generic.worker.singleton_key, None);
         assert!(find_workspace_orchestrator(&api).is_none());
 
-        let forged_public = create_workspace_worker(
+        let forged_public = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -52849,39 +53107,37 @@ mod tests {
 
         // Even a trusted internal caller that accidentally assigns the legacy key cannot turn
         // generic Worker metadata into Orchestrator completion authority.
-        let forged_internal = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    requested_worker_name: Some("Forged Orchestrator claimant".to_string()),
-                    singleton_key: Some(
-                        crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
-                    ),
-                    intent: WorkerSpawnIntent::WorkspaceCompanion,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: ProfileSelector::Builtin("builtin:companion".to_string()),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: None,
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let forged_internal = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some("Forged Orchestrator claimant".to_string()),
+                singleton_key: Some(crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string()),
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
                 },
-            )
-            .unwrap()
-            .worker
-            .unwrap();
+                profile: ProfileSelector::Builtin("builtin:companion".to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
+            },
+        )
+        .unwrap()
+        .worker
+        .unwrap();
         assert!(find_workspace_orchestrator(&api).is_none());
         assert!(
             require_merge_request_completion_grant(&api, &forged_internal.worker, "mr-completion")
@@ -52909,7 +53165,7 @@ mod tests {
             .delete_worker_registry(&workspace_id, &forged_internal.worker)
             .unwrap();
 
-        let reserved = create_workspace_worker(
+        let reserved = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -52931,14 +53187,13 @@ mod tests {
         .unwrap_err();
         assert!(matches!(reserved.error, Error::ReservedWorkerName(_)));
 
-        let Json(started) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: workspace_id.clone(),
-            }),
-        )
-        .await
-        .unwrap();
+        let started = seed_test_orchestrator_as_owner(
+            &api,
+            &[(
+                "worker",
+                &["worker.list", "worker.observe", "worker.observe.list"],
+            )],
+        );
         assert_eq!(started.disposition, "created");
         let dedicated = started.worker.expect("dedicated Orchestrator Worker");
         assert_eq!(
@@ -53067,7 +53322,7 @@ mod tests {
         .unwrap();
         assert!(unauthorized.sessions.is_empty());
 
-        let Json(existing) = scoped_start_workspace_orchestrator(
+        let Json(existing) = start_workspace_orchestrator_as_owner(
             State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: workspace_id.clone(),
@@ -54969,7 +55224,8 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        api.spawn_workspace_worker(
+        spawn_workspace_worker_as_owner(
+            &api,
             EMBEDDED_WORKER_RUNTIME_ID,
             WorkerSpawnRequest {
                 requested_worker_name: Some(name.to_string()),
@@ -59861,38 +60117,39 @@ mod tests {
         assert_eq!(below_threshold.candidate_count, 1);
         assert!(below_threshold.summary.contains("Backend policy threshold"));
 
-        let resolved_config_bundle = None;
-        let existing = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
-                    intent: WorkerSpawnIntent::WorkspaceOrchestrator,
-                    singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string()),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle,
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: Some(test_worker_workspace_api(
-                        EMBEDDED_WORKER_RUNTIME_ID,
-                    )),
-                    resolved_memory_settings: Some(test_worker_memory_settings()),
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let resolved_config_bundle = Some(test_internal_builtin_profile_bundle(
+            &api,
+            MEMORY_CONSOLIDATION_PROFILE,
+        ));
+        let existing = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
+                intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+                singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
                 },
-            )
-            .unwrap();
+                profile: ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string()),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: Some(test_worker_workspace_api(EMBEDDED_WORKER_RUNTIME_ID)),
+                resolved_memory_settings: Some(test_worker_memory_settings()),
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
+            },
+        )
+        .unwrap();
         assert_eq!(
             existing.state,
             InternalWorkerOperationState::Accepted,
@@ -60487,7 +60744,7 @@ mod tests {
         ticket_id: &str,
         assignment_id: &str,
     ) -> RuntimeWorkerRef {
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -60945,7 +61202,7 @@ mod tests {
         register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
         let runtime = WorkdirlessFixtureRuntime::default();
         api.runtime.register_or_replace(runtime.clone());
-        let Json(created) = create_workspace_worker(
+        let Json(created) = create_workspace_worker_as_owner(
             State(api.clone()),
             HeaderMap::new(),
             Json(CreateWorkspaceWorkerRequest {
@@ -62592,7 +62849,9 @@ mod tests {
              intent: server_api::RuntimeWorkerSpawnIntent,
              profile: &str,
              singleton_key: &str| server_api::RuntimeWorkerSpawnRequest {
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
                 control_operation_id: "runtime-test-create".into(),
                 requested_worker_name: Some(requested_worker_name.to_string()),
                 intent,
@@ -62669,8 +62928,10 @@ mod tests {
         let ticket = backend.create(input).unwrap();
         assign_test_orchestrator(&api, &ticket.id);
         let request = server_api::RuntimeWorkerSpawnRequest {
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
-                control_operation_id: "runtime-test-create".into(),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
+            control_operation_id: "runtime-test-create".into(),
             requested_worker_name: Some("assigned-spawn".to_string()),
             intent: server_api::RuntimeWorkerSpawnIntent::TicketRole {
                 ticket_id: ticket.id.clone(),
@@ -62692,12 +62953,9 @@ mod tests {
             workdir_attachment_requests: Vec::new(),
         };
 
-        let Json(result) = scoped_create_runtime_worker(
+        let Json(result) = create_runtime_worker_as_owner(
             State(api.clone()),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-            }),
+            AxumPath(EMBEDDED_WORKER_RUNTIME_ID.to_string()),
             Json(request.clone()),
         )
         .await
@@ -62725,12 +62983,9 @@ mod tests {
                 .workflow_state,
             TicketState::Open
         );
-        let Json(replay) = scoped_create_runtime_worker(
+        let Json(replay) = create_runtime_worker_as_owner(
             State(api),
-            AxumPath(ScopedRuntimePath {
-                workspace_id: TEST_WORKSPACE_ID.into(),
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.into(),
-            }),
+            AxumPath(EMBEDDED_WORKER_RUNTIME_ID.into()),
             Json(request),
         )
         .await
@@ -63877,6 +64132,342 @@ mod tests {
             .unwrap();
     }
 
+    // Use the authenticated creation boundary for owner-origin fixture Workers;
+    // unauthenticated and Worker-origin denial tests must keep their own caller.
+    async fn start_workspace_orchestrator_as_owner(
+        state: State<WorkspaceApi>,
+        path: AxumPath<ScopedWorkspacePath>,
+    ) -> ApiResult<Json<BrowserWorkspaceOrchestratorResponse>> {
+        let context = server_request_context(
+            Some(test_owner_actor()),
+            None,
+            None,
+            None,
+            &HeaderMap::new(),
+        );
+        scoped_start_workspace_orchestrator(state, path, context).await
+    }
+
+    async fn create_workspace_worker_as_owner(
+        State(api): State<WorkspaceApi>,
+        headers: HeaderMap,
+        Json(request): Json<CreateWorkspaceWorkerRequest>,
+    ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+        let context = server_request_context(Some(test_owner_actor()), None, None, None, &headers);
+        create_workspace_worker_authenticated(api, headers, request, None, Some(&context)).await
+    }
+
+    async fn create_runtime_worker_as_owner(
+        State(api): State<WorkspaceApi>,
+        AxumPath(runtime_id): AxumPath<String>,
+        Json(request): Json<server_api::RuntimeWorkerSpawnRequest>,
+    ) -> ApiResult<Json<server_api::RuntimeWorkerSpawnResponse>> {
+        let context = server_request_context(
+            Some(test_owner_actor()),
+            None,
+            None,
+            None,
+            &HeaderMap::new(),
+        );
+        create_runtime_worker_authenticated(
+            State(api),
+            AxumPath(runtime_id),
+            Json(request),
+            Some(&context),
+        )
+        .await
+    }
+
+    // Low-level spawn tests retain their internal intent/claims, but resolve the
+    // owner grant and immutable Profile through the same resolver as public creation.
+    fn spawn_workspace_worker_as_owner(
+        api: &WorkspaceApi,
+        runtime_id: &str,
+        mut request: WorkerSpawnRequest,
+    ) -> ApiResult<WorkerSpawnResult> {
+        let actor = test_owner_actor();
+        let authorization = request.authorization.clone().unwrap_or(
+            server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+        );
+        request.authorization = Some(authorization.clone());
+        let operation = match request.resolved_control_operation.clone() {
+            Some(operation) => operation,
+            None => WorkerControlOperation {
+                operation_id: format!("human-worker:{}:{}", actor.account_id, Uuid::now_v7()),
+                input_fingerprint: worker_spawn_create_fingerprint(&request)
+                    .map_err(|message| Error::Config(message.to_string()))?,
+            },
+        };
+        let profile = match &request.profile {
+            ProfileSelector::Builtin(name) if !name.starts_with("builtin:") => {
+                format!("builtin:{name}")
+            }
+            ProfileSelector::Named(name) if !name.starts_with("project:") => {
+                format!("project:{name}")
+            }
+            ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => name.clone(),
+        };
+        let (profile, bundle, grant) = if let Some(bundle) = request.resolved_config_bundle.take() {
+            // Internal fixtures may select a non-public builtin Profile, but the
+            // owner grant must still bind its exact canonical selector and bundle.
+            let selector = match &request.profile {
+                ProfileSelector::Builtin(_) => ProfileSelector::Builtin(profile.clone()),
+                ProfileSelector::Named(_) => ProfileSelector::Named(profile.clone()),
+            };
+            let saved = api.config_store.saved_core_worker_launch(
+                api.workspace_id(),
+                &operation.operation_id,
+                &operation.input_fingerprint,
+            )?;
+            let (grant, bundle) = match saved {
+                Some((grant, bundle)) => {
+                    subject_authorization::revalidate_core_grant(api, &grant)?;
+                    (grant, bundle)
+                }
+                None => (
+                    core_worker_creation::resolve_core_creation_grant(
+                        api,
+                        None,
+                        Some(&actor.account_id),
+                        &authorization,
+                        runtime_id,
+                        &profile,
+                        &bundle,
+                        &operation,
+                    )?,
+                    bundle,
+                ),
+            };
+            (selector, Some(bundle), Some(grant))
+        } else {
+            let (_, profile, bundle, grant) = core_worker_creation::resolve_creation_profile(
+                api,
+                None,
+                Some(&actor.account_id),
+                &authorization,
+                runtime_id,
+                Some(profile),
+                Some(&operation),
+                false,
+            )?;
+            (profile, bundle, grant)
+        };
+        request.profile = profile;
+        request.resolved_config_bundle = bundle;
+        request.resolved_core_execution_grant = grant;
+        request.authorization = Some(authorization);
+        request.resolved_control_operation = Some(operation);
+        api.spawn_workspace_worker(runtime_id, request)
+    }
+
+    fn seed_test_orchestrator_as_owner(
+        api: &WorkspaceApi,
+        namespaces: &[(&str, &[&str])],
+    ) -> BrowserWorkspaceOrchestratorResponse {
+        seed_test_delivery_binding(api);
+        let key = crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY;
+        let created = spawn_workspace_worker_as_owner(
+            api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                requested_worker_name: Some(key.into()),
+                singleton_key: Some(key.into()),
+                intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
+                },
+                profile: ProfileSelector::Builtin("builtin:orchestrator".into()),
+                ticket_assignment: None,
+                initial_submit: vec![],
+                workdir_attachment_requests: vec![],
+                resolved_workdir_attachment_requests: vec![],
+                resolved_workdir_attachments: vec![],
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: true,
+                resolved_worker_observation_grants: vec![],
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                resolved_core_execution_grant: None,
+                authorization: Some(test_worker_operation_authorization(namespaces)),
+            },
+        )
+        .unwrap();
+        assert_eq!(created.state, InternalWorkerOperationState::Accepted);
+        workspace_orchestrator_response(api, "created")
+    }
+
+    fn test_worker_operation_authorization(
+        namespaces: &[(&str, &[&str])],
+    ) -> server_api::launch_policy::WorkerCreationAuthorization {
+        use feature_permissions::{
+            NamespaceId, NamespacePermissions, PermissionAssignment, PermissionKey,
+            PermissionReference,
+        };
+        server_api::launch_policy::WorkerCreationAuthorization::Human {
+            assignment: Some(PermissionAssignment {
+                grants: namespaces
+                    .iter()
+                    .map(|(namespace, operations)| {
+                        PermissionReference::Namespace(NamespacePermissions {
+                            namespace: NamespaceId::parse(*namespace).unwrap(),
+                            keys: operations
+                                .iter()
+                                .map(|operation| PermissionKey::parse(*operation).unwrap())
+                                .collect(),
+                        })
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn test_worker_policy_authorizations(
+        api: &WorkspaceApi,
+        policy_id: &str,
+        profile: &str,
+        child_permissions: feature_permissions::PermissionAssignment,
+    ) -> (
+        server_api::launch_policy::WorkerCreationAuthorization,
+        server_api::launch_policy::WorkerCreationAuthorization,
+    ) {
+        use server_api::launch_policy::{
+            WorkerCreationAuthorization, WorkerLaunchPolicyAction, WorkerLaunchPolicyMutation,
+        };
+        let policy = api
+            .config_store
+            .mutate_worker_launch_policy(
+                api.workspace_id(),
+                &test_owner_actor().account_id,
+                &WorkerLaunchPolicyMutation {
+                    operation_key: format!("create-{policy_id}"),
+                    policy_id: policy_id.into(),
+                    expected: None,
+                    action: WorkerLaunchPolicyAction::Create {
+                        name: policy_id.into(),
+                        allowed_profiles: vec![profile.into()],
+                        child_permissions,
+                    },
+                },
+            )
+            .unwrap()
+            .policy;
+        let usage = policy.usage_key().unwrap();
+        (
+            test_worker_operation_authorization(&[("worker", &["worker.create", usage.as_str()])]),
+            WorkerCreationAuthorization::Policy {
+                policy_id: policy.policy_id,
+                policy_revision: policy.authorization_revision,
+            },
+        )
+    }
+
+    // Exact ID restrictions are historical storage fixtures, not inputs accepted
+    // by today's owner API. Seed only that retained ceiling; keep the live lanes
+    // unchanged until the authenticated owner mutation below grants/revokes keys.
+    fn seed_test_subject_legacy_constraints(
+        api: &WorkspaceApi,
+        subject: &str,
+        execution: Vec<server_api::authorization::ScopedPermission>,
+        delegation: Vec<server_api::authorization::ScopedPermission>,
+    ) -> server_api::authorization::CurrentSubjectPolicy {
+        use server_api::authorization::{CurrentSubjectPolicy, SubjectPermissions};
+        let legacy = SubjectPermissions {
+            change_id: Uuid::now_v7().to_string(),
+            execution,
+            delegation,
+        };
+        let keyed = |lane: &[server_api::authorization::ScopedPermission]| {
+            lane.iter()
+                .filter(|permission| {
+                    feature_permissions::PermissionKey::parse(
+                        server_api::authorization::canonical_worker_operation(
+                            &permission.operation,
+                        )
+                        .unwrap_or(&permission.operation),
+                    )
+                    .is_ok()
+                })
+                .cloned()
+                .collect()
+        };
+        let mut selected = CurrentSubjectPolicy::from_legacy(SubjectPermissions {
+            change_id: legacy.change_id.clone(),
+            execution: keyed(&legacy.execution),
+            delegation: keyed(&legacy.delegation),
+        })
+        .unwrap()
+        .into_current_reference_encoding();
+        // Unmappable scalar names remain historical restrictions, never live keys.
+        selected.legacy_constraints = Some(legacy);
+        let previous = api
+            .config_store
+            .current_subject_permission_policy(api.workspace_id(), subject)
+            .unwrap();
+        let mut retained = selected.clone();
+        retained.execution = previous
+            .as_ref()
+            .map(|p| p.execution.clone())
+            .unwrap_or_default();
+        retained.delegation = previous
+            .as_ref()
+            .map(|p| p.delegation.clone())
+            .unwrap_or_default();
+        let saved = crate::policy_config::AdoptedSubjectPolicy::from_current(subject, &retained);
+        api.config_store.with_immediate_transaction(|conn| {
+            conn.execute(
+                "INSERT INTO workspace_configuration_policies(workspace_id,subject_id,policy_json) VALUES(?1,?2,?3) ON CONFLICT(workspace_id,subject_id) DO UPDATE SET policy_json=excluded.policy_json",
+                rusqlite::params![api.workspace_id(), subject, serde_json::to_string(&saved).unwrap()],
+            )?;
+            Ok(())
+        }).unwrap();
+        selected
+    }
+
+    async fn replace_test_subject_policy_as_owner(
+        api: &WorkspaceApi,
+        subject: &str,
+        execution: feature_permissions::PermissionAssignment,
+        delegation: feature_permissions::PermissionAssignment,
+    ) -> server_api::authorization::CurrentSubjectPolicy {
+        let context = server_request_context(
+            Some(test_owner_actor()),
+            None,
+            None,
+            None,
+            &HeaderMap::new(),
+        );
+        let current = subject_permission_policy::get(
+            api.clone(),
+            context.clone(),
+            api.workspace_id().into(),
+            subject.into(),
+        )
+        .await
+        .unwrap();
+        subject_permission_policy::set(
+            api.clone(),
+            context,
+            api.workspace_id().into(),
+            subject.into(),
+            server_api::subject_policy::SubjectPermissionPolicyMutation {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_change_id: current.change_id,
+                action: server_api::subject_policy::SubjectPermissionPolicyAction::Replace {
+                    execution,
+                    delegation,
+                },
+            },
+        )
+        .await
+        .unwrap()
+        .policy
+        .unwrap()
+    }
+
     fn test_owner_actor() -> RequestActor {
         RequestActor {
             user_id: "owner-user".to_string(),
@@ -64207,14 +64798,7 @@ mod tests {
     async fn worker_remove_rejects_self_and_running_at_caller_boundary() {
         let temp = tempfile::tempdir().unwrap();
         let api = test_api(temp.path()).await;
-        let Json(orchestrator) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let orchestrator = seed_test_orchestrator_as_owner(&api, &[("worker", &["worker.remove"])]);
         let source = orchestrator.worker.unwrap();
         let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
         let verified_source = || crate::worker_source::VerifiedWorkerMutationSource {
@@ -64237,37 +64821,37 @@ mod tests {
         assert_eq!(self_response.status, StatusCode::CONFLICT.as_u16());
         assert!(self_response.body.contains("self_removal_forbidden"));
 
-        let spawned = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::WorkspaceCompanion,
-                    requested_worker_name: Some("guard-target".to_string()),
-                    singleton_key: None,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
-                        "builtin:companion".to_string(),
-                    ),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: Some(runtime_test_bundle()),
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let spawned = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                requested_worker_name: Some("guard-target".to_string()),
+                singleton_key: None,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
                 },
-            )
-            .unwrap();
+                profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                    "builtin:companion".to_string(),
+                ),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
+            },
+        )
+        .unwrap();
         let target = spawned.worker.unwrap().worker;
         let target_summary = api.runtime.worker(&target).unwrap();
         sync_worker_observation(&api, &target_summary).unwrap();
@@ -64310,48 +64894,41 @@ mod tests {
         )
         .await
         .unwrap();
-        let Json(orchestrator) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let orchestrator = seed_test_orchestrator_as_owner(&api, &[("worker", &["worker.remove"])]);
         let source = orchestrator.worker.unwrap();
         let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
 
-        let spawned = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::WorkspaceCompanion,
-                    requested_worker_name: Some("remove-target".to_string()),
-                    singleton_key: None,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
-                        "builtin:companion".to_string(),
-                    ),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: Some(runtime_test_bundle()),
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let spawned = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                requested_worker_name: Some("remove-target".to_string()),
+                singleton_key: None,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
                 },
-            )
-            .unwrap();
+                profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                    "builtin:companion".to_string(),
+                ),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
+            },
+        )
+        .unwrap();
         let target = spawned.worker.unwrap().worker;
         seed_worker_control_grant(&api, &source, &target, "embedded-valid-proof");
         let target_key = api
@@ -64465,37 +65042,37 @@ mod tests {
     async fn published_spawn_compensation_uses_catalog_removal_commit() {
         let temp = tempfile::tempdir().unwrap();
         let api = test_api(temp.path()).await;
-        let spawned = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::WorkspaceCompanion,
-                    requested_worker_name: Some("compensation-target".to_string()),
-                    singleton_key: None,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
-                        "builtin:companion".to_string(),
-                    ),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: Some(runtime_test_bundle()),
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let spawned = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                requested_worker_name: Some("compensation-target".to_string()),
+                singleton_key: None,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
                 },
-            )
-            .unwrap();
+                profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                    "builtin:companion".to_string(),
+                ),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
+            },
+        )
+        .unwrap();
         let worker = spawned.worker.unwrap().worker;
         let summary = api.runtime.worker(&worker).unwrap();
         sync_worker_observation(&api, &summary).unwrap();
@@ -68190,14 +68767,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let Json(orchestrator) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let orchestrator = seed_test_orchestrator_as_owner(&api, &[]);
         let worker = orchestrator.worker.unwrap();
         let worker = RuntimeWorkerRef::new(worker.runtime_id, worker.worker_id);
         let mut stop_events = api.worker_projection.subscribe_ordered(10).unwrap();
@@ -68280,14 +68850,7 @@ mod tests {
             [crate::store::WorkerCatalogChange::Removed(removed)] if removed == &worker
         ));
 
-        let Json(recreated) = scoped_start_workspace_orchestrator(
-            State(api.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let recreated = seed_test_orchestrator_as_owner(&api, &[]);
         let recreated = recreated.worker.expect("recreated Orchestrator");
         assert_ne!(recreated.worker_id, worker.worker_id);
     }
@@ -68297,37 +68860,37 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let spawned = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                WorkerSpawnRequest {
-                    intent: WorkerSpawnIntent::WorkspaceCompanion,
-                    requested_worker_name: Some("cleanup-projection-target".to_string()),
-                    singleton_key: None,
-                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
-                        expected_segments: 0,
-                    },
-                    profile: worker_runtime::catalog::ProfileSelector::Builtin(
-                        "builtin:companion".to_string(),
-                    ),
-                    ticket_assignment: None,
-                    initial_submit: Vec::new(),
-                    workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachment_requests: Vec::new(),
-                    resolved_workdir_attachments: Vec::new(),
-                    resolved_config_bundle: Some(runtime_test_bundle()),
-                    resolved_worker_observation_enabled: false,
-                    resolved_worker_observation_grants: Vec::new(),
-                    resolved_workspace_api: None,
-                    resolved_memory_settings: None,
-                    resolved_subjektiv_attached: false,
-                    resolved_control_operation: None,
-                    resolved_execution_grant: None,
-                    authorization: None,
-                    resolved_core_execution_grant: None,
+        let spawned = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            WorkerSpawnRequest {
+                intent: WorkerSpawnIntent::WorkspaceCompanion,
+                requested_worker_name: Some("cleanup-projection-target".to_string()),
+                singleton_key: None,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 0,
                 },
-            )
-            .unwrap();
+                profile: worker_runtime::catalog::ProfileSelector::Builtin(
+                    "builtin:companion".to_string(),
+                ),
+                ticket_assignment: None,
+                initial_submit: Vec::new(),
+                workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachment_requests: Vec::new(),
+                resolved_workdir_attachments: Vec::new(),
+                resolved_config_bundle: None,
+                resolved_worker_observation_enabled: false,
+                resolved_worker_observation_grants: Vec::new(),
+                resolved_workspace_api: None,
+                resolved_memory_settings: None,
+                resolved_subjektiv_attached: false,
+                resolved_control_operation: None,
+                resolved_execution_grant: None,
+                authorization: None,
+                resolved_core_execution_grant: None,
+            },
+        )
+        .unwrap();
         let worker = spawned.worker.unwrap().worker;
         let stopped = api
             .runtime
@@ -69464,6 +70027,23 @@ mod tests {
             worker_runtime::resource::BackendResourceError::Unauthorized { .. }
         ));
         server.abort();
+    }
+
+    fn test_internal_builtin_profile_bundle(
+        api: &WorkspaceApi,
+        profile: &str,
+    ) -> worker_runtime::config_bundle::ConfigBundle {
+        let selector = ProfileSelector::Builtin(format!(
+            "builtin:{}",
+            profile.strip_prefix("builtin:").unwrap_or(profile)
+        ));
+        let mut bundle = runtime_test_bundle();
+        bundle.metadata.workspace_id = api.workspace_id().into();
+        bundle.profiles[0].selector = selector.clone();
+        bundle.profiles[0].label = Some(profile.strip_prefix("builtin:").unwrap_or(profile).into());
+        bundle.profile_source_archive =
+            Some(crate::profile_settings::builtin_profile_source_archive(&selector).unwrap());
+        bundle.with_computed_digest()
     }
 
     fn runtime_test_bundle() -> worker_runtime::config_bundle::ConfigBundle {
@@ -71358,11 +71938,13 @@ mod tests {
         api.runtime
             .register_or_replace(WorkdirlessFixtureRuntime::default());
 
-        let Json(runtime_response) = create_runtime_worker(
+        let Json(runtime_response) = create_runtime_worker_as_owner(
             State(api.clone()),
             AxumPath(WorkdirlessFixtureRuntime::RUNTIME_ID.to_string()),
             Json(server_api::RuntimeWorkerSpawnRequest {
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                    assignment: None,
+                },
                 control_operation_id: "runtime-test-create".into(),
                 intent: server_api::RuntimeWorkerSpawnIntent::WorkspaceCompanion,
                 requested_worker_name: Some("Runtime Worker".to_string()),
@@ -71389,10 +71971,10 @@ mod tests {
                 .is_empty()
         );
 
-        let Json(response) = create_workspace_worker_inner(
-            api,
+        let Json(response) = create_workspace_worker_as_owner(
+            State(api),
             HeaderMap::new(),
-            CreateWorkspaceWorkerRequest {
+            Json(CreateWorkspaceWorkerRequest {
                 runtime_id: WorkdirlessFixtureRuntime::RUNTIME_ID.to_string(),
                 display_name: "Remote Worker".to_string(),
                 singleton_key: None,
@@ -71405,8 +71987,7 @@ mod tests {
                 authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
                     assignment: None,
                 },
-            },
-            None,
+            }),
         )
         .await
         .unwrap();
@@ -72325,14 +72906,8 @@ mod tests {
         );
 
         // Exercise the ordinary guarded removal service, not direct catalog deletion.
-        let Json(orchestrator) = scoped_start_workspace_orchestrator(
-            State(restored.clone()),
-            AxumPath(ScopedWorkspacePath {
-                workspace_id: TEST_WORKSPACE_ID.to_string(),
-            }),
-        )
-        .await
-        .unwrap();
+        let orchestrator =
+            seed_test_orchestrator_as_owner(&restored, &[("worker", &["worker.remove"])]);
         let source = orchestrator.worker.expect("removal controller");
         let source = RuntimeWorkerRef::new(&source.runtime_id, &source.worker_id);
         sync_worker_observation(&restored, &restored_worker).unwrap();
@@ -73621,7 +74196,7 @@ mod tests {
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle: Some(runtime_test_bundle()),
+            resolved_config_bundle: None,
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
@@ -73632,9 +74207,9 @@ mod tests {
             authorization: None,
             resolved_core_execution_grant: None,
         };
-        let spawned = api
-            .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn_request)
-            .unwrap();
+        let spawned =
+            spawn_workspace_worker_as_owner(&api, EMBEDDED_WORKER_RUNTIME_ID, spawn_request)
+                .unwrap();
         assert_eq!(spawned.state, InternalWorkerOperationState::Accepted);
         let worker_id = spawned.worker.unwrap().worker.worker_id;
         let projections = api
@@ -74517,7 +75092,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
             workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachment_requests: Vec::new(),
             resolved_workdir_attachments: Vec::new(),
-            resolved_config_bundle: None,
+            resolved_config_bundle: Some(test_internal_builtin_profile_bundle(&api, profile)),
             resolved_worker_observation_enabled: false,
             resolved_worker_observation_grants: Vec::new(),
             resolved_workspace_api: None,
@@ -74530,19 +75105,24 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         };
 
         let dedicated_key = "subjektiv-consolidation:dedicated-subject";
-        let dedicated = api
-            .spawn_workspace_worker(
-                EMBEDDED_WORKER_RUNTIME_ID,
-                spawn(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE, dedicated_key),
-            )
-            .unwrap()
-            .worker
-            .unwrap();
-        assert!(is_dedicated_subjektiv_consolidation_worker(
-            &dedicated,
-            TEST_WORKSPACE_ID,
-            dedicated_key
-        ));
+        let dedicated = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            spawn(SUBJEKTIV_MEMORY_CONSOLIDATION_PROFILE, dedicated_key),
+        )
+        .unwrap()
+        .worker
+        .unwrap();
+        assert!(
+            is_dedicated_subjektiv_consolidation_worker(
+                &dedicated,
+                TEST_WORKSPACE_ID,
+                dedicated_key
+            ),
+            "dedicated fixture Profile: {:?}; tags: {:?}",
+            dedicated.profile,
+            dedicated.tags
+        );
         let dedicated_context = server_api::ServerRequestContext {
             actor: None,
             worker_source: None,
@@ -74562,11 +75142,14 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         );
 
         let forged_key = "subjektiv-consolidation:forged-subject";
-        let forged = api
-            .spawn_workspace_worker(EMBEDDED_WORKER_RUNTIME_ID, spawn("companion", forged_key))
-            .unwrap()
-            .worker
-            .unwrap();
+        let forged = spawn_workspace_worker_as_owner(
+            &api,
+            EMBEDDED_WORKER_RUNTIME_ID,
+            spawn("companion", forged_key),
+        )
+        .unwrap()
+        .worker
+        .unwrap();
         let forged_context = server_api::ServerRequestContext {
             actor: None,
             worker_source: None,

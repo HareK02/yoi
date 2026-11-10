@@ -31,6 +31,7 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
 impl SubjektivStore {
     /// Distinguishes a saved Feature assignment from a legacy scoped source without
     /// exception-text dispatch or inferring authority from the database path.
+    /// Feature references are normalized for consumers, not for raw transfer evidence.
     pub fn subject_policy_source(&self, subject_id: &str) -> Result<Option<SubjectPolicySource>> {
         self.database.try_transaction(|connection| {
             require_subject(connection, subject_id)?;
@@ -57,11 +58,14 @@ impl SubjektivStore {
                 .canonical_permission_source
                 .as_ref()
                 .ok_or_else(|| denied("canonical permission source is not connected"))?
-                .current_subject_policy(self.scope_id(), subject_id);
+                .current_subject_policy(self.scope_id(), subject_id)
+                .map(|source| source.map(CurrentSubjectPolicy::into_current_reference_encoding));
         }
         stored_source(connection, subject_id)?
             .map(|source| match source {
-                StoredSubjectPolicy::Feature(source) => Ok(source),
+                StoredSubjectPolicy::Feature(source) => {
+                    Ok(source.into_current_reference_encoding())
+                }
                 StoredSubjectPolicy::Legacy(source) => {
                     CurrentSubjectPolicy::from_legacy(source).map_err(SubjektivError::InvalidRecord)
                 }
@@ -226,14 +230,20 @@ impl SubjektivStore {
         connection: &Connection,
         subject: &str,
     ) -> Result<Option<SubjectPolicySource>> {
-        if transfer::is_sealed(connection)? {
-            return self
-                .canonical_permission_source
+        let source = if transfer::is_sealed(connection)? {
+            self.canonical_permission_source
                 .as_ref()
                 .ok_or_else(|| denied("canonical permission source is not connected"))?
-                .subject_policy_source(self.scope_id(), subject);
-        }
-        stored_source(connection, subject)
+                .subject_policy_source(self.scope_id(), subject)?
+        } else {
+            stored_source(connection, subject)?
+        };
+        Ok(source.map(|source| match source {
+            SubjectPolicySource::Feature(source) => {
+                SubjectPolicySource::Feature(source.into_current_reference_encoding())
+            }
+            SubjectPolicySource::Legacy(source) => SubjectPolicySource::Legacy(source),
+        }))
     }
 
     fn bind_worker_execution_grant_inner<L>(

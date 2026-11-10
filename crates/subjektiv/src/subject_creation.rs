@@ -5,7 +5,7 @@
 //! from recreating an erased Subject or restoring a revoked policy.
 use super::*;
 use server_api::authorization::{
-    CurrentSubjectPolicy, subject_default_delegation_assignment,
+    CurrentSubjectPolicy, PermissionReferenceEncoding, subject_default_delegation_assignment,
     subject_default_permission_assignment,
 };
 use sha2::{Digest, Sha256};
@@ -24,6 +24,7 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
 impl SubjektivStore {
     /// Creation-only enrollment evidence for the canonical domain. Never a current permission
     /// source or a read-time default; the Host must not apply it to an existing/unset policy.
+    /// References remain raw evidence; normalize only when consuming a pending enrollment.
     pub fn subject_permission_enrollment(
         &self,
         subject_id: &str,
@@ -83,6 +84,7 @@ impl SubjektivStore {
                 execution: subject_default_permission_assignment(),
                 delegation: subject_default_delegation_assignment(),
                 legacy_constraints: None,
+                reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
             };
             let sealed = permissions::transfer::is_sealed(tx)?;
             if !sealed {

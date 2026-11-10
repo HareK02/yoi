@@ -13,11 +13,13 @@ before registering it. It retains [`FeatureHandle`] and supplies only the bound
 Host with the same textual Workspace identity does not create interchangeable
 handles or results. A namespace conveys ownership, not permission to execute.
 
-Children are graph edges, not dotted-prefix wildcards. A key can have multiple
-segments and explicit children; a shared set collects Feature contributions using
-the same references. Installing a declaration validates its candidate graph
-atomically. Duplicate definitions, unknown references and cycles reject the update
-without changing the prior catalog. Duplicate assignment paths are deduplicated,
+Children are explicit graph edges within the definition's own namespace, not
+dotted-prefix wildcards. Same-namespace children need not share the parent's
+dotted prefix. Cross-Feature or cross-namespace composition belongs in shared
+sets: each namespace contributes only its own keys or references to other sets.
+Installing a declaration validates ownership and its candidate graph atomically.
+Foreign children, duplicate definitions, unknown references and cycles reject the
+update without changing the prior catalog. Duplicate assignment paths are deduplicated,
 with distinct provenance paths retained in deterministic order. Invalid assignment
 references deny the whole assignment with diagnostics. Disabled positive
 contributions are omitted independently. Explicit exclusions still traverse disabled

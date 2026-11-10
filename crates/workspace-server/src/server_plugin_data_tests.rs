@@ -104,40 +104,52 @@ fn create_ticket_with_slug(f: &Fixture, body: &str, slug: Option<&str>) -> ticke
     backend.show(ticket.id.into()).unwrap()
 }
 
-// Keep the real installation policy and change only concrete Ticket permissions.
+// Preserve Plugin keys while changing only the Ticket operation lane. Actual
+// Ticket IDs remain domain resources on each resolve/read/write request.
 // A cached resolve or receipt must not bypass these subsequent live changes.
 pub(super) fn ticket_policy(f: &Fixture, tickets: &[(&str, bool, bool)]) {
+    use feature_permissions::{
+        NamespaceId, NamespacePermissions, PermissionKey, PermissionReference,
+    };
     let store = open_subjektiv_store(&f.api).unwrap();
-    let previous = store.subject_permissions(&f.subject).unwrap().unwrap();
-    let mut execution: Vec<_> = previous
-        .execution
-        .into_iter()
-        .filter(|p| !matches!(p.resource, PermissionResource::Ticket { .. }))
-        .collect();
-    for &(ticket, read, write) in tickets {
-        for (operation, granted) in [("ticket.read", read), ("ticket.extension.write", write)] {
-            if granted {
-                execution.push(ScopedPermission {
-                    operation: operation.into(),
-                    resource: PermissionResource::Ticket {
-                        workspace_id: TEST_WORKSPACE_ID.into(),
-                        ticket_id: ticket.into(),
-                    },
-                });
-            }
-        }
-    }
-    store
-        .set_subject_permissions(
-            &f.subject,
-            &SubjectPermissionsUpdate {
-                operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: Some(previous.change_id),
-                execution,
-                delegation: vec![],
-            },
+    let previous = store.current_subject_policy(&f.subject).unwrap().unwrap();
+    let namespace = NamespaceId::parse("ticket").unwrap();
+    let mut execution = previous.execution;
+    execution.grants.retain(|reference| {
+        !matches!(
+            reference,
+            PermissionReference::Namespace(grant) if grant.namespace == namespace
         )
-        .unwrap();
+    });
+    let (read, write) = tickets
+        .first()
+        .map(|&(_, read, write)| (read, write))
+        .unwrap_or_default();
+    assert!(
+        tickets
+            .iter()
+            .all(|&(id, r, w)| !id.is_empty() && (r, w) == (read, write)),
+        "current key fixtures must not reinterpret different ID-scoped grants"
+    );
+    let keys = [("ticket.read", read), ("ticket.extension.write", write)]
+        .into_iter()
+        .filter(|(_, granted)| *granted)
+        .map(|(operation, _)| PermissionKey::parse(operation).unwrap())
+        .collect::<Vec<_>>();
+    if !keys.is_empty() {
+        execution
+            .grants
+            .push(PermissionReference::Namespace(NamespacePermissions {
+                namespace,
+                keys,
+            }));
+    }
+    replace_config_plugin_subject_policy_as_owner(
+        &f.api,
+        &f.subject,
+        execution,
+        previous.delegation,
+    );
 }
 
 async fn data_host(f: &Fixture, owner: Arc<dyn PluginHostOwner>, call: &str) -> Arc<OwnerHost> {
@@ -1157,34 +1169,8 @@ async fn same_artifact_in_second_installation_cannot_read_cells_or_reuse_list_cu
         None,
         Some(&configured_grants(true, true)),
     );
-    let store = open_subjektiv_store(&f.api).unwrap();
-    let mut permissions = store.subject_permissions(&f.subject).unwrap().unwrap();
-    let more: Vec<_> = permissions
-        .execution
-        .iter()
-        .filter_map(|p| match &p.resource {
-            PermissionResource::PluginInstallation { workspace_id, .. } => Some(ScopedPermission {
-                operation: p.operation.clone(),
-                resource: PermissionResource::PluginInstallation {
-                    workspace_id: workspace_id.clone(),
-                    installation_id: installed.installation.installation_id.clone(),
-                },
-            }),
-            _ => None,
-        })
-        .collect();
-    permissions.execution.extend(more);
-    store
-        .set_subject_permissions(
-            &f.subject,
-            &SubjectPermissionsUpdate {
-                operation_id: Uuid::now_v7().to_string(),
-                expected_change_id: Some(permissions.change_id),
-                execution: permissions.execution,
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    // The current Plugin keys already cover the second installation's operations;
+    // its plan pin and data namespace still carry the concrete installation ID.
     let execution = f.api.plugin_execution_identity(&f.source).await.unwrap();
     let state = f
         .api

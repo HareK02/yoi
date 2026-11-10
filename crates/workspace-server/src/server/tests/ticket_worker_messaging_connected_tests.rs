@@ -419,20 +419,43 @@ fn install_public_ticket_profiles(api: &WorkspaceApi) {
           profile = (import "$builtin/profiles/coder.dcdl") // { slug = "public-ticket-editor"; scope = "workspace_write"; feature = { subjektiv = { enabled = false; }; worker = { enabled = true; direct_spawn = false; }; }; };
         }
     ]; }; }"#;
-    commit_workspace_config_tree(
-        api,
-        TEST_WORKSPACE_ID,
-        &ConfigCommitRequest {
-            base_digest: state.snapshot.digest.clone(),
-            entrypoints: state.contract.entrypoints.clone(),
-            changes: vec![config_source::ConfigTreeChange::Update {
-                path: main.path.clone(),
-                expected_digest: main.content_digest.clone(),
-                content: content.into(),
-            }],
-        },
-    )
-    .unwrap();
+    let source = ConfigCommitRequest {
+        base_digest: state.snapshot.digest.clone(),
+        entrypoints: state.contract.entrypoints.clone(),
+        changes: vec![config_source::ConfigTreeChange::Update {
+            path: main.path.clone(),
+            expected_digest: main.content_digest.clone(),
+            content: content.into(),
+        }],
+    };
+    let owner = test_owner_actor().account_id;
+    let registry = api.permission_registry.read().unwrap();
+    api.config_store
+        .adopt_configuration(
+            TEST_WORKSPACE_ID,
+            &owner,
+            &crate::config_adoption::ConfigurationAdoptionRequest {
+                operation_id: Uuid::now_v7().to_string(),
+                expected_head: api
+                    .config_store
+                    .configuration_head(TEST_WORKSPACE_ID, &owner)
+                    .unwrap(),
+                expected_catalog_digest: crate::config_adoption::catalog_digest(registry.host())
+                    .unwrap(),
+                expected_legacy_export: None,
+                source,
+            },
+            api.config_schema_registry.compose().unwrap(),
+            registry.host(),
+            None,
+            |_| Ok(()),
+            |_| {
+                Err(Error::RegistryInconsistency(
+                    "fixture cannot transfer sealed authority".into(),
+                ))
+            },
+        )
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

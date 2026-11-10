@@ -44,6 +44,7 @@ mod plugin_controller_tests {
         model_tool: Arc<Mutex<String>>,
         requests: Arc<Mutex<Vec<agen::llm_client::Request>>>,
         model_clients: Arc<AtomicUsize>,
+        unavailable_artifact_on_spawn: Arc<Mutex<Option<PathBuf>>>,
         _directory: tempfile::TempDir,
     }
 
@@ -67,6 +68,8 @@ mod plugin_controller_tests {
             let model_tool = Arc::new(Mutex::new(String::new()));
             let model_clients = Arc::new(AtomicUsize::new(0));
             let clients = model_clients.clone();
+            let unavailable_artifact_on_spawn = Arc::new(Mutex::new(None::<PathBuf>));
+            let unavailable_artifact = unavailable_artifact_on_spawn.clone();
             let observed = requests.clone();
             let tool = model_tool.clone();
             let transport = Arc::new(peer.transport_for_requests(request_count));
@@ -77,6 +80,9 @@ mod plugin_controller_tests {
                 move |factory| {
                     factory.with_spawn_model_client_factory(move || {
                         clients.fetch_add(1, Ordering::SeqCst);
+                        if let Some(path) = unavailable_artifact.lock().unwrap().take() {
+                            fs::remove_file(path).unwrap();
+                        }
                         Box::new(Model {
                             tool_name: tool.lock().unwrap().clone(),
                             requests: observed.clone(),
@@ -108,6 +114,7 @@ mod plugin_controller_tests {
                 model_tool,
                 requests,
                 model_clients,
+                unavailable_artifact_on_spawn,
                 _directory: directory,
             }
         }
@@ -327,7 +334,7 @@ mod plugin_controller_tests {
         }
 
         async fn create(&self, profile: &str) -> RuntimeWorkerRef {
-            let Json(created) = create_workspace_worker(
+            let Json(created) = create_workspace_worker_as_owner(
                 State(self.api.clone()),
                 HeaderMap::new(),
                 Json(create_request(profile)),
@@ -445,7 +452,22 @@ mod plugin_controller_tests {
             workdir_attachments: vec![],
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+            authorization: test_worker_operation_authorization(&[
+                ("session", &["session.record"]),
+                (
+                    "plugin",
+                    &[
+                        "plugin.admit",
+                        "plugin.artifact.read",
+                        "plugin.service.consume",
+                        "plugin.log",
+                        "plugin.publish",
+                        "plugin.connection.open",
+                        "plugin.http.send",
+                    ],
+                ),
+                ("ticket", &["ticket.read", "ticket.query"]),
+            ]),
         }
     }
 
@@ -1617,27 +1639,31 @@ mod plugin_controller_tests {
         let peer = Peer::new(HOST, vec![]).await;
         let f = Fixture::new(&peer).await;
         let (installed, _) = f.install(&peer).await;
-        // Keep catalog/config valid, but simulate unavailable authoritative bytes.
-        // This is deliberately a delivery refusal, not a claim of policy denial.
+        // Keep authoritative bytes available during Profile/grant resolution.
+        // Remove them only when the real factory begins startup, after sealing
+        // the plan, so this still exercises startup compensation and pin release.
         let digest = &installed.installation.artifacts[0].artifact_digest;
         let blob = ServerConfig::server_data_root_for_data_dir(&f.api.config.data_root)
             .join("plugin-artifacts/blobs")
             .join(digest.strip_prefix("sha256:").unwrap());
         assert!(blob.is_file());
-        fs::remove_file(blob).unwrap();
+        *f.unavailable_artifact_on_spawn.lock().unwrap() = Some(blob);
+        let error = create_workspace_worker_as_owner(
+            State(f.api.clone()),
+            HeaderMap::new(),
+            Json(create_request(PROFILE)),
+        )
+        .await
+        .expect_err("missing authoritative bytes must refuse creation");
         assert!(
-            create_workspace_worker(
-                State(f.api.clone()),
-                HeaderMap::new(),
-                Json(create_request(PROFILE))
-            )
-            .await
-            .is_err()
+            matches!(error.error, Error::WorkerCreateFailed { .. }),
+            "{:?}",
+            error.error
         );
         assert_eq!(
             f.model_clients.load(Ordering::SeqCst),
             1,
-            "failure must reach the production factory, not fail in Profile selection before dispatch"
+            "failure must reach the real factory after Profile/grant resolution"
         );
         assert!(f.requests.lock().unwrap().is_empty());
         let plans: Vec<(String, String)> = f.api.config_store.with_conn(|conn| {

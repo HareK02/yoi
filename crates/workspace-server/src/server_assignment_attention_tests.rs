@@ -1,3 +1,88 @@
+// Synchronous fixtures call the Subject owner domain with an authenticated owner
+// context and the same native lifecycle/catalog guards as the HTTP adapter.
+fn set_test_subject_policy_as_owner(
+    api: &WorkspaceApi,
+    subject: &str,
+    execution: feature_permissions::PermissionAssignment,
+    delegation: feature_permissions::PermissionAssignment,
+) -> server_api::authorization::CurrentSubjectPolicy {
+    use server_api::subject_policy::{
+        SubjectPermissionPolicyAction, SubjectPermissionPolicyMutation,
+    };
+    let context = server_request_context(
+        Some(test_owner_actor()),
+        None,
+        None,
+        None,
+        &HeaderMap::new(),
+    );
+    let actor = subject_authorization::administration_actor(&context).unwrap();
+    let native = open_subjektiv_store(api).unwrap();
+    let identity = native.database_identity().unwrap();
+    native
+        .with_permission_authority_guard(&identity, |authority| {
+            authority.require_subject(subject)?;
+            let registry = api.permission_registry.read().unwrap();
+            let (expected_change_id, _) = api
+                .config_store
+                .subject_permission_policy_state(api.workspace_id(), subject)
+                .unwrap();
+            let saved = api
+                .config_store
+                .mutate_subject_permission_policy(
+                    api.workspace_id(),
+                    &actor.account_id,
+                    subject,
+                    &SubjectPermissionPolicyMutation {
+                        operation_id: Uuid::now_v7().to_string(),
+                        expected_change_id,
+                        action: SubjectPermissionPolicyAction::Replace {
+                            execution,
+                            delegation,
+                        },
+                    },
+                    registry.host(),
+                )
+                .unwrap();
+            Ok(saved
+                .policy
+                .expect("owner replacement installs a current policy"))
+        })
+        .unwrap()
+}
+
+fn test_operation_assignment(
+    api: &WorkspaceApi,
+    operations: &[&str],
+) -> feature_permissions::PermissionAssignment {
+    use feature_permissions::{NamespacePermissions, PermissionKey, PermissionReference};
+    let catalog = api.permission_registry.read().unwrap().host().catalog();
+    feature_permissions::PermissionAssignment {
+        grants: operations
+            .iter()
+            .map(|operation| {
+                let key = PermissionKey::parse(*operation).unwrap();
+                let namespace = catalog
+                    .namespaces
+                    .iter()
+                    .find(|namespace| {
+                        namespace
+                            .declaration
+                            .permissions
+                            .iter()
+                            .any(|permission| permission.key == key)
+                    })
+                    .unwrap_or_else(|| panic!("undeclared fixture operation: {operation}"));
+                PermissionReference::Namespace(NamespacePermissions {
+                    namespace: namespace.namespace.clone(),
+                    keys: vec![key],
+                })
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
 async fn attention_test_api() -> (
     tempfile::TempDir,
     WorkspaceApi,
@@ -43,24 +128,24 @@ fn ensure_test_assignment_subject(api: &WorkspaceApi) -> String {
             "Handle only the assigned Ticket; distinguish delivery from processing.".into(),
         )
         .unwrap();
-    // This legacy suite needs exact-Subject conversation grants before the real
-    // Runtime startup callbacks. Install the fixture explicitly, without reading
-    // shared Feature sets as scoped permissions or enrolling any Ticket IDs.
-    let current = store.current_subject_policy(&subject.id).unwrap().unwrap();
-    store
-        .set_subject_permissions(
-            &subject.id,
-            &server_api::authorization::SubjectPermissionsUpdate {
-                operation_id: format!("legacy-assignment-fixture-{}", subject.id),
-                expected_change_id: Some(current.change_id),
-                execution: server_api::authorization::subject_conversation_permissions(
-                    api.workspace_id(),
-                    &subject.id,
-                ),
-                delegation: vec![],
-            },
-        )
-        .unwrap();
+    set_test_subject_policy_as_owner(
+        api,
+        &subject.id,
+        test_operation_assignment(
+            api,
+            &[
+                "session.record",
+                "journal.recording.request",
+                "memory.query",
+                "memory.read",
+                "memory.changes.list",
+                "journal.text.read",
+                "journal.operation.list",
+                "journal.entry.create",
+            ],
+        ),
+        Default::default(),
+    );
     subject.id
 }
 
@@ -93,23 +178,11 @@ fn grant_test_ticket_operations(
     ticket_id: &str,
     operations: &[&str],
 ) {
-    use server_api::authorization::{PermissionResource, ScopedPermission};
-    let store = open_subjektiv_store(api).unwrap();
-    extend_legacy_assignment_fixture_permissions(
-        &store,
-        subject_id,
-        Uuid::now_v7().to_string(),
-        operations
-            .iter()
-            .map(|operation| ScopedPermission {
-                operation: (*operation).into(),
-                resource: PermissionResource::Ticket {
-                    workspace_id: api.workspace_id().into(),
-                    ticket_id: ticket_id.into(),
-                },
-            })
-            .collect(),
-    );
+    browser_ticket_backend(api)
+        .unwrap()
+        .show(ticket_id.into())
+        .unwrap();
+    extend_test_assignment_operations(api, subject_id, operations);
 }
 
 async fn create_test_assignment_body(
@@ -117,7 +190,7 @@ async fn create_test_assignment_body(
     runtime_id: &str,
     subject_id: &str,
 ) -> RuntimeWorkerRef {
-    let Json(created) = create_workspace_worker(
+    let Json(created) = create_workspace_worker_as_owner(
         State(api.clone()),
         HeaderMap::new(),
         Json(CreateWorkspaceWorkerRequest {
@@ -134,7 +207,9 @@ async fn create_test_assignment_body(
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                assignment: None,
+            },
         }),
     )
     .await
@@ -181,6 +256,13 @@ async fn start_attention_test_orchestrator(
                     (api.runtime.worker(&existing.worker).unwrap(), "restored")
                 }
             } else {
+                let context = server_request_context(
+                    Some(test_owner_actor()),
+                    None,
+                    None,
+                    None,
+                    &HeaderMap::new(),
+                );
                 let Json(created) =
                     futures::executor::block_on(create_workspace_worker_authenticated_on_host(
                         api.clone(),
@@ -200,10 +282,13 @@ async fn start_attention_test_orchestrator(
                                     }),
                                 },
                             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+                            authorization:
+                                server_api::launch_policy::WorkerCreationAuthorization::Human {
+                                    assignment: None,
+                                },
                         },
                         None,
-                        None,
+                        Some(&context),
                     ))
                     .unwrap();
                 (
@@ -1451,7 +1536,6 @@ impl crate::hosts::WorkspaceWorkerRuntime for AssignmentLookupHookRuntime {
 
 #[tokio::test]
 async fn subject_assignment_cached_send_rechecks_policy_after_runtime_target_lookup() {
-    use server_api::authorization::SubjectPermissionsUpdate;
     let dir = tempfile::tempdir().unwrap();
     let api = test_api(dir.path()).await;
     register_test_runtime(&api, WorkdirlessFixtureRuntime::RUNTIME_ID).await;
@@ -1530,22 +1614,12 @@ async fn subject_assignment_cached_send_rechecks_policy_after_runtime_target_loo
                 // this exact target lookup, then changes before the final send.
                 authorize_assignment_delivery(&revoking_api, &revoking_body, &revoking_ticket)
                     .unwrap();
-                let store = open_subjektiv_store(&revoking_api).unwrap();
-                let previous = store
-                    .current_subject_policy(&revoking_subject)
-                    .unwrap()
-                    .unwrap();
-                store
-                    .set_subject_permissions(
-                        &revoking_subject,
-                        &SubjectPermissionsUpdate {
-                            operation_id: "revoke-at-target-lookup".into(),
-                            expected_change_id: Some(previous.change_id),
-                            execution: vec![],
-                            delegation: vec![],
-                        },
-                    )
-                    .unwrap();
+                set_test_subject_policy_as_owner(
+                    &revoking_api,
+                    &revoking_subject,
+                    Default::default(),
+                    Default::default(),
+                );
                 called.store(true, std::sync::atomic::Ordering::SeqCst);
             }))),
         });

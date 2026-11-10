@@ -44,6 +44,14 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "backend_job_recovery_probes",
     "backend_job_attempts",
     "backend_jobs",
+    "backend_job_reference_migration_jobs",
+    "backend_job_reference_migration_targets",
+    "core_worker_launch_bindings",
+    "core_worker_grant_revocations",
+    "core_worker_execution_grants",
+    "worker_launch_policy_history",
+    "worker_launch_policy_operations",
+    "worker_launch_policies",
     "external_workdir_connection_observations",
     "external_workdir_grants",
     "flow_source_contents",
@@ -144,9 +152,13 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_tombstones",
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",
+    "workspace_permission_migration_plans",
     "workspace_configuration_publication_observations",
     "workspace_configuration_receipts",
     "workspace_configuration_policies",
+    "subject_permission_operations",
+    "subject_permission_enrollments",
+    "subject_permission_tombstones",
     "workspace_configuration_authorities",
     "workspace_config_entries",
     "workspace_config_grants",
@@ -565,6 +577,8 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ("workspace_configuration_authorities", "workspace_configuration_authorities_no_delete"),
                 ("workspace_configuration_publication_observations", "workspace_configuration_publication_no_delete"),
                 ("workspace_configuration_receipts", "workspace_configuration_receipts_no_delete"),
+                ("subject_permission_operations", "subject_permission_operations_no_delete"),
+                ("subject_permission_enrollments", "subject_permission_enrollments_no_delete"),
             ] {
                 let definition: String = tx.query_row(
                     "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1 AND tbl_name=?2",
@@ -1059,6 +1073,309 @@ mod tests {
     }
 
     #[test]
+    fn workspace_purge_erases_launch_authority_and_job_migration_references_atomically() {
+        let (store, owner, workspace_id) = setup();
+        let tables = [
+            "backend_job_reference_migration_jobs",
+            "backend_job_reference_migration_targets",
+            "core_worker_launch_bindings",
+            "core_worker_grant_revocations",
+            "core_worker_execution_grants",
+            "worker_launch_policy_history",
+            "worker_launch_policy_operations",
+            "worker_launch_policies",
+        ];
+        store.with_conn(|conn| {
+            for workspace in ["workspace-a", "workspace-b"] {
+                conn.execute("INSERT INTO worker_launch_policies VALUES(?1,'policy',1,'active','{}','policy-operation')", [workspace])?;
+                conn.execute("INSERT INTO worker_launch_policy_history VALUES(?1,'policy','policy-operation',1,'{}')", [workspace])?;
+                conn.execute("INSERT INTO worker_launch_policy_operations VALUES(?1,'policy-operation','owner','{}','{}')", [workspace])?;
+                conn.execute("INSERT INTO core_worker_execution_grants VALUES(?1,'grant','creation','runtime','worker','{}','policy',1,0)", [workspace])?;
+                conn.execute("INSERT INTO core_worker_grant_revocations VALUES(?1,'revoke','owner','grant')", [workspace])?;
+                conn.execute("INSERT INTO core_worker_launch_bindings VALUES(?1,'creation','fingerprint','runtime','worker','{}')", [workspace])?;
+                conn.execute("INSERT INTO backend_job_reference_migration_targets VALUES(?1,'physical')", [workspace])?;
+                conn.execute("INSERT INTO backend_job_reference_migration_jobs VALUES(?1,'legacy-job')", [workspace])?;
+            }
+            Ok(())
+        }).unwrap();
+        let counts = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    tables
+                        .iter()
+                        .map(|table| {
+                            conn.query_row(
+                                &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id=?1"),
+                                [workspace],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .map_err(Error::from)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .unwrap()
+        };
+        assert_eq!(counts("workspace-a"), vec![1; tables.len()]);
+        assert_eq!(counts("workspace-b"), vec![1; tables.len()]);
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .unwrap();
+        let operation = store
+            .reserve_workspace_deletion(
+                &owner,
+                &workspace_id,
+                &WorkspaceDeletionRequest {
+                    operation_id: "delete-launch-authority".into(),
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                    confirmation: "Alpha".into(),
+                },
+            )
+            .unwrap()
+            .operation;
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER fail_launch_authority_purge BEFORE DELETE ON workspaces BEGIN SELECT RAISE(ABORT,'injected launch authority purge failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap_err()
+                .to_string()
+                .contains("injected launch authority purge failure")
+        );
+        assert_eq!(counts("workspace-a"), vec![1; tables.len()]);
+        assert_eq!(counts("workspace-b"), vec![1; tables.len()]);
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_launch_authority_purge;")?;
+                Ok(())
+            })
+            .unwrap();
+        let completed = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap();
+        assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
+        assert_eq!(counts("workspace-a"), vec![0; tables.len()]);
+        assert_eq!(counts("workspace-b"), vec![1; tables.len()]);
+        assert_eq!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap(),
+            completed
+        );
+        store
+            .with_conn(|conn| {
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn subject_permission_tables_are_in_workspace_purge_inventory() {
+        let (store, _, _) = setup();
+        store
+            .with_conn(|conn| {
+                for table in [
+                    "subject_permission_operations",
+                    "subject_permission_enrollments",
+                    "subject_permission_tombstones",
+                ] {
+                    assert!(WORKSPACE_DELETION_PURGE_TABLES.contains(&table));
+                    assert_eq!(
+                        conn.query_row(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                            [table],
+                            |row| row.get::<_, i64>(0)
+                        )?,
+                        1
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn workspace_purge_erases_subject_permission_data_and_restores_guards_after_rollback_and_commit()
+     {
+        use server_api::authorization::{
+            CurrentSubjectPolicy, PermissionReferenceEncoding, SubjectPolicySource,
+        };
+        use server_api::subject_policy::{
+            SubjectPermissionPolicyAction, SubjectPermissionPolicyMutation,
+            SubjectPermissionPolicyMutationResponse,
+        };
+
+        let (store, owner, workspace_id) = setup();
+        let tables = [
+            "workspace_configuration_policies",
+            "subject_permission_operations",
+            "subject_permission_enrollments",
+            "subject_permission_tombstones",
+        ];
+        // Deletion-boundary fixtures retain native enrollment and historical full
+        // responses, without invoking native lifecycle or owner API setup.
+        store.with_conn(|conn| {
+            for workspace in ["workspace-a", "workspace-b"] {
+                conn.execute("INSERT INTO workspace_configuration_authorities(workspace_id,transfer_identity,legacy_physical_identity,legacy_export_digest) VALUES(?1,'policy-erasure-transfer','fixture-native','fixture-export')", [workspace])?;
+                for subject in ["active-subject", "removed-subject"] {
+                    let policy = CurrentSubjectPolicy {
+                        change_id: format!("creation-{subject}"),
+                        execution: Default::default(),
+                        delegation: Default::default(),
+                        legacy_constraints: None,
+                        reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
+                    };
+                    let enrollment = SubjectPolicySource::Feature(policy.clone());
+                    let removed = subject == "removed-subject";
+                    let request = SubjectPermissionPolicyMutation {
+                        operation_id: format!("operation-{subject}"),
+                        expected_change_id: Some(policy.change_id.clone()),
+                        action: if removed { SubjectPermissionPolicyAction::Remove } else {
+                            SubjectPermissionPolicyAction::Replace { execution: policy.execution.clone(), delegation: policy.delegation.clone() }
+                        },
+                    };
+                    let mut current = policy;
+                    current.change_id = format!("owner-{subject}");
+                    let response = SubjectPermissionPolicyMutationResponse {
+                        change_id: Some(current.change_id.clone()),
+                        policy: (!removed).then_some(current.clone()),
+                    };
+                    if removed {
+                        conn.execute("INSERT INTO subject_permission_tombstones(workspace_id,subject_id,change_id) VALUES(?1,?2,?3)", params![workspace, subject, current.change_id])?;
+                    } else {
+                        let saved = crate::policy_config::AdoptedSubjectPolicy::from_current(subject, &current);
+                        conn.execute("INSERT INTO workspace_configuration_policies(workspace_id,subject_id,policy_json) VALUES(?1,?2,?3)", params![workspace, subject, serde_json::to_string(&saved).unwrap()])?;
+                    }
+                    conn.execute("INSERT INTO subject_permission_operations(workspace_id,operation_id,subject_id,account_id,request_json,result_json) VALUES(?1,?2,?3,'owner',?4,?5)", params![workspace, request.operation_id, subject, serde_json::to_string(&request).unwrap(), serde_json::to_string(&response).unwrap()])?;
+                    conn.execute("INSERT INTO subject_permission_enrollments(workspace_id,subject_id,source_json) VALUES(?1,?2,?3)", params![workspace, subject, serde_json::to_string(&enrollment).unwrap()])?;
+                }
+            }
+            Ok(())
+        }).unwrap();
+        let rows = |workspace: &str| -> Vec<Vec<Vec<String>>> {
+            store
+                .with_conn(|conn| {
+                    tables
+                        .iter()
+                        .map(|table| {
+                            let mut statement = conn.prepare(&format!(
+                                "SELECT * FROM {table} WHERE workspace_id=?1 ORDER BY subject_id"
+                            ))?;
+                            let rows = statement
+                                .query_map([workspace], |row| {
+                                    (0..row.as_ref().column_count())
+                                        .map(|column| row.get(column))
+                                        .collect::<rusqlite::Result<Vec<String>>>()
+                                })?
+                                .collect::<rusqlite::Result<Vec<_>>>()?;
+                            Ok(rows)
+                        })
+                        .collect()
+                })
+                .unwrap()
+        };
+        let guards = || -> Vec<(String, String)> {
+            store.with_conn(|conn| {
+                Ok(conn.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('subject_permission_operations','subject_permission_enrollments') ORDER BY name")?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?)
+            }).unwrap()
+        };
+        let assert_immutable = |workspace: &str| {
+            store
+                .with_conn(|conn| {
+                    for table in [
+                        "subject_permission_operations",
+                        "subject_permission_enrollments",
+                    ] {
+                        for sql in [
+                            format!("DELETE FROM {table} WHERE workspace_id=?1"),
+                            format!(
+                                "UPDATE {table} SET subject_id=subject_id WHERE workspace_id=?1"
+                            ),
+                        ] {
+                            let error = conn.execute(&sql, [workspace]).unwrap_err();
+                            assert!(error.to_string().contains("Subject permission"), "{error}");
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let target_before = rows("workspace-a");
+        let other_before = rows("workspace-b");
+        let guards_before = guards();
+        assert_eq!(guards_before.len(), 4);
+        assert_immutable("workspace-a");
+        assert_immutable("workspace-b");
+        let preflight = store
+            .workspace_deletion_preflight(&owner, &workspace_id)
+            .unwrap();
+        let operation = store
+            .reserve_workspace_deletion(
+                &owner,
+                &workspace_id,
+                &WorkspaceDeletionRequest {
+                    operation_id: "delete-subject-policies".into(),
+                    expected_workspace_updated_at: preflight.expected_workspace_updated_at,
+                    confirmation: "Alpha".into(),
+                },
+            )
+            .unwrap()
+            .operation;
+        store.with_conn(|conn| {
+            conn.execute_batch("CREATE TRIGGER fail_subject_policy_workspace_purge BEFORE DELETE ON workspaces
+                BEGIN
+                    SELECT CASE WHEN (SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN ('subject_permission_operations_no_update','subject_permission_enrollments_no_update')) != 2
+                        THEN RAISE(ABORT,'policy update guards were suspended') END;
+                    SELECT RAISE(ABORT,'injected subject policy purge failure');
+                END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap_err()
+                .to_string()
+                .contains("injected subject policy purge failure")
+        );
+        assert_eq!(rows("workspace-a"), target_before);
+        assert_eq!(rows("workspace-b"), other_before);
+        assert_eq!(guards(), guards_before);
+        assert_immutable("workspace-a");
+        assert_immutable("workspace-b");
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_subject_policy_workspace_purge;")?;
+                Ok(())
+            })
+            .unwrap();
+        let completed = store
+            .finalize_workspace_deletion(&operation.operation_id)
+            .unwrap();
+        assert_eq!(completed.state, WorkspaceDeletionState::Succeeded);
+        assert!(rows("workspace-a").iter().all(Vec::is_empty));
+        assert_eq!(rows("workspace-b"), other_before);
+        assert_eq!(guards(), guards_before);
+        assert_immutable("workspace-b");
+        assert_eq!(
+            store
+                .finalize_workspace_deletion(&operation.operation_id)
+                .unwrap(),
+            completed
+        );
+        assert_eq!(rows("workspace-b"), other_before);
+        assert_eq!(guards(), guards_before);
+    }
+
+    #[test]
     fn workspace_purge_preserves_other_cases_and_restores_immutability_after_commit_or_rollback() {
         use ticket::TicketBackend;
 
@@ -1174,6 +1491,7 @@ mod tests {
                         conn.execute("INSERT INTO notification_source_preparation_failures(source_sequence,code) SELECT sequence,'source_lookup_failed' FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
                         conn.execute("INSERT INTO notification_source_offers(source_sequence,last_offered) SELECT sequence,1 FROM notification_sources WHERE workspace_id=?1 LIMIT 1",[workspace])?;
                         let policy = crate::policy_config::AdoptedSubjectPolicy {
+                            reference_encoding: server_api::authorization::PermissionReferenceEncoding::FeatureSetsV2,
                             source: crate::policy_config::SubjectAssignmentSource {
                                 subject_id: "retained-subject".into(),
                                 execution: Default::default(),
@@ -1182,6 +1500,7 @@ mod tests {
                             change_id: "retained-policy-change".into(),
                             legacy_constraints: None,
                         };
+                        conn.execute("INSERT INTO workspace_permission_migration_plans VALUES(?1,'retained-transfer','{}')", [workspace])?;
                         conn.execute("INSERT INTO workspace_configuration_authorities VALUES(?1,'transfer','physical','export')", [workspace])?;
                         conn.execute("INSERT INTO workspace_configuration_policies VALUES(?1,'retained-subject',?2)", params![workspace, serde_json::to_string(&policy).unwrap()])?;
                         conn.execute("INSERT INTO workspace_configuration_receipts VALUES(?1,'adopt','fingerprint','{}')", [workspace])?;
@@ -1229,6 +1548,7 @@ mod tests {
                 .unwrap()
                 .operation;
             let tables = [
+                "workspace_permission_migration_plans",
                 "workspace_configuration_publication_observations",
                 "workspace_configuration_authorities",
                 "workspace_configuration_policies",
