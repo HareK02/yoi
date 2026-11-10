@@ -207,7 +207,7 @@ async fn create_test_assignment_body(
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),
@@ -283,7 +283,7 @@ async fn start_attention_test_orchestrator(
                                 },
                             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                             authorization:
-                                server_api::launch_policy::WorkerCreationAuthorization::Human {
+                                server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                                     assignment: None,
                                 },
                         },

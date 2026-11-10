@@ -446,17 +446,7 @@ struct WorkspaceWorkerLifecycleService {
     client: Arc<dyn WorkspaceClient>,
 }
 
-pub(crate) fn validate_launch_selection(
-    policy_id: &str,
-    policy_revision: u64,
-    profile: &str,
-) -> Result<(), String> {
-    server_api::launch_policy::validate_policy_id(policy_id)?;
-    server_api::launch_policy::validate_authorization_revision(policy_revision)?;
-    canonical_launch_profile(profile.to_owned())
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
+use crate::feature::contracts::validate_launch_selection;
 
 pub(crate) fn canonical_launch_profile(profile: String) -> Result<String, ToolError> {
     server_api::launch_policy::validate_canonical_profile(&profile)
@@ -477,12 +467,8 @@ fn workspace_worker_create_request(
             "orchestrator_assignment_id requires ticket_id".into(),
         ));
     }
-    validate_launch_selection(
-        &request.policy_id,
-        request.policy_revision,
-        &request.profile,
-    )
-    .map_err(WorkspaceClientError::Request)?;
+    validate_launch_selection(&request.authorization, &request.profile)
+        .map_err(WorkspaceClientError::Request)?;
     let ticket_assignment =
         request
             .ticket_id
@@ -509,10 +495,7 @@ fn workspace_worker_create_request(
             .collect(),
         feature_connections: Default::default(),
         control_operation_id: Some(control_operation_id),
-        authorization: server_api::launch_policy::WorkerCreationAuthorization::Policy {
-            policy_id: request.policy_id,
-            policy_revision: request.policy_revision,
-        },
+        authorization: request.authorization,
     })
 }
 
@@ -733,11 +716,9 @@ struct WorkerSpawnInput {
     working_directory_id: Option<String>,
     /// Stable caller-chosen intent ID. Exact retries retain this ID and full input.
     operation_id: String,
-    /// Stable Workspace launch policy identity and observed authorization revision.
-    policy_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    #[serde(deserialize_with = "server_api::launch_policy::deserialize_authorization_revision")]
-    policy_revision: u64,
+    /// Omit for the shared Worker default, or select an explicit assignment or launch policy.
+    #[serde(default)]
+    authorization: server_api::launch_policy::WorkerCreationAuthorization,
     profile: String,
     /// Optional opaque Workspace singleton key. Prefixes are caller-owned and uninterpreted.
     #[serde(default)]
@@ -881,7 +862,7 @@ impl WorkerOperation {
                 "List only known Runtime Workers and direct SubWorkers granted to the current Worker."
             }
             Self::Spawn => {
-                "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission, with an optional Flow segment. Set `ticket_id` to atomically assign the Worker; Backend validates claims and resource requirements. Selecting a profile or Flow does not grant review authority. policy_id and policy_revision are required; profile must be a source-qualified builtin: or project: selector allowed by that policy. Reuse operation_id and the full input after an unknown outcome."
+                "Spawn a Backend/Runtime Worker session in one existing Workspace Workdir. The model-facing input remains singular and the shared lifecycle wraps it as the canonical attachment collection under the stable `workdir` alias. The Workdir id is authority; filesystem paths and Runtime URLs are not accepted. `initial_submit` carries the normal typed user submission, with an optional Flow segment. Set `ticket_id` to atomically assign the Worker; Backend validates claims and resource requirements. Selecting a profile or Flow does not grant review authority. Omit authorization to use the shared worker_default; an explicit assignment (including empty) or Policy selection is forwarded without fallback. profile must be a source-qualified builtin: or project: selector; Profile selection does not grant permissions. Reuse operation_id and the full input after an unknown outcome."
             }
             Self::SendInput => {
                 "Start a fresh turn for an Idle Worker. Non-Idle Workers reject WorkerSendInput without queueing. Use WorkerNotify for advisory information during work already in progress. Direct SubWorkers also require Idle."
@@ -949,8 +930,7 @@ impl Tool for WorkspaceWorkerTool {
                             .transpose()?,
                         runtime_id: authority_id(&input.runtime_id, "runtime_id")?,
                         workdir_attachments,
-                        policy_id: authority_id(&input.policy_id, "policy_id")?,
-                        policy_revision: input.policy_revision,
+                        authorization: input.authorization,
                         profile: canonical_launch_profile(input.profile)?,
                         singleton_key: input.singleton_key,
                         ticket_id,
@@ -2109,8 +2089,6 @@ mod tests {
                 "working_directory_id": "workdir-1",
                 "relative_cwd": "crates/worker",
                 "profile": "builtin:coder",
-                "policy_id": "policy-1",
-                "policy_revision": 1,
                 "ticket_id": "00001KZ9E0DBS",
                 "operation_id": "stable-ticket-intent",
                 "initial_submit": [
@@ -2557,7 +2535,7 @@ mod tests {
             control: test_control(client.clone()),
             runtime_worker_control: true,
         };
-        let mut input = serde_json::json!({"runtime_id":"runtime-1", "profile":"builtin:coder", "policy_id":"policy-1", "policy_revision":1});
+        let mut input = serde_json::json!({"runtime_id":"runtime-1", "profile":"builtin:coder", "authorization":{"kind":"policy", "policy_id":"policy-1", "policy_revision":1}});
         assert!(
             tool.execute(&input.to_string(), ToolExecutionContext::direct())
                 .await
@@ -2592,6 +2570,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn worker_spawn_defaults_authorization_and_preserves_explicit_selections() {
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        let tool = WorkspaceWorkerTool {
+            operation: WorkerOperation::Spawn,
+            control: test_control(client.clone()),
+            runtime_worker_control: true,
+        };
+        for authorization in [
+            None,
+            Some(serde_json::json!({"kind":"assignment", "assignment":null})),
+            Some(serde_json::json!({"kind":"assignment", "assignment":{
+                "grants":[], "exclusions":[], "revoked":false
+            }})),
+            Some(serde_json::json!({"kind":"assignment", "assignment":{
+                "grants":[{"kind":"set", "value":"conversation"}],
+                "exclusions":[], "revoked":true
+            }})),
+            Some(serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":3})),
+        ] {
+            let mut input = serde_json::json!({
+                "runtime_id":"runtime-1", "operation_id":"spawn-selection",
+                "profile":"builtin:coder"
+            });
+            if let Some(authorization) = &authorization {
+                input["authorization"] = authorization.clone();
+            }
+            tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            let requests = client.requests.lock().unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(requests.last().unwrap().body.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                body["authorization"],
+                authorization
+                    .unwrap_or_else(|| serde_json::json!({"kind":"assignment", "assignment":null}))
+            );
+        }
+    }
+
     #[test]
     fn lifecycle_spawn_rejects_missing_or_blank_id_before_backend() {
         for operation_id in [
@@ -2608,8 +2627,7 @@ mod tests {
                 singleton_key: None,
                 ticket_id: None,
                 operation_id,
-                policy_id: "policy-1".into(),
-                policy_revision: 1,
+                authorization: Default::default(),
                 display_name: "Worker".into(),
                 initial_submit: Vec::new(),
             });
@@ -2618,7 +2636,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_spawn_rejects_missing_policy_legacy_grants_and_noncanonical_profiles() {
+    async fn worker_spawn_rejects_invalid_selection_legacy_grants_and_noncanonical_profiles() {
         let client = Arc::new(RecordingWorkspaceClient::default());
         let tool = WorkspaceWorkerTool {
             operation: WorkerOperation::Spawn,
@@ -2627,9 +2645,9 @@ mod tests {
         };
         let valid = serde_json::json!({
             "runtime_id":"runtime-1", "operation_id":"spawn-policy-test",
-            "policy_id":"coder", "policy_revision":1, "profile":"builtin:coder"
+            "profile":"builtin:coder"
         });
-        for field in ["policy_id", "policy_revision", "profile"] {
+        for field in ["profile"] {
             for value in [None, Some(serde_json::Value::Null)] {
                 let mut input = valid.clone();
                 input.as_object_mut().unwrap().remove(field);
@@ -2643,9 +2661,27 @@ mod tests {
                 );
             }
         }
+        for authorization in [
+            serde_json::Value::Null,
+            serde_json::json!({"kind":"human", "assignment":null}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder"}),
+            serde_json::json!({"kind":"policy", "policy_revision":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"", "policy_revision":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":0}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":9_007_199_254_740_992_u64}),
+            serde_json::json!({"kind":"assignment", "policy_id":"coder"}),
+        ] {
+            let mut input = valid.clone();
+            input["authorization"] = authorization;
+            assert!(
+                tool.execute(&input.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+        }
         for (field, value) in [
-            ("policy_id", serde_json::json!("")),
-            ("policy_revision", serde_json::json!(0)),
+            ("policy_id", serde_json::json!("coder")),
+            ("policy_revision", serde_json::json!(1)),
             ("profile", serde_json::json!("default")),
             ("profile", serde_json::json!("coder")),
             ("profile", serde_json::json!("path:coder.toml")),
@@ -2679,7 +2715,7 @@ mod tests {
         );
         assert!(!text.contains("execution_grant"));
         assert!(!text.contains("redelegation"));
-        for field in ["policy_id", "policy_revision", "profile"] {
+        for field in ["profile"] {
             assert!(
                 schema["required"]
                     .as_array()
@@ -2687,6 +2723,15 @@ mod tests {
                     .contains(&serde_json::json!(field))
             );
         }
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("authorization"))
+        );
+        assert!(schema["properties"].get("authorization").is_some());
+        assert!(schema["properties"].get("policy_id").is_none());
+        assert!(schema["properties"].get("policy_revision").is_none());
         assert!(text.contains("initial_submit"));
         assert!(text.contains("ticket_id"));
         assert!(text.contains("selector"));
@@ -2715,8 +2760,7 @@ mod tests {
             singleton_key: Some("subjektiv:subject-1".to_string()),
             ticket_id: None,
             operation_id: Some("ordinary-spawn-intent-1".into()),
-            policy_id: "policy-1".into(),
-            policy_revision: 1,
+            authorization: Default::default(),
             display_name: "Coder".to_string(),
             initial_submit: vec![
                 Segment::Flow {
@@ -2766,8 +2810,7 @@ mod tests {
             singleton_key: None,
             ticket_id: Some("T-719".to_string()),
             operation_id: Some("spawn-ticket-worker:T-719:call-1".to_string()),
-            policy_id: "policy-1".into(),
-            policy_revision: 1,
+            authorization: Default::default(),
             display_name: "Worker · T-719".to_string(),
             initial_submit: vec![Segment::text("Investigate Ticket T-719.")],
         })
@@ -3153,8 +3196,7 @@ mod tests {
                             singleton_key: None,
                             ticket_id: None,
                             operation_id: Some("spawn-intent".into()),
-                            policy_id: "policy-1".into(),
-                            policy_revision: 1,
+                            authorization: Default::default(),
                             display_name: "child".into(),
                             initial_submit: vec![Segment::text("work")],
                         })

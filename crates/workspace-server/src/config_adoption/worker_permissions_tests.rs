@@ -1,5 +1,5 @@
 //! Materialized source (with or without adoption) -> SQLite reopen -> current
-//! catalog -> human creation selection component coverage.
+//! catalog -> caller-neutral creation selection component coverage.
 //! Real schema evaluation, resolver and storage are used;
 //! identity creation and Runtime dispatch belong to the Server connected suites.
 
@@ -14,7 +14,7 @@ const WORKSPACE: &str = "human-config-workspace";
 const OWNER: &str = "human-config-owner";
 const SELECTED: &str = r#"{ permissions = {
     sets = [{ id = "research"; sets = ["ticket"]; }];
-    human_worker_default = { sets = ["research"]; };
+    worker_default = { sets = ["research"]; };
 }; } as WorkspaceConfigSchema"#;
 
 fn host() -> PermissionHost {
@@ -36,13 +36,16 @@ fn host() -> PermissionHost {
                     children: vec![],
                 })
                 .collect(),
-            sets: vec![SetContribution {
-                set: PermissionSetId::parse("ticket").unwrap(),
-                children: vec![PermissionReference::Namespace(NamespacePermissions {
-                    namespace: NamespaceId::parse("ticket").unwrap(),
-                    keys: vec![PermissionKey::parse("ticket.read").unwrap()],
-                })],
-            }],
+            sets: ["ticket", "implementer"]
+                .into_iter()
+                .map(|set| SetContribution {
+                    set: PermissionSetId::parse(set).unwrap(),
+                    children: vec![PermissionReference::Namespace(NamespacePermissions {
+                        namespace: NamespaceId::parse("ticket").unwrap(),
+                        keys: vec![PermissionKey::parse("ticket.read").unwrap()],
+                    })],
+                })
+                .collect(),
         },
     )
     .unwrap();
@@ -172,9 +175,7 @@ fn permission_reads_reuse_native_authority_reservation_without_releasing_or_writ
     let configured = reserved
         .configured_permission_host(WORKSPACE, &host)
         .unwrap();
-    let (selected_host, assignment) = reserved
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
+    let (selected_host, assignment) = reserved.worker_permissions(WORKSPACE, &host, None).unwrap();
     assert_eq!(keys(&configured, &assignment), vec!["ticket.read"]);
     assert_eq!(keys(&selected_host, &assignment), vec!["ticket.read"]);
     assert_eq!(
@@ -214,21 +215,26 @@ fn permission_reads_reuse_native_authority_reservation_without_releasing_or_writ
 }
 
 #[test]
-fn unadopted_missing_default_and_explicit_empty_stay_empty_without_policy_transfer() {
+fn unadopted_missing_default_selects_implementer_but_explicit_empty_stays_empty() {
     let (_directory, store) = fixture();
     let host = host();
     let before = store.load_workspace_config(WORKSPACE).unwrap();
     assert_unadopted(&store);
-    let configured = store.configured_permission_host(WORKSPACE, &host).unwrap();
+    let (configured, selected) = store.worker_permissions(WORKSPACE, &host, None).unwrap();
+    assert_eq!(
+        selected,
+        policy_config::PermissionSource::default()
+            .worker_default
+            .assignment()
+    );
+    assert_eq!(keys(&configured, &selected), ["ticket.read"]);
     let empty = PermissionAssignment::default();
-    for explicit in [None, Some(&empty)] {
-        let (current, selected) = store
-            .human_worker_permissions(WORKSPACE, &host, explicit)
-            .unwrap();
-        assert_eq!(selected, empty);
-        assert!(keys(&current, &selected).is_empty());
-        assert!(keys(&configured, &selected).is_empty());
-    }
+    assert_eq!(
+        store
+            .worker_assignment(WORKSPACE, &host, Some(&empty))
+            .unwrap(),
+        empty
+    );
     assert!(matches!(
         store.adopted_subject_legacy_permissions(WORKSPACE, "subject-a", &host),
         Err(Error::InvalidInput(message)) if message == "Workspace policy transfer is not adopted"
@@ -247,9 +253,7 @@ fn unadopted_default_reopens_and_explicit_inputs_replace_without_policy_transfer
     let reopened =
         SqliteWorkspaceStore::open_for_test(&directory.path().join("server.sqlite")).unwrap();
     let before = reopened.load_workspace_config(WORKSPACE).unwrap();
-    let (configured, saved) = reopened
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
+    let (configured, saved) = reopened.worker_permissions(WORKSPACE, &host, None).unwrap();
     assert_eq!(
         saved.grants,
         vec![PermissionReference::Set(
@@ -260,7 +264,7 @@ fn unadopted_default_reopens_and_explicit_inputs_replace_without_policy_transfer
     let empty = PermissionAssignment::default();
     assert_eq!(
         reopened
-            .human_worker_assignment(WORKSPACE, &host, Some(&empty))
+            .worker_assignment(WORKSPACE, &host, Some(&empty))
             .unwrap(),
         empty
     );
@@ -281,7 +285,7 @@ fn unadopted_default_reopens_and_explicit_inputs_replace_without_policy_transfer
             ..explicit.clone()
         };
         let (current, selected) = reopened
-            .human_worker_permissions(WORKSPACE, &host, Some(&explicit))
+            .worker_permissions(WORKSPACE, &host, Some(&explicit))
             .unwrap();
         assert_eq!(selected, explicit);
         if revoked {
@@ -298,7 +302,7 @@ fn unadopted_default_reopens_and_explicit_inputs_replace_without_policy_transfer
         };
         assert!(
             reopened
-                .human_worker_assignment(WORKSPACE, &host, Some(&unknown))
+                .worker_assignment(WORKSPACE, &host, Some(&unknown))
                 .is_err()
         );
     }
@@ -313,10 +317,13 @@ fn unadopted_default_reopens_and_explicit_inputs_replace_without_policy_transfer
         }; } as WorkspaceConfigSchema"#,
     );
     let after = reopened.load_workspace_config(WORKSPACE).unwrap();
-    let (current, selected) = reopened
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
-    assert_eq!(selected, empty);
+    let (current, selected) = reopened.worker_permissions(WORKSPACE, &host, None).unwrap();
+    assert_eq!(
+        selected,
+        policy_config::PermissionSource::default()
+            .worker_default
+            .assignment()
+    );
     assert_eq!(keys(&current, &saved), ["ticket.read", "ticket.write"]);
     assert_eq!(keys(&configured, &saved), ["ticket.read"]);
     assert_eq!(reopened.load_workspace_config(WORKSPACE).unwrap(), after);
@@ -331,9 +338,7 @@ fn adopted_default_reopens_as_references_and_explicit_inputs_replace_without_mer
     drop(store);
     let reopened =
         SqliteWorkspaceStore::open_for_test(&directory.path().join("server.sqlite")).unwrap();
-    let (configured, selected) = reopened
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
+    let (configured, selected) = reopened.worker_permissions(WORKSPACE, &host, None).unwrap();
     assert_eq!(
         selected.grants,
         vec![PermissionReference::Set(
@@ -343,7 +348,7 @@ fn adopted_default_reopens_as_references_and_explicit_inputs_replace_without_mer
     assert_eq!(keys(&configured, &selected), ["ticket.read"]);
     let empty = PermissionAssignment::default();
     let (_, selected_empty) = reopened
-        .human_worker_permissions(WORKSPACE, &host, Some(&empty))
+        .worker_permissions(WORKSPACE, &host, Some(&empty))
         .unwrap();
     assert_eq!(selected_empty, empty);
     let explicit = PermissionAssignment {
@@ -354,7 +359,7 @@ fn adopted_default_reopens_as_references_and_explicit_inputs_replace_without_mer
         ..Default::default()
     };
     let (_, selected_explicit) = reopened
-        .human_worker_permissions(WORKSPACE, &host, Some(&explicit))
+        .worker_permissions(WORKSPACE, &host, Some(&explicit))
         .unwrap();
     assert_eq!(selected_explicit, explicit);
     assert_eq!(keys(&configured, &selected_explicit), ["ticket.write"]);
@@ -368,19 +373,19 @@ fn adopted_default_reopens_as_references_and_explicit_inputs_replace_without_mer
         };
         assert!(
             reopened
-                .human_worker_permissions(WORKSPACE, &host, Some(&unknown))
+                .worker_permissions(WORKSPACE, &host, Some(&unknown))
                 .is_err()
         );
     }
 }
 
 #[test]
-fn subject_and_human_assignments_resolve_candidate_sets_with_exclusions() {
+fn subject_and_worker_assignments_resolve_candidate_sets_with_exclusions() {
     let (directory, store) = fixture();
     let host = host();
     let source = r#"{ permissions = {
         sets = [{ id = "research"; namespaces = [{ namespace = "ticket"; keys = ["ticket.read", "ticket.write"]; }]; }];
-        human_worker_default = { sets = ["research"]; exclude_namespaces = [{ namespace = "ticket"; keys = ["ticket.read"]; }]; };
+        worker_default = { sets = ["research"]; exclude_namespaces = [{ namespace = "ticket"; keys = ["ticket.read"]; }]; };
     }; } as WorkspaceConfigSchema"#;
     let candidate = request(&store, &host, "shared-sets", source);
     let preview = store
@@ -436,9 +441,7 @@ fn subject_and_human_assignments_resolve_candidate_sets_with_exclusions() {
     drop(store);
     let store =
         SqliteWorkspaceStore::open_for_test(&directory.path().join("server.sqlite")).unwrap();
-    let (configured, selected) = store
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
+    let (configured, selected) = store.worker_permissions(WORKSPACE, &host, None).unwrap();
     assert_eq!(selected.grants, vec![research]);
     assert_eq!(
         selected.exclusions,
@@ -478,17 +481,15 @@ fn subject_and_human_assignments_resolve_candidate_sets_with_exclusions() {
 }
 
 #[test]
-fn default_changes_only_new_selection_while_saved_human_sets_remain_dynamic() {
+fn default_changes_only_new_selection_while_saved_worker_sets_remain_dynamic() {
     let (_directory, store) = fixture();
     let host = host();
     let initial = request(&store, &host, "initial", SELECTED);
     let first_receipt = adopt(&store, &host, &initial).unwrap();
-    let (old_host, saved) = store
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
+    let (old_host, saved) = store.worker_permissions(WORKSPACE, &host, None).unwrap();
     let expanded = r#"{ permissions = {
         sets = [{ id = "research"; namespaces = [{ namespace = "ticket"; keys = ["ticket.read", "ticket.write"]; }]; }];
-        human_worker_default = {};
+        worker_default = {};
     }; } as WorkspaceConfigSchema"#;
     adopt(
         &store,
@@ -496,9 +497,7 @@ fn default_changes_only_new_selection_while_saved_human_sets_remain_dynamic() {
         &request(&store, &old_host, "expanded", expanded),
     )
     .unwrap();
-    let (current_host, new_selection) = store
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
+    let (current_host, new_selection) = store.worker_permissions(WORKSPACE, &host, None).unwrap();
     assert_eq!(new_selection, PermissionAssignment::default());
     assert_eq!(keys(&current_host, &saved), ["ticket.read", "ticket.write"]);
     assert_eq!(adopt(&store, &host, &initial).unwrap(), first_receipt);
@@ -554,10 +553,10 @@ fn invalid_sets_defaults_and_schema_do_not_change_adopted_source_or_receipts() {
         r#"{ permissions.sets = [{ id = "a"; }, { id = "a"; }]; } as WorkspaceConfigSchema"#,
         r#"{ permissions.sets = [{ id = "ticket"; }]; } as WorkspaceConfigSchema"#,
         r#"{ permissions.sets = [{ id = "a"; namespaces = [{ namespace = "ticket"; keys = ["ticket.unknown"]; }]; }]; } as WorkspaceConfigSchema"#,
-        r#"{ permissions.human_worker_default = { sets = ["missing"]; }; } as WorkspaceConfigSchema"#,
-        r#"{ permissions.human_worker_default = { sets = ["missing"]; revoked = true; }; } as WorkspaceConfigSchema"#,
-        r#"{ permissions.human_worker_default = { revoked = "yes"; }; } as WorkspaceConfigSchema"#,
-        r#"{ permissions.human_worker_default = { policy = "all"; }; } as WorkspaceConfigSchema"#,
+        r#"{ permissions.worker_default = { sets = ["missing"]; }; } as WorkspaceConfigSchema"#,
+        r#"{ permissions.worker_default = { sets = ["missing"]; revoked = true; }; } as WorkspaceConfigSchema"#,
+        r#"{ permissions.worker_default = { revoked = "yes"; }; } as WorkspaceConfigSchema"#,
+        r#"{ permissions.worker_default = { policy = "all"; }; } as WorkspaceConfigSchema"#,
     ].into_iter().enumerate() {
         let id = format!("invalid-{index}");
         let candidate = request(&store, &host, &id, source);
@@ -582,9 +581,7 @@ fn source_write_failure_keeps_old_sets_and_default_after_reopen() {
     drop(store);
     let reopened =
         SqliteWorkspaceStore::open_for_test(&directory.path().join("server.sqlite")).unwrap();
-    let (configured, selection) = reopened
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
+    let (configured, selection) = reopened.worker_permissions(WORKSPACE, &host, None).unwrap();
     assert_eq!(keys(&configured, &selection), ["ticket.read"]);
     assert!(
         reopened
@@ -593,10 +590,13 @@ fn source_write_failure_keeps_old_sets_and_default_after_reopen() {
             .is_none()
     );
     adopt(&reopened, &host, &change).unwrap();
-    let (_, empty) = reopened
-        .human_worker_permissions(WORKSPACE, &host, None)
-        .unwrap();
-    assert_eq!(empty, PermissionAssignment::default());
+    let (_, selected) = reopened.worker_permissions(WORKSPACE, &host, None).unwrap();
+    assert_eq!(
+        selected,
+        policy_config::PermissionSource::default()
+            .worker_default
+            .assignment()
+    );
 }
 
 #[test]
@@ -606,7 +606,7 @@ fn unadopted_unavailable_source_and_cross_workspace_never_fallback() {
     let empty = PermissionAssignment::default();
     assert_eq!(
         store
-            .human_worker_assignment(WORKSPACE, &host, Some(&empty))
+            .worker_assignment(WORKSPACE, &host, Some(&empty))
             .unwrap(),
         empty
     );
@@ -617,7 +617,7 @@ fn unadopted_unavailable_source_and_cross_workspace_never_fallback() {
         Err(Error::WorkspaceIdMismatch)
     ));
     assert!(matches!(
-        store.human_worker_permissions(WORKSPACE, &foreign, Some(&empty)),
+        store.worker_permissions(WORKSPACE, &foreign, Some(&empty)),
         Err(Error::WorkspaceIdMismatch)
     ));
     store
@@ -632,7 +632,7 @@ fn unadopted_unavailable_source_and_cross_workspace_never_fallback() {
     assert!(store.configured_permission_host(WORKSPACE, &host).is_err());
     assert!(
         store
-            .human_worker_permissions(WORKSPACE, &host, Some(&empty))
+            .worker_permissions(WORKSPACE, &host, Some(&empty))
             .is_err()
     );
     assert_unadopted(&store);
@@ -660,7 +660,7 @@ fn unadopted_missing_source_or_invalid_evaluation_identity_rejects_explicit_empt
         );
         assert!(
             store
-                .human_worker_permissions(WORKSPACE, &host, Some(&PermissionAssignment::default()))
+                .worker_permissions(WORKSPACE, &host, Some(&PermissionAssignment::default()))
                 .is_err(),
             "{corruption}"
         );
@@ -671,8 +671,8 @@ fn unadopted_missing_source_or_invalid_evaluation_identity_rejects_explicit_empt
 #[test]
 fn unadopted_unresolved_defaults_reject_even_explicit_empty_without_adoption() {
     for source in [
-        r#"{ permissions.human_worker_default = { sets = ["missing"]; }; } as WorkspaceConfigSchema"#,
-        r#"{ permissions.human_worker_default = { exclude_sets = ["missing"]; revoked = true; }; } as WorkspaceConfigSchema"#,
+        r#"{ permissions.worker_default = { sets = ["missing"]; }; } as WorkspaceConfigSchema"#,
+        r#"{ permissions.worker_default = { exclude_sets = ["missing"]; revoked = true; }; } as WorkspaceConfigSchema"#,
         r#"{ permissions.sets = [{ id = "research"; sets = ["missing"]; }]; } as WorkspaceConfigSchema"#,
     ] {
         let (_directory, store) = fixture();
@@ -682,7 +682,7 @@ fn unadopted_unresolved_defaults_reject_even_explicit_empty_without_adoption() {
         assert!(store.configured_permission_host(WORKSPACE, &host).is_err());
         assert!(
             store
-                .human_worker_permissions(WORKSPACE, &host, Some(&PermissionAssignment::default()))
+                .worker_permissions(WORKSPACE, &host, Some(&PermissionAssignment::default()))
                 .is_err()
         );
         assert_eq!(store.load_workspace_config(WORKSPACE).unwrap(), before);
@@ -695,9 +695,7 @@ fn disabled_feature_withdraws_operations_without_losing_selected_reference() {
     let (_directory, store) = fixture();
     let mut host = host();
     adopt(&store, &host, &request(&store, &host, "initial", SELECTED)).unwrap();
-    let selected = store
-        .human_worker_assignment(WORKSPACE, &host, None)
-        .unwrap();
+    let selected = store.worker_assignment(WORKSPACE, &host, None).unwrap();
     // Reconstruct a Feature lifecycle change in the trusted loader, retaining the
     // Workspace source. Reinstallation here intentionally gets a new registration.
     let mut disabled = PermissionHost::new(WorkspaceId::parse(WORKSPACE).unwrap());
@@ -724,4 +722,89 @@ fn disabled_feature_withdraws_operations_without_losing_selected_reference() {
                 FeatureIdentity::parse("builtin:ticket").unwrap()
             ))
     );
+}
+
+#[test]
+fn missing_empty_excluded_and_revoked_config_defaults_survive_reopen_without_merging() {
+    let implementer = policy_config::PermissionSource::default()
+        .worker_default
+        .assignment();
+    let empty = PermissionAssignment::default();
+    let excluded = PermissionAssignment {
+        exclusions: implementer.grants.clone(),
+        ..implementer.clone()
+    };
+    let revoked = PermissionAssignment {
+        revoked: true,
+        ..implementer.clone()
+    };
+    for adopted in [false, true] {
+        for (source, expected, allowed) in [
+            (
+                "{} as WorkspaceConfigSchema",
+                &implementer,
+                vec!["ticket.read"],
+            ),
+            (
+                "{ permissions = {}; } as WorkspaceConfigSchema",
+                &implementer,
+                vec!["ticket.read"],
+            ),
+            (
+                "{ permissions.worker_default = {}; } as WorkspaceConfigSchema",
+                &empty,
+                vec![],
+            ),
+            (
+                "{ permissions.worker_default = { sets = []; }; } as WorkspaceConfigSchema",
+                &empty,
+                vec![],
+            ),
+            (
+                r#"{ permissions.worker_default = { sets = ["implementer"]; exclude_sets = ["implementer"]; }; } as WorkspaceConfigSchema"#,
+                &excluded,
+                vec![],
+            ),
+            (
+                r#"{ permissions.worker_default = { sets = ["implementer"]; revoked = true; }; } as WorkspaceConfigSchema"#,
+                &revoked,
+                vec![],
+            ),
+        ] {
+            let (directory, store) = fixture();
+            let host = host();
+            if adopted {
+                adopt(
+                    &store,
+                    &host,
+                    &request(&store, &host, "config-default", source),
+                )
+                .unwrap();
+            } else {
+                commit_unadopted_source(&store, &host, source);
+                assert_unadopted(&store);
+            }
+            let before = store.load_workspace_config(WORKSPACE).unwrap();
+            let (configured, selected) = store.worker_permissions(WORKSPACE, &host, None).unwrap();
+            assert_eq!(&selected, expected, "{source}");
+            assert_eq!(keys(&configured, &selected), allowed, "{source}");
+            drop(store);
+            let store =
+                SqliteWorkspaceStore::open_for_test(&directory.path().join("server.sqlite"))
+                    .unwrap();
+            let (configured, selected) = store.worker_permissions(WORKSPACE, &host, None).unwrap();
+            assert_eq!(&selected, expected, "{source}");
+            assert_eq!(keys(&configured, &selected), allowed, "{source}");
+            assert_eq!(
+                store
+                    .worker_assignment(WORKSPACE, &host, Some(&empty))
+                    .unwrap(),
+                empty
+            );
+            assert_eq!(store.load_workspace_config(WORKSPACE).unwrap(), before);
+            if !adopted {
+                assert_unadopted(&store);
+            }
+        }
+    }
 }

@@ -1,7 +1,7 @@
 //! Read-only preparation of a Workspace permission migration draft.
 //!
 //! Native exports supply Subject policies; configuration supplies only shared
-//! sets and the human Worker default. Preview neither saves the draft nor seals
+//! sets and the shared Worker default. Preview neither saves the draft nor seals
 //! the legacy writer. Adoption must recheck source, head and export identity.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,17 +76,13 @@ pub(crate) fn preview_migration(
     // Until source-range removal is available, block instead of publishing a copy
     // of it in a new active wrapper. Schema-injected empty defaults are not source.
     let mut source = shared_source_for_migration(&original, &before)?;
-    let references_changed = policy_config::migrate_source_references(&mut source);
-    let changes = if references_changed {
-        reference_migration_changes(&original, &source)?
-    } else {
-        vec![]
-    };
+    let changes = shared_source_migration_changes(&original, &mut source)?;
     let candidate = store.with_conn(|conn| {
         let tx = conn.unchecked_transaction()?;
         evaluate_migration_candidate(&tx, workspace, &original, &changes, schema)
     })?;
     crate::config_adoption::semantic_references::prove_reference_only(
+        &original,
         &before,
         &candidate.evaluation,
     )?;
@@ -126,20 +122,11 @@ pub(crate) fn shared_source_for_migration(
     current: &WorkspaceConfigState,
     before: &EvaluationResult,
 ) -> Result<PermissionSource> {
-    let old_schema = current
-        .contract
-        .schema_bundle
-        .contributions
-        .iter()
-        .any(|provider| {
-            provider.provider_id == "builtin:permissions"
-                && provider
-                    .version
-                    .parse::<u32>()
-                    .is_ok_and(|version| version <= 3)
-        });
-    let source = if old_schema {
-        let old = policy_config::legacy_source(before)?;
+    let Some(version) = legacy_permission_schema(current) else {
+        return policy_config::source(before);
+    };
+    let mut old = policy_config::legacy_source(before)?;
+    if version <= 3 {
         if !old.remove_subjects.is_empty() {
             return Err(Error::WorkspaceConfigConflict(
                 "legacy remove_subjects requires a durable Subject-domain removal fence before source migration; no policy was recreated".into(),
@@ -149,11 +136,61 @@ pub(crate) fn shared_source_for_migration(
             return Err(individual_source_conflict());
         }
         ensure_no_individual_source(current)?;
-        old.shared_source()
+    }
+    // Old schema defaults cannot distinguish omission from an authored {}.
+    // Inspect source without those defaults before carrying an assignment forward.
+    let raw = authored_evaluation(current)?;
+    let explicit = before.projections.first().is_some_and(|before| {
+        raw.projections.iter().any(|projection| {
+            projection.entrypoint == before.entrypoint
+                && projection
+                    .data_json
+                    .get("permissions")
+                    .and_then(|value| value.get("human_worker_default"))
+                    .is_some()
+        })
+    });
+    if !explicit {
+        old.human_worker_default = None;
+    }
+    Ok(old.shared_source())
+}
+
+fn legacy_permission_schema(current: &WorkspaceConfigState) -> Option<u32> {
+    current
+        .contract
+        .schema_bundle
+        .contributions
+        .iter()
+        .find_map(|provider| {
+            (provider.provider_id == "builtin:permissions")
+                .then(|| provider.version.parse::<u32>().ok())
+                .flatten()
+                .filter(|version| (1..=4).contains(version))
+        })
+}
+
+pub(crate) fn shared_source_migration_changes(
+    current: &WorkspaceConfigState,
+    source: &mut PermissionSource,
+) -> Result<Vec<ConfigTreeChange>> {
+    let references_changed = policy_config::migrate_source_references(source);
+    let rename = legacy_permission_schema(current).is_some()
+        && authored_evaluation(current)?
+            .projections
+            .iter()
+            .any(|projection| {
+                projection
+                    .data_json
+                    .get("permissions")
+                    .and_then(|value| value.get("human_worker_default"))
+                    .is_some()
+            });
+    if references_changed || rename {
+        reference_migration_changes(current, source)
     } else {
-        policy_config::source(before)?
-    };
-    Ok(source)
+        Ok(vec![])
+    }
 }
 
 fn individual_source_conflict() -> Error {
@@ -162,18 +199,22 @@ fn individual_source_conflict() -> Error {
     )
 }
 
-fn ensure_no_individual_source(current: &WorkspaceConfigState) -> Result<()> {
+fn authored_evaluation(current: &WorkspaceConfigState) -> Result<EvaluationResult> {
     let open = ToolchainContract::with_schema_bundle(
         current.contract.schema_version,
         current.contract.entrypoints.clone(),
         current.contract.import_policy_version,
         WorkspaceConfigSchemaBundle::empty(),
     );
-    let raw = SnapshotEnvironment::new(current.snapshot.clone())
+    SnapshotEnvironment::new(current.snapshot.clone())
         .evaluate_contract(&open)
         .map_err(|error| Error::WorkspaceConfigConflict(format!(
-            "cannot prove absence of individual Subject source without schema defaults: {error:?}; source was not changed"
-        )))?;
+            "cannot inspect authored permission source without schema defaults: {error:?}; source was not changed"
+        )))
+}
+
+fn ensure_no_individual_source(current: &WorkspaceConfigState) -> Result<()> {
+    let raw = authored_evaluation(current)?;
     if raw.projections.iter().any(|projection| {
         projection
             .data_json
@@ -200,7 +241,7 @@ pub(crate) fn evaluate_migration_candidate(
     let permissions = schema
         .contributions
         .into_iter()
-        .find(|provider| provider.provider_id == "builtin:permissions" && provider.version == "4")
+        .find(|provider| provider.provider_id == "builtin:permissions" && provider.version == "5")
         .ok_or_else(|| Error::WorkspaceConfigConflict(
             "permission migration requires the current shared-only schema; legacy frozen targets require explicit recovery".into(),
         ))?;
@@ -369,18 +410,48 @@ pub(crate) fn reference_migration_changes(
         "    permissions = {};\n}} as WorkspaceConfigSchema\n",
         render_permission_source(source),
     ));
-    Ok(vec![
+    let mut changes = vec![
         ConfigTreeChange::Create {
             path: base,
             content_type: ConfigContentType::Decodal,
-            content: main.content.clone(),
+            content: render_historical_source(current, &main.content),
         },
         ConfigTreeChange::Update {
-            path: main_path,
+            path: main_path.clone(),
             expected_digest: main.content_digest.clone(),
             content: wrapper,
         },
-    ])
+    ];
+    // Imported modules have their own lexical scope. Pin their old assertions as
+    // well; the unchanged source bytes remain in the existing content history.
+    if legacy_permission_schema(current).is_some() {
+        for entry in current.snapshot.entries.values() {
+            if entry.path != main_path
+                && entry.content_type == ConfigContentType::Decodal
+                && entry.content.contains("WorkspaceConfigSchema")
+            {
+                changes.push(ConfigTreeChange::Update {
+                    path: entry.path.clone(),
+                    expected_digest: entry.content_digest.clone(),
+                    content: render_historical_source(current, &entry.content),
+                });
+            }
+        }
+    }
+    Ok(changes)
+}
+
+fn render_historical_source(current: &WorkspaceConfigState, source: &str) -> String {
+    if legacy_permission_schema(current).is_some() && source.contains("WorkspaceConfigSchema") {
+        // Retain the stored typed range, not an open schema or a textual field
+        // rename. Only the outer wrapper is checked against the new schema.
+        format!(
+            "let WorkspaceConfigSchema = {}; in\n{source}",
+            current.contract.schema_bundle.source,
+        )
+    } else {
+        source.to_owned()
+    }
 }
 
 fn quote(value: &str) -> String {
@@ -434,8 +505,8 @@ fn render_permission_source(source: &PermissionSource) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "{{ sets = [{sets}]; human_worker_default = {}; }}",
-        render_assignment(&source.human_worker_default)
+        "{{ sets = [{sets}]; worker_default = {}; }}",
+        render_assignment(&source.worker_default)
     )
 }
 
@@ -480,7 +551,10 @@ mod tests {
                         children: vec![],
                     },
                 ],
-                sets: vec![],
+                sets: vec![feature_permissions::SetContribution {
+                    set: PermissionSetId::parse("implementer").unwrap(),
+                    children: vec![],
+                }],
             },
         )
         .unwrap();
@@ -722,7 +796,7 @@ mod tests {
                 sets: vec![],
                 namespaces: vec![],
             }],
-            human_worker_default: AssignmentSource {
+            worker_default: AssignmentSource {
                 sets: vec![PermissionSetId::parse("local").unwrap()],
                 exclude_sets: vec![PermissionSetId::parse("excluded").unwrap()],
                 revoked: true,
@@ -765,7 +839,7 @@ mod tests {
         let provider = policy_config::PermissionConfigSchemaProvider
             .contribution()
             .unwrap();
-        assert_eq!(provider.version, "4");
+        assert_eq!(provider.version, "5");
         assert!(!provider.source.contains("subjects"));
         assert!(!provider.source.contains("subject_id"));
         for value in [

@@ -20,11 +20,15 @@ Featureの有効化、Tool・service・hookの登録、セッション内状態�
 
 MCPはT-787の移行対象外とする暫定例外であり、既存の `mcp` 起動認可と `PermissionResource::Feature` を保持する。discoveryは外部プロセスを起動するため、既存の拒否を共通コード整理で失わせない。この例外を他のFeatureへ拡張せず、MCPの各呼出し・restoreに新しい操作認可が整備されたとも扱わない。
 
+### Workerの既定権限
+
+新規の通常Workerは、明示された操作権限または起動policyを選び、省略時はWorkspace共有設定の`permissions.worker_default`を使う。設定自体の省略時は`implementer`への参照を選び、明示的な空・除外・失効はそのまま適用する。アカウント認証や起動経路を人間の操作である証拠とせず、呼出元によって既定権限を分けない。委譲による作成では起点の操作上限を維持し、既定設定を委譲権限の代わりにしない。再送・復元は発行済みgrantを使い、新しい既定値で権限を付け直さない。Subject本体とJobはそれぞれの専用authorityを使う。
+
 ### Subjectの標準権限セット
 
 新規Subjectの初期割当は、直接実行の`execution`に会話・保持contextの`conversation`と作業調整の`work-coordination`、委譲上限の`delegation`に実装・調査・レビューの`work-execution`への参照を保存する。これらはSubject専用の権限ではなく、各Featureが自身の操作だけを寄与する共有セットである。Subjectは初期割当方針を選ぶが、他Featureの操作一覧を所有しない。
 
-- 直接実行と委譲上限を分離し、各起動では必要な操作とTicket・Workdir等の対象を明示して、限定された実効grantを固定する。Reviewerへの再委譲もその明示範囲内とする。セットの解決は担当・現在本体・control grant・CAS・独立承認・retention等のdomain条件を免除しない。
+- 直接実行と委譲上限を分離し、委譲で発行した操作キーの上限を固定する。Ticket・Workdir等の選択はdomain・実行context・providerの既存条件として扱い、新しい対象決定・限定機構（ASL）はここでは導入しない。保存済み旧grantの対象制約の保持とは区別する。Reviewerへの再委譲も発行済みの操作上限内とする。セットの解決は担当・現在本体・control grant・CAS・独立承認・retention等のdomain条件を免除しない。
 - 本体の発言/Memory/Journal identity、担当変更・handling判断、案件終了、MR統合記録、権限管理を委譲しない。Subject本体にfilesystem/Bash、MRの作成・レビュー、設定管理権限を初期付与しない。
 - ProfileのFeatureとTool許可は利用面の構成であり、セット参照や対象grantの代わりではない。長時間の実装・検証・Git操作は背景Workerへ渡す。
 

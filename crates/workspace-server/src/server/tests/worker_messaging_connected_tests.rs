@@ -186,7 +186,7 @@ impl agen::llm_client::LlmClient for MessagingModel {
                     "roundtrip-spawn"
                 };
                 let policy = self.policy.lock().unwrap().clone().unwrap();
-                let mut input = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:messaging-peer","operation_id":"public-roundtrip-spawn","display_name":"Notify-only delegated peer","initial_submit":if self.repair.is_some() {vec![protocol::Segment::Text {content:EARLY.into()}]} else {vec![]},"policy_id":policy.policy_id,"policy_revision":policy.authorization_revision});
+                let mut input = json!({"runtime_id":CONNECTED_RUNTIME,"profile":"project:messaging-peer","operation_id":"public-roundtrip-spawn","display_name":"Notify-only delegated peer","initial_submit":if self.repair.is_some() {vec![protocol::Segment::Text {content:EARLY.into()}]} else {vec![]},"authorization":{"kind":"policy","policy_id":policy.policy_id,"policy_revision":policy.authorization_revision}});
                 if let Some(workdir) = self.workdir.lock().unwrap().as_ref() {
                     input["working_directory_id"] = json!(workdir);
                 }
@@ -466,7 +466,7 @@ async fn connected_roundtrip(explicit_workdir: bool, repair: bool) {
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),

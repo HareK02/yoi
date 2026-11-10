@@ -1012,11 +1012,12 @@ function segment(value: unknown, label: string): Segment {
 }
 
 function creationAuthorization(value: unknown): WorkerCreationAuthorization {
+  if (value === undefined) return { kind: "assignment", assignment: null };
   const item = record(value, "authorization");
-  if (item.kind === "human") {
+  if (item.kind === "assignment") {
     exact(item, ["kind", "assignment"], "authorization");
     return {
-      kind: "human",
+      kind: "assignment",
       ...(item.assignment === undefined ? {} : {
         assignment: item.assignment === null ? null : parseAssignment(item.assignment),
       }),
@@ -1032,7 +1033,7 @@ function creationAuthorization(value: unknown): WorkerCreationAuthorization {
       policy_revision: observed as Extract<WorkerCreationAuthorization, { kind: "policy" }>["policy_revision"],
     };
   }
-  throw new Error("authorization.kind must be human or policy");
+  throw new Error("authorization.kind must be assignment or policy");
 }
 
 export function parseCreateWorkspaceWorkerRequest(

@@ -8,7 +8,7 @@
 //! Initial native permission transfer remains one-way and preserves the exact
 //! saved policy and change identities. The frozen plan precedes its separate
 //! Feature seal; a failed publication resumes that plan rather than issuing new
-//! defaults or treating the migration as owner approval. Ordinary human Worker
+//! defaults or treating the migration as owner approval. Account-authorized Worker
 //! creation remains independent of an unavailable native Subject transfer.
 //!
 //! Source publication compares content and editing history, with owner identity

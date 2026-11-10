@@ -132,9 +132,9 @@ pub struct WorkerLaunchPolicyReceipt {
     pub operation_key: String,
 }
 
-/// Policy selection is mandatory on Worker-originated creation. Human initial
-/// assignment is a separate authenticated path: omission and explicit empty have
-/// different meanings there, never on the policy path.
+/// Caller-neutral initial assignment selection. Omission selects the Workspace
+/// Worker default; an explicit assignment (including empty) takes precedence.
+/// Explicit policy selection remains a separate, usage-authorized launch path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -146,9 +146,15 @@ pub enum WorkerCreationAuthorization {
         #[serde(deserialize_with = "crate::launch_policy::deserialize_authorization_revision")]
         policy_revision: u64,
     },
-    Human {
+    Assignment {
         assignment: Option<PermissionAssignment>,
     },
+}
+
+impl Default for WorkerCreationAuthorization {
+    fn default() -> Self {
+        Self::Assignment { assignment: None }
+    }
 }
 
 pub fn validate_policy_id(value: &str) -> Result<(), String> {
@@ -325,7 +331,8 @@ mod tests {
         for input in [
             json!({"kind":"policy", "policy_id":"coder"}),
             json!({"kind":"policy", "policy_id":"coder", "policy_revision":1, "execution_grant":{}}),
-            json!({"kind":"human", "redelegation":[]}),
+            json!({"kind":"human", "assignment":null}),
+            json!({"kind":"assignment", "redelegation":[]}),
         ] {
             assert!(serde_json::from_value::<WorkerCreationAuthorization>(input).is_err());
         }
@@ -339,6 +346,31 @@ mod tests {
                 policy_id: "coder".into(),
                 policy_revision: 1
             }
+        );
+    }
+
+    #[test]
+    fn assignment_wire_distinguishes_default_from_explicit_empty_without_human_alias() {
+        let omitted: WorkerCreationAuthorization =
+            serde_json::from_value(json!({"kind":"assignment"})).unwrap();
+        assert_eq!(omitted, WorkerCreationAuthorization::default());
+        assert_eq!(
+            serde_json::to_value(omitted).unwrap(),
+            json!({
+                "kind":"assignment", "assignment":null
+            })
+        );
+        let empty = json!({"kind":"assignment", "assignment":{
+            "grants":[], "exclusions":[], "revoked":false
+        }});
+        let parsed: WorkerCreationAuthorization = serde_json::from_value(empty.clone()).unwrap();
+        assert_ne!(parsed, WorkerCreationAuthorization::default());
+        assert_eq!(serde_json::to_value(parsed).unwrap(), empty);
+        assert!(
+            serde_json::from_value::<WorkerCreationAuthorization>(
+                json!({"kind":"human", "assignment":null})
+            )
+            .is_err()
         );
     }
 

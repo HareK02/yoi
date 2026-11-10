@@ -9999,7 +9999,8 @@ pub struct RuntimeWorkerSpawnWorkingDirectoryAttachmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeWorkerSpawnRequest {
-    /// Mandatory caller intent, independent of Profile and Host-resolved authority.
+    /// Omission selects the shared Worker default, independently of Profile.
+    #[serde(default)]
     pub authorization: launch_policy::WorkerCreationAuthorization,
     pub control_operation_id: String,
     pub intent: RuntimeWorkerSpawnIntent,
@@ -11473,7 +11474,8 @@ pub struct CreateWorkspaceWorkerRequest {
     /// Backend idempotency key used only for authenticated Worker-owned spawn/control.
     #[serde(default)]
     pub control_operation_id: Option<String>,
-    /// Host authenticates the policy caller or human initial issuer separately.
+    /// Omission selects the shared Worker default; Host authenticates the issuer separately.
+    #[serde(default)]
     pub authorization: launch_policy::WorkerCreationAuthorization,
 }
 
@@ -14160,7 +14162,9 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: None,
-            authorization: launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+            authorization: launch_policy::WorkerCreationAuthorization::Assignment {
+                assignment: None,
+            },
         })
         .unwrap();
         assert_eq!(
@@ -14175,8 +14179,45 @@ mod tests {
                 "workdir_attachments": [],
                 "feature_connections": {},
                 "control_operation_id": null,
-                "authorization": { "kind": "human", "assignment": null },
+                "authorization": { "kind": "assignment", "assignment": null },
             })
+        );
+    }
+
+    #[test]
+    fn worker_creation_requests_default_omitted_authorization_and_reject_human_alias() {
+        let mut workspace = serde_json::json!({
+            "runtime_id":"runtime-a", "display_name":"Worker", "feature_connections":{}
+        });
+        let mut runtime = serde_json::json!({
+            "control_operation_id":"spawn-1", "intent":{"kind":"workspace_coding"},
+            "acceptance":{"kind":"socket_ready"}, "profile":{"kind":"builtin", "value":"coder"}
+        });
+        assert_eq!(
+            serde_json::from_value::<CreateWorkspaceWorkerRequest>(workspace.clone())
+                .unwrap()
+                .authorization,
+            launch_policy::WorkerCreationAuthorization::default()
+        );
+        assert_eq!(
+            serde_json::from_value::<RuntimeWorkerSpawnRequest>(runtime.clone())
+                .unwrap()
+                .authorization,
+            launch_policy::WorkerCreationAuthorization::default()
+        );
+        workspace["authorization"] = serde_json::json!({"kind":"human", "assignment":null});
+        runtime["authorization"] = serde_json::json!({"kind":"human", "assignment":null});
+        assert!(
+            serde_json::from_value::<CreateWorkspaceWorkerRequest>(workspace)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown variant")
+        );
+        assert!(
+            serde_json::from_value::<RuntimeWorkerSpawnRequest>(runtime)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown variant")
         );
     }
 

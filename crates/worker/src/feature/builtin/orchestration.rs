@@ -21,7 +21,7 @@ use crate::feature::{
 
 const FEATURE_ID: &str = "orchestration";
 const TOOL_NAME: &str = "SpawnTicketWorker";
-const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. policy_id, policy_revision and a source-qualified profile selector are required; repository/Workdir attachments are optional. For builtin:coder, omitted flow defaults to builtin:coder-review so the Coder owns the Reviewer SubWorker cycle and MR verdict. Explicit flow: null disables Flow; a string selects another Flow. Other profiles get no default Flow. Results and return choices follow user intent, not a universal approval or MR gate. Assigned Subject starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
+const TOOL_DESCRIPTION: &str = "Spawn and atomically assign a generic Ticket Worker for the natural-language initial request. A source-qualified profile selector is required; authorization and repository/Workdir attachments are optional. Omit authorization to use the shared worker_default; explicit assignment (including empty) or Policy selections are forwarded without fallback. For builtin:coder, omitted flow defaults to builtin:coder-review so the Coder owns the Reviewer SubWorker cycle and MR verdict. Explicit flow: null disables Flow; a string selects another Flow. Other profiles get no default Flow. Results and return choices follow user intent, not a universal approval or MR gate. Assigned Subject starts must supply the observed orchestrator_assignment_id; stale delegations cannot start new work. Assign is enough (no Queue/ready); unresolved dependencies are diagnostics for partial work and never start implicitly. Backend validates claims and derives attachment access from Ticket targets; acceptance follows spawn, initial input, assignment, and resource finalization. Profile/Flow selection grants neither trusted review nor merge authority.";
 
 #[derive(Debug, Default)]
 pub struct OrchestrationFeature;
@@ -88,12 +88,11 @@ struct SpawnTicketWorkerInput {
     #[serde(default)]
     orchestrator_assignment_id: Option<String>,
     runtime_id: String,
-    /// Source-qualified registered selector allowed by the selected launch policy.
+    /// Source-qualified registered selector; Profile selection does not grant permissions.
     profile: String,
-    policy_id: String,
-    #[schemars(range(min = 1, max = 9_007_199_254_740_991_u64))]
-    #[serde(deserialize_with = "server_api::launch_policy::deserialize_authorization_revision")]
-    policy_revision: u64,
+    /// Omit for the shared Worker default, or select an explicit assignment or launch policy.
+    #[serde(default)]
+    authorization: server_api::launch_policy::WorkerCreationAuthorization,
     /// Initial user request delivered through the normal typed submission path.
     initial_request: String,
     /// Flow selector, delivered before the request. Omission defaults to
@@ -138,14 +137,9 @@ impl Tool for SpawnTicketWorkerTool {
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         let call_id = non_empty(ctx.call_id, "tool call_id")?;
         let runtime_id = authority_id(input.runtime_id, "runtime_id")?;
-        let profile = super::manage_worker::canonical_launch_profile(input.profile)?;
-        let policy_id = authority_id(input.policy_id, "policy_id")?;
-        super::manage_worker::validate_launch_selection(
-            &policy_id,
-            input.policy_revision,
-            &profile,
-        )
-        .map_err(ToolError::InvalidArgument)?;
+        let profile = input.profile;
+        crate::feature::contracts::validate_launch_selection(&input.authorization, &profile)
+            .map_err(ToolError::InvalidArgument)?;
         let initial_request = non_empty(input.initial_request, "initial_request")?;
         let flow = match input.flow {
             Some(flow) => flow.map(|flow| non_empty(flow, "flow")).transpose()?,
@@ -173,8 +167,7 @@ impl Tool for SpawnTicketWorkerTool {
                 operation_id: Some(format!("spawn-ticket-worker:{}:{call_id}", ticket.id)),
                 display_name: format!("Worker · {}", ticket.resource_key),
                 initial_submit,
-                policy_id,
-                policy_revision: input.policy_revision,
+                authorization: input.authorization,
             })
             .await
             .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
@@ -327,8 +320,6 @@ mod tests {
             "ticket_id": "T-719",
             "runtime_id": "runtime-1",
             "profile": "project:ticket-worker",
-            "policy_id": "policy-1",
-            "policy_revision": 3,
             "initial_request": "Investigate Ticket T-719."
         })
     }
@@ -366,8 +357,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
         assert_eq!(request.runtime_id, "runtime-1");
-        assert_eq!(request.policy_id, "policy-1");
-        assert_eq!(request.policy_revision, 3);
+        assert_eq!(request.authorization, Default::default());
         assert_eq!(
             request.orchestrator_assignment_id.as_deref(),
             Some("delegation-742")
@@ -437,10 +427,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_ticket_worker_requires_explicit_policy_revision_and_canonical_profile() {
+    async fn spawn_ticket_worker_preserves_explicit_authorization() {
+        let service = Arc::new(RecordingService::default());
+        for authorization in [
+            serde_json::json!({"kind":"assignment", "assignment":null}),
+            serde_json::json!({"kind":"assignment", "assignment":{
+                "grants":[], "exclusions":[], "revoked":false
+            }}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":3}),
+        ] {
+            let mut input = input();
+            input["authorization"] = authorization.clone();
+            tool(service.clone(), TicketState::Open)
+                .execute(&input.to_string(), ToolExecutionContext::direct())
+                .await
+                .unwrap();
+            let requests = service.requests.lock().unwrap();
+            assert_eq!(
+                serde_json::to_value(&requests.last().unwrap().authorization).unwrap(),
+                authorization
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_ticket_worker_rejects_invalid_authorization_without_fallback() {
+        let service = Arc::new(RecordingService::default());
+        for authorization in [
+            serde_json::Value::Null,
+            serde_json::json!({"kind":"human", "assignment":null}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder"}),
+            serde_json::json!({"kind":"policy", "policy_id":"bad.id", "policy_revision":1}),
+            serde_json::json!({"kind":"policy", "policy_id":"coder", "policy_revision":0}),
+            serde_json::json!({"kind":"assignment", "assignment":{}}),
+        ] {
+            let mut input = input();
+            input["authorization"] = authorization;
+            assert!(
+                tool(service.clone(), TicketState::Open)
+                    .execute(&input.to_string(), ToolExecutionContext::direct())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(service.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_ticket_worker_requires_canonical_profile_and_rejects_legacy_fields() {
         let service = Arc::new(RecordingService::default());
         let tool = tool(service.clone(), TicketState::Open);
-        for field in ["profile", "policy_id", "policy_revision"] {
+        for field in ["profile"] {
             for value in [None, Some(serde_json::Value::Null)] {
                 let mut input = input();
                 input.as_object_mut().unwrap().remove(field);
@@ -471,7 +508,12 @@ mod tests {
                     .is_err()
             );
         }
-        for field in ["execution_grant", "redelegation"] {
+        for field in [
+            "execution_grant",
+            "redelegation",
+            "policy_id",
+            "policy_revision",
+        ] {
             let mut input = input();
             input[field] = serde_json::json!([]);
             assert!(
@@ -734,14 +776,7 @@ mod tests {
                 "unexpected error for {field}: {error}"
             );
         }
-        for field in [
-            "ticket_id",
-            "runtime_id",
-            "initial_request",
-            "profile",
-            "policy_id",
-            "policy_revision",
-        ] {
+        for field in ["ticket_id", "runtime_id", "initial_request", "profile"] {
             let mut input = input();
             input.as_object_mut().unwrap().remove(field);
             let error = tool
@@ -789,13 +824,13 @@ mod tests {
         let schema = serde_json::to_value(schemars::schema_for!(SpawnTicketWorkerInput)).unwrap();
         assert_eq!(schema["additionalProperties"], false);
         let required = schema["required"].as_array().unwrap();
-        for field in ["ticket_id", "runtime_id", "initial_request"] {
+        for field in ["ticket_id", "runtime_id", "initial_request", "profile"] {
             assert!(
                 required.contains(&serde_json::json!(field)),
                 "missing required field {field}"
             );
         }
-        for field in ["flow", "workdir_attachments"] {
+        for field in ["authorization", "flow", "workdir_attachments"] {
             assert!(schema["properties"].get(field).is_some());
             assert!(!required.contains(&serde_json::json!(field)));
         }

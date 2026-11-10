@@ -122,9 +122,10 @@ fn deletion_after_seal_blocks_resume_without_rewriting_plan_or_failing_ordinary_
         seal
     );
     assert_eq!(
-        db.human_worker_assignment(WORKSPACE, &host(), None)
-            .unwrap(),
-        PermissionAssignment::default()
+        db.worker_assignment(WORKSPACE, &host(), None).unwrap(),
+        crate::policy_config::PermissionSource::default()
+            .worker_default
+            .assignment()
     );
     drop(db);
     features.close();

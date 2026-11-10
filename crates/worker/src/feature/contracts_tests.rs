@@ -233,13 +233,14 @@ async fn consumers_install_and_execute_with_contract_only_test_provider() {
         .install_into_pending(&mut tools, &mut HookRegistryBuilder::default());
     assert!(!report.has_errors(), "{report:?}");
     let result = tool(&tools, "SpawnTicketWorker").execute(
-        r#"{"ticket_id":"T-788","runtime_id":"runtime-test","profile":"builtin:coder","policy_id":"policy-1","policy_revision":1,"initial_request":"implement","orchestrator_assignment_id":"delegation-test"}"#,
+        r#"{"ticket_id":"T-788","runtime_id":"runtime-test","profile":"builtin:coder","initial_request":"implement","orchestrator_assignment_id":"delegation-test"}"#,
         ToolExecutionContext::new("spawn-call", "batch", 0),
     ).await.unwrap();
     assert_eq!(result.summary, "Spawned Worker for Ticket T-788");
     {
         let requests = services.spawns.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].authorization, Default::default());
         assert_eq!(requests[0].ticket_id.as_deref(), Some("ticket-internal-id"));
         assert_eq!(
             requests[0].orchestrator_assignment_id.as_deref(),
@@ -376,4 +377,20 @@ fn consumer_plan_rejections_leave_no_partial_installation() {
             (_, error) => panic!("{condition}: unexpected plan error {error:?}"),
         }
     }
+}
+
+#[test]
+fn lifecycle_spawn_omitted_authorization_selects_common_default() {
+    let request: WorkerLifecycleSpawnRequest = serde_json::from_value(serde_json::json!({
+        "runtime_id":"runtime-1",
+        "workdir_attachments":[],
+        "profile":"builtin:coder",
+        "display_name":"Worker",
+        "initial_submit":[]
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(request.authorization).unwrap(),
+        serde_json::json!({"kind":"assignment", "assignment":null})
+    );
 }

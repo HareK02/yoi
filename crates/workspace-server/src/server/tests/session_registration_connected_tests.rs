@@ -313,7 +313,7 @@ impl RegistrationFixture {
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }

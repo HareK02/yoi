@@ -88,7 +88,7 @@ async fn spawn_journal_source(api: &WorkspaceApi, subject: &str, name: &str) -> 
                 }),
             },
             control_operation_id: Some(Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),
@@ -3151,7 +3151,7 @@ impl SubjectRemovalFixture {
                     }),
                 },
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),

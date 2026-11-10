@@ -689,7 +689,7 @@ fn source_and_catalog_roundtrip_preserve_explicit_children_and_shared_set_select
         let mut source = base();
         let catalog = serde_json::json!({"workspace":"workspace-test","namespaces":[{"namespace":"ticket","feature":"builtin:ticket","enabled":true,"declaration":{"permissions":[{"key":"ticket.hoge","description":"","children":children},{"key":"ticket.hoge.fuga","description":"","children":[]}],"sets":[{"set":"shared","children":[{"kind":"namespace","value":{"namespace":"ticket","keys":["ticket.hoge"]}}]}]}}]});
         source.catalog = serde_json::from_value(catalog.clone()).unwrap();
-        source.state.snapshot.entries.get_mut("main.dcdl").unwrap().content = "{ permissions = { sets = [{ set = \"shared\"; children = [{ kind = \"namespace\"; value = { namespace = \"ticket\"; keys = [\"ticket.hoge\"]; }; }]; }]; human_worker_default = { sets = [\"shared\"]; }; }; } as WorkspaceConfigSchema\n".into();
+        source.state.snapshot.entries.get_mut("main.dcdl").unwrap().content = "{ permissions = { sets = [{ set = \"shared\"; children = [{ kind = \"namespace\"; value = { namespace = \"ticket\"; keys = [\"ticket.hoge\"]; }; }]; }]; worker_default = { sets = [\"shared\"]; }; }; } as WorkspaceConfigSchema\n".into();
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("checkout");
         install(

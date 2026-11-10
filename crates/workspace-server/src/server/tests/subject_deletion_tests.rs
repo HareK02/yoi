@@ -243,7 +243,7 @@ async fn unconfirmed_worker_shutdown_is_not_completion_and_exact_retry_converges
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),
@@ -1158,7 +1158,7 @@ async fn old_body_archive_reconciles_unchanged_and_remains_retained_after_subjec
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),

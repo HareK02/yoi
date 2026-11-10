@@ -67,6 +67,7 @@ test("zero-repository Workspace launches a normal embedded Worker request withou
     profile: null,
     workdir_attachments: [],
     ticket_assignment: null,
+    authorization: { kind: "assignment", assignment: null },
   });
   expect(body).not.toHaveProperty("repository_key");
 });
@@ -130,6 +131,7 @@ test.each(["embedded", "remote"].flatMap((runtime) =>
     expect(request.ticket_assignment.ticket_id).toBe("T-720");
     expect(request.ticket_assignment.operation_id).toMatch(/^[0-9a-f-]{36}$/);
     expect(request.initial_submit).toEqual([{ kind: "text", content: text }]);
+    expect(request.authorization).toEqual({ kind: "assignment", assignment: null });
     expect(request.profile).toBeNull();
     expect(request.workdir_attachments).toEqual([]);
     expect(request.ticket_assignment).not.toHaveProperty("role");

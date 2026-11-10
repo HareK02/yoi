@@ -597,7 +597,7 @@ impl BackendWorkspaceProductClient {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         };
@@ -1681,7 +1681,7 @@ mod tests {
             serde_json::from_str(create_request.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(
             body["authorization"],
-            serde_json::json!({"kind":"human", "assignment":null})
+            serde_json::json!({"kind":"assignment", "assignment":null})
         );
         assert!(uuid::Uuid::parse_str(body["control_operation_id"].as_str().unwrap()).is_ok());
         assert!(body.get("execution_grant").is_none());

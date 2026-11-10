@@ -323,7 +323,7 @@ impl Fixture {
                     }),
                 },
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             },
@@ -1435,7 +1435,7 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
             workdir_attachments: vec![],
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: Some(standalone_assignment(
                     r#"{ namespaces = [{ namespace = "ticket"; keys = ["ticket.create"]; }]; }"#,
                 )),
@@ -1457,13 +1457,13 @@ async fn signed_current_body_uses_explicit_policy_and_old_unset_body_denies() {
         StatusCode::FORBIDDEN,
         "owner assignment does not grant another operation"
     );
-    let mut forged_human = f.child_request("worker-cannot-issue-human", vec![]);
-    forged_human
+    let mut without_create = f.child_request("worker-without-create-operation", vec![]);
+    without_create
         .as_object_mut()
         .unwrap()
         .remove("execution_grant");
-    forged_human["authorization"] = json!({"kind":"human", "assignment":null});
-    let (status, _) = f.spawn(&legacy, forged_human).await;
+    without_create["authorization"] = json!({"kind":"assignment", "assignment":null});
+    let (status, _) = f.spawn(&legacy, without_create).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     let legacy_client = f.client(&legacy);
     let (installed, tool) =
@@ -2587,11 +2587,11 @@ async fn generic_create_routes_refuse_body_and_child_delegation_before_any_creat
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn generic_create_routes_accept_owner_and_refuse_worker_claimed_human_authorization() {
+async fn generic_create_routes_accept_owner_and_require_worker_control_path() {
     let f = Fixture::new().await;
     let mut request = f.child_request("unused-on-generic-route", vec![]);
     request.as_object_mut().unwrap().remove("execution_grant");
-    request["authorization"] = json!({"kind":"human", "assignment":null});
+    request["authorization"] = json!({"kind":"assignment", "assignment":null});
     request["control_operation_id"] = json!("generic-owner-once");
     for path in [
         format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
@@ -3372,7 +3372,7 @@ async fn installed_ticket_service_and_raw_backend_recheck_current_signed_source(
             workdir_attachments: vec![],
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),
@@ -4344,7 +4344,7 @@ async fn connected_read_only_subject_delegates_editing_profile_to_real_runtime_r
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),
@@ -4780,7 +4780,7 @@ async fn connected_two_subjects_delegate_distinct_tickets_concurrently_on_separa
                 "profile":"project:authority-source", "initial_submit":[], "workdir_attachments":[],
                 "feature_connections":{"subjektiv":{"subject_id":subject}},
                 "control_operation_id":format!("parallel-{label}-body"),
-                "authorization":{"kind":"human", "assignment":null}})).await;
+                "authorization":{"kind":"assignment", "assignment":null}})).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -5159,7 +5159,7 @@ async fn ordinary_bound_attachment_returns_concrete_resource_and_rejects_replace
             workdir_attachments: vec![],
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: Some(standalone_assignment(
                     r#"{ namespaces = [{ namespace = "workdir"; keys = ["workdir.detach"]; }]; }"#,
                 )),
@@ -5455,7 +5455,7 @@ async fn job_origin_replacement_revokes_new_operations_without_changing_frozen_r
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         }),

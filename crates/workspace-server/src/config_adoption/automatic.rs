@@ -85,7 +85,7 @@ fn saved_plan(store: &SqliteWorkspaceStore, workspace: &str) -> Result<Option<Pl
 
 /// Runs under the native Feature lifecycle guard through the Server commit. A
 /// blocked conversion leaves the old authority intact and does not gate ordinary
-/// human Worker creation. A post-seal failure retains the plan for exact recovery.
+/// Worker creation. A post-seal failure retains the plan for exact recovery.
 pub(crate) fn migrate(
     store: &SqliteWorkspaceStore,
     legacy: &SubjektivStore,

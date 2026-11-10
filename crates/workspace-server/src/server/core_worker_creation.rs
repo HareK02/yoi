@@ -1,4 +1,4 @@
-//! Creation authority is selected by authenticated caller kind, never by Profile.
+//! Assignment selection is caller-neutral; authenticated provenance bounds issuance.
 use super::*;
 use server_api::authorization::{
     CoreWorkerExecutionGrant, CoreWorkerGrantSource, PermissionReferenceEncoding,
@@ -33,11 +33,16 @@ pub(super) fn resolve_core_creation_grant(
             &digest,
             &operation.operation_id,
         ),
-        (Some(_), WorkerCreationAuthorization::Human { .. }) => {
-            Err(Error::WorkspacePermissionDenied(
-                "Worker-origin creation cannot use human initial permissions or defaults".into(),
+        (Some(source), WorkerCreationAuthorization::Assignment { assignment }) => {
+            subject_authorization::WorkerAuthorityView::prepare_assignment_grant(
+                api,
+                source,
+                assignment.as_ref(),
+                runtime,
+                profile,
+                &digest,
+                &operation.operation_id,
             )
-            .into())
         }
         (None, WorkerCreationAuthorization::Policy { .. }) => {
             Err(Error::WorkspacePermissionDenied(
@@ -45,10 +50,10 @@ pub(super) fn resolve_core_creation_grant(
             )
             .into())
         }
-        (None, WorkerCreationAuthorization::Human { assignment }) => {
+        (None, WorkerCreationAuthorization::Assignment { assignment }) => {
             let account = account.ok_or_else(|| {
                 Error::WorkspacePermissionDenied(
-                    "human initial grant requires an authenticated Workspace owner".into(),
+                    "initial grant requires an authenticated Workspace owner".into(),
                 )
             })?;
             api.config_store.with_conn(|connection| {
@@ -59,7 +64,7 @@ pub(super) fn resolve_core_creation_grant(
                 .permission_registry
                 .read()
                 .map_err(|_| Error::Config("Feature declarations unavailable".into()))?;
-            let assignment = api.config_store.human_worker_assignment(
+            let assignment = api.config_store.worker_assignment(
                 api.workspace_id(),
                 registry.host(),
                 assignment.as_ref(),
@@ -75,7 +80,7 @@ pub(super) fn resolve_core_creation_grant(
                 assignment,
                 reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
                 issuance_ceiling: None,
-                source: CoreWorkerGrantSource::Human {
+                source: CoreWorkerGrantSource::Account {
                     account_id: account.into(),
                 },
             })
@@ -102,7 +107,7 @@ pub(super) fn resolve_creation_profile(
     Option<CoreWorkerExecutionGrant>,
 )> {
     match (source, authorization) {
-        (None, WorkerCreationAuthorization::Human { .. }) => {
+        (None, WorkerCreationAuthorization::Assignment { .. }) => {
             let account = account.ok_or_else(|| {
                 Error::WorkspacePermissionDenied(
                     "Worker creation requires authenticated owner context".into(),
@@ -112,10 +117,11 @@ pub(super) fn resolve_creation_profile(
                 crate::launch_policy::require_owner(conn, api.workspace_id(), account)
             })?;
         }
-        (Some(_), WorkerCreationAuthorization::Policy { .. }) => {}
-        _ => {
+        (Some(_), WorkerCreationAuthorization::Policy { .. })
+        | (Some(_), WorkerCreationAuthorization::Assignment { .. }) => {}
+        (None, WorkerCreationAuthorization::Policy { .. }) => {
             return Err(Error::WorkspacePermissionDenied(
-                "creation authorization does not match authenticated caller kind".into(),
+                "policy use requires an authenticated Worker origin".into(),
             )
             .into());
         }
@@ -152,7 +158,9 @@ pub(super) fn resolve_creation_profile(
                     &api.config.workspace_id,
                     &config_state,
                 )?;
-            let profile = if source.is_some() {
+            let policy_selection =
+                matches!(authorization, WorkerCreationAuthorization::Policy { .. });
+            let profile = if policy_selection {
                 let profile = profile.as_deref().ok_or_else(|| {
                     Error::InvalidInput(
                         "policy launch requires an explicit canonical Profile selector".into(),
@@ -172,7 +180,7 @@ pub(super) fn resolve_creation_profile(
                         )
                     })?
             };
-            let profile_selector = if source.is_some() {
+            let profile_selector = if policy_selection {
                 crate::profile_settings::selector_for_registered_profile(
                     &profile_projection,
                     &profile,
@@ -192,7 +200,7 @@ pub(super) fn resolve_creation_profile(
             let canonical_profile = match &profile_selector {
                 ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => name.clone(),
             };
-            if source.is_some() && profile != canonical_profile {
+            if policy_selection && profile != canonical_profile {
                 return Err(Error::InvalidInput(
                     "policy Profile must be canonical and source-qualified".into(),
                 )

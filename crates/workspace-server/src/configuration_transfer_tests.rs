@@ -83,7 +83,15 @@ fn host() -> PermissionHost {
                     children: vec![],
                 })
                 .collect(),
-            sets: vec![],
+            sets: vec![feature_permissions::SetContribution {
+                set: feature_permissions::PermissionSetId::parse("implementer").unwrap(),
+                children: vec![feature_permissions::PermissionReference::Namespace(
+                    feature_permissions::NamespacePermissions {
+                        namespace: NamespaceId::parse("file").unwrap(),
+                        keys: vec![PermissionKey::parse("file.read").unwrap()],
+                    },
+                )],
+            }],
         },
     )
     .unwrap();

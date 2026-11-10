@@ -30,7 +30,7 @@ fn schema(version: &str) -> WorkspaceConfigSchemaBundle {
     let mut permissions = policy_config::PermissionConfigSchemaProvider
         .contribution()
         .unwrap();
-    if version != "4" {
+    if version != "5" {
         // Exact legacy input shape: real Subject assignments as well as the
         // schema-injected empty fields must evaluate before migration can refuse them.
         let source = r#"{
@@ -67,6 +67,25 @@ fn schema(version: &str) -> WorkspaceConfigSchemaBundle {
                 } default {};
             };
         }"#;
+        // Keep the historical shared-only schema independent of the current provider.
+        let source = if version == "4" {
+            r#"{ permissions = {
+                sets = [...{
+                    id = String;
+                    sets = [...String] default [];
+                    namespaces = [...{ namespace = String; keys = [...String]; }] default [];
+                }] default [];
+                human_worker_default = {
+                    sets = [...String] default [];
+                    namespaces = [...{ namespace = String; keys = [...String]; }] default [];
+                    exclude_sets = [...String] default [];
+                    exclude_namespaces = [...{ namespace = String; keys = [...String]; }] default [];
+                    revoked = Bool default false;
+                } default {};
+            }; }"#
+        } else {
+            source
+        };
         permissions = config_source::ConfigSchemaContribution::new(
             "builtin:permissions",
             "permissions",
@@ -103,6 +122,7 @@ fn host() -> PermissionHost {
         ("conversation", "test.chat"),
         ("work-coordination", "test.coordinate"),
         ("work-execution", "test.execute"),
+        ("implementer", "test.implement"),
     ];
     host.declare(
         &namespace,
@@ -139,6 +159,18 @@ fn fixture_with_schema(
     main: &str,
     bundle: WorkspaceConfigSchemaBundle,
 ) -> (tempfile::TempDir, SqliteWorkspaceStore) {
+    fixture_with_settings(
+        main,
+        bundle,
+        "{ label = \"subject-default and subject.delegate are just text here\"; }",
+    )
+}
+
+fn fixture_with_settings(
+    main: &str,
+    bundle: WorkspaceConfigSchemaBundle,
+    settings: &str,
+) -> (tempfile::TempDir, SqliteWorkspaceStore) {
     let dir = tempfile::tempdir().unwrap();
     let db = SqliteWorkspaceStore::open_for_test(&dir.path().join("server.sqlite")).unwrap();
     let mut state = crate::config_source::initial_state_with_schema(bundle).unwrap();
@@ -152,7 +184,7 @@ fn fixture_with_schema(
         ConfigEntry::new(
             path("settings/other.dcdl"),
             ConfigContentType::Decodal,
-            "{ label = \"subject-default and subject.delegate are just text here\"; }",
+            settings,
         )
         .unwrap(),
     ])
@@ -201,6 +233,22 @@ fn fixture_with_schema(
             tx.execute("INSERT INTO workspace_configuration_policies VALUES(?1,?2,?3)", params![WORKSPACE,subject,raw])?;
         }
         tx.execute("INSERT INTO workspace_configuration_receipts VALUES(?1,'historical','old-fingerprint','{\"old\":true}')", [WORKSPACE])?;
+        // Previously issued grants are evidence, including their retired issuer spelling,
+        // reference encoding, whitespace and revocation; never reissue from the new default.
+        let historical_grant = server_api::authorization::CoreWorkerExecutionGrant {
+            grant_id: "historical-grant".into(), workspace_id: WORKSPACE.into(),
+            creation_operation_id: "historical-creation".into(), runtime_id: "runtime".into(),
+            worker_id: "historical-worker".into(), profile: "builtin:coder".into(),
+            profile_digest: "historical-profile".into(),
+            assignment: PermissionAssignment::default(), reference_encoding: Default::default(),
+            issuance_ceiling: None,
+            source: server_api::authorization::CoreWorkerGrantSource::Human { account_id: OWNER.into() },
+        };
+        tx.execute(
+            "INSERT INTO core_worker_execution_grants(workspace_id,grant_id,creation_operation_id,runtime_id,worker_id,grant_json,revoked) VALUES(?1,'historical-grant','historical-creation','runtime','historical-worker',?2,1)",
+            params![WORKSPACE, serde_json::to_string_pretty(&historical_grant).unwrap()],
+        )?;
+        tx.execute("INSERT INTO core_worker_grant_revocations VALUES(?1,'historical-revocation',?2,'historical-grant')", params![WORKSPACE, OWNER])?;
         tx.execute("INSERT INTO workspace_permission_migration_plans VALUES(?1,'frozen-old','{\"reference\":\"subject-default\"}')", [WORKSPACE])?;
         Ok(())
     }).unwrap();
@@ -214,6 +262,8 @@ fn preserved_evidence(db: &SqliteWorkspaceStore) -> Vec<String> {
             "SELECT transfer_identity || legacy_physical_identity || legacy_export_digest FROM workspace_configuration_authorities WHERE workspace_id=?1",
             "SELECT request_fingerprint || result_json FROM workspace_configuration_receipts WHERE workspace_id=?1",
             "SELECT transfer_id || plan_json FROM workspace_permission_migration_plans WHERE workspace_id=?1",
+            "SELECT grant_json || revoked FROM core_worker_execution_grants WHERE workspace_id=?1",
+            "SELECT operation_key || actor_account_id || grant_id FROM core_worker_grant_revocations WHERE workspace_id=?1",
         ] { rows.push(conn.query_row(query, [WORKSPACE], |row| row.get(0))?); }
         Ok(rows)
     }).unwrap()
@@ -236,7 +286,7 @@ fn shared_reference_migration_preserves_domain_policies_constraints_and_immutabl
         .unwrap()
         .shared_source();
     assert!(policy_config::migrate_source_references(&mut expected));
-    assert!(semantic_references::migrate(&db, WORKSPACE, schema("4"), &host).unwrap());
+    assert!(semantic_references::migrate(&db, WORKSPACE, schema("5"), &host).unwrap());
     let state = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
     let after = SnapshotEnvironment::new(state.snapshot.clone())
         .evaluate_contract(&state.contract)
@@ -251,10 +301,10 @@ fn shared_reference_migration_preserves_domain_policies_constraints_and_immutabl
         vec!["conversation", "work-coordination", "work-execution"]
     );
     assert!(expected.sets[0].namespaces.is_empty());
-    assert!(expected.human_worker_default.exclude_namespaces.is_empty());
+    assert!(expected.worker_default.exclude_namespaces.is_empty());
     assert_eq!(
         expected
-            .human_worker_default
+            .worker_default
             .exclude_sets
             .iter()
             .map(|s| s.as_str())
@@ -265,23 +315,38 @@ fn shared_reference_migration_preserves_domain_policies_constraints_and_immutabl
         before.projections[0].data_json["other"],
         after.projections[0].data_json["other"]
     );
+    let historical_base = &state
+        .snapshot
+        .get(&path("permission-references-base-0.dcdl"))
+        .unwrap()
+        .content;
+    assert!(historical_base.ends_with(MAIN));
+    assert!(historical_base.contains(&before_state.contract.schema_bundle.source));
+    let historical_contract = config_source::ToolchainContract::with_schema_bundle(
+        before_state.contract.schema_version,
+        vec![path("permission-references-base-0.dcdl")],
+        before_state.contract.import_policy_version,
+        WorkspaceConfigSchemaBundle::empty(),
+    );
+    let historical = SnapshotEnvironment::new(state.snapshot.clone())
+        .evaluate_contract(&historical_contract)
+        .unwrap();
     assert_eq!(
-        state
-            .snapshot
-            .get(&path("permission-references-base-0.dcdl"))
-            .unwrap()
-            .content,
-        MAIN
+        historical.projections[0].data_json,
+        before.projections[0].data_json,
     );
     assert_eq!(
         state.snapshot.get(&path("settings/other.dcdl")),
         before_state.snapshot.get(&path("settings/other.dcdl"))
     );
     for entry in state.snapshot.entries.values() {
-        assert!(!entry.content.contains("subject_id"));
-        assert!(!entry.content.contains("remove_subjects"));
+        // The pinned schema has individual field ranges, but no source records.
+        if entry.path != path("permission-references-base-0.dcdl") {
+            assert!(!entry.content.contains("subject_id"));
+            assert!(!entry.content.contains("remove_subjects"));
+        }
         for id in ["shown", "omitted", "previously-removed"] {
-            assert!(!entry.content.contains(id));
+            assert!(!entry.content.contains(&serde_json::to_string(id).unwrap()));
         }
     }
     let current = db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap();
@@ -332,10 +397,60 @@ fn shared_reference_migration_preserves_domain_policies_constraints_and_immutabl
     .unwrap();
     assert_eq!(preserved_evidence(&db), before_evidence);
     let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
-    assert!(!semantic_references::migrate(&db, WORKSPACE, schema("4"), &host).unwrap());
+    assert!(!semantic_references::migrate(&db, WORKSPACE, schema("5"), &host).unwrap());
     assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
     assert_eq!(db.load_workspace_config(WORKSPACE).unwrap().unwrap(), state);
     assert_eq!(preserved_evidence(&db), before_evidence);
+}
+
+#[test]
+fn legacy_schema_assertions_in_imports_keep_their_stored_typed_range() {
+    let settings =
+        r#"({ other = { label = "historical import"; }; } as WorkspaceConfigSchema).other"#;
+    let (dir, db) = fixture_with_settings(MAIN, schema("4"), settings);
+    let before = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+    let objects = history_objects(&db);
+    let evidence = preserved_evidence(&db);
+    assert!(semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
+    let after = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+    let pinned = &after
+        .snapshot
+        .get(&path("settings/other.dcdl"))
+        .unwrap()
+        .content;
+    assert!(pinned.ends_with(settings));
+    assert!(pinned.contains(&before.contract.schema_bundle.source));
+    let evaluation = SnapshotEnvironment::new(after.snapshot.clone())
+        .evaluate_contract(&after.contract)
+        .unwrap();
+    assert_eq!(
+        evaluation.projections[0].data_json["other"]["label"],
+        "historical import",
+    );
+    for provider in &before.contract.schema_bundle.contributions {
+        if provider.provider_id != "builtin:permissions" {
+            assert!(
+                after
+                    .contract
+                    .schema_bundle
+                    .contributions
+                    .contains(provider)
+            );
+        }
+    }
+    let current_objects = history_objects(&db);
+    assert!(
+        objects
+            .iter()
+            .all(|object| current_objects.contains(object))
+    );
+    assert_eq!(preserved_evidence(&db), evidence);
+    drop(db);
+    let db = SqliteWorkspaceStore::open_for_test(&dir.path().join("server.sqlite")).unwrap();
+    assert_eq!(db.load_workspace_config(WORKSPACE).unwrap().unwrap(), after);
+    assert!(!semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
+    assert_eq!(preserved_evidence(&db), evidence);
+    assert_eq!(history_objects(&db), current_objects);
 }
 
 #[test]
@@ -349,7 +464,7 @@ fn stored_subject_policies_do_not_change_authored_config_or_inject_subject_ids()
         let (_dir, db) = fixture(main);
         let before = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
         let before_policies = db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap();
-        assert!(semantic_references::migrate(&db, WORKSPACE, schema("4"), &host()).unwrap());
+        assert!(semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
         let after = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
         assert_eq!(after.snapshot, before.snapshot);
         let current = db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap();
@@ -365,7 +480,7 @@ fn stored_subject_policies_do_not_change_authored_config_or_inject_subject_ids()
             );
         }
         let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
-        assert!(!semantic_references::migrate(&db, WORKSPACE, schema("4"), &host()).unwrap());
+        assert!(!semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
         assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
     }
 }
@@ -399,7 +514,7 @@ fn explicit_and_computed_legacy_subject_source_blocks_without_changing_bytes_or_
         let before_policies = db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap();
         let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
         let evidence = preserved_evidence(&db);
-        let error = semantic_references::migrate(&db, WORKSPACE, schema("4"), &host()).unwrap_err();
+        let error = semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap_err();
         assert!(
             matches!(&error, Error::WorkspaceConfigConflict(_)),
             "{error}"
@@ -428,42 +543,48 @@ fn explicit_and_computed_legacy_subject_source_blocks_without_changing_bytes_or_
 
 #[test]
 fn canonical_migration_storage_failures_roll_back_source_policies_and_history_then_retry() {
-    for (table, event) in [
-        ("workspace_config_entries", "INSERT"),
-        ("workspace_configuration_policies", "UPDATE"),
-        ("content_objects", "INSERT"),
-        ("content_scopes", "UPDATE"),
-    ] {
-        let (dir, db) = fixture(MAIN);
-        let before = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
-        let policies_before = db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap();
-        let evidence = preserved_evidence(&db);
-        let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
-        db.with_conn(|conn| {
-            conn.execute_batch(&format!("CREATE TRIGGER inject_failure BEFORE {event} ON {table} BEGIN SELECT RAISE(ABORT,'injected'); END;"))?;
-            Ok(())
-        }).unwrap();
-        let error = semantic_references::migrate(&db, WORKSPACE, schema("4"), &host()).unwrap_err();
-        assert!(error.to_string().contains("injected"), "{table}: {error}");
-        db.with_conn(|conn| {
-            conn.execute_batch("DROP TRIGGER inject_failure")?;
-            Ok(())
-        })
-        .unwrap();
-        drop(db);
-        let db = SqliteWorkspaceStore::open_for_test(&dir.path().join("server.sqlite")).unwrap();
-        assert_eq!(
-            db.load_workspace_config(WORKSPACE).unwrap().unwrap(),
-            before
-        );
-        assert_eq!(
-            db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap(),
-            policies_before
-        );
-        assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
-        assert_eq!(preserved_evidence(&db), evidence);
-        assert!(semantic_references::migrate(&db, WORKSPACE, schema("4"), &host()).unwrap());
-        assert!(!semantic_references::migrate(&db, WORKSPACE, schema("4"), &host()).unwrap());
+    for version in ["3", "4"] {
+        for (table, event) in [
+            ("workspace_config_entries", "INSERT"),
+            ("workspace_configuration_policies", "UPDATE"),
+            ("content_objects", "INSERT"),
+            ("content_scopes", "UPDATE"),
+        ] {
+            let (dir, db) = fixture_with_schema(MAIN, schema(version));
+            let before = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+            let policies_before = db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap();
+            let evidence = preserved_evidence(&db);
+            let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
+            db.with_conn(|conn| {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER inject_failure BEFORE {event} ON {table} BEGIN SELECT RAISE(ABORT,'injected'); END;"
+                ))?;
+                Ok(())
+            }).unwrap();
+            let error =
+                semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap_err();
+            assert!(error.to_string().contains("injected"), "{table}: {error}");
+            db.with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER inject_failure")?;
+                Ok(())
+            })
+            .unwrap();
+            drop(db);
+            let db =
+                SqliteWorkspaceStore::open_for_test(&dir.path().join("server.sqlite")).unwrap();
+            assert_eq!(
+                db.load_workspace_config(WORKSPACE).unwrap().unwrap(),
+                before
+            );
+            assert_eq!(
+                db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap(),
+                policies_before
+            );
+            assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
+            assert_eq!(preserved_evidence(&db), evidence);
+            assert!(semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
+            assert!(!semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
+        }
     }
 }
 
@@ -471,8 +592,13 @@ fn canonical_migration_storage_failures_roll_back_source_policies_and_history_th
 fn permission_migration_preserves_unrelated_schemas_despite_live_default_drift() {
     for (main, version) in [
         (MAIN, "3"),
+        (MAIN, "4"),
         ("{ permissions = {}; } as WorkspaceConfigSchema", "3"),
         ("{ permissions = {}; } as WorkspaceConfigSchema", "4"),
+        (
+            "{ permissions = { human_worker_default = {}; }; } as WorkspaceConfigSchema",
+            "4",
+        ),
     ] {
         let bundle = WorkspaceConfigSchemaBundle::compose(
             schema(version)
@@ -544,8 +670,11 @@ fn permission_migration_preserves_unrelated_schemas_despite_live_default_drift()
             before_evaluation.projections[0].data_json["other"],
             after_evaluation.projections[0].data_json["other"]
         );
-        if version == "4" {
-            assert_eq!(after, before);
+        if !main.contains("human_worker_default") {
+            assert_eq!(
+                after.snapshot, before.snapshot,
+                "omission needs only a schema update"
+            );
         }
         for (subject, policy) in db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap() {
             assert_eq!(policy.current(), before_policies[&subject].current());
@@ -594,10 +723,14 @@ fn reference_only_proof_rejects_unrelated_projection_changes() {
             .evaluate_contract(&contract)
             .unwrap()
     };
-    semantic_references::prove_reference_only(&before_evaluation, &evaluate(schema("4"))).unwrap();
-    let error =
-        semantic_references::prove_reference_only(&before_evaluation, &evaluate(incompatible))
-            .unwrap_err();
+    semantic_references::prove_reference_only(&before, &before_evaluation, &evaluate(schema("5")))
+        .unwrap();
+    let error = semantic_references::prove_reference_only(
+        &before,
+        &before_evaluation,
+        &evaluate(incompatible),
+    )
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -616,23 +749,79 @@ fn reference_only_proof_rejects_unrelated_projection_changes() {
 }
 
 #[test]
+fn reference_only_proof_normalizes_sparse_defaults_but_rejects_permission_changes() {
+    for (main, permissions) in [
+        ("{} as WorkspaceConfigSchema", None),
+        (
+            "{ permissions = {}; } as WorkspaceConfigSchema",
+            Some(serde_json::json!({"sets":[]})),
+        ),
+        (
+            "{ permissions = { human_worker_default = {}; }; } as WorkspaceConfigSchema",
+            Some(serde_json::json!({"worker_default":{}})),
+        ),
+        (
+            "{ permissions = { human_worker_default = { sets = [\"implementer\"]; }; }; } as WorkspaceConfigSchema",
+            Some(serde_json::json!({"worker_default":{"sets":["implementer"]}})),
+        ),
+    ] {
+        let (_dir, db) = fixture_with_schema(main, schema("4"));
+        let original = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+        let before = SnapshotEnvironment::new(original.snapshot.clone())
+            .evaluate_contract(&original.contract)
+            .unwrap();
+        let mut after = before.clone();
+        let root = after.projections[0].data_json.as_object_mut().unwrap();
+        root.remove("permissions");
+        if let Some(permissions) = permissions {
+            root.insert("permissions".into(), permissions);
+        }
+        semantic_references::prove_reference_only(&original, &before, &after).unwrap();
+        for invalid in [
+            serde_json::json!({"human_worker_default":{}}),
+            serde_json::json!({"subjects":[]}),
+            serde_json::json!({"worker_default":{"revoked":true}}),
+            serde_json::json!({"worker_default":{"unknown":true}}),
+            serde_json::json!({"sets":[{"id":"unexpected"}]}),
+        ] {
+            let mut changed = after.clone();
+            changed.projections[0].data_json["permissions"] = invalid;
+            assert!(
+                semantic_references::prove_reference_only(&original, &before, &changed).is_err(),
+                "{main}: {}",
+                changed.projections[0].data_json["permissions"],
+            );
+        }
+        let permissions = if main.contains("human_worker_default = {}") {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({"worker_default":{}})
+        };
+        let mut changed = after.clone();
+        changed.projections[0].data_json["permissions"] = permissions;
+        assert!(semantic_references::prove_reference_only(&original, &before, &changed).is_err());
+    }
+}
+
+#[test]
 fn current_owner_adoption_rejects_individual_fields_even_empty_and_retired_shared_references() {
     let (_dir, db) = fixture(MAIN);
     let host = host();
-    semantic_references::migrate(&db, WORKSPACE, schema("4"), &host).unwrap();
+    semantic_references::migrate(&db, WORKSPACE, schema("5"), &host).unwrap();
     let state = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
     let main = state.snapshot.get(&path(MAIN_CONFIG_ENTRYPOINT)).unwrap();
     let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
     for (permissions, expected) in [
+        ("human_worker_default = {};", "human_worker_default"),
         ("subjects = [];", "subjects"),
         ("remove_subjects = [];", "remove_subjects"),
         ("subjects = [{ subject_id = \"shown\"; }];", "subjects"),
         (
-            "human_worker_default = { sets = [\"subject-default\"]; };",
+            "worker_default = { sets = [\"subject-default\"]; };",
             "invalid permission references",
         ),
         (
-            "human_worker_default = { namespaces = [{ namespace = \"subject\"; keys = [\"subject.delegate\"]; }]; revoked = true; };",
+            "worker_default = { namespaces = [{ namespace = \"subject\"; keys = [\"subject.delegate\"]; }]; revoked = true; };",
             "invalid permission references",
         ),
         (
@@ -662,7 +851,7 @@ fn current_owner_adoption_rejects_individual_fields_even_empty_and_retired_share
                 WORKSPACE,
                 OWNER,
                 &request,
-                schema("4"),
+                schema("5"),
                 &host,
                 None,
                 |_| Ok(()),
@@ -690,7 +879,7 @@ fn ambiguous_retired_set_definition_blocks_migration_without_changing_authority(
     let policies_before = db.with_conn(|conn| policies(conn, WORKSPACE)).unwrap();
     let evidence = preserved_evidence(&db);
     let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
-    let error = semantic_references::migrate(&db, WORKSPACE, schema("4"), &host()).unwrap_err();
+    let error = semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap_err();
     assert!(
         error
             .to_string()
@@ -713,13 +902,16 @@ fn legacy_target_schema_blocks_instead_of_repreparing_frozen_plan_as_current_inp
     let (_dir, db) = fixture(MAIN);
     let before = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
     let evidence = preserved_evidence(&db);
-    let error = semantic_references::migrate(&db, WORKSPACE, schema("3"), &host()).unwrap_err();
-    assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
-    assert_eq!(
-        db.load_workspace_config(WORKSPACE).unwrap().unwrap(),
-        before
-    );
-    assert_eq!(preserved_evidence(&db), evidence);
+    for version in ["3", "4"] {
+        let error =
+            semantic_references::migrate(&db, WORKSPACE, schema(version), &host()).unwrap_err();
+        assert!(matches!(error, Error::WorkspaceConfigConflict(_)));
+        assert_eq!(
+            db.load_workspace_config(WORKSPACE).unwrap().unwrap(),
+            before
+        );
+        assert_eq!(preserved_evidence(&db), evidence);
+    }
 }
 
 #[test]
@@ -739,4 +931,136 @@ fn legacy_adopted_policy_missing_encoding_round_trips_without_changing_frozen_by
     );
     assert_eq!(decoded.current().change_id, "unchanged");
     assert_eq!(serde_json::to_string(&decoded).unwrap(), before);
+}
+
+fn history_objects(db: &SqliteWorkspaceStore) -> Vec<(i64, Vec<u8>, Vec<u8>)> {
+    db.with_conn(|conn| {
+        let mut query =
+            conn.prepare("SELECT kind,hash,bytes FROM content_objects ORDER BY kind,hash")?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .unwrap()
+}
+
+#[test]
+fn legacy_worker_default_rename_preserves_explicit_values_omission_and_evidence_on_reopen() {
+    for version in ["1", "2", "3", "4"] {
+        for (permissions, expected, rewrites_source) in [
+            (
+                None,
+                policy_config::PermissionSource::default().worker_default,
+                false,
+            ),
+            (
+                Some(""),
+                policy_config::PermissionSource::default().worker_default,
+                false,
+            ),
+            (
+                Some("human_worker_default = {};"),
+                policy_config::AssignmentSource::default(),
+                true,
+            ),
+            (
+                Some(
+                    r#"human_worker_default = {
+                    sets = ["implementer"];
+                    namespaces = [{ namespace = "test"; keys = ["test.chat"]; }];
+                    exclude_sets = ["conversation"];
+                    exclude_namespaces = [{ namespace = "test"; keys = ["test.execute"]; }];
+                    revoked = true;
+                };"#,
+                ),
+                policy_config::AssignmentSource {
+                    sets: vec![PermissionSetId::parse("implementer").unwrap()],
+                    namespaces: vec![NamespacePermissions {
+                        namespace: NamespaceId::parse("test").unwrap(),
+                        keys: vec![PermissionKey::parse("test.chat").unwrap()],
+                    }],
+                    exclude_sets: vec![PermissionSetId::parse("conversation").unwrap()],
+                    exclude_namespaces: vec![NamespacePermissions {
+                        namespace: NamespaceId::parse("test").unwrap(),
+                        keys: vec![PermissionKey::parse("test.execute").unwrap()],
+                    }],
+                    revoked: true,
+                },
+                true,
+            ),
+            (
+                // A reference conversion elsewhere must not turn an omitted old default
+                // into the old schema's injected empty assignment in the new wrapper.
+                Some(r#"sets = [{ id = "local"; sets = ["subject-default"]; }];"#),
+                policy_config::PermissionSource::default().worker_default,
+                true,
+            ),
+        ] {
+            let main = permissions.map_or_else(
+                || "# old whole-config omission\n{} as WorkspaceConfigSchema".to_owned(),
+                |fields| format!("# old authored source\n{{ permissions = {{ {fields} }}; }} as WorkspaceConfigSchema"),
+            );
+            let (dir, db) = fixture_with_schema(&main, schema(version));
+            let before = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+            let objects = history_objects(&db);
+            let evidence = preserved_evidence(&db);
+            assert!(semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
+            let after = db.load_workspace_config(WORKSPACE).unwrap().unwrap();
+            if rewrites_source {
+                assert_ne!(after.snapshot, before.snapshot);
+                assert!(
+                    after
+                        .snapshot
+                        .get(&path(MAIN_CONFIG_ENTRYPOINT))
+                        .unwrap()
+                        .content
+                        .contains("worker_default")
+                );
+                let historical_base = &after
+                    .snapshot
+                    .get(&path("permission-references-base-0.dcdl"))
+                    .unwrap()
+                    .content;
+                assert!(historical_base.ends_with(&main));
+                assert!(historical_base.contains(&before.contract.schema_bundle.source));
+            } else {
+                assert_eq!(
+                    after.snapshot, before.snapshot,
+                    "omission must stay unauthored"
+                );
+            }
+            assert_eq!(
+                db.worker_assignment(WORKSPACE, &host(), None).unwrap(),
+                expected.assignment()
+            );
+            assert_eq!(preserved_evidence(&db), evidence);
+            let current_objects = history_objects(&db);
+            for object in &objects {
+                assert!(
+                    current_objects.contains(object),
+                    "original history bytes changed"
+                );
+            }
+            drop(db);
+            let db =
+                SqliteWorkspaceStore::open_for_test(&dir.path().join("server.sqlite")).unwrap();
+            assert_eq!(db.load_workspace_config(WORKSPACE).unwrap().unwrap(), after);
+            assert_eq!(
+                db.worker_assignment(WORKSPACE, &host(), None).unwrap(),
+                expected.assignment()
+            );
+            let empty = PermissionAssignment::default();
+            assert_eq!(
+                db.worker_assignment(WORKSPACE, &host(), Some(&empty))
+                    .unwrap(),
+                empty
+            );
+            assert_eq!(preserved_evidence(&db), evidence);
+            let head = db.configuration_head(WORKSPACE, OWNER).unwrap();
+            assert!(!semantic_references::migrate(&db, WORKSPACE, schema("5"), &host()).unwrap());
+            assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), head);
+            assert_eq!(db.load_workspace_config(WORKSPACE).unwrap().unwrap(), after);
+            assert_eq!(history_objects(&db), current_objects);
+            assert_eq!(preserved_evidence(&db), evidence);
+        }
+    }
 }

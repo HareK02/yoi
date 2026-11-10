@@ -60,12 +60,15 @@ Shared permission configuration example (edit the actual pulled source path):
   { sets = [{ id = "workspace-ticket-query";
       namespaces = [{ namespace = "ticket"; keys = ["ticket.query"]; }];
     }];
-    human_worker_default = { sets = ["workspace-ticket-query"]; };
+    worker_default = { sets = ["workspace-ticket-query"]; };
   }
 The imported file is a plain object; main.dcdl keeps its existing schema/import.
-Permission configuration defines shared Workspace Sets and the human Worker default.
-The default is selected only for a new ordinary human-created Worker that omits
-an assignment, never for Subject bodies, Jobs, children, retries or restores.
+Permission configuration defines shared Workspace Sets and the Worker default.
+New ordinary Workers select this default when neither an assignment nor a launch
+policy is specified, regardless of caller. Omitted configuration selects the
+implementer Set; an explicit empty assignment stays empty. Delegated Workers
+remain bounded by their source. Subject bodies and Jobs use dedicated authority;
+retries and restores retain their issued grant.
 Individual Subject policies are Server-managed domain data, not config source.
 Keys carry no payloads; namespace denotes Feature ownership, not prefix inclusion.
 Only catalog-declared children expand. Use the catalog in the read-only pull

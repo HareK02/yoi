@@ -838,8 +838,9 @@ pub(super) fn has_subject_authority(
         let Some(grant) = core else { break };
         use server_api::authorization::{CoreWorkerGrantParent, CoreWorkerGrantSource};
         match grant.source {
-            CoreWorkerGrantSource::Human { .. } => break,
-            CoreWorkerGrantSource::LaunchPolicy { parent, .. } => match parent {
+            CoreWorkerGrantSource::Human { .. } | CoreWorkerGrantSource::Account { .. } => break,
+            CoreWorkerGrantSource::LaunchPolicy { parent, .. }
+            | CoreWorkerGrantSource::Delegation { parent } => match parent {
                 CoreWorkerGrantParent::SubjectBody { .. }
                 | CoreWorkerGrantParent::LegacySubjectGrant { .. } => return Ok(true),
                 CoreWorkerGrantParent::WorkerGrant {

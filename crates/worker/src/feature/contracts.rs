@@ -24,6 +24,21 @@ use ticket::{NewTicket, Result as TicketResult, TicketError, TicketRef, TicketSt
 // Reuse the Host-neutral response/error vocabulary rather than redesigning transport DTOs.
 use crate::worker::{WorkspaceClientError, WorkspaceResponse};
 
+pub(crate) fn validate_launch_selection(
+    authorization: &server_api::launch_policy::WorkerCreationAuthorization,
+    profile: &str,
+) -> Result<(), String> {
+    if let server_api::launch_policy::WorkerCreationAuthorization::Policy {
+        policy_id,
+        policy_revision,
+    } = authorization
+    {
+        server_api::launch_policy::validate_policy_id(policy_id)?;
+        server_api::launch_policy::validate_authorization_revision(*policy_revision)?;
+    }
+    server_api::launch_policy::validate_canonical_profile(profile)
+}
+
 pub const WORKER_CONTROL_SERVICE_ID: &str = "worker.control";
 pub const WORKER_CONTROL_SERVICE_VERSION: &str = "1";
 pub const WORKER_LIFECYCLE_SERVICE_ID: &str = "worker.lifecycle";
@@ -104,7 +119,8 @@ pub trait WorkerLifecycleService: Send + Sync {
     ) -> Result<WorkspaceResponse, WorkspaceClientError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerLifecycleWorkdirAttachment {
     /// Stable Worker-local routing alias preserved into the canonical create request.
     pub alias: String,
@@ -114,7 +130,8 @@ pub struct WorkerLifecycleWorkdirAttachment {
     pub relative_cwd: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerLifecycleSpawnRequest {
     /// Observed delegation required for Orchestrator Ticket starts.
     pub orchestrator_assignment_id: Option<String>,
@@ -127,9 +144,9 @@ pub struct WorkerLifecycleSpawnRequest {
     pub ticket_id: Option<String>,
     /// Required for ordinary and Ticket spawn; exact retries reuse this ID and full input.
     pub operation_id: Option<String>,
-    /// Workspace launch policy and observed authorization revision.
-    pub policy_id: String,
-    pub policy_revision: u64,
+    /// Omission selects the shared Worker default; explicit selections are forwarded unchanged.
+    #[serde(default)]
+    pub authorization: server_api::launch_policy::WorkerCreationAuthorization,
     pub display_name: String,
     pub initial_submit: Vec<Segment>,
 }

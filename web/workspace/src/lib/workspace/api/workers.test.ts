@@ -312,7 +312,7 @@ Deno.test("Worker launch response parsers reject missing and unknown fields", ()
   );
 });
 
-Deno.test("Worker create request parser requires the complete shared request", () => {
+Deno.test("Worker create request parser defaults authorization and preserves explicit selections", () => {
   const request = {
     runtime_id: "runtime-a",
     display_name: "Worker A",
@@ -328,10 +328,29 @@ Deno.test("Worker create request parser requires the complete shared request", (
       relative_cwd: null,
     }],
     feature_connections: {},
-    authorization: { kind: "human", assignment: null }, control_operation_id: "create-op",
+    authorization: { kind: "assignment", assignment: null }, control_operation_id: "create-op",
   };
 
   assertEquals(parseCreateWorkspaceWorkerRequest(request), request);
+  const { authorization: _authorization, ...omittedAuthorization } = request;
+  assertEquals(
+    parseCreateWorkspaceWorkerRequest(omittedAuthorization).authorization,
+    { kind: "assignment", assignment: null },
+  );
+  assertEquals(
+    parseCreateWorkspaceWorkerRequest({ ...request, authorization: undefined }).authorization,
+    { kind: "assignment", assignment: null },
+  );
+  for (const assignment of [
+    { grants: [], exclusions: [], revoked: false },
+    { grants: [{ kind: "set", value: "conversation" }], exclusions: [], revoked: true },
+  ]) {
+    const authorization = { kind: "assignment", assignment };
+    assertEquals(
+      parseCreateWorkspaceWorkerRequest({ ...request, authorization }).authorization,
+      authorization,
+    );
+  }
   for (const policy_revision of [1, Number.MAX_SAFE_INTEGER]) {
     const authorization = { kind: "policy", policy_id: "coder", policy_revision };
     assertEquals(parseCreateWorkspaceWorkerRequest({ ...request, authorization }).authorization, authorization);
@@ -341,7 +360,7 @@ Deno.test("Worker create request parser requires the complete shared request", (
       ...request, authorization: { kind: "policy", policy_id: "coder", policy_revision },
     }), Error, "policy_revision");
   }
-  for (const authorization of [undefined, null, { kind: "default" },
+  for (const authorization of [null, { kind: "human", assignment: null }, { kind: "default" },
     { kind: "policy", policy_id: "coder", policy_revision: 1, assignment: {} },
     { kind: "policy", policy_id: "bad.id", policy_revision: 1 }]) {
     assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, authorization }), Error,
@@ -408,7 +427,7 @@ Deno.test("Worker launch request preserves typed Feature invocations and rejects
     { name: "enabled", value: { kind: "boolean", value: true } },
   ] };
   const request = { runtime_id: "runtime-a", display_name: "Worker A", profile: "builtin:coder", ticket_assignment: null,
-    initial_submit: [{ kind: "feature_invoke", invocation }], workdir_attachments: [], feature_connections: {}, authorization: { kind: "human", assignment: null }, control_operation_id: "create-op" };
+    initial_submit: [{ kind: "feature_invoke", invocation }], workdir_attachments: [], feature_connections: {}, authorization: { kind: "assignment", assignment: null }, control_operation_id: "create-op" };
   assertEquals(parseCreateWorkspaceWorkerRequest(request).initial_submit, request.initial_submit);
   assertThrows(() => parseCreateWorkspaceWorkerRequest({ ...request, initial_submit: [{ kind: "feature_invoke", invocation: {
     ...invocation, arguments: [{ name: "count", value: { kind: "integer", value: 9007199254740992 } }],

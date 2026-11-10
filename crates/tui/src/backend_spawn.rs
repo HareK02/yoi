@@ -162,7 +162,7 @@ fn request_from_selection(selection: Selection) -> BackendCreateWorkerRequest {
         ticket_assignment: None,
         feature_connections: Default::default(),
         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-        authorization: client::BackendWorkerCreationAuthorization::Human { assignment: None },
+        authorization: client::BackendWorkerCreationAuthorization::Assignment { assignment: None },
     }
 }
 

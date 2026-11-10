@@ -567,7 +567,7 @@ pub(super) async fn start(
                     }),
                 },
                 control_operation_id: None,
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             },

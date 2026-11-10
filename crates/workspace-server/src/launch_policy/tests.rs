@@ -349,7 +349,12 @@ fn legacy_human_grant_projection_preserves_dynamic_and_explicit_empty_sqlite_cei
             account_id: "owner".into(),
         };
         human.issuance_ceiling = ceiling.clone();
-        f.bind(&human);
+        assert!(bind_core_grant(&f.conn, &human).is_err());
+        // Only a previously issued row may retain the historical source spelling.
+        f.conn.execute(
+            "INSERT INTO core_worker_execution_grants(workspace_id,grant_id,creation_operation_id,runtime_id,worker_id,grant_json) VALUES('w',?1,?2,'r',?1,?3)",
+            params![id, human.creation_operation_id, encode(&human).unwrap()],
+        ).unwrap();
         f.reopen();
         let saved = core_grant(&f.conn, "w", "r", id).unwrap().unwrap();
         assert_eq!(
@@ -360,6 +365,45 @@ fn legacy_human_grant_projection_preserves_dynamic_and_explicit_empty_sqlite_cei
         assert_eq!(encode(&saved).unwrap(), encode(&human).unwrap());
         assert_eq!(bind_core_grant(&f.conn, &saved).unwrap(), human);
     }
+}
+
+#[test]
+fn assignment_delegation_keeps_finite_empty_bound_and_rechecks_revoked_parent_after_reopen() {
+    let mut f = Fixture::new();
+    let p = f.change(&create()).policy;
+    let mut root = grant(&p, "account-root");
+    root.source = CoreWorkerGrantSource::Account {
+        account_id: "owner".into(),
+    };
+    root.issuance_ceiling = None;
+    f.bind(&root);
+    let mut child = grant(&p, "assignment-child");
+    child.source = CoreWorkerGrantSource::Delegation {
+        parent: CoreWorkerGrantParent::WorkerGrant {
+            grant_id: root.grant_id.clone(),
+            runtime_id: root.runtime_id.clone(),
+            worker_id: root.worker_id.clone(),
+        },
+    };
+    child.assignment = Default::default();
+    child.issuance_ceiling = None;
+    assert!(bind_core_grant(&f.conn, &child).is_err());
+    child.issuance_ceiling = Some(vec![]);
+    f.bind(&child);
+    f.reopen();
+    assert!(validate_policy_lineage(&f.conn, &child).unwrap().is_empty());
+    assert_eq!(
+        core_grant(&f.conn, "w", "r", "assignment-child").unwrap(),
+        Some(child.clone())
+    );
+    assert!(
+        bounded_current_keys(&child, [PermissionKey::parse("worker.create").unwrap()]).is_empty()
+    );
+    revoke_core_grant(&f.conn, "w", "owner", &root.grant_id, "revoke-root").unwrap();
+    f.reopen();
+    assert!(validate_policy_lineage(&f.conn, &child).is_err());
+    // Immutable exact replay is not authority to launch or act again.
+    assert_eq!(bind_core_grant(&f.conn, &child).unwrap(), child);
 }
 
 #[test]

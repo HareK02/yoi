@@ -133,9 +133,10 @@ mod subject_permission_policy_tests {
                         }),
                     },
                     control_operation_id: Some("policy-test-worker".into()),
-                    authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
-                        assignment: None,
-                    },
+                    authorization:
+                        server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                            assignment: None,
+                        },
                 },
                 None,
                 Some(&context),

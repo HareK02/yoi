@@ -15,7 +15,7 @@ impl Drop for ServerTask {
 fn request() -> CreateWorkspaceWorkerRequest {
     serde_json::from_value(serde_json::json!({
         "runtime_id": "runtime", "display_name": "Worker", "feature_connections": {},
-        "authorization": {"kind": "human", "assignment": null},
+        "authorization": {"kind": "assignment", "assignment": null},
         "control_operation_id": "fixture-create"
     }))
     .unwrap()

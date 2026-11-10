@@ -40,13 +40,16 @@ fn host(children: bool) -> PermissionHost {
                     children: vec![],
                 },
             ],
-            sets: vec![SetContribution {
-                set: PermissionSetId::parse("ticket").unwrap(),
-                children: vec![PermissionReference::Namespace(NamespacePermissions {
-                    namespace: NamespaceId::parse("ticket").unwrap(),
-                    keys: vec![PermissionKey::parse("ticket.hoge").unwrap()],
-                })],
-            }],
+            sets: ["ticket", "implementer"]
+                .into_iter()
+                .map(|set| SetContribution {
+                    set: PermissionSetId::parse(set).unwrap(),
+                    children: vec![PermissionReference::Namespace(NamespacePermissions {
+                        namespace: NamespaceId::parse("ticket").unwrap(),
+                        keys: vec![PermissionKey::parse("ticket.hoge").unwrap()],
+                    })],
+                })
+                .collect(),
         },
     )
     .unwrap();
@@ -168,8 +171,8 @@ fn adopt(
         },
     )
 }
-const A: &str = r#"{ permissions = { human_worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge"]; }]; }; }; } as WorkspaceConfigSchema"#;
-const B: &str = r#"{ permissions = { human_worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge.fuga"]; }]; }; }; } as WorkspaceConfigSchema"#;
+const A: &str = r#"{ permissions = { worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge"]; }]; }; }; } as WorkspaceConfigSchema"#;
+const B: &str = r#"{ permissions = { worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge.fuga"]; }]; }; }; } as WorkspaceConfigSchema"#;
 
 #[test]
 fn editing_head_rejects_aba_and_parallel_editors_but_receipts_reconcile_lost_responses() {
@@ -299,10 +302,10 @@ fn invalid_references_structure_and_owner_do_not_prepare_a_transfer() {
     let initial = db.load_workspace_config(WORKSPACE).unwrap();
     for source in [
         "not valid Decodal {",
-        r#"{permissions={human_worker_default={sets=["missing"];};};} as WorkspaceConfigSchema"#,
-        r#"{permissions={human_worker_default={namespaces=[{namespace="ticket";keys=["ticket.unknown"];}];};};} as WorkspaceConfigSchema"#,
+        r#"{permissions={worker_default={sets=["missing"];};};} as WorkspaceConfigSchema"#,
+        r#"{permissions={worker_default={namespaces=[{namespace="ticket";keys=["ticket.unknown"];}];};};} as WorkspaceConfigSchema"#,
         r#"{permissions={sets=[{id="duplicate";},{id="duplicate";}];};} as WorkspaceConfigSchema"#,
-        r#"{permissions={human_worker_default={namespaces=[{namespace="ticket";keys=[{key="ticket.hoge"; payload="forbidden";}];}];};};} as WorkspaceConfigSchema"#,
+        r#"{permissions={worker_default={namespaces=[{namespace="ticket";keys=[{key="ticket.hoge"; payload="forbidden";}];}];};};} as WorkspaceConfigSchema"#,
     ] {
         let request = request(&db, &host, "bad", Some(source));
         let result = db.adopt_configuration(
@@ -464,7 +467,7 @@ fn feature_children_are_explicit_and_multisegment_keys_are_preserved_in_saved_as
         let (_dir, db) = fixture();
         let host = host(children);
         adopt(&db, &host, &request(&db, &host, "initial", Some(A))).unwrap();
-        let (configured, assignment) = db.human_worker_permissions(WORKSPACE, &host, None).unwrap();
+        let (configured, assignment) = db.worker_permissions(WORKSPACE, &host, None).unwrap();
         let resolution = configured.resolve(Some(&assignment));
         assert_eq!(
             resolution
@@ -474,7 +477,7 @@ fn feature_children_are_explicit_and_multisegment_keys_are_preserved_in_saved_as
             children
         );
         adopt(&db, &host, &request(&db, &host, "multi", Some(B))).unwrap();
-        let (_, assignment) = db.human_worker_permissions(WORKSPACE, &host, None).unwrap();
+        let (_, assignment) = db.worker_permissions(WORKSPACE, &host, None).unwrap();
         assert_eq!(
             assignment.grants,
             vec![PermissionReference::Namespace(NamespacePermissions {

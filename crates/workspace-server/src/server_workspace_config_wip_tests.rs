@@ -1539,7 +1539,9 @@ async fn workspace_config_actual_remote_and_embedded_clients_use_authenticated_w
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
+                assignment: None,
+            },
         }),
     )
     .await

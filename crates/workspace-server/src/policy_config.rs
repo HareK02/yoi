@@ -1,10 +1,11 @@
 //! Shared Workspace permission configuration, separate from Subject policy storage.
 //!
 //! Workspace sets use the Feature graph resolver and cannot replace Feature-owned
-//! sets or declare keys. `human_worker_default` selects references only for a new
-//! human-created ordinary Worker that omits an assignment; retries, restores,
-//! Subject bodies, Jobs and internal children never select it. Unknown references
-//! are rejected even when revoked.
+//! sets or declare keys. `worker_default` selects shared references when a new
+//! Worker creation caller omits its selection. Callers still enforce their own
+//! launch authority; retries and restores retain issued grants. Omission selects
+//! `implementer`, while an explicit empty assignment stays empty. Unknown
+//! references are rejected even when revoked.
 //!
 //! Individual Subject records below retain the existing persisted JSON contract.
 //! They are not current configuration input, and legacy decoding never authorizes
@@ -25,6 +26,9 @@ use server_api::authorization::{
 use crate::config_source::WorkspaceConfigSchemaProvider;
 use crate::{Error, Result};
 
+// Decodal 0.4 materializes object members before object-level defaults. Keep
+// this optional selection abstract until supplied, then decode its closed shape
+// with AssignmentSource. This distinguishes omission from an authored empty object.
 const SCHEMA: &str = r#"{
     permissions = {
         sets = [...{
@@ -32,13 +36,7 @@ const SCHEMA: &str = r#"{
             sets = [...String] default [];
             namespaces = [...{ namespace = String; keys = [...String]; }] default [];
         }] default [];
-        human_worker_default = {
-            sets = [...String] default [];
-            namespaces = [...{ namespace = String; keys = [...String]; }] default [];
-            exclude_sets = [...String] default [];
-            exclude_namespaces = [...{ namespace = String; keys = [...String]; }] default [];
-            revoked = Bool default false;
-        } default {};
+        worker_default = Unknown default { sets = ["implementer"]; };
     };
 }"#;
 
@@ -47,7 +45,7 @@ pub struct PermissionConfigSchemaProvider;
 
 impl WorkspaceConfigSchemaProvider for PermissionConfigSchemaProvider {
     fn contribution(&self) -> Result<ConfigSchemaContribution> {
-        ConfigSchemaContribution::new("builtin:permissions", "permissions", "4", SCHEMA)
+        ConfigSchemaContribution::new("builtin:permissions", "permissions", "5", SCHEMA)
             .map_err(|e| Error::Config(e.to_string()))
     }
 }
@@ -149,17 +147,33 @@ impl WorkspacePermissionSetSource {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionSource {
     #[serde(default)]
     pub sets: Vec<WorkspacePermissionSetSource>,
-    #[serde(default)]
-    pub human_worker_default: AssignmentSource,
+    #[serde(default = "default_worker_assignment")]
+    pub worker_default: AssignmentSource,
+}
+
+fn default_worker_assignment() -> AssignmentSource {
+    AssignmentSource {
+        sets: vec![PermissionSetId::parse("implementer").expect("built-in set ID")],
+        ..Default::default()
+    }
+}
+
+impl Default for PermissionSource {
+    fn default() -> Self {
+        Self {
+            sets: vec![],
+            worker_default: default_worker_assignment(),
+        }
+    }
 }
 
 /// Decoder for persisted configuration evaluated with permission schema versions
-/// through three. Never use this permissive historical shape for current input.
+/// through four. Never use this historical shape for current input.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyPermissionSource {
@@ -170,14 +184,17 @@ pub struct LegacyPermissionSource {
     #[serde(default)]
     pub sets: Vec<WorkspacePermissionSetSource>,
     #[serde(default)]
-    pub human_worker_default: AssignmentSource,
+    pub human_worker_default: Option<AssignmentSource>,
 }
 
 impl LegacyPermissionSource {
     pub fn shared_source(&self) -> PermissionSource {
         PermissionSource {
             sets: self.sets.clone(),
-            human_worker_default: self.human_worker_default.clone(),
+            worker_default: self
+                .human_worker_default
+                .clone()
+                .unwrap_or_else(default_worker_assignment),
         }
     }
 }
@@ -212,7 +229,7 @@ pub(crate) fn migrate_source_references(source: &mut PermissionSource) -> bool {
             false
         }
     }
-    let mut changed = lane(&mut source.human_worker_default);
+    let mut changed = lane(&mut source.worker_default);
     for set in &mut source.sets {
         let mut assignment = AssignmentSource {
             sets: set.sets.clone(),
@@ -326,7 +343,7 @@ pub fn configured_host(host: &PermissionHost, source: &PermissionSource) -> Resu
         .map_err(|error| {
             Error::InvalidInput(format!("invalid Workspace permission sets: {error}"))
         })?;
-    validate_assignment(&configured, &source.human_worker_default)?;
+    validate_assignment(&configured, &source.worker_default)?;
     Ok(configured)
 }
 
@@ -495,5 +512,31 @@ impl AdoptedSubjectPolicy {
             execution: filter(execution.projection(), &retained.execution)?,
             delegation: filter(delegation.projection(), &retained.delegation)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_permission_decoder_distinguishes_missing_and_explicit_empty_default() {
+        let missing: PermissionSource = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            missing.worker_default.sets,
+            vec![PermissionSetId::parse("implementer").unwrap()]
+        );
+        let empty: PermissionSource =
+            serde_json::from_value(serde_json::json!({"worker_default": {}})).unwrap();
+        assert_eq!(empty.worker_default, AssignmentSource::default());
+        for value in [
+            serde_json::json!({"human_worker_default": {}}),
+            serde_json::json!({"worker_default": {}, "human_worker_default": {}}),
+        ] {
+            assert!(
+                serde_json::from_value::<PermissionSource>(value).is_err(),
+                "the retired field is storage-only, not a current alias"
+            );
+        }
     }
 }

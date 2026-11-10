@@ -279,9 +279,15 @@ pub(crate) fn bind_core_grant(
             }
             (Some(policy_id.as_str()), Some(*policy_revision))
         }
-        CoreWorkerGrantSource::Human { account_id } => {
+        CoreWorkerGrantSource::Account { account_id } => {
             require_owner(conn, &grant.workspace_id, account_id)?;
             (None, None)
+        }
+        CoreWorkerGrantSource::Delegation { .. } => (None, None),
+        CoreWorkerGrantSource::Human { .. } => {
+            return Err(invalid(
+                "historical human grant source cannot be newly issued",
+            ));
         }
     };
     // The row is inserted only after lineage validation. Its own record need not
@@ -310,8 +316,11 @@ pub(crate) fn validate_policy_lineage(
         if revoked == Some(true) {
             return Err(invalid("Core Worker grant revoked"));
         }
-        match &cursor.source {
-            CoreWorkerGrantSource::Human { .. } => return Ok(vec![]),
+        let parent = match &cursor.source {
+            CoreWorkerGrantSource::Account { .. } | CoreWorkerGrantSource::Human { .. } => {
+                return Ok(vec![]);
+            }
+            CoreWorkerGrantSource::Delegation { parent } => parent,
             CoreWorkerGrantSource::LaunchPolicy {
                 policy_id,
                 policy_revision,
@@ -327,22 +336,23 @@ pub(crate) fn validate_policy_lineage(
                 if p.effective_child_permissions() != cursor.effective_assignment() {
                     return Err(invalid("Core Worker grant policy assignment mismatch"));
                 }
-                match parent {
-                    CoreWorkerGrantParent::WorkerGrant {
-                        grant_id,
-                        runtime_id,
-                        worker_id,
-                    } => {
-                        let next = core_grant(conn, &cursor.workspace_id, runtime_id, worker_id)?
-                            .ok_or_else(|| invalid("Parent core Worker grant missing"))?;
-                        if &next.grant_id != grant_id {
-                            return Err(invalid("Parent core Worker grant identity mismatch"));
-                        }
-                        cursor = next;
-                    }
-                    _ => return Ok(vec![parent.clone()]),
-                }
+                parent
             }
+        };
+        match parent {
+            CoreWorkerGrantParent::WorkerGrant {
+                grant_id,
+                runtime_id,
+                worker_id,
+            } => {
+                let next = core_grant(conn, &cursor.workspace_id, runtime_id, worker_id)?
+                    .ok_or_else(|| invalid("Parent core Worker grant missing"))?;
+                if &next.grant_id != grant_id {
+                    return Err(invalid("Parent core Worker grant identity mismatch"));
+                }
+                cursor = next;
+            }
+            _ => return Ok(vec![parent.clone()]),
         }
     }
 }

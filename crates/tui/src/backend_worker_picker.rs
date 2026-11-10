@@ -674,6 +674,7 @@ mod tests {
 
     fn worker(runtime_id: &str, worker_id: &str, profile: Option<&str>) -> BackendWorkerSummary {
         BackendWorkerSummary {
+            removal: None,
             restore_observation_token: Some("observed-worker-state".into()),
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
@@ -729,6 +730,9 @@ mod tests {
             runtime_id: "runtime-a".to_string(),
             worker_id: "worker-a".to_string(),
             result: BackendWorkerRestoreResult {
+                startup: None,
+                control_explanation: None,
+                control: None,
                 state,
                 worker: None,
                 diagnostics: Vec::new(),
@@ -859,13 +863,23 @@ mod tests {
             }
         }
 
-        fn stop_worker(
+        fn stop_worker_operation(
             &self,
-            _: &worker_runtime::identity::WorkerRef,
+            request: worker_runtime::execution::WorkerExecutionStopRequest,
         ) -> worker_runtime::execution::WorkerExecutionResult {
-            worker_runtime::execution::WorkerExecutionResult::accepted(
-                worker_runtime::execution::WorkerExecutionOperation::Stop,
-            )
+            use worker_runtime::execution::*;
+            let mut result = WorkerExecutionResult::accepted(WorkerExecutionOperation::Stop);
+            result.execution_id = Some("00000000-0000-4000-8000-000000000001".parse().unwrap());
+            result.termination = Some(WorkerExecutionTermination {
+                scope: WorkerExecutionTerminationScope::Controller,
+                worker_ref: request.worker_ref,
+                stop_operation_id: request.operation_id,
+                execution_id: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+                shutdown_command_id: Some(1),
+                submissions: Vec::new(),
+                feature_failures: Vec::new(),
+            });
+            result
         }
 
         fn dispatch_input(
@@ -909,7 +923,8 @@ mod tests {
                     serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap(),
                 )
                 .map_err(|error| match error {
-                    worker_runtime::error::RuntimeError::RestoreObservationConflict { .. } => {
+                    worker_runtime::error::RuntimeError::RestoreObservationConflict { .. }
+                    | worker_runtime::error::RuntimeError::RestoreObservationStale { .. } => {
                         RestoreAttemptError::Conflict
                     }
                     error => RestoreAttemptError::Unknown(io::Error::other(error.to_string())),
@@ -965,6 +980,7 @@ mod tests {
         let worker = runtime
             .create_worker(CreateWorkerRequest {
                 worker_id: protocol::WorkerId::now_v7(),
+                plugin_execution: None,
                 create_fingerprint: "tui-recovery-create".into(),
                 profile: ProfileSelector::Builtin("builtin:coder".into()),
                 display_name: None,

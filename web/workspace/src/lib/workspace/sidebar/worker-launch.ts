@@ -149,7 +149,7 @@ export function buildCreateWorkspaceWorkerRequest(
     feature_connections: form.subjektiv_subject_id.trim()
       ? { subjektiv: { subject_id: form.subjektiv_subject_id.trim() } }
       : {},
-    authorization: { kind: "human", assignment: null },
+    authorization: { kind: "assignment", assignment: null },
     control_operation_id: operationId,
   });
 }

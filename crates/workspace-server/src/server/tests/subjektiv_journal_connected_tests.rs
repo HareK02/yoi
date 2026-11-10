@@ -350,7 +350,7 @@ async fn connected_create(api: &WorkspaceApi, subject: &str, name: &str) -> Runt
             workdir_attachments: vec![],
             feature_connections: server_api::WorkspaceWorkerFeatureConnectionsRequest {
                 subjektiv: Some(server_api::SubjektivWorkerConnectionRequest { subject_id: subject.into() }),
-            }, control_operation_id: Some(uuid::Uuid::now_v7().to_string()), authorization: server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+            }, control_operation_id: Some(uuid::Uuid::now_v7().to_string()), authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None },
         }),
     ).await.unwrap();
     RuntimeWorkerRef::new(created.runtime_id, created.worker_id)
@@ -1948,7 +1948,7 @@ async fn connected_restore_fixture_with_pending_head(
                     }),
                 },
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),

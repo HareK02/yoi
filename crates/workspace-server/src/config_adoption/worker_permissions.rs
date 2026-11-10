@@ -1,11 +1,10 @@
 //! Reconstruct Worker creation selections from the materialized Workspace source.
 //!
-//! Ordinary human selection is independent of Subject policy adoption. Legacy
-//! Subject reads still require adoption before consulting transferred policy.
+//! Shared selection is independent of Subject policy adoption. Legacy Subject
+//! reads still require adoption before consulting transferred policy.
 //!
-//! These reads do not issue grants. The caller authenticates a human creator and
-//! binds the chosen references before any protected supply or Runtime dispatch.
-//! Worker-origin launches must use their launch-policy authority instead. A retry
+//! These reads do not issue grants. Each caller enforces its own launch authority
+//! and binds the selection before protected supply or Runtime dispatch. A retry
 //! or restore uses the saved grant, never this selection routine's latest default.
 
 use feature_permissions::{PermissionAssignment, PermissionHost};
@@ -107,12 +106,12 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    /// Human-only new ordinary Worker selection. `None` selects the configured
+    /// Caller-neutral new Worker selection. `None` selects the configured
     /// default; `Some(empty)` stays empty; `Some(selection)` replaces the default.
     /// Return references, not their expansion, so later Set contributions remain
     /// dynamic. The caller owns creation authorization, grant persistence and the
     /// effect-admission fence; this read is neither a credential nor a reservation.
-    pub fn human_worker_permissions(
+    pub fn worker_permissions(
         &self,
         workspace: &str,
         feature_host: &PermissionHost,
@@ -124,7 +123,7 @@ impl SqliteWorkspaceStore {
             let host = policy_config::configured_host(feature_host, &source)?;
             let assignment = explicit
                 .cloned()
-                .unwrap_or_else(|| source.human_worker_default.assignment());
+                .unwrap_or_else(|| source.worker_default.assignment());
             policy_config::validate_assignment(
                 &host,
                 &policy_config::AssignmentSource::from_assignment(&assignment),
@@ -133,13 +132,13 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub fn human_worker_assignment(
+    pub fn worker_assignment(
         &self,
         workspace: &str,
         feature_host: &PermissionHost,
         explicit: Option<&PermissionAssignment>,
     ) -> Result<PermissionAssignment> {
-        self.human_worker_permissions(workspace, feature_host, explicit)
+        self.worker_permissions(workspace, feature_host, explicit)
             .map(|(_, assignment)| assignment)
     }
 }

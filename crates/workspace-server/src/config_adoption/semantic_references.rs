@@ -38,15 +38,11 @@ pub(crate) fn migrate(
             .evaluate_contract(&original.contract)
             .map_err(|error| Error::InvalidInput(format!("cannot evaluate current reference migration source: {error:?}")))?;
         let mut source = crate::configuration_migration::shared_source_for_migration(&original, &before)?;
-        let changes = if policy_config::migrate_source_references(&mut source) {
-            crate::configuration_migration::reference_migration_changes(&original, &source)?
-        } else {
-            vec![]
-        };
+        let changes = crate::configuration_migration::shared_source_migration_changes(&original, &mut source)?;
         let candidate = crate::configuration_migration::evaluate_migration_candidate(
             tx, workspace, &original, &changes, schema,
         )?;
-        prove_reference_only(&before, &candidate.evaluation)?;
+        prove_reference_only(&original, &before, &candidate.evaluation)?;
         crate::config_source::validate_workspace_config_candidate_projections(workspace, &candidate)?;
         crate::repository_access::validate_repository_access_in_transaction(tx, workspace, &candidate)?;
         let evaluated_source = policy_config::source(&candidate.evaluation)?;
@@ -94,23 +90,42 @@ pub(crate) fn migrate(
 }
 
 pub(crate) fn prove_reference_only(
+    original: &WorkspaceConfigState,
     before: &EvaluationResult,
     after: &EvaluationResult,
 ) -> Result<()> {
     let mut expected = before.clone();
+    let mut actual = after.clone();
     for projection in &mut expected.projections {
-        if let Some(value) = projection.data_json.get_mut("permissions") {
-            // This proof compares an old evaluated projection with current output;
-            // it is not a decoder for new config input. Actual source removal must
-            // be proven independently before staging any active configuration.
-            let old: policy_config::LegacyPermissionSource = serde_json::from_value(value.clone())
-                .map_err(|error| {
-                    Error::InvalidInput(format!("invalid old permission source: {error}"))
-                })?;
-            let mut source = old.shared_source();
-            policy_config::migrate_source_references(&mut source);
-            *value =
-                serde_json::to_value(source).map_err(|error| Error::Store(error.to_string()))?;
+        // The stored contract selects old decoding; current input has no alias.
+        let mut single = before.clone();
+        single
+            .projections
+            .retain(|p| p.entrypoint == projection.entrypoint);
+        let mut source =
+            crate::configuration_migration::shared_source_for_migration(original, &single)?;
+        policy_config::migrate_source_references(&mut source);
+        if let Some(root) = projection.data_json.as_object_mut() {
+            root.insert(
+                "permissions".into(),
+                serde_json::to_value(source).map_err(|error| Error::Store(error.to_string()))?,
+            );
+        }
+    }
+    for projection in &mut actual.projections {
+        let mut single = after.clone();
+        single
+            .projections
+            .retain(|p| p.entrypoint == projection.entrypoint);
+        // Normalize schema materialization only through the strict current type.
+        // Unknown fields, the old spelling and explicit empty assignments are not
+        // discarded; all non-permission JSON remains part of the exact proof.
+        let source = policy_config::source(&single)?;
+        if let Some(root) = projection.data_json.as_object_mut() {
+            root.insert(
+                "permissions".into(),
+                serde_json::to_value(source).map_err(|error| Error::Store(error.to_string()))?,
+            );
         }
     }
     if expected
@@ -118,7 +133,7 @@ pub(crate) fn prove_reference_only(
         .iter()
         .map(|p| (&p.entrypoint, &p.data_json))
         .collect::<Vec<_>>()
-        != after
+        != actual
             .projections
             .iter()
             .map(|p| (&p.entrypoint, &p.data_json))

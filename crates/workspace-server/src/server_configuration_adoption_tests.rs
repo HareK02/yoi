@@ -668,9 +668,7 @@ mod configuration_adoption_http_integration {
                 Some(receipt.history_head.as_str())
             );
             assert_eq!(
-                shared_permissions(&committed)
-                    .human_worker_default
-                    .assignment(),
+                shared_permissions(&committed).worker_default.assignment(),
                 assignment("ticket.create")
             );
             f.assert_source_policy_unchanged(&committed);
@@ -688,7 +686,7 @@ mod configuration_adoption_http_integration {
 
             // A real Web owner then clears shared defaults. Historical receipt
             // recovery must not resurrect it, rewind the head, or send later edits.
-            let removal = "{ sets = []; human_worker_default = {}; }\n";
+            let removal = "{ sets = []; worker_default = {}; }\n";
             let web = request(
                 &committed,
                 "response-loss-later-web-removal",
@@ -712,9 +710,7 @@ mod configuration_adoption_http_integration {
             let cleared = f.source().await;
             f.assert_source_policy_unchanged(&cleared);
             assert_eq!(
-                shared_permissions(&cleared)
-                    .human_worker_default
-                    .assignment(),
+                shared_permissions(&cleared).worker_default.assignment(),
                 Default::default()
             );
             f.assert_subject_policy_unchanged();
@@ -867,7 +863,7 @@ mod configuration_adoption_http_integration {
         let text = r#"{
     sets = [{ id = "owner-tools"; sets = ["ticket"];
         namespaces = [{ namespace = "worker"; keys = ["worker.observe"]; }]; }];
-    human_worker_default = {
+    worker_default = {
         sets = ["owner-tools"];
         exclude_namespaces = [{ namespace = "ticket"; keys = ["ticket.create"]; }];
     };
@@ -885,7 +881,7 @@ mod configuration_adoption_http_integration {
         server.run(&f.owner, &checkout, Push).await.unwrap();
         let source = f.source().await;
         let shared = shared_permissions(&source);
-        let assignment = shared.human_worker_default.assignment();
+        let assignment = shared.worker_default.assignment();
         assert_eq!(
             assignment.grants,
             vec![PermissionReference::Set(
@@ -1015,7 +1011,8 @@ mod configuration_adoption_http_integration {
             "source deletion is not implicit policy deletion"
         );
 
-        let main = "{ permissions = { sets = []; human_worker_default = {}; }; } as WorkspaceConfigSchema\n";
+        let main =
+            "{ permissions = { sets = []; worker_default = {}; }; } as WorkspaceConfigSchema\n";
         std::fs::write(checkout.join("source/main.dcdl"), &main).unwrap();
         let preview = server.run(&f.owner, &checkout, Preview).await.unwrap();
         assert!(preview.contains("main.dcdl"), "{preview}");
@@ -1023,9 +1020,7 @@ mod configuration_adoption_http_integration {
         let removed = f.source().await;
         f.assert_source_policy_unchanged(&removed);
         assert_eq!(
-            shared_permissions(&removed)
-                .human_worker_default
-                .assignment(),
+            shared_permissions(&removed).worker_default.assignment(),
             Default::default()
         );
         f.assert_subject_policy_unchanged();
@@ -1159,9 +1154,9 @@ mod configuration_adoption_http_integration {
                 "unknown-key",
                 permission_source("ticket.not_a_builtin_operation", "ticket.query"),
             ),
-            ("unknown-set", "{ human_worker_default = { sets = [\"not-a-builtin-set\"]; }; }".to_owned()),
-            ("key-payload", r#"{ human_worker_default = { namespaces = [{ namespace = "ticket"; keys = [{ key = "ticket.query"; arguments = {}; }]; }]; }; }"#.to_owned()),
-            ("wrong-namespace", r#"{ human_worker_default = { namespaces = [{ namespace = "ticket"; keys = ["worker.observe"]; }]; }; }"#.to_owned()),
+            ("unknown-set", "{ worker_default = { sets = [\"not-a-builtin-set\"]; }; }".to_owned()),
+            ("key-payload", r#"{ worker_default = { namespaces = [{ namespace = "ticket"; keys = [{ key = "ticket.query"; arguments = {}; }]; }]; }; }"#.to_owned()),
+            ("wrong-namespace", r#"{ worker_default = { namespaces = [{ namespace = "ticket"; keys = ["worker.observe"]; }]; }; }"#.to_owned()),
         ] {
             std::fs::write(&local, &content).unwrap();
             for command in [Validate, Preview, Push] {
@@ -1334,7 +1329,7 @@ mod configuration_adoption_http_integration {
         format!(
             r#"{{
     sets = [{{ id = "owner-tools"; namespaces = [{{ namespace = "ticket"; keys = [{set_key:?}]; }}]; }}];
-    human_worker_default = {{ namespaces = [{{ namespace = "ticket"; keys = [{default:?}]; }}]; }};
+    worker_default = {{ namespaces = [{{ namespace = "ticket"; keys = [{default:?}]; }}]; }};
 }}
 "#
         )
@@ -1778,9 +1773,7 @@ mod configuration_adoption_http_integration {
         );
         assert_ne!(stored.history_head, source.history_head);
         assert_eq!(
-            shared_permissions(&stored)
-                .human_worker_default
-                .assignment(),
+            shared_permissions(&stored).worker_default.assignment(),
             assignment("ticket.create")
         );
         fixture.assert_source_policy_unchanged(&stored);
@@ -1910,7 +1903,7 @@ mod configuration_adoption_http_integration {
         let current = fixture.source().await;
         let path = permission_path(&current);
         // Clearing shared defaults makes old-source resurrection observable.
-        let removal = "{ sets = []; human_worker_default = {}; }\n";
+        let removal = "{ sets = []; worker_default = {}; }\n";
         fixture
             .commit(&request(
                 &current,
@@ -1921,9 +1914,7 @@ mod configuration_adoption_http_integration {
         fixture.assert_subject_policy_unchanged();
         let cleared = fixture.source().await;
         assert_eq!(
-            shared_permissions(&cleared)
-                .human_worker_default
-                .assignment(),
+            shared_permissions(&cleared).worker_default.assignment(),
             Default::default()
         );
         fixture.assert_source_policy_unchanged(&cleared);
@@ -2122,7 +2113,7 @@ mod configuration_adoption_http_integration {
             ),
             (
                 "unknown-set",
-                r#"{ human_worker_default = { sets = ["unknown-adoption-set"]; }; }"#.to_owned(),
+                r#"{ worker_default = { sets = ["unknown-adoption-set"]; }; }"#.to_owned(),
             ),
         ];
         for (name, content) in invalid {

@@ -659,7 +659,7 @@ fn unadopted_subject_writes_fail_closed_without_blocking_ordinary_human_selectio
     ));
     assert_eq!(
         store
-            .human_worker_assignment(WORKSPACE, &host(), Some(&assignment("ticket")))
+            .worker_assignment(WORKSPACE, &host(), Some(&assignment("ticket")))
             .unwrap(),
         assignment("ticket")
     );

@@ -1980,7 +1980,11 @@
         "properties": {
           "authorization": {
             "$ref": "#/components/schemas/WorkerCreationAuthorization",
-            "description": "Host authenticates the policy caller or human initial issuer separately."
+            "default": {
+              "assignment": null,
+              "kind": "assignment"
+            },
+            "description": "Omission selects the shared Worker default; Host authenticates the issuer separately."
           },
           "control_operation_id": {
             "default": null,
@@ -2044,8 +2048,7 @@
         "required": [
           "runtime_id",
           "display_name",
-          "feature_connections",
-          "authorization"
+          "feature_connections"
         ],
         "type": "object"
       },
@@ -15673,7 +15676,11 @@
           },
           "authorization": {
             "$ref": "#/components/schemas/WorkerCreationAuthorization",
-            "description": "Mandatory caller intent, independent of Profile and Host-resolved authority."
+            "default": {
+              "assignment": null,
+              "kind": "assignment"
+            },
+            "description": "Omission selects the shared Worker default, independently of Profile."
           },
           "control_operation_id": {
             "type": "string"
@@ -15719,7 +15726,6 @@
           }
         },
         "required": [
-          "authorization",
           "control_operation_id",
           "intent",
           "acceptance",
@@ -23496,7 +23502,7 @@
         ]
       },
       "WorkerCreationAuthorization": {
-        "description": "Policy selection is mandatory on Worker-originated creation. Human initial\nassignment is a separate authenticated path: omission and explicit empty have\ndifferent meanings there, never on the policy path.",
+        "description": "Caller-neutral initial assignment selection. Omission selects the Workspace\nWorker default; an explicit assignment (including empty) takes precedence.\nExplicit policy selection remains a separate, usage-authorized launch path.",
         "oneOf": [
           {
             "additionalProperties": false,
@@ -23536,7 +23542,7 @@
                 ]
               },
               "kind": {
-                "const": "human",
+                "const": "assignment",
                 "type": "string"
               }
             },
@@ -26666,7 +26672,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:c65b11cc9d0b65b2c5b42a1dd8a3b7feaa761fb987161fcba8a537c621cdb050"
+    "x-yoi-source-digest": "sha256:3cec42775326573edb9c39064b09c63233075bd6727f6124f2f73fb32f6baeea"
   },
   "openapi": "3.1.0",
   "paths": {

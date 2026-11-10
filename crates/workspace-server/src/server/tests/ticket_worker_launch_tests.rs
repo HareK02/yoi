@@ -524,7 +524,7 @@ impl LaunchFixture {
             "runtime_id": self.runtime_id, "display_name": "Explicit Ticket Worker", "profile": profile,
             "ticket_assignment": {"ticket_id": ticket_id, "operation_id": operation_id},
             "initial_submit": segments, "workdir_attachments": [], "feature_connections": {},
-            "authorization": { "kind": "human", "assignment": null },
+            "authorization": { "kind": "assignment", "assignment": null },
             "control_operation_id": format!("launch-{operation_id}"),
         })
     }
@@ -1482,7 +1482,7 @@ async fn uncertain_launch_replay_after_target_edit_keeps_claim_and_blocks_compet
             {"alias":"checkout", "working_directory_id":fixture.main_workdir_id},
             {"alias":"docs", "working_directory_id":fixture.docs_workdir_id}
         ], "feature_connections": {},
-        "authorization": { "kind": "human", "assignment": null },
+        "authorization": { "kind": "assignment", "assignment": null },
         "control_operation_id": "uncertain-ticket-worker-launch"
     });
     let launch = |body: Value| {

@@ -116,7 +116,7 @@ fn delivery_create_request(subject: Option<&str>, profile: &str) -> CreateWorksp
         },
         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
         authorization: if subject.is_some() {
-            server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None }
+            server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None }
         } else {
             test_worker_operation_authorization(&[(
                 "plugin",

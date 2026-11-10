@@ -43,6 +43,14 @@ pub enum CoreWorkerGrantSource {
         policy_revision: u64,
         parent: CoreWorkerGrantParent,
     },
+    Account {
+        account_id: String,
+    },
+    Delegation {
+        parent: CoreWorkerGrantParent,
+    },
+    /// Historical issued grants only. Retain this wire spelling and raw identity
+    /// for replay/restore; new creation requests and issuance never select it.
     Human {
         account_id: String,
     },
@@ -65,9 +73,9 @@ pub struct CoreWorkerExecutionGrant {
         skip_serializing_if = "PermissionReferenceEncoding::is_legacy"
     )]
     pub reference_encoding: PermissionReferenceEncoding,
-    /// Policy children always carry a finite ceiling (including explicit empty).
-    /// Human initial assignments may remain dynamic; None is not an allow-all
-    /// resolution and never applies to policy-derived grants.
+    /// Policy and assignment-delegated children always carry a finite ceiling,
+    /// including explicit empty. Account root assignments may remain dynamic;
+    /// None never applies to a Worker-originated child.
     pub issuance_ceiling: Option<Vec<PermissionKey>>,
     pub source: CoreWorkerGrantSource,
 }
@@ -97,19 +105,20 @@ impl CoreWorkerExecutionGrant {
             }
         }
         crate::launch_policy::validate_canonical_profile(&self.profile)?;
+        if let CoreWorkerGrantSource::LaunchPolicy {
+            policy_id,
+            policy_revision,
+            ..
+        } = &self.source
+        {
+            crate::launch_policy::validate_policy_id(policy_id)?;
+            crate::launch_policy::validate_authorization_revision(*policy_revision)?;
+        }
         match &self.source {
-            CoreWorkerGrantSource::LaunchPolicy {
-                policy_id,
-                policy_revision,
-                parent,
-            } => {
-                crate::launch_policy::validate_policy_id(policy_id)?;
-                crate::launch_policy::validate_authorization_revision(*policy_revision)?;
+            CoreWorkerGrantSource::LaunchPolicy { parent, .. }
+            | CoreWorkerGrantSource::Delegation { parent } => {
                 if self.issuance_ceiling.is_none() {
-                    return Err(
-                        "policy grant requires a nonzero revision and finite issuance ceiling"
-                            .into(),
-                    );
+                    return Err("Worker-origin grant requires a finite issuance ceiling".into());
                 }
                 let (runtime, worker, source_id) = match parent {
                     CoreWorkerGrantParent::SubjectBody {
@@ -143,9 +152,10 @@ impl CoreWorkerExecutionGrant {
                     return Err("invalid or self-referencing parent provenance".into());
                 }
             }
-            CoreWorkerGrantSource::Human { account_id } => {
+            CoreWorkerGrantSource::Account { account_id }
+            | CoreWorkerGrantSource::Human { account_id } => {
                 if account_id.trim().is_empty() {
-                    return Err("missing authenticated human issuer".into());
+                    return Err("missing authenticated account issuer".into());
                 }
             }
         }
@@ -208,6 +218,35 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&grant).unwrap()["reference_encoding"],
             "feature_sets_v2"
+        );
+    }
+
+    #[test]
+    fn delegation_wire_requires_finite_ceiling_and_retains_typed_parent() {
+        let raw = serde_json::json!({
+            "grant_id":"g", "workspace_id":"w", "creation_operation_id":"op",
+            "runtime_id":"r", "worker_id":"child", "profile":"builtin:coder",
+            "profile_digest":"digest", "reference_encoding":"feature_sets_v2",
+            "assignment":{"grants":[], "exclusions":[], "revoked":false},
+            "issuance_ceiling":null,
+            "source":{"kind":"delegation", "parent":{
+                "kind":"worker_grant", "grant_id":"parent-grant",
+                "runtime_id":"r", "worker_id":"parent"
+            }}
+        });
+        let mut grant: CoreWorkerExecutionGrant = serde_json::from_value(raw).unwrap();
+        assert!(grant.validate().is_err());
+        grant.issuance_ceiling = Some(vec![]);
+        grant.validate().unwrap();
+        assert!(!grant.bounds_operation(&PermissionKey::parse("workdir.list").unwrap()));
+        assert_eq!(
+            serde_json::to_value(&grant).unwrap()["source"],
+            serde_json::json!({
+                "kind":"delegation", "parent":{
+                    "kind":"worker_grant", "grant_id":"parent-grant",
+                    "runtime_id":"r", "worker_id":"parent"
+                }
+            })
         );
     }
 

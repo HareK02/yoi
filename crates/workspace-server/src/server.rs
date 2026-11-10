@@ -29682,7 +29682,7 @@ async fn scoped_start_workspace_orchestrator(
         disposition = "recreated";
     }
 
-    let authorization = server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None };
+    let authorization = server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None };
     let mut request = WorkerSpawnRequest {
             requested_worker_name: Some(
                 crate::hosts::WORKSPACE_ORCHESTRATOR_SINGLETON_KEY.to_string(),
@@ -36099,7 +36099,7 @@ async fn create_workspace_worker_authenticated_on_host(
     let subject_connection = feature_connections.subjektiv.is_some();
     if source.is_some() && (singleton_key.is_some() || subject_connection) {
         return Err(Error::WorkspacePermissionDenied(
-            "policy-created Workers cannot acquire Subject body or singleton identity".into(),
+            "delegated Workers cannot acquire Subject body or singleton identity".into(),
         )
         .into());
     }
@@ -36112,7 +36112,7 @@ async fn create_workspace_worker_authenticated_on_host(
     } else if subject_connection {
         if !matches!(
             &authorization,
-            server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None }
+            server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None }
         ) {
             return Err(Error::WorkspacePermissionDenied(
                 "Subject body attachment has dedicated authority, not an ordinary initial grant"
@@ -42244,7 +42244,7 @@ mod tests {
                         },
                         control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
                         authorization:
-                            server_api::launch_policy::WorkerCreationAuthorization::Human {
+                            server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                                 assignment: None,
                             },
                     }),
@@ -43576,7 +43576,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -44200,7 +44200,7 @@ mod tests {
                 ],
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -44451,7 +44451,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -48361,7 +48361,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -48399,7 +48399,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -48438,7 +48438,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -49738,7 +49738,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: Some("singleton-exact-retry".into()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         };
@@ -49909,7 +49909,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -50012,7 +50012,7 @@ mod tests {
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         };
@@ -51271,7 +51271,7 @@ mod tests {
                     }),
                 },
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }
@@ -51405,7 +51405,7 @@ mod tests {
                     }),
                 },
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -51593,7 +51593,7 @@ mod tests {
                 }),
             },
             control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         };
@@ -52813,7 +52813,7 @@ mod tests {
         let mut restart_request = request("owner-restart-before-dispatch");
         restart_request.singleton_key = Some("fixture:restart-retry".to_string());
         restart_request.authorization = Some(
-            server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+            server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None },
         );
         let restart_fingerprint = worker_spawn_create_fingerprint(&restart_request).unwrap();
         let operation = WorkerControlOperation {
@@ -53087,7 +53087,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -53178,7 +53178,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -60757,7 +60757,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -61215,7 +61215,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),
@@ -62849,7 +62849,7 @@ mod tests {
              intent: server_api::RuntimeWorkerSpawnIntent,
              profile: &str,
              singleton_key: &str| server_api::RuntimeWorkerSpawnRequest {
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
                 control_operation_id: "runtime-test-create".into(),
@@ -62928,7 +62928,7 @@ mod tests {
         let ticket = backend.create(input).unwrap();
         assign_test_orchestrator(&api, &ticket.id);
         let request = server_api::RuntimeWorkerSpawnRequest {
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
             control_operation_id: "runtime-test-create".into(),
@@ -64187,7 +64187,7 @@ mod tests {
     ) -> ApiResult<WorkerSpawnResult> {
         let actor = test_owner_actor();
         let authorization = request.authorization.clone().unwrap_or(
-            server_api::launch_policy::WorkerCreationAuthorization::Human { assignment: None },
+            server_api::launch_policy::WorkerCreationAuthorization::Assignment { assignment: None },
         );
         request.authorization = Some(authorization.clone());
         let operation = match request.resolved_control_operation.clone() {
@@ -64306,7 +64306,7 @@ mod tests {
             NamespaceId, NamespacePermissions, PermissionAssignment, PermissionKey,
             PermissionReference,
         };
-        server_api::launch_policy::WorkerCreationAuthorization::Human {
+        server_api::launch_policy::WorkerCreationAuthorization::Assignment {
             assignment: Some(PermissionAssignment {
                 grants: namespaces
                     .iter()
@@ -71942,7 +71942,7 @@ mod tests {
             State(api.clone()),
             AxumPath(WorkdirlessFixtureRuntime::RUNTIME_ID.to_string()),
             Json(server_api::RuntimeWorkerSpawnRequest {
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
                 control_operation_id: "runtime-test-create".into(),
@@ -71984,7 +71984,7 @@ mod tests {
                 workdir_attachments: Vec::new(),
                 feature_connections: Default::default(),
                 control_operation_id: Some(uuid::Uuid::now_v7().to_string()),
-                authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+                authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                     assignment: None,
                 },
             }),

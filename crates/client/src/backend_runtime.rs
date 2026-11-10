@@ -909,8 +909,8 @@ mod tests {
             initial_submit: Vec::new(),
             workdir_attachments: Vec::new(),
             feature_connections: Default::default(),
-            control_operation_id: Some("test-human-create".into()),
-            authorization: server_api::launch_policy::WorkerCreationAuthorization::Human {
+            control_operation_id: Some("test-worker-create".into()),
+            authorization: server_api::launch_policy::WorkerCreationAuthorization::Assignment {
                 assignment: None,
             },
         };
@@ -931,6 +931,10 @@ mod tests {
         assert_eq!(body["runtime_id"], "embedded");
         assert_eq!(body["display_name"], "Coder one");
         assert_eq!(body["profile"], "builtin:coder");
+        assert_eq!(
+            body["authorization"],
+            serde_json::json!({"kind":"assignment", "assignment":null})
+        );
         assert_eq!(body["initial_submit"], serde_json::json!([]));
         assert_eq!(body["workdir_attachments"], serde_json::json!([]));
     }
