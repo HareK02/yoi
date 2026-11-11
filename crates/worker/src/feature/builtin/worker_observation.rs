@@ -115,8 +115,10 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
                 runtime_id: runtime_id.clone(),
                 worker_id: worker_id.clone(),
             },
-            WorkerObservationSubjectRef::SubWorker { name } => {
-                server_api::WorkerObservationSubjectRef::SubWorker { name: name.clone() }
+            // Internal captures belong to the parent registry provider, never
+            // to the Workspace transport (including when that transport fails).
+            WorkerObservationSubjectRef::SubWorker { .. } => {
+                return Err(WorkerObservationError::NotFound);
             }
         };
         let _workspace_id = self.client.workspace_id().ok_or_else(|| {
@@ -124,18 +126,14 @@ impl WorkerObservationProvider for WorkspaceClientWorkerObservationProvider {
                 "Workspace observation requires a scoped Workspace client".to_string(),
             )
         })?;
-        match subject {
-            WorkerObservationSubjectRef::RuntimeWorker { .. } => self.client.authorize_operation(
+        self.client
+            .authorize_operation(
                 "worker.observe",
                 &server_api::authorization::PermissionResource::WorkerOperation {
                     workspace_id: _workspace_id.into(),
                 },
-            ),
-            WorkerObservationSubjectRef::SubWorker { name } => self
-                .client
-                .authorize_subworker_operation("subworker.observe", name),
-        }
-        .map_err(workspace_client_error)?;
+            )
+            .map_err(workspace_client_error)?;
         let response = self
             .client
             .execute_server_operation(

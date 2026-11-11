@@ -121,11 +121,6 @@ pub enum PermissionResource {
     Network {
         url: String,
     },
-    SubWorker {
-        runtime_id: String,
-        worker_id: String,
-        name: String,
-    },
     Feature,
     Workspace {
         workspace_id: String,
@@ -200,11 +195,6 @@ impl<'de> Deserialize<'de> for PermissionResource {
             },
             Network {
                 url: String,
-            },
-            SubWorker {
-                runtime_id: String,
-                worker_id: String,
-                name: String,
             },
             Feature {},
             Workspace {
@@ -304,15 +294,6 @@ impl<'de> Deserialize<'de> for PermissionResource {
                 recursive,
             },
             Wire::Network { url } => Self::Network { url },
-            Wire::SubWorker {
-                runtime_id,
-                worker_id,
-                name,
-            } => Self::SubWorker {
-                runtime_id,
-                worker_id,
-                name,
-            },
             Wire::Feature {} => Self::Feature,
             Wire::Workspace { workspace_id } => Self::Workspace { workspace_id },
             Wire::Workdir {
@@ -453,15 +434,6 @@ impl PermissionResource {
                 }
                 Ok(())
             }
-            Self::SubWorker {
-                runtime_id,
-                worker_id,
-                name,
-            } => {
-                validate_authorization_identifier(runtime_id)?;
-                validate_authorization_identifier(worker_id)?;
-                validate_authorization_identifier(name)
-            }
             Self::Feature => Ok(()),
             Self::Workspace { workspace_id } | Self::WorkerOperation { workspace_id } => {
                 validate_authorization_identifier(workspace_id)
@@ -590,18 +562,6 @@ impl PermissionResource {
                 },
             ) => a == b && ai == bi,
             (Self::Network { url: a }, Self::Network { url: b }) => a == b,
-            (
-                Self::SubWorker {
-                    runtime_id: a,
-                    worker_id: aw,
-                    name: an,
-                },
-                Self::SubWorker {
-                    runtime_id: b,
-                    worker_id: bw,
-                    name: bn,
-                },
-            ) => a == b && aw == bw && an == bn,
             (
                 Self::WorkspaceConfig {
                     workspace_id: a,
@@ -813,9 +773,6 @@ pub enum BoundAuthorizationTarget {
         alias: String,
         expected_connection_id: Option<String>,
     },
-    SubWorker {
-        name: String,
-    },
     NotificationSource {
         source_event_id: String,
     },
@@ -910,6 +867,27 @@ pub fn validate_relative_permission_path(path: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_children_are_not_server_authorization_resources_or_targets() {
+        assert!(
+            serde_json::from_value::<PermissionResource>(serde_json::json!({
+                "kind": "sub_worker", "runtime_id": "r", "worker_id": "w", "name": "child"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<BoundAuthorizationTarget>(serde_json::json!({
+                "kind": "sub_worker", "name": "child"
+            }))
+            .is_err()
+        );
+        assert!(
+            subject_permission_operations()
+                .iter()
+                .all(|operation| !operation.operation.starts_with("subworker."))
+        );
+    }
 
     #[test]
     fn plugin_installation_permissions_require_exact_workspace_and_installation() {
@@ -1115,11 +1093,6 @@ mod tests {
                 runtime_id: "r".into(),
                 worker_id: "w".into(),
             },
-            PermissionResource::SubWorker {
-                runtime_id: "r".into(),
-                worker_id: "w".into(),
-                name: "child".into(),
-            },
         ] {
             assert!(!resource.covers(&other), "{other:?}");
             assert!(!other.covers(&resource), "{other:?}");
@@ -1162,11 +1135,6 @@ mod tests {
                 },
                 PermissionResource::Workspace {
                     workspace_id: "ws".into(),
-                },
-                PermissionResource::SubWorker {
-                    runtime_id: "r".into(),
-                    worker_id: "w".into(),
-                    name: "child".into(),
                 },
             ] {
                 assert!(

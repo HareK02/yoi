@@ -285,6 +285,41 @@ impl WorkdirScopeLease {
                     Err(error) => break Err(error),
                 }
             };
+            // Revocation can forbid reading remaining output while cancellation
+            // and status reconciliation of an owned command remain permitted.
+            // Do not restore output authority or fabricate a transport terminal.
+            if let Err(error) = &terminal
+                && matches!(error.classification_source(), WorkdirError::Denied(_))
+            {
+                let settled = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        match self
+                            .broker
+                            .authority
+                            .source
+                            .command_status(handle.clone())
+                            .await?
+                        {
+                            CommandStatus::Running => {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            _ => return Ok::<(), WorkdirError>(()),
+                        }
+                    }
+                })
+                .await;
+                if matches!(settled, Ok(Ok(()))) {
+                    self.broker
+                        .authority
+                        .owned_commands
+                        .lock()
+                        .expect("scoped command set mutex poisoned")
+                        .remove(&command_id);
+                    continue;
+                }
+                // Unknown, inaccessible or still-running commands retain the
+                // cleanup fence and the write lease for an explicit retry.
+            }
             match (cancel, terminal) {
                 (_, Ok(output)) => {
                     self.broker.authority.publish_terminal_if_missing(

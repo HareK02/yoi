@@ -42,7 +42,7 @@ impl WorkspaceClient for ParentFilesystemAuthority {
             && !self.revoked.load(Ordering::SeqCst)
             && grant.covers(resource)
         {
-            Ok(Some(grant))
+            Ok(Some(resource.clone()))
         } else {
             Err(WorkspaceClientError::Request(
                 "parent direct authority denied".into(),
@@ -122,21 +122,41 @@ async fn parent_feature_off_child_feature_on_uses_live_parent_direct_authority()
         fixture.profiles.clone(),
     )
     .with_internal_client(Box::new(EnvironmentClient::default()));
-    let denied = tool
-        .execute(
-            &json!({"name":"denied-child", "task":TASK, "profile":"project:coder",
-            "scope":[{"target":".","permission":"read"}]})
-            .to_string(),
-            agen::tool::ToolExecutionContext::direct(),
-        )
+    // Local child creation grants no effects, even when the parent's Host
+    // authority has already been revoked. The child's actual Read must fail.
+    tool.execute(
+        &json!({"name":"denied-child", "task":TASK, "profile":"project:coder",
+        "scope":[{"target":".","permission":"read"}]})
+        .to_string(),
+        agen::tool::ToolExecutionContext::direct(),
+    )
+    .await
+    .unwrap();
+    let record = fixture.registry.get_internal("denied-child").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), record.session.wait_until_idle())
         .await
-        .unwrap_err();
+        .unwrap();
     assert!(
-        denied
-            .to_string()
-            .contains("parent direct authority denied")
+        record
+            .workdir_tool_scope
+            .session_router()
+            .resolve(None)
+            .unwrap()
+            .session
+            .read(workdir::ReadRequest {
+                path: workdir::WorkdirPath::new("marker.txt").unwrap(),
+                offset: 0,
+                limit: 10,
+                max_bytes: 4096,
+            })
+            .await
+            .is_err()
     );
-    assert!(fixture.registry.get_internal("denied-child").is_none());
+    fixture
+        .registry
+        .remove_internal("denied-child")
+        .await
+        .unwrap();
 }
 
 fn prompt_environments(prompt: &str) -> Vec<Value> {

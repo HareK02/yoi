@@ -17,7 +17,6 @@ pub fn builtin_permission_registry(
         &builtin::bash::permission_declaration::DECLARATION,
         &builtin::manage_workdir::permission_declaration::DECLARATION,
         &builtin::manage_worker::permission_declaration::DECLARATION,
-        &builtin::manage_worker::permission_declaration::SUBWORKER,
         &builtin::ticket::permission_declaration::DECLARATION,
         &builtin::objective::permission_declaration::DECLARATION,
         &builtin::merge_request::permission_declaration::DECLARATION,

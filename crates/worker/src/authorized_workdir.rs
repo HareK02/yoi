@@ -279,41 +279,22 @@ impl WorkdirSession for AuthorizedWorkdirSession {
 
     async fn authorize_scope_path(
         &self,
-        mut request: WorkdirScopeAuthorizationRequest,
+        request: WorkdirScopeAuthorizationRequest,
     ) -> Result<(), WorkdirError> {
-        let path = request.path.clone();
-        // A delegated writable scope also performs read-only checks (for example
-        // Bash's cwd). This point check must not demand writable capabilities
-        // from the temporary read-authorized provider session. Keep the same path
-        // ceilings, but attenuate the rules to the operation actually checked.
-        if request.permission == WorkdirToolScopePermission::Read {
-            for rule in &mut request.rules {
-                rule.permission = WorkdirToolScopePermission::Read;
-            }
-        }
-        self.with_authorized(
-            match request.permission {
-                WorkdirToolScopePermission::Read => READ,
-                WorkdirToolScopePermission::Write => WRITE,
-            },
-            &path,
-            false,
-            |session, root, _| async move {
-                request.path = relative_path(&root, &request.path)?;
-                for rule in &mut request.rules {
-                    rule.target = relative_path(&root, &rule.target)?;
-                }
-                session.authorize_scope_path(request).await
-            },
-        )
-        .await
+        // Structural validation is not a protected filesystem effect or a child
+        // grant. Preserve the provider's path/symlink/capability ceilings without
+        // interpreting a point-access authorization as the whole child scope.
+        // Every subsequent Read/Write/search/command still passes live Host
+        // authorization below; this result cannot authorize an effect.
+        self.session.authorize_scope_path(request).await
     }
 
     async fn scope_rules_overlap(
         &self,
         request: WorkdirScopeOverlapRequest,
     ) -> Result<bool, WorkdirError> {
-        self.require_legacy(READ)?;
+        // Provider-resolved overlap is a structural query for the parent's
+        // write leases, not permission to read or mutate either path.
         self.session.scope_rules_overlap(request).await
     }
 
@@ -522,6 +503,7 @@ mod tests {
     //! Only the Host authorization transport/policy is replaced; these are not E2E tests.
 
     mod environment;
+    mod subworker;
 
     use super::*;
     use crate::{WorkspaceClientError, WorkspaceRequest, WorkspaceResponse};
@@ -536,6 +518,7 @@ mod tests {
     #[derive(Debug)]
     struct AuthorizationClient {
         legacy: bool,
+        requested_scope_only: bool,
         revoked: AtomicBool,
         requests: Mutex<Vec<ScopedPermission>>,
         permissions: Vec<ScopedPermission>,
@@ -545,6 +528,7 @@ mod tests {
         fn new(permissions: Vec<ScopedPermission>) -> Arc<Self> {
             Arc::new(Self {
                 legacy: false,
+                requested_scope_only: false,
                 revoked: AtomicBool::new(false),
                 requests: Mutex::new(Vec::new()),
                 permissions,
@@ -593,7 +577,11 @@ mod tests {
                     .iter()
                     .find(|permission| permission.covers(&request))
                 {
-                    return Ok(Some(granted.resource.clone()));
+                    return Ok(Some(if self.requested_scope_only {
+                        resource.clone()
+                    } else {
+                        granted.resource.clone()
+                    }));
                 }
             }
             Err(WorkspaceClientError::Request(
@@ -644,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writable_scope_read_checks_require_only_current_read_authority() {
+    async fn structural_scope_checks_preserve_provider_bounds_without_granting_effects() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("allowed")).unwrap();
         let client = AuthorizationClient::new(vec![permission(READ, "allowed", true)]);
@@ -662,12 +650,25 @@ mod tests {
         session.authorize_scope_path(request.clone()).await.unwrap();
         let mut write = request.clone();
         write.permission = WorkdirToolScopePermission::Write;
-        assert!(session.authorize_scope_path(write).await.is_err());
+        session.authorize_scope_path(write).await.unwrap();
+        assert!(client.requests.lock().unwrap().is_empty());
+        assert!(
+            session
+                .write(WriteRequest {
+                    path: WorkdirPath::new("allowed/denied").unwrap(),
+                    content: b"denied".to_vec(),
+                    expected_hash: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(!root.path().join("allowed/denied").exists());
         let mut outside = request.clone();
         outside.path = WorkdirPath::root();
         assert!(session.authorize_scope_path(outside).await.is_err());
         client.revoked.store(true, Ordering::SeqCst);
-        assert!(session.authorize_scope_path(request).await.is_err());
+        session.authorize_scope_path(request).await.unwrap();
+        assert!(session.read(read("allowed/file")).await.is_err());
         session.close().await.unwrap();
     }
 
@@ -865,7 +866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_unmapped_checkout_and_overlap_are_denied_even_with_root_grants() {
+    async fn scoped_unmapped_checkout_is_denied_but_structural_overlap_is_available() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("file"), "original").unwrap();
         let client = AuthorizationClient::new(vec![
@@ -909,15 +910,15 @@ mod tests {
             recursive: true,
             symlink_policy: manifest::SymlinkPolicy::Resolved,
         };
-        assert!(matches!(
+        assert!(
             session
                 .scope_rules_overlap(WorkdirScopeOverlapRequest {
                     left: rule.clone(),
-                    right: rule
+                    right: rule,
                 })
-                .await,
-            Err(WorkdirError::Denied(_))
-        ));
+                .await
+                .unwrap()
+        );
         assert_eq!(
             std::fs::read(root.path().join("file")).unwrap(),
             b"original"
@@ -931,6 +932,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let client = Arc::new(AuthorizationClient {
             legacy: true,
+            requested_scope_only: false,
             revoked: AtomicBool::new(false),
             requests: Mutex::new(Vec::new()),
             permissions: Vec::new(),

@@ -10517,25 +10517,6 @@ impl server_api::ServerApi for ServerApiContractService {
                         // path; a broader matching grant is not ownership metadata.
                         Some(resource)
                     }
-                    BoundAuthorizationTarget::SubWorker { name } => {
-                        let worker = subject_authorization::source_from_context(&context)?;
-                        // Names select a parent-owned capability, not a lookup of
-                        // a child session or a grant to read that child's data.
-                        let resource = PermissionResource::SubWorker {
-                            runtime_id: worker.runtime_id.clone(),
-                            worker_id: worker.worker_id.clone(),
-                            name,
-                        };
-                        let allowed = subject_authorization::authorize_scope(
-                            &api,
-                            &worker,
-                            &OperationAuthorizationRequest {
-                                operation: request.operation,
-                                resource: resource.clone(),
-                            },
-                        )?;
-                        allowed.map(|_| resource)
-                    }
                 };
                 Ok(OperationAuthorizationResponse { scope })
             })
@@ -51315,7 +51296,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bound_authorization_rechecks_host_subject_and_exact_parent_without_target_lookup() {
+    async fn bound_authorization_rechecks_subject_and_rejects_internal_child_targets() {
         use server_api::authorization::{PermissionResource, ScopedPermission};
 
         // Real signed router, Host binding and permission storage; only Runtime
@@ -51386,24 +51367,13 @@ mod tests {
             workspace_id: TEST_WORKSPACE_ID.into(),
             subject_id: subject.id.clone(),
         };
-        let child_resource = PermissionResource::SubWorker {
-            runtime_id: created.runtime_id.clone(),
-            worker_id: created.worker_id.clone(),
-            name: "not-started-child".into(),
-        };
         let selected = seed_test_subject_legacy_constraints(
             &api,
             &subject.id,
-            vec![
-                ScopedPermission {
-                    operation: "memory.resident.supply".into(),
-                    resource: subject_resource.clone(),
-                },
-                ScopedPermission {
-                    operation: "subworker.observe".into(),
-                    resource: child_resource.clone(),
-                },
-            ],
+            vec![ScopedPermission {
+                operation: "memory.resident.supply".into(),
+                resource: subject_resource.clone(),
+            }],
             vec![],
         );
         replace_test_subject_policy_as_owner(
@@ -51413,13 +51383,7 @@ mod tests {
             selected.delegation,
         )
         .await;
-        for (body, expected) in [
-            (subject_request.clone(), subject_resource),
-            (
-                json!({"operation":"subworker.observe", "target":{"kind":"sub_worker", "name":"not-started-child"}}),
-                child_resource,
-            ),
-        ] {
+        for (body, expected) in [(subject_request.clone(), subject_resource)] {
             let response = build_router(api.clone())
                 .oneshot(check(body))
                 .await
@@ -51429,8 +51393,8 @@ mod tests {
             let value: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value, json!({"scope": expected}));
         }
-        // A different child name cannot inherit this grant. Caller-provided Subject
-        // identities are rejected at the wire boundary, not used as selectors.
+        // Internal children are no longer Server authorization targets.
+        // Caller-provided Subject identities are also rejected at the wire boundary.
         for body in [
             json!({"operation":"subworker.observe", "target":{"kind":"sub_worker", "name":"other-child"}}),
             json!({"operation":"memory.resident.supply", "target":{"kind":"subject", "subject_id":"other-subject"}}),

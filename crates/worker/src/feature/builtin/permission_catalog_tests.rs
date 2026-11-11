@@ -218,10 +218,6 @@ const WORK_EXECUTION_KEYS: &[&str] = &[
     "workdir.attachment.read",
     "worker.list",
     "worker.messaging",
-    "subworker.spawn",
-    "subworker.send_input",
-    "subworker.observe",
-    "subworker.stop",
     "ticket.query",
     "ticket.read",
     "ticket.relation.read",
@@ -521,12 +517,14 @@ fn shared_sets_are_feature_contributions_and_callee_handles_cannot_be_substitute
     assert!(allows(&registry, &companion, "objective", "objective.read"));
     assert!(!allows(&registry, &companion, "bash", "bash.execute"));
     assert!(allows(&registry, &implementer, "bash", "bash.execute"));
-    assert!(allows(
-        &registry,
-        &implementer,
-        "sub-worker-control",
-        "subworker.spawn"
-    ));
+    assert!(
+        registry
+            .namespace_handle(
+                &FeatureId::builtin("sub-worker-control"),
+                &NamespaceId::parse("subworker").unwrap(),
+            )
+            .is_none()
+    );
     let ticket = registry
         .namespace_handle(
             &FeatureId::builtin("ticket"),

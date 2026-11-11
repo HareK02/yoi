@@ -8735,31 +8735,6 @@
             "additionalProperties": false,
             "properties": {
               "kind": {
-                "const": "sub_worker",
-                "type": "string"
-              },
-              "name": {
-                "type": "string"
-              },
-              "runtime_id": {
-                "type": "string"
-              },
-              "worker_id": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "runtime_id",
-              "worker_id",
-              "name"
-            ],
-            "type": "object"
-          },
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
                 "const": "feature",
                 "type": "string"
               }
@@ -8866,7 +8841,6 @@
           "workdir_attachment",
           "workspace_config",
           "network",
-          "sub_worker",
           "feature",
           "workspace",
           "workdir",
@@ -26672,7 +26646,7 @@
   "info": {
     "title": "Yoi Server API",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:7c293cbd1d4229b317977771eaf2c16093f4ea191162d7455debad19491c0fc8"
+    "x-yoi-source-digest": "sha256:b574de18161ec4865b6b79da85b5442b8ae95f27c046f1514d1db3d469ac15cd"
   },
   "openapi": "3.1.0",
   "paths": {

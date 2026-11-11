@@ -26,7 +26,6 @@ pub enum PermissionResourceKind {
     WorkdirAttachment,
     WorkspaceConfig,
     Network,
-    SubWorker,
     Feature,
     Workspace,
     Workdir,
@@ -50,7 +49,6 @@ impl PermissionResource {
             Self::WorkdirAttachment { .. } => K::WorkdirAttachment,
             Self::WorkspaceConfig { .. } => K::WorkspaceConfig,
             Self::Network { .. } => K::Network,
-            Self::SubWorker { .. } => K::SubWorker,
             Self::Feature => K::Feature,
             Self::Workspace { .. } => K::Workspace,
             Self::Workdir { .. } => K::Workdir,
@@ -865,19 +863,6 @@ pub fn subject_permission_operations() -> Vec<PermissionOperationDescriptor> {
             description: "Operation use permission and directional Backend target control grants are separate. Acceptance does not prove processing or success; lifecycle state conditions still apply.".into(),
             resource_kinds: vec![K::WorkerOperation],
             availability: PermissionOperationAvailability::Available,
-        });
-    }
-    for (operation, label) in [
-        ("subworker.spawn", "Create Internal SubWorker"),
-        ("subworker.send_input", "Submit to Internal SubWorker"),
-        ("subworker.stop", "Stop Internal SubWorker"),
-        ("subworker.observe", "Observe Internal SubWorker"),
-    ] {
-        catalog.push(PermissionOperationDescriptor {
-            operation: operation.into(), label: label.into(),
-            description: "Parent-owned Internal SubWorkers are distinct from independently controlled Runtime Workers. Existing exact parent/name scopes are retained.".into(),
-            resource_kinds: vec![],
-            availability: PermissionOperationAvailability::Unavailable { reason: "A safe parent-bound management selector is not yet available. Existing scopes may be retained or removed, not widened by replacing parent identifiers.".into() },
         });
     }
     catalog

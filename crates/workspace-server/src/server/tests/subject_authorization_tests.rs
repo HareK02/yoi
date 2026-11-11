@@ -1543,14 +1543,6 @@ fn concrete_resource_permissions(f: &Fixture) -> Vec<ScopedPermission> {
                 url: "https://example.invalid/resource".into(),
             },
         ),
-        (
-            "subworker.observe",
-            PermissionResource::SubWorker {
-                runtime_id: f.source.runtime_id.clone(),
-                worker_id: f.source.worker_id.clone(),
-                name: "resource-child".into(),
-            },
-        ),
     ]
     .into_iter()
     .map(|(operation, resource)| ScopedPermission {
@@ -3533,7 +3525,61 @@ async fn signed_host_keys_and_provider_scope_guard_real_local_read_write_and_rev
         json!({"scope":PermissionResource::Workdir { working_directory_id:"fixture-local-attachment".into(), path:"src/source.txt".into(), recursive:false }}),
         "a Feature key returns concrete context, not a broader resource capability"
     );
+    // Internal scope partitioning must work with the real Host's request-only
+    // resource response. Keep the same live authorization adapter as the parent.
+    let broker = workdir::WorkdirToolBroker::new(session.clone());
+    let internal = broker
+        .scope(workdir::WorkdirToolScope {
+            rules: vec![workdir::WorkdirToolScopeRule {
+                target: WorkdirPath::new("src").unwrap(),
+                permission: workdir::WorkdirToolScopePermission::Write,
+                recursive: true,
+                symlink_policy: Default::default(),
+            }],
+            cwd: WorkdirPath::new("src").unwrap(),
+            command: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        internal
+            .tool_session()
+            .read(read("source.txt"))
+            .await
+            .unwrap()
+            .bytes,
+        b"source"
+    );
+    internal
+        .tool_session()
+        .write(WriteRequest {
+            path: WorkdirPath::new("internal.txt").unwrap(),
+            content: b"internal".to_vec(),
+            expected_hash: None,
+        })
+        .await
+        .unwrap();
     owner_subject_policy(&f.api, &f.owner, &f.subject, key_assignment(&[])).await;
+    assert!(
+        internal
+            .tool_session()
+            .read(read("source.txt"))
+            .await
+            .is_err()
+    );
+    assert!(
+        internal
+            .tool_session()
+            .write(WriteRequest {
+                path: WorkdirPath::new("after-revoke.txt").unwrap(),
+                content: b"denied".to_vec(),
+                expected_hash: None,
+            })
+            .await
+            .is_err()
+    );
+    assert!(!root.path().join("src/after-revoke.txt").exists());
+    internal.close().await.unwrap();
     assert!(session.read(read("src/source.txt")).await.is_err());
     assert!(
         session

@@ -1317,17 +1317,6 @@ pub trait WorkspaceClient: std::fmt::Debug + Send + Sync {
         )
     }
 
-    fn authorize_subworker_operation(
-        &self,
-        operation: &str,
-        name: &str,
-    ) -> Result<(), WorkspaceClientError> {
-        self.authorize_bound_operation(
-            operation,
-            server_api::authorization::BoundAuthorizationTarget::SubWorker { name: name.into() },
-        )
-    }
-
     /// Activation is retained only for the temporary MCP exception. Explicit
     /// standalone contexts with no Workspace binding keep local MCP compatibility.
     fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {
@@ -1696,23 +1685,6 @@ impl WorkspaceClient for MarkerWorkspaceClient {
             operation,
             &server_api::authorization::PermissionResource::Network { url: url.into() },
         )
-    }
-
-    fn authorize_bound_operation(
-        &self,
-        _operation: &str,
-        target: server_api::authorization::BoundAuthorizationTarget,
-    ) -> Result<(), WorkspaceClientError> {
-        if self.workspace_id.is_none()
-            && self.legacy_local_activation
-            && matches!(
-                target,
-                server_api::authorization::BoundAuthorizationTarget::SubWorker { .. }
-            )
-        {
-            return Ok(());
-        }
-        Err(WorkspaceClientError::Unavailable(self.reason.clone()))
     }
 
     fn authorize_feature_activation(&self, feature: &str) -> Result<(), WorkspaceClientError> {

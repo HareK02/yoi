@@ -426,10 +426,6 @@ impl Tool for SubWorkerSpawnTool {
             )));
         }
         validate_reviewer_handoff(&input)?;
-        self.workspace_context
-            .client()
-            .authorize_subworker_operation("subworker.spawn", &input.name)
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
         let name_reservation = self
             .registry
             .reserve_internal_name(input.name.clone())
@@ -1351,9 +1347,7 @@ enabled = false
         .unwrap();
         let workspace_context = crate::worker::WorkerWorkspaceContext::with_client(
             Some(WorkspaceId::new("workspace-test").unwrap()),
-            Arc::new(AvailableWorkspaceClient {
-                child_names: &["supplied-model-child"],
-            }),
+            Arc::new(AvailableWorkspaceClient),
         );
         let make_tool = |context| {
             SubWorkerSpawnTool::new(
@@ -1467,9 +1461,7 @@ enabled = false
         let registry = SpawnedWorkerRegistry::new_internal("parent".into(), spawner_scope.clone());
         let workspace_context = crate::worker::WorkerWorkspaceContext::with_client(
             Some(WorkspaceId::new("workspace-test").unwrap()),
-            Arc::new(AvailableWorkspaceClient {
-                child_names: &["reviewer-child", "reviewer-child-parent-drop"],
-            }),
+            Arc::new(AvailableWorkspaceClient),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_parent_write_revoked = Arc::new(AtomicBool::new(false));
@@ -1934,9 +1926,7 @@ enabled = false
         let registry = SpawnedWorkerRegistry::new_internal("parent".into(), spawner_scope.clone());
         let workspace_context = crate::worker::WorkerWorkspaceContext::with_client(
             Some(WorkspaceId::new("workspace-test").unwrap()),
-            Arc::new(AvailableWorkspaceClient {
-                child_names: &["remote-child"],
-            }),
+            Arc::new(AvailableWorkspaceClient),
         );
         let remote_client = Arc::new(StrictRemoteWorkdirWorkspaceClient::default());
         let workdir_tool_broker = workdir::WorkdirToolBrokerRouter::from_single(
@@ -2124,9 +2114,7 @@ enabled = false
     }
 
     #[derive(Debug)]
-    struct AvailableWorkspaceClient {
-        child_names: &'static [&'static str],
-    }
+    struct AvailableWorkspaceClient;
 
     impl WorkspaceClient for AvailableWorkspaceClient {
         fn workspace_id(&self) -> Option<&str> {
@@ -2145,25 +2133,7 @@ enabled = false
             &self,
             request: WorkspaceRequest,
         ) -> Result<WorkspaceResponse, WorkspaceClientError> {
-            assert_eq!(
-                request.path,
-                "/api/w/workspace-test/authorization/bound-check"
-            );
-            let body: serde_json::Value =
-                serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
-            assert!(
-                self.child_names.iter().any(|name| body
-                    == serde_json::json!({
-                        "operation": "subworker.spawn",
-                        "target": {"kind": "sub_worker", "name": name}
-                    })),
-                "unexpected bound authorization: {body}"
-            );
-            Ok(WorkspaceResponse {
-                content_type: None,
-                status: 200,
-                body: serde_json::json!({"scope": null}).to_string(),
-            })
+            panic!("internal spawn must not request Server authorization: {request:?}")
         }
     }
 

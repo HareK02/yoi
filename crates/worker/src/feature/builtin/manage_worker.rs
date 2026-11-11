@@ -63,18 +63,6 @@ impl WorkspaceWorkerControlService {
         )
     }
 
-    fn authorize_subworker(&self, operation: &str, name: &str) -> Result<(), WorkspaceClientError> {
-        // Explicit standalone sessions retain parent-owned local child control.
-        // A failed or incomplete Workspace binding must never take this path.
-        if !self.client.is_available()
-            && self.client.workspace_id().is_none()
-            && self.client.kind() == "unavailable"
-        {
-            return Ok(());
-        }
-        self.client.authorize_subworker_operation(operation, name)
-    }
-
     fn known_subworkers(&self) -> Result<Vec<serde_json::Value>, WorkspaceClientError> {
         let Some(registry) = &self.registry else {
             return Ok(Vec::new());
@@ -83,7 +71,6 @@ impl WorkspaceWorkerControlService {
             .list_internal()
             .into_iter()
             .map(|internal| {
-                self.authorize_subworker("subworker.observe", &internal.worker_name)?;
                 Ok(serde_json::json!({
                     "subject": { "kind": "sub_worker", "name": internal.worker_name },
                     "relation": "direct_child",
@@ -400,7 +387,8 @@ impl WorkerControlService for WorkspaceWorkerControlService {
                     .and_then(|registry| registry.get_internal(name))
                     .is_some();
                 if known && matches!(permission, "send_input" | "stop" | "observe") {
-                    self.authorize_subworker(&format!("subworker.{permission}"), name)
+                    // The direct-child registry is the ownership authority.
+                    Ok(())
                 } else {
                     Err(WorkspaceClientError::Request(
                         "unknown Worker or permission not granted".to_string(),
@@ -574,13 +562,6 @@ impl SubWorkerControlFeature {
 }
 
 impl FeatureModule for SubWorkerControlFeature {
-    fn declare_permissions(
-        &self,
-        registrar: &mut crate::feature::permissions::FeaturePermissionRegistrar<'_>,
-    ) -> Result<(), FeatureInstallError> {
-        permission_declaration::SUBWORKER.declare(registrar)
-    }
-
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin("sub-worker-control", "SubWorker Control")
             .with_description(
@@ -3348,8 +3329,133 @@ mod tests {
         assert_eq!(client.authorizations.lock().unwrap().len(), 12);
     }
 
-    #[test]
-    fn runtime_operation_denial_does_not_replace_host_bound_subworker_authorization() {
+    #[tokio::test]
+    async fn internal_control_and_capture_use_only_the_owning_registry() {
+        use crate::feature::builtin::worker_observation::{
+            CompositeWorkerObservationProvider, SpawnedSubWorkerObservationProvider,
+            WorkspaceClientWorkerObservationProvider,
+        };
+        use crate::feature::contracts::WorkerObservationProvider;
+        use crate::internal_worker::{InternalWorkerVisibility, test_internal_worker_session};
+        use crate::spawn::registry::InternalSpawnedWorkerRecord;
+        use workdir::*;
+
+        let root = tempfile::tempdir().unwrap();
+        let scope = manifest::Scope::writable(root.path()).unwrap();
+        let registry = SpawnedWorkerRegistry::new_internal(
+            "parent".into(),
+            manifest::SharedScope::new(scope.clone()),
+        );
+        let other = SpawnedWorkerRegistry::new_internal(
+            "other".into(),
+            manifest::SharedScope::new(scope.clone()),
+        );
+        let source = WorkdirToolBroker::new(Arc::new(LocalWorkdirSession::new(
+            scope,
+            root.path().into(),
+        )));
+        let lease = source
+            .scope(WorkdirToolScope {
+                rules: vec![WorkdirToolScopeRule {
+                    target: WorkdirPath::root(),
+                    permission: WorkdirToolScopePermission::Read,
+                    recursive: true,
+                    symlink_policy: Default::default(),
+                }],
+                cwd: WorkdirPath::root(),
+                command: false,
+            })
+            .await
+            .unwrap();
+        let (session, _events) =
+            test_internal_worker_session(InternalWorkerVisibility::ParentClient);
+        registry
+            .reserve_internal_name("child".into())
+            .unwrap()
+            .commit(InternalSpawnedWorkerRecord::new(
+                "child".into(),
+                Vec::new(),
+                Arc::new(
+                    WorkdirScopeLeaseSet::from_single(
+                        WorkdirAttachmentAlias::new("workdir").unwrap(),
+                        lease,
+                    )
+                    .unwrap(),
+                ),
+                Vec::new(),
+                session,
+                other.clone(),
+                None,
+            ))
+            .await
+            .unwrap();
+        let client = Arc::new(RecordingWorkspaceClient::default());
+        client
+            .denied
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let control = WorkspaceWorkerControlService {
+            client: client.clone(),
+            workspace_id: "workspace/test".into(),
+            registry: Some(registry.clone()),
+            runtime_worker_control: false,
+        };
+        let subject = WorkerObservationSubjectRef::SubWorker {
+            name: "child".into(),
+        };
+        for permission in ["send_input", "stop", "observe"] {
+            control
+                .ensure_permission(&subject, permission)
+                .await
+                .unwrap();
+        }
+        assert!(control.ensure_permission(&subject, "remove").await.is_err());
+        let foreign = WorkspaceWorkerControlService {
+            client: client.clone(),
+            workspace_id: "workspace/test".into(),
+            registry: Some(other),
+            runtime_worker_control: false,
+        };
+        assert!(
+            foreign
+                .ensure_permission(&subject, "observe")
+                .await
+                .is_err()
+        );
+        let listed = control.list_workers().await.unwrap();
+        assert!(listed.body.contains("child"));
+        // Even a Server provider placed first must not receive a child selector.
+        let provider = CompositeWorkerObservationProvider::new(vec![
+            Arc::new(WorkspaceClientWorkerObservationProvider::new(
+                client.clone(),
+            )),
+            Arc::new(SpawnedSubWorkerObservationProvider::new(registry.clone())),
+        ]);
+        provider.capture_worker_session(&subject).await.unwrap();
+        control
+            .stop_worker(
+                WorkerControlSubject::SubWorker {
+                    name: "child".into(),
+                },
+                WorkerControlStopKind::Stop,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            control
+                .ensure_permission(&subject, "observe")
+                .await
+                .is_err()
+        );
+        assert!(provider.capture_worker_session(&subject).await.is_err());
+        assert!(client.bound_authorizations.lock().unwrap().is_empty());
+        assert!(client.authorizations.lock().unwrap().is_empty());
+        assert!(client.requests.lock().unwrap().is_empty());
+        source.tool_session().close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn internal_control_rejects_unknown_children_without_server_authorization() {
         let client = Arc::new(RecordingWorkspaceClient::default());
         client
             .denied
@@ -3358,52 +3464,24 @@ mod tests {
             client: client.clone(),
             workspace_id: "workspace/test".into(),
             registry: None,
-            runtime_worker_control: true,
+            runtime_worker_control: false,
         };
-        for operation in [
-            "subworker.send_input",
-            "subworker.stop",
-            "subworker.observe",
-        ] {
-            control.authorize_subworker(operation, "child").unwrap();
-            let checks = client.bound_authorizations.lock().unwrap();
-            let check = checks.last().unwrap();
-            assert_eq!(check.operation, operation);
-            assert_eq!(
-                check.target,
-                server_api::authorization::BoundAuthorizationTarget::SubWorker {
-                    name: "child".into(),
-                }
+        assert!(control.known_subworkers().unwrap().is_empty());
+        for permission in ["send_input", "stop", "observe", "remove"] {
+            assert!(
+                control
+                    .ensure_permission(
+                        &WorkerObservationSubjectRef::SubWorker {
+                            name: "child".into()
+                        },
+                        permission,
+                    )
+                    .await
+                    .is_err()
             );
         }
-        assert_eq!(client.bound_authorizations.lock().unwrap().len(), 3);
+        assert!(client.bound_authorizations.lock().unwrap().is_empty());
         assert!(client.authorizations.lock().unwrap().is_empty());
         assert!(client.requests.lock().unwrap().is_empty());
-        assert!(client.removals.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn only_explicit_standalone_retains_local_subworker_authority_without_host() {
-        for workspace_id in [None, Some("bound-workspace".to_string())] {
-            let identity = workspace_id
-                .as_ref()
-                .map(|id| crate::worker::WorkspaceId::new(id.clone()).unwrap());
-            let client = crate::worker::unavailable_workspace_client(
-                identity.as_ref(),
-                "unavailable fixture",
-            );
-            let control = WorkspaceWorkerControlService {
-                client,
-                workspace_id: workspace_id.clone().unwrap_or_default(),
-                registry: None,
-                runtime_worker_control: false,
-            };
-            assert_eq!(
-                control
-                    .authorize_subworker("subworker.stop", "child")
-                    .is_ok(),
-                workspace_id.is_none()
-            );
-        }
     }
 }

@@ -63,30 +63,3 @@ pub(crate) const DECLARATION: BuiltinPermissionDeclaration = BuiltinPermissionDe
         },
     ],
 };
-
-pub(crate) const SUBWORKER: BuiltinPermissionDeclaration = BuiltinPermissionDeclaration {
-    feature: "sub-worker-control",
-    namespace: "subworker",
-    operations: &[
-        BuiltinPermissionOperation {
-            key: "subworker.spawn",
-            description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer", "work-execution"],
-        },
-        BuiltinPermissionOperation {
-            key: "subworker.send_input",
-            description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer", "work-execution"],
-        },
-        BuiltinPermissionOperation {
-            key: "subworker.stop",
-            description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer", "work-execution"],
-        },
-        BuiltinPermissionOperation {
-            key: "subworker.observe",
-            description: "Parent-owned child operation; exact parent, name and delegated provider limits remain required.",
-            sets: &["implementer", "work-execution"],
-        },
-    ],
-};

@@ -1817,7 +1817,7 @@ async fn full_mr_scenario(replace_body: bool) {
     .await;
     let mut coder_permissions = workdir_permissions(&coder_wd);
     // Frozen Ticket contexts derive only this Ticket's
-    // linked MRs and this assigned Coder's OWN children from these frozen Ticket
+    // linked MRs from these frozen Ticket
     // contexts. There is no future MR ID, allocated Worker ID or wildcard here.
     for operation in [
         "ticket.read",
@@ -1827,9 +1827,6 @@ async fn full_mr_scenario(replace_body: bool) {
         "merge_request.read",
         "merge_request.readiness",
         "merge_request.review",
-        "subworker.spawn",
-        "subworker.observe",
-        "subworker.stop",
     ] {
         coder_permissions.push(ticket_permission(&ticket, operation));
     }

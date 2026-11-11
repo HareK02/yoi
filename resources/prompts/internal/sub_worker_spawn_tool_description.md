@@ -1,5 +1,7 @@
 Spawn a parent-owned Internal SubWorker session to split context for a delegated task. The parent Worker's write scope is reduced by the scope passed here; the Internal SubWorker starts running `task` immediately without creating a Runtime Worker record, OS process, PID, or Unix socket. It remains available for follow-up turns until explicitly stopped or its parent exits.
 
+Internal creation and scope partitioning are parent-local operations, not independent Server grants. Protected resource access still uses the parent's currently authorized path and retains child scope, attachment/provider limits, and revocation checks. A child Profile cannot enlarge that authority.
+
 Optional `cwd`: when provided, the spawned SubWorker's tool default working directory only. It must be a Workdir-relative existing directory covered by the child's readable scope, and it does not change workspace/Profile/memory/Ticket roots or grant authority. `name` must be unique among this Worker's direct children.
 
 Profile selection: omit `profile` or set it to `inherit` to derive reusable child configuration from this Worker. Set it to `default` to use the effective registry default profile, or to one of the registry selectors below. Raw/path profile selectors are not accepted by SubWorkerSpawn. `scope` is the child's only filesystem capability and replaces profile scope. `command` is a separate explicit grant, defaults to false, and is accepted only with a writable scope; writable scope alone does not grant command execution.

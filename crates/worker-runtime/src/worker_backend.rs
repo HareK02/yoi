@@ -8821,9 +8821,6 @@ mod tests {
                     alias: "checkout".into(),
                     expected_connection_id: None,
                 },
-                BoundAuthorizationTarget::SubWorker {
-                    name: "child".into(),
-                },
                 BoundAuthorizationTarget::NotificationSource {
                     source_event_id: "event".into(),
                 },

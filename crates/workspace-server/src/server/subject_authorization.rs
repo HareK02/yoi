@@ -1006,7 +1006,6 @@ fn ticket_execution_resource(
         return Ok(false);
     }
     match (&needed.resource, needed.operation.as_str()) {
-        (PermissionResource::SubWorker { runtime_id, worker_id, .. }, "subworker.spawn" | "subworker.observe" | "subworker.send_input" | "subworker.stop") => Ok(runtime_id == &worker.runtime_id && worker_id == &worker.worker_id),
         (PermissionResource::MergeRequest { workspace_id: requested, merge_request_id }, "merge_request.read" | "merge_request.readiness" | "merge_request.review") if requested == workspace_id => {
             api.config_store.with_conn(|connection| {
                 Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM merge_request_ticket_relations WHERE workspace_id=?1 AND ticket_id=?2 AND merge_request_id=?3)", rusqlite::params![workspace_id, ticket, merge_request_id], |row| row.get(0))?)
