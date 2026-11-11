@@ -84,7 +84,6 @@ fn request(
     let expected_head = store.configuration_head(WORKSPACE, OWNER).unwrap();
     ConfigurationAdoptionRequest {
         operation_id: id.into(),
-        expected_legacy_export: expected_head.is_none().then(|| "empty-export".into()),
         expected_head,
         expected_catalog_digest: catalog_digest(host).unwrap(),
         source: ConfigCommitRequest {
@@ -103,23 +102,7 @@ fn adopt(
     host: &PermissionHost,
     request: &ConfigurationAdoptionRequest,
 ) -> Result<ConfigurationAdoptionResult> {
-    store.adopt_configuration(
-        WORKSPACE,
-        OWNER,
-        request,
-        schema(),
-        host,
-        None,
-        |_| Ok(()),
-        |fingerprint| {
-            Ok(ConfigurationPolicyTransfer {
-                transfer_identity: fingerprint.into(),
-                physical_identity: "empty-physical".into(),
-                export_digest: "empty-export".into(),
-                policies: BTreeMap::new(),
-            })
-        },
-    )
+    store.adopt_configuration(WORKSPACE, OWNER, request, schema(), host)
 }
 fn keys(host: &PermissionHost, assignment: &PermissionAssignment) -> Vec<String> {
     host.resolve(Some(assignment))
@@ -144,21 +127,20 @@ fn commit_unadopted_source(store: &SqliteWorkspaceStore, host: &PermissionHost, 
 }
 
 fn assert_unadopted(store: &SqliteWorkspaceStore) {
-    let counts: (i64, i64, i64) = store
+    let counts: (i64, i64) = store
         .with_conn(|connection| {
             connection
                 .query_row(
                     "SELECT
-                        (SELECT COUNT(*) FROM workspace_configuration_authorities WHERE workspace_id=?1),
                         (SELECT COUNT(*) FROM workspace_configuration_policies WHERE workspace_id=?1),
                         (SELECT COUNT(*) FROM workspace_configuration_receipts WHERE workspace_id=?1)",
                     [WORKSPACE],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(Error::from)
         })
         .unwrap();
-    assert_eq!(counts, (0, 0, 0));
+    assert_eq!(counts, (0, 0));
     assert_eq!(store.configuration_head(WORKSPACE, OWNER).unwrap(), None);
 }
 
@@ -235,10 +217,12 @@ fn unadopted_missing_default_selects_implementer_but_explicit_empty_stays_empty(
             .unwrap(),
         empty
     );
-    assert!(matches!(
-        store.adopted_subject_legacy_permissions(WORKSPACE, "subject-a", &host),
-        Err(Error::InvalidInput(message)) if message == "Workspace policy transfer is not adopted"
-    ));
+    assert_eq!(
+        store
+            .adopted_subject_legacy_permissions(WORKSPACE, "subject-a", &host)
+            .unwrap(),
+        None
+    );
     assert_eq!(store.load_workspace_config(WORKSPACE).unwrap(), before);
     assert_unadopted(&store);
 }
@@ -389,9 +373,7 @@ fn subject_and_worker_assignments_resolve_candidate_sets_with_exclusions() {
     }; } as WorkspaceConfigSchema"#;
     let candidate = request(&store, &host, "shared-sets", source);
     let preview = store
-        .preview_configuration_adoption(WORKSPACE, OWNER, &candidate, schema(), &host, None, |_| {
-            panic!("shared configuration must not resolve individual Subjects")
-        })
+        .preview_configuration_adoption(WORKSPACE, OWNER, &candidate, schema(), &host)
         .unwrap();
     assert!(preview.changed_subjects.is_empty());
     let receipt = adopt(&store, &host, &candidate).unwrap();

@@ -235,7 +235,6 @@ struct EditingBase {
     history_head: Option<String>,
     catalog: feature_permissions::PermissionCatalog,
     catalog_digest: String,
-    expected_legacy_export: Option<String>,
 }
 impl From<ConfigurationSourceResponse> for EditingBase {
     fn from(source: ConfigurationSourceResponse) -> Self {
@@ -244,7 +243,6 @@ impl From<ConfigurationSourceResponse> for EditingBase {
             history_head: source.history_head,
             catalog: source.catalog,
             catalog_digest: source.catalog_digest,
-            expected_legacy_export: source.expected_legacy_export,
         }
     }
 }
@@ -406,7 +404,6 @@ impl LockedCheckout {
             operation_id: uuid::Uuid::now_v7().to_string(),
             expected_head: base.history_head.clone(),
             expected_catalog_digest: base.catalog_digest.clone(),
-            expected_legacy_export: base.expected_legacy_export.clone(),
             source: ConfigCommitRequest {
                 base_digest: base.state.snapshot.digest.clone(),
                 changes,
@@ -431,7 +428,6 @@ impl LockedCheckout {
         // an editor may have changed them after the original commit request escaped.
         self.state.base.state = receipt.state.clone();
         self.state.base.history_head = Some(receipt.history_head.clone());
-        self.state.base.expected_legacy_export = None;
         self.state.pending = None;
         self.save().map_err(|_| Error { exit_code: 7, message: "Server receipt confirmed adoption, but local baseline save failed; preserve checkout and reconcile the retained request if present".into() })
     }
@@ -582,7 +578,6 @@ pub async fn run<A: RequestAuthorizer>(
             match api.configuration_reconcile(workspace.to_owned(), request).await.map_err(unresolved)? {
                 ConfigurationReconciliation::Adopted { receipt } => { checkout.adopted(&receipt)?; return Ok(receipt_output(&receipt)); }
                 ConfigurationReconciliation::NotObserved => return Err(Error { exit_code: 7, message: "NotObserved: outcome remains unknown, NOT failure; request retained. Reconcile later or explicitly retry the SAME request.".into() }),
-                ConfigurationReconciliation::PendingTransfer { .. } => return Err(Error { exit_code: 7, message: "pending transfer: adoption not confirmed; retain request and explicitly retry the SAME request".into() }),
             }
         }
         // Any denial now is about this retry, not proof that the first send failed.

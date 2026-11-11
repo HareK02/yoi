@@ -362,26 +362,10 @@ impl WorkerAuthorityView {
         if subject.state != crate::subjektiv::SubjectState::Active {
             return Err(denied("Subject permission source is retired"));
         }
-        let canonical = self.config_store.with_conn(|connection| {
-            crate::config_adoption::canonical(connection, &self.workspace_id)
-        })?;
-        if canonical {
-            return Ok(self
-                .config_store
-                .current_subject_permission_policy(&self.workspace_id, subject_id)?
-                .map(CurrentSubjectPolicy::Canonical));
-        }
-        Ok(store
-            .subject_policy_source(subject_id)
-            .map_err(subjektiv_store_error)?
-            .map(|source| match source {
-                server_api::authorization::SubjectPolicySource::Legacy(policy) => {
-                    CurrentSubjectPolicy::Legacy(policy)
-                }
-                server_api::authorization::SubjectPolicySource::Feature(policy) => {
-                    CurrentSubjectPolicy::Canonical(policy)
-                }
-            }))
+        Ok(self
+            .config_store
+            .current_subject_permission_policy(&self.workspace_id, subject_id)?
+            .map(CurrentSubjectPolicy::Canonical))
     }
 
     fn resources_cover(
@@ -838,7 +822,7 @@ pub(super) fn has_subject_authority(
         let Some(grant) = core else { break };
         use server_api::authorization::{CoreWorkerGrantParent, CoreWorkerGrantSource};
         match grant.source {
-            CoreWorkerGrantSource::Human { .. } | CoreWorkerGrantSource::Account { .. } => break,
+            CoreWorkerGrantSource::Account { .. } => break,
             CoreWorkerGrantSource::LaunchPolicy { parent, .. }
             | CoreWorkerGrantSource::Delegation { parent } => match parent {
                 CoreWorkerGrantParent::SubjectBody { .. }

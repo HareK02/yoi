@@ -701,53 +701,35 @@ fn install_subject_profiles(api: &WorkspaceApi, editor_scope: &str) {
             content,
         }],
     };
-    if api
+    let owner: String = api
         .config_store
-        .with_conn(|connection| crate::config_adoption::canonical(connection, TEST_WORKSPACE_ID))
-        .unwrap()
-    {
-        let owner: String = api
-            .config_store
-            .with_conn(|connection| {
-                Ok(connection.query_row(
-                    "SELECT owner_account_id FROM workspaces WHERE workspace_id=?1",
-                    [TEST_WORKSPACE_ID],
-                    |row| row.get(0),
-                )?)
-            })
-            .unwrap();
-        let registry = api.permission_registry.read().unwrap();
-        api.config_store
-            .adopt_configuration(
-                TEST_WORKSPACE_ID,
-                &owner,
-                &crate::config_adoption::ConfigurationAdoptionRequest {
-                    operation_id: uuid::Uuid::new_v4().to_string(),
-                    expected_head: api
-                        .config_store
-                        .configuration_head(TEST_WORKSPACE_ID, &owner)
-                        .unwrap(),
-                    expected_catalog_digest: crate::config_adoption::catalog_digest(
-                        registry.host(),
-                    )
+        .with_conn(|connection| {
+            Ok(connection.query_row(
+                "SELECT owner_account_id FROM workspaces WHERE workspace_id=?1",
+                [TEST_WORKSPACE_ID],
+                |row| row.get(0),
+            )?)
+        })
+        .unwrap();
+    let registry = api.permission_registry.read().unwrap();
+    api.config_store
+        .adopt_configuration(
+            TEST_WORKSPACE_ID,
+            &owner,
+            &crate::config_adoption::ConfigurationAdoptionRequest {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                expected_head: api
+                    .config_store
+                    .configuration_head(TEST_WORKSPACE_ID, &owner)
                     .unwrap(),
-                    expected_legacy_export: None,
-                    source: request,
-                },
-                api.config_schema_registry.compose().unwrap(),
-                registry.host(),
-                None,
-                |_| Ok(()),
-                |_| {
-                    Err(Error::RegistryInconsistency(
-                        "fixture must not transfer adopted authority again".into(),
-                    ))
-                },
-            )
-            .unwrap();
-    } else {
-        commit_workspace_config_tree(api, TEST_WORKSPACE_ID, &request).unwrap();
-    }
+                expected_catalog_digest: crate::config_adoption::catalog_digest(registry.host())
+                    .unwrap(),
+                source: request,
+            },
+            api.config_schema_registry.compose().unwrap(),
+            registry.host(),
+        )
+        .unwrap();
 }
 
 /// Transport only: a fresh real signed proof passes the production router on

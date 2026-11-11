@@ -1355,7 +1355,6 @@ async fn owner_adoption_publishes_after_commit_without_holding_the_sql_lane() {
         operation_id: "owned-publication".into(),
         expected_head: current.history_head.clone(),
         expected_catalog_digest: current.catalog_digest.clone(),
-        expected_legacy_export: current.expected_legacy_export.clone(),
         source: server_api::ConfigCommitRequest {
             base_digest: current.state.snapshot.digest.clone(),
             entrypoints: current.state.contract.entrypoints.clone(),

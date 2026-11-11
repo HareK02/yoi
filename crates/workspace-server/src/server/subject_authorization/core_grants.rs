@@ -238,7 +238,7 @@ impl WorkerAuthorityView {
                 &current.worker_id,
             ))?;
             let (parent, usage) = match &current.source {
-                CoreWorkerGrantSource::Account { .. } | CoreWorkerGrantSource::Human { .. } => {
+                CoreWorkerGrantSource::Account { .. } => {
                     return Ok(());
                 }
                 CoreWorkerGrantSource::Delegation { parent } => (parent, None),

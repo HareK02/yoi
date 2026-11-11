@@ -38,17 +38,14 @@ pub(super) async fn get(
                                 &subject_id,
                                 registry.host(),
                             )?;
-                        let semantic_policy = policy
-                            .clone()
-                            .map(|policy| policy.into_current_reference_encoding());
                         // These projections describe references, not effective grants:
                         // exact legacy domain constraints remain in the response policy.
                         let execution_resolution = host
-                            .resolve(semantic_policy.as_ref().map(|policy| &policy.execution))
+                            .resolve(policy.as_ref().map(|policy| &policy.execution))
                             .projection()
                             .clone();
                         let delegation_resolution = host
-                            .resolve(semantic_policy.as_ref().map(|policy| &policy.delegation))
+                            .resolve(policy.as_ref().map(|policy| &policy.delegation))
                             .projection()
                             .clone();
                         Ok(SubjectPermissionPolicyResponse {

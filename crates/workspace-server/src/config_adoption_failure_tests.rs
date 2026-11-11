@@ -126,16 +126,7 @@ fn request_identity_conflict_and_owner_denial_stay_typed_without_a_second_update
     );
     assert_eq!(cause.details().operation, FailureOperation::Reconcile);
     let Error::Configuration(cause) = db
-        .adopt_configuration(
-            WORKSPACE,
-            "not-the-owner",
-            &changed,
-            schema(),
-            &host,
-            None,
-            |_| panic!("owner denial precedes protected validation"),
-            |_| panic!("owner denial must not prepare a transfer"),
-        )
+        .adopt_configuration(WORKSPACE, "not-the-owner", &changed, schema(), &host)
         .unwrap_err()
     else {
         panic!("typed owner denial")

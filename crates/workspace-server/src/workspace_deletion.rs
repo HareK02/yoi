@@ -152,14 +152,12 @@ const WORKSPACE_DELETION_PURGE_TABLES: &[&str] = &[
     "worker_tombstones",
     "worker_workdir_attachment_reservations",
     "worker_workdir_links",
-    "workspace_permission_migration_plans",
     "workspace_configuration_publication_observations",
     "workspace_configuration_receipts",
     "workspace_configuration_policies",
     "subject_permission_operations",
     "subject_permission_enrollments",
     "subject_permission_tombstones",
-    "workspace_configuration_authorities",
     "workspace_config_entries",
     "workspace_config_grants",
     "workspace_drive_grants",
@@ -574,7 +572,6 @@ impl WorkspaceDeletionStore for SqliteWorkspaceStore {
                 ("typed_ticket_assignment_tracking_operations", "typed_ticket_assignment_tracking_operations_no_delete"),
                 ("typed_ticket_case_history", "typed_ticket_case_history_no_delete"),
                 ("typed_ticket_legacy_workflow_snapshot", "typed_ticket_legacy_workflow_no_delete"),
-                ("workspace_configuration_authorities", "workspace_configuration_authorities_no_delete"),
                 ("workspace_configuration_publication_observations", "workspace_configuration_publication_no_delete"),
                 ("workspace_configuration_receipts", "workspace_configuration_receipts_no_delete"),
                 ("subject_permission_operations", "subject_permission_operations_no_delete"),
@@ -1223,7 +1220,6 @@ mod tests {
         // responses, without invoking native lifecycle or owner API setup.
         store.with_conn(|conn| {
             for workspace in ["workspace-a", "workspace-b"] {
-                conn.execute("INSERT INTO workspace_configuration_authorities(workspace_id,transfer_identity,legacy_physical_identity,legacy_export_digest) VALUES(?1,'policy-erasure-transfer','fixture-native','fixture-export')", [workspace])?;
                 for subject in ["active-subject", "removed-subject"] {
                     let policy = CurrentSubjectPolicy {
                         change_id: format!("creation-{subject}"),
@@ -1500,8 +1496,6 @@ mod tests {
                             change_id: "retained-policy-change".into(),
                             legacy_constraints: None,
                         };
-                        conn.execute("INSERT INTO workspace_permission_migration_plans VALUES(?1,'retained-transfer','{}')", [workspace])?;
-                        conn.execute("INSERT INTO workspace_configuration_authorities VALUES(?1,'transfer','physical','export')", [workspace])?;
                         conn.execute("INSERT INTO workspace_configuration_policies VALUES(?1,'retained-subject',?2)", params![workspace, serde_json::to_string(&policy).unwrap()])?;
                         conn.execute("INSERT INTO workspace_configuration_receipts VALUES(?1,'adopt','fingerprint','{}')", [workspace])?;
                         conn.execute("INSERT INTO workspace_configuration_publication_observations(workspace_id,operation_id,stage,runtime_id,outcome) VALUES(?1,'adopt','dispatch','','observed')", [workspace])?;
@@ -1516,7 +1510,6 @@ mod tests {
                         assert!(conn.execute(&format!("UPDATE {table} SET ticket_id=ticket_id WHERE workspace_id=?1"), [workspace]).is_err());
                     }
                     for (table, column) in [
-                        ("workspace_configuration_authorities", "transfer_identity"),
                         ("workspace_configuration_publication_observations", "stage"),
                         ("workspace_configuration_receipts", "request_fingerprint"),
                     ] {
@@ -1548,9 +1541,7 @@ mod tests {
                 .unwrap()
                 .operation;
             let tables = [
-                "workspace_permission_migration_plans",
                 "workspace_configuration_publication_observations",
-                "workspace_configuration_authorities",
                 "workspace_configuration_policies",
                 "workspace_configuration_receipts",
                 "typed_ticket_case_history",

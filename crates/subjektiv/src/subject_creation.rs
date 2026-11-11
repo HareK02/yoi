@@ -1,8 +1,6 @@
-//! Before sealing, new Subjects receive execution/delegation permission references atomically.
-//! After sealing, creation retains enrollment evidence only; current reads never revive defaults.
-//! This path is never called by migration, launch, restore or permission reads. Receipts retain
-//! identity, input fingerprint and any post-seal enrollment across erasure, preventing replay
-//! from recreating an erased Subject or restoring a revoked policy.
+//! Creation records immutable initial policy evidence for the owning Host.
+//! Local Subjects store their policy directly; connected Subjects enroll through their Host.
+//! Replay never recreates a Subject or reinstalls a removed policy.
 use super::*;
 use server_api::authorization::{
     CurrentSubjectPolicy, PermissionReferenceEncoding, subject_default_delegation_assignment,
@@ -24,21 +22,19 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
 impl SubjektivStore {
     /// Creation-only enrollment evidence for the canonical domain. Never a current permission
     /// source or a read-time default; the Host must not apply it to an existing/unset policy.
-    /// References remain raw evidence; normalize only when consuming a pending enrollment.
+    /// Only current reference encoding is accepted.
     pub fn subject_permission_enrollment(
         &self,
         subject_id: &str,
     ) -> Result<Option<server_api::authorization::SubjectPolicySource>> {
         self.database.try_transaction(|tx| {
             require_subject(tx, subject_id)?;
-            if !permissions::transfer::has_table(tx, "permission_authority_seal")? {
-                return Ok(None);
-            }
             let raw: Option<String> = tx.query_row(
-                "SELECT permission_enrollment_json FROM subject_creation_receipts WHERE subject_id=?1",
-                [subject_id], |row| row.get::<_, Option<String>>(0),
-            ).optional()?.flatten();
-            raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into)).transpose()
+                "SELECT policy_json FROM subject_permission_enrollment_sources WHERE subject_id=?1",
+                [subject_id], |row| row.get::<_, String>(0),
+            ).optional()?;
+            raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
+                .transpose()
         })
     }
 
@@ -86,20 +82,13 @@ impl SubjektivStore {
                 legacy_constraints: None,
                 reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
             };
-            let sealed = permissions::transfer::is_sealed(tx)?;
-            if !sealed {
+            if self.canonical_permission_source.is_none() {
                 tx.execute("INSERT INTO subject_permission_changes(subject_id,change_id,record_json) VALUES(?1,?2,?3)",
                     params![record.id,source.change_id,serde_json::to_string(&source)?])?;
                 tx.execute("INSERT INTO subject_permissions(subject_id,change_id) VALUES(?1,?2)",params![record.id,source.change_id])?;
             }
-            if sealed {
-                // Retain creation-only enrollment for the canonical domain, never a legacy
-                // source write or a read-time default. Even non-idempotent creation has evidence.
-                let enrollment_operation = operation_id.map(str::to_owned)
-                    .unwrap_or_else(|| format!("subject-enrollment:{}", record.id));
-                tx.execute("INSERT INTO subject_creation_receipts(operation_id,subject_id,request_fingerprint,permission_enrollment_json) VALUES(?1,?2,?3,?4)",
-                    params![enrollment_operation,record.id,fingerprint,serde_json::to_string(&source)?])?;
-            } else if let Some(operation) = operation_id {
+            tx.execute("INSERT INTO subject_permission_enrollment_sources(subject_id,policy_json) VALUES(?1,?2)", params![record.id, serde_json::to_string(&source)?])?;
+            if let Some(operation) = operation_id {
                 tx.execute("INSERT INTO subject_creation_receipts(operation_id,subject_id,request_fingerprint) VALUES(?1,?2,?3)",params![operation,record.id,fingerprint])?;
             }
             Ok(record)

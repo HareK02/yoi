@@ -174,7 +174,6 @@ fn configure_delivery_plan(
                 expected_head: current.history_head,
                 expected_catalog_digest: crate::config_adoption::catalog_digest(registry.host())
                     .unwrap(),
-                expected_legacy_export: None,
                 source: ConfigCommitRequest {
                     base_digest: state.snapshot.digest.clone(),
                     entrypoints: vec![path.clone()],
@@ -190,9 +189,6 @@ fn configure_delivery_plan(
             },
             bundle,
             registry.host(),
-            None,
-            |_| panic!("delivery-only config has no Subject policy references"),
-            |_| panic!("ordinary config adoption must not transfer legacy authority"),
         )
         .unwrap()
         .state;

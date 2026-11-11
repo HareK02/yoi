@@ -1,5 +1,5 @@
 //! Workspace-owner source adoption transport. The Server authenticates the owner
-//! before reading source, previewing, sealing migration data, adopting or reconciling.
+//! before reading source, previewing, adopting or reconciling.
 //! A result lookup is not a new adoption and absence is not proof of failure.
 use crate::{
     ConfigCommitRequest, ConfigurationApiError, ServerRequestContext, WorkspaceConfigTreeResponse,
@@ -15,7 +15,6 @@ pub struct ConfigurationAdoptionRequest {
     pub operation_id: String,
     pub expected_head: Option<String>,
     pub expected_catalog_digest: String,
-    pub expected_legacy_export: Option<String>,
     pub source: ConfigCommitRequest,
 }
 
@@ -57,36 +56,15 @@ pub struct ConfigurationSubjectPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ConfigurationMigrationDiagnostic {
-    Converted {
-        subject_id: String,
-        operation: String,
-    },
-    DomainConstraint {
-        subject_id: String,
-        permission: crate::authorization::ScopedPermission,
-    },
-    ExplicitConfigurationRequired {
-        subject_id: String,
-        permission: crate::authorization::ScopedPermission,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(deny_unknown_fields)]
 pub struct ConfigurationSourceResponse {
-    /// Before the first adoption this is an editable, evaluated migration draft.
-    /// source_stored distinguishes it from the unchanged stored source.
+    /// Current stored shared configuration.
     pub state: WorkspaceConfigTreeResponse,
     pub history_head: Option<String>,
     pub source_stored: bool,
     pub catalog: PermissionCatalog,
     pub catalog_digest: String,
-    pub expected_legacy_export: Option<String>,
     pub policies: Vec<ConfigurationSubjectPolicy>,
-    pub migration_diagnostics: Vec<ConfigurationMigrationDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -105,10 +83,6 @@ pub struct ConfigurationPreviewResponse {
 pub enum ConfigurationReconciliation {
     Adopted {
         receipt: ConfigurationAdoptionReceipt,
-    },
-    PendingTransfer {
-        transfer_identity: String,
-        export_digest: String,
     },
     /// No matching evidence was observed. This is not permission to change the ID.
     NotObserved,
@@ -187,7 +161,6 @@ pub fn configuration_typescript() -> String {
         RuntimePolicyApplication::decl(&config),
         ConfigurationAdoptionReceipt::decl(&config),
         ConfigurationSubjectPolicy::decl(&config),
-        ConfigurationMigrationDiagnostic::decl(&config),
         ConfigurationSourceResponse::decl(&config),
         ConfigurationPreviewResponse::decl(&config),
         ConfigurationReconciliation::decl(&config),

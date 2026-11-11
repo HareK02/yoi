@@ -434,7 +434,6 @@ mod workspace_config_integration {
             "operation_id": "logical-editor-owner-adoption",
             "expected_head": current["history_head"],
             "expected_catalog_digest": current["catalog_digest"],
-            "expected_legacy_export": current["expected_legacy_export"],
             "source": {"base_digest": current["state"]["snapshot"]["digest"],
                 "entrypoints": current["state"]["contract"]["entrypoints"], "changes": change.changes}
         });

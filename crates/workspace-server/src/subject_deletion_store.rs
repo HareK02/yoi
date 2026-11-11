@@ -893,7 +893,6 @@ mod tests {
 
         store.with_conn(|conn| {
             for workspace in ["w", "other"] {
-                conn.execute("INSERT INTO workspace_configuration_authorities(workspace_id,transfer_identity,legacy_physical_identity,legacy_export_digest) VALUES(?1,'policy-erasure-transfer','fixture-native','fixture-export')", [workspace])?;
                 for subject in ["subject", "another"] {
                     let policy = CurrentSubjectPolicy {
                         change_id: format!("creation-{subject}"),

@@ -284,11 +284,6 @@ pub(crate) fn bind_core_grant(
             (None, None)
         }
         CoreWorkerGrantSource::Delegation { .. } => (None, None),
-        CoreWorkerGrantSource::Human { .. } => {
-            return Err(invalid(
-                "historical human grant source cannot be newly issued",
-            ));
-        }
     };
     // The row is inserted only after lineage validation. Its own record need not
     // exist to validate a newly reserved child's parent chain.
@@ -317,7 +312,7 @@ pub(crate) fn validate_policy_lineage(
             return Err(invalid("Core Worker grant revoked"));
         }
         let parent = match &cursor.source {
-            CoreWorkerGrantSource::Account { .. } | CoreWorkerGrantSource::Human { .. } => {
+            CoreWorkerGrantSource::Account { .. } => {
                 return Ok(vec![]);
             }
             CoreWorkerGrantSource::Delegation { parent } => parent,

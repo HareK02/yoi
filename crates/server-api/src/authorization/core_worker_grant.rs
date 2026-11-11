@@ -1,7 +1,7 @@
 //! Host-issued ordinary Worker grants do not depend on a Subject foreign key.
 //! Legacy Subject grants retain their original type and containment validation.
 
-use super::{PermissionReferenceEncoding, migrate_legacy_subject_assignment};
+use super::PermissionReferenceEncoding;
 use feature_permissions::{PermissionAssignment, PermissionKey};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -49,11 +49,6 @@ pub enum CoreWorkerGrantSource {
     Delegation {
         parent: CoreWorkerGrantParent,
     },
-    /// Historical issued grants only. Retain this wire spelling and raw identity
-    /// for replay/restore; new creation requests and issuance never select it.
-    Human {
-        account_id: String,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -68,10 +63,6 @@ pub struct CoreWorkerExecutionGrant {
     pub profile: String,
     pub profile_digest: String,
     pub assignment: PermissionAssignment,
-    #[serde(
-        default,
-        skip_serializing_if = "PermissionReferenceEncoding::is_legacy"
-    )]
     pub reference_encoding: PermissionReferenceEncoding,
     /// Policy and assignment-delegated children always carry a finite ceiling,
     /// including explicit empty. Account root assignments may remain dynamic;
@@ -83,11 +74,7 @@ pub struct CoreWorkerExecutionGrant {
 impl CoreWorkerExecutionGrant {
     /// Current authorization projection only; immutable binding/replay uses the raw grant.
     pub fn effective_assignment(&self) -> PermissionAssignment {
-        let mut assignment = self.assignment.clone();
-        if self.reference_encoding.is_legacy() {
-            migrate_legacy_subject_assignment(&mut assignment);
-        }
-        assignment
+        self.assignment.clone()
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -152,8 +139,7 @@ impl CoreWorkerExecutionGrant {
                     return Err("invalid or self-referencing parent provenance".into());
                 }
             }
-            CoreWorkerGrantSource::Account { account_id }
-            | CoreWorkerGrantSource::Human { account_id } => {
+            CoreWorkerGrantSource::Account { account_id } => {
                 if account_id.trim().is_empty() {
                     return Err("missing authenticated account issuer".into());
                 }
@@ -180,47 +166,6 @@ impl CoreWorkerExecutionGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn legacy_grant_projection_maps_both_vectors_without_changing_bytes_or_ceiling() {
-        let raw = concat!(
-            r#"{"grant_id":"g","workspace_id":"w","creation_operation_id":"op","runtime_id":"r","worker_id":"child","profile":"builtin:coder","profile_digest":"digest","assignment":{"grants":["#,
-            r#"{"kind":"set","value":"subject-default"},{"kind":"namespace","value":{"namespace":"subject","keys":["subject.orchestrate","subject.delegate"]}}],"exclusions":["#,
-            r#"{"kind":"set","value":"subject-default"},{"kind":"namespace","value":{"namespace":"subject","keys":["subject.orchestrate","subject.delegate"]}}],"revoked":true},"#,
-            r#""issuance_ceiling":["worker.create"],"source":{"kind":"human","account_id":"owner"}}"#,
-        );
-        let mut grant: CoreWorkerExecutionGrant = serde_json::from_str(raw).unwrap();
-        assert_eq!(
-            grant.reference_encoding,
-            PermissionReferenceEncoding::LegacySubjectV1
-        );
-        let effective = grant.effective_assignment();
-        let expected = serde_json::json!([
-            {"kind":"set", "value":"conversation"},
-            {"kind":"set", "value":"work-coordination"},
-            {"kind":"set", "value":"work-coordination"},
-            {"kind":"set", "value":"work-execution"}
-        ]);
-        assert_eq!(serde_json::to_value(&effective.grants).unwrap(), expected);
-        assert_eq!(effective.grants, effective.exclusions);
-        assert!(effective.revoked);
-        assert_eq!(serde_json::to_string(&grant).unwrap(), raw);
-        let stop = PermissionKey::parse("worker.stop").unwrap();
-        assert!(!grant.bounds_operation(&stop));
-        grant.issuance_ceiling = Some(vec![]);
-        grant.effective_assignment();
-        assert_eq!(grant.issuance_ceiling, Some(vec![]));
-        assert!(!grant.bounds_operation(&stop));
-        grant.issuance_ceiling = None;
-        grant.effective_assignment();
-        assert_eq!(grant.issuance_ceiling, None);
-        grant.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
-        assert_eq!(grant.effective_assignment(), grant.assignment);
-        assert_eq!(
-            serde_json::to_value(&grant).unwrap()["reference_encoding"],
-            "feature_sets_v2"
-        );
-    }
-
     #[test]
     fn delegation_wire_requires_finite_ceiling_and_retains_typed_parent() {
         let raw = serde_json::json!({
@@ -252,7 +197,7 @@ mod tests {
 
     #[test]
     fn stored_policy_grant_requires_finite_ceiling_on_decode_validation() {
-        let raw = serde_json::json!({"grant_id":"g", "workspace_id":"w", "creation_operation_id":"op", "runtime_id":"r", "worker_id":"child", "profile":"builtin:coder", "profile_digest":"digest", "assignment":{"grants":[], "exclusions":[], "revoked":false}, "issuance_ceiling":null, "source":{"kind":"launch_policy", "policy_id":"coder", "policy_revision":1,"parent":{"kind":"subject_body", "subject_id":"s", "source_change_id":"v1", "runtime_id":"r", "worker_id":"body"}}});
+        let raw = serde_json::json!({"grant_id":"g", "workspace_id":"w", "creation_operation_id":"op", "runtime_id":"r", "worker_id":"child", "profile":"builtin:coder", "profile_digest":"digest", "reference_encoding":"feature_sets_v2", "assignment":{"grants":[], "exclusions":[], "revoked":false}, "issuance_ceiling":null, "source":{"kind":"launch_policy", "policy_id":"coder", "policy_revision":1,"parent":{"kind":"subject_body", "subject_id":"s", "source_change_id":"v1", "runtime_id":"r", "worker_id":"body"}}});
         let mut grant: CoreWorkerExecutionGrant = serde_json::from_value(raw).unwrap();
         assert!(grant.validate().is_err());
         grant.issuance_ceiling = Some(vec![]);

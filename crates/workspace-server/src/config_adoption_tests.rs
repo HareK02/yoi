@@ -1,7 +1,4 @@
-//! Adoption component tests use the real Server SQLite transaction and content
-//! store. The legacy transfer callback retains a fixed native policy independently
-//! of authored source; physical Feature transfer and authenticated HTTP are separate
-//! integration coverage.
+//! Shared configuration persistence is independent of Subject policy enrollment.
 use super::*;
 use crate::config_source::{MAIN_CONFIG_ENTRYPOINT, WorkspaceConfigSchemaProvider};
 use crate::policy_config::PermissionConfigSchemaProvider;
@@ -76,6 +73,11 @@ fn fixture() -> (tempfile::TempDir, SqliteWorkspaceStore) {
     }).unwrap();
     db.ensure_workspace_config_materialized_with_schema(WORKSPACE, "now", schema())
         .unwrap();
+    db.with_immediate_transaction(|tx| {
+        let policy = native_policy();
+        tx.execute("INSERT INTO workspace_configuration_policies(workspace_id,subject_id,policy_json) VALUES(?1,?2,?3)", params![WORKSPACE, "subject-a", serde_json::to_string(&policy).unwrap()])?;
+        Ok(())
+    }).unwrap();
     (dir, db)
 }
 fn request(
@@ -97,11 +99,6 @@ fn request(
         .unwrap_or_default();
     ConfigurationAdoptionRequest {
         operation_id: id.into(),
-        expected_legacy_export: db
-            .configuration_head(WORKSPACE, OWNER)
-            .unwrap()
-            .is_none()
-            .then(|| "fixture-native-export".into()),
         expected_head: db.configuration_head(WORKSPACE, OWNER).unwrap(),
         expected_catalog_digest: catalog_digest(host).unwrap(),
         source: ConfigCommitRequest {
@@ -147,29 +144,7 @@ fn adopt(
     host: &PermissionHost,
     request: &ConfigurationAdoptionRequest,
 ) -> Result<ConfigurationAdoptionResult> {
-    db.adopt_configuration(
-        WORKSPACE,
-        OWNER,
-        request,
-        schema(),
-        host,
-        None,
-        |s| {
-            if s == "subject-a" {
-                Ok(())
-            } else {
-                Err(Error::InvalidInput("unknown Subject".into()))
-            }
-        },
-        |fingerprint| {
-            Ok(ConfigurationPolicyTransfer {
-                transfer_identity: fingerprint.into(),
-                physical_identity: "fixture-physical".into(),
-                export_digest: "fixture-native-export".into(),
-                policies: BTreeMap::from([("subject-a".into(), native_policy())]),
-            })
-        },
-    )
+    db.adopt_configuration(WORKSPACE, OWNER, request, schema(), host)
 }
 const A: &str = r#"{ permissions = { worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge"]; }]; }; }; } as WorkspaceConfigSchema"#;
 const B: &str = r#"{ permissions = { worker_default = { namespaces = [{ namespace = "ticket"; keys = ["ticket.hoge.fuga"]; }]; }; }; } as WorkspaceConfigSchema"#;
@@ -256,47 +231,7 @@ fn failure_at_each_storage_boundary_rolls_back_and_reopens_the_previous_adoption
 }
 
 #[test]
-fn initial_native_policy_insert_failure_rolls_back_source_authority_head_and_receipt() {
-    let (dir, db) = fixture();
-    let host = host(false);
-    let before = db.load_workspace_config(WORKSPACE).unwrap();
-    let candidate = request(&db, &host, "initial-policy-failure", Some(A));
-    db.with_conn(|conn| {
-        conn.execute_batch("CREATE TEMP TRIGGER injected_failure BEFORE INSERT ON workspace_configuration_policies BEGIN SELECT RAISE(ABORT,'injected policy insert'); END;")?;
-        Ok(())
-    }).unwrap();
-    let error = adopt(&db, &host, &candidate).unwrap_err();
-    assert!(
-        error.to_string().contains("injected policy insert"),
-        "{error}"
-    );
-    drop(db);
-    let reopened = open(&dir.path().join("server.sqlite"));
-    assert_eq!(reopened.load_workspace_config(WORKSPACE).unwrap(), before);
-    assert_eq!(reopened.configuration_head(WORKSPACE, OWNER).unwrap(), None);
-    assert!(
-        !reopened
-            .configuration_policy_is_canonical(WORKSPACE)
-            .unwrap()
-    );
-    assert!(
-        reopened
-            .with_conn(|conn| policies(conn, WORKSPACE))
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        reopened
-            .configuration_adoption_result(WORKSPACE, OWNER, &candidate.operation_id)
-            .unwrap()
-            .is_none()
-    );
-    adopt(&reopened, &host, &candidate).unwrap();
-    assert_native_policy(&reopened);
-}
-
-#[test]
-fn invalid_references_structure_and_owner_do_not_prepare_a_transfer() {
+fn invalid_references_structure_and_owner_do_not_change_configuration() {
     let (_dir, db) = fixture();
     let host = host(false);
     let initial = db.load_workspace_config(WORKSPACE).unwrap();
@@ -308,39 +243,15 @@ fn invalid_references_structure_and_owner_do_not_prepare_a_transfer() {
         r#"{permissions={worker_default={namespaces=[{namespace="ticket";keys=[{key="ticket.hoge"; payload="forbidden";}];}];};};} as WorkspaceConfigSchema"#,
     ] {
         let request = request(&db, &host, "bad", Some(source));
-        let result = db.adopt_configuration(
-            WORKSPACE,
-            OWNER,
-            &request,
-            schema(),
-            &host,
-            None,
-            |s| {
-                if s == "subject-a" {
-                    Ok(())
-                } else {
-                    Err(Error::InvalidInput("unknown Subject".into()))
-                }
-            },
-            |_| panic!("validation failure must precede seal"),
-        );
+        let result = db.adopt_configuration(WORKSPACE, OWNER, &request, schema(), &host);
         assert!(result.is_err(), "{source}");
         assert_eq!(db.load_workspace_config(WORKSPACE).unwrap(), initial);
         assert_eq!(db.configuration_head(WORKSPACE, OWNER).unwrap(), None);
     }
     let request = request(&db, &host, "other-owner", None);
     assert!(
-        db.adopt_configuration(
-            WORKSPACE,
-            "non-owner",
-            &request,
-            schema(),
-            &host,
-            None,
-            |_| Ok(()),
-            |_| panic!("owner refusal must precede seal")
-        )
-        .is_err()
+        db.adopt_configuration(WORKSPACE, "non-owner", &request, schema(), &host)
+            .is_err()
     );
 }
 
@@ -377,15 +288,7 @@ fn source_edits_omission_and_noop_leave_dedicated_current_policy_identity_unchan
     ] {
         let candidate = request(&db, &host, id, source);
         let preview = db
-            .preview_configuration_adoption(
-                WORKSPACE,
-                OWNER,
-                &candidate,
-                schema(),
-                &host,
-                None,
-                |_| Ok(()),
-            )
+            .preview_configuration_adoption(WORKSPACE, OWNER, &candidate, schema(), &host)
             .unwrap();
         assert_eq!(preview.changed_paths.is_empty(), source.is_none());
         assert!(preview.changed_subjects.is_empty());
@@ -431,16 +334,13 @@ fn individual_config_fields_are_rejected_even_empty_without_changing_current_pol
         let candidate = request(&db, &host, &id, Some(source));
         let preview_error = db
             .preview_configuration_adoption(
-                WORKSPACE, OWNER, &candidate, schema(), &host, None,
-                |_| panic!("current config must not resolve individual Subjects"),
+                WORKSPACE, OWNER, &candidate, schema(), &host,
             )
             .unwrap_err();
         assert!(preview_error.to_string().contains(field), "{source}: {preview_error}");
         let error = db
             .adopt_configuration(
-                WORKSPACE, OWNER, &candidate, schema(), &host, None,
-                |_| panic!("current config must not resolve individual Subjects"),
-                |_| panic!("invalid source must not prepare a transfer"),
+                WORKSPACE, OWNER, &candidate, schema(), &host,
             )
             .unwrap_err();
         assert!(error.to_string().contains(field), "{source}: {error}");
@@ -784,4 +684,24 @@ mod publication_observations {
             Some(result)
         );
     }
+}
+
+#[test]
+fn fresh_configuration_storage_has_no_permission_migration_state() {
+    let (_dir, db) = fixture();
+    db.with_conn(|conn| {
+        for table in [
+            "workspace_configuration_authorities",
+            "workspace_permission_migration_plans",
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            assert!(!exists, "{table}");
+        }
+        Ok(())
+    })
+    .unwrap();
 }

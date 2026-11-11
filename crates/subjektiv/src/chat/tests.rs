@@ -1164,11 +1164,6 @@ fn chat_native_transaction_drops_uncommitted_effect_and_never_calls_canonical_pr
         })
         .unwrap();
     assert!(page(&store, &c).messages.is_empty());
-    let identity = store.database_identity().unwrap();
-    let preview = store.preview_permission_transfer(&identity).unwrap();
-    store
-        .seal_permission_sources(&identity, "chat-transfer", &preview.export_digest)
-        .unwrap();
     let store = store.with_canonical_permission_source(Arc::new(NoReentry));
     store
         .with_chat_transaction(&subject, |chat| {

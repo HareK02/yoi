@@ -156,7 +156,6 @@ Deno.test("config adoption formats changed sources and validates a request bound
   assert(
     source.includes("expected_head: editingMetadata.history_head") &&
       source.includes("expected_catalog_digest: editingMetadata.catalog_digest") &&
-      source.includes("expected_legacy_export: editingMetadata.expected_legacy_export") &&
       source.includes("base_digest: baseDigest") &&
       source.includes("entrypoints: entrypoints()"),
     "adoption should carry the observed history head and migration conditions separately from the source digest",

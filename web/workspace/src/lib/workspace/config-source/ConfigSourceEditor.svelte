@@ -251,7 +251,6 @@
       state: receipt.state,
       history_head: receipt.history_head,
       catalog_digest: editingMetadata!.catalog_digest,
-      expected_legacy_export: null,
       source_stored: true,
     };
     baseSnapshot = $state.snapshot(receipt.state.snapshot);
@@ -287,9 +286,7 @@
         await applyReceipt(result.receipt);
         return "adopted";
       }
-      status = result.status === "pending_transfer"
-        ? "Adoption outcome unknown: transfer pending. Commit resumes the same request; reconcile before adopting edits."
-        : "Adoption outcome unknown: not observed does not mean failed. Commit resumes the same request; reconcile before adopting edits.";
+      status = "Adoption outcome unknown: not observed does not mean failed. Commit resumes the same request; reconcile before adopting edits.";
       return "unresolved";
     } catch (error) {
       status = `Adoption outcome unknown. Retained request must be reconciled: ${String(error)}`;
@@ -358,7 +355,6 @@
         operation_id: crypto.randomUUID(),
         expected_head: editingMetadata.history_head,
         expected_catalog_digest: editingMetadata.catalog_digest,
-        expected_legacy_export: editingMetadata.expected_legacy_export,
         source: {
           base_digest: baseDigest,
           changes: $state.snapshot(workingChanges),

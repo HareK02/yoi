@@ -5090,62 +5090,6 @@ impl WorkspaceApi {
             #[cfg(test)]
             subject_effect_admission_observer: None,
         };
-        // Both catalog and single-Workspace startup reach this boundary before
-        // exposure or recovery can attach the canonical permission source.
-        let migration_api = api.clone();
-        api.store
-            .db_executor()
-            .run(move || {
-                migration_api.refresh_plugin_permission_registry()?;
-                // No registry guard may cross native Feature admission. This API
-                // is still private, so the refreshed Host snapshot is stable.
-                let host = migration_api
-                    .permission_registry
-                    .read()
-                    .map_err(|_| Error::Config("current Feature declarations unavailable".into()))?
-                    .host()
-                    .clone();
-                let legacy = crate::subjektiv::SubjektivStore::open(
-                    &migration_api.feature_storage,
-                    &migration_api.subjektiv_registration,
-                )
-                .map_err(|error| {
-                    Error::Store(format!(
-                        "failed to open permission migration storage: {error}"
-                    ))
-                })?;
-                let schema = migration_api.config_schema_registry.compose()?;
-                match crate::config_adoption::automatic::migrate(
-                    &migration_api.config_store,
-                    &legacy,
-                    &migration_api.config.workspace_id,
-                    schema.clone(),
-                    &host,
-                ) {
-                    Ok(_) => {
-                        crate::config_adoption::semantic_references::migrate(
-                            &migration_api.config_store,
-                            &migration_api.config.workspace_id,
-                            schema,
-                            &host,
-                        )?;
-                        Ok(())
-                    }
-                    Err(error) => {
-                        if let Some(reason) = crate::config_adoption::automatic::blocked_reason(&error) {
-                            tracing::warn!(
-                                workspace_id = %migration_api.config.workspace_id,
-                                reason,
-                                "Automatic permission storage migration blocked; ordinary human Worker creation remains available"
-                            );
-                            Ok(())
-                        } else {
-                            Err(error)
-                        }
-                    }
-                }
-            })
-            .await?;
         // Restore the domain fence before this API can issue any Drive handle,
         // including blocked/failed deletions not scheduled for automatic recovery.
         if api
@@ -25094,7 +25038,7 @@ where
     executor.run(move || runtime.block_on(future)).await
 }
 
-fn open_legacy_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
+fn open_native_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::SubjektivStore> {
     if let Some(reader) = &api.subject_authority_store {
         return Ok(reader.clone());
     }
@@ -25111,7 +25055,7 @@ fn open_subjektiv_store(api: &WorkspaceApi) -> ApiResult<crate::subjektiv::Subje
         .host()
         .clone();
     Ok(
-        open_legacy_subjektiv_store(api)?.with_canonical_permission_source(Arc::new(
+        open_native_subjektiv_store(api)?.with_canonical_permission_source(Arc::new(
             crate::subject_policy_source::CanonicalSubjectPolicySource {
                 store: api.config_store.as_ref().clone(),
                 host,
@@ -64399,8 +64343,7 @@ mod tests {
             execution: keyed(&legacy.execution),
             delegation: keyed(&legacy.delegation),
         })
-        .unwrap()
-        .into_current_reference_encoding();
+        .unwrap();
         // Unmappable scalar names remain historical restrictions, never live keys.
         selected.legacy_constraints = Some(legacy);
         let previous = api
@@ -74824,7 +74767,7 @@ VALUES ('0192f0e8-4d84-7d6e-a000-000000000001', 'ticket', 3);
         let initial = get_json_authenticated(app.clone(), &adoption_path, &owner).await;
         let request = json!({
             "operation_id": "nested-config-adoption", "expected_head": initial["history_head"],
-            "expected_catalog_digest": initial["catalog_digest"], "expected_legacy_export": initial["expected_legacy_export"],
+            "expected_catalog_digest": initial["catalog_digest"],
             "source": {
                 "base_digest": initial["state"]["snapshot"]["digest"],
                 "changes": [{ "kind": "create", "path": "notes/readme.txt", "content_type": "text", "content": "nested entry" }],

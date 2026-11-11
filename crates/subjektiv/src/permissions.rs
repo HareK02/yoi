@@ -15,23 +15,24 @@ use server_api::authorization::{
 };
 use sha2::{Digest, Sha256};
 
-pub(crate) mod transfer;
-pub use transfer::{
-    CanonicalPermissionSource, DatabaseIdentity, PermissionAuthorityGuard, PermissionSourceExport,
-    PermissionTransferReceipt, PermissionTransferSnapshot,
-};
+pub(crate) mod authority;
+pub use authority::{CanonicalPermissionSource, DatabaseIdentity, PermissionAuthorityGuard};
 
 pub const MAX_SUBJECT_WORKER_EXECUTION_GRANTS: usize = 1_000;
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> feature_storage::Result<()> {
     tx.execute_batch(include_str!("permissions.sql"))?;
+    migrate_current(tx)
+}
+
+pub(super) fn migrate_current(tx: &Transaction<'_>) -> feature_storage::Result<()> {
+    tx.execute_batch(include_str!("permissions/current.sql"))?;
     Ok(())
 }
 
 impl SubjektivStore {
     /// Distinguishes a saved Feature assignment from a legacy scoped source without
     /// exception-text dispatch or inferring authority from the database path.
-    /// Feature references are normalized for consumers, not for raw transfer evidence.
     pub fn subject_policy_source(&self, subject_id: &str) -> Result<Option<SubjectPolicySource>> {
         self.database.try_transaction(|connection| {
             require_subject(connection, subject_id)?;
@@ -39,7 +40,7 @@ impl SubjektivStore {
         })
     }
 
-    /// Reads the single current source, including Feature assignments after cutover.
+    /// Reads the current source from the explicitly connected Host or the local store.
     /// Retained creation receipts are never consulted to restore a removed source.
     pub fn current_subject_policy(&self, subject_id: &str) -> Result<Option<CurrentSubjectPolicy>> {
         self.database.try_transaction(|connection| {
@@ -53,19 +54,16 @@ impl SubjektivStore {
         connection: &Connection,
         subject_id: &str,
     ) -> Result<Option<CurrentSubjectPolicy>> {
-        if transfer::is_sealed(connection)? {
+        if self.canonical_permission_source.is_some() {
             return self
                 .canonical_permission_source
                 .as_ref()
                 .ok_or_else(|| denied("canonical permission source is not connected"))?
-                .current_subject_policy(self.scope_id(), subject_id)
-                .map(|source| source.map(CurrentSubjectPolicy::into_current_reference_encoding));
+                .current_subject_policy(self.scope_id(), subject_id);
         }
         stored_source(connection, subject_id)?
             .map(|source| match source {
-                StoredSubjectPolicy::Feature(source) => {
-                    Ok(source.into_current_reference_encoding())
-                }
+                StoredSubjectPolicy::Feature(source) => Ok(source),
                 StoredSubjectPolicy::Legacy(source) => {
                     CurrentSubjectPolicy::from_legacy(source).map_err(SubjektivError::InvalidRecord)
                 }
@@ -96,8 +94,7 @@ impl SubjektivStore {
     /// Management replacement rejects new unsupported operation/resource pairs while
     /// retaining exact legacy entries in their original execution/delegation lane.
     /// Validation shares the existing CAS/receipt transaction so a stale editor cannot
-    /// retain a removed legacy grant. Before sealing, exact replay remains historical evidence;
-    /// once sealed, replacements reject even an otherwise exact historical receipt replay.
+    /// retain a removed grant. Connected Hosts own replacements; local replay is historical evidence.
     pub fn set_managed_subject_permissions(
         &self,
         subject_id: &str,
@@ -125,7 +122,7 @@ impl SubjektivStore {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         self.database.try_transaction(|tx| {
-            transfer::require_unsealed(tx)?;
+            if self.canonical_permission_source.is_some() { return Err(denied("Subject permissions belong to the connected Host")); }
             require_subject(tx, subject_id)?;
             let receipt: Option<(String, String)> = tx.query_row(
                 "SELECT request_fingerprint, change_id FROM subject_permission_receipts WHERE operation_id=?1",
@@ -230,7 +227,7 @@ impl SubjektivStore {
         connection: &Connection,
         subject: &str,
     ) -> Result<Option<SubjectPolicySource>> {
-        let source = if transfer::is_sealed(connection)? {
+        let source = if self.canonical_permission_source.is_some() {
             self.canonical_permission_source
                 .as_ref()
                 .ok_or_else(|| denied("canonical permission source is not connected"))?
@@ -239,9 +236,7 @@ impl SubjektivStore {
             stored_source(connection, subject)?
         };
         Ok(source.map(|source| match source {
-            SubjectPolicySource::Feature(source) => {
-                SubjectPolicySource::Feature(source.into_current_reference_encoding())
-            }
+            SubjectPolicySource::Feature(source) => SubjectPolicySource::Feature(source),
             SubjectPolicySource::Legacy(source) => SubjectPolicySource::Legacy(source),
         }))
     }
@@ -343,9 +338,8 @@ impl SubjektivStore {
             require_covered(&origin.redelegation, &grant.permissions)?;
             require_covered(&origin.redelegation, &grant.redelegation)?;
         }
-        let table = if transfer::is_sealed(tx)? {
+        let table = if self.canonical_permission_source.is_some() {
             // Canonical IDs must not be mirrored into legacy source history to satisfy its FK.
-            crate::storage_formats::install_permission_transfer(tx)?;
             "canonical_worker_execution_grants"
         } else {
             "worker_execution_grants"
@@ -365,11 +359,7 @@ impl SubjektivStore {
         validate_authorization_identifier(subject_id).map_err(SubjektivError::InvalidRecord)?;
         self.database.try_with_connection(|connection| {
             require_subject_in_connection(connection, subject_id)?;
-            let sql = if transfer::has_table(connection, "canonical_worker_execution_grants")? {
-                "SELECT record_json FROM (SELECT runtime_id,worker_id,subject_id,record_json FROM worker_execution_grants UNION ALL SELECT runtime_id,worker_id,subject_id,record_json FROM canonical_worker_execution_grants) WHERE subject_id=?1 ORDER BY runtime_id,worker_id LIMIT ?2"
-            } else {
-                "SELECT record_json FROM worker_execution_grants WHERE subject_id=?1 ORDER BY runtime_id,worker_id LIMIT ?2"
-            };
+            let sql = "SELECT record_json FROM (SELECT runtime_id,worker_id,subject_id,record_json FROM worker_execution_grants UNION ALL SELECT runtime_id,worker_id,subject_id,record_json FROM canonical_worker_execution_grants) WHERE subject_id=?1 ORDER BY runtime_id,worker_id LIMIT ?2";
             let mut statement = connection.prepare(sql)?;
             let mut rows = statement.query(params![subject_id, MAX_SUBJECT_WORKER_EXECUTION_GRANTS + 1])?;
             let mut grants = Vec::new();
@@ -433,11 +423,7 @@ fn grant_in_connection(
     // Absence must never become non-Subject fallback authority after purge.
     deletion::require_live_worker(connection, runtime, worker)?;
 
-    let sql = if transfer::has_table(connection, "canonical_worker_execution_grants")? {
-        "SELECT record_json FROM (SELECT runtime_id,worker_id,subject_id,record_json FROM worker_execution_grants UNION ALL SELECT runtime_id,worker_id,subject_id,record_json FROM canonical_worker_execution_grants) g WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=g.subject_id)"
-    } else {
-        "SELECT record_json FROM worker_execution_grants WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=worker_execution_grants.subject_id)"
-    };
+    let sql = "SELECT record_json FROM (SELECT runtime_id,worker_id,subject_id,record_json FROM worker_execution_grants UNION ALL SELECT runtime_id,worker_id,subject_id,record_json FROM canonical_worker_execution_grants) g WHERE runtime_id=?1 AND worker_id=?2 AND NOT EXISTS(SELECT 1 FROM subject_deletions d WHERE d.subject_id=g.subject_id)";
     let raw: Option<String> = connection
         .query_row(sql, params![runtime, worker], |row| row.get(0))
         .optional()?;

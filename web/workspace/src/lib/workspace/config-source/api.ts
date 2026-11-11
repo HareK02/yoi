@@ -36,7 +36,7 @@ import type {
 // 未使用のpolicy/catalogを認可判定へ転用しない。editorが使う観測値だけを型へ変換する。
 export type ConfigurationEditingState = Pick<
   ConfigurationSourceResponse,
-  "state" | "history_head" | "catalog_digest" | "expected_legacy_export" | "source_stored"
+  "state" | "history_head" | "catalog_digest" | "source_stored"
 >;
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -345,19 +345,17 @@ function checkOpaqueData(value: unknown, depth = 0, budget = { nodes: 65536 }): 
 export function parseConfigurationSourceResponse(value: unknown): ConfigurationEditingState {
   const item = record(value, [
     "state", "history_head", "source_stored", "catalog", "catalog_digest",
-    "expected_legacy_export", "policies", "migration_diagnostics",
+    "policies",
   ]);
   if (typeof item.source_stored !== "boolean") throw schemaError();
   objectValue(item.catalog);
   boundedArray(item.policies);
-  boundedArray(item.migration_diagnostics);
-  checkOpaqueData([item.catalog, item.policies, item.migration_diagnostics]);
+  checkOpaqueData([item.catalog, item.policies]);
   return {
     state: parseWorkspaceConfigTreeResponse(item.state),
     history_head: nullableDigest(item.history_head),
     source_stored: item.source_stored,
     catalog_digest: boundedString(item.catalog_digest, MAX_DIGEST_BYTES),
-    expected_legacy_export: nullableDigest(item.expected_legacy_export),
   };
 }
 
@@ -394,14 +392,6 @@ export function parseConfigurationReconciliation(value: unknown): ConfigurationR
   if (status === "adopted") {
     const item = record(value, ["status", "receipt"]);
     return { status, receipt: parseConfigurationAdoptionReceipt(item.receipt) };
-  }
-  if (status === "pending_transfer") {
-    const item = record(value, ["status", "transfer_identity", "export_digest"]);
-    return {
-      status,
-      transfer_identity: boundedString(item.transfer_identity),
-      export_digest: boundedString(item.export_digest, MAX_DIGEST_BYTES),
-    };
   }
   if (status === "not_observed") {
     record(value, ["status"]);

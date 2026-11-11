@@ -452,11 +452,6 @@ fn check_authorization(
         let Principal::Subject(subject) = principal else {
             return Err(ChatError::AuthorizationChanged);
         };
-        if crate::permissions::transfer::is_sealed(tx)? {
-            // Canonical policies require the Host's Server-transaction snapshot via
-            // with_chat_transaction, not a retained head or recursive provider call.
-            return Err(ChatError::AuthorizationChanged);
-        }
         let actual = local_policy_source(tx, subject)?.map(|source| match source {
             server_api::authorization::SubjectPolicySource::Feature(policy) => policy.change_id,
             server_api::authorization::SubjectPolicySource::Legacy(policy) => policy.change_id,

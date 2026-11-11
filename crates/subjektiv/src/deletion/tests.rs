@@ -299,6 +299,12 @@ fn every_subject_owned_table_has_old_and_new_sql_fences_and_retention_is_scoped(
                 assert!(c.prepare("PRAGMA foreign_key_list(subject_creation_receipts)")?.query([])?.next()?.is_none());
                 continue;
             }
+            if table == "subject_permission_enrollment_sources" {
+                assert!(c.execute("UPDATE subject_permission_enrollment_sources SET policy_json=policy_json", []).is_err());
+                assert!(c.execute("DELETE FROM subject_permission_enrollment_sources", []).is_err());
+                continue;
+            }
+            if table == "canonical_worker_execution_grants" { continue; }
             assert!(DIRECT.contains(&table.as_str()) || table == "journal_erased_sessions" || table == "chat_conversations", "unclassified Subject table: {table}");
         }
         for table in DIRECT.iter().copied().chain(INDIRECT.iter().map(|v| v.0)).chain(["journal_erased_sessions"]) {

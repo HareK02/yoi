@@ -2,10 +2,7 @@
 //!
 //! This is a policy value, not an authorization receipt. Hosts resolve its lanes
 //! against their current registered Feature declarations at every protected access.
-use super::{
-    PermissionReferenceEncoding, ScopedPermission, SubjectPermissions,
-    migrate_legacy_subject_assignment,
-};
+use super::{PermissionReferenceEncoding, ScopedPermission, SubjectPermissions};
 use feature_permissions::{
     NamespacePermissions, PermissionAssignment, PermissionKey, PermissionReference,
 };
@@ -30,25 +27,10 @@ pub struct CurrentSubjectPolicy {
     pub execution: PermissionAssignment,
     pub delegation: PermissionAssignment,
     pub legacy_constraints: Option<SubjectPermissions>,
-    #[serde(
-        default,
-        skip_serializing_if = "PermissionReferenceEncoding::is_legacy"
-    )]
     pub reference_encoding: PermissionReferenceEncoding,
 }
 
 impl CurrentSubjectPolicy {
-    /// Interpret stored references only at an effective-policy boundary. Raw history,
-    /// exports and receipts must retain their original encoding and serialized bytes.
-    pub fn into_current_reference_encoding(mut self) -> Self {
-        if self.reference_encoding.is_legacy() {
-            migrate_legacy_subject_assignment(&mut self.execution);
-            migrate_legacy_subject_assignment(&mut self.delegation);
-            self.reference_encoding = PermissionReferenceEncoding::FeatureSetsV2;
-        }
-        self
-    }
-
     /// Representation-only projection. Exact old resource conditions remain a
     /// separate conjunct; unrepresentable names are diagnosed, never discarded.
     pub fn from_legacy(source: SubjectPermissions) -> Result<Self, String> {

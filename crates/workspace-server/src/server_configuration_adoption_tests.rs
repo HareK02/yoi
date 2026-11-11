@@ -9,15 +9,10 @@ fn adopt_test_config_as_owner(
     let current = api
         .config_store
         .configuration_current(api.workspace_id(), &owner.account_id)?;
-    assert!(
-        current.canonical,
-        "ordinary config fixtures use the current owner writer"
-    );
     let request = crate::config_adoption::ConfigurationAdoptionRequest {
         operation_id: Uuid::now_v7().to_string(),
         expected_head: current.history_head,
         expected_catalog_digest: crate::config_adoption::catalog_digest(&host)?,
-        expected_legacy_export: None,
         source: source.clone(),
     };
     api.config_store
@@ -27,9 +22,6 @@ fn adopt_test_config_as_owner(
             &request,
             api.config_schema_registry.compose()?,
             &host,
-            None,
-            |_| panic!("shared config must not enumerate individual Subject assignments"),
-            |_| panic!("current config fixture must not replay native permission transfer"),
         )
         .map(|result| result.state)
 }
@@ -164,7 +156,7 @@ mod configuration_adoption_http_integration {
 
             // Startup has already transferred native authority. Seed the current
             // Subject domain through its owner/CAS operation, not the sealed writer.
-            let legacy = open_legacy_subjektiv_store(&api).unwrap();
+            let legacy = open_subjektiv_store(&api).unwrap();
             let subject = open_subjektiv_store(&api)
                 .unwrap()
                 .create_subject(crate::subjektiv::SubjectRole::new("adoption-http").unwrap())
@@ -344,7 +336,6 @@ mod configuration_adoption_http_integration {
                 .config_store
                 .configuration_current(TEST_WORKSPACE_ID, &self.owner_account)
                 .unwrap();
-            let identity = self.legacy.database_identity().unwrap();
             let receipts: Vec<(String, String, String)> = self.api.config_store.with_conn(|conn| {
                 let mut query = conn.prepare(
                     "SELECT operation_id,request_fingerprint,result_json FROM workspace_configuration_receipts WHERE workspace_id=?1 ORDER BY operation_id",
@@ -357,17 +348,14 @@ mod configuration_adoption_http_integration {
             json!({
                 "state": current.state,
                 "history_head": current.history_head,
-                "canonical": current.canonical,
                 "policies": current.policies,
                 "receipts": receipts,
                 "subject_policy": self.api.config_store.current_subject_permission_policy(TEST_WORKSPACE_ID, &self.subject).unwrap(),
-                "legacy_export": self.legacy.preview_permission_transfer(&identity).unwrap(),
-                "legacy_receipt": self.legacy.permission_transfer_receipt(&identity).unwrap(),
             })
         }
 
         fn assert_subject_policy_unchanged(&self) {
-            self.assert_legacy_sealed();
+            self.assert_native_writer_denied();
             assert_eq!(
                 self.api
                     .config_store
@@ -407,11 +395,11 @@ mod configuration_adoption_http_integration {
             );
         }
 
-        fn assert_legacy_sealed(&self) {
+        fn assert_native_writer_denied(&self) {
             assert!(matches!(
                 self.legacy
                     .set_subject_permissions(&self.subject, &self.legacy_update),
-                Err(crate::subjektiv::SubjektivError::PermissionAuthoritySealed),
+                Err(crate::subjektiv::SubjektivError::AuthorizationDenied(_)),
             ));
         }
     }
@@ -674,7 +662,7 @@ mod configuration_adoption_http_integration {
             f.assert_source_policy_unchanged(&committed);
             f.assert_subject_policy_unchanged();
             assert_eq!(f.durable()["receipts"].as_array().unwrap().len(), 2);
-            f.assert_legacy_sealed();
+            f.assert_native_writer_denied();
 
             // The editor moves on while the original request is still unresolved.
             let later_text = permission_source("ticket.query", "ticket.create");
@@ -824,10 +812,9 @@ mod configuration_adoption_http_integration {
             .config_store
             .configuration_current(TEST_WORKSPACE_ID, &f.owner_account)
             .unwrap();
-        assert!(current.canonical);
         assert_eq!(workspace_config_state_to_api(current.state), stored.state);
         assert_eq!(current.history_head, stored.history_head);
-        f.assert_legacy_sealed();
+        f.assert_native_writer_denied();
 
         let repull = dir.path().join("repull");
         server.run(&f.owner, &repull, Pull).await.unwrap();
@@ -1174,7 +1161,7 @@ mod configuration_adoption_http_integration {
         }
         std::fs::write(&local, original).unwrap();
         server.run(&f.owner, &checkout, Push).await.unwrap();
-        f.assert_legacy_sealed();
+        f.assert_native_writer_denied();
     }
 
     #[tokio::test]
@@ -1236,7 +1223,7 @@ mod configuration_adoption_http_integration {
             }
             f.assert_subject_policy_unchanged();
             server.run(&f.owner, &checkout, Push).await.unwrap();
-            f.assert_legacy_sealed();
+            f.assert_native_writer_denied();
         }
     }
 
@@ -1245,7 +1232,6 @@ mod configuration_adoption_http_integration {
             operation_id: request.operation_id.clone(),
             expected_head: request.expected_head.clone(),
             expected_catalog_digest: request.expected_catalog_digest.clone(),
-            expected_legacy_export: request.expected_legacy_export.clone(),
             source: config_commit_request_from_api(request.source.clone()).unwrap(),
         }
     }
@@ -1277,7 +1263,6 @@ mod configuration_adoption_http_integration {
             operation_id: id.into(),
             expected_head: source.history_head.clone(),
             expected_catalog_digest: source.catalog_digest.clone(),
-            expected_legacy_export: source.expected_legacy_export.clone(),
             source: SourceRequest {
                 base_digest: source.state.snapshot.digest.clone(),
                 changes,
@@ -1694,7 +1679,7 @@ mod configuration_adoption_http_integration {
                 preview["state"]
             );
             assert_eq!(f.source().await.state, saved.state);
-            f.assert_legacy_sealed();
+            f.assert_native_writer_denied();
             assert_eq!(
                 secret_counts(),
                 secrets_before,
@@ -1718,7 +1703,6 @@ mod configuration_adoption_http_integration {
         let source = fixture.source().await;
         assert!(source.source_stored);
         assert!(source.history_head.is_some());
-        assert!(source.expected_legacy_export.is_none());
         fixture.assert_source_policy_unchanged(&source);
         assert_eq!(
             source.state.snapshot.digest,
@@ -1854,7 +1838,7 @@ mod configuration_adoption_http_integration {
         .unwrap();
         assert_eq!(reconciled, Reconciliation::NotObserved);
         assert_eq!(fixture.durable(), before);
-        fixture.assert_legacy_sealed();
+        fixture.assert_native_writer_denied();
     }
 
     #[tokio::test]
@@ -1938,7 +1922,7 @@ mod configuration_adoption_http_integration {
             "historical receipt must not resurrect removed policy or head"
         );
         fixture.assert_subject_policy_unchanged();
-        fixture.assert_legacy_sealed();
+        fixture.assert_native_writer_denied();
     }
 
     #[tokio::test]
@@ -1955,9 +1939,6 @@ mod configuration_adoption_http_integration {
         let mut changed = adoption.clone();
         changed.expected_catalog_digest.push_str("-different");
         variants.push(("catalog", changed));
-        let mut changed = adoption.clone();
-        changed.expected_legacy_export = Some("unexpected-legacy-export".into());
-        variants.push(("legacy export", changed));
         let mut changed = adoption.clone();
         changed.source.base_digest.push_str("-different");
         variants.push(("base content", changed));
@@ -2084,7 +2065,7 @@ mod configuration_adoption_http_integration {
             assert_eq!(status, StatusCode::OK, "{response}");
             assert_eq!(serde_json::from_value::<Source>(response).unwrap(), source);
             fixture.commit(&adoption).await;
-            fixture.assert_legacy_sealed();
+            fixture.assert_native_writer_denied();
         }
     }
 

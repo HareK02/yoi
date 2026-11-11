@@ -332,12 +332,6 @@
               "null"
             ]
           },
-          "expected_legacy_export": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "operation_id": {
             "type": "string"
           },
@@ -411,73 +405,6 @@
           "publication_registry_unavailable"
         ],
         "type": "string"
-      },
-      "ConfigurationMigrationDiagnostic": {
-        "oneOf": [
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "const": "converted",
-                "type": "string"
-              },
-              "operation": {
-                "type": "string"
-              },
-              "subject_id": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "subject_id",
-              "operation"
-            ],
-            "type": "object"
-          },
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "const": "domain_constraint",
-                "type": "string"
-              },
-              "permission": {
-                "$ref": "#/components/schemas/ScopedPermission"
-              },
-              "subject_id": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "subject_id",
-              "permission"
-            ],
-            "type": "object"
-          },
-          {
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "const": "explicit_configuration_required",
-                "type": "string"
-              },
-              "permission": {
-                "$ref": "#/components/schemas/ScopedPermission"
-              },
-              "subject_id": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "kind",
-              "subject_id",
-              "permission"
-            ],
-            "type": "object"
-          }
-        ]
       },
       "ConfigurationPreviewResponse": {
         "additionalProperties": false,
@@ -689,27 +616,6 @@
           },
           {
             "additionalProperties": false,
-            "properties": {
-              "export_digest": {
-                "type": "string"
-              },
-              "status": {
-                "const": "pending_transfer",
-                "type": "string"
-              },
-              "transfer_identity": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "status",
-              "transfer_identity",
-              "export_digest"
-            ],
-            "type": "object"
-          },
-          {
-            "additionalProperties": false,
             "description": "No matching evidence was observed. This is not permission to change the ID.",
             "properties": {
               "status": {
@@ -733,23 +639,11 @@
           "catalog_digest": {
             "type": "string"
           },
-          "expected_legacy_export": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "history_head": {
             "type": [
               "string",
               "null"
             ]
-          },
-          "migration_diagnostics": {
-            "items": {
-              "$ref": "#/components/schemas/ConfigurationMigrationDiagnostic"
-            },
-            "type": "array"
           },
           "policies": {
             "items": {
@@ -762,7 +656,7 @@
           },
           "state": {
             "$ref": "#/components/schemas/WorkspaceConfigTreeResponse",
-            "description": "Before the first adoption this is an editable, evaluated migration draft.\nsource_stored distinguishes it from the unchanged stored source."
+            "description": "Current stored shared configuration."
           }
         },
         "required": [
@@ -770,8 +664,7 @@
           "source_stored",
           "catalog",
           "catalog_digest",
-          "policies",
-          "migration_diagnostics"
+          "policies"
         ],
         "type": "object"
       },
@@ -2116,7 +2009,7 @@
   "info": {
     "title": "Workspace configuration adoption",
     "version": "0.1.0",
-    "x-yoi-source-digest": "sha256:54cfb4724c519c40ba45a65a61aca4f306c9db3310cad07fb54d11bfebd4cc8e"
+    "x-yoi-source-digest": "sha256:856c92ff64f283cc5117b197aa91dbc9aede11369b9b4335acae81ba6c23b899"
   },
   "openapi": "3.1.0",
   "paths": {

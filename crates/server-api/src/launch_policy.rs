@@ -2,7 +2,7 @@
 //! These values are data, never credentials. Management requires the authenticated
 //! Workspace owner; using a policy requires both worker.create and its exact usage key.
 
-use crate::authorization::{PermissionReferenceEncoding, migrate_legacy_subject_assignment};
+use crate::authorization::PermissionReferenceEncoding;
 use feature_permissions::{PermissionAssignment, PermissionKey};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -50,10 +50,6 @@ pub struct WorkerLaunchPolicy {
     pub state: WorkerLaunchPolicyState,
     pub allowed_profiles: Vec<String>,
     pub child_permissions: PermissionAssignment,
-    #[serde(
-        default,
-        skip_serializing_if = "PermissionReferenceEncoding::is_legacy"
-    )]
     pub reference_encoding: PermissionReferenceEncoding,
     pub last_operation_key: String,
 }
@@ -72,11 +68,7 @@ pub struct WorkerLaunchPolicyObservation {
 impl WorkerLaunchPolicy {
     /// Current authorization projection; historical receipts retain their saved representation.
     pub fn effective_child_permissions(&self) -> PermissionAssignment {
-        let mut assignment = self.child_permissions.clone();
-        if self.reference_encoding.is_legacy() {
-            migrate_legacy_subject_assignment(&mut assignment);
-        }
-        assignment
+        self.child_permissions.clone()
     }
 
     pub fn observation(&self) -> WorkerLaunchPolicyObservation {
@@ -290,41 +282,6 @@ pub trait WorkerLaunchPoliciesApi {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn policy_projection_only_interprets_retired_references_for_legacy_encoding() {
-        let mut raw = json!({
-            "policy_id":"coder", "name":"Coder", "authorization_revision":1,
-            "state":"active", "allowed_profiles":["builtin:coder"],
-            "child_permissions": {
-                "grants":[{"kind":"set", "value":"subject-default"}],
-                "exclusions":[{"kind":"namespace", "value": {
-                    "namespace":"subject", "keys":["subject.delegate"]
-                }}],
-                "revoked":false
-            },
-            "last_operation_key":"create"
-        });
-        let legacy: WorkerLaunchPolicy = serde_json::from_value(raw.clone()).unwrap();
-        assert!(legacy.reference_encoding.is_legacy());
-        assert_ne!(
-            legacy.effective_child_permissions(),
-            legacy.child_permissions
-        );
-        assert!(
-            serde_json::to_value(&legacy)
-                .unwrap()
-                .get("reference_encoding")
-                .is_none()
-        );
-        raw["reference_encoding"] = json!("feature_sets_v2");
-        let current: WorkerLaunchPolicy = serde_json::from_value(raw).unwrap();
-        assert_eq!(
-            current.effective_child_permissions(),
-            current.child_permissions
-        );
-        assert_eq!(current.child_permissions, legacy.child_permissions);
-    }
 
     #[test]
     fn worker_creation_wire_requires_policy_revision_and_rejects_arbitrary_grants() {

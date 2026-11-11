@@ -76,9 +76,7 @@ const sourceResponse = (state = tree) => ({
   source_stored: true,
   catalog: { workspace: "w", namespaces: [] },
   catalog_digest: "sha256:catalog",
-  expected_legacy_export: "sha256:legacy",
   policies: [],
-  migration_diagnostics: [],
 });
 const response = () => new Response(JSON.stringify(sourceResponse()));
 const jsonResponse = (body: unknown) => new Response(JSON.stringify(body));
@@ -478,7 +476,6 @@ test.each([409, 422])(
       operation_id: expect.any(String),
       expected_head: "head:observed",
       expected_catalog_digest: "sha256:catalog",
-      expected_legacy_export: "sha256:legacy",
       source: {
         base_digest: tree.snapshot.digest,
         changes: [change],
@@ -571,24 +568,18 @@ test("commit rejection does not refresh the head or discard local source", async
   expect(requestAt(3).operation_id).not.toBe(requestAt(1).operation_id);
 });
 
-test.each(["not_observed", "pending_transfer"])(
+test.each(["not_observed"])(
   "lost commit followed by %s retains the exact request for explicit resume",
   async (status) => {
     const view = await prepareDraft();
-    const unknown = status === "not_observed" ? { status } : {
-      status,
-      transfer_identity: "transfer:one",
-      export_digest: "sha256:legacy",
-    };
+    const unknown = { status };
     fetcher.mockResolvedValueOnce(previewResponse(candidateState));
     fetcher.mockRejectedValueOnce(new TypeError("response lost"));
     fetcher.mockResolvedValueOnce(jsonResponse(unknown));
     await fireEvent.click(view.getByRole("button", { name: "Commit" }));
     await waitFor(() =>
       expect(view.container.textContent).toContain(
-        status === "not_observed"
-          ? "not observed does not mean failed"
-          : "transfer pending",
+        "not observed does not mean failed",
       )
     );
     expect(fetcher).toHaveBeenCalledTimes(4);
@@ -658,7 +649,6 @@ test("adopted reconciliation updates head and clears the legacy export for the n
   await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(6));
   const second = requestAt(4);
   expect(second.expected_head).toBe("head:adopted");
-  expect(second.expected_legacy_export).toBeNull();
   expect(second.expected_catalog_digest).toBe(first.expected_catalog_digest);
   expect(second.operation_id).not.toBe(first.operation_id);
   expect(second.source.base_digest).toBe(candidate.digest);

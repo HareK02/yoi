@@ -2056,7 +2056,6 @@ async fn adopt_chat_configuration(
         operation_id: Uuid::now_v7().to_string(),
         expected_head: source.history_head,
         expected_catalog_digest: source.catalog_digest,
-        expected_legacy_export: source.expected_legacy_export,
         source: server_api::ConfigCommitRequest {
             base_digest: source.state.snapshot.digest.clone(),
             entrypoints: source.state.contract.entrypoints,

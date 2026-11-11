@@ -25,7 +25,7 @@ impl subjektiv::CanonicalPermissionSource for CanonicalSubjectPolicySource {
         subject: &str,
     ) -> subjektiv::Result<Option<server_api::authorization::CurrentSubjectPolicy>> {
         if self.host.catalog().workspace.as_str() != workspace {
-            return Err(subjektiv::SubjektivError::PermissionTransferConflict);
+            return Err(subjektiv::SubjektivError::PermissionAuthorityConflict);
         }
         self.store
             .current_subject_permission_policy(workspace, subject)
@@ -42,7 +42,7 @@ impl subjektiv::CanonicalPermissionSource for CanonicalSubjectPolicySource {
         subject: &str,
     ) -> subjektiv::Result<Option<server_api::authorization::SubjectPermissions>> {
         if self.host.catalog().workspace.as_str() != workspace {
-            return Err(subjektiv::SubjektivError::PermissionTransferConflict);
+            return Err(subjektiv::SubjektivError::PermissionAuthorityConflict);
         }
         self.store
             .adopted_subject_legacy_permissions(workspace, subject, &self.host)

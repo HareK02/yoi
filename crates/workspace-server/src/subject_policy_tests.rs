@@ -36,6 +36,7 @@ fn host() -> PermissionHost {
                 "conversation",
                 "work-coordination",
                 "work-execution",
+                "implementer",
             ]
             .into_iter()
             .map(|name| SetContribution {
@@ -53,17 +54,6 @@ fn host() -> PermissionHost {
 }
 
 fn fixture() -> (tempfile::TempDir, SqliteWorkspaceStore) {
-    let (directory, store) = unadopted_fixture();
-    store.with_immediate_transaction(|transaction| {
-        transaction.execute_batch(
-            "INSERT INTO workspace_configuration_authorities(workspace_id,transfer_identity,legacy_physical_identity,legacy_export_digest) VALUES('subject-policy-workspace','fixture-transfer','fixture-physical','fixture-export');",
-        )?;
-        Ok(())
-    }).unwrap();
-    (directory, store)
-}
-
-fn unadopted_fixture() -> (tempfile::TempDir, SqliteWorkspaceStore) {
     let directory = tempfile::tempdir().unwrap();
     let store =
         SqliteWorkspaceStore::open_for_test(&directory.path().join("server.sqlite")).unwrap();
@@ -151,7 +141,6 @@ fn consume(
 ) -> Result<Option<CurrentSubjectPolicy>> {
     store.with_immediate_transaction(|transaction| {
         require_owner(transaction, WORKSPACE, OWNER)?;
-        require_canonical(transaction, WORKSPACE)?;
         enroll(transaction, WORKSPACE, SUBJECT, enrollment, &host())
     })
 }
@@ -517,25 +506,13 @@ fn enrollment_consumption_is_durable_and_remove_never_revives_creation_policy() 
 }
 
 #[test]
-fn explicit_remove_before_enrollment_and_old_adoption_receipt_both_consume_without_issuance() {
-    for old_receipt in [false, true] {
-        let (_directory, store) = fixture();
-        if old_receipt {
-            store.with_immediate_transaction(|transaction| {
-                transaction.execute(
-                    "INSERT INTO workspace_configuration_receipts(workspace_id,operation_id,request_fingerprint,result_json) VALUES(?1,?2,'old-fingerprint','{}')",
-                    params![WORKSPACE, format!("subject-enrollment:{SUBJECT}")],
-                )?;
-                Ok(())
-            }).unwrap();
-        } else {
-            remove(&store, "remove-before-enrollment", None).unwrap();
-        }
-        assert!(consume(&store, &source()).unwrap().is_none());
-        assert!(consume(&store, &source()).unwrap().is_none());
-        assert_eq!(count(&store, "subject_permission_enrollments"), 1);
-        assert_eq!(count(&store, "workspace_configuration_policies"), 0);
-    }
+fn explicit_remove_before_enrollment_consumes_without_issuance() {
+    let (_directory, store) = fixture();
+    remove(&store, "remove-before-enrollment", None).unwrap();
+    assert!(consume(&store, &source()).unwrap().is_none());
+    assert!(consume(&store, &source()).unwrap().is_none());
+    assert_eq!(count(&store, "subject_permission_enrollments"), 1);
+    assert_eq!(count(&store, "workspace_configuration_policies"), 0);
 }
 
 #[test]
@@ -552,40 +529,6 @@ fn existing_policy_wins_enrollment_without_regenerating_a_change_identity() {
     assert_eq!(count(&store, "subject_permission_enrollments"), 1);
     remove(&store, "remove-owner-empty", Some(&previous.change_id)).unwrap();
     assert!(consume(&store, &source()).unwrap().is_none());
-}
-
-#[test]
-fn old_creation_reference_encoding_is_converted_only_for_current_policy() {
-    let (_directory, store) = fixture();
-    let mut old = match source() {
-        SubjectPolicySource::Feature(policy) => policy,
-        SubjectPolicySource::Legacy(_) => unreachable!(),
-    };
-    old.reference_encoding = PermissionReferenceEncoding::LegacySubjectV1;
-    old.execution = assignment("subject-default");
-    old.execution.exclusions = assignment("subject-default").grants;
-    let source = SubjectPolicySource::Feature(old);
-    let raw = json(&source).unwrap();
-    let enrolled = consume(&store, &source).unwrap().unwrap();
-    assert_eq!(enrolled.change_id, "native-creation-change");
-    assert_eq!(
-        enrolled.reference_encoding,
-        PermissionReferenceEncoding::FeatureSetsV2
-    );
-    assert_eq!(
-        enrolled.execution.grants,
-        vec![
-            PermissionReference::Set(PermissionSetId::parse("conversation").unwrap()),
-            PermissionReference::Set(PermissionSetId::parse("work-coordination").unwrap()),
-        ]
-    );
-    assert_eq!(enrolled.execution.exclusions, enrolled.execution.grants);
-    assert!(enrolled.delegation.grants.is_empty());
-    let saved: String = store.with_conn(|connection| {
-        Ok(connection.query_row("SELECT source_json FROM subject_permission_enrollments WHERE workspace_id=?1 AND subject_id=?2", params![WORKSPACE, SUBJECT], |row| row.get(0))?)
-    }).unwrap();
-    assert_eq!(saved, raw);
-    assert_eq!(consume(&store, &source).unwrap(), Some(enrolled));
 }
 
 #[test]
@@ -644,30 +587,6 @@ fn receipt_insertion_failure_rolls_back_current_policy_and_retry_is_safe() {
 }
 
 #[test]
-fn unadopted_subject_writes_fail_closed_without_blocking_ordinary_human_selection() {
-    let (_directory, store) = unadopted_fixture();
-    assert!(matches!(
-        mutate(
-            &store,
-            &replacement("not-adopted", None, assignment("ticket"))
-        ),
-        Err(Error::WorkspaceConfigConflict(_))
-    ));
-    assert!(matches!(
-        consume(&store, &source()),
-        Err(Error::WorkspaceConfigConflict(_))
-    ));
-    assert_eq!(
-        store
-            .worker_assignment(WORKSPACE, &host(), Some(&assignment("ticket")))
-            .unwrap(),
-        assignment("ticket")
-    );
-    assert_eq!(count(&store, "subject_permission_operations"), 0);
-    assert_eq!(count(&store, "subject_permission_enrollments"), 0);
-}
-
-#[test]
 fn enrollment_rejects_unknown_saved_references_and_legacy_scalar_defaults() {
     let (_directory, store) = fixture();
     let invalid = SubjectPolicySource::Feature(CurrentSubjectPolicy {
@@ -693,95 +612,6 @@ fn enrollment_rejects_unknown_saved_references_and_legacy_scalar_defaults() {
     assert_eq!(count(&store, "subject_permission_enrollments"), 0);
     assert_eq!(count(&store, "workspace_configuration_policies"), 0);
     assert!(consume(&store, &source()).unwrap().is_some());
-}
-
-#[test]
-fn legacy_removals_preserve_current_and_existing_tombstone_and_fence_enrollment() {
-    let (_directory, store) = fixture();
-    let active = mutate(&store, &replacement("active", None, assignment("ticket"))).unwrap();
-    let removed = store
-        .mutate_subject_permission_policy(
-            WORKSPACE,
-            OWNER,
-            "subject-b",
-            &SubjectPermissionPolicyMutation {
-                operation_id: "remove-b".into(),
-                expected_change_id: None,
-                action: SubjectPermissionPolicyAction::Remove,
-            },
-            &host(),
-        )
-        .unwrap();
-    let before_config = config_identity(&store);
-    let subjects = [SUBJECT, "subject-b", "subject-c", "subject-c"].map(str::to_owned);
-    store
-        .with_immediate_transaction(|transaction| {
-            preserve_legacy_removals(transaction, WORKSPACE, &subjects)
-        })
-        .unwrap();
-    assert_eq!(
-        store
-            .subject_permission_policy_state(WORKSPACE, SUBJECT)
-            .unwrap(),
-        (active.change_id, active.policy)
-    );
-    assert_eq!(
-        store
-            .subject_permission_policy_state(WORKSPACE, "subject-b")
-            .unwrap(),
-        (removed.change_id.clone(), None)
-    );
-    let legacy_removed = store
-        .subject_permission_policy_state(WORKSPACE, "subject-c")
-        .unwrap();
-    assert!(legacy_removed.0.is_some());
-    assert!(legacy_removed.1.is_none());
-    assert_eq!(count(&store, "subject_permission_tombstones"), 2);
-    assert_eq!(count(&store, "subject_permission_operations"), 2);
-    store
-        .with_immediate_transaction(|transaction| {
-            preserve_legacy_removals(transaction, WORKSPACE, &subjects)?;
-            for subject in ["subject-b", "subject-c"] {
-                assert!(enroll(transaction, WORKSPACE, subject, &source(), &host())?.is_none());
-            }
-            Ok(())
-        })
-        .unwrap();
-    assert_eq!(
-        store
-            .subject_permission_policy_state(WORKSPACE, "subject-c")
-            .unwrap(),
-        legacy_removed
-    );
-    assert_eq!(
-        store
-            .subject_permission_policy_state(WORKSPACE, "subject-b")
-            .unwrap(),
-        (removed.change_id, None)
-    );
-    assert_eq!(count(&store, "subject_permission_enrollments"), 2);
-    assert_eq!(count(&store, "workspace_configuration_policies"), 1);
-    assert_eq!(config_identity(&store), before_config);
-}
-
-#[test]
-fn legacy_removal_preservation_rolls_back_with_the_migration_transaction() {
-    let (_directory, store) = fixture();
-    assert!(
-        store
-            .with_immediate_transaction(|transaction| {
-                preserve_legacy_removals(transaction, WORKSPACE, &["subject-c".into()])?;
-                Err::<(), _>(Error::Store("injected migration failure".into()))
-            })
-            .is_err()
-    );
-    assert_eq!(count(&store, "subject_permission_tombstones"), 0);
-    assert_eq!(
-        store
-            .subject_permission_policy_state(WORKSPACE, "subject-c")
-            .unwrap(),
-        (None, None)
-    );
 }
 
 #[test]

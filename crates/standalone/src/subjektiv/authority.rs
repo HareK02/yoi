@@ -157,15 +157,6 @@ pub(super) fn bind_canonical_policy(
         subject: subject.id.clone(),
         current: Mutex::new(catalog.store.current_subject_policy(&subject.id).unwrap()),
     });
-    let identity = catalog.store.database_identity().unwrap();
-    let preview = catalog
-        .store
-        .preview_permission_transfer(&identity)
-        .unwrap();
-    catalog
-        .store
-        .seal_permission_sources(&identity, "local-test-transfer", &preview.export_digest)
-        .unwrap();
     catalog.store = catalog
         .store
         .clone()

@@ -29,13 +29,12 @@ const state: WorkspaceConfigTreeResponse = {
 const source = {
   state, history_head: null, source_stored: false,
   catalog: { workspace: "w/one", namespaces: [] },
-  catalog_digest: "sha256:catalog", expected_legacy_export: "sha256:legacy",
-  policies: [], migration_diagnostics: [],
+  catalog_digest: "sha256:catalog",
+  policies: [],
 };
 const request: ConfigurationAdoptionRequest = {
   operation_id: "operation:one", expected_head: "head:A-after-B",
   expected_catalog_digest: source.catalog_digest,
-  expected_legacy_export: source.expected_legacy_export,
   source: { base_digest: state.snapshot.digest, changes: [], entrypoints: ["main.dcdl"] },
 };
 const receipt = {
@@ -51,16 +50,14 @@ Deno.test("adoption source parser retains nullable observed metadata separately 
   assertEquals(parsed.state, state);
   assertEquals(parsed.history_head, null);
   assertEquals(parsed.source_stored, false);
-  assertEquals(parsed.expected_legacy_export, "sha256:legacy");
   // A -> B -> A can retain content-A while having a different editing head.
   assertEquals(parseConfigurationSourceResponse({ ...source, history_head: "head:A-after-B" }).history_head, request.expected_head);
 });
 
 Deno.test("adoption source parser rejects missing metadata, unknown envelope fields and unbounded opaque collections", () => {
   const { history_head: _head, ...missingHead } = source;
-  const { expected_legacy_export: _export, ...missingExport } = source;
   for (const invalid of [
-    state, missingHead, missingExport,
+    state, missingHead,
     { ...source, unexpected: true }, { ...source, history_head: 1 },
     { ...source, catalog_digest: "x".repeat(257) },
     { ...source, expected_legacy_export: false }, { ...source, source_stored: null },
@@ -114,10 +111,9 @@ Deno.test("receipt requires committed source and policy and matches the requeste
   }
 });
 
-Deno.test("not_observed and pending_transfer remain distinct unknown evidence, never a failed-save receipt", () => {
+Deno.test("not_observed remains unknown evidence, never a failed-save receipt", () => {
   for (const evidence of [
     { status: "not_observed" },
-    { status: "pending_transfer", transfer_identity: "transfer:one", export_digest: "sha256:legacy" },
     { status: "adopted", receipt },
   ]) assertEquals<unknown>(parseConfigurationReconciliation(evidence), evidence);
   for (const invalid of [

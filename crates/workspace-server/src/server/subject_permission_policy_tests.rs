@@ -216,7 +216,6 @@ mod subject_permission_policy_tests {
                     operation_id: operation.into(),
                     expected_head: current.history_head,
                     expected_catalog_digest: catalog_digest(registry.host()).unwrap(),
-                    expected_legacy_export: None,
                     source: ConfigCommitRequest {
                         base_digest: current.state.snapshot.digest.clone(),
                         entrypoints: current.state.contract.entrypoints,
@@ -235,9 +234,6 @@ mod subject_permission_policy_tests {
                 },
                 f.api.config_schema_registry.compose().unwrap(),
                 registry.host(),
-                None,
-                |_| panic!("shared sets do not refer to individual Subjects"),
-                |_| panic!("shared settings edits do not migrate Subject authority"),
             )
             .unwrap();
     }

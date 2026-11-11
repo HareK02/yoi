@@ -575,7 +575,6 @@ async fn memory_authority_schedule(consumer: AuthorityConsumer) {
                 .unwrap();
             assert_eq!(source_after.state, source_before.state);
             assert_eq!(source_after.history_head, source_before.history_head);
-            assert_eq!(source_after.canonical, source_before.canonical);
             f.api
                 .config_store
                 .with_conn(|connection| {

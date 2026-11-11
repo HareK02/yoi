@@ -17,7 +17,7 @@ use tokio::{
 fn base() -> ConfigurationSourceResponse {
     serde_json::from_value(serde_json::json!({
         "state": {"snapshot":{"digest":"root-a","entries":{"main.dcdl":{"path":"main.dcdl","content_type":"decodal","content":"{ value = 1; }\n","content_digest":"file-a"}, "notes.txt":{"path":"notes.txt","content_type":"text","content":"note","content_digest":"note-a"}}}, "contract":{"contract_version":2,"decodal_version":"0.4.0","schema_version":1,"entrypoints":["main.dcdl"],"import_policy_version":1,"schema_bundle":{"contributions":[],"source":"","fingerprint":"schema"},"fingerprint":"toolchain"},"projection_digest":"projection-a"},
-        "history_head":"head-a", "source_stored":true,"catalog":{"workspace":"workspace-test","namespaces":[]},"catalog_digest":"catalog-a","expected_legacy_export":null,"policies":[],"migration_diagnostics":[]
+        "history_head":"head-a", "source_stored":true,"catalog":{"workspace":"workspace-test","namespaces":[]},"catalog_digest":"catalog-a","policies":[]
     })).unwrap()
 }
 fn checkout() -> (tempfile::TempDir, PathBuf) {

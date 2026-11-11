@@ -27,7 +27,6 @@ export function permissionSource(
     history_head: "head:adopted",
     source_stored: true,
     catalog_digest: "sha256:catalog",
-    expected_legacy_export: null,
     catalog: {
       workspace,
       namespaces: [{
@@ -109,18 +108,6 @@ export function permissionSource(
           },
         }],
         delegation: [],
-      },
-    }],
-    migration_diagnostics: [{
-      kind: "domain_constraint",
-      subject_id: subject,
-      permission: {
-        operation: "ticket.read",
-        resource: {
-          kind: "ticket",
-          workspace_id: workspace,
-          ticket_id: "T-837",
-        },
       },
     }],
   };

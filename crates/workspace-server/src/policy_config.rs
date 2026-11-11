@@ -7,15 +7,13 @@
 //! `implementer`, while an explicit empty assignment stays empty. Unknown
 //! references are rejected even when revoked.
 //!
-//! Individual Subject records below retain the existing persisted JSON contract.
-//! They are not current configuration input, and legacy decoding never authorizes
-//! replaying assignments or removals over the current domain policy.
+//! Individual Subject records are managed separately, never through shared configuration.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use config_source::{ConfigSchemaContribution, EvaluationResult};
 use feature_permissions::{
-    NamespaceId, NamespacePermissions, PermissionAssignment, PermissionDiagnostic, PermissionHost,
+    NamespacePermissions, PermissionAssignment, PermissionDiagnostic, PermissionHost,
     PermissionKey, PermissionReference, PermissionSetId,
 };
 use serde::{Deserialize, Serialize};
@@ -172,33 +170,6 @@ impl Default for PermissionSource {
     }
 }
 
-/// Decoder for persisted configuration evaluated with permission schema versions
-/// through four. Never use this historical shape for current input.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyPermissionSource {
-    #[serde(default)]
-    pub subjects: Vec<SubjectAssignmentSource>,
-    #[serde(default)]
-    pub remove_subjects: Vec<String>,
-    #[serde(default)]
-    pub sets: Vec<WorkspacePermissionSetSource>,
-    #[serde(default)]
-    pub human_worker_default: Option<AssignmentSource>,
-}
-
-impl LegacyPermissionSource {
-    pub fn shared_source(&self) -> PermissionSource {
-        PermissionSource {
-            sets: self.sets.clone(),
-            worker_default: self
-                .human_worker_default
-                .clone()
-                .unwrap_or_else(default_worker_assignment),
-        }
-    }
-}
-
 /// Retained exact legacy restrictions belong to the domain, not the editable source.
 /// Keeping the original change identity preserves the distinction between live and
 /// already stale child grants during representation-only migration.
@@ -208,63 +179,7 @@ pub struct AdoptedSubjectPolicy {
     pub source: SubjectAssignmentSource,
     pub change_id: String,
     pub legacy_constraints: Option<SubjectPermissions>,
-    // Missing metadata denotes the old encoding. Omitting it again on serialization
-    // keeps preexisting frozen-plan digests stable until an explicit current edit.
-    #[serde(
-        default,
-        skip_serializing_if = "PermissionReferenceEncoding::is_legacy"
-    )]
     pub reference_encoding: PermissionReferenceEncoding,
-}
-
-/// Normalize only the retired Subject references, in every editable source slot.
-/// Catalog validation deliberately follows this typed representation conversion.
-pub(crate) fn migrate_source_references(source: &mut PermissionSource) -> bool {
-    fn lane(source: &mut AssignmentSource) -> bool {
-        let mut assignment = source.assignment();
-        if server_api::authorization::migrate_legacy_subject_assignment(&mut assignment) {
-            *source = AssignmentSource::from_assignment(&assignment);
-            true
-        } else {
-            false
-        }
-    }
-    let mut changed = lane(&mut source.worker_default);
-    for set in &mut source.sets {
-        let mut assignment = AssignmentSource {
-            sets: set.sets.clone(),
-            namespaces: set.namespaces.clone(),
-            ..Default::default()
-        };
-        if lane(&mut assignment) {
-            set.sets = assignment.sets;
-            set.namespaces = assignment.namespaces;
-            changed = true;
-        }
-    }
-    changed
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
-pub enum MigrationDiagnostic {
-    Converted {
-        subject_id: String,
-        operation: String,
-    },
-    DomainConstraint {
-        subject_id: String,
-        permission: ScopedPermission,
-    },
-    ExplicitConfigurationRequired {
-        subject_id: String,
-        permission: ScopedPermission,
-    },
-}
-
-pub fn legacy_source(evaluation: &EvaluationResult) -> Result<LegacyPermissionSource> {
-    serde_json::from_value(permission_value(evaluation))
-        .map_err(|e| Error::InvalidInput(format!("invalid legacy permission configuration: {e}")))
 }
 
 fn permission_value(evaluation: &EvaluationResult) -> serde_json::Value {
@@ -281,21 +196,10 @@ pub fn source(evaluation: &EvaluationResult) -> Result<PermissionSource> {
         .map_err(|e| Error::InvalidInput(format!("invalid permission configuration: {e}")))
 }
 
-fn reject_retired_references(assignment: &PermissionAssignment) -> Result<()> {
-    let mut candidate = assignment.clone();
-    if server_api::authorization::migrate_legacy_subject_assignment(&mut candidate) {
-        return Err(Error::InvalidInput(
-            "invalid permission references: retired Subject references are storage-only".into(),
-        ));
-    }
-    Ok(())
-}
-
 pub fn validate_assignment(host: &PermissionHost, source: &AssignmentSource) -> Result<()> {
     // Validate even revoked assignments. A revocation must not hide a misspelled
     // reference which would become active on a later edit.
     let mut assignment = source.assignment();
-    reject_retired_references(&assignment)?;
     assignment.revoked = false;
     let resolution = host.resolve(Some(&assignment));
     if resolution.projection().diagnostics.iter().any(|d| {
@@ -318,19 +222,6 @@ pub fn validate_assignment(host: &PermissionHost, source: &AssignmentSource) -> 
 /// is all-or-nothing, and both adoption and runtime reads use this same path.
 /// No expanded permissions are persisted as a second source of truth.
 pub fn configured_host(host: &PermissionHost, source: &PermissionSource) -> Result<PermissionHost> {
-    for set in &source.sets {
-        // Reserving the old ID prevents a new narrow custom set from being
-        // interpreted as the historical broader reference on a later startup.
-        if set.id.as_str() == "subject-default" {
-            return Err(Error::InvalidInput(
-                "invalid Workspace permission sets: retired Subject set ID is reserved".into(),
-            ));
-        }
-        reject_retired_references(&PermissionAssignment {
-            grants: set.contribution().children,
-            ..Default::default()
-        })?;
-    }
     let mut configured = host.clone();
     configured
         .replace_workspace_sets(
@@ -347,88 +238,9 @@ pub fn configured_host(host: &PermissionHost, source: &PermissionSource) -> Resu
     Ok(configured)
 }
 
-pub fn validate_source(
-    host: &PermissionHost,
-    source: &PermissionSource,
-    _require_subject: impl FnMut(&str) -> Result<()>,
-) -> Result<()> {
+pub fn validate_source(host: &PermissionHost, source: &PermissionSource) -> Result<()> {
     configured_host(host, source)?;
     Ok(())
-}
-
-/// Convert exact legacy operations without expanding explicit children. Restrictions
-/// which cannot be represented by the owning domain must be diagnosed before seal.
-/// This routine does not issue a grant or install a policy.
-pub fn migrate_subject(
-    host: &PermissionHost,
-    subject_id: &str,
-    legacy: &SubjectPermissions,
-) -> Result<(AdoptedSubjectPolicy, Vec<MigrationDiagnostic>)> {
-    let mut diagnostics = vec![];
-    let mut lane = |permissions: &[ScopedPermission]| -> Result<AssignmentSource> {
-        let mut by_namespace: BTreeMap<NamespaceId, BTreeSet<PermissionKey>> = BTreeMap::new();
-        for permission in permissions {
-            let operation =
-                server_api::authorization::canonical_worker_operation(&permission.operation)
-                    .unwrap_or(&permission.operation);
-            let Ok(key) = PermissionKey::parse(operation.to_owned()) else {
-                diagnostics.push(MigrationDiagnostic::ExplicitConfigurationRequired {
-                    subject_id: subject_id.into(),
-                    permission: permission.clone(),
-                });
-                continue;
-            };
-            let assignment = PermissionAssignment {
-                grants: vec![PermissionReference::Namespace(NamespacePermissions {
-                    namespace: key.namespace(),
-                    keys: vec![key.clone()],
-                })],
-                exclusions: vec![],
-                revoked: false,
-            };
-            let resolution = host.resolve(Some(&assignment));
-            let exact = resolution.projection().diagnostics.is_empty()
-                && resolution.projection().allowed.len() == 1
-                && resolution.projection().allowed.contains_key(&key);
-            if !exact {
-                diagnostics.push(MigrationDiagnostic::ExplicitConfigurationRequired {
-                    subject_id: subject_id.into(),
-                    permission: permission.clone(),
-                });
-                continue;
-            }
-            by_namespace.entry(key.namespace()).or_default().insert(key);
-            diagnostics.push(MigrationDiagnostic::DomainConstraint {
-                subject_id: subject_id.into(),
-                permission: permission.clone(),
-            });
-        }
-        Ok(AssignmentSource {
-            namespaces: by_namespace
-                .into_iter()
-                .map(|(namespace, keys)| NamespacePermissions {
-                    namespace,
-                    keys: keys.into_iter().collect(),
-                })
-                .collect(),
-            ..Default::default()
-        })
-    };
-    let execution = lane(&legacy.execution)?;
-    let delegation = lane(&legacy.delegation)?;
-    Ok((
-        AdoptedSubjectPolicy {
-            source: SubjectAssignmentSource {
-                subject_id: subject_id.into(),
-                execution,
-                delegation,
-            },
-            change_id: legacy.change_id.clone(),
-            legacy_constraints: Some(legacy.clone()),
-            reference_encoding: PermissionReferenceEncoding::FeatureSetsV2,
-        },
-        diagnostics,
-    ))
 }
 
 impl AdoptedSubjectPolicy {
@@ -440,26 +252,12 @@ impl AdoptedSubjectPolicy {
             legacy_constraints: self.legacy_constraints.clone(),
             reference_encoding: self.reference_encoding,
         }
-        .into_current_reference_encoding()
-    }
-
-    /// Persist the current representation without changing authorization identity
-    /// or any retained domain restriction. Historical/frozen values are not callers.
-    pub(crate) fn migrate_reference_encoding(&mut self) -> bool {
-        let current = Self::from_current(&self.source.subject_id, &self.current());
-        if *self == current {
-            false
-        } else {
-            *self = current;
-            true
-        }
     }
 
     pub fn from_current(
         subject_id: &str,
         current: &server_api::authorization::CurrentSubjectPolicy,
     ) -> Self {
-        let current = current.clone().into_current_reference_encoding();
         Self {
             source: SubjectAssignmentSource {
                 subject_id: subject_id.into(),
@@ -535,7 +333,7 @@ mod tests {
         ] {
             assert!(
                 serde_json::from_value::<PermissionSource>(value).is_err(),
-                "the retired field is storage-only, not a current alias"
+                "retired fields are not accepted"
             );
         }
     }

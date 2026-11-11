@@ -10,7 +10,7 @@
 use feature_permissions::{PermissionAssignment, PermissionHost};
 use rusqlite::OptionalExtension;
 
-use super::{canonical, policy_config};
+use super::policy_config;
 use crate::{Error, Result, SqliteWorkspaceStore};
 
 fn current_source(
@@ -66,11 +66,6 @@ impl SqliteWorkspaceStore {
     ) -> Result<Option<server_api::authorization::SubjectPermissions>> {
         require_workspace(workspace, feature_host)?;
         self.with_permission_snapshot(|transaction| {
-            if !canonical(transaction, workspace)? {
-                return Err(Error::InvalidInput(
-                    "Workspace policy transfer is not adopted".into(),
-                ));
-            }
             let source = current_source(transaction, workspace)?;
             let host = policy_config::configured_host(feature_host, &source)?;
             let raw: Option<String> = transaction

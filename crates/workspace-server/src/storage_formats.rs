@@ -83,7 +83,6 @@ pub(super) fn verify_history(conn: &Connection, current: i64) -> Result<()> {
         ticket::verify_sqlite_ticket_schema(conn).map_err(invalid)?;
     }
     verify_launch_policy_shape(conn, current)?;
-    verify_permission_migration_shape(conn, current)?;
     verify_subject_permission_domain_shape(conn, current)?;
     verify_publication_shape(conn, current)?;
     verify_connection_observation_shape(conn, current)?;
@@ -369,7 +368,6 @@ impl FailureTail {
         tail.push((129, super::DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME));
         tail.push((130, super::backend_job_current::MIGRATION_NAME));
         tail.push((131, crate::launch_policy::MIGRATION_NAME));
-        tail.push((132, crate::config_adoption::automatic::MIGRATION_NAME));
         tail.push((133, crate::subject_policy::MIGRATION_NAME));
         tail
     }
@@ -2444,29 +2442,6 @@ CREATE TABLE content_history_references (
 );
 CREATE INDEX content_history_object_owners ON content_history_references(workspace, kind, hash);
 "####;
-
-fn verify_permission_migration_shape(conn: &Connection, current: i64) -> Result<()> {
-    let select = |shape: Shape| -> Shape {
-        shape
-            .into_iter()
-            .filter(|(_, object)| object.1 == "workspace_permission_migration_plans")
-            .collect()
-    };
-    let actual = select(snapshot(conn)?);
-    if current < 132 {
-        return if actual.is_empty() {
-            Ok(())
-        } else {
-            Err(invalid("permission migration schema before its receipt"))
-        };
-    }
-    let reference = Connection::open_in_memory()?;
-    reference.execute_batch(crate::config_adoption::automatic::SCHEMA)?;
-    if actual != select(snapshot(&reference)?) {
-        return Err(invalid("permission migration physical schema mismatch"));
-    }
-    Ok(())
-}
 
 fn verify_subject_permission_domain_shape(conn: &Connection, current: i64) -> Result<()> {
     let select = |shape: Shape| -> Shape {

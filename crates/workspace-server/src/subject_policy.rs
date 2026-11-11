@@ -55,15 +55,6 @@ fn require_owner(connection: &Connection, workspace: &str, account: &str) -> Res
     Ok(())
 }
 
-fn require_canonical(connection: &Connection, workspace: &str) -> Result<()> {
-    if !crate::config_adoption::canonical(connection, workspace)? {
-        return Err(conflict(
-            "Workspace policy transfer is not adopted; reconcile it before changing Subject permissions",
-        ));
-    }
-    Ok(())
-}
-
 fn require_host(workspace: &str, host: &PermissionHost) -> Result<()> {
     if host.catalog().workspace.as_str() != workspace {
         return Err(Error::WorkspaceIdMismatch);
@@ -116,27 +107,6 @@ fn state(
         None => tombstone(connection, workspace, subject)?,
     };
     Ok((change_id, policy))
-}
-
-/// Preserve removed legacy assignments inside the caller's migration transaction.
-/// This records no grant and never replaces a current policy or removal identity.
-pub(crate) fn preserve_legacy_removals(
-    connection: &Connection,
-    workspace: &str,
-    subjects: &[String],
-) -> Result<()> {
-    for subject in subjects {
-        server_api::authorization::validate_authorization_identifier(subject)
-            .map_err(Error::InvalidInput)?;
-        if state(connection, workspace, subject)?.0.is_some() {
-            continue;
-        }
-        connection.execute(
-            "INSERT INTO subject_permission_tombstones(workspace_id,subject_id,change_id) SELECT ?1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM workspace_configuration_policies WHERE workspace_id=?1 AND subject_id=?2) ON CONFLICT(workspace_id,subject_id) DO NOTHING",
-            params![workspace, subject, uuid::Uuid::new_v4().to_string()],
-        )?;
-    }
-    Ok(())
 }
 
 fn save(
@@ -196,10 +166,7 @@ impl SqliteWorkspaceStore {
         workspace: &str,
         subject: &str,
     ) -> Result<Option<CurrentSubjectPolicy>> {
-        self.with_conn(|connection| {
-            require_canonical(connection, workspace)?;
-            current(connection, workspace, subject)
-        })
+        self.with_conn(|connection| current(connection, workspace, subject))
     }
 
     /// Read policy and its active or removed state identity from one SQLite snapshot.
@@ -211,7 +178,6 @@ impl SqliteWorkspaceStore {
     ) -> Result<(Option<String>, Option<CurrentSubjectPolicy>)> {
         self.with_conn(|connection| {
             let transaction = connection.unchecked_transaction()?;
-            require_canonical(&transaction, workspace)?;
             state(&transaction, workspace, subject)
         })
     }
@@ -224,7 +190,6 @@ impl SqliteWorkspaceStore {
     ) -> Result<(Option<String>, Option<CurrentSubjectPolicy>, PermissionHost)> {
         self.with_conn(|connection| {
             let transaction = connection.unchecked_transaction()?;
-            require_canonical(&transaction, workspace)?;
             let (change_id, policy) = state(&transaction, workspace, subject)?;
             let host = configured_host(&transaction, workspace, host)?;
             Ok((change_id, policy, host))
@@ -253,7 +218,6 @@ impl SqliteWorkspaceStore {
     ) -> Result<SubjectPermissionPolicyMutationResponse> {
         self.with_immediate_transaction(|transaction| {
             require_owner(transaction, workspace, account)?;
-            require_canonical(transaction, workspace)?;
             server_api::authorization::validate_authorization_identifier(subject)
                 .map_err(Error::InvalidInput)?;
             server_api::authorization::validate_authorization_identifier(&request.operation_id)
@@ -362,8 +326,7 @@ impl SqliteWorkspaceStore {
         native
             .with_permission_authority_guard(&identity, |authority| {
                 authority.require_subject(subject)?;
-                // The native reader deliberately retains the original encoding.
-                // Serialize before from_current performs the storage conversion.
+                // Retain the exact creation policy as immutable enrollment evidence.
                 let enrollment = authority.subject_permission_enrollment(subject)?;
                 Ok((|| {
                     let Some(enrollment) = enrollment else {
@@ -373,7 +336,6 @@ impl SqliteWorkspaceStore {
                     require_host(workspace, &host)?;
                     self.with_immediate_transaction(|transaction| {
                         require_owner(transaction, workspace, account)?;
-                        require_canonical(transaction, workspace)?;
                         enroll(transaction, workspace, subject, &enrollment, &host)
                     })
                 })())
@@ -407,8 +369,8 @@ fn enroll(
     }
     let previous = current(connection, workspace, subject)?;
     let decided: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM subject_permission_tombstones WHERE workspace_id=?1 AND subject_id=?2) OR EXISTS(SELECT 1 FROM subject_permission_operations WHERE workspace_id=?1 AND subject_id=?2) OR EXISTS(SELECT 1 FROM workspace_configuration_receipts WHERE workspace_id=?1 AND operation_id=?3)",
-        params![workspace, subject, format!("subject-enrollment:{subject}")],
+        "SELECT EXISTS(SELECT 1 FROM subject_permission_tombstones WHERE workspace_id=?1 AND subject_id=?2) OR EXISTS(SELECT 1 FROM subject_permission_operations WHERE workspace_id=?1 AND subject_id=?2)",
+        params![workspace, subject],
         |row| row.get(0),
     )?;
     let policy = if previous.is_some() || decided {

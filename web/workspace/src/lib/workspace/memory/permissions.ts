@@ -148,28 +148,21 @@ function parseLegacy(value: unknown): SubjectPermissions | null {
   };
 }
 export function parsePolicy(value: unknown): Policy {
-  const raw = object(value);
-  const hasEncoding = "reference_encoding" in raw;
   const policy = record(value, [
     "change_id",
     "execution",
     "delegation",
     "legacy_constraints",
-    ...(hasEncoding ? ["reference_encoding"] : []),
+    "reference_encoding",
   ]);
-  const encoding = policy.reference_encoding;
+  if (policy.reference_encoding !== "feature_sets_v2") return invalid();
   const result: Policy = {
+    reference_encoding: "feature_sets_v2",
     change_id: text(policy.change_id),
     execution: parseAssignment(policy.execution),
     delegation: parseAssignment(policy.delegation),
     legacy_constraints: parseLegacy(policy.legacy_constraints),
   };
-  if (hasEncoding) {
-    if (encoding !== "legacy_subject_v1" && encoding !== "feature_sets_v2") {
-      return invalid();
-    }
-    result.reference_encoding = encoding;
-  }
   return result;
 }
 function parsePolicyState(

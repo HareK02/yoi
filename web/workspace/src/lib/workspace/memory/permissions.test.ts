@@ -161,9 +161,7 @@ Deno.test("current policy preserves exclusions, revocation, encoding and read-on
   for (const encoding of [undefined, "legacy_subject_v1"] as const) {
     const { reference_encoding: _encoding, ...lanes } = policy;
     const legacy = encoding ? { ...lanes, reference_encoding: encoding } : lanes;
-    const view = parsePermissionResponse({ ...response, policy: legacy }, "w/one");
-    assertEquals(view.policy, legacy);
-    assertEquals(view.readOnly, true);
+    assertThrows(() => parsePermissionResponse({ ...response, policy: legacy }, "w/one"));
   }
 });
 Deno.test("dedicated response requires identity and coherent projections without configuration fallbacks", () => {

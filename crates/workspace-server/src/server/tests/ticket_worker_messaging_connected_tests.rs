@@ -442,18 +442,10 @@ fn install_public_ticket_profiles(api: &WorkspaceApi) {
                     .unwrap(),
                 expected_catalog_digest: crate::config_adoption::catalog_digest(registry.host())
                     .unwrap(),
-                expected_legacy_export: None,
                 source,
             },
             api.config_schema_registry.compose().unwrap(),
             registry.host(),
-            None,
-            |_| Ok(()),
-            |_| {
-                Err(Error::RegistryInconsistency(
-                    "fixture cannot transfer sealed authority".into(),
-                ))
-            },
         )
         .unwrap();
 }

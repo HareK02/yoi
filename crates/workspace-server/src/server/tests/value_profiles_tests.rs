@@ -68,7 +68,7 @@ async fn value_profiles_builtin_http_config_tree_is_read_only_and_never_falls_ba
     let adoption = |current: &Value, id: &str, source: Value| {
         json!({
             "operation_id": id, "expected_head": current["history_head"],
-            "expected_catalog_digest": current["catalog_digest"], "expected_legacy_export": current["expected_legacy_export"],
+            "expected_catalog_digest": current["catalog_digest"],
             "source": source,
         })
     };

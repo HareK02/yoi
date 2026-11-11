@@ -589,11 +589,6 @@ const MIGRATIONS: &[Migration] = &[
         apply: migrate_worker_launch_policies_to_v131,
     },
     Migration {
-        version: 132,
-        name: crate::config_adoption::automatic::MIGRATION_NAME,
-        apply: migrate_permission_storage_to_v132,
-    },
-    Migration {
         version: 133,
         name: crate::subject_policy::MIGRATION_NAME,
         apply: migrate_subject_permission_domain_to_v133,
@@ -4490,10 +4485,8 @@ impl SqliteWorkspaceStore {
             request_source,
             &expected.worker,
         )?;
-        let canonical = crate::config_adoption::canonical(tx, workspace_id)?;
-        let policy = match (canonical, source) {
-            (false, ChatPolicySource::Local(Some(policy))) => policy.clone(),
-            (true, ChatPolicySource::Canonical) => {
+        let policy = match source {
+            ChatPolicySource::Canonical => {
                 let raw: Option<String> = tx.query_row(
                     "SELECT policy_json FROM workspace_configuration_policies WHERE workspace_id=?1 AND subject_id=?2",
                     params![workspace_id, subject_id], |row| row.get(0),
@@ -17239,26 +17232,10 @@ fn migrate_worker_launch_policies_to_v131(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_permission_storage_to_v132(conn: &Connection) -> Result<()> {
+fn migrate_subject_permission_domain_to_v133(conn: &Connection) -> Result<()> {
     if current_schema_version(conn)? != 131 {
         return Err(Error::Store(
-            "permission storage migration requires schema 131".into(),
-        ));
-    }
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(crate::config_adoption::automatic::SCHEMA)?;
-    tx.execute(
-        "INSERT INTO __yoi_schema_migrations(version,name) VALUES(132,?1)",
-        [crate::config_adoption::automatic::MIGRATION_NAME],
-    )?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_subject_permission_domain_to_v133(conn: &Connection) -> Result<()> {
-    if current_schema_version(conn)? != 132 {
-        return Err(Error::Store(
-            "Subject permission domain migration requires schema 132".into(),
+            "Subject permission domain migration requires schema 131".into(),
         ));
     }
     let tx = conn.unchecked_transaction()?;
@@ -17275,7 +17252,6 @@ fn create_latest_workspace_schema(conn: &Connection) -> Result<()> {
     create_workspace_schema_prefix(conn, include_str!("latest_schema.sql"), true)?;
     conn.execute_batch(content_history_store::SCHEMA)?;
     conn.execute_batch(crate::config_adoption::SCHEMA)?;
-    conn.execute_batch(crate::config_adoption::automatic::SCHEMA)?;
     conn.execute_batch(crate::subject_policy::SCHEMA)?;
     conn.execute_batch(crate::launch_policy::SCHEMA)?;
     conn.execute_batch(include_str!("core_worker_launch.sql"))?;
@@ -21953,10 +21929,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
                 name: crate::launch_policy::MIGRATION_NAME.into(),
             },
             WorkspaceSchemaMigrationStep {
-                version: 132,
-                name: crate::config_adoption::automatic::MIGRATION_NAME.into(),
-            },
-            WorkspaceSchemaMigrationStep {
                 version: 133,
                 name: crate::subject_policy::MIGRATION_NAME.into(),
             },
@@ -22104,7 +22076,6 @@ CREATE UNIQUE INDEX ticket_current_worker_role_idx
 (129, DOMAIN_FAILURE_OBSERVATIONS_MIGRATION_NAME.into()),
 (130, backend_job_current::MIGRATION_NAME.into()),
 (131, crate::launch_policy::MIGRATION_NAME.into()),
-(132, crate::config_adoption::automatic::MIGRATION_NAME.into()),
 (133, crate::subject_policy::MIGRATION_NAME.into()),
                     ]
                 );

@@ -10,9 +10,6 @@ pub mod config_adoption;
 mod config_publication;
 pub mod config_source;
 pub mod configuration_failure;
-mod configuration_migration;
-#[cfg(test)]
-mod configuration_transfer_tests;
 #[cfg(test)]
 mod content_history_tests;
 pub mod db_executor;

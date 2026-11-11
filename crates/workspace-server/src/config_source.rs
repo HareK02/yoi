@@ -224,13 +224,11 @@ impl SqliteWorkspaceStore {
                     }
                 };
                 let base_identity = load_evaluation_identity(&tx, workspace_id)?;
-                let frozen = crate::config_adoption::canonical(&tx, workspace_id)?
-                    || crate::config_adoption::automatic::pending(&tx, workspace_id)?;
+                let frozen = crate::config_adoption::has_history(&tx, workspace_id)?;
                 tx.commit()?;
                 Ok((state, requires_toolchain_refresh, base_identity, frozen))
             })?;
-        // Neither an adopted authority nor a frozen cross-store migration plan
-        // permits a second startup writer outside its policy/history transaction.
+        // Published configuration is changed only through owner-authorized publication.
         if frozen {
             return Ok(state);
         }
@@ -348,7 +346,7 @@ impl SqliteWorkspaceStore {
     ) -> Result<WorkspaceConfigState> {
         self.with_conn_mut(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if crate::config_adoption::canonical(&tx, workspace_id)? {
+            if crate::config_adoption::has_history(&tx, workspace_id)? {
                 return Err(config_conflict("configuration authority is adopted; use owner adoption with the observed editing head and operation ID"));
             }
             let workspace_exists: bool = tx.query_row(

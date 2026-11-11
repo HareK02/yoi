@@ -90,7 +90,7 @@ impl SubjektivStore {
         self.database.try_with_connection(|connection| {
             let tx = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
             require_active_subject(&tx, subject)?;
-            let source = if crate::permissions::transfer::is_sealed(&tx)? {
+            let source = if self.canonical_permission_source.is_some() {
                 ChatPolicySource::Canonical
             } else {
                 ChatPolicySource::Local(local_policy_source(&tx, subject)?)

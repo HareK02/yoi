@@ -68,9 +68,9 @@ interruptions: Array<SubjectPermissionInterruption>, };
 
 export type SubjectPermissionInterruption = { runtime_id: string, worker_id: string, cancellation_accepted: boolean, backend_command_sessions_closed: boolean, diagnostics: Array<string>, };
 
-export type PermissionReferenceEncoding = "legacy_subject_v1" | "feature_sets_v2";
+export type PermissionReferenceEncoding = "feature_sets_v2";
 
-export type CurrentSubjectPolicy = { change_id: string, execution: PermissionAssignment, delegation: PermissionAssignment, legacy_constraints: SubjectPermissions | null, reference_encoding?: PermissionReferenceEncoding, };
+export type CurrentSubjectPolicy = { change_id: string, execution: PermissionAssignment, delegation: PermissionAssignment, legacy_constraints: SubjectPermissions | null, reference_encoding: PermissionReferenceEncoding, };
 
 export type SubjectPermissionPolicyMutation = { operation_id: string,
 /**

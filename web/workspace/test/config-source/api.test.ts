@@ -69,7 +69,6 @@ function editingState(
     state,
     history_head: "head:observed",
     catalog_digest: "sha256:catalog",
-    expected_legacy_export: "sha256:legacy",
     source_stored: false,
   };
 }
@@ -80,7 +79,6 @@ function sourceResponse(state: unknown = tree) {
     state,
     catalog: {},
     policies: [],
-    migration_diagnostics: [],
   };
 }
 
@@ -96,7 +94,6 @@ function adoptionRequest(
     operation_id: "operation:one",
     expected_head: observed.history_head,
     expected_catalog_digest: observed.catalog_digest,
-    expected_legacy_export: observed.expected_legacy_export,
     source,
   };
 }

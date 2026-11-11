@@ -96,7 +96,6 @@ pub(super) async fn adopt_plugin_config(api: WorkspaceApi, owner: &str, content:
         "operation_id": uuid::Uuid::now_v7().to_string(),
         "expected_head": current["history_head"],
         "expected_catalog_digest": current["catalog_digest"],
-        "expected_legacy_export": current["expected_legacy_export"],
         "source": {
             "base_digest": current["state"]["snapshot"]["digest"],
             "entrypoints": ["main.dcdl"],
@@ -507,7 +506,7 @@ async fn workspace_owner_without_hosting_admin_configures_plugin_through_owner_a
     );
     let change = serde_json::json!({
         "operation_id": "config-plugin-adopt", "expected_head":state["history_head"],
-        "expected_catalog_digest":state["catalog_digest"], "expected_legacy_export":state["expected_legacy_export"],
+        "expected_catalog_digest":state["catalog_digest"],
         "source": {"base_digest":state["state"]["snapshot"]["digest"],"entrypoints":["main.dcdl"],"changes":[{"kind":"update","path":"main.dcdl","expected_digest":state["state"]["snapshot"]["entries"]["main.dcdl"]["content_digest"],"content":source}]}
     });
     json(

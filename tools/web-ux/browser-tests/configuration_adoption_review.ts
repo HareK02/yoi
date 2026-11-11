@@ -212,9 +212,7 @@ try {
                 source_stored: true,
                 catalog: { workspace: "home-owner", namespaces: [] },
                 catalog_digest: hash("catalog"),
-                expected_legacy_export: null,
                 policies: [],
-                migration_diagnostics: [],
               },
             });
           }

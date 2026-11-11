@@ -8,7 +8,7 @@ import type { FailureEnvelope } from "./error-contract.ts";
 import type { ConfigurationFailureDetails } from "./domain-failures.ts";
 import type { RuntimeControlCause } from "./protocol.ts";
 
-export type ConfigurationAdoptionRequest = { operation_id: string, expected_head: string | null, expected_catalog_digest: string, expected_legacy_export: string | null, source: ConfigCommitRequest, };
+export type ConfigurationAdoptionRequest = { operation_id: string, expected_head: string | null, expected_catalog_digest: string, source: ConfigCommitRequest, };
 
 export type RuntimePolicyApplication = "next_current_policy_check";
 
@@ -25,18 +25,15 @@ execution_resolution: PermissionResolution, delegation_resolution: PermissionRes
  */
 legacy_constraints: SubjectPermissions | null, };
 
-export type ConfigurationMigrationDiagnostic = { "kind": "converted", subject_id: string, operation: string, } | { "kind": "domain_constraint", subject_id: string, permission: ScopedPermission, } | { "kind": "explicit_configuration_required", subject_id: string, permission: ScopedPermission, };
-
 export type ConfigurationSourceResponse = {
 /**
- * Before the first adoption this is an editable, evaluated migration draft.
- * source_stored distinguishes it from the unchanged stored source.
+ * Current stored shared configuration.
  */
-state: WorkspaceConfigTreeResponse, history_head: string | null, source_stored: boolean, catalog: PermissionCatalog, catalog_digest: string, expected_legacy_export: string | null, policies: Array<ConfigurationSubjectPolicy>, migration_diagnostics: Array<ConfigurationMigrationDiagnostic>, };
+state: WorkspaceConfigTreeResponse, history_head: string | null, source_stored: boolean, catalog: PermissionCatalog, catalog_digest: string, policies: Array<ConfigurationSubjectPolicy>, };
 
 export type ConfigurationPreviewResponse = { expected_head: string | null, state: WorkspaceConfigTreeResponse, changed_paths: Array<string>, changed_subjects: Array<string>, };
 
-export type ConfigurationReconciliation = { "status": "adopted", receipt: ConfigurationAdoptionReceipt, } | { "status": "pending_transfer", transfer_identity: string, export_digest: string, } | { "status": "not_observed" };
+export type ConfigurationReconciliation = { "status": "adopted", receipt: ConfigurationAdoptionReceipt, } | { "status": "not_observed" };
 
 export type ConfigurationPublicationStage = "dispatch" | "projection" | "runtime";
 
